@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  gateway-and-packages:
+    name: Paquets et passerelle (Node 22, PostgreSQL)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: twake
+          POSTGRES_PASSWORD: twake
+          POSTGRES_DB: twake_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U twake"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: yarn
+      - run: yarn install --frozen-lockfile
+      - run: yarn build
+      - run: yarn typecheck
+      - name: Tests unitaires et contrat de stockage (mémoire et PostgreSQL)
+        run: yarn test
+        env:
+          TEST_DATABASE_URL: postgres://twake:twake@localhost:5432/twake_test
+      - name: Tests de l'app Phone (peer deps de cozy)
+        run: echo "voir le job app-phone"
+
+  app-phone:
+    name: App Phone (Node 24)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/phone
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: yarn
+          cache-dependency-path: apps/phone/yarn.lock
+      - run: yarn install --frozen-lockfile
+      - run: yarn lint
+      - run: yarn test
+      - run: yarn build
+
+  # Les e2e sur la stack Docker (yarn e2e:live, yarn e2e:browser, platform.e2e.mjs) demandent
+  # un PBX, LiveKit et la stack Twake : ils tournent à chaque porte de sortie sur un poste
+  # de dev (voir CONTRIBUTING.md), et passeront en CI quand l'étape 3 aura remplacé MiniPBX
+  # par OpenSIPS et rtpengine en Docker Compose.

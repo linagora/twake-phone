@@ -1,0 +1,12 @@
+{
+  "name": "@twake/phone-widget",
+  "version": "0.1.0",
+  "description": "Mounts the Twake Phone call widget (an intent iframe) in the corner of any Twake app.",
+  "license": "AGPL-3.0",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": ["dist"],
+  "scripts": { "build": "tsc -b" },
+  "peerDependencies": { "cozy-interapp": ">=0.18.0" }
+}

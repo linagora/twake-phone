@@ -1,0 +1,13 @@
+# Local
+.DS_Store
+*.local
+*.log*
+
+# Build
+node_modules
+build/
+
+# IDE
+.vscode/*
+!.vscode/extensions.json
+.idea

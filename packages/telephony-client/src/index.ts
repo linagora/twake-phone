@@ -1,0 +1,198 @@
+import type { Call, Capabilities, ConferenceParticipant, DialInConfiguration, MediaSession, Presence, PresenceStatus, TelephonyEvent } from '@twake/telephony-types'
+
+import { backoffDelay } from './backoff.js'
+
+export { formatNumber, toDialTarget, toE164 } from './phoneNumber.js'
+export { backoffDelay } from './backoff.js'
+
+export interface TelephonyClientOptions {
+  baseUrl: string
+  getToken: () => Promise<string>
+  /** URL of the user's Cozy instance. Sent with a Cozy token so the Gateway can ask that instance who it belongs to. */
+  getInstance?: () => string
+}
+
+export interface HistoryItem {
+  id: string
+  direction: 'inbound' | 'outbound'
+  remoteNumber: string
+  startedAt: string
+  endedAt?: string
+  durationSec: number
+  state: string
+  answered: boolean
+  missed: boolean
+}
+
+export interface HistoryFilter {
+  direction?: 'inbound' | 'outbound'
+  status?: 'missed' | 'answered' | 'failed'
+  number?: string
+  from?: string
+  to?: string
+  limit?: number
+  before?: string
+}
+
+export interface Conference {
+  /** Identifier used by every conference call (the Meet room id, which is also its LiveKit room name). */
+  meetingId: string
+  /** Last part of the Meet link. */
+  slug?: string
+  url?: string
+  dialIn: DialInConfiguration
+  participants?: ConferenceParticipant[]
+}
+
+/** Extracts the Meet room id from a pasted link or code (abc-defg-hij). */
+export const parseMeetingId = (input: string): string | null => {
+  const raw = input.trim()
+  if (!raw) return null
+  let candidate = raw
+  try {
+    const url = new URL(raw)
+    candidate = url.pathname.split('/').filter(Boolean).pop() ?? ''
+  } catch {}
+  return /^[A-Za-z0-9][A-Za-z0-9_-]{2,63}$/.test(candidate) ? candidate : null
+}
+
+export class TelephonyClient {
+  constructor(private readonly options: TelephonyClientOptions) {}
+
+  private async request<T>(path: string, init: RequestInit = {}): Promise<T> {
+    const res = await fetch(`${this.options.baseUrl}/api/v1${path}`, {
+      ...init,
+      headers: {
+        'content-type': 'application/json',
+        authorization: `Bearer ${await this.options.getToken()}`,
+        ...(this.options.getInstance ? { 'x-cozy-instance': this.options.getInstance() } : {}),
+        ...init.headers
+      }
+    })
+    if (!res.ok) throw new Error(`Gateway ${res.status} on ${path}`)
+    return (res.status === 204 ? undefined : await res.json()) as T
+  }
+
+  getMe() {
+    return this.request<{ id: string; displayName: string; extension?: string }>('/me')
+  }
+
+  getMediaSession() {
+    return this.request<MediaSession>('/me/media-session')
+  }
+
+  hangup(callId: string) {
+    return this.action(callId, 'hangup')
+  }
+
+  hold(callId: string) {
+    return this.action(callId, 'hold')
+  }
+
+  resume(callId: string) {
+    return this.action(callId, 'resume')
+  }
+
+  private async action(callId: string, name: string) {
+    await this.request<void>(`/calls/${callId}/${name}`, { method: 'POST' })
+  }
+
+  async getHistory(filter: HistoryFilter = {}) {
+    const params = new URLSearchParams()
+    for (const [k, v] of Object.entries(filter)) if (v !== undefined && v !== '') params.set(k, String(v))
+    const qs = params.toString()
+    return this.request<{ items: HistoryItem[]; next?: string }>(`/calls/history${qs ? `?${qs}` : ''}`)
+  }
+
+  getCapabilities() {
+    return this.request<Capabilities>('/capabilities')
+  }
+
+  getPresence() {
+    return this.request<Presence>('/me/presence')
+  }
+
+  setPresence(status: PresenceStatus) {
+    return this.request<Presence>('/me/presence', { method: 'PUT', body: JSON.stringify({ status }) })
+  }
+
+  originate(target: string, idempotencyKey: string) {
+    return this.request<Call>('/calls', {
+      method: 'POST',
+      headers: { 'idempotency-key': idempotencyKey },
+      body: JSON.stringify({ target })
+    })
+  }
+
+  /** Opens the phone panel of a Meet room the user can access, given the slug of its link. */
+  openConference(slug: string) {
+    return this.request<Conference>('/conferences', { method: 'POST', body: JSON.stringify({ slug }) })
+  }
+
+  /** Creates a new Meet room owned by the user and opens its phone panel. */
+  createConference() {
+    return this.request<Conference>('/conferences', { method: 'POST', body: JSON.stringify({ create: true }) })
+  }
+
+  getConference(meetingId: string) {
+    return this.request<Conference>(`/conferences/${encodeURIComponent(meetingId)}`)
+  }
+
+  closeConference(meetingId: string) {
+    return this.request<void>(`/conferences/${encodeURIComponent(meetingId)}`, { method: 'DELETE' })
+  }
+
+  /** Dial-out: makes the phone ring and joins the room when answered. */
+  inviteByPhone(meetingId: string, number: string) {
+    return this.request<ConferenceParticipant>(`/conferences/${encodeURIComponent(meetingId)}/participants`, { method: 'POST', body: JSON.stringify({ number }) })
+  }
+
+  removeParticipant(meetingId: string, participantId: string) {
+    return this.request<void>(`/conferences/${encodeURIComponent(meetingId)}/participants/${encodeURIComponent(participantId)}`, { method: 'DELETE' })
+  }
+
+  muteParticipant(meetingId: string, participantId: string) {
+    return this.request<void>(`/conferences/${encodeURIComponent(meetingId)}/participants/${encodeURIComponent(participantId)}/mute`, { method: 'POST' })
+  }
+
+  /**
+   * Opens the event stream and keeps it open (exponential backoff + jitter). A browser cannot send headers on a
+   * WebSocket, so each attempt first trades the credentials for a single-use ticket over an authenticated call.
+   * Returns a function that stops it.
+   */
+  connect(onEvent: (event: TelephonyEvent) => void): () => void {
+    let stopped = false
+    let attempt = 0
+    let ws: WebSocket | undefined
+    let timer: ReturnType<typeof setTimeout> | undefined
+
+    const open = async () => {
+      if (stopped) return
+      try {
+        const { ticket } = await this.request<{ ticket: string }>('/ws-ticket', { method: 'POST' })
+        const url = new URL(`${this.options.baseUrl}/api/v1/ws`)
+        url.protocol = url.protocol.replace('http', 'ws')
+        url.searchParams.set('ticket', ticket)
+        ws = new WebSocket(url)
+      } catch {
+        return retry()
+      }
+      ws.onopen = () => {
+        attempt = 0
+      }
+      ws.onmessage = e => onEvent(JSON.parse(String(e.data)) as TelephonyEvent)
+      ws.onclose = retry
+    }
+    const retry = () => {
+      if (stopped) return
+      timer = setTimeout(open, backoffDelay(attempt++))
+    }
+
+    void open()
+    return () => {
+      stopped = true
+      clearTimeout(timer)
+      ws?.close()
+    }
+  }
+}

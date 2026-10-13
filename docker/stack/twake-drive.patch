@@ -1,0 +1,139 @@
+diff --git a/src/lib/twakePhoneWidget.js b/src/lib/twakePhoneWidget.js
+new file mode 100644
+index 0000000..6f5d4cf
+--- /dev/null
++++ b/src/lib/twakePhoneWidget.js
+@@ -0,0 +1,112 @@
++import * as interapp from 'cozy-interapp';
++/** Intent served by the Phone app: a persistent card shown in a corner while a call rings or runs. */
++export const PHONE_WIDGET_ACTION = 'OPEN';
++export const PHONE_WIDGET_TYPE = 'io.twake.phone.widget';
++/**
++ * cozy-interapp is CommonJS with `exports.default = Intents`. Depending on the bundler (and on whether this file
++ * is treated as strict ESM) the default import is the class, or the whole `module.exports`: accept both.
++ */
++const resolveIntents = () => {
++    const mod = interapp;
++    const candidates = [mod.default, mod.default?.default, mod.Intents, mod];
++    const found = candidates.find(c => typeof c === 'function');
++    if (!found)
++        throw new Error('cozy-interapp: Intents class not found');
++    return found;
++};
++/**
++ * How other code of the host page (PhoneLink) finds the widget without creating a second intent:
++ * cozy-interapp's listener throws "Invalid event id" when two intents answer from the same origin, which
++ * would kill the widget. A global, keyed by a shared symbol, avoids a dependency between the two packages.
++ */
++export const PHONE_WIDGET_REGISTRY = Symbol.for('twake.phone.widget');
++export const DIAL_MESSAGE = 'twake-phone:dial';
++const ID = 'twake-phone-widget';
++const STYLE = `
++#${ID}{position:fixed;right:var(--tpw-offset,16px);bottom:var(--tpw-offset,16px);z-index:2147483000;
++  width:0;height:0;overflow:hidden;border-radius:18px;transition:width .15s ease,height .15s ease}
++#${ID} iframe{display:block;width:100%;height:100%;border:0;background:transparent}`;
++/**
++ * Keeps the Phone widget alive in the current application, so a call can be answered from there without
++ * switching app. The widget is an intent service iframe: Phone owns the softphone and the UI, the host only
++ * provides the corner and the microphone permission.
++ *
++ * Returns a function that removes the widget. Does nothing (and returns a no-op) when the page is itself an
++ * iframe or the widget is already mounted. Failure to create the intent (Phone not installed) is silent.
++ */
++export const mountPhoneWidget = ({ client, parent = document.body, offset = 16 }) => {
++    if (window.self !== window.top || document.getElementById(ID))
++        return () => undefined;
++    const style = document.createElement('style');
++    style.textContent = STYLE;
++    const container = document.createElement('div');
++    container.id = ID;
++    container.style.setProperty('--tpw-offset', `${offset}px`);
++    container.setAttribute('role', 'region');
++    container.setAttribute('aria-label', 'Phone');
++    // cozy-interapp creates the iframe without an `allow` attribute, which would block the microphone for the
++    // cross-origin Phone page. The browser reads it when the iframe is inserted, so it has to be there *before*:
++    // cozy-interapp inserts it with `container.appendChild(iframe)`, which is intercepted here.
++    const ALLOW = 'microphone; autoplay';
++    const appendChild = container.appendChild.bind(container);
++    container.appendChild = (node) => {
++        if (node instanceof HTMLIFrameElement)
++            node.setAttribute('allow', ALLOW);
++        return appendChild(node);
++    };
++    // Fallback if the host library ever inserts differently.
++    const observer = new MutationObserver(records => {
++        for (const record of records)
++            record.addedNodes.forEach(node => {
++                if (node instanceof HTMLIFrameElement && !node.hasAttribute('allow'))
++                    node.setAttribute('allow', ALLOW);
++            });
++    });
++    observer.observe(container, { childList: true });
++    document.head.appendChild(style);
++    parent.appendChild(container);
++    const handle = {
++        dial: number => new Promise(resolve => {
++            const iframe = container.querySelector('iframe');
++            if (!iframe?.contentWindow || !iframe.src)
++                return resolve({ handled: false, error: 'widget-not-ready' });
++            // A private channel for the answer: nothing is posted on `window`, where cozy-interapp listens.
++            const channel = new MessageChannel();
++            const timer = setTimeout(() => resolve({ handled: false, error: 'timeout' }), 3000);
++            channel.port1.onmessage = event => {
++                clearTimeout(timer);
++                resolve(event.data);
++            };
++            iframe.contentWindow.postMessage({ type: DIAL_MESSAGE, number }, new URL(iframe.src).origin, [channel.port2]);
++        })
++    };
++    window[PHONE_WIDGET_REGISTRY] = handle;
++    let removed = false;
++    const remove = () => {
++        if (removed)
++            return;
++        removed = true;
++        if (window[PHONE_WIDGET_REGISTRY] === handle)
++            delete window[PHONE_WIDGET_REGISTRY];
++        observer.disconnect();
++        container.remove();
++        style.remove();
++    };
++    // The widget is optional: when it cannot start (Phone not installed, intent refused) it leaves no trace
++    // beyond a console message that says why.
++    const fail = (error) => {
++        console.warn('[twake-phone-widget] not started:', error);
++        remove();
++    };
++    try {
++        const Intents = resolveIntents();
++        new Intents({ client })
++            .create(PHONE_WIDGET_ACTION, PHONE_WIDGET_TYPE)
++            .start(container)
++            .catch(error => fail(error));
++    }
++    catch (error) {
++        fail(error);
++    }
++    return remove;
++};
+diff --git a/src/targets/browser/index.jsx b/src/targets/browser/index.jsx
+index ccfb795..9d2c069 100644
+--- a/src/targets/browser/index.jsx
++++ b/src/targets/browser/index.jsx
+@@ -19,6 +19,7 @@ import { createRoot } from 'react-dom/client'
+ import { HashRouter } from 'react-router-dom'
+ 
+ import setupApp from './setupAppContext'
++import { mountPhoneWidget } from '@/lib/twakePhoneWidget'
+ import App from '@/components/App/App'
+ import AppRoute from '@/modules/navigation/AppRoute'
+ import { ROUTER_FUTURE_FLAGS } from '@/constants/config'
+@@ -37,6 +38,8 @@ const AppComponent = props => (
+ const init = () => {
+   const { locale, polyglot, client, store, root } = setupApp()
+ 
++  mountPhoneWidget({ client })
++
+   createRoot(root).render(
+     <AppComponent
+       lang={locale}

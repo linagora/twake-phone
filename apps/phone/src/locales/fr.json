@@ -1,0 +1,109 @@
+{
+  "app": {
+    "name": "Phone"
+  },
+  "nav": {
+    "main": "Navigation principale",
+    "dialer": "Clavier",
+    "recents": "Récents",
+    "contacts": "Contacts",
+    "extension": "poste",
+    "meetings": "Visio"
+  },
+  "presence": {
+    "available": "Disponible",
+    "busy": "Occupé",
+    "away": "Absent",
+    "dnd": "Ne pas déranger",
+    "offline": "Hors ligne"
+  },
+  "dialer": {
+    "placeholder": "Saisir un numéro",
+    "erase": "Effacer",
+    "call": "Appeler",
+    "invalid": "Ce numéro de téléphone n'est pas valide"
+  },
+  "recents": {
+    "title": "Récents",
+    "filter": "Filtrer",
+    "tabs": {
+      "all": "Tous",
+      "missed": "Manqués",
+      "inbound": "Entrants",
+      "outbound": "Sortants"
+    },
+    "search": "Rechercher",
+    "searchPlaceholder": "Rechercher un nom, un numéro…",
+    "empty": "Aucun appel pour le moment",
+    "yesterday": "Hier",
+    "noAnswer": "non répondu",
+    "recall": "Rappeler",
+    "inbound": "Entrant",
+    "outbound": "Sortant",
+    "missed": "Manqué",
+    "kind": {
+      "mobile": "Mobile",
+      "work": "Bureau",
+      "home": "Domicile",
+      "voice": "Fixe"
+    }
+  },
+  "call": {
+    "back": "Retour au clavier",
+    "ongoing": "Appel en cours",
+    "incoming": "Appel entrant",
+    "calling": "Appel en cours…",
+    "ringing": "Ça sonne…",
+    "inCall": "En communication",
+    "held": "En attente",
+    "mute": "Muet",
+    "unmute": "Réactiver",
+    "keypad": "Clavier",
+    "hold": "Attente",
+    "resume": "Reprendre",
+    "transfer": "Transférer",
+    "hangup": "Raccrocher",
+    "answer": "Répondre",
+    "reject": "Refuser",
+    "doubleCall": "Double appel",
+    "holdAnswer": "Mettre en attente & répondre",
+    "context": "Contexte de l'appel",
+    "contactCard": "Fiche contact",
+    "company": "Société",
+    "jobTitle": "Fonction"
+  },
+  "status": {
+    "connecting": "Connexion au service de téléphonie…",
+    "error": "Service de téléphonie indisponible",
+    "notRegistered": "Audio non connecté : les appels ne peuvent pas sonner dans cette fenêtre."
+  },
+  "widget": {
+    "open": "Ouvrir Phone"
+  },
+  "meetings": {
+    "title": "Visio par téléphone",
+    "intro": "Permettez de rejoindre une salle Meet par téléphone, ou appelez des personnes pour les y faire entrer.",
+    "room": "Lien Meet ou code de salle",
+    "enable": "Activer l'accès téléphonique",
+    "dialin": "Appeler pour rejoindre",
+    "number": "Numéro",
+    "pin": "Code PIN",
+    "participants": "Dans la salle",
+    "none": "Personne pour l'instant",
+    "invite": "Appeler un numéro dans la salle",
+    "invitePlaceholder": "Numéro à appeler",
+    "inviteButton": "Appeler",
+    "mute": "Couper le micro",
+    "remove": "Retirer",
+    "phone": "Téléphone",
+    "web": "Web",
+    "muted": "micro coupé",
+    "stop": "Désactiver l'accès téléphonique",
+    "invalid": "Saisissez un lien Meet ou un code de salle",
+    "invalidNumber": "Saisissez un numéro valide",
+    "taken": "Cette salle est déjà gérée par quelqu'un d'autre",
+    "error": "Une erreur est survenue, réessayez",
+    "create": "Créer une nouvelle salle Meet",
+    "notFound": "Salle introuvable, ou vous n’y avez pas accès"
+  }
+}

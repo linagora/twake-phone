@@ -97,7 +97,7 @@ Retirés par décision du 13 octobre 2026 : Linphone desktop, Flexisip, SIP.js, 
 
 ## Origine : le POC
 
-Ce dépôt part du **POC Twake Phone** de Linagora : <https://ci.linagora.com/tdelobelle/poc-twake-phone> (AGPL-3.0).
+Ce dépôt part du **POC Twake Phone** de Linagora : <https://ci.linagora.com/tdelobelle/poc-twake-phone> (AGPL-3.0). Son README d'origine est conservé dans [docs/POC.md](docs/POC.md), sa documentation dans [docs/](docs/).
 
 Le POC a prouvé le cœur : la Twake Telephony Gateway et son contrat de provider, le softphone navigateur, l'accès à Meet par téléphone avec dial-out, et une stack de dev complète avec de vrais appels SIP en e2e. TwakePhone reprend ce code et le pousse vers l'architecture ci-dessus :
 
@@ -118,7 +118,7 @@ Pas de calendrier en semaines : le développement avance par étapes ordonnées,
 
 | # | Étape | Démo de sortie | État |
 |---|---|---|---|
-| 1 | **Monorepo** : import du POC, passerelle, `provider-sdk`, `conference-livekit`, tests, ADR | `yarn test` vert, ADR relus | en cours |
+| 1 | **Monorepo** : import du POC, passerelle, `provider-sdk`, `conference-livekit`, tests, ADR, CI | `yarn test` vert, ADR relus | PR ouverte |
 | 2 | **App React autonome** : OIDC, annuaire LDAP et CardDAV, synchronisation des comptes, CSP, socle RGAA | Connexion SSO, recherche d'un collègue | |
 | 3 | **OpenSIPS et JsSIP** : Docker OpenSIPS + rtpengine, softphone réécrit, attente, transfert direct et supervisé, DTMF, trois navigateurs | Deux utilisateurs s'appellent, s'attendent, se transfèrent | |
 | 4 | **provider-opensips** : événements, présence, CDR, renvois, NPD planifié, groupes | La pastille change pendant un appel, un renvoi est appliqué | |
@@ -168,11 +168,11 @@ yarn dev:gateway                           # passerelle sur http://localhost:808
 | `yarn e2e:browser` | deux navigateurs, audio réel simulé (WebRTC) |
 | `node docker/meet-sip/platform.e2e.mjs` | Meet sur la plateforme : jetons, LiveKit, SIP |
 
-Ces commandes sont celles du POC ; elles deviennent vraies ici à la fin de l'étape 1.
+La stack Docker est encore celle du POC (MiniPBX, voir [docker/README.md](docker/README.md)) : l'étape 3 la remplace par OpenSIPS et rtpengine. Les e2e `yarn e2e:live`, `yarn e2e:browser` et `platform.e2e.mjs` demandent cette stack ; la CI joue le reste sur chaque PR, contrat PostgreSQL compris.
 
 ## Décisions
 
-Chaque décision est un ADR dans `docs/adr/`. Celles déjà prises, le 13 octobre 2026 :
+Chaque décision est un ADR dans [docs/adr/](docs/adr/README.md). Celles déjà prises, le 13 octobre 2026 :
 
 | Décision | Choix | Alternative écartée |
 |---|---|---|
@@ -188,14 +188,14 @@ Chaque décision est un ADR dans `docs/adr/`. Celles déjà prises, le 13 octobr
 
 ## Contribuer
 
-- Une étape, une branche, une PR, une démo. La PR dit ce qu'on voit avant et après.
+- Une fonctionnalité ou un correctif, une branche, une PR, une revue indépendante qui cherche ce qui casse. Voir [CONTRIBUTING.md](CONTRIBUTING.md).
 - Une PR qui ajoute une notion de fournisseur hors de son `provider-*` est refusée.
 - Les tests du POC restent verts à chaque étape ; un test n'est jamais désactivé pour passer.
 - Secrets : jamais dans le dépôt, jamais dans un `.env` commité. Références `env:NOM`.
 
 ## Licence
 
-AGPL-3.0, comme le POC dont ce dépôt est issu. Le fichier `LICENSE` arrive avec l'import du POC à l'étape 1.
+AGPL-3.0, voir [LICENSE](LICENSE), comme le POC dont ce dépôt est issu.
 
 ---
 

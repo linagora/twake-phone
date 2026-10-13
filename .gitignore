@@ -1,0 +1,23 @@
+# Dependencies and build output
+node_modules
+dist
+build
+*.tsbuildinfo
+coverage
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.local
+
+# Dev stack: repositories fetched by scripts/setup-references.sh (never committed)
+references/
+
+# Editors, OS, logs
+.DS_Store
+.idea
+.vscode/*
+!.vscode/extensions.json
+*.log
+.swc

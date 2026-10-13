@@ -1,0 +1,92 @@
+# Dev telephony stack: PBX (MiniPBX + overlay) and the Telephony Gateway.
+# Joins twake-workplace-docker's network and is routed by its Traefik:
+#   https://telephony.<BASE_DOMAIN>  -> Gateway (REST + WebSocket)
+#   wss://pbx.<BASE_DOMAIN>/ws       -> PBX SIP-over-WSS (TLS passthrough, wildcard cert)
+# Build the base image first:
+#   docker build -f ../references/minipbx/docker/Dockerfile -t minipbx-base:local ../references/minipbx
+services:
+  pbx:
+    build:
+      context: ./minipbx-dev
+      args:
+        MINIPBX_IMAGE: ${MINIPBX_IMAGE:-minipbx-base:local}
+    container_name: twake-dev-pbx
+    restart: unless-stopped
+    environment:
+      MINIPBX_SECRET_KEY: dev-secret-key-not-for-production
+      MINIPBX_AMI_PASSWORD: dev-ami-password
+      MINIPBX_COUNTRY: FR
+      # Alembic migrations leave the schema incomplete on the stock image (arm64, 0.1.1):
+      # create tables directly for this throwaway dev PBX.
+      MINIPBX_MIGRATIONS_ENABLED: "false"
+      ARI_USER: twake
+      ARI_PASSWORD: ${ARI_PASSWORD:-twake-dev}
+      # Lets the Gateway set per-user SIP secrets (reachable on the Docker network only, port 18081).
+      TWAKE_PROVISION_TOKEN: ${TWAKE_PROVISION_TOKEN:-dev-provision-token}
+      # IP browsers use to reach the published RTP range (ICE host candidate).
+      ASTERISK_EXTERNAL_ADDRESS: ${ASTERISK_EXTERNAL_ADDRESS:-}
+      ASTERISK_SIP_PORT: "5080"
+    ports:
+      - "127.0.0.1:18080:8080"   # MiniPBX admin UI (admin / admin-dev-password)
+      - "127.0.0.1:8088:8088"    # ARI over HTTP, used by provider-asterisk
+      - "8089:8089"              # SIP over WSS (direct access, standalone tests)
+      # Not 5060: traffic sourced from UDP 5060 got no answer from the SIP provider through the home NAT (see README).
+      - "5080:5080/udp"
+      - "10000-10100:10000-10100/udp"
+    volumes:
+      - pbx_data:/var/lib/minipbx
+      - pbx_etc:/etc/asterisk
+      - ../references/twake-workplace-docker/twake_auth/traefik/ssl/twake-server-fullchain.pem:/run/pbx-tls/fullchain.pem:ro
+      - ../references/twake-workplace-docker/twake_auth/traefik/ssl/twake-server.key:/run/pbx-tls/key.pem:ro
+    labels:
+      - "traefik.enable=true"
+      - "traefik.tcp.routers.pbx.rule=HostSNI(`pbx.${BASE_DOMAIN:-twake.local}`)"
+      - "traefik.tcp.routers.pbx.entrypoints=websecure"
+      - "traefik.tcp.routers.pbx.tls.passthrough=true"
+      - "traefik.tcp.services.pbx.loadbalancer.server.port=8089"
+    networks: [twake-network]
+
+  gateway:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.gateway
+    container_name: twake-dev-gateway
+    restart: unless-stopped
+    depends_on: [pbx]
+    environment:
+      # Identity: the Twake session itself. The Gateway asks the user's instance whether the Cozy token is valid.
+      AUTH_MODE: cozy
+      COZY_INSTANCE_PATTERN: '^https://[a-z0-9-]+\.${BASE_DOMAIN:-twake.local}$$'
+      COZY_INTERNAL_URL: http://cozyt:8080
+      DEFAULT_TENANT: dev
+      # Persistence (database `telephony` of the stack's PostgreSQL) and the key that encrypts SIP secrets at rest.
+      DATABASE_URL: postgres://telephony:telephony-dev@postgres:5432/telephony
+      SECRETS_KEY: "${SECRETS_KEY:?SECRETS_KEY is required: create docker/.env, see docker/README.md}"
+      # Single-tenant bootstrap, applied only when the database holds no provider yet.
+      BOOTSTRAP_PROVIDER_URL: http://pbx:8088
+      PBX_WSS_URL: wss://pbx.${BASE_DOMAIN:-twake.local}/ws
+      PBX_PROVISION_URL: http://pbx:18081
+      TWAKE_PROVISION_TOKEN: ${TWAKE_PROVISION_TOKEN:-dev-provision-token}
+      ARI_USER: twake
+      ARI_PASSWORD: ${ARI_PASSWORD:-twake-dev}
+      ASTERISK_ORIGINATE_CONTEXT: twake-ring
+      # External numbers go through MiniPBX's own dialplan (its outbound rules apply), in national format.
+      ASTERISK_EXTERNAL_CONTEXT: minipbx-internal
+      ASTERISK_EXTERNAL_E164_PREFIX: "+33"
+      ASTERISK_EXTERNAL_NATIONAL_PREFIX: "0"
+      DEV_USER_MAP: user1:101,user2:102,user3:103
+      CORS_ORIGINS: https://user1-phone.${BASE_DOMAIN:-twake.local},https://user2-phone.${BASE_DOMAIN:-twake.local},https://user3-phone.${BASE_DOMAIN:-twake.local}
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.telephony.rule=Host(`telephony.${BASE_DOMAIN:-twake.local}`)"
+      - "traefik.http.routers.telephony.priority=100"
+      - "traefik.http.routers.telephony.entrypoints=websecure"
+      - "traefik.http.routers.telephony.tls=true"
+      - "traefik.http.services.telephony.loadbalancer.server.port=8080"
+    networks: [twake-network]
+volumes:
+  pbx_data:
+  pbx_etc:
+networks:
+  twake-network:
+    external: true

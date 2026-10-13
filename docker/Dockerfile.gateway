@@ -1,0 +1,11 @@
+# Build context: repository root.
+FROM node:22-slim
+WORKDIR /app
+COPY package.json yarn.lock tsconfig.base.json ./
+COPY packages ./packages
+COPY apps/gateway ./apps/gateway
+RUN yarn install --frozen-lockfile && yarn build
+ENV NODE_ENV=production PORT=8080
+EXPOSE 8080
+USER node
+CMD ["node", "apps/gateway/dist/main.js"]

@@ -1,0 +1,7 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": { "outDir": "dist", "rootDir": "src", "lib": ["ES2022", "DOM"], "jsx": "react-jsx" },
+  "include": ["src"],
+  "exclude": ["src/**/*.spec.ts", "src/**/*.spec.tsx"],
+  "references": [{ "path": "../telephony-client" }]
+}
