@@ -1,10 +1,10 @@
 # ADR 0005 : Wazo Platform derrière OpenSIPS, à l'étape 11
 
-Date : 2026-10-13. État : acceptée.
+Date : 2026-10-13. État : acceptée. Décidé dans le fil de discussion du projet du 13 octobre 2026 ; remplacé par : aucun.
 
 ## Contexte
 
-Cinq exigences du CCTP CANUT §7.4.6.2 demandent un serveur média : messagerie vocale, SVI, files d'attente, enregistrement, supervision. OpenSIPS seul ne les couvre pas. Clement voulait Wazo seulement s'il est open source et sans licence : Wazo Platform est GPLv3 et gratuit.
+Cinq exigences du CCTP CANUT §7.4.6.2 demandent un serveur média : messagerie vocale, SVI, files d'attente, enregistrement, supervision. OpenSIPS seul ne les couvre pas. Le responsable produit voulait Wazo seulement s'il est open source et sans licence : Wazo Platform est GPLv3 et gratuit.
 
 ## Décision
 

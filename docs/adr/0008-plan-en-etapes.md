@@ -1,10 +1,10 @@
 # ADR 0008 : plan en étapes avec porte de sortie, PR par fonctionnalité, revue indépendante
 
-Date : 2026-10-13. État : acceptée.
+Date : 2026-10-13. État : acceptée. Décidé dans le fil de discussion du projet du 13 octobre 2026 ; remplacé par : aucun.
 
 ## Contexte
 
-L'équipe développe en vibecoding : la vitesse vient de l'IA, le contrôle doit venir du processus. Clement refuse un planning en semaines et demande « des PR pour chaque feature ou correctif, avec des reviews indépendantes de roast, et des tests e2e pour tout valider ».
+L'équipe développe en vibecoding : la vitesse vient de l'IA, le contrôle doit venir du processus. Le responsable produit (Clement, LINAGORA) refuse un planning en semaines et demande « des PR pour chaque feature ou correctif, avec des reviews indépendantes de roast, et des tests e2e pour tout valider ».
 
 ## Décision
 

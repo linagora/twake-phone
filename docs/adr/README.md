@@ -13,4 +13,4 @@ Une décision, un fichier, numéroté dans l'ordre où elle a été prise. Un AD
 | [0007](0007-fastify-postgresql.md) | Passerelle Fastify et PostgreSQL | acceptée |
 | [0008](0008-plan-en-etapes.md) | Plan en étapes avec porte de sortie, PR par fonctionnalité, revue indépendante | acceptée |
 
-Gabarit : contexte, décision, conséquences, alternatives écartées. Dix lignes suffisent.
+Gabarit : date, état et « remplacé par », contexte, décision, conséquences, alternatives écartées. Dix lignes suffisent. Une décision cite le fil ou le compte rendu où elle a été prise, pas une personne.

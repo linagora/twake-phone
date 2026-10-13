@@ -1,6 +1,6 @@
 # ADR 0004 : OpenSIPS et rtpengine, seul serveur SIP du MVP web ; Flexisip retiré
 
-Date : 2026-10-13. État : acceptée.
+Date : 2026-10-13. État : acceptée. Décidé dans le fil de discussion du projet du 13 octobre 2026 ; remplacé par : aucun.
 
 ## Contexte
 
@@ -8,7 +8,7 @@ Le POC branche le navigateur directement sur le PBX et déclare le trunk dans le
 
 ## Décision
 
-OpenSIPS 3.6 avec rtpengine est le seul serveur SIP du MVP web : registrar (`usrloc`), WSS des navigateurs, fourche multi-onglets, renvois et NPD (`dialplan`, `drouting`), groupes, trunk opérateur (`dispatcher`), anti-fraude (`fraud_detection`, `pike`, `ratelimit`), CDR (`acc`), événements vers la passerelle, HEP vers Homer. Flexisip est retiré. OpenSIPS 3.4 étant en fin de vie depuis mai 2026, la 3.6 est la version de référence.
+OpenSIPS 3.6 avec rtpengine est le seul serveur SIP du MVP web : registrar (`usrloc`), WSS des navigateurs, fourche multi-onglets, renvois et NPD (`dialplan`, `drouting`), groupes, trunk opérateur (`dispatcher`), anti-fraude (`fraud_detection`, `pike`, `ratelimit`), CDR (`acc`), événements vers la passerelle, HEP vers Homer. Flexisip est retiré. OpenSIPS 3.4 (LTS de mai 2023, trois ans de support) est en fin de vie depuis mai 2026 ([versions disponibles](https://opensips.org/about/available-versions/)), la 3.6 est la version de référence.
 
 ## Conséquences
 

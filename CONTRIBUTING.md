@@ -10,12 +10,16 @@
 
 Une décision d'architecture prise ou changée dans une PR donne un ADR dans `docs/adr/`.
 
+Ce que le dépôt n'enforce pas encore et qui est à régler par un administrateur : protection de la branche `main` (PR obligatoire, CI verte, une approbation) et scan de secrets en CI. Jusque-là, les cases « revue faite » et « aucun secret » du gabarit sont déclaratives.
+
 ## Avant d'ouvrir une PR
+
+Node 24 (`.nvmrc`) pour l'app ; la racine accepte 22+.
 
 ```bash
 yarn install && yarn build
 yarn typecheck && yarn test            # packages et Gateway
-(cd apps/phone && yarn lint && yarn test)
+(cd apps/phone && yarn install && yarn lint && yarn test)
 ```
 
 Les trois doivent être verts. Les tests d'intégration (`yarn e2e:*`, `docker/meet-sip/platform.e2e.mjs`) demandent la stack de dev : voir le [README](README.md).

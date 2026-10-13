@@ -1,8 +1,10 @@
-# Twake Phone
+# Twake Phone (README d'origine du POC)
+
+*README du POC <https://ci.linagora.com/tdelobelle/poc-twake-phone>, conservé tel quel sauf les liens, réécrits pour ce dossier. Le README courant du dépôt est [à la racine](../README.md).*
 
 Couche téléphonique native de Twake Workplace : une application **Phone** (clavier, récents, présence, appel en cours), un **widget** d'appel monté dans les autres applications, et la **Twake Telephony Gateway**, qui isole Twake de tout fournisseur de téléphonie. Le premier fournisseur est Asterisk (ARI) ; l'accès téléphonique aux salles **Twake Visio / Meet** passe par LiveKit SIP.
 
-Documentation : [architecture](docs/ARCHITECTURE.md) · [widget](docs/WIDGET.md) · [PBX externe à brancher](docs/PBX-REQUIREMENTS.md) · [PBX et trunk de dev](docker/README.md) · [analyse des dépôts Twake](docs/REFERENCES-ANALYSIS.md) · [spike appels entrants](docs/SPIKE-INCOMING-CALLS.md)
+Documentation : [architecture](ARCHITECTURE.md) · [widget](WIDGET.md) · [PBX externe à brancher](PBX-REQUIREMENTS.md) · [PBX et trunk de dev](../docker/README.md) · [analyse des dépôts Twake](REFERENCES-ANALYSIS.md) · [spike appels entrants](SPIKE-INCOMING-CALLS.md)
 
 ```
 apps/phone                      app Twake/Cozy (React 18, cozy-ui, cozy-client), issue de cozy-app-template
@@ -39,7 +41,7 @@ cp docker/.env.example docker/.env   # puis renseigner les secrets (voir le fich
 scripts/start-twake-stack.sh         # demande votre mot de passe pour 3 réglages de l'hôte, expliqués dans le script
 ```
 
-Visio (accès téléphonique aux salles Meet) et trunk SIP réel : [docker/README.md](docker/README.md).
+Visio (accès téléphonique aux salles Meet) et trunk SIP réel : [docker/README.md](../docker/README.md).
 
 ## Tests
 
@@ -54,4 +56,4 @@ Visio (accès téléphonique aux salles Meet) et trunk SIP réel : [docker/READM
 
 ## Licence
 
-AGPL-3.0, voir [LICENSE](LICENSE).
+AGPL-3.0, voir [LICENSE](../LICENSE).

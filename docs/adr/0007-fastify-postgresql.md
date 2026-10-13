@@ -1,6 +1,6 @@
 # ADR 0007 : passerelle Fastify et PostgreSQL
 
-Date : 2026-10-13. État : acceptée.
+Date : 2026-10-13. État : acceptée. Décidé dans le fil de discussion du projet du 13 octobre 2026 ; remplacé par : aucun.
 
 ## Contexte
 

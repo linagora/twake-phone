@@ -1,6 +1,6 @@
 # ADR 0003 : JsSIP remplace SIP.js
 
-Date : 2026-10-13. État : acceptée.
+Date : 2026-10-13. État : acceptée. Décidé dans le fil de discussion du projet du 13 octobre 2026 ; remplacé par : aucun.
 
 ## Contexte
 
@@ -17,4 +17,4 @@ Le POC utilise SIP.js 0.21.2, sans version depuis octobre 2022. JsSIP (MIT) est 
 
 ## Alternatives écartées
 
-Garder SIP.js : projet dormant. SDK Linphone (liblinphone) : GPLv3 et code natif, refusé pour le mobile par Clement.
+Garder SIP.js : projet dormant. SDK Linphone (liblinphone) : GPLv3 et code natif, refusé pour le mobile par le responsable produit.

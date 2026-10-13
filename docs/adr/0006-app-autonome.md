@@ -1,10 +1,10 @@
 # ADR 0006 : application autonome, Twake Chat l'affiche sans pile SIP
 
-Date : 2026-10-13. État : acceptée.
+Date : 2026-10-13. État : acceptée. Décidé dans le fil de discussion du projet du 13 octobre 2026 ; remplacé par : aucun.
 
 ## Contexte
 
-Le POC est une app Cozy dans Twake Workplace. Le besoin vise Twake Chat (Matrix). Clement veut une app autonome, intégrable dans Twake Chat, mais Twake Chat est secondaire pour l'instant.
+Le POC est une app Cozy dans Twake Workplace. Le besoin vise Twake Chat (Matrix). Le responsable produit veut une app autonome, intégrable dans Twake Chat, mais Twake Chat est secondaire pour l'instant.
 
 ## Décision
 
