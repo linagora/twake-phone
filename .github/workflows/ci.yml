@@ -77,8 +77,8 @@ jobs:
         with:
           node-version: 22
           cache: yarn
-      # La stack SIP se construit pendant que le dépôt s'installe : OpenSIPS 3.6 (image officielle + modules WSS,
-      # TLS, PostgreSQL), rtpengine en espace utilisateur, PostgreSQL avec la table `subscriber`. Réseau hôte.
+      # La stack SIP d'abord (`--wait` bloque jusqu'aux healthchecks) : OpenSIPS 3.6 (image officielle + modules
+      # WSS, TLS, PostgreSQL), rtpengine en espace utilisateur, PostgreSQL avec la table `subscriber`. Réseau hôte.
       - name: Stack SIP (Docker Compose)
         run: docker compose -f docker/docker-compose.sip.yml up --build --wait --wait-timeout 300
       - run: yarn install --frozen-lockfile
@@ -96,7 +96,8 @@ jobs:
       - name: Dépendances système du navigateur (cache ou non)
         if: matrix.browser != 'msedge' && steps.browser-cache.outputs.cache-hit == 'true'
         run: npx playwright-core install-deps ${{ matrix.browser }}
-      # Edge est préinstallé sur ubuntu-latest ; sinon Playwright l'installe par le dépôt Microsoft.
+      # Edge est préinstallé sur ubuntu-latest (la version suit l'image du runner, le script l'affiche) ; sinon
+      # Playwright l'installe par le dépôt Microsoft.
       - name: Microsoft Edge
         if: matrix.browser == 'msedge'
         run: microsoft-edge --version || npx playwright-core install msedge

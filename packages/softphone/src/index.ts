@@ -2,9 +2,9 @@ import { UA, WebSocketInterface } from 'jssip'
 import type { EndEvent, ReferEvent, ReferOptions, RTCSession } from 'jssip/lib/RTCSession.js'
 import type { UAConfiguration } from 'jssip/lib/UA.js'
 import type { MediaSession } from '@twake/telephony-types'
-import { WebAudioRinger, type RingerLike } from './ringer.js'
+import { WebAudioRinger, type RingerLike, type Sinkable } from './ringer.js'
 
-export { WebAudioRinger, type RingerLike } from './ringer.js'
+export { WebAudioRinger, RESUME_WAIT_MS, type AudioContextLike, type RingerLike, type Sinkable } from './ringer.js'
 
 /**
  * Media plane only: SIP over WebSocket (JsSIP) and WebRTC in the browser. The Gateway says where to register and as
@@ -186,15 +186,19 @@ const STATUS_TO_REASON: Record<number, EndReason> = {
 /** A target one can dial: an extension, a number, a SIP user; nothing a URI or a header could be smuggled in. */
 const DIALABLE = /^[+0-9A-Za-z*#._-]{1,64}$/
 
-/** What `getUserMedia` is asked for the microphone: the chosen one when the browser lists it (`exact`: `ideal` is ignored by Chromium), else the default. */
-type MicrophoneConstraint = true | { deviceId: { exact: string } }
-
-/** Media options of every call we place or answer. */
-const mediaOptions = (iceServers: RTCIceServer[], microphone: MicrophoneConstraint = true) => ({
-  mediaConstraints: { audio: microphone, video: false },
+/**
+ * Media options of every call we place or answer: our microphone when the softphone opened it itself (the chosen
+ * device, or the default one when it is gone), else JsSIP opens the default one. Audio only, either way.
+ */
+const mediaOptions = (iceServers: RTCIceServer[], microphone?: MediaStream) => ({
+  ...(microphone ? { mediaStream: microphone } : {}),
+  mediaConstraints: { audio: true, video: false },
   pcConfig: { iceServers },
   rtcOfferConstraints: { offerToReceiveAudio: true, offerToReceiveVideo: false }
 })
+
+/** How long a test ring from a settings screen lasts. */
+export const RING_TEST_MS = 2_500
 
 class WebCall implements SoftCall {
   state: SoftCallState = 'new'
@@ -227,8 +231,8 @@ class WebCall implements SoftCall {
     private readonly iceServers: RTCIceServer[],
     /** Our SIP domain: where a transfer's target lives. */
     private readonly domain: string,
-    /** The microphone to ask for, read when a call needs it; `blocked` says the browser refused to play. */
-    private readonly hooks: { microphone(): MicrophoneConstraint; blocked(): void },
+    /** Opens the microphone when a call needs it (the chosen one when it is there); `blocked` says the browser refused to play. */
+    private readonly hooks: { microphone(): Promise<MediaStream | undefined>; blocked(): void },
     links: { replacedCallId?: string; consultationOf?: string } = {}
   ) {
     if (links.replacedCallId) this.replacedCallId = links.replacedCallId
@@ -294,6 +298,10 @@ class WebCall implements SoftCall {
       this.transferring = false
       this.audio.srcObject = null
       this.audio.remove()
+      // JsSIP only stops what it opened itself: the microphones the softphone opened are let go here, so that the
+      // browser's "microphone in use" light goes out with the call.
+      for (const track of this.ownTracks) track.stop()
+      this.ownTracks.clear()
       this.set('ended')
     }
     session.on('ended', end)
@@ -320,11 +328,15 @@ class WebCall implements SoftCall {
     })
   }
 
-  /** Plays the far end; tells the softphone when the browser wants a gesture first (it asks the person once). */
+  /**
+   * Plays the far end; tells the softphone when the browser wants a gesture first (it asks the person once). A
+   * `play()` cut short because the call ended or its stream changed is not a blocked sound.
+   */
   play() {
     return this.audio.play().then(
       () => true,
-      () => {
+      (err: unknown) => {
+        if ((err as { name?: string } | null)?.name !== 'NotAllowedError' || this.state === 'ended') return true
         this.hooks.blocked()
         return false
       }
@@ -337,6 +349,20 @@ class WebCall implements SoftCall {
   }
 
   private watchedTracks = new WeakSet<MediaStreamTrack>()
+  /** Microphone tracks the softphone opened for this call (JsSIP does not stop those): stopped when the call ends. */
+  private readonly ownTracks = new Set<MediaStreamTrack>()
+  /** Microphone switches run one after the other: two at once would leave a live track nobody references. */
+  private switching: Promise<void> = Promise.resolve()
+
+  /** A microphone stream opened for this call is ours to stop, and its track is watched for an unplugged headset. */
+  adopt(stream: MediaStream | undefined) {
+    if (!stream) return
+    for (const track of stream.getAudioTracks()) {
+      this.ownTracks.add(track)
+      if (this.state === 'ended') track.stop()
+    }
+    this.watchMicrophone()
+  }
 
   /** A headset unplugged ends its track: the call goes on with the chosen microphone, or the default one. */
   private watchMicrophone() {
@@ -344,30 +370,42 @@ class WebCall implements SoftCall {
     if (!track || this.watchedTracks.has(track)) return
     this.watchedTracks.add(track)
     track.addEventListener('ended', () => {
-      if (this.state !== 'ended' && this.microphoneSender()?.track === track) void this.useMicrophone(this.hooks.microphone()).catch(() => undefined)
+      if (this.state !== 'ended' && this.microphoneSender()?.track === track) void this.useMicrophone(undefined, true).catch(() => undefined)
     })
   }
 
-  /** Switches the microphone of the call in progress (`replaceTrack`: no renegotiation); the mute state is kept. */
-  async useMicrophone(microphone: MicrophoneConstraint) {
-    const sender = this.microphoneSender()
-    if (!sender?.track || typeof navigator === 'undefined') return
-    const wanted = microphone === true ? undefined : microphone.deviceId.exact
-    if (wanted && sender.track.readyState === 'live' && sender.track.getSettings().deviceId === wanted) return
-    // The device may have gone between the listing and now: the default one then.
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: microphone }).catch(() => navigator.mediaDevices.getUserMedia({ audio: true }))
-    const track = stream.getAudioTracks()[0]
-    if (!track) return
-    track.enabled = !this.muted
-    const old = sender.track
-    await sender.replaceTrack(track)
-    old.stop()
-    this.watchMicrophone()
+  /**
+   * Switches the microphone of the call in progress (`replaceTrack`: no renegotiation); the mute state is kept.
+   * `wanted` is the chosen device: nothing to do when the call already uses it; with no choice, the microphone is
+   * only reopened when `force` says so (a device change alone leaves a working default microphone alone).
+   */
+  useMicrophone(wanted: string | undefined, force = false) {
+    const run = async () => {
+      const sender = this.microphoneSender()
+      if (!sender?.track) return
+      const current = sender.track
+      if (current.readyState === 'live' && (wanted ? current.getSettings().deviceId === wanted : !force)) return
+      const stream = await this.hooks.microphone()
+      const track = stream?.getAudioTracks()[0]
+      if (!track) return
+      // The call may have ended, or the track may have changed hands, while the microphone was being opened.
+      if (this.state === 'ended' || this.microphoneSender() !== sender) return track.stop()
+      track.enabled = !this.muted
+      const old = sender.track
+      await sender.replaceTrack(track)
+      this.adopt(stream)
+      if (old && old !== track) {
+        old.stop()
+        this.ownTracks.delete(old)
+      }
+    }
+    this.switching = this.switching.then(run, run)
+    return this.switching
   }
 
   /** Where the far end's voice goes; the default device for an empty id. */
   async setOutput(deviceId: string) {
-    const sinkable = this.audio as HTMLAudioElement & { setSinkId?: (id: string) => Promise<void> }
+    const sinkable = this.audio as Sinkable
     if (sinkable.setSinkId) await sinkable.setSinkId(deviceId).catch(() => undefined)
   }
 
@@ -378,7 +416,13 @@ class WebCall implements SoftCall {
 
   async answer() {
     if (this.direction !== 'inbound') throw new CallError('not-inbound', 'Only inbound calls can be answered')
-    this.session.answer(mediaOptions(this.iceServers, this.hooks.microphone()))
+    const microphone = await this.hooks.microphone()
+    if (this.state === 'ended') {
+      microphone?.getTracks().forEach(track => track.stop())
+      throw new CallError('call-ended', 'Call ended')
+    }
+    this.adopt(microphone)
+    this.session.answer(mediaOptions(this.iceServers, microphone))
   }
 
   /** Decline (603): the caller is told the call was refused, not that the line is busy. */
@@ -571,14 +615,14 @@ export class Softphone {
   /** Our SIP domain, from the media session: the only place a transfer, ours or asked of us, may point to. */
   private domain = ''
   private devices: AudioDevices
-  /** Microphones the browser lists, so that a chosen one that is gone is not asked for (`exact` would fail the call). */
-  private microphones?: Set<string>
   private ringer?: RingerLike
   private audioBlocked = false
   private readonly onDeviceChange = () => {
     // The chosen output may be gone, or back: the elements are pointed at it again (the browser falls back to
-    // its default when it is missing). A microphone that is gone ends its track: the calls handle that themselves.
-    void this.refreshDevices().then(() => this.applyOutputs())
+    // its default when it is missing). A microphone that is gone ends its track, the calls handle that
+    // themselves; the chosen one coming back is taken up again.
+    void this.applyOutputs()
+    void this.applyMicrophone()
     this.options.onDevicesChange?.()
   }
   private readonly onGesture = () => void this.unblockAudio()
@@ -609,28 +653,35 @@ export class Softphone {
   /** Applies the person's choice to the calls in progress and the ringtone, at once. */
   async setDevices(devices: AudioDevices) {
     this.devices = { ...devices }
-    await this.refreshDevices()
-    await Promise.all([this.applyOutputs(), ...this.activeCalls().map(c => (c as WebCall).useMicrophone(this.microphone()).catch(() => undefined))])
+    await Promise.all([this.applyOutputs(), this.applyMicrophone(true)])
   }
 
-  private async refreshDevices() {
-    if (typeof navigator === 'undefined' || !navigator.mediaDevices?.enumerateDevices) return
-    const all = await navigator.mediaDevices.enumerateDevices().catch(() => [])
-    this.microphones = new Set(all.filter(d => d.kind === 'audioinput').map(d => d.deviceId))
-  }
-
-  private microphone(): MicrophoneConstraint {
+  /**
+   * Opens the microphone for a call: the chosen one, or the default one when it is gone (or not yet known to the
+   * browser: before the first permission, Chromium lists devices without ids). Nothing outside a browser: JsSIP
+   * then opens the default one itself.
+   */
+  private async acquireMicrophone(): Promise<MediaStream | undefined> {
+    if (typeof navigator === 'undefined' || !navigator.mediaDevices?.getUserMedia) return undefined
     const id = this.devices.microphoneId
-    return id && this.microphones?.has(id) ? { deviceId: { exact: id } } : true
+    if (id) {
+      const chosen = await navigator.mediaDevices.getUserMedia({ audio: { deviceId: { exact: id } } }).catch(() => undefined)
+      if (chosen) return chosen
+    }
+    return navigator.mediaDevices.getUserMedia({ audio: true })
+  }
+
+  private async applyMicrophone(force = false) {
+    await Promise.all(this.activeWebCalls().map(c => c.useMicrophone(this.devices.microphoneId, force).catch(() => undefined)))
   }
 
   private async applyOutputs() {
     const output = this.devices.outputId ?? ''
-    await Promise.all([this.ringer?.setSink(this.devices.ringerId ?? output), ...this.activeCalls().map(c => (c as WebCall).setOutput(output))])
+    await Promise.all([this.ringer?.setSink(this.devices.ringerId ?? output), ...this.activeWebCalls().map(c => c.setOutput(output))])
   }
 
   /** Rings for a moment (a settings screen's "test" button); resolves false when the browser blocks sound. */
-  async ringTest(ms = 2_500) {
+  async ringTest(ms = RING_TEST_MS) {
     const ringer = this.getRinger()
     const ok = await ringer.start()
     setTimeout(() => !this.activeCalls().some(c => c.direction === 'inbound' && c.state === 'ringing') && ringer.stop(), ms)
@@ -640,18 +691,21 @@ export class Softphone {
 
   /** After a user gesture (the app's button, or any click): plays what the browser blocked. */
   async unblockAudio() {
-    const results = await Promise.all([this.ringer?.resume() ?? true, ...this.activeCalls().filter(c => c.state === 'connected' || c.state === 'held').map(c => (c as WebCall).play())])
+    const results = await Promise.all([this.ringer?.resume() ?? true, ...this.activeWebCalls().filter(c => c.state === 'connected' || c.state === 'held').map(c => c.play())])
+    // Still blocked (the gesture did not count): the next one is waited for again.
     this.setBlocked(results.some(ok => !ok))
     return !this.audioBlocked
   }
 
   private setBlocked(blocked: boolean) {
-    if (blocked === this.audioBlocked) return
-    this.audioBlocked = blocked
-    this.options.onAudioBlocked?.(blocked)
+    if (blocked !== this.audioBlocked) {
+      this.audioBlocked = blocked
+      this.options.onAudioBlocked?.(blocked)
+    }
     if (typeof document === 'undefined') return
-    // The next click or key anywhere is the gesture the browser wants.
-    for (const type of ['pointerdown', 'keydown']) {
+    // The next click or key anywhere is the gesture the browser wants (a touch only counts once it is a click).
+    // Adding a listener already there is a no-op, so a gesture that did not unblock arms the next one again.
+    for (const type of ['click', 'keydown']) {
       if (blocked) document.addEventListener(type, this.onGesture, { once: true, capture: true })
       else document.removeEventListener(type, this.onGesture, { capture: true })
     }
@@ -680,13 +734,16 @@ export class Softphone {
 
   /** Calls that are not over, oldest first. */
   activeCalls(): SoftCall[] {
+    return this.activeWebCalls()
+  }
+
+  private activeWebCalls(): WebCall[] {
     return [...this.calls.values()].filter(c => c.state !== 'ended')
   }
 
   async start() {
     this.stopped = false
     if (typeof navigator !== 'undefined') navigator.mediaDevices?.addEventListener('devicechange', this.onDeviceChange)
-    await this.refreshDevices()
     await this.boot()
   }
 
@@ -777,11 +834,17 @@ export class Softphone {
     const current = active[0] as WebCall | undefined
     if (current && current.state !== 'connected' && current.state !== 'held') throw new CallError('call-in-progress', 'A call is already in progress')
     if (current && current.state === 'connected') await current.hold()
+    const microphone = await this.acquireMicrophone()
     this.pendingConsultationOf = current?.id
     try {
-      const session = this.ua.call(`sip:${target}@${this.domain}`, mediaOptions(this.session.iceServers ?? [], this.microphone()))
+      const session = this.ua.call(`sip:${target}@${this.domain}`, mediaOptions(this.session.iceServers ?? [], microphone))
       // JsSIP emits newRTCSession for outgoing calls too (synchronously, inside call()): the wrapper already exists.
-      return this.calls.get(session.id) ?? this.wrap(session, 'outbound', { consultationOf: current?.id })
+      const call = this.calls.get(session.id) ?? this.wrap(session, 'outbound', { consultationOf: current?.id })
+      call.adopt(microphone)
+      return call
+    } catch (err) {
+      microphone?.getTracks().forEach(track => track.stop())
+      throw err
     } finally {
       this.pendingConsultationOf = undefined
     }
@@ -883,7 +946,7 @@ export class Softphone {
       (c, tone) => this.options.onDtmf?.(c, tone),
       iceServers,
       this.domain,
-      { microphone: () => this.microphone(), blocked: () => this.setBlocked(true) },
+      { microphone: () => this.acquireMicrophone(), blocked: () => this.setBlocked(true) },
       links
     )
     this.calls.set(session.id, call)
@@ -896,7 +959,11 @@ export class Softphone {
       if (this.activeCalls().length >= MAX_CALLS || !target?.user || !DIALABLE.test(target.user) || (target.host ?? '').toLowerCase() !== this.domain.toLowerCase()) return e.reject()
       // Who asked for the call goes along with it (RFC 3892): the target sees the transfer for what it is.
       const referredBy = request.getHeader?.('Referred-By')
-      e.accept(() => undefined, { ...mediaOptions(iceServers, this.microphone()), ...(referredBy ? { extraHeaders: [`Referred-By: ${referredBy}`] } : {}) })
+      // JsSIP has already said 202: the new call is placed once our microphone is open.
+      void this.acquireMicrophone().then(
+        microphone => e.accept((s: RTCSession) => this.calls.get(s.id)?.adopt(microphone), { ...mediaOptions(iceServers, microphone), ...(referredBy ? { extraHeaders: [`Referred-By: ${referredBy}`] } : {}) }),
+        () => e.accept(() => undefined, { ...mediaOptions(iceServers), ...(referredBy ? { extraHeaders: [`Referred-By: ${referredBy}`] } : {}) })
+      )
     })
     // The far end of an attended transfer replaces the person who consulted us (INVITE with Replaces).
     session.on('replaces', (e: ReferEvent) => {

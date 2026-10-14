@@ -242,6 +242,9 @@ route {
 }
 
 route[relay] {
+	# A registered contact that cannot be reached (window gone without unregistering) makes tm answer
+	# 477 "Send failed" itself: the softphone renders it as "unreachable" (proven by the e2e). The 500 below is
+	# for a relay that fails before any reply.
 	if (!t_relay())
 		send_reply(500, "Internal Error");
 }
@@ -258,8 +261,4 @@ failure_route[call_failed] {
 	rtpengine_delete();
 	if (t_was_cancelled())
 		exit;
-	# A registered window that is gone (tab closed without unregistering): "unreachable" for the caller, not a
-	# transport error.
-	if (t_check_status("477"))
-		t_reply(480, "Temporarily Unavailable");
 }

@@ -205,6 +205,17 @@ const calls = page => page.evaluate(() => window.twakephone.calls)
 const lastEnded = page => page.evaluate(() => window.twakephone.lastEnded)
 const stats = page => page.evaluate(() => window.twakephone.stats())
 const soundBlocked = page => page.evaluate(() => window.twakephone.soundBlocked)
+/** Waits for the ringtone element to play (not paused, live stream) or to be quiet. */
+const ringerPlaying = (page, playing) =>
+  page.waitForFunction(
+    expected => {
+      const el = document.querySelector('[data-testid=ringer]')
+      return !!el && !el.paused === expected && (!expected || (el.srcObject?.active ?? false))
+    },
+    playing,
+    { timeout: 10_000 }
+  )
+const ringerSink = page => page.evaluate(() => document.querySelector('[data-testid=ringer]')?.sinkId ?? '')
 /** Signs out from this page (unregisters its softphone first) and closes its context. */
 const signOut = async who => {
   await who.page.getByRole('button', { name: 'Se déconnecter' }).click()
@@ -318,24 +329,33 @@ try {
   await step('Alice chooses a microphone and outputs in the settings: the next call uses them, the ringtone can be tested', async () => {
     await alice.page.getByRole('link', { name: 'Réglages' }).click()
     await alice.page.getByRole('heading', { level: 2, name: 'Audio' }).waitFor()
-    // The browsers' simulated devices: Chromium and Edge list several, Firefox one microphone and no output.
+    // The browsers' simulated devices: Chromium and Edge list several microphones and outputs (the choices are
+    // proven there); Firefox lists one microphone and no output, so it only proves the screen and the ringtone.
+    const several = BROWSER !== 'firefox'
     const options = async label => (await alice.page.getByLabel(label).locator('option').all()).length - 1
     const pick = async (label, index) => {
       const n = await options(label)
-      if (n <= index) return null
+      if (n <= index) {
+        if (several) throw new Error(`${label}: ${n} device(s) listed, expected more than ${index}`)
+        return null
+      }
       await alice.page.getByLabel(label).selectOption({ index: index + 1 })
       return alice.page.getByLabel(label).inputValue()
     }
     const microphone = await pick('Microphone', 1)
     const canChooseOutput = await alice.page.evaluate(() => 'setSinkId' in HTMLMediaElement.prototype)
+    if (several) expectEqual(canChooseOutput, true, 'setSinkId available')
     const output = canChooseOutput ? await pick('Sortie de la voix', 1) : null
-    if (canChooseOutput) await pick('Sortie de la sonnerie', 2)
-    console.log(`     devices: microphone ${microphone ?? 'default'}, output ${output ?? 'default'}`)
+    const ringerOutput = canChooseOutput ? await pick('Sortie de la sonnerie', 2) : null
+    console.log(`     devices: microphone ${microphone ?? 'default'}, output ${output ?? 'default'}, ringer ${ringerOutput ?? 'default'}${several ? '' : ' (one device per kind here: choices not proven)'}`)
     const chosen = await alice.page.evaluate(() => window.twakephone.devices)
     if (microphone) expectEqual(chosen.microphoneId, microphone, 'microphone kept')
     await alice.page.getByRole('button', { name: 'Tester la sonnerie' }).click()
-    await alice.page.getByTestId('ringer').waitFor({ state: 'attached' })
+    // The ringtone plays (its element is not paused and carries a live stream), on the chosen output, then stops.
+    await ringerPlaying(alice.page, true)
+    if (ringerOutput) expectEqual(await ringerSink(alice.page), ringerOutput, 'output of the ringtone')
     expectEqual(await soundBlocked(alice.page), false, 'sound blocked during the ringtone test')
+    await ringerPlaying(alice.page, false)
     await alice.page.getByRole('link', { name: 'Clavier' }).click()
     await aliceCallsJean(alice, jean)
     await bothHearEachOther(alice, jean)
@@ -351,12 +371,14 @@ try {
     await dial(jean.page, '101')
     for (const who of [alice, alice2]) {
       await who.page.getByTestId('incoming-call').getByText('Appel entrant de Jean Dupont (102)').waitFor({ timeout: 20_000 })
-      await who.page.getByTestId('ringer').waitFor({ state: 'attached' })
+      await ringerPlaying(who.page, true)
       expectEqual(await soundBlocked(who.page), false, `sound blocked while ringing (${who === alice ? 'first' : 'second'} window)`)
     }
     await alice2.page.getByTestId('incoming-call').getByRole('button', { name: 'Répondre' }).click()
     await jean.page.getByText('En communication avec 101').waitFor()
     await alice.page.getByText('Appel de Jean Dupont (102) pris sur un autre poste ou abandonné.').waitFor()
+    // Both ringtones stop: the window that answered, and the one the SIP server cancelled.
+    for (const who of [alice, alice2]) await ringerPlaying(who.page, false)
     expectEqual((await calls(alice.page)).length, 0, 'calls left in the first window')
     await bothHearEachOther(alice2, jean)
     await alice2.page.getByRole('button', { name: 'Raccrocher' }).click()
@@ -500,7 +522,7 @@ try {
     await signOut(alice)
     await dial(jean.page, '101')
     const ended = await until('the call to 101 to end', () => lastEnded(jean.page), { timeout: 20_000 })
-    // 404: no contact left for 101. A registration left behind would have given 480 (dead contact) or rung.
+    // 404: no contact left for 101. A registration left behind would have given 477 (dead contact) or rung.
     expectEqual(`${ended.endStatus} ${ended.endReason}`, '404 unavailable', 'how the call to 101 ended after Alice signed out')
     await jean.page.getByText('101 est injoignable.').waitFor()
   })

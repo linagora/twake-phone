@@ -1,3 +1,4 @@
+import { RING_TEST_MS } from '@twake/softphone'
 import { useEffect, useState } from 'react'
 import { useAuth } from '../auth/AuthProvider.js'
 import { displayNameFor } from '../auth/oidc.js'
@@ -9,17 +10,23 @@ import { usePhone } from '../softphone.js'
 
 type Device = { id: string; label: string }
 type Devices = { inputs: Device[]; outputs: Device[]; labelled: boolean }
+type DeviceKey = 'microphoneId' | 'outputId' | 'ringerId'
+
+const LABEL_KEY = { microphoneId: 'settings.microphone', outputId: 'settings.output', ringerId: 'settings.ringer' } as const
 
 const canChooseOutput = typeof HTMLMediaElement !== 'undefined' && 'setSinkId' in HTMLMediaElement.prototype
 
-/** The browser's audio devices; labels only come once the microphone was allowed, the person is told so. */
+/**
+ * The browser's audio devices. Before the microphone was allowed, browsers list one nameless device per kind, or
+ * none with an id at all: nothing to choose from, the person is told why and offered to allow it.
+ */
 const enumerate = async (): Promise<Devices> => {
   if (typeof navigator === 'undefined' || !navigator.mediaDevices?.enumerateDevices) return { inputs: [], outputs: [], labelled: false }
   const all = await navigator.mediaDevices.enumerateDevices()
   const of = (kind: MediaDeviceKind) => all.filter(d => d.kind === kind && d.deviceId).map(d => ({ id: d.deviceId, label: d.label }))
   const inputs = of('audioinput')
   const outputs = of('audiooutput')
-  return { inputs, outputs, labelled: [...inputs, ...outputs].every(d => d.label) }
+  return { inputs, outputs, labelled: all.some(d => d.kind === 'audioinput' && d.label) }
 }
 
 /**
@@ -45,38 +52,50 @@ const AudioSettings = () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
       stream.getTracks().forEach(track => track.stop())
+      setError(null)
       setDevices(await enumerate())
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err))
+      setError(t(err instanceof Error && err.name === 'NotAllowedError' ? 'settings.microphoneRefused' : 'settings.microphoneError'))
     }
   }
-  const choose = (key: 'microphoneId' | 'outputId' | 'ringerId') => (id: string) => {
-    const { [key]: _, ...rest } = phone.devices
-    phone.setDevices(id ? { ...rest, [key]: id } : rest)
+  const choose = (key: DeviceKey) => (id: string) => {
+    const next = { ...phone.devices }
+    delete next[key]
+    phone.setDevices(id ? { ...next, [key]: id } : next)
   }
   const ringTest = async () => {
     setRinging(true)
     try {
       await phone.ringTest()
-      await new Promise(r => setTimeout(r, 2_500))
+      await new Promise(r => setTimeout(r, RING_TEST_MS))
     } finally {
       setRinging(false)
     }
   }
   const label = (d: Device, kind: 'microphone' | 'output', index: number) => d.label || t(kind === 'microphone' ? 'settings.unnamedMicrophone' : 'settings.unnamedOutput', { n: index + 1 })
-  const select = (id: string, key: 'microphoneId' | 'outputId' | 'ringerId', list: Device[], kind: 'microphone' | 'output') => (
-    <div className="field">
-      <label htmlFor={id}>{t(`settings.${key === 'microphoneId' ? 'microphone' : key === 'outputId' ? 'output' : 'ringer'}`)}</label>
-      <select id={id} value={phone.devices[key] ?? ''} onChange={e => choose(key)(e.target.value)} disabled={!list.length}>
-        <option value="">{t('settings.defaultDevice')}</option>
-        {list.map((d, i) => (
-          <option key={d.id} value={d.id}>
-            {label(d, kind, i)}
-          </option>
-        ))}
-      </select>
-    </div>
-  )
+  const select = (id: string, key: DeviceKey, list: Device[], kind: 'microphone' | 'output') => {
+    const chosen = phone.devices[key] ?? ''
+    // A chosen device the browser does not list right now (a headset unplugged): the choice stays, and says so.
+    const unplugged = chosen && !list.some(d => d.id === chosen)
+    return (
+      <div className="field">
+        <label htmlFor={id}>{t(LABEL_KEY[key])}</label>
+        <select id={id} value={chosen} onChange={e => choose(key)(e.target.value)} disabled={!list.length && !unplugged}>
+          <option value="">{t('settings.defaultDevice')}</option>
+          {unplugged ? (
+            <option value={chosen} disabled>
+              {t('settings.unpluggedDevice')}
+            </option>
+          ) : null}
+          {list.map((d, i) => (
+            <option key={d.id} value={d.id}>
+              {label(d, kind, i)}
+            </option>
+          ))}
+        </select>
+      </div>
+    )
+  }
   return (
     <section className="card" aria-labelledby="audio">
       <h2 id="audio">{t('settings.audio')}</h2>
@@ -98,7 +117,7 @@ const AudioSettings = () => {
         <p className="badge">{t('settings.outputUnsupported')}</p>
       )}
       <div className="actions">
-        <button type="button" className="btn" onClick={() => void ringTest()} disabled={ringing || phone.state === 'off'} aria-pressed={ringing}>
+        <button type="button" className="btn" onClick={() => void ringTest()} disabled={ringing || phone.state === 'off'} aria-busy={ringing}>
           {t('settings.testRing')}
         </button>
       </div>

@@ -152,16 +152,43 @@ const setup = async (over: Partial<ConstructorParameters<typeof Softphone>[0]> =
 }
 
 /** The browser's devices, for the calls that switch microphone. */
-const withMediaDevices = (deviceId: string, listed = ['mic-usb', 'mic-bt']) => {
+const withMediaDevices = (listed = ['mic-usb', 'mic-bt']) => {
   const tracks: ReturnType<typeof fakeTrack>[] = []
-  const getUserMedia = vi.fn(async (_c: unknown) => {
-    const track = fakeTrack(deviceId)
+  // `exact` on a device the browser does not have fails, as in a browser; `audio: true` opens the default one.
+  const getUserMedia = vi.fn(async (c: { audio: true | { deviceId: { exact: string } } }) => {
+    const wanted = c.audio === true ? undefined : c.audio.deviceId.exact
+    if (wanted && !listed.includes(wanted)) throw Object.assign(new Error('no such device'), { name: 'OverconstrainedError' })
+    const track = fakeTrack(wanted ?? 'mic-default')
     tracks.push(track)
-    return { getAudioTracks: () => [track] }
+    return { getAudioTracks: () => [track], getTracks: () => [track] }
   })
   const enumerateDevices = vi.fn(async () => listed.map(id => ({ kind: 'audioinput', deviceId: id, label: id })))
-  vi.stubGlobal('navigator', { mediaDevices: { getUserMedia, enumerateDevices, addEventListener: vi.fn(), removeEventListener: vi.fn() } })
-  return { getUserMedia, tracks, restore: () => vi.unstubAllGlobals() }
+  const listeners: (() => void)[] = []
+  const addEventListener = vi.fn((_type: string, fn: () => void) => listeners.push(fn))
+  const removeEventListener = vi.fn((_type: string, fn: () => void) => listeners.splice(listeners.indexOf(fn), 1))
+  vi.stubGlobal('navigator', { mediaDevices: { getUserMedia, enumerateDevices, addEventListener, removeEventListener } })
+  const last = () => tracks[tracks.length - 1]!
+  return { getUserMedia, tracks, last, listeners, removeEventListener, plug: () => listeners.forEach(fn => fn()), restore: () => vi.unstubAllGlobals() }
+}
+
+/** A page, for the gesture listeners the softphone arms while the browser blocks sound. */
+const withDocument = () => {
+  const listeners = new Map<string, Set<() => void>>()
+  const addEventListener = vi.fn((type: string, fn: () => void) => void (listeners.get(type) ?? listeners.set(type, new Set()).get(type))!.add(fn))
+  const removeEventListener = vi.fn((type: string, fn: () => void) => void listeners.get(type)?.delete(fn))
+  vi.stubGlobal('document', { addEventListener, removeEventListener })
+  return {
+    addEventListener,
+    removeEventListener,
+    armed: () => [...listeners.entries()].filter(([, fns]) => fns.size).map(([type]) => type),
+    // `once` listeners: gone as they fire.
+    fire: (type: string) => {
+      const fns = [...(listeners.get(type) ?? [])]
+      listeners.get(type)?.clear()
+      fns.forEach(fn => fn())
+    },
+    restore: () => vi.unstubAllGlobals()
+  }
 }
 
 describe('Softphone', () => {
@@ -549,6 +576,8 @@ describe('Softphone', () => {
     expect(reject).toHaveBeenCalledTimes(3)
     expect(accept).not.toHaveBeenCalled()
     s.emit('refer', { request: referTo('103'), accept, reject })
+    // Accepted once our microphone is open (JsSIP has already said 202).
+    await new Promise(r => setTimeout(r, 0))
     expect(accept).toHaveBeenCalled()
     expect(phone.activeCalls()).toHaveLength(2)
     // The call JsSIP placed for the REFER is announced like one of ours, before anything happens to it.
@@ -601,6 +630,9 @@ describe('Softphone', () => {
     const replacing = new FakeSession('incoming')
     s.emit('replaces', { request: {}, accept: (init: (s: unknown) => void) => { init(replacing); ua().emit('newRTCSession', { originator: 'remote', session: replacing }) }, reject: vi.fn() })
     expect(ringer.start).not.toHaveBeenCalled()
+    // The answer comes a tick later: it belongs to this test, not to the next one.
+    await new Promise(r => setTimeout(r, 5))
+    expect(replacing.answer).toHaveBeenCalled()
   })
 
   it('says when the browser blocks sound until a gesture, and plays once the app says the person clicked', async () => {
@@ -620,42 +652,161 @@ describe('Softphone', () => {
   })
 
   it('uses the chosen microphone for calls, switches it during a call and comes back from an unplugged headset', async () => {
-    const media = withMediaDevices('mic-usb')
+    const media = withMediaDevices()
     try {
       const { phone, ua } = await setup({ devices: { microphoneId: 'mic-usb' } })
       await phone.call('102')
-      expect(ua().call).toHaveBeenCalledWith('sip:102@sip.test', expect.objectContaining({ mediaConstraints: { audio: { deviceId: { exact: 'mic-usb' } }, video: false } }))
+      // The softphone opened the chosen microphone itself and handed its stream to JsSIP.
+      expect(media.getUserMedia).toHaveBeenCalledWith({ audio: { deviceId: { exact: 'mic-usb' } } })
+      expect(ua().call).toHaveBeenCalledWith('sip:102@sip.test', expect.objectContaining({ mediaStream: expect.objectContaining({ getAudioTracks: expect.any(Function) }), mediaConstraints: { audio: true, video: false } }))
       const s = ua().lastCall!
       const pc = s.connection as ReturnType<typeof fakePc>
-      // JsSIP opened the chosen microphone for the INVITE.
-      pc.sender.track = fakeTrack('mic-usb')
+      const first = media.last()
+      pc.sender.track = first
       s.emit('accepted', { originator: 'remote' })
-      // The person picks another microphone in the settings: the call goes on with it, no renegotiation.
+      // The same microphone again: nothing to reopen.
       await phone.setDevices({ microphoneId: 'mic-usb', outputId: 'speaker' })
-      expect(media.getUserMedia).not.toHaveBeenCalled()
-      media.tracks.length = 0
+      expect(media.getUserMedia).toHaveBeenCalledTimes(1)
+      // The person picks another microphone in the settings: the call goes on with it, no renegotiation.
       await phone.setDevices({ microphoneId: 'mic-bt', outputId: 'speaker' })
-      expect(media.getUserMedia).toHaveBeenCalledWith({ audio: { deviceId: { exact: 'mic-bt' } } })
+      expect(media.getUserMedia).toHaveBeenLastCalledWith({ audio: { deviceId: { exact: 'mic-bt' } } })
       expect(pc.sender.replaceTrack).toHaveBeenCalled()
+      expect(pc.sender.track!.getSettings().deviceId).toBe('mic-bt')
+      expect(first.stop).toHaveBeenCalled()
       expect(audios[audios.length - 1]!.sinkId).toBe('speaker')
       // Muted calls stay muted on the new microphone.
       phone.activeCalls()[0]!.setMuted(true)
       const current = pc.sender.track!
       current.unplug()
       await new Promise(r => setTimeout(r, 0))
-      expect(media.getUserMedia).toHaveBeenCalledTimes(2)
+      expect(media.getUserMedia).toHaveBeenCalledTimes(3)
       expect(pc.sender.track).not.toBe(current)
       expect(pc.sender.track!.enabled).toBe(false)
       expect(current.stop).toHaveBeenCalled()
       expect(phone.audioDevices).toEqual({ microphoneId: 'mic-bt', outputId: 'speaker' })
-      // A chosen microphone the browser no longer lists is not asked for: the default one instead of a failed call.
+      // A chosen microphone the browser no longer has: the default one instead of a failed call.
       await phone.setDevices({ microphoneId: 'mic-gone' })
+      expect(media.getUserMedia).toHaveBeenLastCalledWith({ audio: true })
+      expect(pc.sender.track!.getSettings().deviceId).toBe('mic-default')
+      // The call over, the microphone the softphone opened is let go (JsSIP only stops what it opened itself).
+      const final = pc.sender.track!
       s.emit('ended', { originator: 'remote', cause: 'Terminated' })
+      expect(final.stop).toHaveBeenCalled()
+      expect(media.tracks.every(t => t.stop.mock.calls.length > 0)).toBe(true)
       await phone.call('103')
-      expect(ua().call).toHaveBeenLastCalledWith('sip:103@sip.test', expect.objectContaining({ mediaConstraints: { audio: true, video: false } }))
+      expect(media.getUserMedia).toHaveBeenLastCalledWith({ audio: true })
+      expect(ua().call).toHaveBeenLastCalledWith('sip:103@sip.test', expect.objectContaining({ mediaStream: expect.anything() }))
     } finally {
       media.restore()
     }
+  })
+
+  it('answers with the chosen microphone and stops it with the call', async () => {
+    const media = withMediaDevices()
+    try {
+      const { phone, ua, incoming } = await setup({ devices: { microphoneId: 'mic-bt' } })
+      const s = new FakeSession('incoming')
+      ua().emit('newRTCSession', { originator: 'remote', session: s })
+      await incoming[0]!.answer()
+      expect(media.getUserMedia).toHaveBeenCalledWith({ audio: { deviceId: { exact: 'mic-bt' } } })
+      expect(s.answer).toHaveBeenCalledWith(expect.objectContaining({ mediaStream: expect.anything(), mediaConstraints: { audio: true, video: false } }))
+      s.emit('accepted', { originator: 'local' })
+      s.emit('ended', { originator: 'remote', cause: 'Terminated' })
+      expect(media.last().stop).toHaveBeenCalled()
+    } finally {
+      media.restore()
+    }
+  })
+
+  it('switches microphones one after the other: no live track is left behind', async () => {
+    const media = withMediaDevices(['mic-usb', 'mic-bt', 'mic-x'])
+    try {
+      const { phone, ua } = await setup()
+      await phone.call('102')
+      const s = ua().lastCall!
+      const pc = s.connection as ReturnType<typeof fakePc>
+      pc.sender.track = media.last()
+      s.emit('accepted', { originator: 'remote' })
+      // Three choices in a row, none awaited: the settings screen, a device change and a headset gone at once.
+      await Promise.all([phone.setDevices({ microphoneId: 'mic-usb' }), phone.setDevices({ microphoneId: 'mic-bt' }), phone.setDevices({ microphoneId: 'mic-x' })])
+      const live = media.tracks.filter(t => !t.stop.mock.calls.length)
+      expect(live).toEqual([pc.sender.track])
+      expect(pc.sender.track!.getSettings().deviceId).toBe('mic-x')
+    } finally {
+      media.restore()
+    }
+  })
+
+  it('takes the chosen microphone up again when it is plugged back, and leaves a default one alone', async () => {
+    const media = withMediaDevices(['mic-usb'])
+    try {
+      const { phone, ua } = await setup()
+      await phone.call('102')
+      const s = ua().lastCall!
+      const pc = s.connection as ReturnType<typeof fakePc>
+      pc.sender.track = media.last()
+      s.emit('accepted', { originator: 'remote' })
+      expect(media.listeners).toHaveLength(1)
+      // No choice: a device plugged in changes nothing for the call.
+      media.plug()
+      await new Promise(r => setTimeout(r, 0))
+      expect(media.getUserMedia).toHaveBeenCalledTimes(1)
+      // The chosen headset was away when the call started (default microphone); it comes back: the call takes it.
+      await phone.setDevices({ microphoneId: 'mic-usb' })
+      expect(pc.sender.track!.getSettings().deviceId).toBe('mic-usb')
+      pc.sender.track = fakeTrack('mic-default')
+      media.plug()
+      await new Promise(r => setTimeout(r, 0))
+      expect(media.getUserMedia).toHaveBeenLastCalledWith({ audio: { deviceId: { exact: 'mic-usb' } } })
+      expect(pc.sender.track!.getSettings().deviceId).toBe('mic-usb')
+      await phone.stop()
+      expect(media.listeners).toHaveLength(0)
+    } finally {
+      media.restore()
+    }
+  })
+
+  it('waits for the next click or key while sound is blocked, and again when that gesture did not unblock it', async () => {
+    const page = withDocument()
+    try {
+      const { phone, ua, ringer, blocked } = await setup()
+      ringer.blocked = true
+      ua().emit('newRTCSession', { originator: 'remote', session: new FakeSession('incoming') })
+      await Promise.resolve()
+      await Promise.resolve()
+      expect(phone.soundBlocked).toBe(true)
+      expect(page.armed().sort()).toEqual(['click', 'keydown'])
+      // A click the browser did not count as a gesture: still blocked, the next one is waited for again.
+      page.fire('click')
+      await new Promise(r => setTimeout(r, 0))
+      expect(phone.soundBlocked).toBe(true)
+      expect(page.armed().sort()).toEqual(['click', 'keydown'])
+      ringer.blocked = false
+      page.fire('keydown')
+      await new Promise(r => setTimeout(r, 0))
+      expect(phone.soundBlocked).toBe(false)
+      expect(page.armed()).toEqual([])
+      expect(blocked).toEqual([true, false])
+    } finally {
+      page.restore()
+    }
+  })
+
+  it('does not take a playback cut short by the end of a call for a blocked sound', async () => {
+    const { phone, ua, blocked } = await setup()
+    await phone.call('102')
+    const s = ua().lastCall!
+    const pc = s.connection as ReturnType<typeof fakePc>
+    const element = audios[audios.length - 1]!
+    element.play.mockRejectedValueOnce(Object.assign(new Error('interrupted'), { name: 'AbortError' }))
+    pc.fire('track', { streams: [{}], track: {} })
+    await new Promise(r => setTimeout(r, 0))
+    expect(blocked).toEqual([])
+    element.play.mockRejectedValueOnce(Object.assign(new Error('gesture'), { name: 'NotAllowedError' }))
+    pc.fire('track', { streams: [{}], track: {} })
+    await new Promise(r => setTimeout(r, 0))
+    expect(blocked).toEqual([true])
+    expect(phone.soundBlocked).toBe(true)
   })
 
   it('refuses tones outside a call', async () => {
