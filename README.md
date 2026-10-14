@@ -4,6 +4,7 @@
 
 **La téléphonie souveraine de Twake : un softphone dans le navigateur, un serveur SIP libre, un trunk opérateur, et zéro licence par utilisateur.**
 
+[![CI](https://github.com/linagora/twake-phone/actions/workflows/ci.yml/badge.svg)](https://github.com/linagora/twake-phone/actions/workflows/ci.yml)
 [![Licence AGPL-3.0](https://img.shields.io/badge/licence-AGPL--3.0-blue.svg)](#licence)
 [![Statut](https://img.shields.io/badge/statut-%C3%A9tape%201%20%2F%2011-orange.svg)](#le-plan-en-11-%C3%A9tapes)
 [![Stack](https://img.shields.io/badge/stack-React%20%C2%B7%20JsSIP%20%C2%B7%20Fastify%20%C2%B7%20OpenSIPS-informational.svg)](#la-pile)
