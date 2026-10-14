@@ -4,7 +4,7 @@
 set -eu
 
 : "${SIP_DOMAIN:=127.0.0.1}"
-: "${LISTEN_IP:=0.0.0.0}"
+: "${LISTEN_IP:=127.0.0.1}"
 : "${SIP_PORT:=5060}"
 : "${WS_PORT:=8088}"
 : "${WSS_PORT:=8089}"

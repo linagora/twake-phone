@@ -27,8 +27,10 @@ describe('SipSecrets', () => {
     const secrets = new SipSecrets({ store, key, provisioner })
     const first = await secrets.getOrCreate('A', 'alice', '101')
     expect(await secrets.getOrCreate('A', 'alice', '101')).toBe(first)
-    expect(provisioner.setSipSecret).toHaveBeenCalledTimes(1)
-    expect(provisioner.setSipSecret).toHaveBeenCalledWith('101', first)
+    // Provisioned again with the same secret each time it is handed out: the PBX side may have lost it.
+    expect(provisioner.setSipSecret).toHaveBeenCalledTimes(2)
+    expect(provisioner.setSipSecret).toHaveBeenNthCalledWith(1, '101', first)
+    expect(provisioner.setSipSecret).toHaveBeenNthCalledWith(2, '101', first)
     expect((await store.getSipSecret('A', 'alice'))!.secretEnc).not.toContain(first)
   })
 

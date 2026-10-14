@@ -37,7 +37,7 @@ CREATE TABLE IF NOT EXISTS subscriber (
 );
 CREATE INDEX IF NOT EXISTS subscriber_username_idx ON subscriber (username);
 INSERT INTO version (table_name, table_version) VALUES ('subscriber', ${SUBSCRIBER_TABLE_VERSION})
-  ON CONFLICT (table_name) DO UPDATE SET table_version = EXCLUDED.table_version;
+  ON CONFLICT (table_name) DO NOTHING;
 `
 
 /** What the provisioner needs to run queries: a pg Pool, or anything with the same `query`. */
@@ -75,8 +75,12 @@ export class SubscriberProvisioner implements SecretProvisioner {
     this.domain = opts.domain ?? ''
   }
 
+  /** Creates the tables when missing; refuses a `subscriber` table of another version (OpenSIPS owns that row). */
   async ensureSchema() {
     await this.pool.query(SUBSCRIBER_SCHEMA)
+    const { rows } = (await this.pool.query("SELECT table_version FROM version WHERE table_name = 'subscriber'")) as { rows: { table_version: number }[] }
+    const version = rows[0]?.table_version
+    if (version !== SUBSCRIBER_TABLE_VERSION) throw new Error(`subscriber table version ${version} in the database, ${SUBSCRIBER_TABLE_VERSION} expected`)
   }
 
   async setSipSecret(extension: string, secret: string) {

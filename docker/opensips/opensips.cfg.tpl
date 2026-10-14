@@ -99,8 +99,12 @@ modparam("rtpengine", "rtpengine_sock", "${RTPENGINE_SOCK}")
 # never see each other's address, and a browser behind a NAT still works), SDP origin and connection rewritten.
 # SIP INFO (DTMF) and the other in-dialog requests pass untouched.
 route[rtp_offer] {
-	if (!rtpengine_offer("ICE=force RTP/SAVPF rtcp-mux-require replace-origin replace-session-connection"))
+	if (!rtpengine_offer("ICE=force RTP/SAVPF rtcp-mux-require replace-origin replace-session-connection")) {
+		# Never relay the browser's own SDP: without rtpengine the call would go browser to browser.
 		xlog("L_ERR", "rtpengine offer failed for $ci\n");
+		send_reply(503, "Media Unavailable");
+		exit;
+	}
 }
 route[rtp_answer] {
 	if (!rtpengine_answer("ICE=force RTP/SAVPF rtcp-mux-require replace-origin replace-session-connection"))
@@ -123,6 +127,17 @@ route {
 		}
 		if (!loose_route()) {
 			send_reply(404, "Not Here");
+			exit;
+		}
+		# Only a dialog this proxy created (an authenticated INVITE between two of its accounts) goes further:
+		# a forged To-tag plus a Route naming us would otherwise turn loose_route() into an open relay.
+		if (!match_dialog()) {
+			if (!is_method("ACK"))
+				send_reply(481, "Call/Transaction Does Not Exist");
+			exit;
+		}
+		if (!is_method("INVITE|UPDATE|ACK|BYE|INFO|REFER|NOTIFY|PRACK|OPTIONS")) {
+			send_reply(405, "Method Not Allowed");
 			exit;
 		}
 		# A browser's Contact names a ".invalid" host (RFC 7118): point it at the WebSocket it came from, so the
@@ -238,9 +253,10 @@ onreply_route[rtp] {
 }
 
 failure_route[call_failed] {
+	# Cancelled or failed, the media session is over: free rtpengine's ports before anything else.
+	rtpengine_delete();
 	if (t_was_cancelled())
 		exit;
-	rtpengine_delete();
 	# A registered window that is gone (tab closed without unregistering): "unreachable" for the caller, not a
 	# transport error.
 	if (t_check_status("477"))

@@ -41,6 +41,10 @@ export const SoftphoneProvider = ({ children }: { children: ReactNode }) => {
   const [tones, setTones] = useState<Record<string, string>>({})
   const phone = useRef<Softphone | null>(null)
   const extension = me?.extension
+  // The name goes in the From header at registration; a change (directory synchronisation) applies at the next
+  // start, never by restarting the softphone in the middle of a call.
+  const nameRef = useRef(displayName)
+  nameRef.current = displayName
 
   useEffect(() => {
     if (!extension || !audio.current) {
@@ -56,7 +60,7 @@ export const SoftphoneProvider = ({ children }: { children: ReactNode }) => {
         return session
       },
       remoteAudio: audio.current,
-      displayName,
+      displayName: nameRef.current,
       onRegistration: (s, why) => {
         if (cancelled) return
         setState(s)
@@ -94,7 +98,7 @@ export const SoftphoneProvider = ({ children }: { children: ReactNode }) => {
       setCalls([])
       setState('off')
     }
-  }, [client, extension, displayName])
+  }, [client, extension])
 
   const call = useCallback(async (target: string) => {
     if (!phone.current) throw new Error('Softphone not started')
@@ -110,10 +114,11 @@ export const SoftphoneProvider = ({ children }: { children: ReactNode }) => {
     window.twakephone = {
       state,
       calls: calls.map(c => ({ id: c.id, direction: c.direction, state: c.state, remoteNumber: c.remoteNumber, remoteHold: c.remoteHold, muted: c.muted, renegotiating: c.renegotiating })),
+      lastEnded: lastEnded ? { remoteNumber: lastEnded.remoteNumber, endReason: lastEnded.endReason, endStatus: lastEnded.endStatus } : null,
       tones,
       stats: () => Promise.all(calls.map(c => c.stats()))
     }
-  }, [state, calls, tones])
+  }, [state, calls, lastEnded, tones])
 
   return (
     <PhoneContext.Provider value={value}>

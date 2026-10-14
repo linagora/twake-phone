@@ -169,6 +169,7 @@ const open = async (login, name) => {
 }
 const phoneState = page => page.getByTestId('phone-state')
 const calls = page => page.evaluate(() => window.twakephone.calls)
+const lastEnded = page => page.evaluate(() => window.twakephone.lastEnded)
 const stats = page => page.evaluate(() => window.twakephone.stats())
 const dial = async (page, number) => {
   await page.getByLabel('Numéro à appeler').fill(number)
@@ -206,11 +207,12 @@ try {
   await step('a call to an extension nobody registered ends as unreachable', async () => {
     await dial(alice.page, '105')
     await alice.page.getByText('105 est injoignable.').waitFor()
+    expectEqual((await lastEnded(alice.page))?.endStatus, 404, 'SIP status for an unregistered extension')
   })
   await step('Alice calls 102: Jean sees who is calling and refuses; Alice is told', async () => {
     await dial(alice.page, '102')
     await alice.page.getByText('Appel de 102…').waitFor()
-    const ringing = jean.page.getByRole('alertdialog')
+    const ringing = jean.page.getByTestId('incoming-call')
     await ringing.getByText('Appel entrant de Alice Martin (101)').waitFor()
     await ringing.getByRole('button', { name: 'Refuser' }).click()
     await alice.page.getByText("102 a refusé l'appel.").waitFor()
@@ -218,7 +220,7 @@ try {
   })
   await step('Alice calls again, Jean answers: both are in communication', async () => {
     await dial(alice.page, '102')
-    await jean.page.getByRole('alertdialog').getByRole('button', { name: 'Répondre' }).click()
+    await jean.page.getByTestId('incoming-call').getByRole('button', { name: 'Répondre' }).click()
     await alice.page.getByText('En communication avec 102').waitFor()
     await jean.page.getByText('En communication avec Alice Martin (101)').waitFor()
     expectEqual((await calls(alice.page))[0].direction, 'outbound', 'Alice call direction')
@@ -267,8 +269,8 @@ try {
   })
   await step('after the reconnection Jean calls Alice, who answers and hangs up', async () => {
     await dial(jean.page, '101')
-    await alice.page.getByRole('alertdialog').getByText('Appel entrant de Jean Dupont (102)').waitFor({ timeout: 20_000 })
-    await alice.page.getByRole('alertdialog').getByRole('button', { name: 'Répondre' }).click()
+    await alice.page.getByTestId('incoming-call').getByText('Appel entrant de Jean Dupont (102)').waitFor({ timeout: 20_000 })
+    await alice.page.getByTestId('incoming-call').getByRole('button', { name: 'Répondre' }).click()
     await jean.page.getByText('En communication avec 101').waitFor()
     await bothHearEachOther(alice, jean)
     await alice.page.getByRole('button', { name: 'Raccrocher' }).click()
@@ -282,6 +284,8 @@ try {
     await alice.page.getByRole('button', { name: 'Se connecter' }).waitFor()
     await dial(jean.page, '101')
     await jean.page.getByText('101 est injoignable.').waitFor({ timeout: 20_000 })
+    // 404: no contact left for 101. A registration left behind would have given 480 (dead contact) or rung.
+    expectEqual((await lastEnded(jean.page))?.endStatus, 404, 'SIP status after Alice signed out')
   })
 } catch (err) {
   failed = true

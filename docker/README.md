@@ -23,7 +23,9 @@ docker compose -f docker/docker-compose.sip.yml up --build --wait
 
 Sans Docker (poste de dev sans démon) : OpenSIPS se compile depuis GitHub (`make prefix=/opt/opensips include_modules="proto_ws proto_wss tls_mgm tls_openssl db_postgres" all install`), rtpengine s'installe depuis Ubuntu 24.04, et `entrypoint.sh` se lance avec `OPENSIPS_BIN`, `OPENSIPS_MPATH`, `CFG_TEMPLATE`, `CFG_OUT`, `TLS_CERT`, `TLS_KEY`, `MI_FIFO` pointés hors de `/etc`. C'est ainsi que la configuration a été mise au point ; la CI joue la stack Docker.
 
-Le e2e : `yarn e2e:sip` (README, section « Vérifier »).
+Le e2e : `yarn e2e:sip` (README, section « Vérifier »). Le rapport DTMF de rtpengine (`--dtmf-log-dest`) s'ouvre sur un socket IPv6 double pile : sans IPv6 sur la machine (certains conteneurs), `RTPENGINE_DTMF_LOG=off` saute cette vérification.
+
+Limites de cette stack, à lever avant toute exposition : tout écoute sur `127.0.0.1` (passer `LISTEN_IP` et `RTPENGINE_INTERFACE` pour un autre poste de test), certificat auto-signé, identifiants PostgreSQL de dev, pas de limitation de débit sur les REGISTER (`pike`, étape 6 avec l'anti-fraude), un seul tenant (voir ARCHITECTURE §5). `SIP_DOMAIN` doit être identique ici et dans la passerelle (`SIP_DOMAIN`, ou l'hôte de `OPENSIPS_WS_URL`) : c'est le realm des empreintes ; s'ils divergent, aucun enregistrement ne passe.
 
 # PBX de dev du POC (MiniPBX + overlay), retiré à la PR 3c
 
@@ -61,15 +63,6 @@ Tous les secrets ci-dessus sont des valeurs de dev jetables.
 - Le DND est un état d'appareil ARI `Stasis:dnd<ext>` (ARI ne pilote que le préfixe `Stasis:`). Le dialplan de l'overlay le respecte pour les appels composés par un téléphone ; le provider le vérifie aussi avant un click-to-call, car ARI contourne le dialplan.
 - Click-to-call : le endpoint de l'appelant sonne d'abord, la cible est ensuite appelée et ponte.
 - Le hold demandé par l'API est signalé par le provider (ARI n'émet pas d'événement) ; avec l'audio navigateur, le hold réel est fait par le navigateur (re-INVITE).
-
-## Test navigateur (audio réel)
-
-`yarn e2e:browser` pilote deux Chrome installés localement (micro simulé) : enregistrement WSS, appel navigateur→navigateur avec paquets RTP dans les deux sens, hold/resume, puis click-to-call via le Gateway. Il faut démarrer le PBX avec l'IP vers laquelle Chrome joint les ports RTP publiés (ICE) :
-
-```bash
-ASTERISK_EXTERNAL_ADDRESS=127.0.0.1 docker compose -f docker/docker-compose.dev.yml up -d --build
-yarn e2e:browser
-```
 
 ## Plusieurs fenêtres par personne
 

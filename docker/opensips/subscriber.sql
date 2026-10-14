@@ -17,4 +17,4 @@ CREATE TABLE IF NOT EXISTS subscriber (
 );
 CREATE INDEX IF NOT EXISTS subscriber_username_idx ON subscriber (username);
 INSERT INTO version (table_name, table_version) VALUES ('subscriber', 8)
-  ON CONFLICT (table_name) DO UPDATE SET table_version = EXCLUDED.table_version;
+  ON CONFLICT (table_name) DO NOTHING;

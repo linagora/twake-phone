@@ -19,6 +19,8 @@ export interface OpensipsConfig {
   iceServers?: IceServer[]
   /** The per-user SIP secret, generated and kept by the Gateway, provisioned in `subscriber`. */
   sipSecretFor(extension: string): Promise<string>
+  /** Releases what `sipSecretFor` holds (the provisioner's connection pool) when the Gateway stops. */
+  onClose?(): Promise<void>
 }
 
 const notYet = (what: string) => Object.assign(new Error(`${what} through the Gateway arrives with the OpenSIPS events (step 4); the softphone does it directly for now`), { statusCode: 501 })
@@ -100,7 +102,9 @@ export class OpensipsProvider implements TelephonyProvider, MediaProvider {
   /** No event stream yet: the iterator ends at once, so the Gateway's pump has nothing to wait on. */
   async *subscribe(): AsyncIterable<RoutedEvent> {}
 
-  async close() {}
+  async close() {
+    await this.config.onClose?.()
+  }
 }
 
 export const opensipsProviderFactory: ProviderFactory<OpensipsConfig> = {

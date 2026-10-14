@@ -7,7 +7,7 @@ Ce document décrit ce qui est réellement implémenté dans le dépôt (état �
 ```mermaid
 flowchart LR
   subgraph Browser["Poste de l'utilisateur"]
-    Phone["App Phone<br/>(React, cozy-ui)<br/>PhoneProvider + Softphone SIP.js"]
+    Phone["App Phone<br/>(React, cozy-ui)<br/>PhoneProvider + Softphone (JsSIP depuis l'étape 3)"]
     Host["Autre app Twake (Drive…)<br/>mountPhoneWidget()"]
     Widget["Iframe d'intent : widget Phone<br/>(même PhoneProvider + Softphone)"]
     Host -- "iframe + cozy-interapp" --> Widget
@@ -67,7 +67,7 @@ Trait plein : contrôle (REST/ARI). Pointillés : signalisation SIP. Double trai
 | Plan | Qui | Où |
 |---|---|---|
 | Contrôle : appeler, raccrocher, attente, présence, état des appels, événements | Gateway et provider, via l'API REST/WebSocket du Gateway et ARI côté PBX | `apps/gateway`, `packages/provider-asterisk` |
-| Média : audio, SIP, ICE, DTLS-SRTP | Le navigateur directement vers le PBX | `packages/softphone` (SIP.js), `packages/sip-media` |
+| Média : audio, SIP, ICE, DTLS-SRTP | Le navigateur directement vers le serveur SIP | `packages/softphone` (JsSIP), `packages/sip-media` (POC) |
 
 Le Gateway ne voit jamais l'audio.
 
@@ -82,7 +82,7 @@ flowchart TB
   lk["conference-livekit<br/>(API Meet, LiveKit SIP)"]
   plink["phone-link<br/>PhoneLink, intent CALL"]
   client["telephony-client<br/>REST, WS, E.164"]
-  soft["softphone<br/>SIP.js"]
+  soft["softphone<br/>JsSIP"]
   widgetlib["phone-widget<br/>mountPhoneWidget"]
   gw["apps/gateway"]
   app["apps/phone"]
@@ -110,7 +110,7 @@ flowchart TB
 | `sip-media` | Fournit la session média `sip-webrtc` (URL WSS, identité, ICE). Réutilisable par un futur provider SIP générique. | Non |
 | `apps/gateway` | API publique `/api/v1`, annuaire utilisateur↔extension, bus d'événements, registre des providers par tenant | Non |
 | `telephony-client` | SDK front : REST (appels, historique, conférences), WebSocket avec reconnexion, normalisation et formatage E.164 | Non |
-| `softphone` | Enveloppe SIP.js : enregistrement, appels, mute, hold, DTMF, compteurs RTP, reconnexion | Non |
+| `softphone` | Enveloppe JsSIP (§5) : enregistrement, appels, mute, hold, DTMF, compteurs RTP, reconnexion | Non |
 | `phone-widget` | Monte le widget d'appel dans n'importe quelle app (iframe d'intent) | Non |
 | `phone-link` | `<PhoneLink>` et `requestCall` : rendre un numéro cliquable (intent `CALL`) | Non |
 | `conference-livekit` | Accès téléphonique aux salles Meet : client de l'API externe de Meet, client Twirp de LiveKit (trunks SIP, participants, webhooks). Aucune notion LiveKit n'en sort. | Oui (LiveKit/Meet), c'est son rôle |
@@ -240,7 +240,10 @@ Réécrit à l'étape 3 sur JsSIP (ADR 0003) : `UA` et `RTCSession`. Il ne fait 
 - Récupère à chaque démarrage `GET /me/media-session` : URL WSS, domaine SIP, poste, secret, serveurs ICE.
 - Un `SoftCall` par appel (`new`, `ringing`, `connected`, `held`, `ended` avec sa raison : raccroché, refusé, occupé, sans réponse, injoignable, annulé, échec) : répondre, refuser (603), raccrocher, attente et reprise (re-INVITE), micro, DTMF (RFC 4733 par défaut, INFO sur demande ; les INFO reçus sont remontés), `stats()` (compteurs RTP, utilisés par les e2e pour prouver que l'audio circule).
 - **Reconnexion** : JsSIP rouvre le WebSocket et se réenregistre seul quand le réseau ou le serveur tombe ; sur un enregistrement refusé (secret tourné, compte retiré), le softphone redémarre avec une session neuve de la passerelle, avec backoff.
-- Se désinscrit à la fermeture de la page (`pagehide`) et à la déconnexion de l'app.
+- Se désinscrit à la déconnexion de l'app (prouvé par le e2e : 404 ensuite) et, au mieux, à la fermeture de la page (`pagehide`, le WebSocket se ferme en même temps) ; un contact mort répond 480 à l'appelant.
+- Un seul appel à la fois (un seul élément audio) : un second appel entrant reçoit 486, le clavier refuse un second appel sortant ; la seconde ligne (transfert supervisé) arrive avec la PR 3b.
+- Le nom affiché sur un appel entrant vient du `From` posé par l'appelant (une personne authentifiée peut y mettre ce qu'elle veut) ; l'étape 4 le fera poser par OpenSIPS depuis l'annuaire.
+- Un seul tenant par serveur OpenSIPS pour l'instant : `subscriber` n'a pas de colonne de tenant (`use_domain 0`) et `lookup("location")` route entre tous les postes enregistrés. Le multi-tenant SIP viendra avec l'administration (étape 7).
 
 ## 6. L'application Phone (`apps/phone`)
 
@@ -380,7 +383,7 @@ Réseau : `telephony.twake.local` va au Gateway ; `pbx.twake.local` va au PBX en
 | `TEST_DATABASE_URL=… yarn test` | Le même contrat de stockage contre PostgreSQL (isolation entre tenants, conférences) |
 | `apps/phone` : `npx jest`, `yarn lint` | UI : dialer, vue d'appel selon capabilities, récents, widget, visio, règles du `PhoneProvider` ; lint sans erreur |
 | `yarn e2e:live` | API complète contre le PBX réel avec deux agents SIP (appel, présence, hold, DND, idempotence) |
-| `yarn e2e:browser` | Deux Chrome : enregistrement WSS, reconnexion après coupure, audio dans les deux sens (paquets RTP), hold, click-to-call |
+| `yarn e2e:sip` (remplace `e2e:browser` du POC) | Deux Chromium à travers OpenSIPS et rtpengine : enregistrement WSS, appel, RTP dans les deux sens, attente, DTMF, reconnexion après coupure, désinscription |
 | `yarn e2e:widget` | Un « Drive » factice avec la vraie `cozy-interapp` : carte visible, appel décroché depuis le widget |
 | `node docker/meet-sip/platform.e2e.mjs` | Visio sur la plateforme, sans simulation : jetons Cozy réels, Meet, LiveKit, LiveKit SIP, PBX (§12) |
 | `node docker/meet-sip/smoke.mjs` | LiveKit seul, mode sans Meet |

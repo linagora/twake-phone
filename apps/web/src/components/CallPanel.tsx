@@ -19,7 +19,7 @@ const REASON_KEY: Record<NonNullable<SoftCall['endReason']>, Key> = {
 
 const who = (call: SoftCall) => (call.remoteName ? `${call.remoteName} (${formatNumber(call.remoteNumber)})` : formatNumber(call.remoteNumber))
 
-/** Elapsed time of a connected call, as m:ss, refreshed every second. */
+/** Elapsed time of a connected call, as m:ss, refreshed every second; outside any live region, so never read aloud each second. */
 const Timer = ({ since }: { since: Date }) => {
   const [now, setNow] = useState(() => Date.now())
   useEffect(() => {
@@ -28,7 +28,7 @@ const Timer = ({ since }: { since: Date }) => {
   }, [])
   const s = Math.max(0, Math.floor((now - since.getTime()) / 1000))
   return (
-    <span className="timer" aria-hidden="true">
+    <span className="timer">
       {Math.floor(s / 60)}:{String(s % 60).padStart(2, '0')}
     </span>
   )
@@ -37,27 +37,38 @@ const Timer = ({ since }: { since: Date }) => {
 const Incoming = ({ call }: { call: SoftCall }) => {
   const { t } = useT()
   const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
   const act = (fn: () => Promise<void>) => async () => {
     setBusy(true)
+    setError(null)
     try {
       await fn()
+    } catch (err) {
+      // The caller gave up, or another window answered first: the banner goes when the call does; say why meanwhile.
+      setError(err instanceof Error ? err.message : String(err))
     } finally {
       setBusy(false)
     }
   }
+  // A live region, not a dialog: nothing traps the focus, the person keeps typing where they were.
   return (
-    <section className="call call-incoming" role="alertdialog" aria-labelledby={`call-${call.id}`} aria-live="assertive">
+    <section className="call call-incoming" role="region" aria-labelledby={`call-${call.id}`} aria-live="assertive" data-testid="incoming-call">
       <p id={`call-${call.id}`} className="call-title">
         {t('call.incoming', { who: who(call) })}
       </p>
       <div className="actions">
-        <button type="button" className="btn btn-primary" onClick={act(() => call.answer())} disabled={busy} autoFocus>
+        <button type="button" className="btn btn-primary" onClick={act(() => call.answer())} disabled={busy}>
           {t('call.answer')}
         </button>
         <button type="button" className="btn btn-danger" onClick={act(() => call.reject())} disabled={busy}>
           {t('call.reject')}
         </button>
       </div>
+      {error ? (
+        <p className="alert alert-error" role="alert">
+          {error}
+        </p>
+      ) : null}
     </section>
   )
 }
@@ -80,8 +91,9 @@ const Active = ({ call, tones }: { call: SoftCall; tones: string }) => {
   return (
     <section className="call" aria-labelledby={`call-${call.id}`}>
       <p id={`call-${call.id}`} className="call-title" role="status">
-        {title} {connected && call.connectedAt ? <Timer since={call.connectedAt} /> : null}
+        {title}
       </p>
+      {connected && call.connectedAt ? <Timer since={call.connectedAt} /> : null}
       {call.remoteHold ? <p className="badge">{t('call.remoteHold')}</p> : null}
       {tones ? <p className="badge">{t('call.tonesReceived', { tones })}</p> : null}
       <div className="actions">

@@ -1,5 +1,5 @@
 import { UA, WebSocketInterface } from 'jssip'
-import type { RTCSession } from 'jssip/lib/RTCSession.js'
+import type { EndEvent, RTCSession } from 'jssip/lib/RTCSession.js'
 import type { UAConfiguration } from 'jssip/lib/UA.js'
 import type { MediaSession } from '@twake/telephony-types'
 
@@ -27,6 +27,8 @@ export interface SoftCall {
   readonly connectedAt?: Date
   readonly endedAt?: Date
   readonly endReason?: EndReason
+  /** SIP status code the call ended with, when a response ended it (404 nobody registered, 480 a dead contact...). */
+  readonly endStatus?: number
   /** The far end put us on hold (re-INVITE with sendonly or inactive). */
   readonly remoteHold: boolean
   readonly muted: boolean
@@ -96,6 +98,7 @@ class WebCall implements SoftCall {
   connectedAt?: Date
   endedAt?: Date
   endReason?: EndReason
+  endStatus?: number
   remoteHold = false
   muted = false
   renegotiating = false
@@ -154,9 +157,12 @@ class WebCall implements SoftCall {
     session.on('newDTMF', (e: { originator: string; dtmf: { tone: string } }) => {
       if (e.originator === 'remote') this.dtmf(this, e.dtmf.tone)
     })
-    const end = (e: { originator: string; cause?: string }) => {
+    const end = (e: EndEvent) => {
       this.endedAt = new Date()
       this.endReason = toReason(e.cause)
+      // A response (the far end's 404, 480, 486, 603...) carries a status; a request (a BYE) does not.
+      const status = e.message && 'status_code' in e.message ? (e.message as { status_code?: unknown }).status_code : undefined
+      this.endStatus = typeof status === 'number' ? status : undefined
       this.reofferPending?.reject(new Error('Call ended'))
       this.reofferPending = undefined
       this.renegotiating = false
@@ -272,6 +278,9 @@ class WebCall implements SoftCall {
 const REOFFER_RETRY_MS = 5_000
 const REOFFER_RETRY_EVERY_MS = 100
 
+/** Restarts on refused registrations before the softphone gives up (about 30 s apart at the end). */
+const MAX_RESTARTS = 12
+
 const restartDelay = (attempt: number) => Math.floor(Math.random() * Math.min(30_000, 500 * 2 ** attempt))
 
 /**
@@ -285,6 +294,15 @@ export class Softphone {
   private stopped = false
   private restartTimer?: ReturnType<typeof setTimeout>
   private restartAttempt = 0
+  /** A restart was due during a call: it runs once the last call is over. */
+  private restartWhenIdle = false
+  private readonly onPagehide = () => {
+    try {
+      this.ua?.unregister()
+    } catch {
+      // the socket may be gone already
+    }
+  }
   private pagehideBound = false
   private readonly calls = new Map<string, WebCall>()
 
@@ -321,24 +339,34 @@ export class Softphone {
     }
     const ua = this.options.createUserAgent?.(config) ?? (new UA(config) as unknown as UserAgentLike)
     this.ua = ua
+    // A replaced user agent still emits (its own disconnect, late replies): only the current one speaks.
+    const live = () => this.ua === ua
     let registeredOnce = false
     ua.on('registered', () => {
+      if (!live()) return
       registeredOnce = true
       this.restartAttempt = 0
       this.options.onRegistration?.('registered')
     })
-    ua.on('unregistered', () => this.options.onRegistration?.('unregistered'))
+    ua.on('unregistered', () => live() && this.options.onRegistration?.('unregistered'))
     ua.on('disconnected', (e: { error?: boolean; reason?: string }) => {
-      if (!this.stopped) this.options.onRegistration?.('unregistered', e?.reason)
+      if (live() && !this.stopped) this.options.onRegistration?.('unregistered', e?.reason)
     })
     ua.on('registrationFailed', (e: { cause?: string; response?: { status_code?: number } }) => {
+      if (!live()) return
       const detail = e?.response?.status_code ? `${e.response.status_code}` : e?.cause
       this.options.onRegistration?.('failed', detail)
       // Refused (secret rotated, account removed) rather than unreachable: come back with a fresh session.
       if (!this.stopped && (registeredOnce || e?.response)) this.scheduleRestart()
     })
     ua.on('newRTCSession', (e: { originator: string; session: RTCSession }) => {
+      if (!live()) return
       const direction = e.originator === 'remote' ? 'inbound' : 'outbound'
+      if (direction === 'inbound' && this.activeCalls().length) {
+        // One call at a time for now (one audio element, no call waiting): the second caller hears busy.
+        e.session.terminate({ status_code: 486, reason_phrase: 'Busy Here' })
+        return
+      }
       const call = this.wrap(e.session, direction)
       if (direction === 'inbound') {
         this.options.onIncoming?.(call)
@@ -348,19 +376,14 @@ export class Softphone {
     if (!this.pagehideBound && typeof window !== 'undefined') {
       this.pagehideBound = true
       // Leaving the page: drop the registration so the SIP server does not ring a window that is gone.
-      window.addEventListener('pagehide', () => {
-        try {
-          this.ua?.unregister()
-        } catch {
-          // the socket may be gone already
-        }
-      })
+      window.addEventListener('pagehide', this.onPagehide)
     }
     ua.start()
   }
 
   async call(target: string): Promise<SoftCall> {
     if (!this.ua || !this.session) throw new Error('Softphone not started')
+    if (this.activeCalls().length) throw new Error('A call is already in progress')
     if (!/^[+0-9A-Za-z*#._-]{1,64}$/.test(target)) throw new Error('Invalid target')
     const domain = this.session.domain ?? new URL(this.session.websocketUrl).hostname
     const session = this.ua.call(`sip:${target}@${domain}`, {
@@ -372,25 +395,42 @@ export class Softphone {
     return this.calls.get(session.id) ?? this.wrap(session, 'outbound')
   }
 
+  /**
+   * Comes back with a fresh media session, later and later (up to 30 s) while registrations keep being refused,
+   * never during a call (stopping the user agent would hang it up), and gives up after MAX_RESTARTS.
+   */
   private scheduleRestart() {
     if (this.stopped || this.restartTimer) return
+    if (this.restartAttempt >= MAX_RESTARTS) {
+      this.options.onRegistration?.('failed', 'registration refused repeatedly')
+      return
+    }
+    const attempt = this.restartAttempt++
     this.restartTimer = setTimeout(async () => {
       this.restartTimer = undefined
       if (this.stopped) return
+      if (this.activeCalls().length) {
+        this.restartWhenIdle = true
+        return
+      }
       try {
         this.ua?.stop()
         await this.boot()
       } catch {
-        this.restartAttempt++
         this.scheduleRestart()
       }
-    }, restartDelay(this.restartAttempt))
+    }, restartDelay(attempt))
   }
 
   async stop() {
     this.stopped = true
     clearTimeout(this.restartTimer)
     this.restartTimer = undefined
+    this.restartWhenIdle = false
+    if (this.pagehideBound && typeof window !== 'undefined') {
+      window.removeEventListener('pagehide', this.onPagehide)
+      this.pagehideBound = false
+    }
     for (const call of this.activeCalls()) await call.hangup().catch(() => undefined)
     this.ua?.stop()
     this.ua = undefined
@@ -407,6 +447,10 @@ export class Softphone {
       c => {
         if (c.state === 'ended') this.calls.delete(c.id)
         this.options.onCallChange?.(c)
+        if (c.state === 'ended' && this.restartWhenIdle && !this.activeCalls().length) {
+          this.restartWhenIdle = false
+          this.scheduleRestart()
+        }
       },
       (c, tone) => this.options.onDtmf?.(c, tone),
       this.session?.iceServers ?? []

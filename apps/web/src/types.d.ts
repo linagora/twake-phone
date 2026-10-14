@@ -4,7 +4,9 @@ declare module '*.css'
 interface Window {
   twakephone?: {
     state: string
-    calls: { id: string; direction: string; state: string; remoteNumber: string; remoteHold: boolean; muted: boolean }[]
+    calls: { id: string; direction: string; state: string; remoteNumber: string; remoteHold: boolean; muted: boolean; renegotiating: boolean }[]
+    /** The last call that ended, kept a few seconds: why and, when the far end said so, the SIP status. */
+    lastEnded: { remoteNumber: string; endReason?: string; endStatus?: number } | null
     tones: Record<string, string>
     stats: () => Promise<{ packetsReceived: number; packetsSent: number }[]>
   }

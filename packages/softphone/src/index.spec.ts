@@ -164,6 +164,8 @@ describe('Softphone', () => {
     ua().emit('newRTCSession', { originator: 'remote', session: s })
     await incoming[0]!.reject()
     expect(s.terminate).toHaveBeenCalledWith({ status_code: 603, reason_phrase: 'Decline' })
+    // JsSIP reports the refusal; until then the call is still active and a second caller would hear busy.
+    s.emit('failed', { originator: 'local', cause: 'Rejected' })
     const s2 = new FakeSession('incoming')
     ua().emit('newRTCSession', { originator: 'remote', session: s2 })
     s2.emit('accepted', { originator: 'local' })
