@@ -5,11 +5,13 @@
 set -eu
 : "${RTPENGINE_INTERFACE:=127.0.0.1}"
 : "${RTPENGINE_LISTEN:=127.0.0.1:22222}"
+# Text CLI (rtpengine-ctl) on the loopback: the healthcheck of the stack asks it for the session count.
+: "${RTPENGINE_CLI:=127.0.0.1:9900}"
 : "${RTPENGINE_PORT_MIN:=30000}"
 : "${RTPENGINE_PORT_MAX:=30100}"
 : "${RTPENGINE_LOG_LEVEL:=5}"
 # Where detected RFC 4733 tones are reported (JSON over UDP), for the e2e; empty disables it.
 : "${RTPENGINE_DTMF_LOG:=}"
 exec rtpengine --foreground --log-stderr --no-fallback --table=-1 \
-  --interface="$RTPENGINE_INTERFACE" --listen-ng="$RTPENGINE_LISTEN" \
+  --interface="$RTPENGINE_INTERFACE" --listen-ng="$RTPENGINE_LISTEN" --listen-cli="$RTPENGINE_CLI" \
   --port-min="$RTPENGINE_PORT_MIN" --port-max="$RTPENGINE_PORT_MAX" --log-level="$RTPENGINE_LOG_LEVEL" ${RTPENGINE_DTMF_LOG:+--dtmf-log-dest="$RTPENGINE_DTMF_LOG"} "$@"

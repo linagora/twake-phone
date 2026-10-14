@@ -39,7 +39,8 @@ services:
       RTPENGINE_DTMF_LOG: ${RTPENGINE_DTMF_LOG:-127.0.0.1:22223}
     network_mode: host
     healthcheck:
-      test: ["CMD-SHELL", "rtpengine-ctl -ip 127.0.0.1 -port 22222 list numsessions >/dev/null 2>&1"]
+      # The CLI port (--listen-cli), not the NG control socket OpenSIPS uses.
+      test: ["CMD-SHELL", "rtpengine-ctl -ip 127.0.0.1 -port 9900 list numsessions >/dev/null 2>&1"]
       interval: 2s
       timeout: 3s
       retries: 15

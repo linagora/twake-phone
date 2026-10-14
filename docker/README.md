@@ -10,7 +10,7 @@ docker compose -f docker/docker-compose.sip.yml up --build --wait
 |---|---|
 | SIP sur WebSocket | `ws://127.0.0.1:8088`, `wss://127.0.0.1:8089` (certificat auto-signé fait au démarrage, à faire accepter au navigateur ; `TLS_CERT` et `TLS_KEY` pour en fournir un) |
 | SIP UDP (trunk à l'étape 6) | `127.0.0.1:5060` |
-| rtpengine | contrôle `udp:127.0.0.1:22222`, RTP `30000-30100/udp`, rapport des DTMF détectés `127.0.0.1:22223/udp` |
+| rtpengine | contrôle `udp:127.0.0.1:22222`, CLI `127.0.0.1:9900/tcp` (healthcheck), RTP `30000-30100/udp`, rapport des DTMF détectés `127.0.0.1:22223/udp` |
 | PostgreSQL | `postgres://twake:twake@127.0.0.1:54320/twake` (`subscriber` créée au premier démarrage par `opensips/subscriber.sql`, la copie de `SUBSCRIBER_SCHEMA` du provider) |
 | Variables | `SIP_DOMAIN` (domaine SIP, realm et adresse annoncée dans Via et Record-Route ; `127.0.0.1` par défaut), `LISTEN_IP`, `OPENSIPS_LOG_LEVEL`, `RTPENGINE_INTERFACE` (`<privée>!<publique>` derrière un NAT) |
 
