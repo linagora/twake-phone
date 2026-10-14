@@ -1,0 +1,32 @@
+{
+  "name": "twake-phone-monorepo",
+  "private": true,
+  "license": "AGPL-3.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "workspaces": [
+    "packages/*",
+    "apps/gateway"
+  ],
+  "scripts": {
+    "build": "yarn workspaces run build",
+    "typecheck": "tsc -b packages/telephony-types packages/provider-sdk packages/sip-media packages/telephony-client packages/phone-link packages/provider-asterisk packages/conference-livekit apps/gateway",
+    "test": "vitest run",
+    "dev:gateway": "yarn workspace @twake/telephony-gateway dev",
+    "e2e:live": "yarn build && NODE_TLS_REJECT_UNAUTHORIZED=0 node apps/gateway/test/e2e.live.mjs",
+    "harness:build": "esbuild packages/softphone/harness/main.ts --bundle --format=esm --outfile=packages/softphone/harness/dist/main.js --log-level=warning && cp packages/softphone/harness/index.html packages/softphone/harness/dist/",
+    "e2e:browser": "yarn build && yarn harness:build && node packages/softphone/test/browser.e2e.mjs",
+    "e2e:widget": "yarn build && (cd apps/phone && npx rsbuild build) && node apps/phone/test/widget-host.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/react": "18.3.12",
+    "esbuild": "^0.28.2",
+    "jsdom": "26",
+    "playwright-core": "^1.63.0",
+    "react": "18.3.1",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.4"
+  }
+}

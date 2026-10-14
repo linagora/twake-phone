@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gateway-and-packages:
+    name: Paquets et passerelle (Node 22, PostgreSQL)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: twake
+          POSTGRES_PASSWORD: twake
+          POSTGRES_DB: twake_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U twake"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: yarn
+          cache-dependency-path: |
+            yarn.lock
+            apps/phone/yarn.lock
+      - run: yarn install --frozen-lockfile
+      # cozy-client et cozy-interapp sont des peer deps de phone-link, installées avec l'app :
+      # vitest.config.ts les résout dans apps/phone/node_modules (engines 24.x, d'où --ignore-engines).
+      - run: yarn --cwd apps/phone install --frozen-lockfile --ignore-engines
+      - run: yarn build
+      - run: yarn typecheck
+      - name: Tests unitaires et contrat de stockage (mémoire et PostgreSQL)
+        run: yarn test
+        env:
+          TEST_DATABASE_URL: postgres://twake:twake@localhost:5432/twake_test
+
+  app-phone:
+    name: App Phone (Node 24)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: yarn
+          cache-dependency-path: |
+            yarn.lock
+            apps/phone/yarn.lock
+      # L'app résout @twake/* vers packages/*/dist (jest.config.js, rsbuild.config.mjs) :
+      # il faut installer et construire la racine d'abord.
+      - run: yarn install --frozen-lockfile
+      - run: yarn build
+      - run: yarn install --frozen-lockfile
+        working-directory: apps/phone
+      - run: yarn lint
+        working-directory: apps/phone
+      - run: yarn test
+        working-directory: apps/phone
+      - run: yarn build
+        working-directory: apps/phone
+
+  # Les e2e sur la stack Docker (yarn e2e:live, yarn e2e:browser, yarn e2e:widget, platform.e2e.mjs)
+  # demandent MiniPBX, LiveKit et la stack Twake : ils se jouent à chaque porte de sortie sur un
+  # poste de dev (CONTRIBUTING.md), et passeront en CI quand l'étape 3 aura remplacé MiniPBX par
+  # OpenSIPS et rtpengine en Docker Compose.

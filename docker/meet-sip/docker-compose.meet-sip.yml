@@ -1,0 +1,46 @@
+# Meet dial-in / dial-out: LiveKit SIP bridging the dev PBX and the stack's LiveKit.
+# Requires the Twake stack with --meet (livekit + valkey) and docker-compose.dev.yml (pbx).
+#   docker compose -f docker-compose.dev.yml -f meet-sip/docker-compose.meet-sip.yml up -d
+# Standalone: docker compose -f meet-sip/docker-compose.meet-sip.yml up -d
+services:
+  livekit-sip:
+    image: livekit/sip:latest
+    container_name: twake-dev-livekit-sip
+    restart: unless-stopped
+    environment:
+      SIP_CONFIG_BODY: |
+        api_key: ${LIVEKIT_API_KEY:-9f3b2c7a8e6d4f1c}
+        api_secret: ${LIVEKIT_API_SECRET:-6a9d0a3f5e4b8c2f9a7d6e3c1b4f8a2e}
+        ws_url: ws://visio-livekit:7880
+        redis:
+          address: valkey:6379
+          password: valkeypass
+        sip_port: 5070
+        rtp_port: 20000-20100
+        use_external_ip: false
+        logging:
+          level: info
+    ports:
+      - "127.0.0.1:5070:5070/udp"
+      - "20000-20100:20000-20100/udp"
+    networks:
+      twake-network:
+        ipv4_address: 172.27.0.60
+
+  # Turns on the Meet endpoints of the Gateway (/api/v1/conferences) when merged with docker-compose.dev.yml.
+  gateway:
+    environment:
+      LIVEKIT_URL: http://visio-livekit:7880
+      LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:-9f3b2c7a8e6d4f1c}
+      LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:-6a9d0a3f5e4b8c2f9a7d6e3c1b4f8a2e}
+      # LiveKit dials the PBX here for dial-out; people dial this internal number to enter a room.
+      MEET_OUTBOUND_ADDRESS: pbx:5080
+      MEET_DIALIN_NUMBERS: "8000"
+      # Meet owns rooms and PINs: the Gateway is one of its applications (external API), see docker/README.md.
+      MEET_URL: http://visio-backend:8000
+      MEET_CLIENT_ID: ${MEET_CLIENT_ID:-}
+      MEET_CLIENT_SECRET: ${MEET_CLIENT_SECRET:-}
+
+networks:
+  twake-network:
+    external: true

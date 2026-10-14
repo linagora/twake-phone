@@ -4,6 +4,7 @@
 
 **La téléphonie souveraine de Twake : un softphone dans le navigateur, un serveur SIP libre, un trunk opérateur, et zéro licence par utilisateur.**
 
+[![CI](https://github.com/linagora/twake-phone/actions/workflows/ci.yml/badge.svg)](https://github.com/linagora/twake-phone/actions/workflows/ci.yml)
 [![Licence AGPL-3.0](https://img.shields.io/badge/licence-AGPL--3.0-blue.svg)](#licence)
 [![Statut](https://img.shields.io/badge/statut-%C3%A9tape%201%20%2F%2011-orange.svg)](#le-plan-en-11-%C3%A9tapes)
 [![Stack](https://img.shields.io/badge/stack-React%20%C2%B7%20JsSIP%20%C2%B7%20Fastify%20%C2%B7%20OpenSIPS-informational.svg)](#la-pile)
@@ -97,7 +98,7 @@ Retirés par décision du 13 octobre 2026 : Linphone desktop, Flexisip, SIP.js, 
 
 ## Origine : le POC
 
-Ce dépôt part du **POC Twake Phone** de Linagora : <https://ci.linagora.com/tdelobelle/poc-twake-phone> (AGPL-3.0).
+Ce dépôt part du **POC Twake Phone** de Linagora : <https://ci.linagora.com/tdelobelle/poc-twake-phone> (AGPL-3.0). Son README d'origine est conservé dans [docs/POC.md](docs/POC.md), sa documentation dans [docs/](docs/).
 
 Le POC a prouvé le cœur : la Twake Telephony Gateway et son contrat de provider, le softphone navigateur, l'accès à Meet par téléphone avec dial-out, et une stack de dev complète avec de vrais appels SIP en e2e. TwakePhone reprend ce code et le pousse vers l'architecture ci-dessus :
 
@@ -118,7 +119,7 @@ Pas de calendrier en semaines : le développement avance par étapes ordonnées,
 
 | # | Étape | Démo de sortie | État |
 |---|---|---|---|
-| 1 | **Monorepo** : import du POC, passerelle, `provider-sdk`, `conference-livekit`, tests, ADR | `yarn test` vert, ADR relus | en cours |
+| 1 | **Monorepo** : import du POC avec tous ses tests, ADR, CI | `yarn test` vert, ADR relus | PR ouverte |
 | 2 | **App React autonome** : OIDC, annuaire LDAP et CardDAV, synchronisation des comptes, CSP, socle RGAA | Connexion SSO, recherche d'un collègue | |
 | 3 | **OpenSIPS et JsSIP** : Docker OpenSIPS + rtpengine, softphone réécrit, attente, transfert direct et supervisé, DTMF, trois navigateurs | Deux utilisateurs s'appellent, s'attendent, se transfèrent | |
 | 4 | **provider-opensips** : événements, présence, CDR, renvois, NPD planifié, groupes | La pastille change pendant un appel, un renvoi est appliqué | |
@@ -132,47 +133,63 @@ Pas de calendrier en semaines : le développement avance par étapes ordonnées,
 
 Ensuite : QoS, exploitation et haute disponibilité, pilote de 30 à 50 utilisateurs, mobile, transcription des appels.
 
-## Organisation du dépôt (cible de l'étape 1)
+## Organisation du dépôt
+
+Ce qui existe à la fin de l'étape 1 (le POC importé) :
 
 ```
-apps/phone                   application TwakePhone (React, JsSIP, OIDC)
+apps/phone                   application Phone (React 18, encore Cozy et SIP.js : étapes 2 et 3)
 apps/gateway                 Twake Telephony Gateway (Fastify, PostgreSQL, OpenAPI sur /docs)
 packages/telephony-types     modèle neutre : Call, Presence, Capabilities
 packages/provider-sdk        contrat TelephonyProvider / MediaProvider / ConferenceBridgeProvider
 packages/telephony-client    SDK front : REST, WebSocket, E.164, conférences
-packages/softphone           softphone JsSIP et harnais de test navigateur
+packages/provider-asterisk   provider de référence du POC (ARI) ; remplacé à l'étape 4
+packages/softphone           softphone SIP.js et harnais de test navigateur ; JsSIP à l'étape 3
 packages/sip-media           plan média SIP / WebRTC partagé
-packages/provider-opensips   OpenSIPS : événements, présence, CDR, règles d'appel
-packages/provider-ovh        OVHcloud : CDR, état du trunk, repli par l'API
-packages/provider-wazo       Wazo (étape 11)
+packages/phone-link          <PhoneLink> et requestCall : numéro cliquable (intent CALL)
+packages/phone-widget        widget d'appel à monter dans les autres apps Twake Workplace
 packages/conference-livekit  Meet : API externe, LiveKit SIP, dial-in, dial-out
-docker/                      OpenSIPS, rtpengine, LiveKit SIP, PostgreSQL, stack de dev
-docs/adr/                    une décision, un fichier
+docker/                      stack de dev du POC : MiniPBX + overlay ARI/WebRTC, LiveKit SIP, correctifs Twake
+scripts/                     mise en place de la stack de dev
+docs/                        documentation du POC, docs/adr/ : une décision, un fichier
 ```
+
+À venir : `packages/provider-opensips` (étape 4), `packages/provider-ovh` (étape 10), `packages/provider-wazo` (étape 11), `docker/` sur OpenSIPS et rtpengine (étape 3).
 
 ## Démarrer
 
-Prérequis : Node 22+, Yarn 1, Docker.
+Prérequis : Node 24 (`.nvmrc` ; la passerelle et les paquets acceptent 22+), Yarn 1, Docker.
 
 ```bash
-yarn install && yarn build && yarn test   # paquets et passerelle, aucun service externe
-docker compose -f docker/docker-compose.dev.yml up   # OpenSIPS, rtpengine, PostgreSQL, LiveKit SIP
-yarn dev:gateway                           # passerelle sur http://localhost:8080, OpenAPI sur /docs
-(cd apps/phone && yarn start)              # application
+yarn install && yarn build && yarn test        # paquets et passerelle, aucun service externe
+(cd apps/phone && yarn install && yarn test)   # application (résout @twake/* vers packages/*/dist)
+yarn dev:gateway                               # passerelle sur http://localhost:8080, OpenAPI sur /docs
 ```
+
+Stack complète en local (Twake, Phone, passerelle, PBX de dev), encore celle du POC jusqu'à l'étape 3 :
+
+```bash
+scripts/setup-references.sh          # clone la stack Twake, Drive et MiniPBX aux révisions testées, applique les correctifs
+cp docker/.env.example docker/.env   # puis renseigner les secrets (voir le fichier)
+scripts/start-twake-stack.sh         # demande le mot de passe pour trois réglages de l'hôte, expliqués dans le script
+```
+
+Visio (accès téléphonique aux salles Meet) et trunk SIP réel : [docker/README.md](docker/README.md).
 
 | Commande | Vérifie |
 |---|---|
-| `yarn test` | unitaires de tous les paquets et de la passerelle (vitest), contrat de stockage mémoire et PostgreSQL |
-| `yarn e2e:live` | passerelle ↔ OpenSIPS, avec de vrais appels SIP |
+| `yarn test` | unitaires de tous les paquets et de la passerelle (vitest), contrat de stockage mémoire et, avec `TEST_DATABASE_URL`, PostgreSQL |
+| `cd apps/phone && yarn lint && yarn test` | application (eslint, stylint, jest) |
+| `yarn e2e:live` | passerelle ↔ PBX de dev (MiniPBX, ARI), avec de vrais appels SIP |
 | `yarn e2e:browser` | deux navigateurs, audio réel simulé (WebRTC) |
-| `node docker/meet-sip/platform.e2e.mjs` | Meet sur la plateforme : jetons, LiveKit, SIP |
+| `yarn e2e:widget` | widget dans un hôte cozy-interapp réel |
+| `node docker/meet-sip/platform.e2e.mjs` | Meet sur la plateforme : jetons, LiveKit, SIP, PBX |
 
-Ces commandes sont celles du POC ; elles deviennent vraies ici à la fin de l'étape 1.
+La CI joue les deux premières lignes sur chaque PR ; les e2e demandent la stack Docker et se jouent à chaque porte de sortie. L'étape 3 remplace MiniPBX (hébergé chez un tiers, `git.oriatec.fr`) par OpenSIPS et rtpengine en Docker Compose, ce qui les fera entrer en CI.
 
 ## Décisions
 
-Chaque décision est un ADR dans `docs/adr/`. Celles déjà prises, le 13 octobre 2026 :
+Chaque décision est un ADR dans [docs/adr/](docs/adr/README.md). Celles déjà prises, le 13 octobre 2026 :
 
 | Décision | Choix | Alternative écartée |
 |---|---|---|
@@ -188,14 +205,14 @@ Chaque décision est un ADR dans `docs/adr/`. Celles déjà prises, le 13 octobr
 
 ## Contribuer
 
-- Une étape, une branche, une PR, une démo. La PR dit ce qu'on voit avant et après.
+- Une fonctionnalité ou un correctif, une branche, une PR, une revue indépendante qui cherche ce qui casse. Voir [CONTRIBUTING.md](CONTRIBUTING.md).
 - Une PR qui ajoute une notion de fournisseur hors de son `provider-*` est refusée.
 - Les tests du POC restent verts à chaque étape ; un test n'est jamais désactivé pour passer.
 - Secrets : jamais dans le dépôt, jamais dans un `.env` commité. Références `env:NOM`.
 
 ## Licence
 
-AGPL-3.0, comme le POC dont ce dépôt est issu. Le fichier `LICENSE` arrive avec l'import du POC à l'étape 1.
+AGPL-3.0, voir [LICENSE](LICENSE), comme le POC dont ce dépôt est issu.
 
 ---
 

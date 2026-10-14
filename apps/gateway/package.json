@@ -1,0 +1,32 @@
+{
+  "name": "@twake/telephony-gateway",
+  "version": "0.1.0",
+  "license": "AGPL-3.0",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -b",
+    "dev": "tsc -b && AUTH_MODE=dev node dist/main.js",
+    "start": "node dist/main.js"
+  },
+  "dependencies": {
+    "@fastify/cors": "^11.3.0",
+    "@fastify/swagger": "^9.0.0",
+    "@fastify/swagger-ui": "^5.0.0",
+    "@fastify/websocket": "^11.0.0",
+    "@twake/conference-livekit": "*",
+    "@twake/provider-asterisk": "*",
+    "@twake/telephony-provider-sdk": "*",
+    "@twake/telephony-types": "*",
+    "fastify": "^5.0.0",
+    "jose": "^6.2.12",
+    "pg": "^8.23.1"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.23.1"
+  }
+}

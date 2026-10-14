@@ -1,0 +1,13 @@
+{
+  "name": "@twake/phone-link",
+  "version": "0.1.0",
+  "description": "Makes a phone number clickable in any Twake app: asks Twake Phone to call it (CALL intent).",
+  "license": "AGPL-3.0",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": ["dist"],
+  "scripts": { "build": "tsc -b" },
+  "dependencies": { "@twake/telephony-client": "*" },
+  "peerDependencies": { "cozy-client": ">=60", "cozy-interapp": ">=0.18.0", "react": ">=18" }
+}
