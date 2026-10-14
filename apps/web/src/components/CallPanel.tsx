@@ -87,7 +87,7 @@ const Active = ({ call, tones }: { call: SoftCall; tones: string }) => {
       <div className="actions">
         {connected ? (
           <>
-            <button type="button" className="btn" aria-pressed={call.state === 'held'} onClick={guard(() => (call.state === 'held' ? call.resume() : call.hold()))}>
+            <button type="button" className="btn" aria-pressed={call.state === 'held'} disabled={call.renegotiating} onClick={guard(() => (call.state === 'held' ? call.resume() : call.hold()))}>
               {call.state === 'held' ? t('call.resume') : t('call.hold')}
             </button>
             <button type="button" className="btn" aria-pressed={call.muted} onClick={guard(() => call.setMuted(!call.muted))}>

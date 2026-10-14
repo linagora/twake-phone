@@ -109,7 +109,7 @@ export const SoftphoneProvider = ({ children }: { children: ReactNode }) => {
   useEffect(() => {
     window.twakephone = {
       state,
-      calls: calls.map(c => ({ id: c.id, direction: c.direction, state: c.state, remoteNumber: c.remoteNumber, remoteHold: c.remoteHold, muted: c.muted })),
+      calls: calls.map(c => ({ id: c.id, direction: c.direction, state: c.state, remoteNumber: c.remoteNumber, remoteHold: c.remoteHold, muted: c.muted, renegotiating: c.renegotiating })),
       tones,
       stats: () => Promise.all(calls.map(c => c.stats()))
     }

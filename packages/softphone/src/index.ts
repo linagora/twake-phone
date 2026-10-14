@@ -30,6 +30,8 @@ export interface SoftCall {
   /** The far end put us on hold (re-INVITE with sendonly or inactive). */
   readonly remoteHold: boolean
   readonly muted: boolean
+  /** A re-INVITE of ours (hold, resume) is waiting for the far end's answer: no other offer until then. */
+  readonly renegotiating: boolean
   answer(): Promise<void>
   reject(): Promise<void>
   hangup(): Promise<void>
@@ -96,9 +98,10 @@ class WebCall implements SoftCall {
   endReason?: EndReason
   remoteHold = false
   muted = false
+  renegotiating = false
   readonly remoteNumber: string
   readonly remoteName: string
-  private holdPending?: { resolve: () => void; reject: (e: Error) => void }
+  private reofferPending?: { reject: (e: Error) => void }
 
   constructor(
     readonly id: string,
@@ -126,8 +129,6 @@ class WebCall implements SoftCall {
     })
     session.on('hold', (e: { originator: string }) => {
       if (e.originator === 'local') {
-        this.holdPending?.resolve()
-        this.holdPending = undefined
         this.set('held')
       } else {
         this.remoteHold = true
@@ -136,8 +137,6 @@ class WebCall implements SoftCall {
     })
     session.on('unhold', (e: { originator: string }) => {
       if (e.originator === 'local') {
-        this.holdPending?.resolve()
-        this.holdPending = undefined
         this.set('connected')
       } else {
         this.remoteHold = false
@@ -158,8 +157,9 @@ class WebCall implements SoftCall {
     const end = (e: { originator: string; cause?: string }) => {
       this.endedAt = new Date()
       this.endReason = toReason(e.cause)
-      this.holdPending?.reject(new Error('Call ended'))
-      this.holdPending = undefined
+      this.reofferPending?.reject(new Error('Call ended'))
+      this.reofferPending = undefined
+      this.renegotiating = false
       this.set('ended')
     }
     session.on('ended', end)
@@ -204,25 +204,45 @@ class WebCall implements SoftCall {
     this.session.terminate()
   }
 
-  private toggleHold(hold: boolean) {
+  /**
+   * Sends one offer of ours (hold or resume) and settles when the far end has answered it. JsSIP refuses an offer
+   * while another one, ours or the far end's, is still unanswered (a hold just sent, on a slow link): the offer
+   * is then retried for a few seconds before giving up.
+   */
+  private reoffer(start: (done: () => void) => boolean, what: string) {
     return new Promise<void>((resolve, reject) => {
       if (this.state === 'ended') return reject(new Error('Call ended'))
-      if (hold ? this.state === 'held' : this.state !== 'held') return resolve()
-      this.holdPending = { resolve, reject }
-      const started = hold ? this.session.hold() : this.session.unhold()
-      if (!started) {
-        this.holdPending = undefined
-        reject(new Error(hold ? 'Hold refused' : 'Resume refused'))
+      if (this.reofferPending) return reject(new Error(`${what} refused: another offer is pending`))
+      const deadline = Date.now() + REOFFER_RETRY_MS
+      const attempt = () => {
+        if (this.state === 'ended') return reject(new Error('Call ended'))
+        const done = () => {
+          this.reofferPending = undefined
+          this.renegotiating = false
+          this.changed(this)
+          resolve()
+        }
+        if (start(done)) {
+          this.reofferPending = { reject }
+          this.renegotiating = true
+          this.changed(this)
+          return
+        }
+        if (Date.now() >= deadline) return reject(new Error(`${what} refused`))
+        setTimeout(attempt, REOFFER_RETRY_EVERY_MS)
       }
+      attempt()
     })
   }
 
   hold() {
-    return this.toggleHold(true)
+    if (this.state === 'held') return Promise.resolve()
+    return this.reoffer(done => this.session.hold({}, done), 'Hold')
   }
 
   resume() {
-    return this.toggleHold(false)
+    if (this.state !== 'held') return Promise.resolve()
+    return this.reoffer(done => this.session.unhold({}, done), 'Resume')
   }
 
   setMuted(muted: boolean) {
@@ -247,6 +267,10 @@ class WebCall implements SoftCall {
     return { packetsReceived, packetsSent }
   }
 }
+
+/** How long an offer is retried while another one is unanswered, and how often. */
+const REOFFER_RETRY_MS = 5_000
+const REOFFER_RETRY_EVERY_MS = 100
 
 const restartDelay = (attempt: number) => Math.floor(Math.random() * Math.min(30_000, 500 * 2 ** attempt))
 

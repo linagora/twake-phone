@@ -13,8 +13,16 @@ class FakeSession extends EventEmitter {
     this.connection = fakePc()
     this.emit('peerconnection', { peerconnection: this.connection })
   })
-  hold = vi.fn(() => true)
-  unhold = vi.fn(() => true)
+  /** JsSIP answers the `done` callback once the far end accepted the re-INVITE: the fake keeps it for the test. */
+  reofferDone?: () => void
+  hold = vi.fn((_o?: unknown, done?: () => void) => {
+    this.reofferDone = done
+    return true
+  })
+  unhold = vi.fn((_o?: unknown, done?: () => void) => {
+    this.reofferDone = done
+    return true
+  })
   mute = vi.fn(() => this.emit('muted', { audio: true }))
   unmute = vi.fn(() => this.emit('unmuted', { audio: true }))
   sendDTMF = vi.fn()
@@ -64,7 +72,7 @@ const setup = async (over: Partial<ConstructorParameters<typeof Softphone>[0]> =
     remoteAudio: audio(),
     displayName: 'Alice',
     onRegistration: s => registration.push(s),
-    onCallChange: c => changes.push(`${c.direction}:${c.state}${c.remoteHold ? ':remoteHold' : ''}${c.muted ? ':muted' : ''}`),
+    onCallChange: c => changes.push(`${c.direction}:${c.state}${c.remoteHold ? ':remoteHold' : ''}${c.muted ? ':muted' : ''}${c.renegotiating ? ':offer' : ''}`),
     onIncoming: c => incoming.push(c),
     onDtmf: (_c, tone) => tones.push(tone),
     createSocket: url => ({ url }) as never,
@@ -171,10 +179,14 @@ describe('Softphone', () => {
     const held = call.hold()
     expect(s.hold).toHaveBeenCalled()
     s.emit('hold', { originator: 'local' })
-    await held
     expect(call.state).toBe('held')
+    expect(call.renegotiating).toBe(true)
+    s.reofferDone!()
+    await held
+    expect(call.renegotiating).toBe(false)
     const resumed = call.resume()
     s.emit('unhold', { originator: 'local' })
+    s.reofferDone!()
     await resumed
     expect(call.state).toBe('connected')
     s.emit('hold', { originator: 'remote' })
@@ -182,7 +194,28 @@ describe('Softphone', () => {
     expect(call.state).toBe('connected')
     s.emit('unhold', { originator: 'remote' })
     expect(call.remoteHold).toBe(false)
-    expect(changes).toEqual(['outbound:connected', 'outbound:held', 'outbound:connected', 'outbound:connected:remoteHold', 'outbound:connected'])
+    // Each offer of ours is visible while it waits for its answer (the UI greys the button out).
+    expect(changes).toEqual(['outbound:connected', 'outbound:connected:offer', 'outbound:held:offer', 'outbound:held', 'outbound:held:offer', 'outbound:connected:offer', 'outbound:connected', 'outbound:connected:remoteHold', 'outbound:connected'])
+  })
+
+  it('retries a resume that JsSIP refuses while the hold is still unanswered, and gives up when the call ends', async () => {
+    const { phone, ua } = await setup()
+    const call = await phone.call('102')
+    const s = ua().lastCall!
+    s.emit('accepted', { originator: 'remote' })
+    s.unhold.mockImplementationOnce(() => false)
+    s.emit('hold', { originator: 'local' })
+    const resumed = call.resume()
+    await new Promise(r => setTimeout(r, 150))
+    expect(s.unhold).toHaveBeenCalledTimes(2)
+    s.reofferDone!()
+    s.emit('unhold', { originator: 'local' })
+    await resumed
+    const held = call.hold()
+    expect(call.renegotiating).toBe(true)
+    s.emit('ended', { originator: 'remote', cause: 'Terminated' })
+    await expect(held).rejects.toThrow('Call ended')
+    expect(call.renegotiating).toBe(false)
   })
 
   it('mutes the microphone, sends tones in the RTP stream by default and reports tones the far end sent by INFO', async () => {
