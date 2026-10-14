@@ -4,6 +4,7 @@ import { buildApp } from './app.js'
 import { authenticatorFromEnv } from './auth.js'
 import { parseKey } from './crypto.js'
 import { StoreDirectory, parseUserMap } from './directory.js'
+import { ldapDirectoryFromEnv } from './ldap-directory.js'
 import { storedAsteriskFactory, type StoredAsteriskConfig } from './providers.js'
 import { ProviderRegistry } from './registry.js'
 import { SipSecrets } from './sip-secrets.js'
@@ -69,6 +70,7 @@ const conference = env.LIVEKIT_API_KEY && env.LIVEKIT_API_SECRET && env.LIVEKIT_
     })()
   : undefined
 
-const app = await buildApp(registry, { store, directory: new StoreDirectory(store), auth: authenticatorFromEnv(env), ...(conference ? { conference } : {}) })
+const contacts = ldapDirectoryFromEnv(env, message => console.warn(`WARNING: ${message}`))
+const app = await buildApp(registry, { store, directory: new StoreDirectory(store), ...(contacts ? { contacts } : {}), auth: authenticatorFromEnv(env), ...(conference ? { conference } : {}) })
 registry.startAll()
 await app.listen({ host: '0.0.0.0', port: Number(env.PORT ?? 8080) })

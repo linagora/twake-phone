@@ -21,6 +21,7 @@ export class MemoryStore implements Store {
   private history = new Map<string, HistoryEntry>()
   private conferences = new Map<string, ConferenceRecord>()
   private secrets = new Map<string, { secretEnc: string; rotatedAt: string }>()
+  private favorites = new Map<string, string[]>()
 
   async listProviders() {
     return [...this.providers]
@@ -68,6 +69,21 @@ export class MemoryStore implements Store {
     let n = 0
     for (const [k, e] of this.history) if (e.tenantId === tenantId && e.userId === userId) (this.history.delete(k), n++)
     return n
+  }
+
+  async listFavorites(tenantId: string, userId: string) {
+    return [...(this.favorites.get(key(tenantId, userId)) ?? [])]
+  }
+
+  async addFavorite(tenantId: string, userId: string, contactId: string) {
+    const list = this.favorites.get(key(tenantId, userId)) ?? []
+    if (!list.includes(contactId)) list.push(contactId)
+    this.favorites.set(key(tenantId, userId), list)
+  }
+
+  async removeFavorite(tenantId: string, userId: string, contactId: string) {
+    const k = key(tenantId, userId)
+    this.favorites.set(k, (this.favorites.get(k) ?? []).filter(id => id !== contactId))
   }
 
   async getSipSecret(tenantId: string, userId: string) {

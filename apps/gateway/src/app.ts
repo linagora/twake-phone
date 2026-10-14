@@ -7,6 +7,7 @@ import { splitParticipantId, verifyWebhook, type LiveKitConferenceBridge, type M
 import type { MediaProvider, TelephonyProvider } from '@twake/telephony-provider-sdk'
 import type { CallDirection, Endpoint, PresenceStatus, TelephonyEvent, User } from '@twake/telephony-types'
 import { authenticatorFromEnv, TicketStore, type Authenticator, type Identity } from './auth.js'
+import { MAX_CONTACT_ID, MAX_FAVORITES, MAX_QUERY, MAX_SEARCH, RateLimiter, type ContactDirectory } from './contacts.js'
 import { StoreDirectory, parseUserMap, type UserDirectory } from './directory.js'
 import { EventBus } from './events.js'
 import { historyEntryFor } from './history.js'
@@ -25,6 +26,10 @@ export interface BuildOptions {
   bus?: EventBus
   store?: Store
   directory?: UserDirectory
+  /** The people one can look up and call. Absent when no directory is configured: the endpoints answer 501. */
+  contacts?: ContactDirectory
+  /** Searches allowed per user (tests inject a tighter one). Default: 30 per 10 seconds. */
+  directorySearchLimiter?: RateLimiter
   auth?: Authenticator
   tickets?: TicketStore
   /** Phone access to Meet rooms. Absent when no LiveKit is configured: the endpoints answer 501. */
@@ -111,6 +116,8 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
   }
 
   const app = Fastify({
+    // Contact ids (directory identifiers) travel in the path; the store bounds them to the same length.
+    maxParamLength: MAX_CONTACT_ID,
     logger: {
       level: process.env.LOG_LEVEL ?? 'info',
       redact: ['req.headers.authorization', 'req.headers.cookie'],
@@ -175,7 +182,11 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         return { user, provider: registry.forTenant(user.tenantId) }
       }
 
-      v1.get('/me', async req => ({ ...(await whoIs(req)), features: {} }))
+      // features tells the app what this platform offers, so it never has to probe an endpoint to find out.
+      v1.get('/me', async req => {
+        const user = await whoIs(req)
+        return { ...user, features: { directory: hasDirectory(user) } }
+      })
       v1.get('/me/endpoints', async req => (await whoIs(req), [BROWSER_ENDPOINT]))
 
       // Media plane: how a browser endpoint reaches the infrastructure. Control stays on the REST API.
@@ -221,6 +232,69 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         const user = await whoIs(req)
         const page = await store.listHistory(user.tenantId, user.id, parseHistoryQuery(req.query))
         return { items: page.items.map(publicEntry), ...(page.next ? { next: page.next } : {}) }
+      })
+
+      // The organisation's directory, and the caller's favourites in it. Tenant and user come from the identity.
+      const directoryFor = (user: User) => {
+        const d = options.contacts
+        if (!d || (d.servesTenant && !d.servesTenant(user.tenantId))) throw Object.assign(new Error('No directory configured'), { statusCode: 501 })
+        return d
+      }
+      const hasDirectory = (user: User) => !!options.contacts && (!options.contacts.servesTenant || options.contacts.servesTenant(user.tenantId))
+      // What the directory says is relayed; how it failed is not: its address, schema and error codes stay in the log.
+      const lookup = async <T>(req: FastifyRequest, run: () => Promise<T>): Promise<T> => {
+        try {
+          return await run()
+        } catch (err) {
+          req.log.error({ err }, 'directory lookup failed')
+          throw Object.assign(new Error('Directory unavailable'), { statusCode: 503 })
+        }
+      }
+      const contactId = (id: string) => {
+        if (!id || id.length > MAX_CONTACT_ID) throw bad('invalid contact id')
+        return id
+      }
+      const searches = options.directorySearchLimiter ?? new RateLimiter(30, 10_000)
+      v1.get<{ Querystring: { q?: string; limit?: string } }>('/directory', async (req, reply) => {
+        const user = await whoIs(req)
+        const q = (req.query.q ?? '').trim()
+        if (q.length > MAX_QUERY) throw bad('query too long')
+        const limit = req.query.limit ? Number(req.query.limit) : 20
+        if (!Number.isInteger(limit) || limit < 1 || limit > MAX_SEARCH) throw bad('invalid limit')
+        const directory = directoryFor(user)
+        if (!q) return { items: [], truncated: false }
+        if (!searches.allow(ownerKey(user.tenantId, user.id))) return reply.code(429).send({ error: 'too many searches, slow down' })
+        return lookup(req, () => directory.search(user.tenantId, q, limit))
+      })
+      v1.get<{ Params: { id: string } }>('/directory/:id', async req => {
+        const user = await whoIs(req)
+        const directory = directoryFor(user)
+        const [contact] = await lookup(req, () => directory.getMany(user.tenantId, [contactId(req.params.id)]))
+        if (!contact) throw Object.assign(new Error('Contact not found'), { statusCode: 404 })
+        return contact
+      })
+      v1.get('/me/favorites', async req => {
+        const user = await whoIs(req)
+        // Without a directory there is nothing to resolve the ids against: an empty list, not an error on every start.
+        if (!hasDirectory(user)) return { items: [] }
+        const ids = await store.listFavorites(user.tenantId, user.id)
+        return { items: ids.length ? await lookup(req, () => options.contacts!.getMany(user.tenantId, ids)) : [] }
+      })
+      v1.put<{ Params: { id: string } }>('/me/favorites/:id', async (req, reply) => {
+        const user = await whoIs(req)
+        const id = contactId(req.params.id)
+        const directory = directoryFor(user)
+        const current = await store.listFavorites(user.tenantId, user.id)
+        if (!current.includes(id) && current.length >= MAX_FAVORITES) throw Object.assign(new Error(`At most ${MAX_FAVORITES} favourites`), { statusCode: 409 })
+        // Only someone the directory knows can be a favourite: no stray ids in the store.
+        if ((await lookup(req, () => directory.getMany(user.tenantId, [id]))).length === 0) throw Object.assign(new Error('Contact not found'), { statusCode: 404 })
+        await store.addFavorite(user.tenantId, user.id, id)
+        return reply.code(204).send()
+      })
+      v1.delete<{ Params: { id: string } }>('/me/favorites/:id', async (req, reply) => {
+        const user = await whoIs(req)
+        await store.removeFavorite(user.tenantId, user.id, contactId(req.params.id))
+        return reply.code(204).send()
       })
 
       // Right to erasure of one's own call history.

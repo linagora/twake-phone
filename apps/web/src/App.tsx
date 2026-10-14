@@ -7,7 +7,9 @@ import { GatewayProvider } from './gateway.js'
 import { I18nProvider, useT } from './i18n/useT.js'
 import { Layout } from './components/Layout.js'
 import { Dialer } from './pages/Dialer.js'
+import { ContactPage } from './pages/ContactPage.js'
 import { Directory } from './pages/Directory.js'
+import { FavoritesProvider } from './favorites.js'
 import { Recents } from './pages/Recents.js'
 import { Settings } from './pages/Settings.js'
 import { SignIn } from './pages/SignIn.js'
@@ -19,17 +21,20 @@ const Gate = ({ config }: { config: AppConfig }) => {
   if (state.status === 'anonymous') return <SignIn />
   return (
     <GatewayProvider config={config}>
-      <BrowserRouter>
-        <Routes>
-          <Route element={<Layout />}>
-            <Route index element={<Dialer />} />
-            <Route path="recents" element={<Recents />} />
-            <Route path="directory" element={<Directory />} />
-            <Route path="settings" element={<Settings config={config} />} />
-            <Route path="*" element={<Navigate to="/" replace />} />
-          </Route>
-        </Routes>
-      </BrowserRouter>
+      <FavoritesProvider>
+        <BrowserRouter>
+          <Routes>
+            <Route element={<Layout />}>
+              <Route index element={<Dialer />} />
+              <Route path="recents" element={<Recents />} />
+              <Route path="directory" element={<Directory />} />
+              <Route path="directory/:id" element={<ContactPage />} />
+              <Route path="settings" element={<Settings config={config} />} />
+              <Route path="*" element={<Navigate to="/" replace />} />
+            </Route>
+          </Routes>
+        </BrowserRouter>
+      </FavoritesProvider>
     </GatewayProvider>
   )
 }

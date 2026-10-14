@@ -7,6 +7,8 @@ export interface Me {
   id: string
   displayName: string
   extension?: string
+  /** What this platform offers; absent on an older Gateway. */
+  features?: { directory?: boolean }
 }
 
 interface Gateway {

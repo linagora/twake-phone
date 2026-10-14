@@ -10,6 +10,23 @@ export interface User {
   extension?: string
 }
 
+export type ContactNumberType = 'extension' | 'work' | 'mobile'
+
+export interface ContactNumber {
+  type: ContactNumberType
+  number: string
+}
+
+/** Someone one can call, as the organisation's directory describes them. Vendor-neutral: no LDAP notion here. */
+export interface Contact {
+  id: string
+  displayName: string
+  numbers: ContactNumber[]
+  email?: string
+  department?: string
+  title?: string
+}
+
 export type EndpointType = 'browser' | 'desk-phone' | 'mobile' | 'external'
 
 export interface Endpoint {

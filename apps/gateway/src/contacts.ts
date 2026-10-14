@@ -1,0 +1,62 @@
+import type { Contact, TenantId } from '@twake/telephony-types'
+
+export const MAX_SEARCH = 50
+export const MAX_QUERY = 100
+/** Contact ids are the directory's; this bounds what the store keeps and what a URL may carry. */
+export const MAX_CONTACT_ID = 256
+/** Favourites per user: enough for a phone, and a bound on the directory lookups a page load costs. */
+export const MAX_FAVORITES = 100
+
+export interface SearchResult {
+  items: Contact[]
+  /** More contacts matched than were returned: the user should refine the search. */
+  truncated: boolean
+}
+
+/**
+ * The organisation's directory of people one can call (cahier §7.4.6.2, annuaire). The Gateway asks it for
+ * contacts and never caches them: what the directory says is the truth, favourites are only ids.
+ */
+export interface ContactDirectory {
+  /** Whether this directory holds the people of that tenant. Absent: every tenant. */
+  servesTenant?(tenantId: TenantId): boolean
+  /** Contacts matching the words of `query` (name, number, department...), at most `limit`. */
+  search(tenantId: TenantId, query: string, limit: number): Promise<SearchResult>
+  /** The contacts with these ids, in the order given; unknown ids are left out. */
+  getMany(tenantId: TenantId, ids: string[]): Promise<Contact[]>
+}
+
+/** A directory held in memory: tests, and a dev Gateway without LDAP. */
+export class MemoryContactDirectory implements ContactDirectory {
+  constructor(private readonly contacts: Contact[] = []) {}
+
+  async search(_tenantId: TenantId, query: string, limit: number): Promise<SearchResult> {
+    const words = query.toLowerCase().split(/\s+/).filter(Boolean)
+    const text = (c: Contact) => [c.displayName, c.email, c.department, c.title, ...c.numbers.map(n => n.number)].filter(Boolean).join(' ').toLowerCase()
+    const all = this.contacts.filter(c => words.every(w => text(c).includes(w)))
+    return { items: all.slice(0, limit), truncated: all.length > limit }
+  }
+
+  async getMany(_tenantId: TenantId, ids: string[]) {
+    return ids.flatMap(id => this.contacts.filter(c => c.id === id))
+  }
+}
+
+/** A sliding window per key: `limit` events per `windowMs`. Protects the directory from a keyboard held down. */
+export class RateLimiter {
+  private readonly hits = new Map<string, number[]>()
+  constructor(private readonly limit: number, private readonly windowMs: number, private readonly now: () => number = Date.now) {}
+
+  /** True when this event is allowed. */
+  allow(key: string): boolean {
+    const t = this.now()
+    const recent = (this.hits.get(key) ?? []).filter(h => h > t - this.windowMs)
+    if (recent.length >= this.limit) {
+      this.hits.set(key, recent)
+      return false
+    }
+    recent.push(t)
+    this.hits.set(key, recent)
+    return true
+  }
+}
