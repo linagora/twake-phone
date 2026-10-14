@@ -1,0 +1,9 @@
+{
+  "gatewayUrl": "http://localhost:8080",
+  "oidc": {
+    "authority": "http://localhost:4400",
+    "clientId": "twakephone-web",
+    "scope": "openid profile email",
+    "resource": "https://gateway.twakephone.test"
+  }
+}

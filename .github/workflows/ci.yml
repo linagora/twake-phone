@@ -47,6 +47,10 @@ jobs:
         run: yarn test
         env:
           TEST_DATABASE_URL: postgres://twake:twake@localhost:5432/twake_test
+      - name: Chromium pour l'e2e de l'app web
+        run: npx playwright-core install --with-deps chromium
+      - name: e2e app web (OIDC, passerelle et navigateur en local, sans Docker)
+        run: node apps/web/test/web.e2e.mjs
 
   app-phone:
     name: App Phone (Node 24)
@@ -74,7 +78,7 @@ jobs:
       - run: yarn build
         working-directory: apps/phone
 
-  # Les e2e sur la stack Docker (yarn e2e:live, yarn e2e:browser, yarn e2e:widget, platform.e2e.mjs)
+  # yarn e2e:web tourne ci-dessus. Les e2e sur la stack Docker (yarn e2e:live, yarn e2e:browser, yarn e2e:widget, platform.e2e.mjs)
   # demandent MiniPBX, LiveKit et la stack Twake : ils se jouent à chaque porte de sortie sur un
   # poste de dev (CONTRIBUTING.md), et passeront en CI quand l'étape 3 aura remplacé MiniPBX par
   # OpenSIPS et rtpengine en Docker Compose.
