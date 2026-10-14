@@ -9,6 +9,7 @@
     "dev": "rsbuild dev",
     "build": "rsbuild build",
     "preview": "rsbuild preview",
+    "start": "node server/main.mjs",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

@@ -6,12 +6,15 @@ import swaggerUi from '@fastify/swagger-ui'
 import { splitParticipantId, verifyWebhook, type LiveKitConferenceBridge, type MeetApi, type MeetRoom } from '@twake/conference-livekit'
 import type { MediaProvider, TelephonyProvider } from '@twake/telephony-provider-sdk'
 import type { CallDirection, Endpoint, PresenceStatus, TelephonyEvent, User } from '@twake/telephony-types'
+import { adminPolicyFromEnv, isAdmin, type AdminPolicy } from './admin.js'
 import { authenticatorFromEnv, TicketStore, type Authenticator, type Identity } from './auth.js'
 import { MAX_CONTACT_ID, MAX_FAVORITES, MAX_QUERY, MAX_SEARCH, RateLimiter, type ContactDirectory } from './contacts.js'
 import { StoreDirectory, parseUserMap, type UserDirectory } from './directory.js'
+import type { DirectorySync } from './directory-sync.js'
 import { EventBus } from './events.js'
 import { historyEntryFor } from './history.js'
 import type { ProviderRegistry } from './registry.js'
+import { securityHeadersFor, type SecurityOptions } from './security.js'
 import { MemoryStore } from './store/memory.js'
 import type { HistoryEntry, HistoryQuery, Store } from './store/types.js'
 
@@ -30,6 +33,11 @@ export interface BuildOptions {
   contacts?: ContactDirectory
   /** Searches allowed per user (tests inject a tighter one). Default: 30 per 10 seconds. */
   directorySearchLimiter?: RateLimiter
+  /** Copies the directory's accounts into the user ↔ extension mappings; administrators can run it from the app. */
+  directorySync?: DirectorySync
+  /** Who administers the platform. Default: from ADMIN_ROLE and ADMIN_USERS. */
+  admin?: AdminPolicy
+  security?: SecurityOptions
   auth?: Authenticator
   tickets?: TicketStore
   /** Phone access to Meet rooms. Absent when no LiveKit is configured: the endpoints answer 501. */
@@ -92,6 +100,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
   const bus = options.bus ?? new EventBus()
   const store = options.store ?? new MemoryStore()
   const auth = options.auth ?? authenticatorFromEnv(process.env)
+  const admin = options.admin ?? adminPolicyFromEnv(process.env)
   const tickets = options.tickets ?? new TicketStore()
   let directory = options.directory
   if (!directory) {
@@ -135,6 +144,12 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
       done(null, body ? JSON.parse(body as string) : {})
     } catch (err) {
       done(Object.assign(err as Error, { statusCode: 400 }), undefined)
+    }
+  })
+  // An API answers nothing a browser should render, frame or cache.
+  app.addHook('onSend', async (req, reply) => {
+    for (const [name, value] of Object.entries(securityHeadersFor(req.url.split('?')[0] ?? '/', options.security))) {
+      if (!reply.hasHeader(name)) reply.header(name, value)
     }
   })
   // Origins of the Twake apps allowed to call the Gateway from a browser.
@@ -184,8 +199,9 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
 
       // features tells the app what this platform offers, so it never has to probe an endpoint to find out.
       v1.get('/me', async req => {
-        const user = await whoIs(req)
-        return { ...user, features: { directory: hasDirectory(user) } }
+        const identity = await auth.authenticate(req)
+        const user = await resolve(identity)
+        return { ...user, features: { directory: hasDirectory(user), admin: isAdmin(identity, admin) } }
       })
       v1.get('/me/endpoints', async req => (await whoIs(req), [BROWSER_ENDPOINT]))
 
@@ -295,6 +311,30 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         const user = await whoIs(req)
         await store.removeFavorite(user.tenantId, user.id, contactId(req.params.id))
         return reply.code(204).send()
+      })
+
+      // Administration: the directory source and its synchronisation into the mappings. Administrators only.
+      const administrator = async (req: FastifyRequest) => {
+        const identity = await auth.authenticate(req)
+        if (!isAdmin(identity, admin)) throw Object.assign(new Error('Administrators only'), { statusCode: 403 })
+        return resolve(identity)
+      }
+      v1.get('/admin/directory', async req => {
+        const user = await administrator(req)
+        const directory = directoryFor(user)
+        const sync = options.directorySync
+        return {
+          source: directory.describe?.() ?? { type: 'unknown' },
+          sync: sync ? { available: true, ...sync.status() } : { available: false, running: false }
+        }
+      })
+      v1.post('/admin/directory/sync', async (req, reply) => {
+        const user = await administrator(req)
+        directoryFor(user)
+        const sync = options.directorySync
+        if (!sync) throw Object.assign(new Error('This directory cannot be synchronised'), { statusCode: 501 })
+        if (sync.status().running) return reply.code(409).send({ error: 'a synchronisation is already running' })
+        return sync.run()
       })
 
       // Right to erasure of one's own call history.

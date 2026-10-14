@@ -48,7 +48,15 @@ export class MemoryStore implements Store {
         throw new Error('extension already mapped to another user of this tenant')
       }
     }
-    this.mappings.set(key(mapping.tenantId, mapping.userId), mapping)
+    this.mappings.set(key(mapping.tenantId, mapping.userId), { source: 'manual', ...mapping })
+  }
+
+  async listMappings(tenantId: string) {
+    return [...this.mappings.values()].filter(m => m.tenantId === tenantId).sort((a, b) => a.userId.localeCompare(b.userId)).map(m => ({ ...m }))
+  }
+
+  async deleteMapping(tenantId: string, userId: string) {
+    this.mappings.delete(key(tenantId, userId))
   }
 
   async addHistory(entry: HistoryEntry) {

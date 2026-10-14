@@ -61,7 +61,16 @@ export class PgStore implements Store {
   }
 
   private mapping(r: Record<string, any> | undefined): UserMapping | null {
-    return r ? { tenantId: r.tenant_id, userId: r.user_id, extension: r.extension, ...(r.display_name ? { displayName: r.display_name } : {}) } : null
+    if (!r) return null
+    return {
+      tenantId: r.tenant_id,
+      userId: r.user_id,
+      extension: r.extension,
+      ...(r.display_name ? { displayName: r.display_name } : {}),
+      ...(r.department ? { department: r.department } : {}),
+      source: r.source ?? 'manual',
+      ...(r.synced_at ? { syncedAt: new Date(r.synced_at).toISOString() } : {})
+    }
   }
 
   async getMappingByUser(tenantId: string, userId: string) {
@@ -76,10 +85,20 @@ export class PgStore implements Store {
 
   async upsertMapping(m: UserMapping) {
     await this.pool.query(
-      `INSERT INTO user_mappings (tenant_id, user_id, extension, display_name) VALUES ($1, $2, $3, $4)
-       ON CONFLICT (tenant_id, user_id) DO UPDATE SET extension = EXCLUDED.extension, display_name = EXCLUDED.display_name`,
-      [m.tenantId, m.userId, m.extension, m.displayName ?? null]
+      `INSERT INTO user_mappings (tenant_id, user_id, extension, display_name, department, source, synced_at) VALUES ($1, $2, $3, $4, $5, $6, $7)
+       ON CONFLICT (tenant_id, user_id) DO UPDATE SET extension = EXCLUDED.extension, display_name = EXCLUDED.display_name,
+         department = EXCLUDED.department, source = EXCLUDED.source, synced_at = EXCLUDED.synced_at`,
+      [m.tenantId, m.userId, m.extension, m.displayName ?? null, m.department ?? null, m.source ?? 'manual', m.syncedAt ?? null]
     )
+  }
+
+  async listMappings(tenantId: string) {
+    const { rows } = await this.pool.query('SELECT * FROM user_mappings WHERE tenant_id = $1 ORDER BY user_id', [tenantId])
+    return rows.map(r => this.mapping(r)!)
+  }
+
+  async deleteMapping(tenantId: string, userId: string) {
+    await this.pool.query('DELETE FROM user_mappings WHERE tenant_id = $1 AND user_id = $2', [tenantId, userId])
   }
 
   async addHistory(e: HistoryEntry) {

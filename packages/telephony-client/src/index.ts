@@ -46,6 +46,25 @@ export interface Conference {
   participants?: ConferenceParticipant[]
 }
 
+export interface SyncReport {
+  startedAt: string
+  finishedAt: string
+  durationMs: number
+  seen: number
+  withExtension: number
+  created: number
+  updated: number
+  unchanged: number
+  removed: number
+  conflicts: { userId: string; extension: string; heldBy: string }[]
+  error?: string
+}
+
+export interface DirectoryAdmin {
+  source: { type: string; url?: string; tenantId?: string; baseDn?: string; userFilter?: string; attributes?: Record<string, string> }
+  sync: { available: boolean; running: boolean; intervalMs?: number; last?: SyncReport }
+}
+
 /** Extracts the Meet room id from a pasted link or code (abc-defg-hij). */
 export const parseMeetingId = (input: string): string | null => {
   const raw = input.trim()
@@ -81,7 +100,17 @@ export class TelephonyClient {
   }
 
   getMe() {
-    return this.request<{ id: string; displayName: string; extension?: string; features?: { directory?: boolean } }>('/me')
+    return this.request<{ id: string; displayName: string; extension?: string; features?: { directory?: boolean; admin?: boolean } }>('/me')
+  }
+
+  /** The directory source and its synchronisation, for administrators (403 otherwise; 501 without a directory). */
+  getDirectoryAdmin() {
+    return this.request<DirectoryAdmin>('/admin/directory')
+  }
+
+  /** Copies the directory's accounts into the user ↔ extension mappings now, and reports what changed (409: already running). */
+  syncDirectory() {
+    return this.request<SyncReport>('/admin/directory/sync', { method: 'POST' })
   }
 
   getMediaSession() {

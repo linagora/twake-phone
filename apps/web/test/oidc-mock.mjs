@@ -1,7 +1,10 @@
 // A throwaway OpenID provider for the web e2e: any login is accepted, access tokens are JWTs for the Gateway.
 import Provider from 'oidc-provider'
 
-const NAMES = { alice: 'Alice Martin', bob: 'Bob Durand' }
+// Logins are the LDAP uids: the SSO and the directory name people the same way, as LemonLDAP::NG does on an LDAP.
+const NAMES = { amartin: 'Alice Martin', bdurand: 'Bob Durand' }
+/** Roles the provider asserts in the access token, as LemonLDAP::NG would from a group: alice administers the platform. */
+const ROLES = { amartin: ['staff', 'twakephone-admin'], bdurand: ['staff'] }
 
 /** Starts the provider on `port`; `appOrigin` is the web app allowed to sign in. Returns a stop function. */
 export const startOidcMock = async ({ port, appOrigin, audience, resource = 'https://gateway.twakephone.test' }) => {
@@ -29,6 +32,8 @@ export const startOidcMock = async ({ port, appOrigin, audience, resource = 'htt
         getResourceServerInfo: () => ({ scope: 'openid profile email', audience, accessTokenFormat: 'jwt' })
       }
     },
+    // A custom claim in the JWT access token: what the Gateway reads as roles (JWT_ROLES_CLAIM=roles).
+    extraTokenClaims: async (_ctx, token) => ({ roles: ROLES[token.accountId] ?? [] }),
     findAccount: async (_ctx, id) => ({
       accountId: id,
       claims: async () => ({ sub: id, name: NAMES[id] ?? id, email: `${id}@example.test` })

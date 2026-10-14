@@ -31,6 +31,25 @@ export const storeContract = (name: string, make: () => Promise<Store>) =>
       await s.close()
     })
 
+    it('lists and deletes mappings per tenant, keeping department, source and sync time', async () => {
+      const s = await make()
+      await s.upsertMapping({ tenantId: 'A', userId: 'alice', extension: '101' })
+      await s.upsertMapping({ tenantId: 'A', userId: 'bob', extension: '102', displayName: 'Bob', department: 'Support', source: 'ldap', syncedAt: '2026-10-14T10:00:00.000Z' })
+      await s.upsertMapping({ tenantId: 'B', userId: 'carol', extension: '101' })
+      const a = await s.listMappings('A')
+      expect(a.map(m => m.userId)).toEqual(['alice', 'bob'])
+      expect(a[0]?.source ?? 'manual').toBe('manual')
+      expect(a[1]).toMatchObject({ extension: '102', displayName: 'Bob', department: 'Support', source: 'ldap', syncedAt: '2026-10-14T10:00:00.000Z' })
+      await s.deleteMapping('A', 'alice')
+      await s.deleteMapping('A', 'nobody')
+      expect((await s.listMappings('A')).map(m => m.userId)).toEqual(['bob'])
+      expect(await s.getMappingByUser('A', 'alice')).toBeNull()
+      expect((await s.listMappings('B')).map(m => m.userId)).toEqual(['carol'])
+      // The extension freed by the delete can be taken by someone else.
+      await s.upsertMapping({ tenantId: 'A', userId: 'dave', extension: '101' })
+      await s.close()
+    })
+
     it('keeps favourites per tenant and user, in the order they were added, without duplicates', async () => {
       const s = await make()
       await s.addFavorite('A', 'alice', 'jdupont')

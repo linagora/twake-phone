@@ -19,7 +19,7 @@ describe('directory routes', () => {
     await store.addFavorite('dev', 'alice', 'leftover')
     const app = await appWith(undefined, store)
     expect((await app.inject({ url: '/api/v1/directory?q=dup', headers: as('alice') })).statusCode).toBe(501)
-    expect((await app.inject({ url: '/api/v1/me', headers: as('alice') })).json().features).toEqual({ directory: false })
+    expect((await app.inject({ url: '/api/v1/me', headers: as('alice') })).json().features).toEqual({ directory: false, admin: false })
     expect((await app.inject({ url: '/api/v1/me/favorites', headers: as('alice') })).json()).toEqual({ items: [] })
   })
 
@@ -29,7 +29,7 @@ describe('directory routes', () => {
     const app = await appWith(dir)
     expect((await app.inject({ url: '/api/v1/directory?q=dup', headers: as('alice', 'acme') })).json().items).toEqual([jean])
     expect((await app.inject({ url: '/api/v1/directory?q=dup', headers: as('alice', 'other') })).statusCode).toBe(501)
-    expect((await app.inject({ url: '/api/v1/me', headers: as('alice', 'other') })).json().features).toEqual({ directory: false })
+    expect((await app.inject({ url: '/api/v1/me', headers: as('alice', 'other') })).json().features).toEqual({ directory: false, admin: false })
     expect((await app.inject({ method: 'PUT', url: '/api/v1/me/favorites/jdupont', headers: as('alice', 'other') })).statusCode).toBe(501)
   })
 

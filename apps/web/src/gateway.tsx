@@ -1,4 +1,4 @@
-import { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from 'react'
+import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react'
 import { TelephonyClient } from '@twake/telephony-client'
 import { useAuth } from './auth/AuthProvider.js'
 import type { AppConfig } from './config.js'
@@ -8,13 +8,15 @@ export interface Me {
   displayName: string
   extension?: string
   /** What this platform offers; absent on an older Gateway. */
-  features?: { directory?: boolean }
+  features?: { directory?: boolean; admin?: boolean }
 }
 
 interface Gateway {
   client: TelephonyClient
   me: Me | null
   meError: string | null
+  /** Asks the Gateway again who the user is (after a synchronisation gave them an extension, for instance). */
+  refreshMe: () => void
 }
 
 const GatewayContext = createContext<Gateway | null>(null)
@@ -25,6 +27,8 @@ export const GatewayProvider = ({ config, children }: { config: AppConfig; child
   const client = useMemo(() => new TelephonyClient({ baseUrl: config.gatewayUrl, getToken }), [config.gatewayUrl, getToken])
   const [me, setMe] = useState<Me | null>(null)
   const [meError, setMeError] = useState<string | null>(null)
+  const [generation, setGeneration] = useState(0)
+  const refreshMe = useCallback(() => setGeneration(g => g + 1), [])
   const signedIn = state.status === 'signed-in'
 
   useEffect(() => {
@@ -48,9 +52,9 @@ export const GatewayProvider = ({ config, children }: { config: AppConfig; child
     return () => {
       cancelled = true
     }
-  }, [client, signedIn])
+  }, [client, signedIn, generation])
 
-  const value = useMemo(() => ({ client, me, meError }), [client, me, meError])
+  const value = useMemo(() => ({ client, me, meError, refreshMe }), [client, me, meError, refreshMe])
   return <GatewayContext.Provider value={value}>{children}</GatewayContext.Provider>
 }
 

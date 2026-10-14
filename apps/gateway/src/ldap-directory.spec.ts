@@ -132,6 +132,21 @@ describe('LdapDirectory against a real LDAP server', () => {
     expect(await dir.getMany('t', ['*'])).toEqual([])
   })
 
+  it('lists everyone with their extension for the synchronisation, in pages, and refuses without an extension attribute', async () => {
+    const withExtension = make({ attributes: { ...DEFAULT_ATTRIBUTES, extension: 'ipPhone' } })
+    const all = await withExtension.listAll('t')
+    expect(all.map(c => c.id).sort()).toEqual(['amartin', 'bdurand', 'jdupont', 'mpetit', 'zlefevre'])
+    expect(all.find(c => c.id === 'amartin')?.numbers).toContainEqual({ type: 'extension', number: '101' })
+    expect(all.find(c => c.id === 'zlefevre')?.numbers.some(n => n.type === 'extension')).toBe(false)
+    await expect(dir.listAll('t')).rejects.toThrow(/LDAP_ATTR_EXTENSION/)
+  })
+
+  it('describes itself without the bind password', () => {
+    const d = make({ url: 'ldaps://reader:secret@ldap.example.test:636' })
+    expect(d.describe()).toEqual({ type: 'ldap', url: 'ldaps://ldap.example.test:636', tenantId: 't', baseDn: BASE_DN, userFilter: FILTER, attributes: DEFAULT_ATTRIBUTES })
+    expect(JSON.stringify(d.describe())).not.toMatch(/secret/)
+  })
+
   it('reports a wrong bind as an error, not as an empty directory', async () => {
     await expect(make({ bindPassword: 'nope' }).search('t', 'dup', 10)).rejects.toThrow()
   })

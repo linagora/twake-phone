@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs'
 import { Client, FilterParser, escapeFilter, type Entry } from 'ldapts'
 import type { Contact, ContactNumber, TenantId } from '@twake/telephony-types'
-import type { ContactDirectory, SearchResult } from './contacts.js'
+import type { ContactDirectory, DirectorySource, SearchResult } from './contacts.js'
 
 /** Which LDAP attributes carry what. Defaults fit inetOrgPerson; a beneficiary's schema is mapped from the environment. */
 export interface LdapAttributes {
@@ -44,6 +44,8 @@ export const MIN_WORD = 2
 export const MAX_WORDS = 5
 /** Favourites are resolved in batches, so a long list never becomes one huge filter. */
 const BATCH = 50
+/** A full listing is paged (RFC 2696): a server's size limit (500 on OpenLDAP by default) must not cut it short. */
+const PAGE = 500
 
 const str = (x: string | Buffer) => (Buffer.isBuffer(x) ? x.toString('utf8') : String(x))
 
@@ -128,8 +130,17 @@ export class LdapDirectory implements ContactDirectory {
     return [...new Set([a.id, a.name, a.surname, a.givenName, a.email, a.phone, a.mobile, a.extension, a.department, a.title].filter(Boolean))]
   }
 
+  /** The source as the administration screen shows it: the bind password never leaves the configuration. */
+  describe(): DirectorySource {
+    const url = new URL(this.config.url)
+    url.username = ''
+    url.password = ''
+    const a = this.config.attributes
+    return { type: 'ldap', url: url.toString().replace(/\/$/, ''), tenantId: this.config.tenantId, baseDn: this.config.baseDn, userFilter: this.userFilter, attributes: { ...a } }
+  }
+
   /** One bound connection per request: simple, and immune to a connection the server dropped meanwhile. */
-  private async query(filter: string, sizeLimit: number): Promise<Contact[]> {
+  private async query(filter: string, sizeLimit: number, paged = false): Promise<Contact[]> {
     const tls = { ...(this.config.ca ? { ca: this.config.ca } : {}), ...(this.config.rejectUnauthorized === false ? { rejectUnauthorized: false } : {}) }
     const client = new Client({
       url: this.config.url,
@@ -139,7 +150,15 @@ export class LdapDirectory implements ContactDirectory {
     })
     try {
       if (this.config.bindDn) await client.bind(this.config.bindDn, this.config.bindPassword ?? '')
-      const { searchEntries } = await client.search(this.config.baseDn, { scope: 'sub', filter, attributes: this.attributes(), sizeLimit, timeLimit: 10 })
+      const { searchEntries } = await client.search(this.config.baseDn, {
+        scope: 'sub',
+        filter,
+        attributes: this.attributes(),
+        sizeLimit,
+        // A full listing may take a while on a large directory; a lookup must not.
+        timeLimit: paged ? 120 : 10,
+        ...(paged ? { paged: { pageSize: PAGE } } : {})
+      })
       return searchEntries.map(e => contactOf(e, this.config.attributes)).filter((c): c is Contact => c !== null)
     } finally {
       await client.unbind().catch(() => undefined)
@@ -154,6 +173,12 @@ export class LdapDirectory implements ContactDirectory {
     const truncated = found.length > limit
     const items = (truncated ? found.slice(0, limit) : found).sort((x, y) => x.displayName.localeCompare(y.displayName))
     return { items, truncated }
+  }
+
+  /** Everyone the user filter admits, in pages. Needs the extension attribute: without it there is nothing to synchronise. */
+  async listAll(_tenantId: TenantId): Promise<Contact[]> {
+    if (!this.config.attributes.extension) throw new Error('LDAP_ATTR_EXTENSION is not set: nothing says which attribute holds the extension to synchronise')
+    return this.query(this.userFilter, 0, true)
   }
 
   async getMany(_tenantId: TenantId, ids: string[]) {

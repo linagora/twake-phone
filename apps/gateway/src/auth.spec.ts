@@ -92,7 +92,7 @@ describe('JwtAuthenticator', () => {
     const jwk = { ...(await exportJWK(publicKey)), alg: 'RS256', kid: 'k1' }
     const sign = (claims: object, opts: { iss?: string; aud?: string; exp?: string } = {}) =>
       new SignJWT(claims as never).setProtectedHeader({ alg: 'RS256', kid: 'k1' }).setIssuer(opts.iss ?? 'https://auth.twake.local').setAudience(opts.aud ?? 'phone').setExpirationTime(opts.exp ?? '5m').sign(privateKey)
-    const auth = new JwtAuthenticator({ keys: createLocalJWKSet({ keys: [jwk] }), issuer: 'https://auth.twake.local', audience: 'phone', tenantClaim: 'org', defaultTenant: 'dev' })
+    const auth = new JwtAuthenticator({ keys: createLocalJWKSet({ keys: [jwk] }), issuer: 'https://auth.twake.local', audience: 'phone', tenantClaim: 'org', rolesClaim: 'groups', defaultTenant: 'dev' })
     return { sign, auth }
   }
 
@@ -100,6 +100,14 @@ describe('JwtAuthenticator', () => {
     const { sign, auth } = await make()
     const id = await auth.authenticate(req({ authorization: `Bearer ${await sign({ preferred_username: 'alice', org: 'acme', name: 'Alice' })}` }))
     expect(id).toEqual({ userId: 'alice', tenantId: 'acme', displayName: 'Alice' })
+  })
+
+  it('reads the roles claim as an array or as one string, and leaves it out when absent', async () => {
+    const { sign, auth } = await make()
+    expect((await auth.authenticate(req({ authorization: `Bearer ${await sign({ sub: 'a', groups: ['staff', 'twakephone-admin'] })}` }))).roles).toEqual(['staff', 'twakephone-admin'])
+    expect((await auth.authenticate(req({ authorization: `Bearer ${await sign({ sub: 'a', groups: 'staff twakephone-admin' })}` }))).roles).toEqual(['staff', 'twakephone-admin'])
+    expect((await auth.authenticate(req({ authorization: `Bearer ${await sign({ sub: 'a', groups: 42 })}` }))).roles).toBeUndefined()
+    expect((await auth.authenticate(req({ authorization: `Bearer ${await sign({ sub: 'a' })}` }))).roles).toBeUndefined()
   })
 
   it('rejects wrong issuer, wrong audience, expired and unsigned tokens', async () => {
@@ -129,6 +137,7 @@ describe('DevAuthenticator and configuration', () => {
   it('accepts the dev token and rejects an anonymous call', async () => {
     const a = new DevAuthenticator()
     expect(await a.authenticate(req({ authorization: 'Bearer dev:user1' }))).toEqual({ userId: 'user1', tenantId: 'dev', email: 'user1@twake.local' })
+    expect((await a.authenticate(req({ authorization: 'Bearer dev:user1', 'x-dev-roles': 'twakephone-admin' }))).roles).toEqual(['twakephone-admin'])
     await expect(a.authenticate(req())).rejects.toMatchObject({ statusCode: 401 })
   })
 
