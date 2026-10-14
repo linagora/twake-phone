@@ -3,19 +3,24 @@ import { useSearchParams } from 'react-router-dom'
 import { formatNumber, toDialTarget } from '@twake/telephony-client'
 import { useGateway } from '../gateway.js'
 import { useT } from '../i18n/useT.js'
+import { usePhone } from '../softphone.js'
 
 const KEYS: [string, string][] = [['1', ''], ['2', 'ABC'], ['3', 'DEF'], ['4', 'GHI'], ['5', 'JKL'], ['6', 'MNO'], ['7', 'PQRS'], ['8', 'TUV'], ['9', 'WXYZ'], ['*', ''], ['0', '+'], ['#', '']]
 
 export const Dialer = () => {
   const { t } = useT()
   const { client } = useGateway()
+  const phone = usePhone()
   // The directory sends a number to call as ?number=: taken once, then the address bar is cleaned.
   const [params, setParams] = useSearchParams()
   const [number, setNumber] = useState(() => (params.get('number') ?? '').slice(0, 32))
   useEffect(() => {
     if (params.has('number')) setParams({}, { replace: true })
   }, [params, setParams])
-  const [canCall, setCanCall] = useState<boolean | null>(null)
+  // The Gateway can place the call for us (click-to-call) or the browser does it itself (softphone registered).
+  const [gatewayCalls, setGatewayCalls] = useState<boolean | null>(null)
+  // One call at a time through the softphone (one audio element; a second line comes with the transfers of 3b).
+  const canCall = (phone.state === 'registered' && !phone.calls.length) || (phone.state !== 'registered' && !!gatewayCalls)
   const [status, setStatus] = useState<{ kind: 'info' | 'error'; text: string } | null>(null)
 
   useEffect(() => {
@@ -23,12 +28,12 @@ export const Dialer = () => {
     setStatus(null)
     client
       .getCapabilities()
-      .then(caps => !cancelled && setCanCall(!!caps.calling?.outbound))
+      .then(caps => !cancelled && setGatewayCalls(!!caps.calling?.outbound))
       .catch((err: unknown) => {
         if (cancelled) return
         // 404 is the Gateway saying "no telephony provider on this platform": calling is not configured, which is not an error.
         // Anything else (401, network) is reported as such, and calling stays possible to retry.
-        if (err instanceof Error && /Gateway 404 /.test(err.message)) setCanCall(false)
+        if (err instanceof Error && /Gateway 404 /.test(err.message)) setGatewayCalls(false)
         else setStatus({ kind: 'error', text: t('dialer.capabilitiesFailed', { reason: err instanceof Error ? err.message : String(err) }) })
       })
     return () => {
@@ -43,8 +48,17 @@ export const Dialer = () => {
     if (!target) return
     setStatus({ kind: 'info', text: t('dialer.placing', { number: formatNumber(number) }) })
     try {
-      await client.originate(target, crypto.randomUUID())
-      setStatus({ kind: 'info', text: t('dialer.placed', { number: formatNumber(number) }) })
+      if (phone.state === 'registered') {
+        // The call panel takes over from here: the status line has nothing more to say.
+        await phone.call(target)
+        setStatus(null)
+        setNumber('')
+      } else if (gatewayCalls) {
+        await client.originate(target, crypto.randomUUID())
+        setStatus({ kind: 'info', text: t('dialer.placed', { number: formatNumber(number) }) })
+      } else {
+        setStatus({ kind: 'error', text: t('dialer.notRegistered') })
+      }
     } catch (err) {
       setStatus({ kind: 'error', text: t('dialer.failed', { reason: err instanceof Error ? err.message : String(err) }) })
     }
@@ -53,7 +67,8 @@ export const Dialer = () => {
   return (
     <>
       <h1>{t('dialer.title')}</h1>
-      {canCall === false ? <p className="alert">{t('dialer.unavailable')}</p> : null}
+      {gatewayCalls === false && phone.state === 'off' ? <p className="alert">{t('dialer.unavailable')}</p> : null}
+      {phone.state === 'failed' || phone.state === 'unregistered' ? <p className="alert">{t('dialer.notRegistered')}</p> : null}
       <form onSubmit={e => void submit(e)}>
         <div className="field">
           <label htmlFor="number">{t('dialer.number')}</label>

@@ -1,4 +1,4 @@
-import type { SecretProvisioner } from '@twake/provider-asterisk'
+import type { SecretProvisioner } from '@twake/telephony-provider-sdk'
 import { decrypt, encrypt, generateSecret } from './crypto.js'
 import type { Store } from './store/types.js'
 
@@ -35,8 +35,12 @@ export class SipSecrets {
 
   private async load(tenantId: string, userId: string, extension: string) {
     const stored = await this.opts.store.getSipSecret(tenantId, userId)
-    if (stored) return decrypt(stored.secretEnc, this.opts.key)
-    return this.create(tenantId, userId, extension)
+    if (!stored) return this.create(tenantId, userId, extension)
+    const secret = decrypt(stored.secretEnc, this.opts.key)
+    // Provisioned again each time (an idempotent upsert): a user moved to another extension, or a PBX whose
+    // account table was recreated, gets the hashes back without a new secret.
+    await this.opts.provisioner.setSipSecret(extension, secret)
+    return secret
   }
 
   private async create(tenantId: string, userId: string, extension: string) {

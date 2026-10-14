@@ -2,7 +2,7 @@
 import Provider from 'oidc-provider'
 
 // Logins are the LDAP uids: the SSO and the directory name people the same way, as LemonLDAP::NG does on an LDAP.
-const NAMES = { amartin: 'Alice Martin', bdurand: 'Bob Durand' }
+const NAMES = { amartin: 'Alice Martin', jdupont: 'Jean Dupont', bdurand: 'Bob Durand' }
 /** Roles the provider asserts in the access token, as LemonLDAP::NG would from a group: alice administers the platform. */
 const ROLES = { amartin: ['staff', 'twakephone-admin'], bdurand: ['staff'] }
 

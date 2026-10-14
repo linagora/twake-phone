@@ -14,6 +14,7 @@ import { FavoritesProvider } from './favorites.js'
 import { Recents } from './pages/Recents.js'
 import { Settings } from './pages/Settings.js'
 import { SignIn } from './pages/SignIn.js'
+import { SoftphoneProvider } from './softphone.js'
 
 const Gate = ({ config }: { config: AppConfig }) => {
   const { t } = useT()
@@ -22,21 +23,23 @@ const Gate = ({ config }: { config: AppConfig }) => {
   if (state.status === 'anonymous') return <SignIn />
   return (
     <GatewayProvider config={config}>
-      <FavoritesProvider>
-        <BrowserRouter>
-          <Routes>
-            <Route element={<Layout />}>
-              <Route index element={<Dialer />} />
-              <Route path="recents" element={<Recents />} />
-              <Route path="directory" element={<Directory />} />
-              <Route path="directory/:id" element={<ContactPage />} />
-              <Route path="settings" element={<Settings config={config} />} />
-              <Route path="admin" element={<Admin />} />
-              <Route path="*" element={<Navigate to="/" replace />} />
-            </Route>
-          </Routes>
-        </BrowserRouter>
-      </FavoritesProvider>
+      <SoftphoneProvider>
+        <FavoritesProvider>
+          <BrowserRouter>
+            <Routes>
+              <Route element={<Layout />}>
+                <Route index element={<Dialer />} />
+                <Route path="recents" element={<Recents />} />
+                <Route path="directory" element={<Directory />} />
+                <Route path="directory/:id" element={<ContactPage />} />
+                <Route path="settings" element={<Settings config={config} />} />
+                <Route path="admin" element={<Admin />} />
+                <Route path="*" element={<Navigate to="/" replace />} />
+              </Route>
+            </Routes>
+          </BrowserRouter>
+        </FavoritesProvider>
+      </SoftphoneProvider>
     </GatewayProvider>
   )
 }

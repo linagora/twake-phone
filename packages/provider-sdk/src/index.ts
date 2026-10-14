@@ -49,6 +49,11 @@ export interface ConferenceBridgeProvider {
   muteParticipant(participantId: string): Promise<void>
 }
 
+/** Pushes a user's SIP secret where the SIP server checks it. The Gateway generates and keeps the secret. */
+export interface SecretProvisioner {
+  setSipSecret(extension: string, secret: string): Promise<void>
+}
+
 /** Provider modules export a factory; config comes from the tenant settings, secrets from env/Vault. */
 export interface ProviderContext {
   tenantId: string
