@@ -120,7 +120,7 @@ Pas de calendrier en semaines : le développement avance par étapes ordonnées,
 | # | Étape | Démo de sortie | État |
 |---|---|---|---|
 | 1 | **Monorepo** : import du POC avec tous ses tests, ADR, CI | `yarn test` vert, ADR relus | Fusionnée le 14 octobre 2026 |
-| 2 | **App React autonome** : OIDC, annuaire LDAP et CardDAV, synchronisation des comptes, CSP, socle RGAA | Connexion SSO, recherche d'un collègue | PR 2a (coquille et SSO) fusionnée, PR 2b (annuaire LDAP, favoris) ouverte |
+| 2 | **App React autonome** : OIDC, annuaire LDAP et CardDAV, synchronisation des comptes, CSP, socle RGAA | Connexion SSO, recherche d'un collègue | PR 2a (coquille et SSO) fusionnée, PR 2b (annuaire LDAP, favoris) et PR 2c (synchronisation des comptes, CSP, administration) ouvertes |
 | 3 | **OpenSIPS et JsSIP** : Docker OpenSIPS + rtpengine, softphone réécrit, attente, transfert direct et supervisé, DTMF, trois navigateurs | Deux utilisateurs s'appellent, s'attendent, se transfèrent | |
 | 4 | **provider-opensips** : événements, présence, CDR, renvois, NPD planifié, groupes | La pastille change pendant un appel, un renvoi est appliqué | |
 | 5 | **Réception sans onglet** : service worker, Web Push, renvoi après délai | Navigateur fermé, la notification ouvre l'app sur l'appel | |
@@ -170,6 +170,10 @@ yarn dev:web                                   # app TwakePhone sur http://local
 
 Annuaire : la passerelle interroge un LDAP quand `LDAP_URL` est renseigné (`ldaps://` dès que le serveur n'est pas local ; `LDAP_BASE_DN` obligatoire ; `LDAP_BIND_DN` et `LDAP_BIND_PASSWORD` pour un compte lecteur ; `LDAP_USER_FILTER`, par défaut `(objectClass=inetOrgPerson)` ; `LDAP_ATTR_ID`, `_NAME`, `_SURNAME`, `_GIVENNAME`, `_EMAIL`, `_PHONE`, `_MOBILE`, `_EXTENSION`, `_DEPARTMENT`, `_TITLE` pour un schéma qui s'écarte d'inetOrgPerson ; `LDAP_TLS_CA_FILE` pour une autorité interne). Un seul annuaire par déploiement pour l'instant, servi au tenant `LDAP_TENANT` (par défaut `DEFAULT_TENANT`) : les autres tenants n'ont pas d'annuaire, la configuration par tenant viendra avec l'écran d'administration (étape 7). Sans `LDAP_URL`, l'app affiche que la plateforme n'a pas d'annuaire. Les favoris (100 au plus par personne) sont dans PostgreSQL.
 
+Comptes : quand `LDAP_ATTR_EXTENSION` dit quel attribut porte le poste (`ipPhone` sur un Active Directory, un attribut maison sur OpenLDAP), la passerelle copie les comptes de l'annuaire dans ses correspondances utilisateur ↔ poste toutes les `LDAP_SYNC_INTERVAL` (`1h` par défaut, `0` pour désactiver) et à la demande depuis l'écran d'administration de l'app. L'identifiant LDAP (`LDAP_ATTR_ID`, `uid` par défaut) doit être celui que le SSO met dans le jeton (`JWT_USER_CLAIM`). L'annuaire fait foi pour les personnes qu'il connaît ; les postes attribués à la main à des personnes qu'il ne connaît pas sont conservés ; un poste donné à deux personnes est signalé, la première le garde. Administrateurs : les personnes dont le jeton porte le rôle `ADMIN_ROLE` (`twakephone-admin` par défaut) dans la revendication `JWT_ROLES_CLAIM` (à renseigner, par exemple `groups` sur LemonLDAP::NG ; sans elle aucun rôle n'est lu), ou nommées dans `ADMIN_USERS` (`alice,acme:bob`). La synchronisation lancée depuis l'écran tourne en arrière-plan ; l'écran la suit jusqu'au rapport. Un listing vide ne retire aucun poste.
+
+App web en production : `yarn workspace @twake/phone-web start` (ou `docker/Dockerfile.web`) sert `apps/web/dist` avec son `config.json` et ses en-têtes de sécurité, à partir de `GATEWAY_URL`, `OIDC_AUTHORITY`, `OIDC_CLIENT_ID`, `OIDC_RESOURCE` (et `OIDC_SCOPE`, `OIDC_PROMPT`), `FRAME_ANCESTORS` (origines autorisées à encadrer l'app, par exemple celles de Twake Chat ; `'none'` sinon), `CONNECT_SRC` (origines supplémentaires, comme le WSS du serveur SIP à l'étape 3), `HSTS_MAX_AGE` une fois derrière TLS (`HSTS_INCLUDE_SUBDOMAINS=1` pour l'étendre). La CSP n'autorise que les scripts et styles du build, la passerelle (REST et WebSocket) et le fournisseur d'identité. La passerelle pose des en-têtes de même nature sur ses réponses (CSP sans source, `nosniff`, `no-store`, HSTS avec les mêmes variables).
+
 Stack complète en local (Twake, Phone, passerelle, PBX de dev), encore celle du POC jusqu'à l'étape 3 :
 
 ```bash
@@ -184,7 +188,7 @@ Visio (accès téléphonique aux salles Meet) et trunk SIP réel : [docker/READM
 |---|---|
 | `yarn test` | unitaires de tous les paquets et de la passerelle (vitest), contrat de stockage mémoire et, avec `TEST_DATABASE_URL`, PostgreSQL |
 | `cd apps/phone && yarn lint && yarn test` | application Phone du POC (eslint, stylint, jest) |
-| `yarn e2e:web` | app TwakePhone dans Chromium : connexion OIDC (fournisseur de test en Node), identité et poste donnés par la passerelle, clavier, annuaire et favoris (LDAP de test en Node), langue, déconnexion, CSP. Sans Docker ; Chromium s'installe une fois avec `npx playwright-core install chromium` (ou `PLAYWRIGHT_CHROMIUM=/chemin/vers/chromium`) |
+| `yarn e2e:web` | app TwakePhone dans Chromium, servie par son serveur de production : connexion OIDC (fournisseur de test en Node, rôle d'administrateur dans le jeton), synchronisation des comptes depuis l'écran d'administration (LDAP de test en Node) puis poste affiché, clavier, annuaire et favoris, langue, déconnexion, en-têtes de sécurité de l'app et de la passerelle, encadrement par un autre site refusé, CSP. Sans Docker ; Chromium s'installe une fois avec `npx playwright-core install chromium` (ou `PLAYWRIGHT_CHROMIUM=/chemin/vers/chromium`) |
 | `yarn e2e:live` | passerelle ↔ PBX de dev (MiniPBX, ARI), avec de vrais appels SIP |
 | `yarn e2e:browser` | deux navigateurs, audio réel simulé (WebRTC) |
 | `yarn e2e:widget` | widget dans un hôte cozy-interapp réel |

@@ -2,9 +2,10 @@ import { defineConfig, type MetaOptions } from '@rsbuild/core'
 import { pluginReact } from '@rsbuild/plugin-react'
 
 /**
- * Content Security Policy of the built app: tokens live in sessionStorage, so no script but ours may run. The Gateway
- * and the identity provider are only known at runtime (config.json), hence the broad connect-src; the reverse proxy
- * that serves the app tightens it to those two origins (step 2c). Dev builds skip it: rsbuild injects styles inline.
+ * Content Security Policy of the built page: tokens live in sessionStorage, so no script but ours may run. The Gateway
+ * and the identity provider are only known at runtime (config.json), hence the broad connect-src; the server that
+ * serves the app (apps/web/server) sends the tight one, with those two origins and frame-ancestors, as a header.
+ * This one is the fallback of a static host that sets no header. Dev builds skip it: rsbuild injects styles inline.
  */
 const CSP = [
   "default-src 'self'",

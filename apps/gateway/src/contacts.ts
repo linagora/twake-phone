@@ -24,6 +24,22 @@ export interface ContactDirectory {
   search(tenantId: TenantId, query: string, limit: number): Promise<SearchResult>
   /** The contacts with these ids, in the order given; unknown ids are left out. */
   getMany(tenantId: TenantId, ids: string[]): Promise<Contact[]>
+  /** Every person of the tenant, for the account synchronisation. Absent: this directory cannot be synchronised. */
+  listAll?(tenantId: TenantId): Promise<Contact[]>
+  /** What an administrator may see of the source: never a credential. */
+  describe?(): DirectorySource
+}
+
+/** The directory as shown on the administration screen. */
+export interface DirectorySource {
+  type: string
+  /** Server address without credentials (an LDAP URL, for instance). */
+  url?: string
+  tenantId?: string
+  baseDn?: string
+  userFilter?: string
+  /** Which attribute carries what, for an LDAP directory. */
+  attributes?: Record<string, string>
 }
 
 /** A directory held in memory: tests, and a dev Gateway without LDAP. */
@@ -39,6 +55,14 @@ export class MemoryContactDirectory implements ContactDirectory {
 
   async getMany(_tenantId: TenantId, ids: string[]) {
     return ids.flatMap(id => this.contacts.filter(c => c.id === id))
+  }
+
+  async listAll() {
+    return [...this.contacts]
+  }
+
+  describe(): DirectorySource {
+    return { type: 'memory' }
   }
 }
 

@@ -6,6 +6,7 @@ import { loadConfig, type AppConfig } from './config.js'
 import { GatewayProvider } from './gateway.js'
 import { I18nProvider, useT } from './i18n/useT.js'
 import { Layout } from './components/Layout.js'
+import { Admin } from './pages/Admin.js'
 import { Dialer } from './pages/Dialer.js'
 import { ContactPage } from './pages/ContactPage.js'
 import { Directory } from './pages/Directory.js'
@@ -30,6 +31,7 @@ const Gate = ({ config }: { config: AppConfig }) => {
               <Route path="directory" element={<Directory />} />
               <Route path="directory/:id" element={<ContactPage />} />
               <Route path="settings" element={<Settings config={config} />} />
+              <Route path="admin" element={<Admin />} />
               <Route path="*" element={<Navigate to="/" replace />} />
             </Route>
           </Routes>

@@ -4,6 +4,7 @@ import { buildApp } from './app.js'
 import { authenticatorFromEnv } from './auth.js'
 import { parseKey } from './crypto.js'
 import { StoreDirectory, parseUserMap } from './directory.js'
+import { DirectorySync, parseInterval } from './directory-sync.js'
 import { ldapDirectoryFromEnv } from './ldap-directory.js'
 import { storedAsteriskFactory, type StoredAsteriskConfig } from './providers.js'
 import { ProviderRegistry } from './registry.js'
@@ -38,7 +39,8 @@ if (env.BOOTSTRAP_PROVIDER_URL && !(await store.listProviders()).some(p => p.ten
   }
   await store.upsertProvider({ tenantId: tenant, type: 'asterisk', config })
 }
-for (const m of parseUserMap(env.DEV_USER_MAP)) await store.upsertMapping({ tenantId: tenant, ...m })
+// DEV_USER_MAP seeds a mapping once; it never overwrites what an administrator or the directory wrote since.
+for (const m of parseUserMap(env.DEV_USER_MAP)) if (!(await store.getMappingByUser(tenant, m.userId))) await store.upsertMapping({ tenantId: tenant, ...m })
 
 const key = env.SECRETS_KEY ? parseKey(env.SECRETS_KEY) : undefined
 const secretsFor = key ? (url: string, token: string) => new SipSecrets({ store, key, provisioner: miniPbxProvisioner({ url, token }) }) : undefined
@@ -71,6 +73,23 @@ const conference = env.LIVEKIT_API_KEY && env.LIVEKIT_API_SECRET && env.LIVEKIT_
   : undefined
 
 const contacts = ldapDirectoryFromEnv(env, message => console.warn(`WARNING: ${message}`))
-const app = await buildApp(registry, { store, directory: new StoreDirectory(store), ...(contacts ? { contacts } : {}), auth: authenticatorFromEnv(env), ...(conference ? { conference } : {}) })
+// The accounts of the directory become user ↔ extension mappings, on a schedule (LDAP_SYNC_INTERVAL, "0" to disable)
+// and on demand from the administration screen. Only when the schema says which attribute holds the extension.
+const directorySync = contacts && env.LDAP_ATTR_EXTENSION ? new DirectorySync({ store, directory: contacts, tenantId: env.LDAP_TENANT ?? tenant }) : undefined
+const hstsMaxAge = env.HSTS_MAX_AGE ? Number(env.HSTS_MAX_AGE) : undefined
+if (hstsMaxAge !== undefined && !(Number.isInteger(hstsMaxAge) && hstsMaxAge >= 0)) throw new Error('HSTS_MAX_AGE must be a number of seconds')
+const app = await buildApp(registry, {
+  store,
+  directory: new StoreDirectory(store),
+  ...(contacts ? { contacts } : {}),
+  ...(directorySync ? { directorySync } : {}),
+  ...(hstsMaxAge !== undefined ? { security: { hstsMaxAge, hstsIncludeSubDomains: env.HSTS_INCLUDE_SUBDOMAINS === '1' } } : {}),
+  auth: authenticatorFromEnv(env),
+  ...(conference ? { conference } : {})
+})
+directorySync?.useLogger(app.log)
+const syncEvery = parseInterval(env.LDAP_SYNC_INTERVAL, 3_600_000)
+if (directorySync && syncEvery > 0) directorySync.start(syncEvery)
+app.addHook('onClose', async () => directorySync?.stop())
 registry.startAll()
 await app.listen({ host: '0.0.0.0', port: Number(env.PORT ?? 8080) })

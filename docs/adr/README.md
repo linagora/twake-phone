@@ -12,5 +12,6 @@ Une décision, un fichier, numéroté dans l'ordre où elle a été prise. Un AD
 | [0006](0006-app-autonome.md) | Application autonome, Twake Chat l'affiche sans pile SIP | acceptée |
 | [0007](0007-fastify-postgresql.md) | Passerelle Fastify et PostgreSQL | acceptée |
 | [0008](0008-plan-en-etapes.md) | Plan en étapes avec porte de sortie, PR par fonctionnalité, revue indépendante | acceptée |
+| [0009](0009-comptes-depuis-l-annuaire.md) | Les postes viennent de l'annuaire LDAP, qui fait foi ; administrateurs par rôle du SSO | acceptée |
 
 Gabarit : date, état et « remplacé par », contexte, décision, conséquences, alternatives écartées. Dix lignes suffisent. Une décision cite le fil ou le compte rendu où elle a été prise, pas une personne.

@@ -9,14 +9,14 @@ export const READER_DN = 'cn=reader,dc=example,dc=test'
 export const READER_PASSWORD = 'reader-secret'
 
 export const PEOPLE = [
-  { uid: 'jdupont', cn: 'Jean Dupont', sn: 'Dupont', givenName: 'Jean', mail: 'jean.dupont@example.test', telephoneNumber: '+33 1 23 45 67 01', mobile: '+33 6 12 34 56 01', ou: 'Support', title: 'Technicien' },
-  { uid: 'amartin', cn: 'Alice Martin', sn: 'Martin', givenName: 'Alice', mail: 'alice.martin@example.test', telephoneNumber: '+33 1 23 45 67 02', ou: 'Direction' },
-  { uid: 'bdurand', cn: 'Bob Durand', sn: 'Durand', givenName: 'Bob', mail: 'bob.durand@example.test', telephoneNumber: ['+33 1 23 45 67 03', '+33 1 23 45 67 04'], mobile: '+33 6 12 34 56 03', ou: 'Support' },
+  { uid: 'jdupont', cn: 'Jean Dupont', sn: 'Dupont', givenName: 'Jean', mail: 'jean.dupont@example.test', telephoneNumber: '+33 1 23 45 67 01', mobile: '+33 6 12 34 56 01', ipPhone: '102', ou: 'Support', title: 'Technicien' },
+  { uid: 'amartin', cn: 'Alice Martin', sn: 'Martin', givenName: 'Alice', mail: 'alice.martin@example.test', telephoneNumber: '+33 1 23 45 67 02', ipPhone: '101', ou: 'Direction' },
+  { uid: 'bdurand', cn: 'Bob Durand', sn: 'Durand', givenName: 'Bob', mail: 'bob.durand@example.test', telephoneNumber: ['+33 1 23 45 67 03', '+33 1 23 45 67 04'], mobile: '+33 6 12 34 56 03', ipPhone: '103', ou: 'Support' },
   { uid: 'zlefevre', cn: 'Zoé Lefèvre', sn: 'Lefèvre', givenName: 'Zoé', mail: 'zoe.lefevre@example.test', telephoneNumber: '+33 1 23 45 67 05', ou: 'Comptabilité' },
-  { uid: 'mpetit', cn: 'Marc Petit', sn: 'Petit', givenName: 'Marc', mail: 'marc.petit@example.test', telephoneNumber: '+33 1 23 45 67 06', ou: 'Support' }
+  { uid: 'mpetit', cn: 'Marc Petit', sn: 'Petit', givenName: 'Marc', mail: 'marc.petit@example.test', telephoneNumber: '+33 1 23 45 67 06', ipPhone: '103', ou: 'Support' }
 ]
 
-const NUMBER_ATTRS = new Set(['telephonenumber', 'mobile', 'homephone', 'facsimiletelephonenumber'])
+const NUMBER_ATTRS = new Set(['telephonenumber', 'mobile', 'homephone', 'facsimiletelephonenumber', 'ipphone'])
 
 /** Decodes the \xx escapes a filter value may carry (bytes of UTF-8), then folds case and accents. */
 const unescape = v => {

@@ -8,11 +8,18 @@ export interface ProviderRecord {
   config: unknown
 }
 
+export type MappingSource = 'manual' | 'ldap'
+
 export interface UserMapping {
   tenantId: string
   userId: string
   extension: string
   displayName?: string
+  department?: string
+  /** Who wrote it: an administrator (or DEV_USER_MAP), or the directory synchronisation. Absent means manual. */
+  source?: MappingSource
+  /** When the synchronisation last wrote this row (ISO 8601); an unchanged row keeps its date. */
+  syncedAt?: string
 }
 
 export interface HistoryEntry {
@@ -67,6 +74,9 @@ export interface Store {
   getMappingByUser(tenantId: string, userId: string): Promise<UserMapping | null>
   getMappingByExtension(tenantId: string, extension: string): Promise<UserMapping | null>
   upsertMapping(mapping: UserMapping): Promise<void>
+  /** Every mapping of a tenant, by user id. */
+  listMappings(tenantId: string): Promise<UserMapping[]>
+  deleteMapping(tenantId: string, userId: string): Promise<void>
 
   /** Idempotent on (tenant, user, callId). */
   addHistory(entry: HistoryEntry): Promise<void>

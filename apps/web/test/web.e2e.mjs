@@ -1,15 +1,19 @@
 // End to end: a real browser signs in through an OpenID provider, the app shows who the Gateway says you are,
 // and signing out brings the sign-in page back. No Docker: the provider, the Gateway and the app run in this process.
+// The app is served by its production server (apps/web/server), so the policy it ships with is the one tested.
+import { createServer as createHttpServer } from 'node:http'
 import { createServer } from 'node:net'
 import { fileURLToPath } from 'node:url'
 import { chromium } from 'playwright-core'
 import { buildApp } from '../../gateway/dist/app.js'
 import { JwtAuthenticator } from '../../gateway/dist/auth.js'
+import { DirectorySync } from '../../gateway/dist/directory-sync.js'
 import { DEFAULT_ATTRIBUTES, LdapDirectory } from '../../gateway/dist/ldap-directory.js'
 import { ProviderRegistry } from '../../gateway/dist/registry.js'
+import { MemoryStore } from '../../gateway/dist/store/memory.js'
 import { BASE_DN, READER_DN, READER_PASSWORD, startLdapMock } from '../../gateway/test/ldap-mock.mjs'
 import { startOidcMock } from './oidc-mock.mjs'
-import { serveApp } from './static-server.mjs'
+import { serveApp } from '../server/serve.mjs'
 
 const AUDIENCE = 'twakephone-gateway'
 const RESOURCE = 'https://gateway.twakephone.test'
@@ -31,25 +35,37 @@ const expectEqual = (actual, expected, what) => {
   if (actual !== expected) throw new Error(`${what}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`)
 }
 
-const [APP_PORT, OIDC_PORT, GATEWAY_PORT] = await Promise.all([freePort(), freePort(), freePort()])
+const [APP_PORT, OIDC_PORT, GATEWAY_PORT, OTHER_PORT] = await Promise.all([freePort(), freePort(), freePort(), freePort()])
 const appOrigin = `http://127.0.0.1:${APP_PORT}`
+const gatewayUrl = `http://127.0.0.1:${GATEWAY_PORT}`
 
 process.env.LOG_LEVEL ??= 'warn'
 process.env.CORS_ORIGINS = appOrigin
 process.env.DEFAULT_TENANT = 'e2e'
-process.env.DEV_USER_MAP = 'alice:101'
 
 const oidc = await startOidcMock({ port: OIDC_PORT, appOrigin, audience: AUDIENCE, resource: RESOURCE })
 const ldap = await startLdapMock()
-const auth = new JwtAuthenticator({ jwksUrl: oidc.jwksUrl, issuer: oidc.issuer, audience: AUDIENCE, defaultTenant: 'e2e' })
-const contacts = new LdapDirectory({ url: ldap.url, tenantId: 'e2e', bindDn: READER_DN, bindPassword: READER_PASSWORD, baseDn: BASE_DN, userFilter: '(objectClass=inetOrgPerson)', attributes: DEFAULT_ATTRIBUTES })
-const gateway = await buildApp(new ProviderRegistry([]), { auth, contacts })
+// The provider's "roles" claim says who administers the platform (JWT_ROLES_CLAIM=roles, ADMIN_ROLE=twakephone-admin).
+const auth = new JwtAuthenticator({ jwksUrl: oidc.jwksUrl, issuer: oidc.issuer, audience: AUDIENCE, defaultTenant: 'e2e', rolesClaim: 'roles' })
+// The directory's ipPhone attribute holds the extension (LDAP_ATTR_EXTENSION=ipPhone): the synchronisation copies it.
+const contacts = new LdapDirectory({ url: ldap.url, tenantId: 'e2e', bindDn: READER_DN, bindPassword: READER_PASSWORD, baseDn: BASE_DN, userFilter: '(objectClass=inetOrgPerson)', attributes: { ...DEFAULT_ATTRIBUTES, extension: 'ipPhone' } })
+const store = new MemoryStore()
+const directorySync = new DirectorySync({ store, directory: contacts, tenantId: 'e2e' })
+const gateway = await buildApp(new ProviderRegistry([]), { auth, store, contacts, directorySync, admin: { adminRole: 'twakephone-admin', adminUsers: new Set() } })
 await gateway.listen({ host: '127.0.0.1', port: GATEWAY_PORT })
 const web = await serveApp({
   dir: fileURLToPath(new URL('../dist/', import.meta.url)),
   port: APP_PORT,
   // No scope here: the app's default (with offline_access, hence a refresh token) is what gets tested.
-  config: { gatewayUrl: `http://127.0.0.1:${GATEWAY_PORT}`, oidc: { authority: oidc.issuer, clientId: 'twakephone-web', resource: RESOURCE } }
+  config: { gatewayUrl, oidc: { authority: oidc.issuer, clientId: 'twakephone-web', resource: RESOURCE } }
+})
+// Another site that tries to embed the app: the policy must refuse it.
+const other = await new Promise(resolve => {
+  const s = createHttpServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+    res.end(`<!doctype html><title>Embedder</title><h1>Embedder</h1><iframe id="phone" src="${appOrigin}/" title="phone"></iframe>`)
+  })
+  s.listen(OTHER_PORT, '127.0.0.1', () => resolve({ origin: `http://127.0.0.1:${OTHER_PORT}`, stop: () => new Promise(r => s.close(r)) }))
 })
 
 const browser = await chromium.launch({ ...(process.env.PLAYWRIGHT_CHROMIUM ? { executablePath: process.env.PLAYWRIGHT_CHROMIUM } : {}) })
@@ -66,6 +82,7 @@ page.on('console', msg => {
 })
 page.on('requestfailed', req => { if (!/fonts\.g(static|oogleapis)\.com/.test(req.url())) console.log('request failed:', req.method(), req.url(), req.failure()?.errorText) })
 let failed = false
+let session = null
 try {
   await step('the app comes up in French and sends an anonymous visitor to sign in', async () => {
     await page.goto(`${web.origin}/recents`)
@@ -73,33 +90,62 @@ try {
     await page.getByRole('button', { name: 'Sign-in' }).waitFor()
     expectEqual(new URL(page.url()).origin, oidc.issuer, 'sign-in page origin')
   })
-  await step('the identity provider authenticates alice and asks for consent', async () => {
-    await page.locator('input[name=login]').fill('alice')
+  await step('the identity provider authenticates amartin and asks for consent', async () => {
+    await page.locator('input[name=login]').fill('amartin')
     await page.locator('input[name=password]').fill('whatever')
     await page.getByRole('button', { name: 'Sign-in' }).click()
     // The consent page is the one with a Continue button: waiting on the URL would match the login page too.
     await page.getByRole('button', { name: 'Continue' }).click()
     await page.waitForURL(`${appOrigin}/**`)
   })
-  await step('the app lands on the page the visitor wanted, as Alice with extension 101', async () => {
+  await step('the app lands on the page the visitor wanted, as Alice, who has no extension yet', async () => {
     await page.waitForURL(`${appOrigin}/recents`)
     const who = page.getByTestId('who')
     await who.getByText('Alice Martin').waitFor()
-    await who.getByText('Poste 101').waitFor()
+    await who.getByText('Aucun poste attribué').waitFor()
     await page.getByRole('heading', { level: 1, name: 'Récents' }).waitFor()
     expectEqual(await page.title(), 'Récents – TwakePhone', 'document title')
     expectEqual(await page.evaluate(() => document.documentElement.lang), 'fr', 'html lang')
   })
-  await step('the provider issued a JWT access token for the Gateway and a refresh token for silent renewal', async () => {
+  await step('the provider issued a JWT access token for the Gateway, with roles, and a refresh token for silent renewal', async () => {
     const user = await page.evaluate(() => {
       const key = Object.keys(sessionStorage).find(k => k.startsWith('oidc.user'))
       return key ? JSON.parse(sessionStorage.getItem(key)) : null
     })
     if (!user) throw new Error('no oidc.user entry in sessionStorage')
+    session = user
     expectEqual(user.access_token.split('.').length, 3, 'access token segments')
     const payload = JSON.parse(Buffer.from(user.access_token.split('.')[1], 'base64url').toString())
     expectEqual(payload.aud, AUDIENCE, 'access token audience')
+    expectEqual(JSON.stringify(payload.roles), JSON.stringify(['staff', 'twakephone-admin']), 'roles claim')
     if (typeof user.refresh_token !== 'string' || !user.refresh_token) throw new Error('no refresh token: offline_access was not granted')
+  })
+  await step('the administration screen shows the LDAP source and synchronises the accounts: Alice gets extension 101', async () => {
+    await page.getByRole('link', { name: 'Administration' }).click()
+    await page.getByRole('heading', { level: 1, name: 'Administration' }).waitFor()
+    expectEqual(await page.title(), 'Administration – TwakePhone', 'document title')
+    await page.getByText(ldap.url).waitFor()
+    await page.getByText(BASE_DN).waitFor()
+    await page.getByText('Aucune synchronisation depuis').waitFor()
+    const accepted = page.waitForResponse(r => r.request().method() === 'POST' && r.url().endsWith('/admin/directory/sync'))
+    await page.getByRole('button', { name: 'Synchroniser maintenant' }).click()
+    expectEqual((await accepted).status(), 202, 'synchronisation accepted')
+    // The screen follows the run until it ends, then shows the report.
+    await page.getByText('Synchronisation terminée.').waitFor()
+    await page.getByText('Dernière synchronisation le').waitFor()
+    await page.getByText('mpetit : le poste 103 est déjà attribué à bdurand').waitFor()
+    const report = (await gateway.inject({ url: '/api/v1/admin/directory', headers: { authorization: `Bearer ${session.access_token}` } })).json().sync.last
+    expectEqual(report.seen, 5, 'people seen')
+    expectEqual(report.withExtension, 4, 'people with an extension')
+    expectEqual(report.created, 3, 'extensions assigned')
+    expectEqual(report.conflicts.length, 1, 'conflicts')
+    // Alice is among the synchronised accounts: the header follows without a reload, and after one.
+    await page.getByTestId('who').getByText('Poste 101').waitFor()
+    await page.reload()
+    await page.getByTestId('who').getByText('Poste 101').waitFor()
+    expectEqual((await gateway.inject({ url: '/api/v1/me', headers: { authorization: `Bearer ${session.access_token}` } })).json().extension, '101', 'extension in the Gateway')
+    // The second run changes nothing: the synchronisation is idempotent.
+    expectEqual((await directorySync.run()).unchanged, 3, 'second run')
   })
   await step('the session survives a reload', async () => {
     await page.reload()
@@ -117,7 +163,7 @@ try {
     await page.getByLabel('Rechercher').fill('dup')
     const list = page.locator('ul.contacts')
     await list.getByRole('link', { name: 'Jean Dupont', exact: true }).waitFor()
-    await list.getByText(/Support · .*23.45.67.01/).waitFor()
+    await list.getByText(/Support · 102/).waitFor()
     expectEqual(await list.getByRole('listitem').count(), 1, 'number of results')
     await page.getByLabel('Rechercher').fill('support')
     await list.getByRole('link', { name: 'Bob Durand', exact: true }).waitFor()
@@ -176,6 +222,36 @@ try {
     const stored = await page.evaluate(() => Object.keys(sessionStorage).filter(k => k.startsWith('oidc.user')))
     if (stored.length) throw new Error(`session still stored: ${stored.join(', ')}`)
   })
+  await step('the app and the Gateway answer with their security headers', async () => {
+    const app = await page.request.get(`${appOrigin}/recents`)
+    const csp = app.headers()['content-security-policy'] ?? ''
+    for (const expected of ["script-src 'self'", `connect-src 'self' ${gatewayUrl} ${gatewayUrl.replace('http', 'ws')} ${oidc.issuer}`, "frame-ancestors 'none'"]) {
+      if (!csp.includes(expected)) throw new Error(`app CSP lacks ${JSON.stringify(expected)}: ${csp}`)
+    }
+    expectEqual(app.headers()['x-frame-options'], 'DENY', 'app X-Frame-Options')
+    expectEqual(app.headers()['x-content-type-options'], 'nosniff', 'app X-Content-Type-Options')
+    expectEqual((await page.request.get(`${appOrigin}/config.json`)).headers()['cache-control'], 'no-store', 'config.json cache')
+    const api = await page.request.get(`${gatewayUrl}/api/v1/me`)
+    expectEqual(api.status(), 401, 'anonymous /me')
+    expectEqual(api.headers()['content-security-policy'], "default-src 'none'; frame-ancestors 'none'", 'Gateway CSP')
+    expectEqual(api.headers()['cache-control'], 'no-store', 'Gateway cache')
+    expectEqual(api.headers()['x-content-type-options'], 'nosniff', 'Gateway X-Content-Type-Options')
+  })
+  await step('another site cannot embed the app in a frame', async () => {
+    const embedder = await browser.newPage()
+    const refused = new Promise(resolve => embedder.on('console', msg => /frame-ancestors|X-Frame-Options/i.test(msg.text()) && resolve(msg.text())))
+    await embedder.goto(`${other.origin}/`)
+    await embedder.getByRole('heading', { name: 'Embedder' }).waitFor()
+    const message = await Promise.race([refused, new Promise(r => setTimeout(() => r(null), 5000))])
+    if (!message) throw new Error('the browser did not report the refused frame')
+    // The frame itself: Playwright reads any frame, whatever its origin. A refused one holds the browser's error page.
+    const frame = embedder.frames().find(f => f !== embedder.mainFrame())
+    if (!frame) throw new Error('no frame on the embedder page')
+    const inside = await frame.evaluate(() => ({ url: location.href, title: document.title, text: document.body?.innerText ?? '' })).catch(() => ({ url: frame.url(), title: '', text: '' }))
+    if (/^http/.test(inside.url) && /TwakePhone/.test(inside.text + inside.title)) throw new Error(`the app rendered inside the frame: ${JSON.stringify(inside)}`)
+    if (!/^chrome-error:/.test(inside.url)) throw new Error(`unexpected frame state: ${JSON.stringify(inside)}`)
+    await embedder.close()
+  })
   await step('the built app ran under its Content Security Policy without a violation', async () => {
     const csp = await page.evaluate(() => document.querySelector('meta[http-equiv="Content-Security-Policy"]')?.getAttribute('content') ?? '')
     if (!/script-src 'self'/.test(csp)) throw new Error(`no CSP in the built page: ${JSON.stringify(csp)}`)
@@ -190,6 +266,7 @@ try {
 } finally {
   await browser.close()
   await web.stop()
+  await other.stop()
   await gateway.close()
   await oidc.stop()
   await ldap.stop()

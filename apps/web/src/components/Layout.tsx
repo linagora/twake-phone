@@ -10,7 +10,8 @@ const LINKS: [string, Key][] = [
   ['/', 'nav.dialer'],
   ['/recents', 'nav.recents'],
   ['/directory', 'nav.directory'],
-  ['/settings', 'nav.settings']
+  ['/settings', 'nav.settings'],
+  ['/admin', 'nav.admin']
 ]
 
 export const Layout = () => {
@@ -18,6 +19,8 @@ export const Layout = () => {
   const { state, signOut } = useAuth()
   const { me } = useGateway()
   const name = displayNameFor(me, state.status === 'signed-in' ? state.user : null)
+  // The administration link shows only to administrators; the Gateway refuses the others anyway.
+  const links = LINKS.filter(([to]) => to !== '/admin' || me?.features?.admin)
   const { pathname } = useLocation()
   const main = useRef<HTMLElement>(null)
   const firstRender = useRef(true)
@@ -50,7 +53,7 @@ export const Layout = () => {
       <div className="layout">
         <nav className="sidenav" aria-label={t('nav.label')}>
           <ul>
-            {LINKS.map(([to, key]) => (
+            {links.map(([to, key]) => (
               <li key={to}>
                 <NavLink to={to} end={to === '/'}>
                   {t(key)}

@@ -11,6 +11,14 @@ export interface Identity {
   displayName?: string
   /** Used to act on the user's behalf in other Twake services (e.g. Meet's external API). */
   email?: string
+  /** Roles the identity provider asserts (a claim of the token); what they allow is decided by the Gateway. */
+  roles?: string[]
+}
+
+/** The roles claim as providers write it: an array, or one space- or comma-separated string. */
+export const rolesOf = (claim: unknown): string[] => {
+  const raw = Array.isArray(claim) ? claim : typeof claim === 'string' ? claim.split(/[\s,]+/) : []
+  return raw.filter((r): r is string => typeof r === 'string' && r.length > 0)
 }
 
 export interface Authenticator {
@@ -34,7 +42,8 @@ export class DevAuthenticator implements Authenticator {
     const id = req.headers['x-dev-user'] ?? query.user ?? tokenUser
     const tenant = req.headers['x-dev-tenant'] ?? this.tenantId
     if (typeof id !== 'string' || !id || typeof tenant !== 'string') throw fail(401, 'Unauthenticated')
-    return { userId: id, tenantId: tenant, email: `${id}@${process.env.DEV_EMAIL_DOMAIN ?? 'twake.local'}` }
+    const roles = rolesOf(req.headers['x-dev-roles'])
+    return { userId: id, tenantId: tenant, email: `${id}@${process.env.DEV_EMAIL_DOMAIN ?? 'twake.local'}`, ...(roles.length ? { roles } : {}) }
   }
 }
 
@@ -132,6 +141,8 @@ export interface JwtAuthOptions {
   audience: string
   userClaim?: string
   tenantClaim?: string
+  /** Claim carrying the user's roles (e.g. "roles", or "groups" on LemonLDAP::NG). Absent: no role is read. */
+  rolesClaim?: string
   defaultTenant: string
 }
 
@@ -152,7 +163,14 @@ export class JwtAuthenticator implements Authenticator {
       const userId = payload[this.opts.userClaim ?? 'preferred_username'] ?? payload.sub
       if (typeof userId !== 'string' || !userId) throw new Error('no user claim')
       const tenant = this.opts.tenantClaim ? payload[this.opts.tenantClaim] : undefined
-      return { userId, tenantId: typeof tenant === 'string' && tenant ? tenant : this.opts.defaultTenant, ...(typeof payload.name === 'string' ? { displayName: payload.name } : {}), ...(typeof payload.email === 'string' ? { email: payload.email } : {}) }
+      const roles = this.opts.rolesClaim ? rolesOf(payload[this.opts.rolesClaim]) : []
+      return {
+        userId,
+        tenantId: typeof tenant === 'string' && tenant ? tenant : this.opts.defaultTenant,
+        ...(typeof payload.name === 'string' ? { displayName: payload.name } : {}),
+        ...(typeof payload.email === 'string' ? { email: payload.email } : {}),
+        ...(roles.length ? { roles } : {})
+      }
     } catch {
       throw fail(401, 'Unauthenticated')
     }
@@ -197,7 +215,15 @@ export const authenticatorFromEnv = (env: NodeJS.ProcessEnv): Authenticator => {
   }
   if (mode === 'jwt') {
     if (!env.JWT_JWKS_URL || !env.JWT_ISSUER || !env.JWT_AUDIENCE) throw new Error('JWT_JWKS_URL, JWT_ISSUER and JWT_AUDIENCE are required in jwt auth mode')
-    return new JwtAuthenticator({ jwksUrl: env.JWT_JWKS_URL, issuer: env.JWT_ISSUER, audience: env.JWT_AUDIENCE, defaultTenant, ...(env.JWT_USER_CLAIM ? { userClaim: env.JWT_USER_CLAIM } : {}), ...(env.JWT_TENANT_CLAIM ? { tenantClaim: env.JWT_TENANT_CLAIM } : {}) })
+    return new JwtAuthenticator({
+      jwksUrl: env.JWT_JWKS_URL,
+      issuer: env.JWT_ISSUER,
+      audience: env.JWT_AUDIENCE,
+      defaultTenant,
+      ...(env.JWT_USER_CLAIM ? { userClaim: env.JWT_USER_CLAIM } : {}),
+      ...(env.JWT_TENANT_CLAIM ? { tenantClaim: env.JWT_TENANT_CLAIM } : {}),
+      ...(env.JWT_ROLES_CLAIM ? { rolesClaim: env.JWT_ROLES_CLAIM } : {})
+    })
   }
   throw new Error(`Unknown AUTH_MODE: ${mode}`)
 }
