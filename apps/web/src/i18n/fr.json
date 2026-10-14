@@ -155,5 +155,20 @@
   "call.errorTransferRejected": "Transfert impossible : le poste visé a refusé l'appel{status}.",
   "call.errorTransferNoAnswer": "Transfert impossible : le poste visé n'a pas répondu{status}.",
   "call.errorTransferCancelled": "Transfert impossible : l'appel vers le poste visé a été abandonné{status}.",
-  "call.errorTransferFailed": "Le transfert a échoué{status}."
+  "call.errorTransferFailed": "Le transfert a échoué{status}.",
+  "settings.audio": "Audio",
+  "settings.microphone": "Microphone",
+  "settings.output": "Sortie de la voix",
+  "settings.ringer": "Sortie de la sonnerie",
+  "settings.defaultDevice": "Par défaut (choix du navigateur)",
+  "settings.unnamedMicrophone": "Microphone {n}",
+  "settings.unnamedOutput": "Sortie {n}",
+  "settings.outputUnsupported": "Ce navigateur ne permet pas de choisir la sortie audio : la voix et la sonnerie suivent la sortie par défaut du système.",
+  "settings.allowMicrophoneHint": "Les noms des périphériques apparaissent une fois l'accès au microphone autorisé.",
+  "settings.allowMicrophone": "Autoriser le microphone",
+  "settings.testRing": "Tester la sonnerie",
+  "settings.audioNeedsPhone": "La sonnerie se teste une fois le téléphone en ligne.",
+  "phone.soundBlocked": "Le navigateur bloque le son jusqu'à un clic.",
+  "phone.enableSound": "Activer le son",
+  "call.endedCancelledInbound": "Appel de {who} pris sur un autre poste ou abandonné."
 }

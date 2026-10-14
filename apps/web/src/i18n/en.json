@@ -155,5 +155,20 @@
   "call.errorTransferRejected": "Transfer not possible: the target declined the call{status}.",
   "call.errorTransferNoAnswer": "Transfer not possible: the target did not answer{status}.",
   "call.errorTransferCancelled": "Transfer not possible: the call to the target was abandoned{status}.",
-  "call.errorTransferFailed": "The transfer failed{status}."
+  "call.errorTransferFailed": "The transfer failed{status}.",
+  "settings.audio": "Audio",
+  "settings.microphone": "Microphone",
+  "settings.output": "Voice output",
+  "settings.ringer": "Ringtone output",
+  "settings.defaultDevice": "Default (the browser's choice)",
+  "settings.unnamedMicrophone": "Microphone {n}",
+  "settings.unnamedOutput": "Output {n}",
+  "settings.outputUnsupported": "This browser cannot choose the audio output: the voice and the ringtone follow the system's default output.",
+  "settings.allowMicrophoneHint": "Device names show once the microphone is allowed.",
+  "settings.allowMicrophone": "Allow the microphone",
+  "settings.testRing": "Test the ringtone",
+  "settings.audioNeedsPhone": "The ringtone can be tested once the phone is online.",
+  "phone.soundBlocked": "The browser blocks sound until you click.",
+  "phone.enableSound": "Enable sound",
+  "call.endedCancelledInbound": "Call from {who} taken on another phone or given up."
 }

@@ -21,3 +21,6 @@ references/
 !.vscode/extensions.json
 *.log
 .swc
+
+# Arbres de travail temporaires des agents
+.claude/worktrees/

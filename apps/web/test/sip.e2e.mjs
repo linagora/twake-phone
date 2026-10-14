@@ -1,8 +1,10 @@
 // End to end of step 3 (3a calls, 3b transfers): people call and transfer each other from their browsers through
 // OpenSIPS and rtpengine. The SIP stack is the only thing outside this process (docker/docker-compose.sip.yml, or
 // OpenSIPS and rtpengine started by hand); the identity provider, the Gateway (with the OpenSIPS provider) and the
-// app run here, and three Chromium contexts with a simulated microphone play Alice (101), Jean (102) and Bob (103).
+// app run here, and three browser contexts with a simulated microphone play Alice (101), Jean (102) and Bob (103).
 //
+//   BROWSER              chromium (default), firefox or msedge (Edge installed on the machine, as Playwright finds it)
+//   PLAYWRIGHT_CHROMIUM  a Chromium binary to use instead of Playwright's (PLAYWRIGHT_FIREFOX likewise)
 //   SIP_WSS_URL          WSS socket of OpenSIPS (default wss://127.0.0.1:8089)
 //   SIP_DOMAIN           SIP domain and digest realm (default: the host of SIP_WSS_URL)
 //   OPENSIPS_DB_URL      the database auth_db reads (default postgres://twake:twake@127.0.0.1:54320/twake)
@@ -12,7 +14,7 @@ import { createSocket } from 'node:dgram'
 import { createServer, connect } from 'node:net'
 import { fileURLToPath } from 'node:url'
 import pg from 'pg'
-import { chromium } from 'playwright-core'
+import { chromium, firefox } from 'playwright-core'
 import { buildApp } from '../../gateway/dist/app.js'
 import { JwtAuthenticator } from '../../gateway/dist/auth.js'
 import { storedOpensipsFactory } from '../../gateway/dist/providers.js'
@@ -28,6 +30,7 @@ const SIP_DOMAIN = process.env.SIP_DOMAIN ?? new URL(SIP_WSS_URL).hostname
 const OPENSIPS_DB_URL = process.env.OPENSIPS_DB_URL ?? 'postgres://twake:twake@127.0.0.1:54320/twake'
 const DTMF_LOG = process.env.RTPENGINE_DTMF_LOG ?? '127.0.0.1:22223'
 const TENANT = 'e2e'
+const BROWSER = process.env.BROWSER ?? 'chromium'
 
 const freePort = () =>
   new Promise((resolve, reject) => {
@@ -154,11 +157,19 @@ const web = await serveApp({
 })
 const db = new pg.Pool({ connectionString: OPENSIPS_DB_URL, max: 1 })
 
-const browser = await chromium.launch({
-  ...(process.env.PLAYWRIGHT_CHROMIUM ? { executablePath: process.env.PLAYWRIGHT_CHROMIUM } : {}),
-  // A microphone that produces a tone, no permission prompt, OpenSIPS's self-signed certificate accepted.
-  args: ['--use-fake-device-for-media-stream', '--use-fake-ui-for-media-stream', '--ignore-certificate-errors', '--autoplay-policy=no-user-gesture-required']
-})
+// A microphone that produces a tone, no permission prompt, sound allowed without a gesture, OpenSIPS's self-signed
+// certificate accepted (Firefox: through the context's ignoreHTTPSErrors).
+const browser =
+  BROWSER === 'firefox'
+    ? await firefox.launch({
+        ...(process.env.PLAYWRIGHT_FIREFOX ? { executablePath: process.env.PLAYWRIGHT_FIREFOX } : {}),
+        firefoxUserPrefs: { 'media.navigator.streams.fake': true, 'media.navigator.permission.disabled': true, 'media.autoplay.default': 0, 'media.autoplay.blocking_policy': 0, 'media.setsinkid.enabled': true }
+      })
+    : await chromium.launch({
+        ...(BROWSER === 'msedge' ? { channel: 'msedge' } : process.env.PLAYWRIGHT_CHROMIUM ? { executablePath: process.env.PLAYWRIGHT_CHROMIUM } : {}),
+        args: ['--use-fake-device-for-media-stream', '--use-fake-ui-for-media-stream', '--ignore-certificate-errors', '--autoplay-policy=no-user-gesture-required']
+      })
+console.log(`browser: ${BROWSER} ${browser.version()}`)
 
 /** One person in their own browser context: signs in, lands on the dialer. */
 const open = async (login, name) => {
@@ -183,6 +194,16 @@ const phoneState = page => page.getByTestId('phone-state')
 const calls = page => page.evaluate(() => window.twakephone.calls)
 const lastEnded = page => page.evaluate(() => window.twakephone.lastEnded)
 const stats = page => page.evaluate(() => window.twakephone.stats())
+const soundBlocked = page => page.evaluate(() => window.twakephone.soundBlocked)
+/** Signs out from this page (unregisters its softphone first) and closes its context. */
+const signOut = async who => {
+  await who.page.getByRole('button', { name: 'Se déconnecter' }).click()
+  await who.page.waitForURL(`${oidc.issuer}/session/end**`)
+  await who.page.getByRole('button', { name: /yes, sign me out/i }).click()
+  await who.page.waitForURL(`${appOrigin}/`)
+  await who.page.getByRole('button', { name: 'Se connecter' }).waitFor()
+  await who.context.close()
+}
 const dial = async (page, number) => {
   await page.getByLabel('Numéro à appeler').fill(number)
   await page.getByRole('button', { name: 'Appeler' }).click()
@@ -283,6 +304,55 @@ try {
     await jean.page.getByText('Appel avec Alice Martin (101) terminé.').waitFor()
     await alice.page.getByText('Appel avec 102 terminé.').waitFor()
     expectEqual((await calls(alice.page)).length, 0, 'calls left on Alice side')
+  })
+  await step('Alice chooses a microphone and outputs in the settings: the next call uses them, the ringtone can be tested', async () => {
+    await alice.page.getByRole('link', { name: 'Réglages' }).click()
+    await alice.page.getByRole('heading', { level: 2, name: 'Audio' }).waitFor()
+    // The browsers' simulated devices: Chromium and Edge list several, Firefox one microphone and no output.
+    const options = async label => (await alice.page.getByLabel(label).locator('option').all()).length - 1
+    const pick = async (label, index) => {
+      const n = await options(label)
+      if (n <= index) return null
+      await alice.page.getByLabel(label).selectOption({ index: index + 1 })
+      return alice.page.getByLabel(label).inputValue()
+    }
+    const microphone = await pick('Microphone', 1)
+    const canChooseOutput = await alice.page.evaluate(() => 'setSinkId' in HTMLMediaElement.prototype)
+    const output = canChooseOutput ? await pick('Sortie de la voix', 1) : null
+    if (canChooseOutput) await pick('Sortie de la sonnerie', 2)
+    console.log(`     devices: microphone ${microphone ?? 'default'}, output ${output ?? 'default'}`)
+    const chosen = await alice.page.evaluate(() => window.twakephone.devices)
+    if (microphone) expectEqual(chosen.microphoneId, microphone, 'microphone kept')
+    await alice.page.getByRole('button', { name: 'Tester la sonnerie' }).click()
+    await alice.page.getByTestId('ringer').waitFor({ state: 'attached' })
+    expectEqual(await soundBlocked(alice.page), false, 'sound blocked during the ringtone test')
+    await alice.page.getByRole('link', { name: 'Clavier' }).click()
+    await aliceCallsJean(alice, jean)
+    await bothHearEachOther(alice, jean)
+    const [s] = await stats(alice.page)
+    if (microphone) expectEqual(s.microphoneId, microphone, 'microphone of the call')
+    if (output) expectEqual(s.outputId, output, 'output of the call')
+    await alice.page.getByRole('button', { name: 'Raccrocher' }).click()
+    await jean.page.getByText('Appel avec Alice Martin (101) terminé.').waitFor()
+  })
+  await step('Alice is signed in twice (a second window): both ring, the one that answers takes the call, the other is told', async () => {
+    const alice2 = await open('amartin', 'Alice Martin')
+    await phoneState(alice2.page).getByText('En ligne').waitFor({ timeout: 20_000 })
+    await dial(jean.page, '101')
+    for (const who of [alice, alice2]) {
+      await who.page.getByTestId('incoming-call').getByText('Appel entrant de Jean Dupont (102)').waitFor({ timeout: 20_000 })
+      await who.page.getByTestId('ringer').waitFor({ state: 'attached' })
+      expectEqual(await soundBlocked(who.page), false, `sound blocked while ringing (${who === alice ? 'first' : 'second'} window)`)
+    }
+    await alice2.page.getByTestId('incoming-call').getByRole('button', { name: 'Répondre' }).click()
+    await jean.page.getByText('En communication avec 101').waitFor()
+    await alice.page.getByText('Appel de Jean Dupont (102) pris sur un autre poste ou abandonné.').waitFor()
+    expectEqual((await calls(alice.page)).length, 0, 'calls left in the first window')
+    await bothHearEachOther(alice2, jean)
+    await alice2.page.getByRole('button', { name: 'Raccrocher' }).click()
+    await jean.page.getByText('Appel avec 101 terminé.').waitFor()
+    // Signing out unregisters that window: 101 is reached in the first one only from now on.
+    await signOut(alice2)
   })
   await step('Bob signs in and registers: a third person, for the transfers', async () => {
     bob = await open('bdurand', 'Bob Durand')
@@ -417,11 +487,7 @@ try {
     await jean.page.getByText('Appel avec 101 terminé.').waitFor()
   })
   await step('Alice signs out, which unregisters her: a call to 101 is now unreachable', async () => {
-    await alice.page.getByRole('button', { name: 'Se déconnecter' }).click()
-    await alice.page.waitForURL(`${oidc.issuer}/session/end**`)
-    await alice.page.getByRole('button', { name: /yes, sign me out/i }).click()
-    await alice.page.waitForURL(`${appOrigin}/`)
-    await alice.page.getByRole('button', { name: 'Se connecter' }).waitFor()
+    await signOut(alice)
     await dial(jean.page, '101')
     const ended = await until('the call to 101 to end', () => lastEnded(jean.page), { timeout: 20_000 })
     // 404: no contact left for 101. A registration left behind would have given 480 (dead contact) or rung.

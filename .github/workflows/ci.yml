@@ -96,9 +96,13 @@ jobs:
         working-directory: apps/phone
 
   sip-e2e:
-    name: SIP (OpenSIPS, rtpengine, trois navigateurs)
+    name: SIP (OpenSIPS, rtpengine, ${{ matrix.browser }})
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        browser: [chromium, firefox, msedge]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -115,21 +119,27 @@ jobs:
       - run: yarn install --frozen-lockfile
       - run: yarn --cwd apps/phone install --frozen-lockfile --ignore-engines
       - run: yarn build
-      - name: Cache de Chromium (clé = version de playwright-core)
-        id: chromium-cache
+      - name: Cache du navigateur Playwright (clé = navigateur et version de playwright-core)
+        if: matrix.browser != 'msedge'
+        id: browser-cache
         uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright
-          key: chromium-${{ runner.os }}-${{ hashFiles('node_modules/playwright-core/package.json') }}
-      - name: Chromium
-        if: steps.chromium-cache.outputs.cache-hit != 'true'
-        run: npx playwright-core install --with-deps chromium
-      - name: Dépendances système de Chromium (cache ou non)
-        if: steps.chromium-cache.outputs.cache-hit == 'true'
-        run: npx playwright-core install-deps chromium
-      - name: e2e SIP (trois navigateurs, micro simulé, OpenSIPS et rtpengine en Docker)
+          key: ${{ matrix.browser }}-${{ runner.os }}-${{ hashFiles('node_modules/playwright-core/package.json') }}
+      - name: Navigateur Playwright
+        if: matrix.browser != 'msedge' && steps.browser-cache.outputs.cache-hit != 'true'
+        run: npx playwright-core install --with-deps ${{ matrix.browser }}
+      - name: Dépendances système du navigateur (cache ou non)
+        if: matrix.browser != 'msedge' && steps.browser-cache.outputs.cache-hit == 'true'
+        run: npx playwright-core install-deps ${{ matrix.browser }}
+      # Edge est préinstallé sur ubuntu-latest ; sinon Playwright l'installe par le dépôt Microsoft.
+      - name: Microsoft Edge
+        if: matrix.browser == 'msedge'
+        run: microsoft-edge --version || npx playwright-core install msedge
+      - name: e2e SIP (trois personnes dans ${{ matrix.browser }}, micro simulé, OpenSIPS et rtpengine en Docker)
         run: node apps/web/test/sip.e2e.mjs
         env:
+          BROWSER: ${{ matrix.browser }}
           SIP_WSS_URL: wss://127.0.0.1:8089
           OPENSIPS_DB_URL: postgres://twake:twake@127.0.0.1:54320/twake
       - name: Journaux de la stack SIP en cas d'échec
@@ -139,7 +149,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: e2e-sip-failure
+          name: e2e-sip-failure-${{ matrix.browser }}
           path: apps/web/dist/sip-e2e-failure-*.png
           if-no-files-found: ignore
       - name: Arrêt de la stack SIP

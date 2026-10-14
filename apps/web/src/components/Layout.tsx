@@ -53,6 +53,15 @@ export const Layout = () => {
               {t(`phone.${phone.state}`)}
             </span>
           ) : null}
+          {phone.soundBlocked ? (
+            // The browser wants a gesture before any sound (ringtone, voice): this click is one.
+            <span role="alert" className="sound-blocked">
+              {t('phone.soundBlocked')}{' '}
+              <button type="button" className="btn btn-primary" onClick={() => void phone.unblockAudio()}>
+                {t('phone.enableSound')}
+              </button>
+            </span>
+          ) : null}
           <button type="button" className="btn" onClick={() => void phone.shutdown().then(signOut)}>
             {t('auth.signout')}
           </button>

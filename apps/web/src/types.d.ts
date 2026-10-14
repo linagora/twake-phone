@@ -8,6 +8,8 @@ interface Window {
     /** The last call that ended, kept a few seconds: why and, when the far end said so, the SIP status. */
     lastEnded: { remoteNumber: string; endReason?: string; endStatus?: number } | null
     tones: Record<string, string>
-    stats: () => Promise<{ packetsReceived: number; packetsSent: number }[]>
+    devices: { microphoneId?: string; outputId?: string; ringerId?: string }
+    soundBlocked: boolean
+    stats: () => Promise<{ packetsReceived: number; packetsSent: number; microphoneId?: string; outputId?: string }[]>
   }
 }

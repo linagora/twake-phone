@@ -21,6 +21,9 @@ const REASON_KEY: Record<NonNullable<SoftCall['endReason']>, Key> = {
 
 const who = (call: SoftCall) => (call.remoteName ? `${call.remoteName} (${formatNumber(call.remoteNumber)})` : formatNumber(call.remoteNumber))
 
+/** How a call ended, for the person: a ringing call of theirs cancelled was answered elsewhere, or given up. */
+const reasonKey = (call: SoftCall): Key => (call.direction === 'inbound' && call.endReason === 'cancelled' ? 'call.endedCancelledInbound' : REASON_KEY[call.endReason ?? 'hangup'])
+
 /** Elapsed time of a connected call, as m:ss, refreshed every second; outside any live region, so never read aloud each second. */
 const Timer = ({ since }: { since: Date }) => {
   const [now, setNow] = useState(() => Date.now())
@@ -238,7 +241,7 @@ export const CallPanel = () => {
       })}
       {lastEnded ? (
         <p className="call call-ended" role="status">
-          {t(REASON_KEY[lastEnded.endReason ?? 'hangup'], { who: who(lastEnded) })}
+          {t(reasonKey(lastEnded), { who: who(lastEnded) })}
         </p>
       ) : null}
       {error && calls.length ? (
