@@ -81,7 +81,7 @@ export class TelephonyClient {
   }
 
   getMe() {
-    return this.request<{ id: string; displayName: string; extension?: string }>('/me')
+    return this.request<{ id: string; displayName: string; extension?: string; features?: { directory?: boolean } }>('/me')
   }
 
   getMediaSession() {
@@ -115,9 +115,9 @@ export class TelephonyClient {
     return this.request<Capabilities>('/capabilities')
   }
 
-  /** People matching the words of `q` in the organisation's directory. 501 means the platform has no directory. */
+  /** People matching the words of `q` in the organisation's directory (`truncated`: refine the search). 501: no directory. */
   searchDirectory(q: string, limit = 20) {
-    return this.request<{ items: Contact[] }>(`/directory?${new URLSearchParams({ q, limit: String(limit) })}`)
+    return this.request<{ items: Contact[]; truncated: boolean }>(`/directory?${new URLSearchParams({ q, limit: String(limit) })}`)
   }
 
   getContact(id: string) {

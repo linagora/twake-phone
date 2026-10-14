@@ -3,12 +3,13 @@ import { formatNumber, type Contact } from '@twake/telephony-client'
 import type { Favorites } from '../favorites.js'
 import { useT } from '../i18n/useT.js'
 
-/** A star that says what it does and what state it is in (aria-pressed), not just a glyph. */
+/** A toggle: one stable name ("Favourite: Jean Dupont") and aria-pressed for the state, as the ARIA pattern asks. */
 export const FavoriteButton = ({ contact, favorites }: { contact: Contact; favorites: Favorites }) => {
   const { t } = useT()
   const on = favorites.has(contact.id)
+  const busy = favorites.pending(contact.id)
   return (
-    <button type="button" className={`btn star${on ? ' star-on' : ''}`} aria-pressed={on} aria-label={t(on ? 'directory.unfavorite' : 'directory.favorite', { name: contact.displayName })} onClick={() => void favorites.toggle(contact)}>
+    <button type="button" className={`btn star${on ? ' star-on' : ''}`} aria-pressed={on} aria-busy={busy || undefined} disabled={busy || favorites.items === null} aria-label={t('directory.favoriteToggle', { name: contact.displayName })} onClick={() => void favorites.toggle(contact)}>
       <span aria-hidden="true">{on ? '★' : '☆'}</span>
     </button>
   )

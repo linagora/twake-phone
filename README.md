@@ -168,7 +168,7 @@ yarn dev:gateway                               # passerelle sur http://localhost
 yarn dev:web                                   # app TwakePhone sur http://localhost:4173 (config dans apps/web/public/config.json)
 ```
 
-Annuaire : la passerelle interroge un LDAP quand `LDAP_URL` est renseigné (`LDAP_BASE_DN` obligatoire ; `LDAP_BIND_DN` et `LDAP_BIND_PASSWORD` pour un compte lecteur ; `LDAP_USER_FILTER`, par défaut `(objectClass=inetOrgPerson)` ; `LDAP_ATTR_ID`, `_NAME`, `_EMAIL`, `_PHONE`, `_MOBILE`, `_EXTENSION`, `_DEPARTMENT`, `_TITLE` pour un schéma qui s'écarte d'inetOrgPerson). Sans `LDAP_URL`, l'app affiche que la plateforme n'a pas d'annuaire. Les favoris sont dans PostgreSQL, par utilisateur.
+Annuaire : la passerelle interroge un LDAP quand `LDAP_URL` est renseigné (`ldaps://` dès que le serveur n'est pas local ; `LDAP_BASE_DN` obligatoire ; `LDAP_BIND_DN` et `LDAP_BIND_PASSWORD` pour un compte lecteur ; `LDAP_USER_FILTER`, par défaut `(objectClass=inetOrgPerson)` ; `LDAP_ATTR_ID`, `_NAME`, `_SURNAME`, `_GIVENNAME`, `_EMAIL`, `_PHONE`, `_MOBILE`, `_EXTENSION`, `_DEPARTMENT`, `_TITLE` pour un schéma qui s'écarte d'inetOrgPerson ; `LDAP_TLS_CA_FILE` pour une autorité interne). Un seul annuaire par déploiement pour l'instant, servi au tenant `LDAP_TENANT` (par défaut `DEFAULT_TENANT`) : les autres tenants n'ont pas d'annuaire, la configuration par tenant viendra avec l'écran d'administration (étape 7). Sans `LDAP_URL`, l'app affiche que la plateforme n'a pas d'annuaire. Les favoris (100 au plus par personne) sont dans PostgreSQL.
 
 Stack complète en local (Twake, Phone, passerelle, PBX de dev), encore celle du POC jusqu'à l'étape 3 :
 

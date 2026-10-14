@@ -3,7 +3,7 @@
 CREATE TABLE favorites (
   tenant_id  text NOT NULL,
   user_id    text NOT NULL,
-  contact_id text NOT NULL,
+  contact_id text NOT NULL CHECK (length(contact_id) <= 256),
   added_at   timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (tenant_id, user_id, contact_id)
 );

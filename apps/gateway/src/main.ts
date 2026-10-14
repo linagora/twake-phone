@@ -70,7 +70,7 @@ const conference = env.LIVEKIT_API_KEY && env.LIVEKIT_API_SECRET && env.LIVEKIT_
     })()
   : undefined
 
-const contacts = ldapDirectoryFromEnv(env)
+const contacts = ldapDirectoryFromEnv(env, message => console.warn(`WARNING: ${message}`))
 const app = await buildApp(registry, { store, directory: new StoreDirectory(store), ...(contacts ? { contacts } : {}), auth: authenticatorFromEnv(env), ...(conference ? { conference } : {}) })
 registry.startAll()
 await app.listen({ host: '0.0.0.0', port: Number(env.PORT ?? 8080) })

@@ -40,15 +40,13 @@
   "directory.placeholder": "Nom, numéro, équipe…",
   "directory.searching": "Recherche en cours…",
   "directory.results": "Résultats",
-  "directory.count": "{count} résultat(s)",
+  "directory.count": "{count} résultats",
   "directory.empty": "Personne ne correspond à « {query} ».",
   "directory.unavailable": "Cette plateforme n'a pas encore d'annuaire.",
   "directory.error": "La recherche dans l'annuaire a échoué.",
   "directory.favorites": "Favoris",
   "directory.noFavorites": "Aucun favori pour l'instant. Cherchez un collègue et appuyez sur l'étoile.",
   "directory.favoritesError": "Vos favoris n'ont pas pu être enregistrés ou chargés.",
-  "directory.favorite": "Ajouter {name} aux favoris",
-  "directory.unfavorite": "Retirer {name} des favoris",
   "directory.notFound": "Ce contact n'est plus dans l'annuaire.",
   "directory.back": "Retour à l'annuaire",
   "contact.numbers": "Numéros",
@@ -59,5 +57,8 @@
   "contact.call": "Appeler",
   "contact.callNumber": "Appeler le {number}",
   "contact.callName": "Appeler {name}",
-  "contact.email": "Courriel"
+  "contact.email": "Courriel",
+  "directory.countOne": "1 résultat",
+  "directory.favoriteToggle": "Favori : {name}",
+  "directory.truncated": "D'autres personnes correspondent mais ne sont pas affichées : affinez la recherche."
 }

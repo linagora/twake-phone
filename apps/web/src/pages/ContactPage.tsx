@@ -25,6 +25,11 @@ export const ContactPage = () => {
     }
   }, [client, id])
 
+  // The card is a page of its own: its title says who (RGAA 8.6); the layout set the directory's title on navigation.
+  useEffect(() => {
+    if (contact) document.title = `${contact.displayName} – ${t('app.name')}`
+  }, [contact, t])
+
   if (contact === undefined) return <h1>{t('directory.title')}</h1>
   if (contact === null) {
     return (
@@ -41,7 +46,7 @@ export const ContactPage = () => {
         <Link to="/directory">{t('directory.back')}</Link>
       </p>
       <h1>{contact.displayName}</h1>
-      <p className="muted">{[contact.title, contact.department].filter(Boolean).join(' · ')}</p>
+      {contact.title || contact.department ? <p className="muted">{[contact.title, contact.department].filter(Boolean).join(' · ')}</p> : null}
       <FavoriteButton contact={contact} favorites={favorites} />
       <section className="card" aria-labelledby="numbers">
         <h2 id="numbers">{t('contact.numbers')}</h2>

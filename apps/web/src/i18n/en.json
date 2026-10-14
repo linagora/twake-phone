@@ -40,15 +40,13 @@
   "directory.placeholder": "Name, number, team…",
   "directory.searching": "Searching…",
   "directory.results": "Results",
-  "directory.count": "{count} result(s)",
+  "directory.count": "{count} results",
   "directory.empty": "Nobody matches “{query}”.",
   "directory.unavailable": "This platform has no directory yet.",
   "directory.error": "The directory could not be searched.",
   "directory.favorites": "Favourites",
   "directory.noFavorites": "No favourites yet. Search a colleague and press the star.",
   "directory.favoritesError": "Your favourites could not be saved or loaded.",
-  "directory.favorite": "Add {name} to favourites",
-  "directory.unfavorite": "Remove {name} from favourites",
   "directory.notFound": "This contact is not in the directory anymore.",
   "directory.back": "Back to the directory",
   "contact.numbers": "Numbers",
@@ -59,5 +57,8 @@
   "contact.call": "Call",
   "contact.callNumber": "Call {number}",
   "contact.callName": "Call {name}",
-  "contact.email": "Email"
+  "contact.email": "Email",
+  "directory.countOne": "1 result",
+  "directory.favoriteToggle": "Favourite: {name}",
+  "directory.truncated": "More people match than are shown: refine the search."
 }
