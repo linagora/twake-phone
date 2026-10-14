@@ -158,12 +158,22 @@ const web = await serveApp({
 const db = new pg.Pool({ connectionString: OPENSIPS_DB_URL, max: 1 })
 
 // A microphone that produces a tone, no permission prompt, sound allowed without a gesture, OpenSIPS's self-signed
-// certificate accepted (Firefox: through the context's ignoreHTTPSErrors).
+// certificate accepted (Firefox: through the context's ignoreHTTPSErrors). Firefox ignores ICE candidates on the
+// loopback, and rtpengine only offers 127.0.0.1 here (RTPENGINE_INTERFACE): without ice.loopback the call sets up,
+// ICE fails and no RTP flows.
 const browser =
   BROWSER === 'firefox'
     ? await firefox.launch({
         ...(process.env.PLAYWRIGHT_FIREFOX ? { executablePath: process.env.PLAYWRIGHT_FIREFOX } : {}),
-        firefoxUserPrefs: { 'media.navigator.streams.fake': true, 'media.navigator.permission.disabled': true, 'media.autoplay.default': 0, 'media.autoplay.blocking_policy': 0, 'media.setsinkid.enabled': true }
+        firefoxUserPrefs: {
+          'media.navigator.streams.fake': true,
+          'media.navigator.permission.disabled': true,
+          'media.autoplay.default': 0,
+          'media.autoplay.blocking_policy': 0,
+          'media.setsinkid.enabled': true,
+          'media.peerconnection.ice.loopback': true,
+          'media.peerconnection.ice.obfuscate_host_addresses': false
+        }
       })
     : await chromium.launch({
         ...(BROWSER === 'msedge' ? { channel: 'msedge' } : process.env.PLAYWRIGHT_CHROMIUM ? { executablePath: process.env.PLAYWRIGHT_CHROMIUM } : {}),
