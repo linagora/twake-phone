@@ -18,6 +18,8 @@ export interface Phone {
   /** Tones the far end sent by SIP INFO, per call id. */
   tones: Record<string, string>
   call(target: string): Promise<SoftCall>
+  /** Unregisters and stops the softphone, before the page leaves (sign-out): the SIP server forgets this window. */
+  shutdown(): Promise<void>
 }
 
 const PhoneContext = createContext<Phone | null>(null)
@@ -33,7 +35,7 @@ export const SoftphoneProvider = ({ children }: { children: ReactNode }) => {
   const { state: auth } = useAuth()
   const user = auth.status === 'signed-in' ? auth.user : null
   const displayName = displayNameFor(me, user)
-  const audio = useRef<HTMLAudioElement>(null)
+  const audioHost = useRef<HTMLDivElement>(null)
   const [state, setState] = useState<PhoneState>('off')
   const [detail, setDetail] = useState<string | null>(null)
   const [calls, setCalls] = useState<SoftCall[]>([])
@@ -47,7 +49,7 @@ export const SoftphoneProvider = ({ children }: { children: ReactNode }) => {
   nameRef.current = displayName
 
   useEffect(() => {
-    if (!extension || !audio.current) {
+    if (!extension || !audioHost.current) {
       setState('off')
       return
     }
@@ -59,7 +61,7 @@ export const SoftphoneProvider = ({ children }: { children: ReactNode }) => {
         if (session.type !== 'sip-webrtc') throw new Error('no browser audio on this platform')
         return session
       },
-      remoteAudio: audio.current,
+      audioContainer: audioHost.current,
       displayName: nameRef.current,
       onRegistration: (s, why) => {
         if (cancelled) return
@@ -70,7 +72,8 @@ export const SoftphoneProvider = ({ children }: { children: ReactNode }) => {
         if (cancelled) return
         setCalls(softphone.activeCalls())
         if (call.state === 'ended') {
-          setLastEnded(call)
+          // A completed transfer ends two calls at once: what the person is told is that the transfer happened.
+          setLastEnded(prev => (prev?.endReason === 'transferred' && call.endReason === 'hangup' && prev.endedAt && Date.now() - prev.endedAt.getTime() < LAST_ENDED_MS ? prev : call))
           clearTimeout(lastEndedTimer)
           lastEndedTimer = setTimeout(() => !cancelled && setLastEnded(null), LAST_ENDED_MS)
           setTones(t => {
@@ -108,12 +111,21 @@ export const SoftphoneProvider = ({ children }: { children: ReactNode }) => {
     return c
   }, [])
 
-  const value = useMemo<Phone>(() => ({ state, detail, calls, lastEnded, tones, call }), [state, detail, calls, lastEnded, tones, call])
+  const shutdown = useCallback(async () => {
+    const softphone = phone.current
+    phone.current = null
+    if (!softphone) return
+    await softphone.stop().catch(() => undefined)
+    setCalls([])
+    setState('off')
+  }, [])
+
+  const value = useMemo<Phone>(() => ({ state, detail, calls, lastEnded, tones, call, shutdown }), [state, detail, calls, lastEnded, tones, call, shutdown])
   // What a test can read from outside: never actions, only counters (packets, calls, tones).
   useEffect(() => {
     window.twakephone = {
       state,
-      calls: calls.map(c => ({ id: c.id, direction: c.direction, state: c.state, remoteNumber: c.remoteNumber, remoteHold: c.remoteHold, muted: c.muted, renegotiating: c.renegotiating })),
+      calls: calls.map(c => ({ id: c.id, direction: c.direction, state: c.state, remoteNumber: c.remoteNumber, remoteHold: c.remoteHold, muted: c.muted, renegotiating: c.renegotiating, transferring: c.transferring, ...(c.replacedCallId ? { replacedCallId: c.replacedCallId } : {}), ...(c.consultationOf ? { consultationOf: c.consultationOf } : {}) })),
       lastEnded: lastEnded ? { remoteNumber: lastEnded.remoteNumber, endReason: lastEnded.endReason, endStatus: lastEnded.endStatus } : null,
       tones,
       stats: () => Promise.all(calls.map(c => c.stats()))
@@ -122,8 +134,8 @@ export const SoftphoneProvider = ({ children }: { children: ReactNode }) => {
 
   return (
     <PhoneContext.Provider value={value}>
-      {/* The far end's voice. Hidden: the call panel is the control. */}
-      <audio ref={audio} autoPlay data-testid="remote-audio" />
+      {/* The far ends' voices, one audio element per call. Hidden: the call panel is the control. */}
+      <div ref={audioHost} hidden data-testid="remote-audio-host" />
       {children}
     </PhoneContext.Provider>
   )

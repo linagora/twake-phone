@@ -92,4 +92,6 @@ h3 { font-size: 1rem; margin: 12px 0 8px; }
 .btn-danger { border-color: var(--danger); color: var(--danger); }
 .btn[aria-pressed="true"] { background: var(--accent); color: var(--accent-text); border-color: transparent; }
 .dtmf { margin-top: 12px; }
+.transfer { margin-top: 12px; }
+.transfer .field { margin-bottom: 8px; }
 .dtmf .keypad { margin: 0 0 8px; }

@@ -3,6 +3,7 @@ import { useSearchParams } from 'react-router-dom'
 import { formatNumber, toDialTarget } from '@twake/telephony-client'
 import { useGateway } from '../gateway.js'
 import { useT } from '../i18n/useT.js'
+import { describeCallError } from '../components/callErrors.js'
 import { usePhone } from '../softphone.js'
 
 const KEYS: [string, string][] = [['1', ''], ['2', 'ABC'], ['3', 'DEF'], ['4', 'GHI'], ['5', 'JKL'], ['6', 'MNO'], ['7', 'PQRS'], ['8', 'TUV'], ['9', 'WXYZ'], ['*', ''], ['0', '+'], ['#', '']]
@@ -19,7 +20,7 @@ export const Dialer = () => {
   }, [params, setParams])
   // The Gateway can place the call for us (click-to-call) or the browser does it itself (softphone registered).
   const [gatewayCalls, setGatewayCalls] = useState<boolean | null>(null)
-  // One call at a time through the softphone (one audio element; a second line comes with the transfers of 3b).
+  // The dialer places the first call; a second one (a consultation before a transfer) is placed from the call panel.
   const canCall = (phone.state === 'registered' && !phone.calls.length) || (phone.state !== 'registered' && !!gatewayCalls)
   const [status, setStatus] = useState<{ kind: 'info' | 'error'; text: string } | null>(null)
 
@@ -60,7 +61,7 @@ export const Dialer = () => {
         setStatus({ kind: 'error', text: t('dialer.notRegistered') })
       }
     } catch (err) {
-      setStatus({ kind: 'error', text: t('dialer.failed', { reason: err instanceof Error ? err.message : String(err) }) })
+      setStatus({ kind: 'error', text: t('dialer.failed', { reason: describeCallError(err, t) }) })
     }
   }
 

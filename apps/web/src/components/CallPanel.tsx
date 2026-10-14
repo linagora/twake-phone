@@ -1,9 +1,10 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState, type FormEvent } from 'react'
 import type { SoftCall } from '@twake/softphone'
-import { formatNumber } from '@twake/telephony-client'
+import { formatNumber, toDialTarget } from '@twake/telephony-client'
 import type { Key } from '../i18n/index.js'
 import { useT } from '../i18n/useT.js'
 import { usePhone } from '../softphone.js'
+import { describeCallError } from './callErrors.js'
 
 const TONES = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '*', '0', '#']
 
@@ -14,7 +15,8 @@ const REASON_KEY: Record<NonNullable<SoftCall['endReason']>, Key> = {
   'no-answer': 'call.endedNoAnswer',
   unavailable: 'call.endedUnavailable',
   cancelled: 'call.endedCancelled',
-  failed: 'call.endedFailed'
+  failed: 'call.endedFailed',
+  transferred: 'call.endedTransferred'
 }
 
 const who = (call: SoftCall) => (call.remoteName ? `${call.remoteName} (${formatNumber(call.remoteNumber)})` : formatNumber(call.remoteNumber))
@@ -45,7 +47,7 @@ const Incoming = ({ call }: { call: SoftCall }) => {
       await fn()
     } catch (err) {
       // The caller gave up, or another window answered first: the banner goes when the call does; say why meanwhile.
-      setError(err instanceof Error ? err.message : String(err))
+      setError(describeCallError(err, t))
     } finally {
       setBusy(false)
     }
@@ -73,33 +75,110 @@ const Incoming = ({ call }: { call: SoftCall }) => {
   )
 }
 
-const Active = ({ call, tones }: { call: SoftCall; tones: string }) => {
+/** Where to send the person: typed once, then transferred at once or called first (consultation). */
+const TransferForm = ({ call, onClose, onError }: { call: SoftCall; onClose: () => void; onError: (message: string | null) => void }) => {
+  const { t } = useT()
+  const phone = usePhone()
+  const [target, setTarget] = useState('')
+  const [busy, setBusy] = useState(false)
+  const dialable = toDialTarget(target)
+  const run = (fn: (target: string) => Promise<unknown>) => async (e: FormEvent) => {
+    e.preventDefault()
+    if (!dialable) return
+    setBusy(true)
+    onError(null)
+    try {
+      await fn(dialable)
+      onClose()
+    } catch (err) {
+      onError(describeCallError(err, t))
+    } finally {
+      setBusy(false)
+    }
+  }
+  return (
+    <form id={`transfer-form-${call.id}`} className="transfer" onSubmit={run(to => call.transfer(to))} data-testid="transfer-form">
+      <div className="field">
+        <label htmlFor={`transfer-${call.id}`}>{t('call.transferTarget')}</label>
+        <input id={`transfer-${call.id}`} type="tel" inputMode="tel" autoComplete="off" value={target} onChange={e => setTarget(e.target.value)} disabled={busy} />
+      </div>
+      <div className="actions">
+        <button type="submit" className="btn btn-primary" disabled={busy || !dialable}>
+          {t('call.transferBlind')}
+        </button>
+        <button type="button" className="btn" disabled={busy || !dialable} onClick={e => void run(to => phone.call(to))(e)}>
+          {t('call.transferConsult')}
+        </button>
+        <button type="button" className="btn" disabled={busy} onClick={onClose}>
+          {t('call.transferClose')}
+        </button>
+      </div>
+    </form>
+  )
+}
+
+/**
+ * A call of ours that is not ringing in. A consultation (placed during `original`, which waits on hold) offers to
+ * hand `original` over to the person it is with, or to drop it and go back. Errors go to the panel, under every
+ * call: the one that ends (a consultation hung up) does not take the explanation with it.
+ */
+const Active = ({ call, tones, original, hasOther, onError }: { call: SoftCall; tones: string; original?: SoftCall; hasOther: boolean; onError: (message: string | null) => void }) => {
   const { t } = useT()
   const [keypad, setKeypad] = useState(false)
+  const [transfer, setTransfer] = useState(false)
   const [sent, setSent] = useState('')
-  const [error, setError] = useState<string | null>(null)
+  const transferButton = useRef<HTMLButtonElement>(null)
   const connected = call.state === 'connected' || call.state === 'held'
   const guard = (fn: () => Promise<void> | void) => async () => {
-    setError(null)
+    onError(null)
     try {
       await fn()
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err))
+      onError(describeCallError(err, t))
     }
   }
-  const title = !connected ? t('call.dialing', { who: who(call) }) : call.state === 'held' ? t('call.held', { who: who(call) }) : t('call.inProgress', { who: who(call) })
+  // The form goes, the focus comes back to the button that opened it (not to the top of the page).
+  const closeTransfer = () => {
+    setTransfer(false)
+    transferButton.current?.focus()
+  }
+  const title = call.transferring
+    ? t('call.transferringWho', { who: who(call) })
+    : !connected
+      ? t('call.dialing', { who: who(call) })
+      : call.state === 'held'
+        ? t('call.held', { who: who(call) })
+        : t('call.inProgress', { who: who(call) })
+  const originalReady = original && (original.state === 'connected' || original.state === 'held')
+  // While the transfer of the original is on its way, the consultation must stay: its dialog is what the far end
+  // takes over (Replaces); hanging it up first would make the transfer fail.
+  const busy = call.renegotiating || call.transferring || (original?.transferring ?? false)
   return (
-    <section className="call" aria-labelledby={`call-${call.id}`}>
+    <section className="call" aria-labelledby={`call-${call.id}`} data-testid={original ? 'consultation' : undefined}>
       <p id={`call-${call.id}`} className="call-title" role="status">
         {title}
       </p>
       {connected && call.connectedAt ? <Timer since={call.connectedAt} /> : null}
+      {original ? <p className="badge">{t('call.consulting', { who: who(original) })}</p> : null}
       {call.remoteHold ? <p className="badge">{t('call.remoteHold')}</p> : null}
+      {original?.transferring ? <p className="badge">{t('call.transferring')}</p> : null}
       {tones ? <p className="badge">{t('call.tonesReceived', { tones })}</p> : null}
       <div className="actions">
+        {original && originalReady && connected ? (
+          <button type="button" className="btn btn-primary" disabled={busy} onClick={guard(() => original.transferTo(call))}>
+            {t('call.transferComplete', { from: who(original), to: who(call) })}
+          </button>
+        ) : null}
+        {original ? (
+          // Hanging the consultation up is enough: the softphone takes the person on hold back by itself.
+          <button type="button" className="btn" disabled={busy} onClick={guard(() => call.hangup())}>
+            {t('call.transferCancel')}
+          </button>
+        ) : null}
         {connected ? (
           <>
-            <button type="button" className="btn" aria-pressed={call.state === 'held'} disabled={call.renegotiating} onClick={guard(() => (call.state === 'held' ? call.resume() : call.hold()))}>
+            {/* With two calls, hold and resume belong to the consultation (automatic): no switching between the two. */}
+            <button type="button" className="btn" aria-pressed={call.state === 'held'} disabled={busy || hasOther} onClick={guard(() => (call.state === 'held' ? call.resume() : call.hold()))}>
               {call.state === 'held' ? t('call.resume') : t('call.hold')}
             </button>
             <button type="button" className="btn" aria-pressed={call.muted} onClick={guard(() => call.setMuted(!call.muted))}>
@@ -108,12 +187,19 @@ const Active = ({ call, tones }: { call: SoftCall; tones: string }) => {
             <button type="button" className="btn" aria-pressed={keypad} aria-controls={`dtmf-${call.id}`} onClick={() => setKeypad(k => !k)}>
               {t('call.keypad')}
             </button>
+            {!hasOther ? (
+              <button ref={transferButton} type="button" className="btn" aria-pressed={transfer} aria-controls={`transfer-form-${call.id}`} disabled={busy} onClick={() => (transfer ? closeTransfer() : setTransfer(true))}>
+                {t('call.transfer')}
+              </button>
+            ) : null}
           </>
         ) : null}
-        <button type="button" className="btn btn-danger" onClick={guard(() => call.hangup())}>
+        {/* Hanging up during a transfer of this call is allowed: the far end goes on to its new call without us. */}
+        <button type="button" className="btn btn-danger" disabled={original?.transferring ?? false} onClick={guard(() => call.hangup())}>
           {t('call.hangup')}
         </button>
       </div>
+      {transfer && connected && !hasOther ? <TransferForm call={call} onClose={closeTransfer} onError={onError} /> : null}
       {keypad && connected ? (
         <div id={`dtmf-${call.id}`} className="dtmf">
           <div className="keypad" role="group" aria-label={t('call.keypad')}>
@@ -129,26 +215,35 @@ const Active = ({ call, tones }: { call: SoftCall; tones: string }) => {
           {sent ? <p className="badge">{t('call.tonesSent', { tones: sent })}</p> : null}
         </div>
       ) : null}
-      {error ? (
-        <p className="alert alert-error" role="alert">
-          {error}
-        </p>
-      ) : null}
     </section>
   )
 }
 
-/** Every call of the page, above the routed content: a ringing banner, then the controls of the call in progress. */
+/**
+ * Every call of the page, above the routed content: a ringing banner, the controls of the calls in progress, how
+ * the last call ended (even when another goes on: a consultation that failed says so), and the last error.
+ */
 export const CallPanel = () => {
   const { t } = useT()
   const { calls, lastEnded, tones } = usePhone()
+  const [error, setError] = useState<string | null>(null)
   if (!calls.length && !lastEnded) return null
+  const ours = calls.filter(c => !(c.direction === 'inbound' && c.state === 'ringing'))
   return (
     <div className="calls" data-testid="calls">
-      {calls.map(call => (call.direction === 'inbound' && call.state === 'ringing' ? <Incoming key={call.id} call={call} /> : <Active key={call.id} call={call} tones={tones[call.id] ?? ''} />))}
-      {!calls.length && lastEnded ? (
+      {calls.map(call => {
+        if (call.direction === 'inbound' && call.state === 'ringing') return <Incoming key={call.id} call={call} />
+        const original = call.consultationOf ? ours.find(c => c.id === call.consultationOf) : undefined
+        return <Active key={call.id} call={call} tones={tones[call.id] ?? ''} hasOther={ours.length > 1} onError={setError} {...(original ? { original } : {})} />
+      })}
+      {lastEnded ? (
         <p className="call call-ended" role="status">
           {t(REASON_KEY[lastEnded.endReason ?? 'hangup'], { who: who(lastEnded) })}
+        </p>
+      ) : null}
+      {error && calls.length ? (
+        <p className="alert alert-error" role="alert">
+          {error}
         </p>
       ) : null}
     </div>
