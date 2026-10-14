@@ -130,4 +130,53 @@ jobs:
         if: always()
         run: docker compose -f docker/docker-compose.sip.yml down -v
 
-  # yarn e2e:web et yarn e2e:sip tournent ci-dessus : tous les e2e du dépôt se jouent en CI.
+  pilot:
+    name: Kit pilote (images Docker, Caddy, Keycloak, LDAP, Chromium)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: yarn
+      # Le kit tel qu'un pilote le lance (docker/pilot/README.md), profil demo, avec un nom de test résolu en local
+      # (OpenSIPS le résout à son démarrage) et le certificat de l'autorité interne de Caddy. Le son reste sur la boucle.
+      - name: .env du kit (init.sh, profil demo)
+        run: |
+          echo "127.0.0.1 twakephone.test" | sudo tee -a /etc/hosts
+          docker/pilot/init.sh twakephone.test internal --demo --public-ip 127.0.0.1
+          sed -i 's/^RTPENGINE_INTERFACE=.*/RTPENGINE_INTERFACE=127.0.0.1/' docker/pilot/.env
+      - name: Kit pilote (construction des images et démarrage)
+        working-directory: docker/pilot
+        run: docker compose up --build --wait --wait-timeout 600
+      - run: yarn install --frozen-lockfile
+      - name: Cache de Chromium (clé = version de playwright-core)
+        id: browser-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: chromium-${{ runner.os }}-${{ hashFiles('node_modules/playwright-core/package.json') }}
+      - name: Chromium
+        if: steps.browser-cache.outputs.cache-hit != 'true'
+        run: npx playwright-core install --with-deps chromium
+      - name: Dépendances système de Chromium (cache ou non)
+        if: steps.browser-cache.outputs.cache-hit == 'true'
+        run: npx playwright-core install-deps chromium
+      - name: e2e du kit pilote (connexion Keycloak, annuaire LDAP, appel entre deux navigateurs, Récents)
+        run: |
+          DEMO_PASSWORD=$(sed -n 's/^DEMO_PASSWORD=//p' docker/pilot/.env) node apps/web/test/pilot.e2e.mjs
+        env:
+          PILOT_URL: https://twakephone.test
+          PILOT_RESOLVE: 127.0.0.1
+          PILOT_INSECURE: '1'
+      - name: Journaux du kit en cas d'échec
+        if: failure()
+        working-directory: docker/pilot
+        run: docker compose logs --no-color --timestamps | tail -n 400
+      - name: Arrêt du kit
+        if: always()
+        working-directory: docker/pilot
+        run: docker compose down -v
+
+  # yarn e2e:web, yarn e2e:sip et yarn e2e:pilot tournent ci-dessus : tous les e2e du dépôt se jouent en CI.

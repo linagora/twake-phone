@@ -1,0 +1,71 @@
+{
+  "realm": "twakephone",
+  "displayName": "TwakePhone (démo)",
+  "enabled": true,
+  "sslRequired": "external",
+  "registrationAllowed": false,
+  "resetPasswordAllowed": false,
+  "loginWithEmailAllowed": true,
+  "internationalizationEnabled": true,
+  "supportedLocales": ["fr", "en"],
+  "defaultLocale": "fr",
+  "clients": [
+    {
+      "clientId": "twakephone-web",
+      "name": "TwakePhone",
+      "enabled": true,
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "consentRequired": false,
+      "redirectUris": ["https://${DOMAIN}/callback"],
+      "webOrigins": ["https://${DOMAIN}"],
+      "attributes": {
+        "pkce.code.challenge.method": "S256",
+        "post.logout.redirect.uris": "https://${DOMAIN}/"
+      },
+      "protocolMappers": [
+        {
+          "name": "gateway-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "included.custom.audience": "twakephone-gateway",
+            "access.token.claim": "true",
+            "id.token.claim": "false"
+          }
+        }
+      ]
+    }
+  ],
+  "users": [
+    {
+      "username": "alice",
+      "enabled": true,
+      "email": "alice@twakephone.demo",
+      "emailVerified": true,
+      "firstName": "Alice",
+      "lastName": "Martin",
+      "credentials": [{ "type": "password", "value": "${DEMO_PASSWORD}", "temporary": false }]
+    },
+    {
+      "username": "bob",
+      "enabled": true,
+      "email": "bob@twakephone.demo",
+      "emailVerified": true,
+      "firstName": "Bob",
+      "lastName": "Durand",
+      "credentials": [{ "type": "password", "value": "${DEMO_PASSWORD}", "temporary": false }]
+    },
+    {
+      "username": "carole",
+      "enabled": true,
+      "email": "carole@twakephone.demo",
+      "emailVerified": true,
+      "firstName": "Carole",
+      "lastName": "Bernard",
+      "credentials": [{ "type": "password", "value": "${DEMO_PASSWORD}", "temporary": false }]
+    }
+  ]
+}

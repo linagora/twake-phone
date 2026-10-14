@@ -1,0 +1,29 @@
+# The only public entry of the pilot stack, on one domain: HTTPS (port 443, port 80 for the redirect and the ACME
+# challenge) in front of the services that listen on the loopback. WebSocket upgrades (Gateway events, SIP) pass as is.
+{$DOMAIN} {
+	# An email: a Let's Encrypt certificate under that contact (DNS of DOMAIN must point here, ports 80 and 443 open).
+	# "internal": a certificate from Caddy's own CA, for a test where the browsers are told to trust it.
+	tls {$TLS}
+
+	# The Gateway: REST and its event WebSocket.
+	handle /api/* {
+		reverse_proxy 127.0.0.1:{$GATEWAY_PORT:8080}
+	}
+	# SIP over WebSocket to OpenSIPS (OPENSIPS_WS_URL=wss://DOMAIN/sip): the browsers register and call through here.
+	handle /sip {
+		reverse_proxy 127.0.0.1:{$OPENSIPS_WS_PORT:8088}
+	}
+	# The demo identity provider (Keycloak, `demo` profile). Without that profile nothing listens there (502).
+	handle /auth/* {
+		reverse_proxy 127.0.0.1:{$KEYCLOAK_PORT:8180}
+	}
+	# The app itself (static files, config.json, CSP).
+	handle {
+		reverse_proxy 127.0.0.1:{$WEB_PORT:8081}
+	}
+
+	log {
+		output stdout
+		format console
+	}
+}

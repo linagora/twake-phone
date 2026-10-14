@@ -6,7 +6,12 @@ COPY package.json yarn.lock tsconfig.base.json ./
 COPY packages ./packages
 COPY apps/gateway/package.json ./apps/gateway/package.json
 COPY apps/web ./apps/web
-RUN yarn install --frozen-lockfile --ignore-scripts && yarn workspace @twake/telephony-types build && yarn workspace @twake/telephony-client build && yarn workspace @twake/phone-web build
+# The app bundles the softphone (JsSIP) and the Gateway client: both are built before it, after the types they share.
+RUN yarn install --frozen-lockfile --ignore-scripts \
+    && yarn workspace @twake/telephony-types build \
+    && yarn workspace @twake/telephony-client build \
+    && yarn workspace @twake/softphone build \
+    && yarn workspace @twake/phone-web build
 
 FROM node:22-slim
 WORKDIR /app
