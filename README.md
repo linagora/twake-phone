@@ -168,6 +168,8 @@ yarn dev:gateway                               # passerelle sur http://localhost
 yarn dev:web                                   # app TwakePhone sur http://localhost:4173 (config dans apps/web/public/config.json)
 ```
 
+Annuaire : la passerelle interroge un LDAP quand `LDAP_URL` est renseigné (`LDAP_BASE_DN` obligatoire ; `LDAP_BIND_DN` et `LDAP_BIND_PASSWORD` pour un compte lecteur ; `LDAP_USER_FILTER`, par défaut `(objectClass=inetOrgPerson)` ; `LDAP_ATTR_ID`, `_NAME`, `_EMAIL`, `_PHONE`, `_MOBILE`, `_EXTENSION`, `_DEPARTMENT`, `_TITLE` pour un schéma qui s'écarte d'inetOrgPerson). Sans `LDAP_URL`, l'app affiche que la plateforme n'a pas d'annuaire. Les favoris sont dans PostgreSQL, par utilisateur.
+
 Stack complète en local (Twake, Phone, passerelle, PBX de dev), encore celle du POC jusqu'à l'étape 3 :
 
 ```bash
@@ -182,7 +184,7 @@ Visio (accès téléphonique aux salles Meet) et trunk SIP réel : [docker/READM
 |---|---|
 | `yarn test` | unitaires de tous les paquets et de la passerelle (vitest), contrat de stockage mémoire et, avec `TEST_DATABASE_URL`, PostgreSQL |
 | `cd apps/phone && yarn lint && yarn test` | application Phone du POC (eslint, stylint, jest) |
-| `yarn e2e:web` | app TwakePhone dans Chromium : connexion OIDC (fournisseur de test en Node), identité et poste donnés par la passerelle, clavier, langue, déconnexion, CSP. Sans Docker ; Chromium s'installe une fois avec `npx playwright-core install chromium` (ou `PLAYWRIGHT_CHROMIUM=/chemin/vers/chromium`) |
+| `yarn e2e:web` | app TwakePhone dans Chromium : connexion OIDC (fournisseur de test en Node), identité et poste donnés par la passerelle, clavier, annuaire et favoris (LDAP de test en Node), langue, déconnexion, CSP. Sans Docker ; Chromium s'installe une fois avec `npx playwright-core install chromium` (ou `PLAYWRIGHT_CHROMIUM=/chemin/vers/chromium`) |
 | `yarn e2e:live` | passerelle ↔ PBX de dev (MiniPBX, ARI), avec de vrais appels SIP |
 | `yarn e2e:browser` | deux navigateurs, audio réel simulé (WebRTC) |
 | `yarn e2e:widget` | widget dans un hôte cozy-interapp réel |

@@ -1,4 +1,6 @@
-import type { Call, Capabilities, ConferenceParticipant, DialInConfiguration, MediaSession, Presence, PresenceStatus, TelephonyEvent } from '@twake/telephony-types'
+import type { Call, Capabilities, ConferenceParticipant, Contact, DialInConfiguration, MediaSession, Presence, PresenceStatus, TelephonyEvent } from '@twake/telephony-types'
+
+export type { Contact, ContactNumber } from '@twake/telephony-types'
 
 import { backoffDelay } from './backoff.js'
 
@@ -70,7 +72,12 @@ export class TelephonyClient {
       }
     })
     if (!res.ok) throw new Error(`Gateway ${res.status} on ${path}`)
-    return (res.status === 204 ? undefined : await res.json()) as T
+    if (res.status === 204) {
+      // Drain the empty body: a response left unread shows up as an aborted request in the browser.
+      await res.text()
+      return undefined as T
+    }
+    return (await res.json()) as T
   }
 
   getMe() {
@@ -106,6 +113,27 @@ export class TelephonyClient {
 
   getCapabilities() {
     return this.request<Capabilities>('/capabilities')
+  }
+
+  /** People matching the words of `q` in the organisation's directory. 501 means the platform has no directory. */
+  searchDirectory(q: string, limit = 20) {
+    return this.request<{ items: Contact[] }>(`/directory?${new URLSearchParams({ q, limit: String(limit) })}`)
+  }
+
+  getContact(id: string) {
+    return this.request<Contact>(`/directory/${encodeURIComponent(id)}`)
+  }
+
+  getFavorites() {
+    return this.request<{ items: Contact[] }>('/me/favorites')
+  }
+
+  async addFavorite(id: string) {
+    await this.request<void>(`/me/favorites/${encodeURIComponent(id)}`, { method: 'PUT' })
+  }
+
+  async removeFavorite(id: string) {
+    await this.request<void>(`/me/favorites/${encodeURIComponent(id)}`, { method: 'DELETE' })
   }
 
   getPresence() {

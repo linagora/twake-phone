@@ -5,7 +5,9 @@ import { fileURLToPath } from 'node:url'
 import { chromium } from 'playwright-core'
 import { buildApp } from '../../gateway/dist/app.js'
 import { JwtAuthenticator } from '../../gateway/dist/auth.js'
+import { DEFAULT_ATTRIBUTES, LdapDirectory } from '../../gateway/dist/ldap-directory.js'
 import { ProviderRegistry } from '../../gateway/dist/registry.js'
+import { BASE_DN, READER_DN, READER_PASSWORD, startLdapMock } from '../../gateway/test/ldap-mock.mjs'
 import { startOidcMock } from './oidc-mock.mjs'
 import { serveApp } from './static-server.mjs'
 
@@ -38,8 +40,10 @@ process.env.DEFAULT_TENANT = 'e2e'
 process.env.DEV_USER_MAP = 'alice:101'
 
 const oidc = await startOidcMock({ port: OIDC_PORT, appOrigin, audience: AUDIENCE, resource: RESOURCE })
+const ldap = await startLdapMock()
 const auth = new JwtAuthenticator({ jwksUrl: oidc.jwksUrl, issuer: oidc.issuer, audience: AUDIENCE, defaultTenant: 'e2e' })
-const gateway = await buildApp(new ProviderRegistry([]), { auth })
+const contacts = new LdapDirectory({ url: ldap.url, bindDn: READER_DN, bindPassword: READER_PASSWORD, baseDn: BASE_DN, userFilter: '(objectClass=inetOrgPerson)', attributes: DEFAULT_ATTRIBUTES })
+const gateway = await buildApp(new ProviderRegistry([]), { auth, contacts })
 await gateway.listen({ host: '127.0.0.1', port: GATEWAY_PORT })
 const web = await serveApp({
   dir: fileURLToPath(new URL('../dist/', import.meta.url)),
@@ -107,6 +111,46 @@ try {
     await page.getByRole('button', { name: '5' }).click()
     expectEqual(await page.getByLabel('Numéro à appeler').inputValue(), '5', 'keypad input')
   })
+  await step('the directory finds Jean Dupont by "dup", with his number and department', async () => {
+    await page.getByRole('link', { name: 'Annuaire' }).click()
+    await page.getByText('Aucun favori pour l\'instant').waitFor()
+    await page.getByLabel('Rechercher').fill('dup')
+    const list = page.locator('ul.contacts')
+    await list.getByRole('link', { name: 'Jean Dupont', exact: true }).waitFor()
+    await list.getByText(/Support · .*23.45.67.01/).waitFor()
+    expectEqual(await list.getByRole('listitem').count(), 1, 'number of results')
+    await page.getByLabel('Rechercher').fill('support')
+    await list.getByRole('link', { name: 'Bob Durand', exact: true }).waitFor()
+    expectEqual(await list.getByRole('listitem').count(), 2, 'number of results for "support"')
+  })
+  await step('a favourite survives a reload, because the Gateway keeps it', async () => {
+    await page.getByLabel('Rechercher').fill('dup')
+    const saved = page.waitForResponse(r => r.request().method() === 'PUT' && r.url().endsWith('/me/favorites/jdupont'))
+    await page.getByRole('button', { name: 'Ajouter Jean Dupont aux favoris' }).click()
+    await page.getByRole('button', { name: 'Retirer Jean Dupont des favoris' }).waitFor()
+    expectEqual((await saved).status(), 204, 'favourite saved by the Gateway')
+    await page.reload()
+    await page.getByRole('heading', { level: 2, name: 'Favoris' }).waitFor()
+    await page.getByRole('link', { name: 'Jean Dupont', exact: true }).waitFor()
+    expectEqual(await page.getByRole('button', { name: 'Retirer Jean Dupont des favoris' }).getAttribute('aria-pressed'), 'true', 'aria-pressed')
+  })
+  await step('the contact card lists every number, and Call sends it to the dialer', async () => {
+    await page.getByRole('link', { name: 'Jean Dupont', exact: true }).click()
+    await page.getByRole('heading', { level: 1, name: 'Jean Dupont' }).waitFor()
+    expectEqual(await page.title(), 'Annuaire – TwakePhone', 'document title')
+    await page.getByText('Technicien · Support').waitFor()
+    await page.getByText('Mobile').waitFor()
+    await page.getByRole('link', { name: /Appeler le .*6.12.34.56.01/ }).click()
+    await page.getByRole('heading', { level: 1, name: 'Clavier' }).waitFor()
+    const typed = await page.getByLabel('Numéro à appeler').inputValue()
+    expectEqual(typed.replace(/\s/g, ''), '+33612345601', 'number sent to the dialer')
+    expectEqual(new URL(page.url()).search, '', 'address bar cleaned')
+  })
+  await step('removing the favourite empties the list', async () => {
+    await page.getByRole('link', { name: 'Annuaire' }).click()
+    await page.getByRole('button', { name: 'Retirer Jean Dupont des favoris' }).click()
+    await page.getByText('Aucun favori pour l\'instant').waitFor()
+  })
   await step('switching the language to English changes the UI, the title and the document language', async () => {
     await page.getByRole('link', { name: 'Réglages' }).click()
     await page.getByLabel("Langue de l'interface").selectOption('en')
@@ -139,5 +183,6 @@ try {
   await web.stop()
   await gateway.close()
   await oidc.stop()
+  await ldap.stop()
 }
 process.exit(failed ? 1 : 0)

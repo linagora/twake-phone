@@ -24,6 +24,7 @@
     "@twake/telephony-types": "*",
     "fastify": "^5.0.0",
     "jose": "^6.2.12",
+    "ldapts": "^9.2.0",
     "pg": "^8.23.1"
   },
   "devDependencies": {

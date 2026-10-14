@@ -1,4 +1,5 @@
 import { useEffect, useState, type FormEvent } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import { formatNumber, toDialTarget } from '@twake/telephony-client'
 import { useGateway } from '../gateway.js'
 import { useT } from '../i18n/useT.js'
@@ -8,7 +9,12 @@ const KEYS: [string, string][] = [['1', ''], ['2', 'ABC'], ['3', 'DEF'], ['4', '
 export const Dialer = () => {
   const { t } = useT()
   const { client } = useGateway()
-  const [number, setNumber] = useState('')
+  // The directory sends a number to call as ?number=: taken once, then the address bar is cleaned.
+  const [params, setParams] = useSearchParams()
+  const [number, setNumber] = useState(() => (params.get('number') ?? '').slice(0, 32))
+  useEffect(() => {
+    if (params.has('number')) setParams({}, { replace: true })
+  }, [params, setParams])
   const [canCall, setCanCall] = useState<boolean | null>(null)
   const [status, setStatus] = useState<{ kind: 'info' | 'error'; text: string } | null>(null)
 

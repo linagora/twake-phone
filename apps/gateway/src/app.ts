@@ -7,6 +7,7 @@ import { splitParticipantId, verifyWebhook, type LiveKitConferenceBridge, type M
 import type { MediaProvider, TelephonyProvider } from '@twake/telephony-provider-sdk'
 import type { CallDirection, Endpoint, PresenceStatus, TelephonyEvent, User } from '@twake/telephony-types'
 import { authenticatorFromEnv, TicketStore, type Authenticator, type Identity } from './auth.js'
+import { MAX_CONTACT_ID, MAX_QUERY, MAX_SEARCH, type ContactDirectory } from './contacts.js'
 import { StoreDirectory, parseUserMap, type UserDirectory } from './directory.js'
 import { EventBus } from './events.js'
 import { historyEntryFor } from './history.js'
@@ -25,6 +26,8 @@ export interface BuildOptions {
   bus?: EventBus
   store?: Store
   directory?: UserDirectory
+  /** The people one can look up and call. Absent when no directory is configured: the endpoints answer 501. */
+  contacts?: ContactDirectory
   auth?: Authenticator
   tickets?: TicketStore
   /** Phone access to Meet rooms. Absent when no LiveKit is configured: the endpoints answer 501. */
@@ -221,6 +224,48 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         const user = await whoIs(req)
         const page = await store.listHistory(user.tenantId, user.id, parseHistoryQuery(req.query))
         return { items: page.items.map(publicEntry), ...(page.next ? { next: page.next } : {}) }
+      })
+
+      // The organisation's directory, and the caller's favourites in it. Tenant and user come from the identity.
+      const contacts = () => {
+        if (!options.contacts) throw Object.assign(new Error('No directory configured'), { statusCode: 501 })
+        return options.contacts
+      }
+      const contactId = (id: string) => {
+        if (!id || id.length > MAX_CONTACT_ID) throw bad('invalid contact id')
+        return id
+      }
+      v1.get<{ Querystring: { q?: string; limit?: string } }>('/directory', async req => {
+        const user = await whoIs(req)
+        const q = (req.query.q ?? '').trim()
+        if (q.length > MAX_QUERY) throw bad('query too long')
+        const limit = req.query.limit ? Number(req.query.limit) : 20
+        if (!Number.isInteger(limit) || limit < 1 || limit > MAX_SEARCH) throw bad('invalid limit')
+        return { items: q ? await contacts().search(user.tenantId, q, limit) : [] }
+      })
+      v1.get<{ Params: { id: string } }>('/directory/:id', async req => {
+        const user = await whoIs(req)
+        const [contact] = await contacts().getMany(user.tenantId, [contactId(req.params.id)])
+        if (!contact) throw Object.assign(new Error('Contact not found'), { statusCode: 404 })
+        return contact
+      })
+      v1.get('/me/favorites', async req => {
+        const user = await whoIs(req)
+        const ids = await store.listFavorites(user.tenantId, user.id)
+        return { items: ids.length ? await contacts().getMany(user.tenantId, ids) : [] }
+      })
+      v1.put<{ Params: { id: string } }>('/me/favorites/:id', async (req, reply) => {
+        const user = await whoIs(req)
+        const id = contactId(req.params.id)
+        // Only someone the directory knows can be a favourite: no stray ids in the store.
+        if ((await contacts().getMany(user.tenantId, [id])).length === 0) throw Object.assign(new Error('Contact not found'), { statusCode: 404 })
+        await store.addFavorite(user.tenantId, user.id, id)
+        return reply.code(204).send()
+      })
+      v1.delete<{ Params: { id: string } }>('/me/favorites/:id', async (req, reply) => {
+        const user = await whoIs(req)
+        await store.removeFavorite(user.tenantId, user.id, contactId(req.params.id))
+        return reply.code(204).send()
       })
 
       // Right to erasure of one's own call history.

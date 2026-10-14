@@ -74,6 +74,12 @@ export interface Store {
   /** Deletes the history of a user (retention, right to erasure). Returns the number of rows. */
   deleteHistory(tenantId: string, userId: string): Promise<number>
 
+  /** Favourite contacts of a user, oldest first. Ids are the directory's; the store never interprets them. */
+  listFavorites(tenantId: string, userId: string): Promise<string[]>
+  /** Idempotent. */
+  addFavorite(tenantId: string, userId: string, contactId: string): Promise<void>
+  removeFavorite(tenantId: string, userId: string, contactId: string): Promise<void>
+
   getSipSecret(tenantId: string, userId: string): Promise<{ secretEnc: string; rotatedAt: string } | null>
   setSipSecret(tenantId: string, userId: string, secretEnc: string): Promise<void>
 

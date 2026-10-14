@@ -31,6 +31,24 @@ export const storeContract = (name: string, make: () => Promise<Store>) =>
       await s.close()
     })
 
+    it('keeps favourites per tenant and user, in the order they were added, without duplicates', async () => {
+      const s = await make()
+      await s.addFavorite('A', 'alice', 'jdupont')
+      await s.addFavorite('A', 'alice', 'bdurand')
+      await s.addFavorite('A', 'alice', 'jdupont')
+      await s.addFavorite('A', 'bob', 'jdupont')
+      await s.addFavorite('B', 'alice', 'cmartin')
+      expect(await s.listFavorites('A', 'alice')).toEqual(['jdupont', 'bdurand'])
+      expect(await s.listFavorites('A', 'bob')).toEqual(['jdupont'])
+      expect(await s.listFavorites('B', 'alice')).toEqual(['cmartin'])
+      expect(await s.listFavorites('C', 'alice')).toEqual([])
+      await s.removeFavorite('A', 'alice', 'jdupont')
+      await s.removeFavorite('A', 'alice', 'nobody')
+      expect(await s.listFavorites('A', 'alice')).toEqual(['bdurand'])
+      expect(await s.listFavorites('A', 'bob')).toEqual(['jdupont'])
+      await s.close()
+    })
+
     it('never shows the history of another tenant or another user', async () => {
       const s = await make()
       await s.addHistory(entry({ callId: 'a1' }))

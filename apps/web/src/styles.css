@@ -68,3 +68,8 @@ h1 { font-size: 1.5rem; margin: 0 0 16px; }
 .missed { color: var(--danger); font-weight: 600; }
 .center { max-width: 480px; margin: 10vh auto; text-align: center; }
 .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+.muted { color: var(--muted); margin-top: -8px; }
+.contacts li { align-items: center; }
+.contacts .actions { gap: 8px; }
+.star { min-width: 44px; padding: 8px; font-size: 1.3rem; line-height: 1; }
+.star-on { color: var(--accent); border-color: var(--accent); }

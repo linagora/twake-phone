@@ -306,6 +306,77 @@
   resolved "https://registry.yarnpkg.com/@jridgewell/sourcemap-codec/-/sourcemap-codec-1.6.0.tgz#f4c663e862f06dc98ca4d453862c46902789a18d"
   integrity sha512-T7jf+5zgsZHwNJ4lvQ7/aezbyk0nNX+zJVWpmHA7VYsEx7a7qr5Rg5IbtJFqkgze5Y2sruq1RUY8Q837Od7iFw==
 
+"@ldapjs/asn1@2.0.0", "@ldapjs/asn1@^2.0.0":
+  version "2.0.0"
+  resolved "https://registry.yarnpkg.com/@ldapjs/asn1/-/asn1-2.0.0.tgz#e25fa38fcf0b4310275d6a5a05fe4603efef5eb4"
+  integrity sha512-G9+DkEOirNgdPmD0I8nu57ygQJKOOgFEMKknEuQvIHbGLwP3ny1mY+OTUYLCbCaGJP4sox5eYgBJRuSUpnAddA==
+
+"@ldapjs/asn1@^1.2.0":
+  version "1.2.0"
+  resolved "https://registry.yarnpkg.com/@ldapjs/asn1/-/asn1-1.2.0.tgz#5e99338fb39ff518c205827bec0fd9a6bf6b42db"
+  integrity sha512-KX/qQJ2xxzvO2/WOvr1UdQ+8P5dVvuOLk/C9b1bIkXxZss8BaR28njXdPgFCpj5aHaf1t8PmuVnea+N9YG9YMw==
+
+"@ldapjs/attribute@1.0.0", "@ldapjs/attribute@^1.0.0":
+  version "1.0.0"
+  resolved "https://registry.yarnpkg.com/@ldapjs/attribute/-/attribute-1.0.0.tgz#d81d626080584c1c80ef300a214458f9f78a8abb"
+  integrity sha512-ptMl2d/5xJ0q+RgmnqOi3Zgwk/TMJYG7dYMC0Keko+yZU6n+oFM59MjQOUht5pxJeS4FWrImhu/LebX24vJNRQ==
+  dependencies:
+    "@ldapjs/asn1" "2.0.0"
+    "@ldapjs/protocol" "^1.2.1"
+    process-warning "^2.1.0"
+
+"@ldapjs/change@^1.0.0":
+  version "1.0.0"
+  resolved "https://registry.yarnpkg.com/@ldapjs/change/-/change-1.0.0.tgz#34818a3a31cb337d3b90ab853bb7fa90517c2c4f"
+  integrity sha512-EOQNFH1RIku3M1s0OAJOzGfAohuFYXFY4s73wOhRm4KFGhmQQ7MChOh2YtYu9Kwgvuq1B0xKciXVzHCGkB5V+Q==
+  dependencies:
+    "@ldapjs/asn1" "2.0.0"
+    "@ldapjs/attribute" "1.0.0"
+
+"@ldapjs/controls@^2.1.0":
+  version "2.1.0"
+  resolved "https://registry.yarnpkg.com/@ldapjs/controls/-/controls-2.1.0.tgz#28449cd4352f9389fb52fbf699cfa62f3e8762e6"
+  integrity sha512-2pFdD1yRC9V9hXfAWvCCO2RRWK9OdIEcJIos/9cCVP9O4k72BY1bLDQQ4KpUoJnl4y/JoD4iFgM+YWT3IfITWw==
+  dependencies:
+    "@ldapjs/asn1" "^1.2.0"
+    "@ldapjs/protocol" "^1.2.1"
+
+"@ldapjs/dn@^1.1.0":
+  version "1.1.0"
+  resolved "https://registry.yarnpkg.com/@ldapjs/dn/-/dn-1.1.0.tgz#3687c86d658d2e10aedc2c65a1ef40155dd7370b"
+  integrity sha512-R72zH5ZeBj/Fujf/yBu78YzpJjJXG46YHFo5E4W1EqfNpo1UsVPqdLrRMXeKIsJT3x9dJVIfR6OpzgINlKpi0A==
+  dependencies:
+    "@ldapjs/asn1" "2.0.0"
+    process-warning "^2.1.0"
+
+"@ldapjs/filter@^2.1.1":
+  version "2.1.1"
+  resolved "https://registry.yarnpkg.com/@ldapjs/filter/-/filter-2.1.1.tgz#34f4774aa17086ed0186afe11c698f13dd586d56"
+  integrity sha512-TwPK5eEgNdUO1ABPBUQabcZ+h9heDORE4V9WNZqCtYLKc06+6+UAJ3IAbr0L0bYTnkkWC/JEQD2F+zAFsuikNw==
+  dependencies:
+    "@ldapjs/asn1" "2.0.0"
+    "@ldapjs/protocol" "^1.2.1"
+    process-warning "^2.1.0"
+
+"@ldapjs/messages@^1.3.0":
+  version "1.3.0"
+  resolved "https://registry.yarnpkg.com/@ldapjs/messages/-/messages-1.3.0.tgz#dea3c35de6e768e54abd3c7fbaee151d3d01f386"
+  integrity sha512-K7xZpXJ21bj92jS35wtRbdcNrwmxAtPwy4myeh9duy/eR3xQKvikVycbdWVzkYEAVE5Ce520VXNOwCHjomjCZw==
+  dependencies:
+    "@ldapjs/asn1" "^2.0.0"
+    "@ldapjs/attribute" "^1.0.0"
+    "@ldapjs/change" "^1.0.0"
+    "@ldapjs/controls" "^2.1.0"
+    "@ldapjs/dn" "^1.1.0"
+    "@ldapjs/filter" "^2.1.1"
+    "@ldapjs/protocol" "^1.2.1"
+    process-warning "^2.2.0"
+
+"@ldapjs/protocol@^1.2.1":
+  version "1.2.1"
+  resolved "https://registry.yarnpkg.com/@ldapjs/protocol/-/protocol-1.2.1.tgz#d58d371d6958f28095e8de23b35341bcaba55cf3"
+  integrity sha512-O89xFDLW2gBoZWNXuXpBSM32/KealKCTb3JGtJdtUQc7RjAk8XzrRgyz02cPAwGKwKPxy0ivuC7UP9bmN87egQ==
+
 "@lukeed/ms@^2.0.2":
   version "2.0.2"
   resolved "https://registry.yarnpkg.com/@lukeed/ms/-/ms-2.0.2.tgz#07f09e59a74c52f4d88c6db5c1054e819538e2a8"
@@ -753,6 +824,11 @@ ajv@^8.0.0, ajv@^8.12.0:
     json-schema-traverse "^1.0.0"
     require-from-string "^2.0.2"
 
+assert-plus@^1.0.0:
+  version "1.0.0"
+  resolved "https://registry.yarnpkg.com/assert-plus/-/assert-plus-1.0.0.tgz#f12e0f3c5d77b0b1cdd9146942e4e96c1e4dd525"
+  integrity sha512-NfJ4UzBCcQGLDlQq7nHxH+tv3kyZ0hHQqF5BO6J7tNJeP5do1llPr8dZ8zHonfhAu0PHAdMkSo+8o0wxg9lZWw==
+
 assertion-error@^2.0.1:
   version "2.0.1"
   resolved "https://registry.yarnpkg.com/assertion-error/-/assertion-error-2.0.1.tgz#f641a196b335690b1070bf00b6e7593fec190bf7"
@@ -770,6 +846,13 @@ avvio@^9.0.0:
   dependencies:
     "@fastify/error" "^4.0.0"
     fastq "^1.17.1"
+
+backoff@^2.5.0:
+  version "2.5.0"
+  resolved "https://registry.yarnpkg.com/backoff/-/backoff-2.5.0.tgz#f616eda9d3e4b66b8ca7fca79f695722c5f8e26f"
+  integrity sha512-wC5ihrnUXmR2douXmXLCe5O3zg3GKIyvRi/hi58a/XyRxVI+3/yM0PYueQOZXPXQ9pxBislYkw+sF9b7C/RuMA==
+  dependencies:
+    precond "0.2"
 
 balanced-match@^4.0.2:
   version "4.0.4"
@@ -836,6 +919,11 @@ cookies@~0.9.1:
   dependencies:
     depd "~2.0.0"
     keygrip "~1.1.0"
+
+core-util-is@1.0.2:
+  version "1.0.2"
+  resolved "https://registry.yarnpkg.com/core-util-is/-/core-util-is-1.0.2.tgz#b5fd54220aa2bc5ab57aab7140c940754503c1a7"
+  integrity sha512-3lqz5YjWTYnW6dlDa5TLaTCcShfar1e40rmcJVwCBJC6mWlFuj0eCHIElmG1g5kyuJ/GD+8Wn4FFCcz4gJPfaQ==
 
 cssstyle@^4.2.1:
   version "4.6.0"
@@ -990,6 +1078,11 @@ expect-type@^1.2.1:
   version "1.4.0"
   resolved "https://registry.yarnpkg.com/expect-type/-/expect-type-1.4.0.tgz#24edf7f0cc69a44d008567ba4594ab96f3c3a3d6"
   integrity sha512-KfYbmpRm0VbLjEvVa9yGwCi9GI34xvi7A/HXYWQO65CSD2u3MczUJSuwXKFIxlGsgBQizV9q5J9NHj4VG0n+pA==
+
+extsprintf@^1.2.0:
+  version "1.4.1"
+  resolved "https://registry.yarnpkg.com/extsprintf/-/extsprintf-1.4.1.tgz#8d172c064867f235c0c84a596806d279bf4bcc07"
+  integrity sha512-Wrk35e8ydCKDj/ArClo1VrPVmN8zph5V4AtHwIuHhvMXsKf73UT3BOD+azBIW+3wOJ4FhEH7zyaJCFvChjYvMA==
 
 fast-decode-uri-component@^1.0.1:
   version "1.0.1"
@@ -1278,6 +1371,33 @@ koa@^3.2.1:
     statuses "^2.0.1"
     type-is "^2.0.1"
     vary "^1.1.2"
+
+ldapjs@^3.0.7:
+  version "3.0.7"
+  resolved "https://registry.yarnpkg.com/ldapjs/-/ldapjs-3.0.7.tgz#c69fe2965bc50a747bce834f8183f1f77c3be75d"
+  integrity sha512-1ky+WrN+4CFMuoekUOv7Y1037XWdjKpu0xAPwSP+9KdvmV9PG+qOKlssDV6a+U32apwxdD3is/BZcWOYzN30cg==
+  dependencies:
+    "@ldapjs/asn1" "^2.0.0"
+    "@ldapjs/attribute" "^1.0.0"
+    "@ldapjs/change" "^1.0.0"
+    "@ldapjs/controls" "^2.1.0"
+    "@ldapjs/dn" "^1.1.0"
+    "@ldapjs/filter" "^2.1.1"
+    "@ldapjs/messages" "^1.3.0"
+    "@ldapjs/protocol" "^1.2.1"
+    abstract-logging "^2.0.1"
+    assert-plus "^1.0.0"
+    backoff "^2.5.0"
+    once "^1.4.0"
+    vasync "^2.2.1"
+    verror "^1.10.1"
+
+ldapts@^9.2.0:
+  version "9.2.0"
+  resolved "https://registry.yarnpkg.com/ldapts/-/ldapts-9.2.0.tgz#80ce01d102b51f49def3829d152222cd6d1081f9"
+  integrity sha512-5mDg3OT5fDP9DUXga9dCLW8cMW24OTOKT4pv/Qj+f2zCV3qxb+gkZLCzMAqzVTOANoycidKkYpPvkclUQU2aXw==
+  dependencies:
+    strict-event-emitter-types "2.0.0"
 
 libphonenumber-js@^1.12.0:
   version "1.13.14"
@@ -1589,6 +1709,16 @@ postgres-interval@^1.1.0:
   dependencies:
     xtend "^4.0.0"
 
+precond@0.2:
+  version "0.2.3"
+  resolved "https://registry.yarnpkg.com/precond/-/precond-0.2.3.tgz#aa9591bcaa24923f1e0f4849d240f47efc1075ac"
+  integrity sha512-QCYG84SgGyGzqJ/vlMsxeXd/pgL/I94ixdNFyh1PusWmTCyVfPJjZ1K1jvHtsbfnXQs2TSkEP2fR7QiMZAnKFQ==
+
+process-warning@^2.1.0, process-warning@^2.2.0:
+  version "2.3.2"
+  resolved "https://registry.yarnpkg.com/process-warning/-/process-warning-2.3.2.tgz#70d8a3251aab0eafe3a595d8ae2c5d2277f096a5"
+  integrity sha512-n9wh8tvBe5sFmsqlg+XQhaQLumwpqoAUruLwjCopgTmUBjJ/fjtBsJzKleCaIGBOMXYEhp1YfKl4d7rJ5ZKJGA==
+
 process-warning@^4.0.0:
   version "4.0.1"
   resolved "https://registry.yarnpkg.com/process-warning/-/process-warning-4.0.1.tgz#5c1db66007c67c756e4e09eb170cdece15da32fb"
@@ -1826,6 +1956,11 @@ stream-shift@^1.0.2:
   resolved "https://registry.yarnpkg.com/stream-shift/-/stream-shift-1.0.3.tgz#85b8fab4d71010fc3ba8772e8046cc49b8a3864b"
   integrity sha512-76ORR0DO1o1hlKwTbi/DM3EXWGf3ZJYO8cXX5RJwnul2DEg2oyoZyjLNoQM8WsvZiFKCRfC1O0J7iCvie3RZmQ==
 
+strict-event-emitter-types@2.0.0:
+  version "2.0.0"
+  resolved "https://registry.yarnpkg.com/strict-event-emitter-types/-/strict-event-emitter-types-2.0.0.tgz#05e15549cb4da1694478a53543e4e2f4abcf277f"
+  integrity sha512-Nk/brWYpD85WlOgzw5h173aci0Teyv8YdIAEtV+N88nDB0dLlazZyJMIsN6eo1/AR61l+p6CJTG1JIyFaoNEEA==
+
 string_decoder@^1.1.1:
   version "1.3.0"
   resolved "https://registry.yarnpkg.com/string_decoder/-/string_decoder-1.3.0.tgz#42f114594a46cf1a8e30b0a84f56c78c3edac21e"
@@ -1964,6 +2099,31 @@ vary@^1.1.2:
   version "1.1.2"
   resolved "https://registry.yarnpkg.com/vary/-/vary-1.1.2.tgz#2299f02c6ded30d4a5961b0b9f74524a18f634fc"
   integrity sha512-BNGbWLfd0eUPabhkXUVm0j8uuvREyTh5ovRa/dyow/BqAbZJyC+5fU+IzQOzmAKzYqYRAISoRhdQr3eIZ/PXqg==
+
+vasync@^2.2.1:
+  version "2.2.1"
+  resolved "https://registry.yarnpkg.com/vasync/-/vasync-2.2.1.tgz#d881379ff3685e4affa8e775cf0fd369262a201b"
+  integrity sha512-Hq72JaTpcTFdWiNA4Y22Amej2GH3BFmBaKPPlDZ4/oC8HNn2ISHLkFrJU4Ds8R3jcUi7oo5Y9jcMHKjES+N9wQ==
+  dependencies:
+    verror "1.10.0"
+
+verror@1.10.0:
+  version "1.10.0"
+  resolved "https://registry.yarnpkg.com/verror/-/verror-1.10.0.tgz#3a105ca17053af55d6e270c1f8288682e18da400"
+  integrity sha512-ZZKSmDAEFOijERBLkmYfJ+vmk3w+7hOLYDNkRCuRuMJGEmqYNCNLyBBFwWKVMhfwaEF3WOd0Zlw86U/WC/+nYw==
+  dependencies:
+    assert-plus "^1.0.0"
+    core-util-is "1.0.2"
+    extsprintf "^1.2.0"
+
+verror@^1.10.1:
+  version "1.10.1"
+  resolved "https://registry.yarnpkg.com/verror/-/verror-1.10.1.tgz#4bf09eeccf4563b109ed4b3d458380c972b0cdeb"
+  integrity sha512-veufcmxri4e3XSrT0xwfUR7kguIkaxBeosDg00yDWhk49wdwkSUrvvsm7nc75e1PUyvIeZj6nS8VQRYz2/S4Xg==
+  dependencies:
+    assert-plus "^1.0.0"
+    core-util-is "1.0.2"
+    extsprintf "^1.2.0"
 
 vite-node@3.2.4:
   version "3.2.4"

@@ -117,6 +117,19 @@ export class PgStore implements Store {
     return r.rowCount ?? 0
   }
 
+  async listFavorites(tenantId: string, userId: string) {
+    const { rows } = await this.pool.query('SELECT contact_id FROM favorites WHERE tenant_id = $1 AND user_id = $2 ORDER BY added_at, contact_id', [tenantId, userId])
+    return rows.map(r => r.contact_id as string)
+  }
+
+  async addFavorite(tenantId: string, userId: string, contactId: string) {
+    await this.pool.query('INSERT INTO favorites (tenant_id, user_id, contact_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING', [tenantId, userId, contactId])
+  }
+
+  async removeFavorite(tenantId: string, userId: string, contactId: string) {
+    await this.pool.query('DELETE FROM favorites WHERE tenant_id = $1 AND user_id = $2 AND contact_id = $3', [tenantId, userId, contactId])
+  }
+
   async getSipSecret(tenantId: string, userId: string) {
     const { rows } = await this.pool.query('SELECT secret_enc, rotated_at FROM sip_credentials WHERE tenant_id = $1 AND user_id = $2', [tenantId, userId])
     return rows[0] ? { secretEnc: rows[0].secret_enc, rotatedAt: new Date(rows[0].rotated_at).toISOString() } : null
