@@ -2,7 +2,7 @@
 
 Twake Phone ne fournit pas de PBX. Il se branche sur un PBX qui vit **à l'extérieur du déploiement Twake** (le vôtre, celui d'un hébergeur, un cluster Asterisk existant). Ce document liste ce que ce PBX doit offrir. Il décrit le contrat du provider `provider-asterisk` ; pour un autre PBX, on écrit un autre provider (voir [§10](#10-un-autre-pbx-que-asterisk)).
 
-> **État de validation.** Tout ce qui suit a été éprouvé avec **Asterisk 20.6 (paquet Debian) dans MiniPBX**, via l'overlay de `docker/minipbx-dev/`. Aucun Asterisk de production, FreePBX ou Issabel n'a été testé. Les extraits ci-dessous sont ceux de l'overlay, à adapter ; la liste de contrôle du [§9](#9-liste-de-contrôle) dit si l'ensemble fonctionne.
+> **État de validation.** Tout ce qui suit a été éprouvé pendant le POC avec **Asterisk 20.6 (paquet Debian) dans MiniPBX**, via un overlay retiré du dépôt à la PR 3c avec le PBX de dev (l'historique Git le conserve). Aucun Asterisk de production, FreePBX ou Issabel n'a été testé. Les extraits ci-dessous sont ceux de cet overlay, à adapter ; la liste de contrôle du [§9](#9-liste-de-contrôle) dit si l'ensemble fonctionne. Le MVP de TwakePhone tourne sur OpenSIPS (`provider-opensips`, étapes 3 et 4) ; `provider-asterisk` est retiré à l'étape 4.
 
 ## 1. Frontière
 
@@ -32,7 +32,7 @@ Le WSS doit présenter un **certificat valide pour le nom d'hôte** que le navig
 
 Version : 18 ou plus récente recommandée (ARI, PJSIP, WebRTC ; la validation a eu lieu en 20.6).
 
-Modules à charger (liste de l'overlay, qui complète la configuration de MiniPBX) :
+Modules à charger (liste de l'overlay du POC, qui complétait la configuration de MiniPBX) :
 
 ```ini
 ; modules.conf
@@ -186,7 +186,7 @@ Deux options dans la configuration du provider :
 
 Le Gateway génère un secret aléatoire par utilisateur, le conserve chiffré (AES-256-GCM, `SECRETS_KEY`) et le remet au navigateur par l'appel authentifié `media-session`. Le PBX doit donc accepter ce secret pour l'extension. Trois façons :
 
-1. **API de provisionnement** (ce que fait la stack de dev, `docker/minipbx-dev/overlay/provision.py`). Le Gateway appelle :
+1. **API de provisionnement** (ce que faisait le PBX de dev du POC ; `miniPbxProvisioner` dans `provider-asterisk`). Le Gateway appelle :
 
    ```
    PUT {provisioning.url}/extensions/{extension}/secret
@@ -247,7 +247,7 @@ curl -X PUT -H "x-provision-token: <jeton>" -H "content-type: application/json" 
 curl https://telephony.exemple.org/ready
 ```
 
-Le test de bout en bout du dépôt (`yarn e2e:live`) rejoue ces étapes avec deux agents SIP, mais il est écrit pour le PBX de développement (extensions 104 et 105, adresses de la stack) : il sert de modèle, à adapter pour le lancer contre le vôtre.
+Le test de bout en bout du POC (`yarn e2e:live`, retiré à la PR 3c avec le PBX de dev ; l'historique Git le conserve) rejouait ces étapes avec deux agents SIP, écrit pour le PBX de développement (extensions 104 et 105, adresses de la stack) : il peut servir de modèle, à adapter pour le lancer contre le vôtre.
 
 ## 10. Un autre PBX que Asterisk
 
@@ -257,11 +257,11 @@ Le contrat est `packages/provider-sdk` : `TelephonyProvider` (appels, présence,
 2. déclarer une `ProviderFactory` avec un `type` et l'ajouter à la liste de `apps/gateway/src/registry.ts` (il n'y a pas encore de chargement dynamique) ;
 3. publier ses `Capabilities` honnêtement : l'interface s'adapte (pas de transfert, pas de DND, pas d'audio navigateur…).
 
-`packages/sip-media` fournit la session média `sip-webrtc` à tout provider dont les endpoints sont des clients SIP sur WebSocket ; un provider sans audio navigateur renvoie `{ type: 'external' }` et Phone fonctionne alors en pilotage seul (CTI).
+`SipWebrtcMediaProvider` (`packages/provider-asterisk/src/sip-media.ts`, ex-`packages/sip-media`) fournit la session média `sip-webrtc` à un provider dont les endpoints sont des clients SIP sur WebSocket ; un provider sans audio navigateur renvoie `{ type: 'external' }` et Phone fonctionne alors en pilotage seul (CTI).
 
 ## 11. Visio et opérateur
 
 Les parties **Meet** et **trunk** sont indépendantes du choix d'Asterisk côté Twake :
 
-- **LiveKit SIP** parle SIP standard : le PBX n'a besoin que d'un endpoint vers lui (identifié par adresse IP) et d'un contexte qui renvoie ses appels vers votre plan d'appel (dial-out) ; voir `docker/minipbx-dev/overlay/pjsip_twake.conf` et `extensions_twake.conf`.
+- **LiveKit SIP** parle SIP standard : le PBX n'a besoin que d'un endpoint vers lui (identifié par adresse IP) et d'un contexte qui renvoie ses appels vers votre plan d'appel (dial-out) ; l'overlay du POC en donnait un exemple (`pjsip_twake.conf` et `extensions_twake.conf`, dans l'historique Git), refait sur OpenSIPS à l'étape 8.
 - **Opérateur** : voir [ARCHITECTURE.md §13](ARCHITECTURE.md#13-trunk-sip-réel--ce-que-la-ligne-de-développement-a-appris) pour les pièges mesurés derrière un NAT (port source, keepalive par serveur, pas d'adresse externe).

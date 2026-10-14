@@ -12,11 +12,9 @@
   ],
   "scripts": {
     "build": "yarn workspaces run build",
-    "typecheck": "tsc -b packages/telephony-types packages/provider-sdk packages/sip-media packages/telephony-client packages/softphone packages/phone-link packages/provider-asterisk packages/provider-opensips packages/conference-livekit apps/gateway && tsc -p apps/web --noEmit",
+    "typecheck": "tsc -b packages/telephony-types packages/provider-sdk packages/telephony-client packages/softphone packages/phone-link packages/provider-asterisk packages/provider-opensips packages/conference-livekit apps/gateway && tsc -p apps/web --noEmit",
     "test": "vitest run",
     "dev:gateway": "yarn workspace @twake/telephony-gateway dev",
-    "e2e:live": "yarn build && NODE_TLS_REJECT_UNAUTHORIZED=0 node apps/gateway/test/e2e.live.mjs",
-    "e2e:widget": "yarn build && (cd apps/phone && npx rsbuild build) && node apps/phone/test/widget-host.mjs",
     "dev:web": "yarn workspace @twake/phone-web dev",
     "e2e:web": "yarn build && node apps/web/test/web.e2e.mjs",
     "e2e:sip": "yarn build && node apps/web/test/sip.e2e.mjs"

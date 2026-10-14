@@ -13,7 +13,6 @@
   },
   "dependencies": {
     "@twake/telephony-types": "*",
-    "@twake/telephony-provider-sdk": "*",
-    "@twake/sip-media": "*"
+    "@twake/telephony-provider-sdk": "*"
   }
 }

@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import type { MediaProvider, ProviderFactory, RoutedEvent, TelephonyProvider } from '@twake/telephony-provider-sdk'
-import { SipWebrtcMediaProvider, type IceServer } from '@twake/sip-media'
+import { SipWebrtcMediaProvider, type IceServer } from './sip-media.js'
 import type {
   Call,
   Capabilities,

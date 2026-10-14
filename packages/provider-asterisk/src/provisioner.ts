@@ -9,7 +9,7 @@ export interface MiniPbxProvisionerOptions {
   fetchImpl?: typeof fetch
 }
 
-/** Provisioning API of the dev PBX (docker/minipbx-dev/overlay/provision.py). */
+/** Provisioning API of the POC's dev PBX (MiniPBX overlay, removed with the POC; see docs/PBX-REQUIREMENTS.md §7). */
 export const miniPbxProvisioner = ({ url, token, fetchImpl = fetch }: MiniPbxProvisionerOptions): SecretProvisioner => ({
   async setSipSecret(extension, secret) {
     const res = await fetchImpl(`${url}/extensions/${encodeURIComponent(extension)}/secret`, {

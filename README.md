@@ -137,7 +137,6 @@ Ensuite : QoS, exploitation et haute disponibilité, pilote de 30 à 50 utilisat
 
 ```
 apps/web                     application TwakePhone (React 18, OIDC PKCE, client de la passerelle, softphone) : étapes 2 et 3
-apps/phone                   application Phone du POC (React 18, Cozy) ; instancie encore le softphone avec son ancienne API, retirée à la PR 3c
 apps/gateway                 Twake Telephony Gateway (Fastify, PostgreSQL, OpenAPI sur /docs)
 packages/telephony-types     modèle neutre : Call, Presence, Capabilities, MediaSession
 packages/provider-sdk        contrat TelephonyProvider / MediaProvider / ConferenceBridgeProvider / SecretProvisioner
@@ -145,25 +144,23 @@ packages/telephony-client    SDK front : REST, WebSocket, E.164, conférences
 packages/provider-opensips   provider OpenSIPS : session média (WSS, poste, secret), comptes dans `subscriber` ; événements à l'étape 4
 packages/provider-asterisk   provider de référence du POC (ARI) ; retiré à l'étape 4
 packages/softphone           softphone JsSIP : enregistrement, appels, attente, micro, DTMF, compteurs RTP, reconnexion
-packages/sip-media           plan média SIP / WebRTC du POC ; retiré à la PR 3c
-packages/phone-link          <PhoneLink> et requestCall : numéro cliquable (intent CALL)
+packages/phone-link          <PhoneLink> et requestCall : numéro cliquable (intent CALL) pour Twake Workplace
 packages/phone-widget        widget d'appel à monter dans les autres apps Twake Workplace
-packages/conference-livekit  Meet : API externe, LiveKit SIP, dial-in, dial-out
-docker/opensips, rtpengine   serveur SIP du MVP (docker-compose.sip.yml) : OpenSIPS 3.6, rtpengine, PostgreSQL
-docker/                      le reste : stack de dev du POC (MiniPBX, LiveKit SIP, correctifs Twake), retirée à la PR 3c
-scripts/                     mise en place de la stack de dev du POC
-docs/                        documentation du POC, docs/adr/ : une décision, un fichier
+packages/conference-livekit  Meet : API externe, LiveKit SIP, dial-in, dial-out ; rebranché sur OpenSIPS à l'étape 8
+docker/                      serveur SIP du MVP (docker-compose.sip.yml) : OpenSIPS 3.6, rtpengine, PostgreSQL ; images de la passerelle et de l'app
+docs/                        architecture, PBX, widget ; docs/POC.md, README d'origine du POC ; docs/adr/ : une décision, un fichier
 ```
+
+Le code du POC (app Phone Cozy, PBX de dev MiniPBX, `sip-media`, stack de dev) a été retiré à la PR 3c : l'historique Git avant le 14 octobre 2026 le conserve.
 
 À venir : `packages/provider-ovh` (étape 10), `packages/provider-wazo` (étape 11).
 
 ## Démarrer
 
-Prérequis : Node 24 (`.nvmrc` ; la passerelle et les paquets acceptent 22+), Yarn 1, Docker.
+Prérequis : Node 22 ou plus récent (24 dans `.nvmrc`), Yarn 1, Docker.
 
 ```bash
 yarn install && yarn build && yarn test        # paquets, passerelle et app web, aucun service externe
-(cd apps/phone && yarn install && yarn test)   # application (résout @twake/* vers packages/*/dist)
 yarn dev:gateway                               # passerelle sur http://localhost:8080, OpenAPI sur /docs
 yarn dev:web                                   # app TwakePhone sur http://localhost:4173 (config dans apps/web/public/config.json)
 ```
@@ -182,19 +179,13 @@ OPENSIPS_WS_URL=wss://127.0.0.1:8089 OPENSIPS_DB_URL=postgres://twake:twake@127.
   DATABASE_URL=postgres://twake:twake@127.0.0.1:54320/twake SECRETS_KEY=$(openssl rand -hex 32) yarn dev:gateway
 ```
 
-La stack complète du POC (Twake, Phone, MiniPBX, Meet) reste décrite dans [docker/README.md](docker/README.md) jusqu'à son retrait (PR 3c).
-
 | Commande | Vérifie |
 |---|---|
 | `yarn test` | unitaires de tous les paquets et de la passerelle (vitest), contrat de stockage mémoire et, avec `TEST_DATABASE_URL`, PostgreSQL |
-| `cd apps/phone && yarn lint && yarn test` | application Phone du POC (eslint, stylint, jest) |
 | `yarn e2e:web` | app TwakePhone dans Chromium, servie par son serveur de production : connexion OIDC (fournisseur de test en Node, rôle d'administrateur dans le jeton), synchronisation des comptes depuis l'écran d'administration (LDAP de test en Node) puis poste affiché, clavier, annuaire et favoris, langue, déconnexion, en-têtes de sécurité de l'app et de la passerelle, encadrement par un autre site refusé, CSP. Sans Docker ; Chromium s'installe une fois avec `npx playwright-core install chromium` (ou `PLAYWRIGHT_CHROMIUM=/chemin/vers/chromium`) |
 | `yarn e2e:sip` | trois personnes s'appellent et se transfèrent depuis trois Chromium (micro simulé) à travers OpenSIPS et rtpengine (`docker compose -f docker/docker-compose.sip.yml up --build --wait` d'abord) : enregistrement WSS, empreintes dans `subscriber`, poste injoignable, refus, réponse, paquets RTP dans les deux sens, attente et reprise, micro, DTMF vus par rtpengine (RFC 4733), raccrochage, transfert vers un poste absent (404 rendu en français), transfert direct (REFER, raccrocher reste possible pendant), consultation abandonnée par le transférant, vers un poste absent ou par le collègue (reprise automatique), transfert supervisé (REFER avec Replaces) avec RTP compté après chaque transfert, inscription sur une connexion morte (477 rendu comme injoignable), coupure des WebSockets et retour en ligne, déconnexion qui désinscrit. `SIP_WSS_URL`, `OPENSIPS_DB_URL`, `RTPENGINE_DTMF_LOG` (`off` sur une machine sans IPv6, où rtpengine ne peut pas ouvrir ce socket), `SIP_E2E_DEBUG=1` pour les messages SIP |
-| `yarn e2e:live` | POC : passerelle ↔ MiniPBX (ARI) ; plus joué, retiré à la PR 3c |
-| `yarn e2e:widget` | POC : widget dans un hôte cozy-interapp ; plus joué, retiré à la PR 3c |
-| `node docker/meet-sip/platform.e2e.mjs` | POC : Meet sur la plateforme ; à refaire sur OpenSIPS à l'étape 8 |
 
-La CI joue `yarn test`, l'app Phone du POC, `yarn e2e:web` et `yarn e2e:sip` (stack SIP en Docker Compose sur le runner) sur chaque PR.
+La CI joue `yarn test`, `yarn e2e:web` et `yarn e2e:sip` (stack SIP en Docker Compose sur le runner) sur chaque PR. Les e2e du POC sur sa propre stack (passerelle ↔ MiniPBX, widget, Meet sur la plateforme) sont partis avec lui ; Meet par téléphone est rejoué sur OpenSIPS à l'étape 8.
 
 ## Décisions
 

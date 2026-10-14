@@ -1,5 +1,7 @@
 # Twake Phone (README d'origine du POC)
 
+*Le code du POC décrit ici (app Phone Cozy, PBX de dev MiniPBX, `sip-media`, stack de dev et ses scripts) a été retiré du dépôt à la PR 3c ; l'historique Git avant le 14 octobre 2026 le conserve.*
+
 *README du POC <https://ci.linagora.com/tdelobelle/poc-twake-phone>, conservé tel quel sauf les liens, réécrits pour ce dossier. Le README courant du dépôt est [à la racine](../README.md).*
 
 Couche téléphonique native de Twake Workplace : une application **Phone** (clavier, récents, présence, appel en cours), un **widget** d'appel monté dans les autres applications, et la **Twake Telephony Gateway**, qui isole Twake de tout fournisseur de téléphonie. Le premier fournisseur est Asterisk (ARI) ; l'accès téléphonique aux salles **Twake Visio / Meet** passe par LiveKit SIP.

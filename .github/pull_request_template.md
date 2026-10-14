@@ -17,7 +17,6 @@
 ## Preuves
 
 - [ ] `yarn build && yarn typecheck && yarn test` verts
-- [ ] `cd apps/phone && yarn lint && yarn test` verts
 - [ ] e2e joués sur la stack Docker (lesquels, et leur résultat) ou raison de ne pas les jouer
 - [ ] Revue indépendante (roast) faite ; constats corrigés ou réponse dans la PR
 - [ ] Aucune notion d'un fournisseur hors de son `provider-*`, aucune notion LiveKit ou Meet hors de `conference-livekit`

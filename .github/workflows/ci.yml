@@ -34,13 +34,7 @@ jobs:
         with:
           node-version: 22
           cache: yarn
-          cache-dependency-path: |
-            yarn.lock
-            apps/phone/yarn.lock
       - run: yarn install --frozen-lockfile
-      # cozy-client et cozy-interapp sont des peer deps de phone-link, installées avec l'app :
-      # vitest.config.ts les résout dans apps/phone/node_modules (engines 24.x, d'où --ignore-engines).
-      - run: yarn --cwd apps/phone install --frozen-lockfile --ignore-engines
       - run: yarn build
       - run: yarn typecheck
       - name: Tests unitaires et contrat de stockage (mémoire et PostgreSQL)
@@ -69,32 +63,6 @@ jobs:
           path: apps/web/dist/e2e-failure.png
           if-no-files-found: ignore
 
-  app-phone:
-    name: App Phone (Node 24)
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
-          cache: yarn
-          cache-dependency-path: |
-            yarn.lock
-            apps/phone/yarn.lock
-      # L'app résout @twake/* vers packages/*/dist (jest.config.js, rsbuild.config.mjs) :
-      # il faut installer et construire la racine d'abord.
-      - run: yarn install --frozen-lockfile
-      - run: yarn build
-      - run: yarn install --frozen-lockfile
-        working-directory: apps/phone
-      - run: yarn lint
-        working-directory: apps/phone
-      - run: yarn test
-        working-directory: apps/phone
-      - run: yarn build
-        working-directory: apps/phone
-
   sip-e2e:
     name: SIP (OpenSIPS, rtpengine, ${{ matrix.browser }})
     runs-on: ubuntu-latest
@@ -109,15 +77,11 @@ jobs:
         with:
           node-version: 22
           cache: yarn
-          cache-dependency-path: |
-            yarn.lock
-            apps/phone/yarn.lock
       # La stack SIP se construit pendant que le dépôt s'installe : OpenSIPS 3.6 (image officielle + modules WSS,
       # TLS, PostgreSQL), rtpengine en espace utilisateur, PostgreSQL avec la table `subscriber`. Réseau hôte.
       - name: Stack SIP (Docker Compose)
         run: docker compose -f docker/docker-compose.sip.yml up --build --wait --wait-timeout 300
       - run: yarn install --frozen-lockfile
-      - run: yarn --cwd apps/phone install --frozen-lockfile --ignore-engines
       - run: yarn build
       - name: Cache du navigateur Playwright (clé = navigateur et version de playwright-core)
         if: matrix.browser != 'msedge'
@@ -156,6 +120,4 @@ jobs:
         if: always()
         run: docker compose -f docker/docker-compose.sip.yml down -v
 
-  # yarn e2e:web et yarn e2e:sip tournent ci-dessus. Les e2e du POC sur sa stack (yarn e2e:live, yarn e2e:widget,
-  # platform.e2e.mjs) demandent MiniPBX, LiveKit et la stack Twake : ils ne sont plus joués et partent avec le POC
-  # (étape 3c).
+  # yarn e2e:web et yarn e2e:sip tournent ci-dessus : tous les e2e du dépôt se jouent en CI.

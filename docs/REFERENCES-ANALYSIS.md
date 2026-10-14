@@ -1,6 +1,6 @@
 # Analyse des références Twake pour Twake Phone
 
-Dépôts clonés (shallow) dans `references/` : `twake-drive`, `twake-workplace-docker`, `twake-guidelines`, `cozy-app-template`, `cozy-twakechat`, `cozy-contacts`.
+Analyse faite pendant le POC sur des dépôts clonés (shallow) par son script de mise en place, retiré à la PR 3c : `twake-drive`, `twake-workplace-docker`, `twake-guidelines`, `cozy-app-template`, `cozy-twakechat`, `cozy-contacts`.
 
 ## 1. Constats clés
 
