@@ -162,7 +162,7 @@ docs/                        documentation du POC, docs/adr/ : une décision, un
 Prérequis : Node 24 (`.nvmrc` ; la passerelle et les paquets acceptent 22+), Yarn 1, Docker.
 
 ```bash
-yarn install && yarn build && yarn test        # paquets et passerelle, aucun service externe
+yarn install && yarn build && yarn test        # paquets, passerelle et app web, aucun service externe
 (cd apps/phone && yarn install && yarn test)   # application (résout @twake/* vers packages/*/dist)
 yarn dev:gateway                               # passerelle sur http://localhost:8080, OpenAPI sur /docs
 yarn dev:web                                   # app TwakePhone sur http://localhost:4173 (config dans apps/web/public/config.json)
@@ -182,7 +182,7 @@ Visio (accès téléphonique aux salles Meet) et trunk SIP réel : [docker/READM
 |---|---|
 | `yarn test` | unitaires de tous les paquets et de la passerelle (vitest), contrat de stockage mémoire et, avec `TEST_DATABASE_URL`, PostgreSQL |
 | `cd apps/phone && yarn lint && yarn test` | application Phone du POC (eslint, stylint, jest) |
-| `yarn e2e:web` | app TwakePhone dans Chromium : connexion OIDC (fournisseur de test en Node), identité et poste donnés par la passerelle, clavier, déconnexion. Sans Docker |
+| `yarn e2e:web` | app TwakePhone dans Chromium : connexion OIDC (fournisseur de test en Node), identité et poste donnés par la passerelle, clavier, langue, déconnexion, CSP. Sans Docker ; Chromium s'installe une fois avec `npx playwright-core install chromium` (ou `PLAYWRIGHT_CHROMIUM=/chemin/vers/chromium`) |
 | `yarn e2e:live` | passerelle ↔ PBX de dev (MiniPBX, ARI), avec de vrais appels SIP |
 | `yarn e2e:browser` | deux navigateurs, audio réel simulé (WebRTC) |
 | `yarn e2e:widget` | widget dans un hôte cozy-interapp réel |

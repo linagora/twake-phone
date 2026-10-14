@@ -1,4 +1,4 @@
-import { createContext, useCallback, useContext, useMemo, useState, type ReactNode } from 'react'
+import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react'
 import { detectLang, readStoredLang, storeLang, translate, type Key, type Lang } from './index.js'
 
 interface I18n {
@@ -14,8 +14,11 @@ export const I18nProvider = ({ children }: { children: ReactNode }) => {
   const setLang = useCallback((l: Lang) => {
     storeLang(l)
     setLangState(l)
-    document.documentElement.lang = l
   }, [])
+  // The document language follows the UI language, at load as well as on change (RGAA 8.3).
+  useEffect(() => {
+    document.documentElement.lang = lang
+  }, [lang])
   const t = useCallback((key: Key, params?: Record<string, string | number>) => translate(lang, key, params), [lang])
   const value = useMemo(() => ({ lang, setLang, t }), [lang, setLang, t])
   return <I18nContext.Provider value={value}>{children}</I18nContext.Provider>

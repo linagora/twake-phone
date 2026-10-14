@@ -49,14 +49,24 @@ export const AuthProvider = ({ manager, children }: { manager: UserManager; chil
 
     const onLoaded = (user: User) => settle({ status: 'signed-in', user })
     const onUnloaded = () => settle({ status: 'anonymous' })
+    // The session is over when the token expired and nothing renewed it, or when the renewal failed:
+    // better a sign-in page than a "connected" screen whose every request fails.
+    const endSession = (error: string) => {
+      // removeUser fires userUnloaded (plain anonymous): the reason is set afterwards so it is what the user reads.
+      manager.removeUser().catch(() => undefined).finally(() => settle({ status: 'anonymous', error }))
+    }
+    const onExpired = () => endSession('session expired')
+    const onRenewError = (err: Error) => endSession(`session renewal failed: ${describe(err)}`)
     manager.events.addUserLoaded(onLoaded)
     manager.events.addUserUnloaded(onUnloaded)
-    manager.events.addUserSignedOut(onUnloaded)
+    manager.events.addAccessTokenExpired(onExpired)
+    manager.events.addSilentRenewError(onRenewError)
     return () => {
       cancelled = true
       manager.events.removeUserLoaded(onLoaded)
       manager.events.removeUserUnloaded(onUnloaded)
-      manager.events.removeUserSignedOut(onUnloaded)
+      manager.events.removeAccessTokenExpired(onExpired)
+      manager.events.removeSilentRenewError(onRenewError)
     }
   }, [manager])
 

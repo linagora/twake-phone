@@ -4,7 +4,10 @@ export interface AppConfig {
   oidc: {
     authority: string
     clientId: string
+    /** Scopes to ask; the default adds offline_access for a refresh token. */
     scope?: string
+    /** Prompt sent at sign-in; the default is "consent" when offline_access is asked (OIDC Core 11), "" sends none. */
+    prompt?: string
     /** Resource indicator (RFC 8707): makes the identity provider issue an access token for the Gateway. */
     resource?: string
   }
@@ -26,6 +29,7 @@ export const parseConfig = (raw: unknown): AppConfig => {
       authority: oidc.authority,
       clientId: oidc.clientId,
       ...(typeof oidc.scope === 'string' ? { scope: oidc.scope } : {}),
+      ...(typeof oidc.prompt === 'string' ? { prompt: oidc.prompt } : {}),
       ...(typeof oidc.resource === 'string' ? { resource: oidc.resource } : {})
     }
   }

@@ -4,7 +4,7 @@ import Provider from 'oidc-provider'
 const NAMES = { alice: 'Alice Martin', bob: 'Bob Durand' }
 
 /** Starts the provider on `port`; `appOrigin` is the web app allowed to sign in. Returns a stop function. */
-export const startOidcMock = async ({ port, appOrigin, audience }) => {
+export const startOidcMock = async ({ port, appOrigin, audience, resource = 'https://gateway.twakephone.test' }) => {
   const issuer = `http://127.0.0.1:${port}`
   const provider = new Provider(issuer, {
     clients: [
@@ -24,7 +24,7 @@ export const startOidcMock = async ({ port, appOrigin, audience }) => {
       devInteractions: { enabled: true },
       resourceIndicators: {
         enabled: true,
-        defaultResource: () => 'https://gateway.twakephone.test',
+        defaultResource: () => resource,
         useGrantedResource: () => true,
         getResourceServerInfo: () => ({ scope: 'openid profile email', audience, accessTokenFormat: 'jwt' })
       }

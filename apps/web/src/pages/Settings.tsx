@@ -31,9 +31,7 @@ export const Settings = ({ config }: { config: AppConfig }) => {
       <section className="card" aria-labelledby="language">
         <h2 id="language">{t('settings.language')}</h2>
         <div className="field">
-          <label htmlFor="lang" className="sr-only">
-            {t('settings.language')}
-          </label>
+          <label htmlFor="lang">{t('settings.languageLabel')}</label>
           <select id="lang" value={lang} onChange={e => setLang(e.target.value as Lang)}>
             {LANGS.map(l => (
               <option key={l} value={l}>

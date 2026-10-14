@@ -28,6 +28,7 @@ export const GatewayProvider = ({ config, children }: { config: AppConfig; child
   useEffect(() => {
     if (!signedIn) {
       setMe(null)
+      setMeError(null)
       return
     }
     let cancelled = false

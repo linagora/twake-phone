@@ -20,6 +20,8 @@
   "dialer.unavailable": "L'appel n'est pas encore disponible sur cette plateforme.",
   "dialer.placing": "Appel de {number}…",
   "dialer.failed": "L'appel n'a pas pu être passé : {reason}",
+  "dialer.placed": "Appel vers {number} lancé. Votre téléphone sonne : décrochez.",
+  "dialer.capabilitiesFailed": "La passerelle de téléphonie n'a pas répondu : {reason}",
   "recents.title": "Récents",
   "recents.empty": "Aucun appel pour l'instant.",
   "recents.error": "L'historique des appels n'a pas pu être chargé.",
@@ -31,8 +33,8 @@
   "settings.title": "Réglages",
   "settings.account": "Compte",
   "settings.language": "Langue",
+  "settings.languageLabel": "Langue de l'interface",
   "settings.gateway": "Passerelle de téléphonie",
   "config.error": "L'application n'est pas configurée : {reason}",
-  "error.title": "Une erreur est survenue",
-  "error.retry": "Réessayer"
+  "error.title": "Une erreur est survenue"
 }

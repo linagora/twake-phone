@@ -20,6 +20,8 @@
   "dialer.unavailable": "Calling is not available on this platform yet.",
   "dialer.placing": "Calling {number}…",
   "dialer.failed": "The call could not be placed: {reason}",
+  "dialer.placed": "Call to {number} placed. The ringing phone is yours: pick it up.",
+  "dialer.capabilitiesFailed": "The telephony gateway could not be reached: {reason}",
   "recents.title": "Recents",
   "recents.empty": "No calls yet.",
   "recents.error": "The call history could not be loaded.",
@@ -31,8 +33,8 @@
   "settings.title": "Settings",
   "settings.account": "Account",
   "settings.language": "Language",
+  "settings.languageLabel": "Interface language",
   "settings.gateway": "Telephony gateway",
   "config.error": "The application is not configured: {reason}",
-  "error.title": "Something went wrong",
-  "error.retry": "Retry"
+  "error.title": "Something went wrong"
 }

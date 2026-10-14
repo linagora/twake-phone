@@ -14,14 +14,21 @@ export const Dialer = () => {
 
   useEffect(() => {
     let cancelled = false
+    setStatus(null)
     client
       .getCapabilities()
       .then(caps => !cancelled && setCanCall(!!caps.calling?.outbound))
-      .catch(() => !cancelled && setCanCall(false))
+      .catch((err: unknown) => {
+        if (cancelled) return
+        // 404 is the Gateway saying "no telephony provider on this platform": calling is not configured, which is not an error.
+        // Anything else (401, network) is reported as such, and calling stays possible to retry.
+        if (err instanceof Error && /Gateway 404 /.test(err.message)) setCanCall(false)
+        else setStatus({ kind: 'error', text: t('dialer.capabilitiesFailed', { reason: err instanceof Error ? err.message : String(err) }) })
+      })
     return () => {
       cancelled = true
     }
-  }, [client])
+  }, [client, t])
 
   const press = (k: string) => setNumber(n => (n.length < 32 ? n + k : n))
   const submit = async (e: FormEvent) => {
@@ -31,6 +38,7 @@ export const Dialer = () => {
     setStatus({ kind: 'info', text: t('dialer.placing', { number: formatNumber(number) }) })
     try {
       await client.originate(target, crypto.randomUUID())
+      setStatus({ kind: 'info', text: t('dialer.placed', { number: formatNumber(number) }) })
     } catch (err) {
       setStatus({ kind: 'error', text: t('dialer.failed', { reason: err instanceof Error ? err.message : String(err) }) })
     }
@@ -63,7 +71,7 @@ export const Dialer = () => {
         </div>
       </form>
       {status ? (
-        <p className={`alert${status.kind === 'error' ? ' alert-error' : ''}`} role="status">
+        <p className={`alert${status.kind === 'error' ? ' alert-error' : ''}`} role={status.kind === 'error' ? 'alert' : 'status'}>
           {status.text}
         </p>
       ) : null}
