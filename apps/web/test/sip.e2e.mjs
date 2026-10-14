@@ -344,6 +344,9 @@ try {
     const several = BROWSER !== 'firefox'
     const options = async label => (await alice.page.getByLabel(label).locator('option').all()).length - 1
     const pick = async (label, index) => {
+      // The lists fill once enumerateDevices answers (a moment on a loaded runner): wait for the wanted entry,
+      // or give up on a browser that lists fewer devices.
+      await alice.page.getByLabel(label).locator('option').nth(index + 1).waitFor({ state: 'attached', timeout: 5_000 }).catch(() => undefined)
       const n = await options(label)
       if (n <= index) {
         if (several) throw new Error(`${label}: ${n} device(s) listed, expected more than ${index}`)
