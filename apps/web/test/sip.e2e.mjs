@@ -204,6 +204,15 @@ const open = async (login, name) => {
 const phoneState = page => page.getByTestId('phone-state')
 const calls = page => page.evaluate(() => window.twakephone.calls)
 const lastEnded = page => page.evaluate(() => window.twakephone.lastEnded)
+/** Dials and waits for that call to end: not for the one that ended just before (shown a few seconds longer). */
+const dialUntilEnded = async (page, number) => {
+  const before = await lastEnded(page)
+  await dial(page, number)
+  return until(`the call to ${number} to end`, async () => {
+    const ended = await lastEnded(page)
+    return ended && ended.id !== before?.id ? ended : null
+  }, { timeout: 20_000 })
+}
 const stats = page => page.evaluate(() => window.twakephone.stats())
 const soundBlocked = page => page.evaluate(() => window.twakephone.soundBlocked)
 /** Waits for the ringtone element to play (not paused, live stream) or to be quiet; says what it saw otherwise. */
@@ -510,8 +519,7 @@ try {
   await step('a registration left on a dead connection (the first one, Alice): the caller is told unreachable, not an error', async () => {
     relay.cutUpstream(0)
     await sleep(500)
-    await dial(jean.page, '101')
-    const ended = await until('the call to 101 to end', () => lastEnded(jean.page), { timeout: 20_000 })
+    const ended = await dialUntilEnded(jean.page, '101')
     // 477 "Send failed": OpenSIPS could not reach the contact; the person reads the same as for nobody registered.
     expectEqual(`${ended.endStatus} ${ended.endReason}`, '477 unavailable', 'how the call to a dead contact ended')
     await jean.page.getByText('101 est injoignable.').waitFor()
@@ -533,8 +541,7 @@ try {
   })
   await step('Alice signs out, which unregisters her: a call to 101 is now unreachable', async () => {
     await signOut(alice)
-    await dial(jean.page, '101')
-    const ended = await until('the call to 101 to end', () => lastEnded(jean.page), { timeout: 20_000 })
+    const ended = await dialUntilEnded(jean.page, '101')
     // 404: no contact left for 101. A registration left behind would have given 477 (dead contact) or rung.
     expectEqual(`${ended.endStatus} ${ended.endReason}`, '404 unavailable', 'how the call to 101 ended after Alice signed out')
     await jean.page.getByText('101 est injoignable.').waitFor()
