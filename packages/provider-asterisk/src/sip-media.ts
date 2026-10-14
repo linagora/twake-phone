@@ -1,6 +1,8 @@
 import type { MediaProvider } from '@twake/telephony-provider-sdk'
 import type { Endpoint, MediaSession, User } from '@twake/telephony-types'
 
+// Formerly the @twake/sip-media package, removed with the POC: this provider was its only consumer.
+
 export interface IceServer {
   urls: string[]
   username?: string

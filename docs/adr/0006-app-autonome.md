@@ -12,7 +12,7 @@ TwakePhone est une application web React autonome, sur son propre domaine, authe
 
 ## Conséquences
 
-- `apps/phone` sort de Cozy à l'étape 2 (cozy-client, cozy-ui et cozy-interapp retirés).
+- L'app Phone du POC (`apps/phone`, Cozy) est remplacée par `apps/web` à l'étape 2 et retirée du dépôt à la PR 3c.
 - `phone-link` et `phone-widget` restent utilisables pour Twake Workplace.
 - CSP (`frame-ancestors`, `connect-src` vers la passerelle et le WSS) réglée à l'étape 2.
 

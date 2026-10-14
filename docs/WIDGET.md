@@ -2,6 +2,8 @@
 
 Objectif : être appelé, et décrocher, depuis Drive, Mail, Calendar… sans changer d'application.
 
+*État : les bibliothèques côté hôte (`@twake/phone-widget`, `@twake/phone-link`) restent dans le dépôt pour Twake Workplace (ADR 0006) ; le service côté Phone décrit ci-dessous (l'app Phone du POC et sa cible `/intents`) a été retiré à la PR 3c. L'intégration dans Twake Chat est refaite à l'étape 9.*
+
 ## Principe
 
 1. Phone déclare un intent de service dans son manifeste : `OPEN` sur `io.twake.phone.widget`, servi par `/intents`.
@@ -27,17 +29,9 @@ L'idéal est de le faire une fois pour toutes dans cozy-bar, présente dans tout
 
 Chaque fenêtre qui porte le widget (ou l'application Phone) est un contact SIP de l'extension : toutes sonnent, la première qui décroche prend l'appel. Le premier appel du click-to-call, qui fait sonner son propre poste, n'est décroché que par la fenêtre qui a lancé l'appel.
 
-## Test dans le stack de dev
+## Tests
 
-`scripts/add-phone-widget-to-drive.sh` ajoute le widget au clone de Drive (`references/twake-drive`). Le build de Drive est monté à côté de Phone dans cozy-stack (`COZY_DEV_APP2_*` dans `.env` du stack). Pour revenir au Drive du registre :
-
-```bash
-docker exec cozyt cozy-stack apps update drive --domain user1.twake.local
-```
-
-## Test sans stack
-
-`yarn e2e:widget` simule une application hôte : la vraie bibliothèque et la vraie `cozy-interapp` créent l'intent et l'iframe, le build de Phone sert de service, seuls le stockage des intents et l'endpoint des flags sont simulés. Un appel entrant arrive par le vrai PBX ; le test vérifie que la carte apparaît dans le coin et que l'appel peut être décroché depuis le widget. Il a révélé trois défauts que les tests unitaires ne voyaient pas : la hauteur de la carte écrasée à 0 par la feuille de style de l'app dans une iframe sans hauteur, l'attribut `allow` posé trop tard (le micro est alors refusé), et l'import de `cozy-interapp` selon le bundler.
+Les deux tests du POC (le widget ajouté au clone de Drive dans la stack de dev, et `yarn e2e:widget`, un hôte simulé avec la vraie `cozy-interapp` et le build de Phone comme service) sont partis avec le POC à la PR 3c : le service côté Phone (`/intents`) n'existe plus, seules les bibliothèques côté hôte restent, avec leurs tests unitaires. Ce que `yarn e2e:widget` avait révélé, et que les tests unitaires ne voyaient pas, reste à retenir pour l'étape 9 : la hauteur de la carte écrasée à 0 par la feuille de style de l'app dans une iframe sans hauteur, l'attribut `allow` posé trop tard (le micro est alors refusé), et l'import de `cozy-interapp` selon le bundler.
 
 ## Limites
 
