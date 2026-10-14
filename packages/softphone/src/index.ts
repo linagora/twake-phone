@@ -1,5 +1,5 @@
 import { UA, WebSocketInterface } from 'jssip'
-import type { EndEvent, RTCSession } from 'jssip/lib/RTCSession.js'
+import type { EndEvent, ReferEvent, ReferOptions, RTCSession } from 'jssip/lib/RTCSession.js'
 import type { UAConfiguration } from 'jssip/lib/UA.js'
 import type { MediaSession } from '@twake/telephony-types'
 
@@ -12,7 +12,7 @@ export type SipWebrtcSession = Extract<MediaSession, { type: 'sip-webrtc' }>
 export type SoftCallState = 'new' | 'ringing' | 'connected' | 'held' | 'ended'
 
 /** Why a call ended, as the SIP layer reports it: the UI tells the user, the history keeps it. */
-export type EndReason = 'hangup' | 'rejected' | 'busy' | 'no-answer' | 'unavailable' | 'cancelled' | 'failed'
+export type EndReason = 'hangup' | 'rejected' | 'busy' | 'no-answer' | 'unavailable' | 'cancelled' | 'failed' | 'transferred'
 
 export type DtmfTransport = 'RFC2833' | 'INFO'
 
@@ -34,6 +34,10 @@ export interface SoftCall {
   readonly muted: boolean
   /** A re-INVITE of ours (hold, resume) is waiting for the far end's answer: no other offer until then. */
   readonly renegotiating: boolean
+  /** A transfer of this call (REFER) is waiting for the far end's report. */
+  readonly transferring: boolean
+  /** Set when this call took the place of another one of ours (an attended transfer completed by the far end). */
+  readonly replacedCallId?: string
   answer(): Promise<void>
   reject(): Promise<void>
   hangup(): Promise<void>
@@ -42,6 +46,16 @@ export interface SoftCall {
   setMuted(muted: boolean): void
   /** One tone (0-9, *, #, A-D). RFC 4733 in the RTP stream by default, as trunks and PBXs expect; SIP INFO on demand. */
   sendDtmf(tone: string, transport?: DtmfTransport): void
+  /**
+   * Blind transfer: the far end is told to call `target` (REFER), and this call ends once it got through. If the
+   * target does not answer, the call is resumed and the error says why.
+   */
+  transfer(target: string): Promise<void>
+  /**
+   * Attended transfer: `consultation` is our other call, with the person meant; its far end takes our place in it
+   * (REFER with Replaces). Both calls end once they are through to each other.
+   */
+  transferTo(consultation: SoftCall): Promise<void>
   /** RTP packet counters, to tell whether audio actually flows. */
   stats(): Promise<{ packetsReceived: number; packetsSent: number }>
 }
@@ -51,7 +65,8 @@ export type RegistrationState = 'unregistered' | 'registered' | 'failed'
 export interface SoftphoneOptions {
   /** Fetched at each (re)start so a rotated secret is picked up. */
   getSession(): Promise<SipWebrtcSession>
-  remoteAudio: HTMLAudioElement
+  /** Where the `<audio>` element of each call goes (one per call, removed when it ends); the document body by default. */
+  audioContainer?: HTMLElement
   /** Display name sent with calls (From header); the far end shows it. */
   displayName?: string
   onRegistration?(state: RegistrationState, detail?: string): void
@@ -63,6 +78,8 @@ export interface SoftphoneOptions {
   createUserAgent?(config: UAConfiguration): UserAgentLike
   /** Test seam: the WebSocket transport. */
   createSocket?(url: string): UAConfiguration['sockets']
+  /** Test seam: the audio element of a call. */
+  createAudio?(): HTMLAudioElement
 }
 
 /** The part of JsSIP's UA the softphone uses (and tests fake). */
@@ -73,6 +90,11 @@ export interface UserAgentLike {
   unregister(options?: { all?: boolean }): void
   isRegistered(): boolean
   call(target: string, options?: Record<string, unknown>): RTCSession
+}
+
+/** What JsSIP's `refer()` returns (typed `void` in its declarations): the subscription to the far end's reports. */
+interface ReferSubscriberLike {
+  on(event: string, listener: (...args: any[]) => void): unknown
 }
 
 /** JsSIP's causes (Constants.causes) to what the user is told. */
@@ -92,6 +114,13 @@ const CAUSE_TO_REASON: Record<string, EndReason> = {
 
 const toReason = (cause: string | undefined): EndReason => (cause && CAUSE_TO_REASON[cause]) || (cause ? 'failed' : 'hangup')
 
+/** Media options of every call we place or answer. */
+const mediaOptions = (iceServers: RTCIceServer[]) => ({
+  mediaConstraints: { audio: true, video: false },
+  pcConfig: { iceServers },
+  rtcOfferConstraints: { offerToReceiveAudio: true, offerToReceiveVideo: false }
+})
+
 class WebCall implements SoftCall {
   state: SoftCallState = 'new'
   readonly startedAt = new Date()
@@ -102,18 +131,22 @@ class WebCall implements SoftCall {
   remoteHold = false
   muted = false
   renegotiating = false
+  transferring = false
   readonly remoteNumber: string
   readonly remoteName: string
   private reofferPending?: { reject: (e: Error) => void }
+  /** The far end reported our transfer got through: the end that follows is ours, and a success. */
+  private transferred = false
 
   constructor(
     readonly id: string,
     readonly direction: 'inbound' | 'outbound',
-    private readonly session: RTCSession,
+    readonly session: RTCSession,
     private readonly audio: HTMLAudioElement,
     private readonly changed: (call: WebCall) => void,
     private readonly dtmf: (call: WebCall, tone: string) => void,
-    private readonly iceServers: RTCIceServer[]
+    private readonly iceServers: RTCIceServer[],
+    readonly replacedCallId?: string
   ) {
     this.remoteNumber = session.remote_identity?.uri?.user ?? ''
     this.remoteName = session.remote_identity?.display_name ?? ''
@@ -159,13 +192,16 @@ class WebCall implements SoftCall {
     })
     const end = (e: EndEvent) => {
       this.endedAt = new Date()
-      this.endReason = toReason(e.cause)
+      this.endReason = this.transferred ? 'transferred' : toReason(e.cause)
       // A response (the far end's 404, 480, 486, 603...) carries a status; a request (a BYE) does not.
       const status = e.message && 'status_code' in e.message ? (e.message as { status_code?: unknown }).status_code : undefined
       this.endStatus = typeof status === 'number' ? status : undefined
       this.reofferPending?.reject(new Error('Call ended'))
       this.reofferPending = undefined
       this.renegotiating = false
+      this.transferring = false
+      this.audio.srcObject = null
+      this.audio.remove()
       this.set('ended')
     }
     session.on('ended', end)
@@ -194,9 +230,14 @@ class WebCall implements SoftCall {
     })
   }
 
+  /** The far end's address, as the SIP server knows it (`sip:103@domain`): what a transfer names. */
+  get remoteUri() {
+    return this.session.remote_identity.uri.toString()
+  }
+
   async answer() {
     if (this.direction !== 'inbound') throw new Error('Only inbound calls can be answered')
-    this.session.answer({ mediaConstraints: { audio: true, video: false }, pcConfig: { iceServers: this.iceServers } })
+    this.session.answer(mediaOptions(this.iceServers))
   }
 
   /** Decline (603): the caller is told the call was refused, not that the line is busy. */
@@ -262,6 +303,63 @@ class WebCall implements SoftCall {
     this.session.sendDTMF(tone, { transportType: transport as never })
   }
 
+  /**
+   * One REFER, settled by the far end's reports (NOTIFY): resolved when its new call got through (a 2xx), rejected
+   * when the SIP server refused the REFER or the new call failed, with the status the far end reported.
+   */
+  private refer(target: string, options: ReferOptions = {}) {
+    return new Promise<void>((resolve, reject) => {
+      if (this.state !== 'connected' && this.state !== 'held') return reject(new Error('No call in progress'))
+      if (this.transferring) return reject(new Error('A transfer is already in progress'))
+      const subscriber = (this.session.refer as unknown as (t: string, o?: ReferOptions) => ReferSubscriberLike | false)(target, options)
+      if (!subscriber) return reject(new Error('Transfer refused: the call is not established'))
+      this.transferring = true
+      this.changed(this)
+      const settle = (err?: Error) => {
+        if (!this.transferring) return
+        this.transferring = false
+        this.changed(this)
+        if (err) reject(err)
+        else resolve()
+      }
+      const statusOf = (e: { status_line?: { status_code?: string; reason_phrase?: string } }) => [e.status_line?.status_code, e.status_line?.reason_phrase].filter(Boolean).join(' ')
+      subscriber.on('requestFailed', (e: { response?: { status_code?: number; reason_phrase?: string } | null; cause?: string }) =>
+        settle(new Error(`Transfer refused: ${e.response ? `${e.response.status_code} ${e.response.reason_phrase ?? ''}`.trim() : e.cause ?? 'no answer'}`))
+      )
+      subscriber.on('failed', (e: { status_line?: { status_code?: string; reason_phrase?: string } }) => settle(new Error(`Transfer failed: ${statusOf(e)}`)))
+      subscriber.on('accepted', () => {
+        this.transferred = true
+        settle()
+      })
+    })
+  }
+
+  async transfer(target: string) {
+    if (!/^[+0-9A-Za-z*#._-]{1,64}$/.test(target)) throw new Error('Invalid target')
+    const domain = this.session.remote_identity.uri.host
+    const wasConnected = this.state === 'connected'
+    // The far end is put on hold while its new call is set up (RFC 5589 §6).
+    if (wasConnected) await this.hold()
+    try {
+      await this.refer(`sip:${target}@${domain}`)
+    } catch (err) {
+      if (wasConnected) await this.resume().catch(() => undefined)
+      throw err
+    }
+    this.session.terminate()
+  }
+
+  async transferTo(consultation: SoftCall) {
+    const other = consultation as WebCall
+    if (other === this) throw new Error('A call cannot be transferred to itself')
+    if (!other.session || (other.state !== 'connected' && other.state !== 'held')) throw new Error('The consultation call is not established')
+    if (this.state === 'connected') await this.hold()
+    // Refer-To names the consultation's far end, with Replaces for the consultation's dialog: the two parties
+    // meet in the consultation's place and both of our calls end.
+    await this.refer(other.remoteUri, { replaces: other.session })
+    this.session.terminate()
+  }
+
   async stats() {
     let packetsReceived = 0
     let packetsSent = 0
@@ -281,6 +379,9 @@ const REOFFER_RETRY_EVERY_MS = 100
 /** Restarts on refused registrations before the softphone gives up (about 30 s apart at the end). */
 const MAX_RESTARTS = 12
 
+/** Calls of ours at once: the one in progress and one on hold (the consultation of an attended transfer). */
+const MAX_CALLS = 2
+
 const restartDelay = (attempt: number) => Math.floor(Math.random() * Math.min(30_000, 500 * 2 ** attempt))
 
 /**
@@ -296,6 +397,8 @@ export class Softphone {
   private restartAttempt = 0
   /** A restart was due during a call: it runs once the last call is over. */
   private restartWhenIdle = false
+  /** An INVITE with Replaces accepted for one of our calls: the session JsSIP is building for it, answered at once. */
+  private replacing?: { session: RTCSession; replaces: WebCall }
   private readonly onPagehide = () => {
     try {
       this.ua?.unregister()
@@ -362,8 +465,19 @@ export class Softphone {
     ua.on('newRTCSession', (e: { originator: string; session: RTCSession }) => {
       if (!live()) return
       const direction = e.originator === 'remote' ? 'inbound' : 'outbound'
+      if (direction === 'inbound' && this.replacing?.session === e.session) {
+        // The far end of an attended transfer takes the place of the person who consulted us: no ringing, the
+        // call is answered at once and the one it replaces ends when it is through (RFC 3891).
+        const { replaces } = this.replacing
+        this.replacing = undefined
+        const call = this.wrap(e.session, 'inbound', replaces.id)
+        this.options.onCallChange?.(call)
+        // After its newRTCSession, JsSIP still sends the 180: the answer comes right after it.
+        setTimeout(() => call.answer().catch(() => undefined), 0)
+        return
+      }
       if (direction === 'inbound' && this.activeCalls().length) {
-        // One call at a time for now (one audio element, no call waiting): the second caller hears busy.
+        // One ringing call at a time (no call waiting yet): the second caller hears busy.
         e.session.terminate({ status_code: 486, reason_phrase: 'Busy Here' })
         return
       }
@@ -381,16 +495,20 @@ export class Softphone {
     ua.start()
   }
 
+  /**
+   * Places a call. During a call in progress it is a consultation: the call in progress is put on hold first
+   * (the person then transfers it with `transferTo`, or hangs up the consultation and resumes).
+   */
   async call(target: string): Promise<SoftCall> {
     if (!this.ua || !this.session) throw new Error('Softphone not started')
-    if (this.activeCalls().length) throw new Error('A call is already in progress')
     if (!/^[+0-9A-Za-z*#._-]{1,64}$/.test(target)) throw new Error('Invalid target')
+    const active = this.activeCalls()
+    if (active.length >= MAX_CALLS) throw new Error('Two calls are already in progress')
+    const current = active[0]
+    if (current && current.state !== 'connected' && current.state !== 'held') throw new Error('A call is already in progress')
+    if (current && current.state === 'connected') await current.hold()
     const domain = this.session.domain ?? new URL(this.session.websocketUrl).hostname
-    const session = this.ua.call(`sip:${target}@${domain}`, {
-      mediaConstraints: { audio: true, video: false },
-      pcConfig: { iceServers: this.session.iceServers },
-      rtcOfferConstraints: { offerToReceiveAudio: true, offerToReceiveVideo: false }
-    })
+    const session = this.ua.call(`sip:${target}@${domain}`, mediaOptions(this.session.iceServers ?? []))
     // JsSIP emits newRTCSession for outgoing calls too (synchronously, inside call()): the wrapper already exists.
     return this.calls.get(session.id) ?? this.wrap(session, 'outbound')
   }
@@ -436,14 +554,24 @@ export class Softphone {
     this.ua = undefined
   }
 
-  private wrap(session: RTCSession, direction: 'inbound' | 'outbound') {
+  private createAudio() {
+    if (this.options.createAudio) return this.options.createAudio()
+    const audio = document.createElement('audio')
+    audio.autoplay = true
+    audio.dataset['testid'] = 'remote-audio'
+    ;(this.options.audioContainer ?? document.body).appendChild(audio)
+    return audio
+  }
+
+  private wrap(session: RTCSession, direction: 'inbound' | 'outbound', replacedCallId?: string) {
     const existing = this.calls.get(session.id)
     if (existing) return existing
+    const iceServers = this.session?.iceServers ?? []
     const call = new WebCall(
       session.id,
       direction,
       session,
-      this.options.remoteAudio,
+      this.createAudio(),
       c => {
         if (c.state === 'ended') this.calls.delete(c.id)
         this.options.onCallChange?.(c)
@@ -453,9 +581,22 @@ export class Softphone {
         }
       },
       (c, tone) => this.options.onDtmf?.(c, tone),
-      this.session?.iceServers ?? []
+      iceServers,
+      replacedCallId
     )
     this.calls.set(session.id, call)
+    // The far end transfers us (REFER): we call whom it names, as a new call of ours; it hangs up once we are
+    // through. A transfer is only ever asked by the person we are talking to, so it is followed without asking.
+    session.on('refer', (e: ReferEvent) => {
+      if (this.activeCalls().length >= MAX_CALLS) return e.reject()
+      e.accept(() => undefined, mediaOptions(iceServers))
+    })
+    // The far end of an attended transfer replaces the person who consulted us (INVITE with Replaces).
+    session.on('replaces', (e: ReferEvent) => {
+      e.accept((s: RTCSession) => {
+        this.replacing = { session: s, replaces: call }
+      })
+    })
     return call
   }
 }

@@ -33,7 +33,7 @@ export const SoftphoneProvider = ({ children }: { children: ReactNode }) => {
   const { state: auth } = useAuth()
   const user = auth.status === 'signed-in' ? auth.user : null
   const displayName = displayNameFor(me, user)
-  const audio = useRef<HTMLAudioElement>(null)
+  const audioHost = useRef<HTMLDivElement>(null)
   const [state, setState] = useState<PhoneState>('off')
   const [detail, setDetail] = useState<string | null>(null)
   const [calls, setCalls] = useState<SoftCall[]>([])
@@ -47,7 +47,7 @@ export const SoftphoneProvider = ({ children }: { children: ReactNode }) => {
   nameRef.current = displayName
 
   useEffect(() => {
-    if (!extension || !audio.current) {
+    if (!extension || !audioHost.current) {
       setState('off')
       return
     }
@@ -59,7 +59,7 @@ export const SoftphoneProvider = ({ children }: { children: ReactNode }) => {
         if (session.type !== 'sip-webrtc') throw new Error('no browser audio on this platform')
         return session
       },
-      remoteAudio: audio.current,
+      audioContainer: audioHost.current,
       displayName: nameRef.current,
       onRegistration: (s, why) => {
         if (cancelled) return
@@ -70,7 +70,8 @@ export const SoftphoneProvider = ({ children }: { children: ReactNode }) => {
         if (cancelled) return
         setCalls(softphone.activeCalls())
         if (call.state === 'ended') {
-          setLastEnded(call)
+          // A completed transfer ends two calls at once: what the person is told is that the transfer happened.
+          setLastEnded(prev => (prev?.endReason === 'transferred' && call.endReason === 'hangup' && prev.endedAt && Date.now() - prev.endedAt.getTime() < LAST_ENDED_MS ? prev : call))
           clearTimeout(lastEndedTimer)
           lastEndedTimer = setTimeout(() => !cancelled && setLastEnded(null), LAST_ENDED_MS)
           setTones(t => {
@@ -113,7 +114,7 @@ export const SoftphoneProvider = ({ children }: { children: ReactNode }) => {
   useEffect(() => {
     window.twakephone = {
       state,
-      calls: calls.map(c => ({ id: c.id, direction: c.direction, state: c.state, remoteNumber: c.remoteNumber, remoteHold: c.remoteHold, muted: c.muted, renegotiating: c.renegotiating })),
+      calls: calls.map(c => ({ id: c.id, direction: c.direction, state: c.state, remoteNumber: c.remoteNumber, remoteHold: c.remoteHold, muted: c.muted, renegotiating: c.renegotiating, transferring: c.transferring, ...(c.replacedCallId ? { replacedCallId: c.replacedCallId } : {}) })),
       lastEnded: lastEnded ? { remoteNumber: lastEnded.remoteNumber, endReason: lastEnded.endReason, endStatus: lastEnded.endStatus } : null,
       tones,
       stats: () => Promise.all(calls.map(c => c.stats()))
@@ -122,8 +123,8 @@ export const SoftphoneProvider = ({ children }: { children: ReactNode }) => {
 
   return (
     <PhoneContext.Provider value={value}>
-      {/* The far end's voice. Hidden: the call panel is the control. */}
-      <audio ref={audio} autoPlay data-testid="remote-audio" />
+      {/* The far ends' voices, one audio element per call. Hidden: the call panel is the control. */}
+      <div ref={audioHost} hidden data-testid="remote-audio-host" />
       {children}
     </PhoneContext.Provider>
   )

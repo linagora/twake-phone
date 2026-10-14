@@ -1,7 +1,8 @@
 ####### TwakePhone: OpenSIPS 3.6 for the web MVP (step 3) ##############################################################
 # Rendered by entrypoint.sh from the environment (${VAR}). Registrar of the browsers (SIP over WS and WSS), digest
 # authentication on the `subscriber` table the Gateway fills, calls between registered users through rtpengine
-# (DTLS-SRTP on both legs), hold by re-INVITE. Trunk, forwards, groups and events towards the Gateway come with
+# (DTLS-SRTP on both legs), hold by re-INVITE, transfers by REFER and Replaces between the browsers (ADR 0010: the
+# proxy relays them, it does not implement them). Trunk, forwards, groups and events towards the Gateway come with
 # steps 4 and 6. Everything in here is OpenSIPS-specific; the Gateway only knows `provider-opensips`.
 
 log_level=${OPENSIPS_LOG_LEVEL}
@@ -86,7 +87,7 @@ modparam("registrar", "max_expires", 3600)
 loadmodule "nathelper.so"
 modparam("nathelper", "received_avp", "$avp(received)")
 
-#### Calls: dialogs followed (transfers in step 3b need them), media through rtpengine
+#### Calls: dialogs followed (only ours pass in-dialog; REFER and NOTIFY of the transfers ride them), media through rtpengine
 loadmodule "dialog.so"
 modparam("dialog", "db_mode", 0)
 modparam("dialog", "default_timeout", 14400)

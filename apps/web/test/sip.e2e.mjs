@@ -1,7 +1,7 @@
-// End to end of step 3a: two people call each other from their browsers through OpenSIPS and rtpengine.
-// The SIP stack is the only thing outside this process (docker/docker-compose.sip.yml, or OpenSIPS and rtpengine
-// started by hand); the identity provider, the Gateway (with the OpenSIPS provider) and the app run here, and two
-// Chromium contexts with a simulated microphone play Alice (101) and Jean (102).
+// End to end of step 3 (3a calls, 3b transfers): people call and transfer each other from their browsers through
+// OpenSIPS and rtpengine. The SIP stack is the only thing outside this process (docker/docker-compose.sip.yml, or
+// OpenSIPS and rtpengine started by hand); the identity provider, the Gateway (with the OpenSIPS provider) and the
+// app run here, and three Chromium contexts with a simulated microphone play Alice (101), Jean (102) and Bob (103).
 //
 //   SIP_WSS_URL          WSS socket of OpenSIPS (default wss://127.0.0.1:8089)
 //   SIP_DOMAIN           SIP domain and digest realm (default: the host of SIP_WSS_URL)
@@ -127,6 +127,7 @@ const store = new MemoryStore()
 // What an administrator (or the LDAP synchronisation) would have set: who has which extension.
 await store.upsertMapping({ tenantId: TENANT, userId: 'amartin', extension: '101', displayName: 'Alice Martin' })
 await store.upsertMapping({ tenantId: TENANT, userId: 'jdupont', extension: '102', displayName: 'Jean Dupont' })
+await store.upsertMapping({ tenantId: TENANT, userId: 'bdurand', extension: '103', displayName: 'Bob Durand' })
 // What `OPENSIPS_WS_URL` makes the Gateway store at startup, pointed at the relay.
 await store.upsertProvider({ tenantId: TENANT, type: 'opensips', config: { websocketUrl: relayUrl, domain: SIP_DOMAIN, subscriberDbUrlRef: 'env:OPENSIPS_DB_URL' } })
 const key = randomBytes(32)
@@ -175,19 +176,31 @@ const dial = async (page, number) => {
   await page.getByLabel('Numéro à appeler').fill(number)
   await page.getByRole('button', { name: 'Appeler' }).click()
 }
-const bothHearEachOther = async (a, b) => {
+/** RTP flows both ways on each side; `last` picks the newest call of the page (a consultation) instead of the oldest. */
+const bothHearEachOther = async (a, b, { last = false } = {}) => {
   for (const who of [a, b]) {
-    const before = (await stats(who.page))[0]
+    const pick = all => (last ? all[all.length - 1] : all[0])
+    const before = pick(await stats(who.page))
     await until(`RTP both ways for ${who.name}`, async () => {
-      const [s] = await stats(who.page)
+      const s = pick(await stats(who.page))
       return s && s.packetsReceived > before.packetsReceived + 20 && s.packetsSent > before.packetsSent + 20 ? s : null
     })
   }
+}
+const transferButton = page => page.getByRole('button', { name: 'Transférer', exact: true })
+const transferTarget = page => page.getByLabel('Transférer à (poste ou numéro)')
+/** Alice calls Jean, who answers. */
+const aliceCallsJean = async (alice, jean) => {
+  await dial(alice.page, '102')
+  await jean.page.getByTestId('incoming-call').getByRole('button', { name: 'Répondre' }).click()
+  await jean.page.getByText('En communication avec Alice Martin (101)').waitFor()
+  await alice.page.getByText('En communication avec 102').waitFor()
 }
 
 let failed = false
 let alice
 let jean
+let bob
 try {
   await step('Alice signs in and her softphone registers over WSS: the header says she is online', async () => {
     alice = await open('amartin', 'Alice Martin')
@@ -260,12 +273,88 @@ try {
     await alice.page.getByText('Appel avec 102 terminé.').waitFor()
     expectEqual((await calls(alice.page)).length, 0, 'calls left on Alice side')
   })
+  await step('Bob signs in and registers: a third person, for the transfers', async () => {
+    bob = await open('bdurand', 'Bob Durand')
+    await phoneState(bob.page).getByText('En ligne').waitFor({ timeout: 20_000 })
+  })
+  await step('Jean transfers Alice to an extension nobody registered: told why, and still in the call with Alice', async () => {
+    await aliceCallsJean(alice, jean)
+    await transferButton(jean.page).click()
+    await transferTarget(jean.page).fill('105')
+    await jean.page.getByRole('button', { name: 'Transférer directement' }).click()
+    // Alice (the transferee) was told to call 105, got 404 and reported it to Jean (NOTIFY), who resumed her.
+    await jean.page.getByRole('alert').getByText('Transfer failed: 404 Not Found').waitFor({ timeout: 20_000 })
+    await jean.page.getByText('En communication avec Alice Martin (101)').waitFor()
+    await until('Alice back from hold with her one call', async () => {
+      const c = await calls(alice.page)
+      return c.length === 1 && !c[0].remoteHold ? c : null
+    })
+    await jean.page.getByRole('button', { name: 'Fermer' }).click()
+    await bothHearEachOther(alice, jean)
+  })
+  await step('Jean transfers Alice directly to Bob (REFER): Bob answers Alice, Jean is freed, Alice and Bob hear each other', async () => {
+    await transferButton(jean.page).click()
+    await transferTarget(jean.page).fill('103')
+    await jean.page.getByRole('button', { name: 'Transférer directement' }).click()
+    const ringing = bob.page.getByTestId('incoming-call')
+    await ringing.getByText('Appel entrant de Alice Martin (101)').waitFor({ timeout: 20_000 })
+    await ringing.getByRole('button', { name: 'Répondre' }).click()
+    await jean.page.getByText('Alice Martin (101) a été transféré.').waitFor()
+    expectEqual((await calls(jean.page)).length, 0, 'calls left on Jean side')
+    await alice.page.getByText('En communication avec 103').waitFor()
+    await until('Alice has only her call with Bob', async () => (await calls(alice.page)).length === 1)
+    await bob.page.getByText('En communication avec Alice Martin (101)').waitFor()
+    await bothHearEachOther(alice, bob)
+    await alice.page.getByRole('button', { name: 'Raccrocher' }).click()
+    await bob.page.getByText('Appel avec Alice Martin (101) terminé.').waitFor()
+  })
+  await step('Jean consults Bob while Alice waits, then drops the consultation: Alice is back', async () => {
+    await aliceCallsJean(alice, jean)
+    await transferButton(jean.page).click()
+    await transferTarget(jean.page).fill('103')
+    await jean.page.getByRole('button', { name: "Consulter d'abord" }).click()
+    await jean.page.getByText('Alice Martin (101) en attente').waitFor()
+    await alice.page.getByText('Votre correspondant vous a mis en attente.').waitFor()
+    const ringing = bob.page.getByTestId('incoming-call')
+    await ringing.getByText('Appel entrant de Jean Dupont (102)').waitFor({ timeout: 20_000 })
+    await ringing.getByRole('button', { name: 'Répondre' }).click()
+    const consultation = jean.page.getByTestId('consultation')
+    await consultation.getByText('En communication avec 103').waitFor()
+    await bothHearEachOther(jean, bob, { last: true })
+    await consultation.getByRole('button', { name: 'Annuler la consultation' }).click()
+    await bob.page.getByText('Appel avec Jean Dupont (102) terminé.').waitFor()
+    await jean.page.getByText('En communication avec Alice Martin (101)').waitFor()
+    await until('Alice back from hold', async () => !(await calls(alice.page))[0]?.remoteHold)
+    await bothHearEachOther(alice, jean)
+  })
+  await step('attended transfer: Jean consults Bob, then hands Alice over (REFER with Replaces); Jean is freed, Alice and Bob hear each other', async () => {
+    await transferButton(jean.page).click()
+    await transferTarget(jean.page).fill('103')
+    await jean.page.getByRole('button', { name: "Consulter d'abord" }).click()
+    const ringing = bob.page.getByTestId('incoming-call')
+    await ringing.getByText('Appel entrant de Jean Dupont (102)').waitFor({ timeout: 20_000 })
+    await ringing.getByRole('button', { name: 'Répondre' }).click()
+    const consultation = jean.page.getByTestId('consultation')
+    await consultation.getByText('En communication avec 103').waitFor()
+    await consultation.getByRole('button', { name: 'Transférer Alice Martin (101) à 103' }).click()
+    await jean.page.getByText('Alice Martin (101) a été transféré.').waitFor({ timeout: 20_000 })
+    await until('Jean has no call left', async () => (await calls(jean.page)).length === 0)
+    await alice.page.getByText('En communication avec 103').waitFor()
+    await bob.page.getByText('En communication avec Alice Martin (101)').waitFor()
+    await until('Bob has one call, the one with Alice, which took the place of the one with Jean', async () => {
+      const c = await calls(bob.page)
+      return c.length === 1 && c[0].replacedCallId && c[0].remoteNumber === '101' ? c : null
+    })
+    await until('Alice has only her call with Bob', async () => (await calls(alice.page)).length === 1)
+    await bothHearEachOther(alice, bob)
+    await bob.page.getByRole('button', { name: 'Raccrocher' }).click()
+    await alice.page.getByText('Appel avec 103 terminé.').waitFor()
+  })
   await step('the SIP connections drop: the header says offline, then the softphones come back on their own', async () => {
     const cut = relay.cut()
-    if (cut < 2) throw new Error(`expected at least two relayed connections, cut ${cut}`)
+    if (cut < 3) throw new Error(`expected at least three relayed connections, cut ${cut}`)
     await phoneState(alice.page).getByText('Hors ligne').waitFor()
-    await phoneState(alice.page).getByText('En ligne').waitFor({ timeout: 40_000 })
-    await phoneState(jean.page).getByText('En ligne').waitFor({ timeout: 40_000 })
+    for (const who of [alice, jean, bob]) await phoneState(who.page).getByText('En ligne').waitFor({ timeout: 40_000 })
   })
   await step('after the reconnection Jean calls Alice, who answers and hangs up', async () => {
     await dial(jean.page, '101')
@@ -290,7 +379,7 @@ try {
 } catch (err) {
   failed = true
   console.error(err)
-  for (const who of [alice, jean]) {
+  for (const who of [alice, jean, bob]) {
     if (!who || who.page.isClosed()) continue
     console.log(`[${who.name}] url:`, who.page.url())
     console.log(`[${who.name}] text:`, (await who.page.locator('body').innerText().catch(() => '')).slice(0, 600))

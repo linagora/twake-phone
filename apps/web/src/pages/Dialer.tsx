@@ -19,7 +19,7 @@ export const Dialer = () => {
   }, [params, setParams])
   // The Gateway can place the call for us (click-to-call) or the browser does it itself (softphone registered).
   const [gatewayCalls, setGatewayCalls] = useState<boolean | null>(null)
-  // One call at a time through the softphone (one audio element; a second line comes with the transfers of 3b).
+  // The dialer places the first call; a second one (a consultation before a transfer) is placed from the call panel.
   const canCall = (phone.state === 'registered' && !phone.calls.length) || (phone.state !== 'registered' && !!gatewayCalls)
   const [status, setStatus] = useState<{ kind: 'info' | 'error'; text: string } | null>(null)
 

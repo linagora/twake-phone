@@ -127,5 +127,15 @@
   "call.endedUnavailable": "{who} est injoignable.",
   "call.endedCancelled": "Appel vers {who} annulé.",
   "call.endedFailed": "L'appel avec {who} a échoué.",
+  "call.endedTransferred": "{who} a été transféré.",
+  "call.transfer": "Transférer",
+  "call.transferTarget": "Transférer à (poste ou numéro)",
+  "call.transferBlind": "Transférer directement",
+  "call.transferConsult": "Consulter d'abord",
+  "call.transferComplete": "Transférer {from} à {to}",
+  "call.transferCancel": "Annuler la consultation",
+  "call.transferClose": "Fermer",
+  "call.transferring": "Transfert en cours…",
+  "call.consulting": "Consultation pendant que {who} est en attente",
   "dialer.notRegistered": "Le téléphone n'est pas connecté : impossible d'appeler pour l'instant."
 }

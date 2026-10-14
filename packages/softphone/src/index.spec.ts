@@ -6,7 +6,13 @@ import { Softphone, type SoftCall, type UserAgentLike } from './index.js'
 class FakeSession extends EventEmitter {
   id = `s${Math.random()}`
   direction: string
-  remote_identity = { uri: { user: '102' }, display_name: 'Bob' }
+  remote_identity = { uri: { user: '102', host: 'sip.test', toString: () => 'sip:102@sip.test' }, display_name: 'Bob' }
+  /** JsSIP's refer() returns the subscription to the far end's NOTIFY reports: the fake hands it to the test. */
+  referSubscriber?: EventEmitter
+  refer = vi.fn((_target: string, _options?: unknown) => {
+    this.referSubscriber = new EventEmitter()
+    return this.referSubscriber as never
+  })
   connection: unknown = undefined
   terminate = vi.fn()
   answer = vi.fn(() => {
@@ -57,7 +63,12 @@ class FakeUa extends EventEmitter implements UserAgentLike {
   })
 }
 
-const audio = () => ({ srcObject: null as unknown, play: vi.fn(async () => undefined) }) as unknown as HTMLAudioElement
+const audios: { srcObject: unknown; play: ReturnType<typeof vi.fn>; remove: ReturnType<typeof vi.fn> }[] = []
+const audio = () => {
+  const a = { srcObject: null as unknown, play: vi.fn(async () => undefined), remove: vi.fn() }
+  audios.push(a)
+  return a as unknown as HTMLAudioElement
+}
 
 const setup = async (over: Partial<ConstructorParameters<typeof Softphone>[0]> = {}) => {
   const uas: FakeUa[] = []
@@ -69,7 +80,7 @@ const setup = async (over: Partial<ConstructorParameters<typeof Softphone>[0]> =
   const getSession = vi.fn(async () => ({ type: 'sip-webrtc' as const, websocketUrl: 'wss://sip.test:443/ws', domain: 'sip.test', username: '101', credential: 'pw', iceServers: [{ urls: ['stun:stun.test'] }] }))
   const phone = new Softphone({
     getSession,
-    remoteAudio: audio(),
+    createAudio: audio,
     displayName: 'Alice',
     onRegistration: s => registration.push(s),
     onCallChange: c => changes.push(`${c.direction}:${c.state}${c.remoteHold ? ':remoteHold' : ''}${c.muted ? ':muted' : ''}${c.renegotiating ? ':offer' : ''}`),
@@ -152,7 +163,7 @@ describe('Softphone', () => {
     expect(s.answer).toHaveBeenCalledWith(expect.objectContaining({ mediaConstraints: { audio: true, video: false }, pcConfig: { iceServers: [{ urls: ['stun:stun.test'] }] } }))
     const track = { kind: 'audio' }
     ;(s.connection as ReturnType<typeof fakePc>).fire('track', { track, streams: [{ id: 'remote' }] })
-    expect((phone as unknown as { options: { remoteAudio: { srcObject: unknown } } }).options.remoteAudio.srcObject).toEqual({ id: 'remote' })
+    expect(audios[audios.length - 1]!.srcObject).toEqual({ id: 'remote' })
     s.emit('accepted', { originator: 'local' })
     expect(call.state).toBe('connected')
     expect(changes).toEqual(['inbound:ringing', 'inbound:connected'])
@@ -238,6 +249,115 @@ describe('Softphone', () => {
     s.emit('newDTMF', { originator: 'local', dtmf: { tone: '8' } })
     expect(tones).toEqual(['7'])
     expect(await call.stats()).toEqual({ packetsReceived: 42, packetsSent: 7 })
+  })
+
+  it('places a consultation during a call: the call in progress is held first, a third call is refused', async () => {
+    const { phone, ua, changes } = await setup()
+    const first = await phone.call('102')
+    const s1 = ua().lastCall!
+    s1.emit('accepted', { originator: 'remote' })
+    const consulting = phone.call('103')
+    expect(s1.hold).toHaveBeenCalled()
+    expect(ua().call).toHaveBeenCalledTimes(1)
+    s1.emit('hold', { originator: 'local' })
+    s1.reofferDone!()
+    const second = await consulting
+    expect(ua().call).toHaveBeenLastCalledWith('sip:103@sip.test', expect.anything())
+    expect(first.state).toBe('held')
+    expect(second.state).toBe('new')
+    expect(phone.activeCalls()).toHaveLength(2)
+    await expect(phone.call('104')).rejects.toThrow(/Two calls/)
+    expect(changes).toEqual(['outbound:connected', 'outbound:connected:offer', 'outbound:held:offer', 'outbound:held'])
+  })
+
+  it('transfers blind: holds, refers, ends the call as transferred once the far end got through', async () => {
+    const { phone, ua } = await setup()
+    const call = await phone.call('102')
+    const s = ua().lastCall!
+    s.emit('accepted', { originator: 'remote' })
+    const transfer = call.transfer('103')
+    await Promise.resolve()
+    s.emit('hold', { originator: 'local' })
+    s.reofferDone!()
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(s.refer).toHaveBeenCalledWith('sip:103@sip.test', {})
+    expect(call.transferring).toBe(true)
+    s.referSubscriber!.emit('accepted', { status_line: { status_code: '200', reason_phrase: 'OK' } })
+    await transfer
+    expect(s.terminate).toHaveBeenCalledWith()
+    s.emit('ended', { originator: 'local', cause: 'Terminated' })
+    expect(call.endReason).toBe('transferred')
+  })
+
+  it('resumes the call and says why when the transfer target does not answer', async () => {
+    const { phone, ua } = await setup()
+    const call = await phone.call('102')
+    const s = ua().lastCall!
+    s.emit('accepted', { originator: 'remote' })
+    const transfer = call.transfer('105')
+    await Promise.resolve()
+    s.emit('hold', { originator: 'local' })
+    s.reofferDone!()
+    await Promise.resolve()
+    await Promise.resolve()
+    s.referSubscriber!.emit('failed', { status_line: { status_code: '404', reason_phrase: 'Not Found' } })
+    await new Promise(r => setTimeout(r, 0))
+    expect(s.unhold).toHaveBeenCalled()
+    s.emit('unhold', { originator: 'local' })
+    s.reofferDone!()
+    await expect(transfer).rejects.toThrow('Transfer failed: 404 Not Found')
+    expect(call.state).toBe('connected')
+    expect(s.terminate).not.toHaveBeenCalled()
+    expect(call.transferring).toBe(false)
+  })
+
+  it('transfers attended: refers the held call to the consultation with Replaces, then ends it', async () => {
+    const { phone, ua } = await setup()
+    const first = await phone.call('102')
+    const s1 = ua().lastCall!
+    s1.emit('accepted', { originator: 'remote' })
+    const consulting = phone.call('103')
+    s1.emit('hold', { originator: 'local' })
+    s1.reofferDone!()
+    const second = await consulting
+    const s2 = ua().lastCall!
+    s2.remote_identity = { uri: { user: '103', host: 'sip.test', toString: () => 'sip:103@sip.test' }, display_name: '' }
+    s2.emit('accepted', { originator: 'remote' })
+    await expect(first.transferTo(first)).rejects.toThrow(/itself/)
+    const transfer = first.transferTo(second)
+    await Promise.resolve()
+    expect(s1.refer).toHaveBeenCalledWith('sip:103@sip.test', { replaces: s2 })
+    s1.referSubscriber!.emit('accepted', { status_line: { status_code: '200', reason_phrase: 'OK' } })
+    await transfer
+    expect(s1.terminate).toHaveBeenCalledWith()
+    // The consultation is ended by its far end once the replacing call is through (JsSIP does it, RFC 3891).
+    expect(s2.terminate).not.toHaveBeenCalled()
+  })
+
+  it('follows a transfer asked by the far end (REFER) and takes an INVITE with Replaces as the new far end', async () => {
+    const { phone, ua, incoming, changes } = await setup()
+    const call = await phone.call('102')
+    const s = ua().lastCall!
+    s.emit('accepted', { originator: 'remote' })
+    // REFER from 102: we call whom it names; JsSIP builds that session and announces it as ours.
+    const accept = vi.fn((_init: unknown, options: { mediaConstraints: unknown }) => {
+      expect(options.mediaConstraints).toEqual({ audio: true, video: false })
+      ua().emit('newRTCSession', { originator: 'local', session: new FakeSession('outgoing') })
+    })
+    s.emit('refer', { request: {}, accept, reject: vi.fn() })
+    expect(accept).toHaveBeenCalled()
+    expect(phone.activeCalls()).toHaveLength(2)
+    expect(incoming).toHaveLength(0)
+    // INVITE with Replaces for our first call: answered at once, no ringing, and it says whom it replaced.
+    const replacing = new FakeSession('incoming')
+    s.emit('replaces', { request: {}, accept: (init: (s: unknown) => void) => { init(replacing); ua().emit('newRTCSession', { originator: 'remote', session: replacing }) }, reject: vi.fn() })
+    await new Promise(r => setTimeout(r, 5))
+    expect(replacing.answer).toHaveBeenCalled()
+    expect(incoming).toHaveLength(0)
+    const replacer = phone.activeCalls().find(c => c.replacedCallId === call.id)
+    expect(replacer?.direction).toBe('inbound')
+    expect(changes).toContain('inbound:ringing')
   })
 
   it('refuses tones outside a call', async () => {
