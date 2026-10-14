@@ -5,20 +5,27 @@ import { useT } from '../i18n/useT.js'
 
 export const Recents = () => {
   const { t, lang } = useT()
-  const { client } = useGateway()
+  const { client, onEvent } = useGateway()
   const [items, setItems] = useState<HistoryItem[] | null>(null)
   const [error, setError] = useState(false)
+  // Loaded on arrival, and again each time one of the user's calls ends: the Gateway records it then.
+  const [generation, setGeneration] = useState(0)
+  useEffect(() => onEvent(event => (event.type === 'call.ended' || event.type === 'call.failed') && setGeneration(g => g + 1)), [onEvent])
 
   useEffect(() => {
     let cancelled = false
     client
       .getHistory({ limit: 50 })
-      .then(page => !cancelled && setItems(page.items))
+      .then(page => {
+        if (cancelled) return
+        setItems(page.items)
+        setError(false)
+      })
       .catch(() => !cancelled && setError(true))
     return () => {
       cancelled = true
     }
-  }, [client])
+  }, [client, generation])
 
   if (error) return <><h1>{t('recents.title')}</h1><p className="alert alert-error" role="alert">{t('recents.error')}</p></>
   if (!items) return <h1>{t('recents.title')}</h1>

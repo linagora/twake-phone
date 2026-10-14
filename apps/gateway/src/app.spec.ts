@@ -4,7 +4,8 @@ import { TicketStore } from './auth.js'
 import { StoreDirectory } from './directory.js'
 import { MemoryStore } from './store/memory.js'
 import { ProviderRegistry } from './registry.js'
-import type { ProviderFactory, TelephonyProvider } from '@twake/telephony-provider-sdk'
+import type { ProviderFactory, RoutedEvent, TelephonyProvider } from '@twake/telephony-provider-sdk'
+import type { Presence, TelephonyEvent, User } from '@twake/telephony-types'
 
 const caps = { calling: { outbound: true, inbound: true, answer: false, hangup: true, hold: true, transfer: false, dtmf: true }, media: { browserAudio: true }, presence: { read: true, write: true, realtime: true, statuses: [] }, history: false, conference: { dialIn: false, dialOut: false } }
 const fakeFactory: ProviderFactory<unknown> = {
@@ -154,6 +155,106 @@ describe('history, tenants and tickets', () => {
     expect(await connect(ticket)).toBe('open')
     expect(await connect(ticket)).toBe('closed')
     expect(await connect('invented')).toBe('closed')
+    await app.close()
+  })
+})
+
+describe('presence of the tenant', () => {
+  /** A provider whose events the test pushes, as provider-opensips does from what OpenSIPS tells it. */
+  const pushing = () => {
+    const queues = new Map<string, { waiters: ((e: RoutedEvent) => void)[]; pending: RoutedEvent[] }>()
+    const queueOf = (tenantId: string) => {
+      const q = queues.get(tenantId) ?? { waiters: [], pending: [] }
+      queues.set(tenantId, q)
+      return q
+    }
+    const create = (_config: unknown, context?: { tenantId: string }) => {
+      const q = queueOf(context?.tenantId ?? '')
+      const presences = new Map<string, Presence>()
+      return {
+        getStatus: () => 'CONNECTED',
+        getCapabilities: async () => caps,
+        getPresence: async (u: User) => presences.get(u.extension ?? '') ?? { status: 'offline', source: 'telephony' },
+        setPresence: async (u: User, p: Presence) => void presences.set(u.extension ?? '', p),
+        subscribe: () => ({
+          [Symbol.asyncIterator]: () => ({
+            next: () => (q.pending.length ? Promise.resolve({ value: q.pending.shift()!, done: false }) : new Promise<IteratorResult<RoutedEvent>>(r => q.waiters.push(e => r({ value: e, done: false }))))
+          })
+        }),
+        close: async () => {}
+      } as unknown as TelephonyProvider
+    }
+    const push = (extension: string, event: TelephonyEvent, tenantId = 'A') => {
+      const q = queueOf(tenantId)
+      const w = q.waiters.shift()
+      if (w) w({ extension, event })
+      else q.pending.push({ extension, event })
+    }
+    return { factory: { type: 'pushing', create } as ProviderFactory<unknown>, push }
+  }
+  const presence = (status: Presence['status']): TelephonyEvent => ({ type: 'presence.changed', timestamp: '2026-10-14T18:00:00.000Z', payload: { userId: '', presence: { status, source: 'telephony' } } })
+  const setup = async () => {
+    process.env.AUTH_MODE = 'dev'
+    const store = new MemoryStore()
+    await store.upsertMapping({ tenantId: 'A', userId: 'alice', extension: '101' })
+    await store.upsertMapping({ tenantId: 'A', userId: 'bob', extension: '102' })
+    await store.upsertMapping({ tenantId: 'B', userId: 'carol', extension: '101' })
+    const { factory, push } = pushing()
+    const registry = new ProviderRegistry([{ tenantId: 'A', type: 'pushing', config: {} }, { tenantId: 'B', type: 'pushing', config: {} }], [factory])
+    const app = await buildApp(registry, { store, directory: new StoreDirectory(store), tickets: new TicketStore() })
+    registry.startAll()
+    const as = (user: string, tenant = 'A') => ({ 'x-dev-user': user, 'x-dev-tenant': tenant })
+    return { app, push, as }
+  }
+
+  it('lists the presence of every extension the provider told about, to anyone of the tenant and to nobody else', async () => {
+    const { app, push, as } = await setup()
+    push('101', presence('available'))
+    push('102', presence('busy'))
+    push('109', presence('available'))
+    await new Promise(r => setTimeout(r, 50))
+    const seen = (await app.inject({ url: '/api/v1/presence', headers: as('bob') })).json()
+    expect(seen.realtime).toBe(true)
+    // 109 is nobody's extension: not told.
+    expect(seen.items).toEqual([
+      { extension: '101', userId: 'alice', presence: { status: 'available', source: 'telephony' } },
+      { extension: '102', userId: 'bob', presence: { status: 'busy', source: 'telephony' } }
+    ])
+    expect((await app.inject({ url: '/api/v1/presence', headers: as('carol', 'B') })).json().items).toEqual([])
+    await app.close()
+  })
+
+  it('broadcasts a presence change to every WebSocket of the tenant, with the extension, and calls to their parties only', async () => {
+    const { app, push, as } = await setup()
+    await app.listen({ port: 0 })
+    const port = (app.server.address() as { port: number }).port
+    const open = async (user: string, tenant = 'A') => {
+      const { ticket } = (await app.inject({ method: 'POST', url: '/api/v1/ws-ticket', headers: as(user, tenant) })).json()
+      return new Promise<{ ws: WebSocket; got: TelephonyEvent[] }>(resolve => {
+        const ws = new WebSocket(`ws://127.0.0.1:${port}/api/v1/ws?ticket=${ticket}`)
+        const got: TelephonyEvent[] = []
+        ws.onmessage = e => got.push(JSON.parse(String(e.data)))
+        ws.onopen = () => resolve({ ws, got })
+      })
+    }
+    const alice = await open('alice')
+    const bob = await open('bob')
+    const carol = await open('carol', 'B')
+    push('101', presence('busy'))
+    push('101', { type: 'call.ringing', timestamp: 'T', payload: { call: { id: 'c1', direction: 'outbound', state: 'ringing', remoteNumber: '102' } } })
+    await new Promise(r => setTimeout(r, 100))
+    expect(alice.got.map(e => e.type)).toEqual(['presence.changed', 'call.ringing'])
+    expect(bob.got).toEqual([{ type: 'presence.changed', timestamp: '2026-10-14T18:00:00.000Z', payload: { userId: 'alice', extension: '101', presence: { status: 'busy', source: 'telephony' } } }])
+    expect(carol.got).toEqual([])
+    for (const w of [alice, bob, carol]) w.ws.close()
+    await app.close()
+  })
+
+  it('answers a presence set by the user with what the others see', async () => {
+    const { app, as } = await setup()
+    const res = await app.inject({ method: 'PUT', url: '/api/v1/me/presence', headers: as('alice'), payload: { status: 'dnd' } })
+    expect(res.json()).toMatchObject({ status: 'dnd', source: 'user' })
+    expect((await app.inject({ method: 'PUT', url: '/api/v1/me/presence', headers: as('alice'), payload: { status: 'sleeping' } })).statusCode).toBe(400)
     await app.close()
   })
 })

@@ -5,6 +5,7 @@ import { FavoriteButton } from '../components/ContactList.js'
 import { useFavorites } from '../favorites.js'
 import { useGateway } from '../gateway.js'
 import { useT } from '../i18n/useT.js'
+import { PresenceBadge } from '../presence.js'
 
 /** One person of the directory: every number is a call away, each with a visible label (RGAA 11.1). */
 export const ContactPage = () => {
@@ -30,6 +31,7 @@ export const ContactPage = () => {
     if (contact) document.title = `${contact.displayName} – ${t('app.name')}`
   }, [contact, t])
 
+  const extension = contact?.numbers.find(n => n.type === 'extension')
   if (contact === undefined) return <h1>{t('directory.title')}</h1>
   if (contact === null) {
     return (
@@ -47,6 +49,11 @@ export const ContactPage = () => {
       </p>
       <h1>{contact.displayName}</h1>
       {contact.title || contact.department ? <p className="muted">{[contact.title, contact.department].filter(Boolean).join(' · ')}</p> : null}
+      {extension ? (
+        <p>
+          <PresenceBadge extension={extension.number} />
+        </p>
+      ) : null}
       <FavoriteButton contact={contact} favorites={favorites} />
       <section className="card" aria-labelledby="numbers">
         <h2 id="numbers">{t('contact.numbers')}</h2>

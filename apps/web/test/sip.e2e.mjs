@@ -1,13 +1,16 @@
-// End to end of step 3 (3a calls, 3b transfers): people call and transfer each other from their browsers through
-// OpenSIPS and rtpengine. The SIP stack is the only thing outside this process (docker/docker-compose.sip.yml, or
-// OpenSIPS and rtpengine started by hand); the identity provider, the Gateway (with the OpenSIPS provider) and the
-// app run here, and three browser contexts with a simulated microphone play Alice (101), Jean (102) and Bob (103).
+// End to end of steps 3 and 4 (calls, transfers, what the Gateway hears from OpenSIPS): people call and transfer
+// each other from their browsers through OpenSIPS and rtpengine; the Gateway subscribes to OpenSIPS's events and
+// shows the presence of the others in the directory and the calls in the history. The SIP stack is the only thing
+// outside this process (docker/docker-compose.sip.yml, or OpenSIPS and rtpengine started by hand); the identity
+// provider, the directory, the Gateway (with the OpenSIPS provider) and the app run here, and three browser
+// contexts with a simulated microphone play Alice (101), Jean (102) and Bob (103).
 //
 //   BROWSER              chromium (default), firefox or msedge (Edge installed on the machine, as Playwright finds it)
 //   PLAYWRIGHT_CHROMIUM  a Chromium binary to use instead of Playwright's (PLAYWRIGHT_FIREFOX likewise)
 //   SIP_WSS_URL          WSS socket of OpenSIPS (default wss://127.0.0.1:8089)
 //   SIP_DOMAIN           SIP domain and digest realm (default: the host of SIP_WSS_URL)
 //   OPENSIPS_DB_URL      the database auth_db reads (default postgres://twake:twake@127.0.0.1:54320/twake)
+//   OPENSIPS_MI_URL      the MI socket of OpenSIPS, where the Gateway subscribes to its events (default udp:127.0.0.1:8880)
 //   RTPENGINE_DTMF_LOG   where rtpengine reports the tones it sees (default 127.0.0.1:22223); "off" skips the check
 import { randomBytes } from 'node:crypto'
 import { createSocket } from 'node:dgram'
@@ -17,9 +20,11 @@ import pg from 'pg'
 import { chromium, firefox } from 'playwright-core'
 import { buildApp } from '../../gateway/dist/app.js'
 import { JwtAuthenticator } from '../../gateway/dist/auth.js'
+import { DEFAULT_ATTRIBUTES, LdapDirectory } from '../../gateway/dist/ldap-directory.js'
 import { storedOpensipsFactory } from '../../gateway/dist/providers.js'
 import { ProviderRegistry } from '../../gateway/dist/registry.js'
 import { MemoryStore } from '../../gateway/dist/store/memory.js'
+import { BASE_DN, READER_DN, READER_PASSWORD, startLdapMock } from '../../gateway/test/ldap-mock.mjs'
 import { startOidcMock } from './oidc-mock.mjs'
 import { serveApp } from '../server/serve.mjs'
 
@@ -28,6 +33,7 @@ const RESOURCE = 'https://gateway.twakephone.test'
 const SIP_WSS_URL = process.env.SIP_WSS_URL ?? 'wss://127.0.0.1:8089'
 const SIP_DOMAIN = process.env.SIP_DOMAIN ?? new URL(SIP_WSS_URL).hostname
 const OPENSIPS_DB_URL = process.env.OPENSIPS_DB_URL ?? 'postgres://twake:twake@127.0.0.1:54320/twake'
+const OPENSIPS_MI_URL = process.env.OPENSIPS_MI_URL ?? 'udp:127.0.0.1:8880'
 const DTMF_LOG = process.env.RTPENGINE_DTMF_LOG ?? '127.0.0.1:22223'
 const TENANT = 'e2e'
 const BROWSER = process.env.BROWSER ?? 'chromium'
@@ -44,8 +50,10 @@ const freePort = () =>
   })
 
 const step = (name, fn) => fn().then(() => console.log(`ok   ${name}`), err => { console.log(`FAIL ${name}`); throw err })
+/** Scalars by value, arrays by content (in order). */
 const expectEqual = (actual, expected, what) => {
-  if (actual !== expected) throw new Error(`${what}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`)
+  const same = Array.isArray(expected) ? Array.isArray(actual) && JSON.stringify(actual) === JSON.stringify(expected) : actual === expected
+  if (!same) throw new Error(`${what}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`)
 }
 const sleep = ms => new Promise(r => setTimeout(r, ms))
 /** Polls `fn` until it returns something truthy; the message says what never came. */
@@ -142,11 +150,15 @@ const store = new MemoryStore()
 await store.upsertMapping({ tenantId: TENANT, userId: 'amartin', extension: '101', displayName: 'Alice Martin' })
 await store.upsertMapping({ tenantId: TENANT, userId: 'jdupont', extension: '102', displayName: 'Jean Dupont' })
 await store.upsertMapping({ tenantId: TENANT, userId: 'bdurand', extension: '103', displayName: 'Bob Durand' })
-// What `OPENSIPS_WS_URL` makes the Gateway store at startup, pointed at the relay.
-await store.upsertProvider({ tenantId: TENANT, type: 'opensips', config: { websocketUrl: relayUrl, domain: SIP_DOMAIN, subscriberDbUrlRef: 'env:OPENSIPS_DB_URL' } })
+// What `OPENSIPS_WS_URL` and `OPENSIPS_MI_URL` make the Gateway store at startup, pointed at the relay.
+await store.upsertProvider({ tenantId: TENANT, type: 'opensips', config: { websocketUrl: relayUrl, domain: SIP_DOMAIN, subscriberDbUrlRef: 'env:OPENSIPS_DB_URL', events: { miUrl: OPENSIPS_MI_URL } } })
 const key = randomBytes(32)
 const registry = new ProviderRegistry(await store.listProviders(), [storedOpensipsFactory({ store, key, env: { OPENSIPS_DB_URL } })])
-const gateway = await buildApp(registry, { auth, store, admin: { adminRole: 'twakephone-admin', adminUsers: new Set() } })
+// The directory (same people as the web e2e; the ipPhone attribute holds the extension), for the presence next to each contact.
+const ldap = await startLdapMock()
+const contacts = new LdapDirectory({ url: ldap.url, tenantId: TENANT, bindDn: READER_DN, bindPassword: READER_PASSWORD, baseDn: BASE_DN, userFilter: '(objectClass=inetOrgPerson)', attributes: { ...DEFAULT_ATTRIBUTES, extension: 'ipPhone' } })
+const gateway = await buildApp(registry, { auth, store, contacts, admin: { adminRole: 'twakephone-admin', adminUsers: new Set() } })
+registry.startAll()
 await gateway.listen({ host: '127.0.0.1', port: GATEWAY_PORT })
 const web = await serveApp({
   dir: fileURLToPath(new URL('../dist/', import.meta.url)),
@@ -156,6 +168,8 @@ const web = await serveApp({
   policy: { connectSrc: [new URL(relayUrl).origin] }
 })
 const db = new pg.Pool({ connectionString: OPENSIPS_DB_URL, max: 1 })
+// The CDRs of this run only (a local stack keeps those of the previous runs).
+await db.query('TRUNCATE acc, missed_calls')
 
 // A microphone that produces a tone, no permission prompt, sound allowed without a gesture, OpenSIPS's self-signed
 // certificate accepted (Firefox: through the context's ignoreHTTPSErrors). Firefox ignores ICE candidates on the
@@ -244,7 +258,9 @@ const signOut = async who => {
   await who.page.getByRole('button', { name: 'Se connecter' }).waitFor()
   await who.context.close()
 }
+/** Dials from the keypad (back to it first when the page is elsewhere, such as the directory). */
 const dial = async (page, number) => {
+  if (!(await page.getByLabel('Numéro à appeler').isVisible())) await page.getByRole('link', { name: 'Clavier' }).click()
   await page.getByLabel('Numéro à appeler').fill(number)
   await page.getByRole('button', { name: 'Appeler' }).click()
 }
@@ -258,6 +274,21 @@ const bothHearEachOther = async (a, b, { last = false } = {}) => {
       return s && s.packetsReceived > before.packetsReceived + 20 && s.packetsSent > before.packetsSent + 20 ? s : null
     })
   }
+}
+/** Opens the directory, searches `query` (one person) and waits for the presence next to that extension to read `status`. */
+const presenceIs = async (page, query, extension, status, timeout = 10_000) => {
+  await page.getByRole('link', { name: 'Annuaire' }).click()
+  await page.getByLabel('Rechercher').fill(query)
+  await page.getByTestId(`presence-${extension}`).filter({ hasText: status }).waitFor({ timeout })
+}
+/** Opens Récents and reads its lines as "number: label" (newest first), once at least `atLeast` are shown. */
+const recents = async (page, atLeast) => {
+  await page.getByRole('link', { name: 'Récents' }).click()
+  await page.getByRole('heading', { level: 1, name: 'Récents' }).waitFor()
+  return until(`${atLeast} recent calls`, async () => {
+    const lines = await page.locator('main ul.list li').evaluateAll(items => items.map(li => `${li.querySelector('strong')?.textContent}: ${li.querySelector('.badge')?.textContent}`))
+    return lines.length >= atLeast ? lines : null
+  })
 }
 const transferButton = page => page.getByRole('button', { name: 'Transférer', exact: true })
 const transferTarget = page => page.getByLabel('Transférer à (poste ou numéro)')
@@ -344,6 +375,41 @@ try {
     await jean.page.getByText('Appel avec Alice Martin (101) terminé.').waitFor()
     await alice.page.getByText('Appel avec 102 terminé.').waitFor()
     expectEqual((await calls(alice.page)).length, 0, 'calls left on Alice side')
+  })
+  await step('the Gateway heard the calls from OpenSIPS: Récents on both sides (Jean missed the one he refused), the CDR in acc', async () => {
+    expectEqual(await recents(alice.page, 3), ['102: Sortant', '102: Sortant', '105: Sortant'], "Alice's recent calls")
+    expectEqual(await recents(jean.page, 2), ['101: Entrant', '101: Manqué'], "Jean's recent calls")
+    const { rows } = await db.query('SELECT caller, callee, sip_code, duration FROM acc ORDER BY id')
+    expectEqual(rows.map(r => `${r.caller}>${r.callee} ${r.sip_code} ${r.duration > 0 ? 'talked' : 'silent'}`), ['101>102 200 talked'], 'CDRs in acc')
+    const missed = await db.query('SELECT caller, callee, sip_code FROM missed_calls ORDER BY id')
+    expectEqual(missed.rows.map(r => `${r.caller}>${r.callee} ${r.sip_code}`), ['101>105 404', '101>102 603'], 'rows in missed_calls')
+  })
+  await step('the directory says who is free: Jean is available, Bob (not signed in) is offline', async () => {
+    await presenceIs(alice.page, 'Dupont', '102', 'Disponible')
+    await presenceIs(alice.page, 'Durand', '103', 'Hors ligne')
+    await presenceIs(jean.page, 'Martin', '101', 'Disponible')
+  })
+  await step('Jean calls Alice, who answers from the directory: Jean reads as in a call within 3 s, available again once they hang up', async () => {
+    await presenceIs(alice.page, 'Dupont', '102', 'Disponible')
+    await dial(jean.page, '101')
+    await alice.page.getByTestId('presence-102').filter({ hasText: 'En communication' }).waitFor({ timeout: 3_000 })
+    await alice.page.getByTestId('incoming-call').getByRole('button', { name: 'Répondre' }).click()
+    await jean.page.getByText('En communication avec 101').waitFor()
+    await presenceIs(jean.page, 'Martin', '101', 'En communication', 3_000)
+    await alice.page.getByRole('button', { name: 'Raccrocher' }).click()
+    await jean.page.getByText('Appel avec 101 terminé.').waitFor()
+    await alice.page.getByTestId('presence-102').filter({ hasText: 'Disponible' }).waitFor({ timeout: 3_000 })
+    await jean.page.getByTestId('presence-101').filter({ hasText: 'Disponible' }).waitFor({ timeout: 3_000 })
+  })
+  await step('Alice calls Jean and gives up while it rings: a missed call for Jean, in his Récents and in missed_calls (487)', async () => {
+    await dial(alice.page, '102')
+    await jean.page.getByTestId('incoming-call').waitFor()
+    await alice.page.getByRole('button', { name: 'Raccrocher' }).click()
+    await jean.page.getByTestId('incoming-call').waitFor({ state: 'hidden' })
+    expectEqual((await recents(jean.page, 4))[0], '101: Manqué', "Jean's newest recent call")
+    expectEqual((await recents(alice.page, 5)).slice(0, 2), ['102: Sortant', '102: Entrant'], "Alice's newest recent calls")
+    const missed = await db.query("SELECT caller, callee, sip_code FROM missed_calls WHERE sip_code = '487'")
+    expectEqual(missed.rows.map(r => `${r.caller}>${r.callee}`), ['101>102'], 'cancelled call in missed_calls')
   })
   await step('Alice chooses a microphone and outputs in the settings: the next call uses them, the ringtone can be tested', async () => {
     await alice.page.getByRole('link', { name: 'Réglages' }).click()
@@ -546,6 +612,10 @@ try {
     expectEqual(`${ended.endStatus} ${ended.endReason}`, '404 unavailable', 'how the call to 101 ended after Alice signed out')
     await jean.page.getByText('101 est injoignable.').waitFor()
   })
+  await step('the directory now shows Alice offline, and Bob available', async () => {
+    await presenceIs(jean.page, 'Martin', '101', 'Hors ligne')
+    await presenceIs(jean.page, 'Durand', '103', 'Disponible')
+  })
 } catch (err) {
   failed = true
   console.error(err)
@@ -561,6 +631,7 @@ try {
   await web.stop()
   await gateway.close()
   await oidc.stop()
+  await ldap.stop()
   await relay.stop()
   await dtmf?.stop()
   await db.end()

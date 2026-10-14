@@ -13,12 +13,13 @@ set -eu
 : "${OPENSIPS_LOG_LEVEL:=2}"
 : "${OPENSIPS_MPATH:=/usr/lib/x86_64-linux-gnu/opensips/modules/}"
 : "${MI_FIFO:=/tmp/opensips_fifo}"
+: "${MI_PORT:=8880}"
 : "${TLS_CERT:=/etc/opensips/tls/cert.pem}"
 : "${TLS_KEY:=/etc/opensips/tls/key.pem}"
 : "${CFG_TEMPLATE:=/etc/opensips/opensips.cfg.tpl}"
 : "${CFG_OUT:=/etc/opensips/opensips.cfg}"
 : "${OPENSIPS_BIN:=/usr/sbin/opensips}"
-export SIP_DOMAIN LISTEN_IP SIP_PORT WS_PORT WSS_PORT OPENSIPS_DB_URL RTPENGINE_SOCK OPENSIPS_LOG_LEVEL OPENSIPS_MPATH MI_FIFO TLS_CERT TLS_KEY
+export SIP_DOMAIN LISTEN_IP SIP_PORT WS_PORT WSS_PORT OPENSIPS_DB_URL RTPENGINE_SOCK OPENSIPS_LOG_LEVEL OPENSIPS_MPATH MI_FIFO MI_PORT TLS_CERT TLS_KEY
 
 if [ ! -f "$TLS_CERT" ] || [ ! -f "$TLS_KEY" ]; then
   echo "No certificate at $TLS_CERT: making a self-signed one for $SIP_DOMAIN (dev and CI only)" >&2
@@ -29,7 +30,7 @@ if [ ! -f "$TLS_CERT" ] || [ ! -f "$TLS_KEY" ]; then
 fi
 
 # Only the listed variables are substituted: a "$avp(...)" of the script must stay as it is.
-envsubst '$SIP_DOMAIN $LISTEN_IP $SIP_PORT $WS_PORT $WSS_PORT $OPENSIPS_DB_URL $RTPENGINE_SOCK $OPENSIPS_LOG_LEVEL $OPENSIPS_MPATH $MI_FIFO $TLS_CERT $TLS_KEY' \
+envsubst '$SIP_DOMAIN $LISTEN_IP $SIP_PORT $WS_PORT $WSS_PORT $OPENSIPS_DB_URL $RTPENGINE_SOCK $OPENSIPS_LOG_LEVEL $OPENSIPS_MPATH $MI_FIFO $MI_PORT $TLS_CERT $TLS_KEY' \
   < "$CFG_TEMPLATE" > "$CFG_OUT"
 
 "$OPENSIPS_BIN" -C -f "$CFG_OUT"

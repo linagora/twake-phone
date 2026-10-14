@@ -169,6 +169,11 @@ export class TelephonyClient {
     return this.request<Presence>('/me/presence')
   }
 
+  /** The presence of everyone in the organisation, by extension; `realtime` false: the platform does not tell it. */
+  getPresences() {
+    return this.request<{ realtime: boolean; items: { extension: string; userId: string; presence: Presence }[] }>('/presence')
+  }
+
   setPresence(status: PresenceStatus) {
     return this.request<Presence>('/me/presence', { method: 'PUT', body: JSON.stringify({ status }) })
   }

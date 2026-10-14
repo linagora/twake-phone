@@ -41,13 +41,16 @@ if (env.BOOTSTRAP_PROVIDER_URL && !(await store.listProviders()).some(p => p.ten
 }
 // OpenSIPS (step 3): the SIP server the browsers register to. OPENSIPS_WS_URL is public; the accounts live in the
 // `subscriber` table of OPENSIPS_DB_URL (the Gateway's own database when unset); SIP_DOMAIN defaults to the WS host.
+// Step 4: OPENSIPS_MI_URL (`udp:host:port` of mi_datagram) is where the Gateway subscribes to the events, delivered
+// to OPENSIPS_EVENTS_LISTEN (`host[:port]`, an address OpenSIPS can reach; the loopback and a free port by default).
 if (env.OPENSIPS_WS_URL && env.BOOTSTRAP_PROVIDER_URL) console.warn(`Both BOOTSTRAP_PROVIDER_URL and OPENSIPS_WS_URL are set: tenant ${tenant} keeps the provider already in the database, Asterisk when neither was`)
 if (env.OPENSIPS_WS_URL && !(await store.listProviders()).some(p => p.tenantId === tenant)) {
   const config: StoredOpensipsConfig = {
     websocketUrl: env.OPENSIPS_WS_URL,
     domain: env.SIP_DOMAIN ?? new URL(env.OPENSIPS_WS_URL).hostname,
     ...(env.ICE_SERVERS ? { iceServers: [{ urls: env.ICE_SERVERS.split(',').map(u => u.trim()).filter(Boolean) }] } : {}),
-    subscriberDbUrlRef: env.OPENSIPS_DB_URL ? 'env:OPENSIPS_DB_URL' : 'env:DATABASE_URL'
+    subscriberDbUrlRef: env.OPENSIPS_DB_URL ? 'env:OPENSIPS_DB_URL' : 'env:DATABASE_URL',
+    ...(env.OPENSIPS_MI_URL ? { events: { miUrl: env.OPENSIPS_MI_URL, ...(env.OPENSIPS_EVENTS_LISTEN ? { listen: env.OPENSIPS_EVENTS_LISTEN } : {}) } } : {})
   }
   await store.upsertProvider({ tenantId: tenant, type: 'opensips', config })
 }

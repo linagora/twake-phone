@@ -16,7 +16,7 @@ describe('storedOpensipsFactory', () => {
         query: async text => {
           queries.push(text)
           // The version check of ensureSchema() reads the row OpenSIPS's schema holds.
-          return /SELECT table_version/.test(text) ? { rows: [{ table_version: 8 }] } : { rows: [] }
+          return /SELECT table_name, table_version/.test(text) ? { rows: [{ table_name: 'subscriber', table_version: 8 }, { table_name: 'acc', table_version: 7 }, { table_name: 'missed_calls', table_version: 5 }] } : { rows: [] }
         }
       },
       realm: 'sip.test'

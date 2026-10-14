@@ -2,8 +2,10 @@
 # Rendered by entrypoint.sh from the environment (${VAR}). Registrar of the browsers (SIP over WS and WSS), digest
 # authentication on the `subscriber` table the Gateway fills, calls between registered users through rtpengine
 # (DTLS-SRTP on both legs), hold by re-INVITE, transfers by REFER and Replaces between the browsers (ADR 0010: the
-# proxy relays them, it does not implement them). Trunk, forwards, groups and events towards the Gateway come with
-# steps 4 and 6. Everything in here is OpenSIPS-specific; the Gateway only knows `provider-opensips`.
+# proxy relays them, it does not implement them). Step 4: what happens here is told to the Gateway through the
+# Event Interface (registrations, ringing, answered, CDR, missed calls; `event_datagram` on the loopback, the
+# Gateway subscribes through MI) and accounted in the database (`acc`, `missed_calls`). Trunk, forwards and groups
+# come with steps 4b and 6. Everything in here is OpenSIPS-specific; the Gateway only knows `provider-opensips`.
 
 log_level=${OPENSIPS_LOG_LEVEL}
 xlog_level=${OPENSIPS_LOG_LEVEL}
@@ -62,6 +64,12 @@ loadmodule "sipmsgops.so"
 loadmodule "mi_fifo.so"
 modparam("mi_fifo", "fifo_name", "${MI_FIFO}")
 modparam("mi_fifo", "fifo_mode", 0666)
+# MI for the Gateway (provider-opensips): JSON-RPC over UDP on the loopback (event subscriptions, ul_dump).
+loadmodule "mi_datagram.so"
+modparam("mi_datagram", "socket_name", "udp:${LISTEN_IP}:${MI_PORT}")
+
+#### Events towards the Gateway: JSON-RPC notifications over UDP to whoever subscribed through MI (event_subscribe)
+loadmodule "event_datagram.so"
 
 #### Accounts: digest hashes written by the Gateway (provider-opensips) in `subscriber`
 loadmodule "db_postgres.so"
@@ -93,6 +101,14 @@ modparam("dialog", "db_mode", 0)
 modparam("dialog", "default_timeout", 14400)
 loadmodule "rtpengine.so"
 modparam("rtpengine", "rtpengine_sock", "${RTPENGINE_SOCK}")
+
+#### Accounting: CDRs in the database (the reference history) and the same as events for the Gateway (E_ACC_EVENT at
+#### the answer, E_ACC_CDR at the end of the dialog, E_ACC_MISSED_EVENT for a call that did not go through). Caller
+#### and callee as extra fields: the default ones only carry tags and the Call-ID.
+loadmodule "acc.so"
+modparam("acc", "db_url", "${OPENSIPS_DB_URL}")
+modparam("acc", "extra_fields", "db: caller; callee")
+modparam("acc", "extra_fields", "evi: caller; callee")
 
 #### Routing ###########################################################################################################
 
@@ -228,6 +244,16 @@ route {
 	fix_nated_contact();
 	create_dialog();
 
+	# Who calls whom, as dialled (the Request-URI changes with the lookup): for the CDR and the events.
+	$avp(caller) = $fU;
+	$avp(callee) = $rU;
+	$acc_extra(caller) = $fU;
+	$acc_extra(callee) = $rU;
+	do_accounting("db|evi", "cdr|missed");
+	# The call starts: told to the Gateway (ringing, answer and end follow; the end comes from acc).
+	route(event_attrs);
+	raise_event("E_TWAKEPHONE_CALLING", $avp(ev_attr), $avp(ev_val));
+
 	# Every registered window of the callee rings (parallel forking); the first that answers takes the call.
 	if (!lookup("location")) {
 		t_reply(404, "Not Found");
@@ -254,6 +280,31 @@ onreply_route[rtp] {
 	fix_nated_contact();
 	if (has_body_part("application/sdp"))
 		route(rtp_answer);
+	# Ringing and answer are not accounted: told to the Gateway as events of our own, once per call. Only the
+	# initial INVITE carries $avp(callee): the 200 of a re-INVITE (hold, resume) raises nothing.
+	if ($avp(callee) != NULL) {
+		if (($rs == 180 || $rs == 183) && $avp(ringing) == NULL) {
+			$avp(ringing) = 1;
+			route(event_attrs);
+			raise_event("E_TWAKEPHONE_RINGING", $avp(ev_attr), $avp(ev_val));
+		} else if ($rs == 200 && $avp(answered) == NULL) {
+			$avp(answered) = 1;
+			route(event_attrs);
+			raise_event("E_TWAKEPHONE_ANSWERED", $avp(ev_attr), $avp(ev_val));
+		}
+	}
+}
+
+# The attributes of our events (E_TWAKEPHONE_*): who calls whom as dialled, and the Call-ID the CDR carries too.
+route[event_attrs] {
+	$avp(ev_attr) = NULL;
+	$avp(ev_val) = NULL;
+	$avp(ev_attr) = "callee";
+	$avp(ev_val) = $avp(callee);
+	$avp(ev_attr) = "caller";
+	$avp(ev_val) = $avp(caller);
+	$avp(ev_attr) = "callid";
+	$avp(ev_val) = $ci;
 }
 
 failure_route[call_failed] {

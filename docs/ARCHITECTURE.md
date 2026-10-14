@@ -29,7 +29,7 @@ flowchart LR
   GW -- "LDAP" --> SSO
   GW --> Prov
   GW --> Conf
-  Prov -- "comptes dans subscriber (étape 4 : événements, MI)" --> OS
+  Prov -- "comptes et CDR dans PostgreSQL ; MI et événements (UDP, ADR 0011)" --> OS
   Conf -.-> Meet
   OS --- RTP
   OS -. "SIP" .-> Trunk
@@ -42,13 +42,13 @@ flowchart LR
 
 Trait plein : contrôle (REST, base de données). Pointillés : signalisation SIP. Double trait : audio.
 
-**Deux zones.** La passerelle, ses providers et le serveur SIP sont déployés et exploités avec Twake (`docker/docker-compose.sip.yml` pour OpenSIPS, rtpengine et leur PostgreSQL). L'opérateur est **à l'extérieur** : joint par SIP et RTP, il peut être remplacé. Dans la zone Twake, seul `provider-opensips` connaît OpenSIPS ; `provider-asterisk`, le provider de référence du POC (ARI), reste dans le dépôt jusqu'à l'étape 4, qui donne à `provider-opensips` les événements, la présence et l'historique. Ce qu'un PBX externe doit fournir est dans [PBX-REQUIREMENTS.md](PBX-REQUIREMENTS.md).
+**Deux zones.** La passerelle, ses providers et le serveur SIP sont déployés et exploités avec Twake (`docker/docker-compose.sip.yml` pour OpenSIPS, rtpengine et leur PostgreSQL). L'opérateur est **à l'extérieur** : joint par SIP et RTP, il peut être remplacé. Dans la zone Twake, seul `provider-opensips` connaît OpenSIPS ; `provider-asterisk`, le provider de référence du POC (ARI), reste dans le dépôt jusqu'à la fin de l'étape 4 (PR 4c), `provider-opensips` ayant désormais les événements, la présence et l'historique (PR 4a, ADR 0011). Ce qu'un PBX externe doit fournir est dans [PBX-REQUIREMENTS.md](PBX-REQUIREMENTS.md).
 
 **Deux plans séparés (cahier §25) :**
 
 | Plan | Qui | Où |
 |---|---|---|
-| Contrôle : comptes, session média, présence, état des appels, événements, historique | Gateway et provider, via l'API REST/WebSocket du Gateway ; côté serveur SIP, la table `subscriber` aujourd'hui, les événements et l'interface MI d'OpenSIPS à l'étape 4 | `apps/gateway`, `packages/provider-opensips` (`packages/provider-asterisk` jusqu'à l'étape 4) |
+| Contrôle : comptes, session média, présence, état des appels, événements, historique | Gateway et provider, via l'API REST/WebSocket du Gateway ; côté serveur SIP, la table `subscriber`, les CDR du module `acc`, les événements (`event_datagram`) et l'interface MI (`mi_datagram`) d'OpenSIPS | `apps/gateway`, `packages/provider-opensips` (`packages/provider-asterisk` jusqu'à l'étape 4) |
 | Média et signalisation d'appel : SIP, ICE, DTLS-SRTP, attente, DTMF, transferts | Le navigateur directement vers le serveur SIP | `packages/softphone` (JsSIP) |
 
 Le Gateway ne voit jamais l'audio.
@@ -88,7 +88,7 @@ flowchart TB
 |---|---|---|
 | `telephony-types` | `Call`, `CallState`, `Presence`, `Capabilities`, `TelephonyEvent`, `MediaSession`… | Non |
 | `provider-sdk` | Contrat qu'un provider doit respecter (`originate`, `hangup`, `hold`, `subscribe`, `getCapabilities`…) | Non |
-| `provider-opensips` | Session média `sip-webrtc` (URL WSS, domaine, poste, secret, ICE) et comptes dans la table `subscriber` d'OpenSIPS (empreintes `ha1`) ; événements, présence et historique à l'étape 4. Aucune notion OpenSIPS n'en sort. | Oui, c'est son rôle |
+| `provider-opensips` | Session média `sip-webrtc` (URL WSS, domaine, poste, secret, ICE), comptes dans la table `subscriber` d'OpenSIPS (empreintes `ha1`), abonnement aux événements d'OpenSIPS par MI (`events.ts`) et suivi pur des appels et de la présence par poste (`tracker.ts`, ADR 0011). Aucune notion OpenSIPS n'en sort. | Oui, c'est son rôle |
 | `provider-asterisk` | Provider de référence du POC : traduit le contrat vers ARI (avec sa propre session média `sip-webrtc`, `src/sip-media.ts`). Retiré à l'étape 4. | Oui, c'est son rôle |
 | `apps/gateway` | API publique `/api/v1`, annuaire LDAP, correspondances utilisateur↔poste, bus d'événements, registre des providers par tenant | Non |
 | `telephony-client` | SDK front : REST (appels, historique, conférences), WebSocket avec reconnexion, normalisation et formatage E.164 | Non |
@@ -108,11 +108,12 @@ Fastify, TypeScript. Routes principales sous `/api/v1` :
 |---|---|
 | `GET /me`, `/me/endpoints`, `/me/media-session` | Identité, endpoints, session média (identité SIP + URL WSS) |
 | `GET /capabilities` | Ce que le provider sait faire ; l'UI s'adapte |
-| `GET/PUT /me/presence` | Présence normalisée (`available`, `busy`, `away`, `dnd`, `offline`) |
+| `GET/PUT /me/presence` | Présence normalisée (`available`, `busy`, `away`, `dnd`, `offline`) ; `PUT` répond la présence effective (ce que les autres voient) |
+| `GET /presence` | Présence de tout le tenant, par poste, quand le provider la tient à jour (`realtime`) |
 | `POST /calls` (+ `Idempotency-Key`) | Crée un appel (click-to-call) |
 | `GET /calls/history`, `DELETE /me/history` | Historique serveur de l'appelant (filtres, curseur) et effacement |
 | `POST /calls/:id/{hangup,hold,resume,dtmf,transfer,answer,reject}` | Actions sur un appel, réservées à ses participants (voir ci-dessous) |
-| `POST /ws-ticket`, `GET /ws` | Ticket à usage unique, puis flux d'événements temps réel de l'utilisateur |
+| `POST /ws-ticket`, `GET /ws` | Ticket à usage unique, puis flux d'événements temps réel : ceux de l'utilisateur (appels) et ceux du tenant (`presence.changed`, avec le poste) |
 | `POST /conferences`, `GET/DELETE /conferences/:id`, `POST /conferences/:id/participants`, `DELETE …/participants/:pid`, `POST …/participants/:pid/mute` | Accès téléphonique à une salle Meet (§12) |
 | `POST /webhooks/livekit` | Webhooks LiveKit, authentifiés par signature (§12) |
 | `/health`, `/ready`, `/docs`, `/openapi.json` | Exploitation |
@@ -132,11 +133,11 @@ Mécanismes :
 - **Synchronisation des comptes** (`directory-sync.ts`) : quand l'annuaire sait quel attribut porte le poste (`LDAP_ATTR_EXTENSION`), ses personnes deviennent des correspondances utilisateur ↔ poste (`user_mappings`, avec le nom, le service, `source = ldap` et la date), toutes les `LDAP_SYNC_INTERVAL` et à la demande (`POST /admin/directory/sync`). Une seule exécution à la fois par processus (`POST` répond 202, l'écran suit `GET /admin/directory`) ; le rapport (vus, avec poste, créés, mis à jour, retirés, conflits) est gardé en mémoire. L'annuaire fait foi pour les personnes qu'il connaît ; une correspondance manuelle d'une personne inconnue de l'annuaire n'est ni retirée ni dépossédée de son poste ; un poste donné à deux personnes reste à celle qui l'a déjà, sinon à la première listée ; un conflit ne coûte jamais sa correspondance à la personne (tout est tranché avant la première écriture) ; un listing vide ne retire rien (filtre ou compte lecteur en cause) ; les lignes à réécrire sont retirées avant les écritures, pour que deux personnes puissent échanger leurs postes. Les écritures ne sont pas dans une transaction et le verrou est en mémoire : avec plusieurs réplicas, deux exécutions simultanées se signalent des conflits que l'exécution suivante répare ; un verrou en base viendra avec l'exploitation multi-réplicas (ADR 0009).
 - **Administrateurs** (`admin.ts`) : le rôle `ADMIN_ROLE` dans la revendication `JWT_ROLES_CLAIM` du jeton (aucune revendication lue si la variable est absente), ou un utilisateur de `ADMIN_USERS`. `/me` le dit dans `features.admin` ; les routes `/admin/*` répondent 403 aux autres. Hors mode `dev` (où l'en-tête `x-dev-roles` est cru, comme `x-dev-user`), rien dans une requête ne peut se déclarer administrateur.
 - **En-têtes de sécurité** (`security.ts`) : toute réponse porte `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'`, `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy` et `Cache-Control: no-store` (l'interface OpenAPI sous `/docs` garde une politique qui la laisse tourner) ; `Strict-Transport-Security` quand `HSTS_MAX_AGE` est renseigné (`0` le retire, `HSTS_INCLUDE_SUBDOMAINS=1` l'étend).
-- **Historique** : chaque fin d'appel vue par le provider est enregistrée pour l'utilisateur concerné (`history.ts`, idempotent sur l'identifiant d'appel). `GET /calls/history` filtre par direction, statut, numéro, dates et pagine par curseur ; `DELETE /me/history` efface l'historique de l'appelant.
+- **Historique** : chaque fin d'appel vue par le provider est enregistrée pour l'utilisateur concerné (`history.ts`, idempotent sur l'identifiant d'appel) ; avec OpenSIPS, les deux parties de l'appel reçoivent la leur (sortant, entrant, manqué, refusé), et l'app recharge les Récents à chaque fin d'appel reçue sur le WebSocket. `GET /calls/history` filtre par direction, statut, numéro, dates et pagine par curseur ; `DELETE /me/history` efface l'historique de l'appelant.
 - **Secrets SIP** (`sip-secrets.ts`) : un secret aléatoire par utilisateur, généré par le Gateway, poussé au PBX par son API de provisionnement puis conservé chiffré (AES-256-GCM) en base. Rien n'est stocké dans un doctype ni dans le front : le navigateur ne le reçoit que par l'appel authentifié `media-session`. Si le PBX refuse, rien n'est enregistré.
 - **Secrets de configuration** : la configuration d'un provider ne contient que des références (`env:ARI_PASSWORD`), résolues au démarrage.
 - **Registre de providers par tenant** (`registry.ts`) : point d'extension multi-tenant et multi-provider.
-- **Bus d'événements** (`events.ts`) : diffuse chaque événement au seul utilisateur concerné. Mémoire aujourd'hui, interface prévue pour Redis.
+- **Bus d'événements** (`events.ts`) : diffuse chaque appel à ses seuls participants et chaque changement de présence à tout le tenant ; la passerelle garde la présence courante par poste pour `GET /presence`. Mémoire aujourd'hui, interface prévue pour Redis (qui devra aussi porter la présence entre réplicas).
 - **Prêt à fonctionner** : `/ready` n'est vert que si tous les providers sont `CONNECTED` ; `originate` refuse (503) si la liaison PBX est coupée.
 - Les journaux masquent les en-têtes d'autorisation et les tickets.
 
@@ -228,7 +229,7 @@ Réécrit à l'étape 3 sur JsSIP (ADR 0003) : `UA` et `RTCSession`. Il ne fait 
 - **Périphériques** : le softphone ouvre lui-même le micro de chaque appel (flux passé à JsSIP) : le micro choisi dans les réglages en `exact` (Chromium ignore `ideal`), le défaut s'il n'est pas là ; il relâche ce qu'il a ouvert à la fin de l'appel. Changement de micro pendant l'appel par `replaceTrack` (sans renégociation, mute conservé, bascules sérialisées) ; un casque débranché termine sa piste, l'appel repart sur le micro choisi ou le défaut, et reprend le micro choisi quand il revient (`devicechange`) ; sortie de la voix et de la sonnerie par `setSinkId` (Chromium, Edge, Firefox 116+ ; sinon la sortie système). Le choix reste dans le navigateur (`localStorage`), pas sur le serveur ; un périphérique choisi mais absent reste choisi et l'écran le dit. Avant la première autorisation du micro, les navigateurs ne listent rien d'utilisable : l'écran propose de l'autoriser.
 - **Sonnerie** : deux brèves tonalités toutes les quatre secondes, faites en WebAudio (rien à charger, rien à autoriser dans la CSP) et jouées par un élément audio pour suivre la sortie choisie ; sonne tant qu'un appel entrant sonne (pas pour un INVITE avec `Replaces`, répondu d'emblée). Toutes les fenêtres enregistrées de la personne sonnent (fourche parallèle d'OpenSIPS) ; la première qui répond prend l'appel, les autres lisent « pris sur un autre poste ».
 - **Son bloqué** : quand le navigateur exige un geste avant tout son (page rechargée sans clic), le softphone le détecte (`play()` refusé pour `NotAllowedError`, `AudioContext` qui ne démarre pas : les navigateurs laissent `resume()` en attente jusqu'au geste, le softphone n'attend que 500 ms), l'app affiche « Activer le son », et le premier clic ou la première touche n'importe où lève le blocage (réarmé tant que le geste n'a pas suffi). Une lecture interrompue par la fin d'un appel ou de la sonnerie n'est pas un blocage. Hors sonnerie, le contexte audio est suspendu. Les e2e ne le jouent pas (Chromium piloté par Playwright autorise le son sans geste) ; tests unitaires de la sonnerie sur un `AudioContext` factice et du softphone sur une sonnerie factice.
-- Le nom affiché sur un appel entrant vient du `From` posé par l'appelant (une personne authentifiée peut y mettre ce qu'elle veut) ; l'étape 4 le fera poser par OpenSIPS depuis l'annuaire.
+- Le nom affiché sur un appel entrant vient du `From` posé par l'appelant (une personne authentifiée peut y mettre ce qu'elle veut) ; la PR 4c le fera poser par OpenSIPS depuis l'annuaire.
 - Un seul tenant par serveur OpenSIPS pour l'instant : `subscriber` n'a pas de colonne de tenant (`use_domain 0`) et `lookup("location")` route entre tous les postes enregistrés. Le multi-tenant SIP viendra avec l'administration (étape 7).
 
 ## 6. L'application TwakePhone (`apps/web`)
@@ -252,7 +253,7 @@ Leçons du POC, gardées pour l'étape 9 : dans une iframe sans hauteur, la feui
 
 ## 8. Le serveur SIP de développement (`docker/`)
 
-Le PBX de dev du POC (MiniPBX avec un overlay WebRTC et ARI, la stack Twake Workplace clonée et corrigée, LiveKit SIP) a été retiré à la PR 3c. Le MVP tourne sur `docker/docker-compose.sip.yml` : OpenSIPS 3.6 (registrar, WS et WSS, digest sur `subscriber`, routage entre postes, `dialog`), rtpengine (DTLS-SRTP, ICE) et un PostgreSQL ; la configuration et ses limites sont dans [docker/README.md](../docker/README.md). C'est la même stack que la CI (`yarn e2e:sip`). L'étape 4 branche la passerelle sur les événements d'OpenSIPS (`provider-opensips`), l'étape 6 y ajoute le trunk et l'anti-fraude, l'étape 8 LiveKit SIP pour Meet.
+Le PBX de dev du POC (MiniPBX avec un overlay WebRTC et ARI, la stack Twake Workplace clonée et corrigée, LiveKit SIP) a été retiré à la PR 3c. Le MVP tourne sur `docker/docker-compose.sip.yml` : OpenSIPS 3.6 (registrar, WS et WSS, digest sur `subscriber`, routage entre postes, `dialog`), rtpengine (DTLS-SRTP, ICE) et un PostgreSQL ; la configuration et ses limites sont dans [docker/README.md](../docker/README.md). C'est la même stack que la CI (`yarn e2e:sip`). Depuis la PR 4a, la passerelle s'abonne aux événements d'OpenSIPS (`mi_datagram`, `event_datagram`) et OpenSIPS écrit les CDR (`acc`) : l'annuaire montre la présence des collègues, les Récents viennent du serveur SIP (ADR 0011). L'étape 6 ajoute le trunk et l'anti-fraude, l'étape 8 LiveKit SIP pour Meet.
 
 ## 9. Chemin des données, de bout en bout
 
@@ -261,7 +262,8 @@ Le PBX de dev du POC (MiniPBX avec un overlay WebRTC et ARI, la stack Twake Work
 | Connexion | OIDC (PKCE) | App, LemonLDAP::NG |
 | Annuaire, favoris, capacités, session média, historique | HTTPS (REST) | App, Gateway (LDAP pour l'annuaire) |
 | Événements temps réel | WebSocket | Gateway, App (`/api/v1/ws`) |
-| Comptes SIP | SQL | Gateway/provider, table `subscriber` d'OpenSIPS (événements et MI à l'étape 4) |
+| Comptes SIP, CDR | SQL | Gateway/provider, tables `subscriber`, `acc` et `missed_calls` d'OpenSIPS |
+| Événements d'OpenSIPS, abonnement et relecture d'état | JSON-RPC sur UDP (`event_datagram`, `mi_datagram`), boucle locale | OpenSIPS, provider-opensips |
 | Signalisation SIP : enregistrement, appels, attente, DTMF, transferts | SIP sur WSS | Navigateur, OpenSIPS |
 | Audio | RTP/SRTP (DTLS), ICE | Navigateur, rtpengine |
 | Appels de l'opérateur (étape 6) | SIP/UDP + RTP | Opérateur, OpenSIPS, rtpengine |
@@ -271,10 +273,10 @@ Le PBX de dev du POC (MiniPBX avec un overlay WebRTC et ARI, la stack Twake Work
 
 | Commande | Ce qui est vérifié |
 |---|---|
-| `yarn test` | Unitaires (vitest) : types, client (E.164, backoff, lien Meet), softphone, provider OpenSIPS (`subscriber`, empreintes), tracker Asterisk (états, présence), reconnexion ARI, Gateway (REST, WS, authentification, annuaire, synchronisation, appartenance des appels, conférences, webhooks), `conference-livekit` (jetons, trunks, API Meet), `phone-link`, app web et son serveur |
+| `yarn test` | Unitaires (vitest) : types, client (E.164, backoff, lien Meet), softphone, provider OpenSIPS (`subscriber`, empreintes, abonnement MI contre un faux OpenSIPS en UDP, suivi des appels et de la présence avec les événements tels qu'OpenSIPS les envoie), tracker Asterisk (états, présence), reconnexion ARI, Gateway (REST, WS, authentification, annuaire, synchronisation, appartenance des appels, conférences, webhooks), `conference-livekit` (jetons, trunks, API Meet), `phone-link`, app web et son serveur |
 | `TEST_DATABASE_URL=… yarn test` | Le même contrat de stockage contre PostgreSQL (isolation entre tenants, conférences, favoris) |
 | `yarn e2e:web` | L'app web dans Chromium, servie par son serveur de production : OIDC, administration, annuaire, en-têtes de sécurité (sans Docker) |
-| `yarn e2e:sip` | Trois personnes dans Chromium, Firefox ou Edge (`BROWSER`, deux moteurs : Edge est un Chromium) à travers OpenSIPS et rtpengine (Docker Compose) : enregistrement WSS, appel, RTP dans les deux sens, attente, DTMF, transferts, périphériques, sonnerie, seconde fenêtre, reconnexion après coupure, désinscription |
+| `yarn e2e:sip` | Trois personnes dans Chromium, Firefox ou Edge (`BROWSER`, deux moteurs : Edge est un Chromium) à travers OpenSIPS et rtpengine (Docker Compose) : enregistrement WSS, appel, RTP dans les deux sens, attente, DTMF, transferts, périphériques, sonnerie, seconde fenêtre, reconnexion après coupure, désinscription ; présence dans l'annuaire (en communication en moins de 3 s), Récents des deux côtés, CDR dans `acc`, appel abandonné rendu manqué |
 
 Les e2e du POC sur sa propre stack (`yarn e2e:live` contre MiniPBX par ARI, `yarn e2e:widget` dans un hôte `cozy-interapp`, `platform.e2e.mjs` pour Meet sur la plateforme) sont partis avec lui ; Meet par téléphone est rejoué sur OpenSIPS à l'étape 8.
 

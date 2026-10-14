@@ -1,5 +1,6 @@
-import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react'
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { TelephonyClient } from '@twake/telephony-client'
+import type { TelephonyEvent } from '@twake/telephony-types'
 import { useAuth } from './auth/AuthProvider.js'
 import type { AppConfig } from './config.js'
 
@@ -17,6 +18,8 @@ interface Gateway {
   meError: string | null
   /** Asks the Gateway again who the user is (after a synchronisation gave them an extension, for instance). */
   refreshMe: () => void
+  /** What the Gateway tells as it happens (the presence of the others, calls); one stream for the whole app. */
+  onEvent: (listener: (event: TelephonyEvent) => void) => () => void
 }
 
 const GatewayContext = createContext<Gateway | null>(null)
@@ -54,7 +57,20 @@ export const GatewayProvider = ({ config, children }: { config: AppConfig; child
     }
   }, [client, signedIn, generation])
 
-  const value = useMemo(() => ({ client, me, meError, refreshMe }), [client, me, meError, refreshMe])
+  // The event stream stays open while signed in; each part of the app listens to what concerns it.
+  const listeners = useRef(new Set<(event: TelephonyEvent) => void>())
+  useEffect(() => {
+    if (!signedIn) return
+    return client.connect(event => {
+      for (const listener of listeners.current) listener(event)
+    })
+  }, [client, signedIn])
+  const onEvent = useCallback((listener: (event: TelephonyEvent) => void) => {
+    listeners.current.add(listener)
+    return () => void listeners.current.delete(listener)
+  }, [])
+
+  const value = useMemo(() => ({ client, me, meError, refreshMe, onEvent }), [client, me, meError, refreshMe, onEvent])
   return <GatewayContext.Provider value={value}>{children}</GatewayContext.Provider>
 }
 

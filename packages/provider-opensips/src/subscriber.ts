@@ -6,6 +6,9 @@ import type { SecretProvisioner } from '@twake/telephony-provider-sdk'
 
 /** Table version OpenSIPS 3.6 expects in its `version` table for `subscriber` (scripts/postgres/auth_db-create.sql). */
 export const SUBSCRIBER_TABLE_VERSION = 8
+/** Same for the `acc` and `missed_calls` tables of the acc module (scripts/postgres/acc-create.sql). */
+export const ACC_TABLE_VERSION = 7
+export const MISSED_CALLS_TABLE_VERSION = 5
 
 const hex = (algorithm: string, input: string) => createHash(algorithm).update(input).digest('hex')
 
@@ -18,7 +21,11 @@ export const digestHashes = (username: string, realm: string, secret: string) =>
   return { ha1: hex('md5', a1), ha1Sha256: hex('sha256', a1), ha1Sha512t256: hex('sha512-256', a1) }
 }
 
-/** The schema OpenSIPS 3.6 ships for PostgreSQL, plus the row of the `version` table it checks at startup. */
+/**
+ * The schema OpenSIPS 3.6 ships for PostgreSQL (`subscriber` of auth_db; `acc` and `missed_calls` of acc, the
+ * CDRs, with the caller and callee as dialled as extra columns), plus the rows of the `version` table it checks
+ * at startup.
+ */
 export const SUBSCRIBER_SCHEMA = `
 CREATE TABLE IF NOT EXISTS version (
     table_name VARCHAR(32) NOT NULL,
@@ -37,6 +44,41 @@ CREATE TABLE IF NOT EXISTS subscriber (
 );
 CREATE INDEX IF NOT EXISTS subscriber_username_idx ON subscriber (username);
 INSERT INTO version (table_name, table_version) VALUES ('subscriber', ${SUBSCRIBER_TABLE_VERSION})
+  ON CONFLICT (table_name) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS acc (
+    id SERIAL PRIMARY KEY NOT NULL,
+    method VARCHAR(16) DEFAULT '' NOT NULL,
+    from_tag VARCHAR(64) DEFAULT '' NOT NULL,
+    to_tag VARCHAR(64) DEFAULT '' NOT NULL,
+    callid VARCHAR(64) DEFAULT '' NOT NULL,
+    sip_code VARCHAR(3) DEFAULT '' NOT NULL,
+    sip_reason VARCHAR(32) DEFAULT '' NOT NULL,
+    time TIMESTAMP WITHOUT TIME ZONE NOT NULL,
+    duration INTEGER DEFAULT 0 NOT NULL,
+    ms_duration INTEGER DEFAULT 0 NOT NULL,
+    setuptime INTEGER DEFAULT 0 NOT NULL,
+    created TIMESTAMP WITHOUT TIME ZONE DEFAULT NULL,
+    caller VARCHAR(64) DEFAULT '' NOT NULL,
+    callee VARCHAR(64) DEFAULT '' NOT NULL
+);
+CREATE INDEX IF NOT EXISTS acc_callid_idx ON acc (callid);
+CREATE TABLE IF NOT EXISTS missed_calls (
+    id SERIAL PRIMARY KEY NOT NULL,
+    method VARCHAR(16) DEFAULT '' NOT NULL,
+    from_tag VARCHAR(64) DEFAULT '' NOT NULL,
+    to_tag VARCHAR(64) DEFAULT '' NOT NULL,
+    callid VARCHAR(64) DEFAULT '' NOT NULL,
+    sip_code VARCHAR(3) DEFAULT '' NOT NULL,
+    sip_reason VARCHAR(32) DEFAULT '' NOT NULL,
+    time TIMESTAMP WITHOUT TIME ZONE NOT NULL,
+    setuptime INTEGER DEFAULT 0 NOT NULL,
+    created TIMESTAMP WITHOUT TIME ZONE DEFAULT NULL,
+    caller VARCHAR(64) DEFAULT '' NOT NULL,
+    callee VARCHAR(64) DEFAULT '' NOT NULL
+);
+CREATE INDEX IF NOT EXISTS missed_calls_callid_idx ON missed_calls (callid);
+INSERT INTO version (table_name, table_version) VALUES ('acc', ${ACC_TABLE_VERSION}), ('missed_calls', ${MISSED_CALLS_TABLE_VERSION})
   ON CONFLICT (table_name) DO NOTHING;
 `
 
@@ -75,12 +117,14 @@ export class SubscriberProvisioner implements SecretProvisioner {
     this.domain = opts.domain ?? ''
   }
 
-  /** Creates the tables when missing; refuses a `subscriber` table of another version (OpenSIPS owns that row). */
+  /** Creates the tables when missing; refuses a table of another version (OpenSIPS owns those rows). */
   async ensureSchema() {
     await this.pool.query(SUBSCRIBER_SCHEMA)
-    const { rows } = (await this.pool.query("SELECT table_version FROM version WHERE table_name = 'subscriber'")) as { rows: { table_version: number }[] }
-    const version = rows[0]?.table_version
-    if (version !== SUBSCRIBER_TABLE_VERSION) throw new Error(`subscriber table version ${version} in the database, ${SUBSCRIBER_TABLE_VERSION} expected`)
+    const { rows } = (await this.pool.query("SELECT table_name, table_version FROM version WHERE table_name IN ('subscriber', 'acc', 'missed_calls')")) as { rows: { table_name: string; table_version: number }[] }
+    for (const [table, expected] of [['subscriber', SUBSCRIBER_TABLE_VERSION], ['acc', ACC_TABLE_VERSION], ['missed_calls', MISSED_CALLS_TABLE_VERSION]] as const) {
+      const version = rows.find(r => r.table_name === table)?.table_version
+      if (version !== expected) throw new Error(`${table} table version ${version} in the database, ${expected} expected`)
+    }
   }
 
   async setSipSecret(extension: string, secret: string) {
