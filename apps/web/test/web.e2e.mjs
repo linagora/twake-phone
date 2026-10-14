@@ -208,6 +208,10 @@ try {
   })
   await step('switching the language to English changes the UI, the title and the document language', async () => {
     await page.getByRole('link', { name: 'Réglages' }).click()
+    // The audio devices live here too; without a phone on this platform the ringtone cannot be tested.
+    await page.getByRole('heading', { level: 2, name: 'Audio' }).waitFor()
+    await page.getByLabel('Microphone').waitFor()
+    if (!(await page.getByRole('button', { name: 'Tester la sonnerie' }).isDisabled())) throw new Error('the ringtone test must wait for a phone')
     await page.getByLabel("Langue de l'interface").selectOption('en')
     await page.getByRole('heading', { level: 1, name: 'Settings' }).waitFor()
     expectEqual(await page.title(), 'Settings – TwakePhone', 'document title')

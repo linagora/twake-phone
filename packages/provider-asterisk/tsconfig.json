@@ -13,9 +13,6 @@
     },
     {
       "path": "../provider-sdk"
-    },
-    {
-      "path": "../sip-media"
     }
   ],
   "exclude": [

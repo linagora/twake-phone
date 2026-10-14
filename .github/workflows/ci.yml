@@ -34,13 +34,7 @@ jobs:
         with:
           node-version: 22
           cache: yarn
-          cache-dependency-path: |
-            yarn.lock
-            apps/phone/yarn.lock
       - run: yarn install --frozen-lockfile
-      # cozy-client et cozy-interapp sont des peer deps de phone-link, installées avec l'app :
-      # vitest.config.ts les résout dans apps/phone/node_modules (engines 24.x, d'où --ignore-engines).
-      - run: yarn --cwd apps/phone install --frozen-lockfile --ignore-engines
       - run: yarn build
       - run: yarn typecheck
       - name: Tests unitaires et contrat de stockage (mémoire et PostgreSQL)
@@ -69,67 +63,57 @@ jobs:
           path: apps/web/dist/e2e-failure.png
           if-no-files-found: ignore
 
-  app-phone:
-    name: App Phone (Node 24)
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
-          cache: yarn
-          cache-dependency-path: |
-            yarn.lock
-            apps/phone/yarn.lock
-      # L'app résout @twake/* vers packages/*/dist (jest.config.js, rsbuild.config.mjs) :
-      # il faut installer et construire la racine d'abord.
-      - run: yarn install --frozen-lockfile
-      - run: yarn build
-      - run: yarn install --frozen-lockfile
-        working-directory: apps/phone
-      - run: yarn lint
-        working-directory: apps/phone
-      - run: yarn test
-        working-directory: apps/phone
-      - run: yarn build
-        working-directory: apps/phone
-
   sip-e2e:
-    name: SIP (OpenSIPS, rtpengine, trois navigateurs)
+    name: SIP (OpenSIPS, rtpengine, ${{ matrix.browser }})
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        browser: [chromium, firefox, msedge]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: yarn
-          cache-dependency-path: |
-            yarn.lock
-            apps/phone/yarn.lock
-      # La stack SIP se construit pendant que le dépôt s'installe : OpenSIPS 3.6 (image officielle + modules WSS,
-      # TLS, PostgreSQL), rtpengine en espace utilisateur, PostgreSQL avec la table `subscriber`. Réseau hôte.
+      # La stack SIP d'abord (`--wait` bloque jusqu'aux healthchecks) : OpenSIPS 3.6 (image officielle + modules
+      # WSS, TLS, PostgreSQL), rtpengine en espace utilisateur, PostgreSQL avec la table `subscriber`. Réseau hôte.
       - name: Stack SIP (Docker Compose)
         run: docker compose -f docker/docker-compose.sip.yml up --build --wait --wait-timeout 300
       - run: yarn install --frozen-lockfile
-      - run: yarn --cwd apps/phone install --frozen-lockfile --ignore-engines
       - run: yarn build
-      - name: Cache de Chromium (clé = version de playwright-core)
-        id: chromium-cache
+      - name: Cache du navigateur Playwright (clé = navigateur et version de playwright-core)
+        if: matrix.browser != 'msedge'
+        id: browser-cache
         uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright
-          key: chromium-${{ runner.os }}-${{ hashFiles('node_modules/playwright-core/package.json') }}
-      - name: Chromium
-        if: steps.chromium-cache.outputs.cache-hit != 'true'
-        run: npx playwright-core install --with-deps chromium
-      - name: Dépendances système de Chromium (cache ou non)
-        if: steps.chromium-cache.outputs.cache-hit == 'true'
-        run: npx playwright-core install-deps chromium
-      - name: e2e SIP (trois navigateurs, micro simulé, OpenSIPS et rtpengine en Docker)
+          key: ${{ matrix.browser }}-${{ runner.os }}-${{ hashFiles('node_modules/playwright-core/package.json') }}
+      - name: Navigateur Playwright
+        if: matrix.browser != 'msedge' && steps.browser-cache.outputs.cache-hit != 'true'
+        run: npx playwright-core install --with-deps ${{ matrix.browser }}
+      - name: Dépendances système du navigateur (cache ou non)
+        if: matrix.browser != 'msedge' && steps.browser-cache.outputs.cache-hit == 'true'
+        run: npx playwright-core install-deps ${{ matrix.browser }}
+      # Firefox n'a pas de sortie audio simulée : sans périphérique de sortie, son AudioContext ne démarre jamais
+      # (la sonnerie reste « bloquée »). Un serveur PulseAudio avec un puits nul lui en donne une.
+      - name: Sortie audio pour Firefox (PulseAudio, puits nul)
+        if: matrix.browser == 'firefox'
+        run: |
+          sudo apt-get install -y --no-install-recommends pulseaudio
+          pulseaudio --start --exit-idle-time=-1
+          pactl load-module module-null-sink sink_name=twakephone sink_properties=device.description=TwakePhone
+          pactl info | head -5
+      # Edge est préinstallé sur ubuntu-latest (la version suit l'image du runner, le script l'affiche) ; sinon
+      # Playwright l'installe par le dépôt Microsoft.
+      - name: Microsoft Edge
+        if: matrix.browser == 'msedge'
+        run: microsoft-edge --version || npx playwright-core install msedge
+      - name: e2e SIP (trois personnes dans ${{ matrix.browser }}, micro simulé, OpenSIPS et rtpengine en Docker)
         run: node apps/web/test/sip.e2e.mjs
         env:
+          BROWSER: ${{ matrix.browser }}
           SIP_WSS_URL: wss://127.0.0.1:8089
           OPENSIPS_DB_URL: postgres://twake:twake@127.0.0.1:54320/twake
       - name: Journaux de la stack SIP en cas d'échec
@@ -139,13 +123,11 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: e2e-sip-failure
+          name: e2e-sip-failure-${{ matrix.browser }}
           path: apps/web/dist/sip-e2e-failure-*.png
           if-no-files-found: ignore
       - name: Arrêt de la stack SIP
         if: always()
         run: docker compose -f docker/docker-compose.sip.yml down -v
 
-  # yarn e2e:web et yarn e2e:sip tournent ci-dessus. Les e2e du POC sur sa stack (yarn e2e:live, yarn e2e:widget,
-  # platform.e2e.mjs) demandent MiniPBX, LiveKit et la stack Twake : ils ne sont plus joués et partent avec le POC
-  # (étape 3c).
+  # yarn e2e:web et yarn e2e:sip tournent ci-dessus : tous les e2e du dépôt se jouent en CI.

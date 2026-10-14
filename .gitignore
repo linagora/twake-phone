@@ -11,9 +11,6 @@ coverage
 !.env.example
 *.local
 
-# Dev stack: repositories fetched by scripts/setup-references.sh (never committed)
-references/
-
 # Editors, OS, logs
 .DS_Store
 .idea
@@ -21,3 +18,6 @@ references/
 !.vscode/extensions.json
 *.log
 .swc
+
+# Arbres de travail temporaires des agents
+.claude/worktrees/

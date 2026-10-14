@@ -21,6 +21,8 @@ const CODE_KEY: Partial<Record<CallError['code'], Key>> = {
   'too-many-calls': 'call.errorTooManyCalls',
   'call-in-progress': 'call.errorCallInProgress',
   'not-established': 'call.errorNotEstablished',
+  'not-inbound': 'call.errorNotInbound',
+  'invalid-tone': 'call.errorInvalidTone',
   'call-ended': 'call.errorCallEnded',
   'offer-pending': 'call.errorOfferPending',
   'offer-refused': 'call.errorOfferRefused',

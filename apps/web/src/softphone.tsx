@@ -1,5 +1,5 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
-import { Softphone, type SoftCall } from '@twake/softphone'
+import { Softphone, type AudioDevices, type SoftCall } from '@twake/softphone'
 import { useAuth } from './auth/AuthProvider.js'
 import { displayNameFor } from './auth/oidc.js'
 import { useGateway } from './gateway.js'
@@ -20,6 +20,39 @@ export interface Phone {
   call(target: string): Promise<SoftCall>
   /** Unregisters and stops the softphone, before the page leaves (sign-out): the SIP server forgets this window. */
   shutdown(): Promise<void>
+  /** The person's devices, kept in this browser; applied to the calls in progress at once. */
+  devices: AudioDevices
+  setDevices(devices: AudioDevices): void
+  /** Bumped when the browser's devices change (a headset plugged in): lists are read again. */
+  devicesVersion: number
+  /** The browser blocks sound until the person clicks or types on the page. */
+  soundBlocked: boolean
+  unblockAudio(): Promise<boolean>
+  /** Rings for a moment, so the person hears where the ringtone goes. */
+  ringTest(): Promise<boolean>
+}
+
+const DEVICES_KEY = 'twakephone.audio'
+
+const readDevices = (): AudioDevices => {
+  try {
+    const raw = localStorage.getItem(DEVICES_KEY)
+    const parsed: unknown = raw ? JSON.parse(raw) : null
+    if (!parsed || typeof parsed !== 'object') return {}
+    const d = parsed as Record<string, unknown>
+    const pick = (k: string) => (typeof d[k] === 'string' && d[k] ? { [k]: d[k] as string } : {})
+    return { ...pick('microphoneId'), ...pick('outputId'), ...pick('ringerId') }
+  } catch {
+    return {}
+  }
+}
+
+const storeDevices = (devices: AudioDevices) => {
+  try {
+    localStorage.setItem(DEVICES_KEY, JSON.stringify(devices))
+  } catch {
+    // private mode: the choice lasts for the page
+  }
 }
 
 const PhoneContext = createContext<Phone | null>(null)
@@ -41,7 +74,12 @@ export const SoftphoneProvider = ({ children }: { children: ReactNode }) => {
   const [calls, setCalls] = useState<SoftCall[]>([])
   const [lastEnded, setLastEnded] = useState<SoftCall | null>(null)
   const [tones, setTones] = useState<Record<string, string>>({})
+  const [devices, setDevicesState] = useState<AudioDevices>(readDevices)
+  const [devicesVersion, setDevicesVersion] = useState(0)
+  const [soundBlocked, setSoundBlocked] = useState(false)
   const phone = useRef<Softphone | null>(null)
+  const devicesRef = useRef(devices)
+  devicesRef.current = devices
   const extension = me?.extension
   // The name goes in the From header at registration; a change (directory synchronisation) applies at the next
   // start, never by restarting the softphone in the middle of a call.
@@ -63,6 +101,9 @@ export const SoftphoneProvider = ({ children }: { children: ReactNode }) => {
       },
       audioContainer: audioHost.current,
       displayName: nameRef.current,
+      devices: devicesRef.current,
+      onAudioBlocked: blocked => !cancelled && setSoundBlocked(blocked),
+      onDevicesChange: () => !cancelled && setDevicesVersion(v => v + 1),
       onRegistration: (s, why) => {
         if (cancelled) return
         setState(s)
@@ -100,6 +141,7 @@ export const SoftphoneProvider = ({ children }: { children: ReactNode }) => {
       void softphone.stop()
       setCalls([])
       setState('off')
+      setSoundBlocked(false)
     }
   }, [client, extension])
 
@@ -120,17 +162,30 @@ export const SoftphoneProvider = ({ children }: { children: ReactNode }) => {
     setState('off')
   }, [])
 
-  const value = useMemo<Phone>(() => ({ state, detail, calls, lastEnded, tones, call, shutdown }), [state, detail, calls, lastEnded, tones, call, shutdown])
+  const setDevices = useCallback((d: AudioDevices) => {
+    setDevicesState(d)
+    storeDevices(d)
+    void phone.current?.setDevices(d)
+  }, [])
+  const unblockAudio = useCallback(async () => (phone.current ? phone.current.unblockAudio() : true), [])
+  const ringTest = useCallback(async () => (phone.current ? phone.current.ringTest() : false), [])
+
+  const value = useMemo<Phone>(
+    () => ({ state, detail, calls, lastEnded, tones, call, shutdown, devices, setDevices, devicesVersion, soundBlocked, unblockAudio, ringTest }),
+    [state, detail, calls, lastEnded, tones, call, shutdown, devices, setDevices, devicesVersion, soundBlocked, unblockAudio, ringTest]
+  )
   // What a test can read from outside: never actions, only counters (packets, calls, tones).
   useEffect(() => {
     window.twakephone = {
       state,
       calls: calls.map(c => ({ id: c.id, direction: c.direction, state: c.state, remoteNumber: c.remoteNumber, remoteHold: c.remoteHold, muted: c.muted, renegotiating: c.renegotiating, transferring: c.transferring, ...(c.replacedCallId ? { replacedCallId: c.replacedCallId } : {}), ...(c.consultationOf ? { consultationOf: c.consultationOf } : {}) })),
-      lastEnded: lastEnded ? { remoteNumber: lastEnded.remoteNumber, endReason: lastEnded.endReason, endStatus: lastEnded.endStatus } : null,
+      lastEnded: lastEnded ? { id: lastEnded.id, remoteNumber: lastEnded.remoteNumber, endReason: lastEnded.endReason, endStatus: lastEnded.endStatus } : null,
       tones,
+      devices,
+      soundBlocked,
       stats: () => Promise.all(calls.map(c => c.stats()))
     }
-  }, [state, calls, lastEnded, tones])
+  }, [state, calls, lastEnded, tones, devices, soundBlocked])
 
   return (
     <PhoneContext.Provider value={value}>
