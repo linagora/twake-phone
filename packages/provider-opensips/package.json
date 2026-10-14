@@ -1,7 +1,7 @@
 {
   "name": "@twake/provider-opensips",
   "version": "0.1.0",
-  "description": "OpenSIPS provider of the TwakePhone Gateway: SIP accounts in the subscriber table, media session of the browser softphone.",
+  "description": "OpenSIPS provider of the TwakePhone Gateway: SIP accounts in the subscriber table, media session of the browser softphone, events (presence, calls, CDR) heard from OpenSIPS over MI and event_datagram.",
   "license": "AGPL-3.0",
   "type": "module",
   "main": "dist/index.js",

@@ -2,6 +2,7 @@ import { Link } from 'react-router-dom'
 import { formatNumber, type Contact } from '@twake/telephony-client'
 import type { Favorites } from '../favorites.js'
 import { useT } from '../i18n/useT.js'
+import { PresenceBadge } from '../presence.js'
 
 /** A toggle: one stable name ("Favourite: Jean Dupont") and aria-pressed for the state, as the ARIA pattern asks. */
 export const FavoriteButton = ({ contact, favorites }: { contact: Contact; favorites: Favorites }) => {
@@ -30,6 +31,12 @@ export const ContactList = ({ contacts, favorites }: { contacts: Contact[]; favo
               </Link>
               <br />
               <span className="badge">{[c.department, n ? formatNumber(n.number) : t('contact.noNumber')].filter(Boolean).join(' · ')}</span>
+              {n?.type === 'extension' ? (
+                <>
+                  {' '}
+                  <PresenceBadge extension={n.number} />
+                </>
+              ) : null}
             </span>
             <span className="actions">
               <FavoriteButton contact={c} favorites={favorites} />

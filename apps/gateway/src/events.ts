@@ -28,4 +28,16 @@ export class EventBus {
   publish(tenantId: TenantId, userId: UserId, event: TelephonyEvent) {
     this.listeners.get(this.key(tenantId, userId))?.forEach(l => l(event))
   }
+
+  /** What everyone of a tenant hears (the presence of the others). */
+  subscribeTenant(tenantId: TenantId, listener: Listener): () => void {
+    return this.subscribe(tenantId, ALL, listener)
+  }
+
+  broadcast(tenantId: TenantId, event: TelephonyEvent) {
+    this.publish(tenantId, ALL, event)
+  }
 }
+
+/** No user id looks like this: the tenant-wide channel. */
+const ALL = '*'

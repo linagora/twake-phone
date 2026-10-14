@@ -175,5 +175,10 @@
   "settings.microphoneError": "Le microphone n'a pas pu être ouvert.",
   "phone.soundBlocked": "Le navigateur bloque le son jusqu'à un clic.",
   "phone.enableSound": "Activer le son",
-  "call.endedCancelledInbound": "Appel de {who} pris sur un autre poste ou abandonné."
+  "call.endedCancelledInbound": "Appel de {who} pris sur un autre poste ou abandonné.",
+  "presence.available": "Disponible",
+  "presence.busy": "En communication",
+  "presence.away": "Absent",
+  "presence.dnd": "Ne pas déranger",
+  "presence.offline": "Hors ligne"
 }

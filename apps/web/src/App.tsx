@@ -11,6 +11,7 @@ import { Dialer } from './pages/Dialer.js'
 import { ContactPage } from './pages/ContactPage.js'
 import { Directory } from './pages/Directory.js'
 import { FavoritesProvider } from './favorites.js'
+import { PresenceProvider } from './presence.js'
 import { Recents } from './pages/Recents.js'
 import { Settings } from './pages/Settings.js'
 import { SignIn } from './pages/SignIn.js'
@@ -25,6 +26,7 @@ const Gate = ({ config }: { config: AppConfig }) => {
     <GatewayProvider config={config}>
       <SoftphoneProvider>
         <FavoritesProvider>
+          <PresenceProvider>
           <BrowserRouter>
             <Routes>
               <Route element={<Layout />}>
@@ -38,6 +40,7 @@ const Gate = ({ config }: { config: AppConfig }) => {
               </Route>
             </Routes>
           </BrowserRouter>
+          </PresenceProvider>
         </FavoritesProvider>
       </SoftphoneProvider>
     </GatewayProvider>

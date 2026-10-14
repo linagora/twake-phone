@@ -132,7 +132,8 @@ export interface ConferenceParticipant {
 
 export type TelephonyEvent =
   | { type: 'call.created' | 'call.ringing' | 'call.connected' | 'call.held' | 'call.resumed' | 'call.ended' | 'call.failed'; timestamp: string; payload: { call: Call } }
-  | { type: 'presence.changed'; timestamp: string; payload: { userId: UserId; presence: Presence } }
+  /** `extension`: the telephony identity the presence is about, so that a directory can show it next to a contact. */
+  | { type: 'presence.changed'; timestamp: string; payload: { userId: UserId; extension?: string; presence: Presence } }
   | { type: 'endpoint.connected' | 'endpoint.disconnected'; timestamp: string; payload: { userId: UserId; endpoint: Endpoint } }
   | { type: 'conference.participant.joined' | 'conference.participant.left'; timestamp: string; payload: { participant: ConferenceParticipant } }
 

@@ -1,5 +1,5 @@
 import { AsteriskProvider, miniPbxProvisioner, type AsteriskConfig } from '@twake/provider-asterisk'
-import { OpensipsProvider, SubscriberProvisioner, type SubscriberProvisionerOptions } from '@twake/provider-opensips'
+import { OpensipsProvider, SubscriberProvisioner, type EventsLogger, type SubscriberProvisionerOptions } from '@twake/provider-opensips'
 import type { ProviderContext, ProviderFactory } from '@twake/telephony-provider-sdk'
 import { SipSecrets } from './sip-secrets.js'
 import type { Store } from './store/types.js'
@@ -76,6 +76,11 @@ export interface StoredOpensipsConfig {
   iceServers?: { urls: string[]; username?: string; credential?: string }[]
   /** `env:NAME` holding the URL of the database OpenSIPS's auth_db reads; may be the Gateway's own. */
   subscriberDbUrlRef: string
+  /**
+   * Where to hear OpenSIPS (ADR 0011): its MI socket (`udp:host:port` of `mi_datagram`) and the address this
+   * Gateway listens on for the events (`host[:port]`, reachable from OpenSIPS). Without it: no presence, no history.
+   */
+  events?: { miUrl: string; listen?: string }
 }
 
 export interface OpensipsFactoryDeps {
@@ -85,6 +90,8 @@ export interface OpensipsFactoryDeps {
   env?: NodeJS.ProcessEnv
   /** Test seam: builds the provisioner from its options. */
   provisionerFor?: (opts: SubscriberProvisionerOptions) => SubscriberProvisioner
+  /** Where the provider logs what OpenSIPS tells it; the console by default. */
+  logger?: EventsLogger
 }
 
 /**
@@ -93,7 +100,7 @@ export interface OpensipsFactoryDeps {
  * (and created when missing: dev and CI stacks share one fresh database) as soon as the provider is built, so a
  * wrong database shows in the Gateway's log at start-up and not at the first call.
  */
-export const storedOpensipsFactory = ({ store, key, env = process.env, provisionerFor = opts => new SubscriberProvisioner(opts) }: OpensipsFactoryDeps): ProviderFactory<StoredOpensipsConfig> => ({
+export const storedOpensipsFactory = ({ store, key, env = process.env, provisionerFor = opts => new SubscriberProvisioner(opts), logger }: OpensipsFactoryDeps): ProviderFactory<StoredOpensipsConfig> => ({
   type: 'opensips',
   create(config, context?: ProviderContext) {
     const tenantId = context?.tenantId ?? 'default'
@@ -126,7 +133,9 @@ export const storedOpensipsFactory = ({ store, key, env = process.env, provision
         if (!mapping) throw Object.assign(new Error('Extension is not mapped to a user'), { statusCode: 404 })
         return secrets.getOrCreate(tenantId, mapping.userId, extension)
       },
-      onClose: () => provisioner.close()
+      onClose: () => provisioner.close(),
+      ...(config.events ? { events: config.events } : {}),
+      ...(logger ? { logger } : {})
     })
   }
 })

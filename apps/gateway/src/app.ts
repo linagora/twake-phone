@@ -5,7 +5,7 @@ import swagger from '@fastify/swagger'
 import swaggerUi from '@fastify/swagger-ui'
 import { splitParticipantId, verifyWebhook, type LiveKitConferenceBridge, type MeetApi, type MeetRoom } from '@twake/conference-livekit'
 import type { MediaProvider, TelephonyProvider } from '@twake/telephony-provider-sdk'
-import type { CallDirection, Endpoint, PresenceStatus, TelephonyEvent, User } from '@twake/telephony-types'
+import type { CallDirection, Endpoint, Presence, PresenceStatus, TelephonyEvent, User } from '@twake/telephony-types'
 import { adminPolicyFromEnv, isAdmin, type AdminPolicy } from './admin.js'
 import { authenticatorFromEnv, TicketStore, type Authenticator, type Identity } from './auth.js'
 import { MAX_CONTACT_ID, MAX_FAVORITES, MAX_QUERY, MAX_SEARCH, RateLimiter, type ContactDirectory } from './contacts.js'
@@ -161,15 +161,28 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
   await app.register(swaggerUi, { routePrefix: '/docs' })
   await app.register(websocket)
 
-  // Pump provider events to the Twake users they concern, and keep the history of finished calls.
+  // The presence of every extension the providers told about, per tenant: what a directory shows next to a contact.
+  const presences = new Map<string, Map<string, { userId: string; presence: Presence }>>()
+  const presencesOf = (tenantId: string) => {
+    const map = presences.get(tenantId) ?? new Map<string, { userId: string; presence: Presence }>()
+    presences.set(tenantId, map)
+    return map
+  }
+  // Pump provider events to the Twake users they concern, and keep the history of finished calls. A presence is
+  // everyone's business in the tenant (the directory shows it); a call is its two parties' only.
   registry.onCreate = (tenantId, provider) => {
     void (async () => {
       for await (const { extension, event } of provider.subscribe()) {
         const userId = await dir.userIdForExtension(tenantId, extension)
         if (!userId) continue
-        const mapped: TelephonyEvent = event.type === 'presence.changed' ? { ...event, payload: { ...event.payload, userId } } : event
-        trackOwner(tenantId, userId, mapped)
-        bus.publish(tenantId, userId, mapped)
+        if (event.type === 'presence.changed') {
+          const mapped: TelephonyEvent = { ...event, payload: { ...event.payload, userId, extension } }
+          presencesOf(tenantId).set(extension, { userId, presence: event.payload.presence })
+          bus.broadcast(tenantId, mapped)
+          continue
+        }
+        trackOwner(tenantId, userId, event)
+        bus.publish(tenantId, userId, event)
         const entry = historyEntryFor(tenantId, userId, event)
         if (entry) await store.addHistory(entry).catch(err => app.log.error({ err }, 'could not record call history'))
       }
@@ -230,7 +243,20 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         if (!STATUSES.includes(status)) return reply.code(400).send({ error: 'invalid status' })
         const presence = { status, source: 'user' as const, since: new Date().toISOString() }
         await provider.setPresence(user, presence)
-        return presence
+        // What the others see may differ (in a call, not registered): the provider's events say so.
+        return provider.getPresence(user)
+      })
+
+      // The presence of everyone in the caller's tenant, by extension, as the provider's events built it. Only when
+      // the provider tells presences as they change (`realtime`): otherwise a directory shows none, rather than
+      // everyone offline.
+      v1.get('/presence', async req => {
+        const { user, provider } = await who(req)
+        const realtime = (await provider.getCapabilities()).presence.realtime
+        return {
+          realtime,
+          items: realtime ? [...presencesOf(user.tenantId).entries()].map(([extension, { userId, presence }]) => ({ extension, userId, presence })) : []
+        }
       })
 
       v1.post<{ Body: { target: string } }>('/calls', async (req, reply) => {
@@ -497,8 +523,13 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         const identity = ticketed ?? (await auth.authenticate(req).catch(() => null))
         if (!identity) return socket.close(1008, 'Unauthenticated')
         const user = await resolve(identity)
-        const unsubscribe = bus.subscribe(user.tenantId, user.id, event => socket.send(JSON.stringify(event)))
-        socket.on('close', unsubscribe)
+        const send = (event: TelephonyEvent) => socket.send(JSON.stringify(event))
+        const unsubscribe = bus.subscribe(user.tenantId, user.id, send)
+        const unsubscribeTenant = bus.subscribeTenant(user.tenantId, send)
+        socket.on('close', () => {
+          unsubscribe()
+          unsubscribeTenant()
+        })
       })
 
       if (process.env.AUTH_MODE === 'dev') {

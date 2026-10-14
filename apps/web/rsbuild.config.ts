@@ -14,7 +14,8 @@ const CSP = [
   "img-src 'self' data:",
   "font-src 'self'",
   // The SIP WebSocket's origin is runtime configuration, hence `wss:` here; the server's header narrows it to CONNECT_SRC.
-  "connect-src 'self' https: wss: http://localhost:* http://127.0.0.1:*",
+  // A local Gateway without TLS is reached over http and its event stream over ws (browsers do not take one for the other).
+  "connect-src 'self' https: wss: http://localhost:* http://127.0.0.1:* ws://localhost:* ws://127.0.0.1:*",
   "frame-src 'none'",
   "object-src 'none'",
   "base-uri 'self'",
