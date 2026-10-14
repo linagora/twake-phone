@@ -1,0 +1,23 @@
+{
+  "name": "@twake/provider-opensips",
+  "version": "0.1.0",
+  "description": "OpenSIPS provider of the TwakePhone Gateway: SIP accounts in the subscriber table, media session of the browser softphone.",
+  "license": "AGPL-3.0",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -b"
+  },
+  "dependencies": {
+    "@twake/telephony-provider-sdk": "*",
+    "@twake/telephony-types": "*",
+    "pg": "^8.23.1"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.23.1"
+  }
+}

@@ -121,7 +121,7 @@ Pas de calendrier en semaines : le développement avance par étapes ordonnées,
 |---|---|---|---|
 | 1 | **Monorepo** : import du POC avec tous ses tests, ADR, CI | `yarn test` vert, ADR relus | Fusionnée le 14 octobre 2026 |
 | 2 | **App React autonome** : OIDC, annuaire LDAP et CardDAV, synchronisation des comptes, CSP, socle RGAA | Connexion SSO, recherche d'un collègue | Fusionnée le 14 octobre 2026 : PR 2a (coquille et SSO), PR 2b (annuaire LDAP, favoris), PR 2c (synchronisation des comptes, CSP, administration). CardDAV non fait (hors besoin immédiat) |
-| 3 | **OpenSIPS et JsSIP** : Docker OpenSIPS + rtpengine, softphone réécrit, attente, transfert direct et supervisé, DTMF, trois navigateurs | Deux utilisateurs s'appellent, s'attendent, se transfèrent | |
+| 3 | **OpenSIPS et JsSIP** : Docker OpenSIPS + rtpengine, softphone réécrit, attente, transfert direct et supervisé, DTMF, trois navigateurs | Deux utilisateurs s'appellent, s'attendent, se transfèrent | En cours : PR 3a (serveur SIP, softphone JsSIP, premier appel, attente, DTMF). Puis 3b (transferts), 3c (trois navigateurs, périphériques, retrait du POC) |
 | 4 | **provider-opensips** : événements, présence, CDR, renvois, NPD planifié, groupes | La pastille change pendant un appel, un renvoi est appliqué | |
 | 5 | **Réception sans onglet** : service worker, Web Push, renvoi après délai | Navigateur fermé, la notification ouvre l'app sur l'appel | |
 | 6 | **Trunk OVH et anti-fraude** : `dispatcher`, `drouting`, `fraud_detection`, repli, urgences | Appel sortant vers un mobile, entrant sur la SDA, appel interdit refusé | |
@@ -135,27 +135,27 @@ Ensuite : QoS, exploitation et haute disponibilité, pilote de 30 à 50 utilisat
 
 ## Organisation du dépôt
 
-Ce qui existe à la fin de l'étape 1 (le POC importé) :
-
 ```
-apps/web                     application TwakePhone (React 18, OIDC PKCE, client de la passerelle) : étape 2
-apps/phone                   application Phone du POC (React 18, Cozy, SIP.js), gardée jusqu'à l'étape 3
+apps/web                     application TwakePhone (React 18, OIDC PKCE, client de la passerelle, softphone) : étapes 2 et 3
+apps/phone                   application Phone du POC (React 18, Cozy), plus branchée sur le softphone ; retirée à la PR 3c
 apps/gateway                 Twake Telephony Gateway (Fastify, PostgreSQL, OpenAPI sur /docs)
-packages/telephony-types     modèle neutre : Call, Presence, Capabilities
-packages/provider-sdk        contrat TelephonyProvider / MediaProvider / ConferenceBridgeProvider
+packages/telephony-types     modèle neutre : Call, Presence, Capabilities, MediaSession
+packages/provider-sdk        contrat TelephonyProvider / MediaProvider / ConferenceBridgeProvider / SecretProvisioner
 packages/telephony-client    SDK front : REST, WebSocket, E.164, conférences
-packages/provider-asterisk   provider de référence du POC (ARI) ; remplacé à l'étape 4
-packages/softphone           softphone SIP.js et harnais de test navigateur ; JsSIP à l'étape 3
-packages/sip-media           plan média SIP / WebRTC partagé
+packages/provider-opensips   provider OpenSIPS : session média (WSS, poste, secret), comptes dans `subscriber` ; événements à l'étape 4
+packages/provider-asterisk   provider de référence du POC (ARI) ; retiré à l'étape 4
+packages/softphone           softphone JsSIP : enregistrement, appels, attente, micro, DTMF, compteurs RTP, reconnexion
+packages/sip-media           plan média SIP / WebRTC du POC ; retiré à la PR 3c
 packages/phone-link          <PhoneLink> et requestCall : numéro cliquable (intent CALL)
 packages/phone-widget        widget d'appel à monter dans les autres apps Twake Workplace
 packages/conference-livekit  Meet : API externe, LiveKit SIP, dial-in, dial-out
-docker/                      stack de dev du POC : MiniPBX + overlay ARI/WebRTC, LiveKit SIP, correctifs Twake
-scripts/                     mise en place de la stack de dev
+docker/opensips, rtpengine   serveur SIP du MVP (docker-compose.sip.yml) : OpenSIPS 3.6, rtpengine, PostgreSQL
+docker/                      le reste : stack de dev du POC (MiniPBX, LiveKit SIP, correctifs Twake), retirée à la PR 3c
+scripts/                     mise en place de la stack de dev du POC
 docs/                        documentation du POC, docs/adr/ : une décision, un fichier
 ```
 
-À venir : `packages/provider-opensips` (étape 4), `packages/provider-ovh` (étape 10), `packages/provider-wazo` (étape 11), `docker/` sur OpenSIPS et rtpengine (étape 3).
+À venir : `packages/provider-ovh` (étape 10), `packages/provider-wazo` (étape 11).
 
 ## Démarrer
 
@@ -172,29 +172,29 @@ Annuaire : la passerelle interroge un LDAP quand `LDAP_URL` est renseigné (`lda
 
 Comptes : quand `LDAP_ATTR_EXTENSION` dit quel attribut porte le poste (`ipPhone` sur un Active Directory, un attribut maison sur OpenLDAP), la passerelle copie les comptes de l'annuaire dans ses correspondances utilisateur ↔ poste toutes les `LDAP_SYNC_INTERVAL` (`1h` par défaut, `0` pour désactiver) et à la demande depuis l'écran d'administration de l'app. L'identifiant LDAP (`LDAP_ATTR_ID`, `uid` par défaut) doit être celui que le SSO met dans le jeton (`JWT_USER_CLAIM`). L'annuaire fait foi pour les personnes qu'il connaît ; les postes attribués à la main à des personnes qu'il ne connaît pas sont conservés ; un poste donné à deux personnes est signalé, la première le garde. Administrateurs : les personnes dont le jeton porte le rôle `ADMIN_ROLE` (`twakephone-admin` par défaut) dans la revendication `JWT_ROLES_CLAIM` (à renseigner, par exemple `groups` sur LemonLDAP::NG ; sans elle aucun rôle n'est lu), ou nommées dans `ADMIN_USERS` (`alice,acme:bob`). La synchronisation lancée depuis l'écran tourne en arrière-plan ; l'écran la suit jusqu'au rapport. Un listing vide ne retire aucun poste.
 
-App web en production : `yarn workspace @twake/phone-web start` (ou `docker/Dockerfile.web`) sert `apps/web/dist` avec son `config.json` et ses en-têtes de sécurité, à partir de `GATEWAY_URL`, `OIDC_AUTHORITY`, `OIDC_CLIENT_ID`, `OIDC_RESOURCE` (et `OIDC_SCOPE`, `OIDC_PROMPT`), `FRAME_ANCESTORS` (origines autorisées à encadrer l'app, par exemple celles de Twake Chat ; `'none'` sinon), `CONNECT_SRC` (origines supplémentaires, comme le WSS du serveur SIP à l'étape 3), `HSTS_MAX_AGE` une fois derrière TLS (`HSTS_INCLUDE_SUBDOMAINS=1` pour l'étendre). La CSP n'autorise que les scripts et styles du build, la passerelle (REST et WebSocket) et le fournisseur d'identité. La passerelle pose des en-têtes de même nature sur ses réponses (CSP sans source, `nosniff`, `no-store`, HSTS avec les mêmes variables).
+App web en production : `yarn workspace @twake/phone-web start` (ou `docker/Dockerfile.web`) sert `apps/web/dist` avec son `config.json` et ses en-têtes de sécurité, à partir de `GATEWAY_URL`, `OIDC_AUTHORITY`, `OIDC_CLIENT_ID`, `OIDC_RESOURCE` (et `OIDC_SCOPE`, `OIDC_PROMPT`), `FRAME_ANCESTORS` (origines autorisées à encadrer l'app, par exemple celles de Twake Chat ; `'none'` sinon), `CONNECT_SRC` (origines supplémentaires : le WSS d'OpenSIPS quand il n'est pas sur l'origine de la passerelle), `HSTS_MAX_AGE` une fois derrière TLS (`HSTS_INCLUDE_SUBDOMAINS=1` pour l'étendre). La CSP n'autorise que les scripts et styles du build, la passerelle (REST et WebSocket) et le fournisseur d'identité. La passerelle pose des en-têtes de même nature sur ses réponses (CSP sans source, `nosniff`, `no-store`, HSTS avec les mêmes variables).
 
-Stack complète en local (Twake, Phone, passerelle, PBX de dev), encore celle du POC jusqu'à l'étape 3 :
+Téléphonie : la passerelle configure le provider OpenSIPS du tenant par défaut quand `OPENSIPS_WS_URL` est renseigné (l'URL WSS publique d'OpenSIPS ; `SIP_DOMAIN`, domaine SIP et realm, par défaut l'hôte de cette URL ; `OPENSIPS_DB_URL`, la base où OpenSIPS lit ses comptes, par défaut celle de la passerelle ; `ICE_SERVERS`, liste de STUN/TURN séparés par des virgules ; `SECRETS_KEY` obligatoire). Chaque personne qui a un poste reçoit un secret SIP généré par la passerelle, gardé chiffré chez elle et écrit en empreintes (`ha1`) dans la table `subscriber` d'OpenSIPS : le navigateur s'enregistre avec son poste et ce secret, obtenus par `GET /me/media-session`, et appelle directement par le softphone. Le serveur SIP du MVP tourne en Docker Compose ([docker/README.md](docker/README.md)) :
 
 ```bash
-scripts/setup-references.sh          # clone la stack Twake, Drive et MiniPBX aux révisions testées, applique les correctifs
-cp docker/.env.example docker/.env   # puis renseigner les secrets (voir le fichier)
-scripts/start-twake-stack.sh         # demande le mot de passe pour trois réglages de l'hôte, expliqués dans le script
+docker compose -f docker/docker-compose.sip.yml up --build --wait     # OpenSIPS 3.6 (WS 8088, WSS 8089), rtpengine, PostgreSQL 54320
+OPENSIPS_WS_URL=wss://127.0.0.1:8089 OPENSIPS_DB_URL=postgres://twake:twake@127.0.0.1:54320/twake \
+  DATABASE_URL=postgres://twake:twake@127.0.0.1:54320/twake SECRETS_KEY=$(openssl rand -hex 32) yarn dev:gateway
 ```
 
-Visio (accès téléphonique aux salles Meet) et trunk SIP réel : [docker/README.md](docker/README.md).
+La stack complète du POC (Twake, Phone, MiniPBX, Meet) reste décrite dans [docker/README.md](docker/README.md) jusqu'à son retrait (PR 3c).
 
 | Commande | Vérifie |
 |---|---|
 | `yarn test` | unitaires de tous les paquets et de la passerelle (vitest), contrat de stockage mémoire et, avec `TEST_DATABASE_URL`, PostgreSQL |
 | `cd apps/phone && yarn lint && yarn test` | application Phone du POC (eslint, stylint, jest) |
 | `yarn e2e:web` | app TwakePhone dans Chromium, servie par son serveur de production : connexion OIDC (fournisseur de test en Node, rôle d'administrateur dans le jeton), synchronisation des comptes depuis l'écran d'administration (LDAP de test en Node) puis poste affiché, clavier, annuaire et favoris, langue, déconnexion, en-têtes de sécurité de l'app et de la passerelle, encadrement par un autre site refusé, CSP. Sans Docker ; Chromium s'installe une fois avec `npx playwright-core install chromium` (ou `PLAYWRIGHT_CHROMIUM=/chemin/vers/chromium`) |
-| `yarn e2e:live` | passerelle ↔ PBX de dev (MiniPBX, ARI), avec de vrais appels SIP |
-| `yarn e2e:browser` | deux navigateurs, audio réel simulé (WebRTC) |
-| `yarn e2e:widget` | widget dans un hôte cozy-interapp réel |
-| `node docker/meet-sip/platform.e2e.mjs` | Meet sur la plateforme : jetons, LiveKit, SIP, PBX |
+| `yarn e2e:sip` | deux personnes s'appellent depuis deux Chromium (micro simulé) à travers OpenSIPS et rtpengine (`docker compose -f docker/docker-compose.sip.yml up --build --wait` d'abord) : enregistrement WSS, empreintes dans `subscriber`, poste injoignable, refus, réponse, paquets RTP dans les deux sens, attente et reprise, micro, DTMF vus par rtpengine (RFC 4733), raccrochage, coupure des WebSockets et retour en ligne, déconnexion qui désinscrit. `SIP_WSS_URL`, `OPENSIPS_DB_URL`, `RTPENGINE_DTMF_LOG` (`off` sans IPv6 local), `SIP_E2E_DEBUG=1` pour les messages SIP |
+| `yarn e2e:live` | POC : passerelle ↔ MiniPBX (ARI) ; plus joué, retiré à la PR 3c |
+| `yarn e2e:widget` | POC : widget dans un hôte cozy-interapp ; plus joué, retiré à la PR 3c |
+| `node docker/meet-sip/platform.e2e.mjs` | POC : Meet sur la plateforme ; à refaire sur OpenSIPS à l'étape 8 |
 
-La CI joue les trois premières lignes sur chaque PR ; les e2e demandent la stack Docker et se jouent à chaque porte de sortie. L'étape 3 remplace MiniPBX (hébergé chez un tiers, `git.oriatec.fr`) par OpenSIPS et rtpengine en Docker Compose, ce qui les fera entrer en CI.
+La CI joue `yarn test`, l'app Phone du POC, `yarn e2e:web` et `yarn e2e:sip` (stack SIP en Docker Compose sur le runner) sur chaque PR.
 
 ## Décisions
 

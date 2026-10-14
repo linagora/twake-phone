@@ -1,7 +1,6 @@
-/** Pushes a SIP secret to the PBX. Asterisk-specific: the Gateway only sees this interface. */
-export interface SecretProvisioner {
-  setSipSecret(extension: string, secret: string): Promise<void>
-}
+import type { SecretProvisioner } from '@twake/telephony-provider-sdk'
+
+export type { SecretProvisioner }
 
 export interface MiniPbxProvisionerOptions {
   /** Base URL of the PBX provisioning API, e.g. http://pbx:18081 */

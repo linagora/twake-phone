@@ -95,7 +95,57 @@ jobs:
       - run: yarn build
         working-directory: apps/phone
 
-  # yarn e2e:web tourne ci-dessus. Les e2e sur la stack Docker (yarn e2e:live, yarn e2e:browser, yarn e2e:widget, platform.e2e.mjs)
-  # demandent MiniPBX, LiveKit et la stack Twake : ils se jouent à chaque porte de sortie sur un
-  # poste de dev (CONTRIBUTING.md), et passeront en CI quand l'étape 3 aura remplacé MiniPBX par
-  # OpenSIPS et rtpengine en Docker Compose.
+  sip-e2e:
+    name: SIP (OpenSIPS, rtpengine, deux navigateurs)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: yarn
+          cache-dependency-path: |
+            yarn.lock
+            apps/phone/yarn.lock
+      # La stack SIP se construit pendant que le dépôt s'installe : OpenSIPS 3.6 (image officielle + modules WSS,
+      # TLS, PostgreSQL), rtpengine en espace utilisateur, PostgreSQL avec la table `subscriber`. Réseau hôte.
+      - name: Stack SIP (Docker Compose)
+        run: docker compose -f docker/docker-compose.sip.yml up --build --wait --wait-timeout 300
+      - run: yarn install --frozen-lockfile
+      - run: yarn --cwd apps/phone install --frozen-lockfile --ignore-engines
+      - run: yarn build
+      - name: Cache de Chromium (clé = version de playwright-core)
+        id: chromium-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: chromium-${{ runner.os }}-${{ hashFiles('node_modules/playwright-core/package.json') }}
+      - name: Chromium
+        if: steps.chromium-cache.outputs.cache-hit != 'true'
+        run: npx playwright-core install --with-deps chromium
+      - name: Dépendances système de Chromium (cache ou non)
+        if: steps.chromium-cache.outputs.cache-hit == 'true'
+        run: npx playwright-core install-deps chromium
+      - name: e2e SIP (deux navigateurs, micro simulé, OpenSIPS et rtpengine en Docker)
+        run: node apps/web/test/sip.e2e.mjs
+        env:
+          SIP_WSS_URL: wss://127.0.0.1:8089
+          OPENSIPS_DB_URL: postgres://twake:twake@127.0.0.1:54320/twake
+      - name: Journaux de la stack SIP en cas d'échec
+        if: failure()
+        run: docker compose -f docker/docker-compose.sip.yml logs --no-color --timestamps | tail -n 400
+      - name: Captures d'écran de l'e2e en cas d'échec
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-sip-failure
+          path: apps/web/dist/sip-e2e-failure-*.png
+          if-no-files-found: ignore
+      - name: Arrêt de la stack SIP
+        if: always()
+        run: docker compose -f docker/docker-compose.sip.yml down -v
+
+  # yarn e2e:web et yarn e2e:sip tournent ci-dessus. Les e2e du POC sur sa stack (yarn e2e:live, yarn e2e:widget,
+  # platform.e2e.mjs) demandent MiniPBX, LiveKit et la stack Twake : ils ne sont plus joués et partent avec le POC
+  # (étape 3c). Les e2e à trois navigateurs (transferts) arrivent avec la PR 3b.

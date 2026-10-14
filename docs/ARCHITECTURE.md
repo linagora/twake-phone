@@ -235,12 +235,12 @@ Le premier appel fait sonner **le propre poste** de l'appelant, puis la cible es
 
 ## 5. Le softphone (`packages/softphone`)
 
-SIP.js (UserAgent, Registerer, Inviter, Invitation). Il ne fait que le **média et la signalisation SIP**, jamais le contrôle d'appel métier.
+Réécrit à l'étape 3 sur JsSIP (ADR 0003) : `UA` et `RTCSession`. Il ne fait que le **média et la signalisation SIP**, jamais le contrôle d'appel métier. L'app (`apps/web/src/softphone.tsx`, `SoftphoneProvider`) le monte une fois au-dessus du routeur, dès que la passerelle donne une session `sip-webrtc`, et affiche l'état d'enregistrement dans l'en-tête et le panneau d'appel (`CallPanel`) au-dessus des pages.
 
-- Récupère à chaque démarrage `GET /me/media-session` : URL WSS, identité, secret.
-- **Reconnexion** : si le WebSocket tombe (réseau, redémarrage du PBX), nouvelle tentative avec backoff exponentiel et jitter, puis nouvel enregistrement. L'état « enregistré » est republié explicitement (SIP.js ne change pas d'état dans ce cas).
-- Se désinscrit à la fermeture de la page.
-- `stats()` expose les compteurs RTP, utilisés par les tests pour prouver que l'audio circule.
+- Récupère à chaque démarrage `GET /me/media-session` : URL WSS, domaine SIP, poste, secret, serveurs ICE.
+- Un `SoftCall` par appel (`new`, `ringing`, `connected`, `held`, `ended` avec sa raison : raccroché, refusé, occupé, sans réponse, injoignable, annulé, échec) : répondre, refuser (603), raccrocher, attente et reprise (re-INVITE), micro, DTMF (RFC 4733 par défaut, INFO sur demande ; les INFO reçus sont remontés), `stats()` (compteurs RTP, utilisés par les e2e pour prouver que l'audio circule).
+- **Reconnexion** : JsSIP rouvre le WebSocket et se réenregistre seul quand le réseau ou le serveur tombe ; sur un enregistrement refusé (secret tourné, compte retiré), le softphone redémarre avec une session neuve de la passerelle, avec backoff.
+- Se désinscrit à la fermeture de la page (`pagehide`) et à la déconnexion de l'app.
 
 ## 6. L'application Phone (`apps/phone`)
 

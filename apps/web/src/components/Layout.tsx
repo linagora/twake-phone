@@ -5,6 +5,8 @@ import { displayNameFor } from '../auth/oidc.js'
 import { useGateway } from '../gateway.js'
 import type { Key } from '../i18n/index.js'
 import { useT } from '../i18n/useT.js'
+import { usePhone } from '../softphone.js'
+import { CallPanel } from './CallPanel.js'
 
 const LINKS: [string, Key][] = [
   ['/', 'nav.dialer'],
@@ -18,6 +20,7 @@ export const Layout = () => {
   const { t } = useT()
   const { state, signOut } = useAuth()
   const { me } = useGateway()
+  const phone = usePhone()
   const name = displayNameFor(me, state.status === 'signed-in' ? state.user : null)
   // The administration link shows only to administrators; the Gateway refuses the others anyway.
   const links = LINKS.filter(([to]) => to !== '/admin' || me?.features?.admin)
@@ -45,11 +48,17 @@ export const Layout = () => {
             <strong>{name}</strong>
             {me ? <span className="badge"> · {me.extension ? t('auth.extension', { extension: me.extension }) : t('auth.noExtension')}</span> : null}
           </span>
+          {phone.state !== 'off' ? (
+            <span className={`phone-state phone-state-${phone.state}`} role="status" data-testid="phone-state" title={phone.detail ?? undefined}>
+              {t(`phone.${phone.state}`)}
+            </span>
+          ) : null}
           <button type="button" className="btn" onClick={() => void signOut()}>
             {t('auth.signout')}
           </button>
         </div>
       </header>
+      <CallPanel />
       <div className="layout">
         <nav className="sidenav" aria-label={t('nav.label')}>
           <ul>

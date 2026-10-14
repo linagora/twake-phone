@@ -1,4 +1,31 @@
-# PBX de dev (MiniPBX + overlay)
+# Serveur SIP du MVP : OpenSIPS 3.6 et rtpengine (`docker-compose.sip.yml`)
+
+Le serveur SIP de TwakePhone depuis l'étape 3 : OpenSIPS (registrar, SIP sur WS et WSS, authentification digest, routage entre postes, `dialog`) et rtpengine (média, DTLS-SRTP des deux côtés, ICE), avec un PostgreSQL qui porte la table `subscriber` que la passerelle remplit. Les trois services sont en réseau hôte : les navigateurs de la machine joignent les ports RTP de rtpengine et les sockets d'OpenSIPS directement (les candidats ICE sont l'adresse de l'hôte). Linux, ou Docker Desktop ≥ 4.34 avec le réseau hôte activé.
+
+```bash
+docker compose -f docker/docker-compose.sip.yml up --build --wait
+```
+
+| Quoi | Où |
+|---|---|
+| SIP sur WebSocket | `ws://127.0.0.1:8088`, `wss://127.0.0.1:8089` (certificat auto-signé fait au démarrage, à faire accepter au navigateur ; `TLS_CERT` et `TLS_KEY` pour en fournir un) |
+| SIP UDP (trunk à l'étape 6) | `127.0.0.1:5060` |
+| rtpengine | contrôle `udp:127.0.0.1:22222`, RTP `30000-30100/udp`, rapport des DTMF détectés `127.0.0.1:22223/udp` |
+| PostgreSQL | `postgres://twake:twake@127.0.0.1:54320/twake` (`subscriber` créée au premier démarrage par `opensips/subscriber.sql`, la copie de `SUBSCRIBER_SCHEMA` du provider) |
+| Variables | `SIP_DOMAIN` (domaine SIP, realm et adresse annoncée dans Via et Record-Route ; `127.0.0.1` par défaut), `LISTEN_IP`, `OPENSIPS_LOG_LEVEL`, `RTPENGINE_INTERFACE` (`<privée>!<publique>` derrière un NAT) |
+
+`opensips/opensips.cfg.tpl` est rendu par `opensips/entrypoint.sh` à partir de l'environnement, puis vérifié (`opensips -C`) avant le démarrage. Ce que fait la configuration :
+
+- `REGISTER` : digest (`auth_db` sur `subscriber`, empreintes `ha1` écrites par la passerelle, jamais de mot de passe en clair), une personne n'enregistre que son propre poste, `fix_nated_register`, connexion WebSocket gardée ouverte le temps de l'enregistrement ; dix contacts par poste.
+- `INVITE` : digest aussi (`proxy_authorize`, l'appelant appelle en son nom), `lookup("location")` vers tous les contacts enregistrés du poste appelé (fourche parallèle, le premier qui répond prend l'appel), rtpengine des deux côtés (`ICE=force`, `RTP/SAVPF`, `rtcp-mux`), `dialog` suit l'appel (les transferts de la PR 3b s'y appuient). Un poste sans contact répond 404 ; un contact dont la connexion est partie répond 480.
+- En dialogue : `Record-Route`, les `Contact` des navigateurs (hôte `.invalid`, RFC 7118) sont remplacés par la connexion d'où ils viennent (`fix_nated_contact`) pour que re-INVITE (attente), INFO (DTMF), BYE et REFER suivent ; rtpengine libéré au `BYE`.
+- `OPTIONS` : 200. Pas encore de `SUBSCRIBE`/`PUBLISH`/`MESSAGE` (503).
+
+Sans Docker (poste de dev sans démon) : OpenSIPS se compile depuis GitHub (`make prefix=/opt/opensips include_modules="proto_ws proto_wss tls_mgm tls_openssl db_postgres" all install`), rtpengine s'installe depuis Ubuntu 24.04, et `entrypoint.sh` se lance avec `OPENSIPS_BIN`, `OPENSIPS_MPATH`, `CFG_TEMPLATE`, `CFG_OUT`, `TLS_CERT`, `TLS_KEY`, `MI_FIFO` pointés hors de `/etc`. C'est ainsi que la configuration a été mise au point ; la CI joue la stack Docker.
+
+Le e2e : `yarn e2e:sip` (README, section « Vérifier »).
+
+# PBX de dev du POC (MiniPBX + overlay), retiré à la PR 3c
 
 MiniPBX sert uniquement d'infrastructure de test (cahier §4). Il est utilisé tel quel (`references/minipbx`, non modifié) ; l'overlay `minipbx-dev/` lui ajoute ce que son MVP exclut : WebRTC (WSS, DTLS-SRTP, Opus) et ARI. Le build échoue si une ancre du patch a bougé en amont.
 

@@ -1,0 +1,63 @@
+# The SIP stack of the web MVP: OpenSIPS (registrar, WS and WSS, routing) and rtpengine (media), with a PostgreSQL
+# that holds the OpenSIPS accounts (`subscriber`, written by the Gateway) and can hold the Gateway's own tables.
+# Host network: the browsers of the machine reach rtpengine's RTP ports and OpenSIPS's sockets directly (ICE
+# candidates are the host's address). Linux and Docker Desktop >= 4.34 (host networking enabled in its settings).
+#
+#   docker compose -f docker/docker-compose.sip.yml up --build --wait
+#   OPENSIPS_WS_URL=wss://127.0.0.1:8089 SIP_DOMAIN=127.0.0.1 OPENSIPS_DB_URL=postgres://twake:twake@127.0.0.1:54320/twake ...
+#
+# Ports: 5060/udp SIP, 8088 WS, 8089 WSS, 22222/udp rtpengine control, 22223/udp its DTMF report, 30000-30100/udp RTP,
+# 54320 PostgreSQL.
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: twake
+      POSTGRES_PASSWORD: twake
+      POSTGRES_DB: twake
+    command: ["postgres", "-p", "54320"]
+    # OpenSIPS checks its `subscriber` table at startup: created with the database, filled by the Gateway.
+    volumes:
+      - ./opensips/subscriber.sql:/docker-entrypoint-initdb.d/01-subscriber.sql:ro
+    network_mode: host
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U twake -p 54320"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  rtpengine:
+    build: ./rtpengine
+    environment:
+      RTPENGINE_INTERFACE: ${RTPENGINE_INTERFACE:-127.0.0.1}
+      RTPENGINE_LISTEN: 127.0.0.1:22222
+      RTPENGINE_PORT_MIN: "30000"
+      RTPENGINE_PORT_MAX: "30100"
+      # Tones detected in the media, reported to the e2e (apps/web/test/sip.e2e.mjs) as JSON over UDP.
+      RTPENGINE_DTMF_LOG: ${RTPENGINE_DTMF_LOG:-127.0.0.1:22223}
+    network_mode: host
+    healthcheck:
+      test: ["CMD-SHELL", "rtpengine-ctl -ip 127.0.0.1 -port 22222 list numsessions >/dev/null 2>&1 || true"]
+      interval: 2s
+      timeout: 3s
+      retries: 5
+
+  opensips:
+    build: ./opensips
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rtpengine:
+        condition: service_started
+    environment:
+      SIP_DOMAIN: ${SIP_DOMAIN:-127.0.0.1}
+      LISTEN_IP: ${LISTEN_IP:-0.0.0.0}
+      OPENSIPS_DB_URL: postgres://twake:twake@127.0.0.1:54320/twake
+      RTPENGINE_SOCK: udp:127.0.0.1:22222
+      OPENSIPS_LOG_LEVEL: ${OPENSIPS_LOG_LEVEL:-2}
+    network_mode: host
+    healthcheck:
+      test: ["CMD-SHELL", "test -p /tmp/opensips_fifo"]
+      interval: 2s
+      timeout: 3s
+      retries: 30

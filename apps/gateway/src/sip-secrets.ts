@@ -1,4 +1,4 @@
-import type { SecretProvisioner } from '@twake/provider-asterisk'
+import type { SecretProvisioner } from '@twake/telephony-provider-sdk'
 import { decrypt, encrypt, generateSecret } from './crypto.js'
 import type { Store } from './store/types.js'
 

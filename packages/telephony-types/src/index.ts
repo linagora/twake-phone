@@ -100,6 +100,8 @@ export type MediaSession =
   | {
       type: 'sip-webrtc'
       websocketUrl: string
+      /** SIP domain of the identity (`sip:<username>@<domain>`); the WebSocket host when absent. */
+      domain?: string
       username: string
       /** Short-lived credential, never a permanent SIP password. */
       credential: string
