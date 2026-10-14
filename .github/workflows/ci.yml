@@ -96,6 +96,15 @@ jobs:
       - name: Dépendances système du navigateur (cache ou non)
         if: matrix.browser != 'msedge' && steps.browser-cache.outputs.cache-hit == 'true'
         run: npx playwright-core install-deps ${{ matrix.browser }}
+      # Firefox n'a pas de sortie audio simulée : sans périphérique de sortie, son AudioContext ne démarre jamais
+      # (la sonnerie reste « bloquée »). Un serveur PulseAudio avec un puits nul lui en donne une.
+      - name: Sortie audio pour Firefox (PulseAudio, puits nul)
+        if: matrix.browser == 'firefox'
+        run: |
+          sudo apt-get install -y --no-install-recommends pulseaudio
+          pulseaudio --start --exit-idle-time=-1
+          pactl load-module module-null-sink sink_name=twakephone sink_properties=device.description=TwakePhone
+          pactl info | head -5
       # Edge est préinstallé sur ubuntu-latest (la version suit l'image du runner, le script l'affiche) ; sinon
       # Playwright l'installe par le dépôt Microsoft.
       - name: Microsoft Edge

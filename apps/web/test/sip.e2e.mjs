@@ -171,6 +171,7 @@ const browser =
           'media.autoplay.default': 0,
           'media.autoplay.blocking_policy': 0,
           'media.setsinkid.enabled': true,
+          'media.autoplay.block-webaudio': false,
           'media.peerconnection.ice.loopback': true,
           'media.peerconnection.ice.obfuscate_host_addresses': false
         }
@@ -205,16 +206,25 @@ const calls = page => page.evaluate(() => window.twakephone.calls)
 const lastEnded = page => page.evaluate(() => window.twakephone.lastEnded)
 const stats = page => page.evaluate(() => window.twakephone.stats())
 const soundBlocked = page => page.evaluate(() => window.twakephone.soundBlocked)
-/** Waits for the ringtone element to play (not paused, live stream) or to be quiet. */
-const ringerPlaying = (page, playing) =>
-  page.waitForFunction(
-    expected => {
-      const el = document.querySelector('[data-testid=ringer]')
-      return !!el && !el.paused === expected && (!expected || (el.srcObject?.active ?? false))
-    },
-    playing,
-    { timeout: 10_000 }
-  )
+/** Waits for the ringtone element to play (not paused, live stream) or to be quiet; says what it saw otherwise. */
+const ringerPlaying = async (page, playing) => {
+  const state = () => page.evaluate(() => {
+    const el = document.querySelector('[data-testid=ringer]')
+    return el ? { paused: el.paused, active: el.srcObject?.active ?? null, readyState: el.readyState, soundBlocked: window.twakephone.soundBlocked } : null
+  })
+  try {
+    await page.waitForFunction(
+      expected => {
+        const el = document.querySelector('[data-testid=ringer]')
+        return !!el && !el.paused === expected && (!expected || (el.srcObject?.active ?? false))
+      },
+      playing,
+      { timeout: 10_000 }
+    )
+  } catch (err) {
+    throw new Error(`ringtone not ${playing ? 'playing' : 'quiet'} after 10 s: ${JSON.stringify(await state())}`, { cause: err })
+  }
+}
 const ringerSink = page => page.evaluate(() => document.querySelector('[data-testid=ringer]')?.sinkId ?? '')
 /** Signs out from this page (unregisters its softphone first) and closes its context. */
 const signOut = async who => {
