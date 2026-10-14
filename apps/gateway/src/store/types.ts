@@ -18,7 +18,7 @@ export interface UserMapping {
   department?: string
   /** Who wrote it: an administrator (or DEV_USER_MAP), or the directory synchronisation. Absent means manual. */
   source?: MappingSource
-  /** When the synchronisation last wrote it (ISO 8601). */
+  /** When the synchronisation last wrote this row (ISO 8601); an unchanged row keeps its date. */
   syncedAt?: string
 }
 

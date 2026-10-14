@@ -127,16 +127,18 @@ try {
     await page.getByText(ldap.url).waitFor()
     await page.getByText(BASE_DN).waitFor()
     await page.getByText('Aucune synchronisation depuis').waitFor()
-    const synced = page.waitForResponse(r => r.request().method() === 'POST' && r.url().endsWith('/admin/directory/sync'))
+    const accepted = page.waitForResponse(r => r.request().method() === 'POST' && r.url().endsWith('/admin/directory/sync'))
     await page.getByRole('button', { name: 'Synchroniser maintenant' }).click()
-    const report = await (await synced).json()
+    expectEqual((await accepted).status(), 202, 'synchronisation accepted')
+    // The screen follows the run until it ends, then shows the report.
+    await page.getByText('Synchronisation terminée.').waitFor()
+    await page.getByText('Dernière synchronisation le').waitFor()
+    await page.getByText('mpetit : le poste 103 est déjà attribué à bdurand').waitFor()
+    const report = (await gateway.inject({ url: '/api/v1/admin/directory', headers: { authorization: `Bearer ${session.access_token}` } })).json().sync.last
     expectEqual(report.seen, 5, 'people seen')
     expectEqual(report.withExtension, 4, 'people with an extension')
     expectEqual(report.created, 3, 'extensions assigned')
     expectEqual(report.conflicts.length, 1, 'conflicts')
-    await page.getByText('Synchronisation terminée.').waitFor()
-    await page.getByText('Dernière synchronisation le').waitFor()
-    await page.getByText('mpetit : le poste 103 est déjà attribué à bdurand').waitFor()
     // Alice is among the synchronised accounts: the header follows without a reload, and after one.
     await page.getByTestId('who').getByText('Poste 101').waitFor()
     await page.reload()
@@ -241,15 +243,13 @@ try {
     await embedder.goto(`${other.origin}/`)
     await embedder.getByRole('heading', { name: 'Embedder' }).waitFor()
     const message = await Promise.race([refused, new Promise(r => setTimeout(() => r(null), 5000))])
-    if (!message) throw new Error('the frame was not refused')
-    const framed = await embedder.evaluate(() => {
-      try {
-        return document.getElementById('phone').contentDocument?.body?.innerText ?? ''
-      } catch {
-        return ''
-      }
-    })
-    if (/TwakePhone/.test(framed)) throw new Error('the app rendered inside the frame')
+    if (!message) throw new Error('the browser did not report the refused frame')
+    // The frame itself: Playwright reads any frame, whatever its origin. A refused one holds the browser's error page.
+    const frame = embedder.frames().find(f => f !== embedder.mainFrame())
+    if (!frame) throw new Error('no frame on the embedder page')
+    const inside = await frame.evaluate(() => ({ url: location.href, title: document.title, text: document.body?.innerText ?? '' })).catch(() => ({ url: frame.url(), title: '', text: '' }))
+    if (/^http/.test(inside.url) && /TwakePhone/.test(inside.text + inside.title)) throw new Error(`the app rendered inside the frame: ${JSON.stringify(inside)}`)
+    if (!/^chrome-error:/.test(inside.url)) throw new Error(`unexpected frame state: ${JSON.stringify(inside)}`)
     await embedder.close()
   })
   await step('the built app ran under its Content Security Policy without a violation', async () => {

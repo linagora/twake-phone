@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import type { Contact } from '@twake/telephony-types'
 import { MemoryContactDirectory } from './contacts.js'
-import { DirectorySync, extensionOf, parseInterval } from './directory-sync.js'
+import { DirectorySync, MAX_INTERVAL_MS, extensionOf, parseInterval } from './directory-sync.js'
 import { MemoryStore } from './store/memory.js'
 
 const person = (id: string, name: string, extension?: string, department = 'Support'): Contact => ({
@@ -78,6 +78,52 @@ describe('DirectorySync', () => {
     expect(await store.getMappingByExtension('acme', '103')).toMatchObject({ userId: 'bob' })
   })
 
+  it('leaves a duplicated extension with the person who already holds it, whatever the listing order', async () => {
+    const people = [person('alice', 'Alice', '101')]
+    const { store, directory, sync } = setup(people)
+    await sync.run()
+    directory.listAll = async () => [person('bob', 'Bob', '101'), person('alice', 'Alice', '101')]
+    const report = await sync.run()
+    expect(report).toMatchObject({ unchanged: 1, created: 0, removed: 0, conflicts: [{ userId: 'bob', extension: '101', heldBy: 'alice' }] })
+    expect(await store.getMappingByUser('acme', 'alice')).toMatchObject({ extension: '101' })
+    expect(await store.getMappingByUser('acme', 'bob')).toBeNull()
+  })
+
+  it('never costs a mapping to a conflict: a person whose new extension is taken keeps the old one', async () => {
+    const store = new MemoryStore()
+    await store.upsertMapping({ tenantId: 'acme', userId: 'admin', extension: '100' })
+    const people = [person('alice', 'Alice', '101')]
+    const { directory, sync } = setup(people, store)
+    await sync.run()
+    directory.listAll = async () => [person('alice', 'Alice', '100')]
+    const report = await sync.run()
+    expect(report).toMatchObject({ created: 0, updated: 0, removed: 0, conflicts: [{ userId: 'alice', extension: '100', heldBy: 'admin' }] })
+    expect(await store.getMappingByUser('acme', 'alice')).toMatchObject({ extension: '101', source: 'ldap' })
+    expect(await store.getMappingByUser('acme', 'admin')).toMatchObject({ extension: '100' })
+  })
+
+  it('lets a person take the extension a known person moves away from, in any order', async () => {
+    const store = new MemoryStore()
+    await store.upsertMapping({ tenantId: 'acme', userId: 'alice', extension: '101' })
+    const { sync } = setup([person('bob', 'Bob', '101'), person('alice', 'Alice', '102')], store)
+    expect(await sync.run()).toMatchObject({ created: 1, updated: 1, conflicts: [] })
+    expect(await store.getMappingByUser('acme', 'alice')).toMatchObject({ extension: '102', source: 'ldap' })
+    expect(await store.getMappingByUser('acme', 'bob')).toMatchObject({ extension: '101' })
+  })
+
+  it('refuses to remove anything when the directory lists nobody', async () => {
+    const people = [person('alice', 'Alice', '101')]
+    const { store, directory, sync } = setup(people)
+    await sync.run()
+    directory.listAll = async () => []
+    const report = await sync.run()
+    expect(report.error).toMatch(/listed nobody/)
+    expect(report.removed).toBe(0)
+    expect(await store.getMappingByUser('acme', 'alice')).not.toBeNull()
+    // Nothing synced yet and nobody listed: nothing to say.
+    expect((await setup([]).sync.run()).error).toBeUndefined()
+  })
+
   it('never touches another tenant', async () => {
     const store = new MemoryStore()
     await store.upsertMapping({ tenantId: 'other', userId: 'alice', extension: '101', source: 'ldap' })
@@ -136,6 +182,11 @@ describe('extensionOf and parseInterval', () => {
     expect(parseInterval('1h', 7)).toBe(3_600_000)
     expect(parseInterval('90', 7)).toBe(90_000)
     expect(parseInterval('0', 7)).toBe(0)
+    expect(parseInterval('24d', 7)).toBe(24 * 86_400_000)
     expect(() => parseInterval('soon', 7)).toThrow(/invalid interval/)
+    // Above what a timer takes, Node would fire at once: a hot loop against the directory.
+    expect(() => parseInterval('30d', 7)).toThrow(/at most 24 days/)
+    expect(() => parseInterval('99999999999', 7)).toThrow(/at most 24 days/)
+    expect(() => new DirectorySync({ store: new MemoryStore(), directory: new MemoryContactDirectory([]), tenantId: 't' }).start(MAX_INTERVAL_MS + 1)).toThrow(/out of range/)
   })
 })

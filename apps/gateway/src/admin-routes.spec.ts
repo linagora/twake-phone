@@ -6,6 +6,7 @@ import { DirectorySync } from './directory-sync.js'
 import { ProviderRegistry } from './registry.js'
 import { API_CSP, DOCS_CSP, securityHeadersFor } from './security.js'
 import { MemoryStore } from './store/memory.js'
+import { parseUserMap } from './directory.js'
 
 const alice = { id: 'amartin', displayName: 'Alice Martin', numbers: [{ type: 'extension' as const, number: '101' }], department: 'Direction' }
 const policy = { adminRole: 'twakephone-admin', adminUsers: new Set(['dev:root']) }
@@ -31,6 +32,8 @@ describe('admin policy', () => {
     expect(p.adminRole).toBe('twakephone-admin')
     expect([...p.adminUsers]).toEqual(['acme:alice', 'other:bob'])
     expect(adminPolicyFromEnv({ ADMIN_ROLE: 'phone-admin' } as never)).toEqual({ adminRole: 'phone-admin', adminUsers: new Set() })
+    // The same default tenant as the dev authenticator, so ADMIN_USERS=alice works on a dev box.
+    expect([...adminPolicyFromEnv({ AUTH_MODE: 'dev', ADMIN_USERS: 'alice' } as never).adminUsers]).toEqual(['dev:alice'])
   })
 })
 
@@ -54,15 +57,32 @@ describe('admin routes', () => {
     expect(res.json()).toEqual({ source: { type: 'ldap', url: 'ldaps://ldap.example.test', baseDn: 'ou=people', userFilter: '(objectClass=person)', attributes: { id: 'uid', extension: 'ipPhone' } }, sync: { available: true, running: false } })
   })
 
-  it('synchronises on demand and reports what it did; the next status carries the report', async () => {
+  it('starts a synchronisation on demand (202) and the status then carries the report', async () => {
     const store = new MemoryStore()
     const app = await appWith({ contacts: new MemoryContactDirectory([alice]), store })
     expect((await app.inject({ url: '/api/v1/me', headers: as('amartin') })).json().extension).toBeUndefined()
     const res = await app.inject({ method: 'POST', url: '/api/v1/admin/directory/sync', headers: as('root') })
-    expect(res.statusCode).toBe(200)
-    expect(res.json()).toMatchObject({ seen: 1, withExtension: 1, created: 1, conflicts: [] })
+    expect(res.statusCode).toBe(202)
+    expect(res.json()).toMatchObject({ running: true })
+    const until = Date.now() + 2000
+    let status = res.json()
+    while (status.running && Date.now() < until) status = (await app.inject({ url: '/api/v1/admin/directory', headers: as('root') })).json().sync
+    expect(status.last).toMatchObject({ seen: 1, withExtension: 1, created: 1, conflicts: [] })
     expect((await app.inject({ url: '/api/v1/me', headers: as('amartin') })).json()).toMatchObject({ extension: '101', displayName: 'Alice Martin' })
-    expect((await app.inject({ url: '/api/v1/admin/directory', headers: as('root') })).json().sync.last).toMatchObject({ created: 1 })
+  })
+
+  it('seeds DEV_USER_MAP only where no mapping exists: a restart never undoes the synchronisation', async () => {
+    const store = new MemoryStore()
+    await store.upsertMapping({ tenantId: 'dev', userId: 'alice', extension: '101', displayName: 'Alice Martin', source: 'ldap' })
+    process.env.DEV_USER_MAP = 'alice:199,bob:102'
+    try {
+      expect(parseUserMap(process.env.DEV_USER_MAP)).toHaveLength(2)
+      await buildApp(new ProviderRegistry([]), { store })
+    } finally {
+      delete process.env.DEV_USER_MAP
+    }
+    expect(await store.getMappingByUser('dev', 'alice')).toMatchObject({ extension: '101', source: 'ldap' })
+    expect(await store.getMappingByUser('dev', 'bob')).toMatchObject({ extension: '102', source: 'manual' })
   })
 
   it('answers 501 without a directory, 501 when it cannot be synchronised, and 409 while a run is in progress', async () => {
@@ -75,11 +95,10 @@ describe('admin routes', () => {
     let release!: () => void
     slow.listAll = () => new Promise(resolve => (release = () => resolve([alice])))
     const app = await appWith({ contacts: slow })
-    const first = app.inject({ method: 'POST', url: '/api/v1/admin/directory/sync', headers: as('root') })
-    await new Promise(r => setTimeout(r, 20))
+    expect((await app.inject({ method: 'POST', url: '/api/v1/admin/directory/sync', headers: as('root') })).statusCode).toBe(202)
     expect((await app.inject({ method: 'POST', url: '/api/v1/admin/directory/sync', headers: as('root') })).statusCode).toBe(409)
+    expect((await app.inject({ url: '/api/v1/admin/directory', headers: as('root') })).json().sync.running).toBe(true)
     release()
-    expect((await first).statusCode).toBe(200)
   })
 })
 
@@ -98,10 +117,16 @@ describe('security headers', () => {
     const docs = await app.inject({ url: '/docs/' })
     expect(docs.headers['content-security-policy']).toBe(DOCS_CSP)
     expect(docs.headers['cache-control']).toBeUndefined()
+    // The UI's page runs under that policy: external scripts only, no inline one.
+    expect(docs.statusCode).toBe(200)
+    expect(docs.body).toMatch(/<script src=/)
+    expect(docs.body.replace(/<script src="[^"]*"[^>]*>\s*<\/script>/g, '')).not.toMatch(/<script/)
   })
 
-  it('adds HSTS only when asked, with subdomains', () => {
-    expect(securityHeadersFor('/api/v1/me', { hstsMaxAge: 31536000 })['strict-transport-security']).toBe('max-age=31536000; includeSubDomains')
+  it('adds HSTS only when asked, subdomains on request, and lets max-age=0 retract it', () => {
+    expect(securityHeadersFor('/api/v1/me', { hstsMaxAge: 31536000 })['strict-transport-security']).toBe('max-age=31536000')
+    expect(securityHeadersFor('/api/v1/me', { hstsMaxAge: 31536000, hstsIncludeSubDomains: true })['strict-transport-security']).toBe('max-age=31536000; includeSubDomains')
+    expect(securityHeadersFor('/api/v1/me', { hstsMaxAge: 0 })['strict-transport-security']).toBe('max-age=0')
     expect(securityHeadersFor('/api/v1/me')['strict-transport-security']).toBeUndefined()
     expect(securityHeadersFor('/docs')['content-security-policy']).toBe(DOCS_CSP)
     expect(securityHeadersFor('/docsx')['content-security-policy']).toBe(API_CSP)

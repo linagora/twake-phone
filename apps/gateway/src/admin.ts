@@ -18,7 +18,8 @@ export const isAdmin = (identity: Identity, policy: AdminPolicy): boolean =>
 
 /** ADMIN_ROLE (default twakephone-admin) and ADMIN_USERS ("alice,acme:bob": a bare id is in DEFAULT_TENANT). */
 export const adminPolicyFromEnv = (env: NodeJS.ProcessEnv): AdminPolicy => {
-  const defaultTenant = env.DEFAULT_TENANT ?? 'default'
+  // The same default as the authenticators: 'dev' in dev mode, 'default' otherwise.
+  const defaultTenant = env.DEFAULT_TENANT ?? (env.AUTH_MODE === 'dev' ? 'dev' : 'default')
   const adminUsers = new Set(
     (env.ADMIN_USERS ?? '')
       .split(',')

@@ -97,5 +97,6 @@
   "admin.conflict": "{userId}: extension {extension} is already assigned to {heldBy}",
   "admin.duration.seconds": "{seconds} s",
   "admin.interval.minutes": "{minutes} min",
-  "admin.interval.hours": "{hours} h"
+  "admin.interval.hours": "{hours} h",
+  "admin.duration.ms": "{ms} ms"
 }

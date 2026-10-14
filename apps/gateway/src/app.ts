@@ -106,7 +106,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
   if (!directory) {
     // Dev convenience: a bare in-memory gateway maps users from DEV_USER_MAP.
     const tenant = process.env.DEFAULT_TENANT ?? 'dev'
-    for (const m of parseUserMap(process.env.DEV_USER_MAP)) await store.upsertMapping({ tenantId: tenant, ...m })
+    for (const m of parseUserMap(process.env.DEV_USER_MAP)) if (!(await store.getMappingByUser(tenant, m.userId))) await store.upsertMapping({ tenantId: tenant, ...m })
     directory = new StoreDirectory(store)
   }
   const dir = directory
@@ -334,7 +334,9 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         const sync = options.directorySync
         if (!sync) throw Object.assign(new Error('This directory cannot be synchronised'), { statusCode: 501 })
         if (sync.status().running) return reply.code(409).send({ error: 'a synchronisation is already running' })
-        return sync.run()
+        // A large directory takes a while: the run goes on in the background, GET /admin/directory follows it.
+        void sync.run()
+        return reply.code(202).send(sync.status())
       })
 
       // Right to erasure of one's own call history.

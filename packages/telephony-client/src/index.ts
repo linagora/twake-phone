@@ -108,9 +108,9 @@ export class TelephonyClient {
     return this.request<DirectoryAdmin>('/admin/directory')
   }
 
-  /** Copies the directory's accounts into the user ↔ extension mappings now, and reports what changed (409: already running). */
+  /** Starts copying the directory's accounts into the user ↔ extension mappings (409: already running); follow it with getDirectoryAdmin. */
   syncDirectory() {
-    return this.request<SyncReport>('/admin/directory/sync', { method: 'POST' })
+    return this.request<DirectoryAdmin['sync']>('/admin/directory/sync', { method: 'POST' })
   }
 
   getMediaSession() {

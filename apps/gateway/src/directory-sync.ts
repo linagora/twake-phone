@@ -14,9 +14,9 @@ export interface SyncReport {
   created: number
   updated: number
   unchanged: number
-  /** Mappings the synchronisation had written earlier and that no longer have a reason to exist. */
+  /** Mappings the synchronisation had written earlier for people the directory no longer lists with an extension. */
   removed: number
-  /** Extensions the directory gives to two people, or that a manual mapping already holds: left as they were. */
+  /** Extensions the directory gives to two people, or that someone else keeps: these people keep the mapping they had. */
   conflicts: { userId: string; extension: string; heldBy: string }[]
   /** Why the run failed, in words safe to show (no address, no filter, no credential). */
   error?: string
@@ -66,6 +66,7 @@ export class DirectorySync {
 
   /** Runs every `intervalMs`, the first time after `firstDelayMs` (the directory may not be ready at startup). */
   start(intervalMs: number, firstDelayMs = 10_000) {
+    if (!(intervalMs > 0 && intervalMs <= MAX_INTERVAL_MS) || firstDelayMs > MAX_INTERVAL_MS) throw new Error('interval out of range')
     this.stop()
     this.intervalMs = intervalMs
     const tick = () => {
@@ -117,33 +118,67 @@ export class DirectorySync {
     }
     report.seen = people.length
     const syncedAt = started.toISOString()
+    const previous = new Map((await store.listMappings(tenantId)).map(m => [m.userId, m]))
+    const synced = [...previous.values()].filter(m => m.source === 'ldap')
 
-    // What the directory says each person's mapping should be. The first person to claim an extension keeps it.
+    // An empty listing is far more often a wrong filter or a reader without rights than an organisation with
+    // nobody in it: it must not wipe every extension in one run.
+    if (people.length === 0 && synced.length > 0) {
+      this.opts.log?.error({ synced: synced.length }, 'directory synchronisation: the listing is empty, nothing removed')
+      report.error = 'the directory listed nobody: nothing was removed (check the user filter and the reader account)'
+      return finish()
+    }
+
+    // What the directory says each person's mapping should be. An extension the directory gives to two people stays
+    // with the one who already holds it from an earlier run, else with the first listed; the other is a conflict.
+    const byExtension = new Map([...previous.values()].map(m => [m.extension, m]))
     const wanted = new Map<string, UserMapping>()
-    const claimed = new Map<string, string>()
+    const claimed = new Map<string, { userId: string; mapping: UserMapping }>()
     for (const person of people) {
       const extension = extensionOf(person)
       if (!extension) continue
       report.withExtension++
-      const holder = claimed.get(extension)
-      if (holder) {
-        report.conflicts.push({ userId: person.id, extension, heldBy: holder })
+      const mapping: UserMapping = { tenantId, userId: person.id, extension, ...(person.displayName ? { displayName: person.displayName } : {}), ...(person.department ? { department: person.department } : {}), source: 'ldap', syncedAt }
+      const other = claimed.get(extension)
+      if (!other) {
+        claimed.set(extension, { userId: person.id, mapping })
         continue
       }
-      claimed.set(extension, person.id)
-      wanted.set(person.id, { tenantId, userId: person.id, extension, ...(person.displayName ? { displayName: person.displayName } : {}), ...(person.department ? { department: person.department } : {}), source: 'ldap', syncedAt })
+      const current = byExtension.get(extension)
+      // The current holder keeps it, whatever the listing order; the listing order decides between two newcomers.
+      const keep = current?.userId === person.id ? { userId: person.id, mapping } : other
+      const lose = keep === other ? person.id : other.userId
+      claimed.set(extension, keep)
+      report.conflicts.push({ userId: lose, extension, heldBy: keep.userId })
+    }
+    for (const { userId, mapping } of claimed.values()) wanted.set(userId, mapping)
+
+    // Rows that will go: mappings of people the directory knows whose extension changes (rewritten), and mappings
+    // this synchronisation wrote for people it no longer lists (removed). Everything else keeps its extension.
+    const released = new Set<string>()
+    for (const m of previous.values()) {
+      const next = wanted.get(m.userId)
+      if (next ? next.extension !== m.extension : m.source === 'ldap') released.add(m.userId)
+    }
+    // An extension someone else keeps (a manual mapping of a person unknown to the directory, above all) is not
+    // taken away: the person who wanted it is a conflict and keeps the mapping they had. Settled before any write,
+    // so a conflict never costs a mapping; repeated because a kept mapping can hold an extension someone else wanted.
+    let settled = false
+    while (!settled) {
+      settled = true
+      for (const next of wanted.values()) {
+        const holder = byExtension.get(next.extension)
+        if (!holder || holder.userId === next.userId || released.has(holder.userId)) continue
+        report.conflicts.push({ userId: next.userId, extension: next.extension, heldBy: holder.userId })
+        wanted.delete(next.userId)
+        if (released.delete(next.userId)) settled = false
+      }
     }
 
-    const previous = new Map((await store.listMappings(tenantId)).map(m => [m.userId, m]))
-    // Mappings this synchronisation wrote earlier and that it no longer wants, or wants with another extension, go
-    // first: that frees the extensions before they are given to someone else (two people swapping numbers).
-    for (const m of previous.values()) {
-      if (m.source !== 'ldap') continue
-      const next = wanted.get(m.userId)
-      if (!next) {
-        await store.deleteMapping(tenantId, m.userId)
-        report.removed++
-      } else if (next.extension !== m.extension) await store.deleteMapping(tenantId, m.userId)
+    // Rows that go, first: that frees the extensions before they are given to someone else (two people swapping).
+    for (const userId of released) {
+      await store.deleteMapping(tenantId, userId)
+      if (!wanted.has(userId)) report.removed++
     }
     for (const next of wanted.values()) {
       const before = previous.get(next.userId)
@@ -151,16 +186,11 @@ export class DirectorySync {
         report.unchanged++
         continue
       }
-      // An extension a manual mapping holds for someone else is not taken away: the administrator decided it.
-      const holder = await store.getMappingByExtension(tenantId, next.extension)
-      if (holder && holder.userId !== next.userId) {
-        report.conflicts.push({ userId: next.userId, extension: next.extension, heldBy: holder.userId })
-        continue
-      }
       try {
         await store.upsertMapping(next)
         before ? report.updated++ : report.created++
       } catch (err) {
+        // Another process wrote meanwhile (two Gateways synchronising at once): reported, repaired by the next run.
         this.opts.log?.error({ err, userId: next.userId }, 'directory synchronisation: mapping not written')
         report.conflicts.push({ userId: next.userId, extension: next.extension, heldBy: '?' })
       }
@@ -170,11 +200,16 @@ export class DirectorySync {
   }
 }
 
-/** "15m", "1h", "90s", "0" (off) or a number of seconds. */
+/** The longest delay a timer takes (2^31 - 1 ms, about 24.8 days); above it Node fires at once. */
+export const MAX_INTERVAL_MS = 2_147_483_647
+
+/** "15m", "1h", "90s", "0" (off) or a number of seconds; at most 24 days. */
 export const parseInterval = (spec: string | undefined, fallbackMs: number): number => {
   if (spec === undefined || spec === '') return fallbackMs
   const m = /^(\d+)\s*(ms|s|m|h|d)?$/.exec(spec.trim())
   if (!m) throw new Error(`invalid interval: ${spec} (examples: 15m, 1h, 0)`)
   const units: Record<string, number> = { ms: 1, s: 1000, m: 60_000, h: 3_600_000, d: 86_400_000 }
-  return Number(m[1]) * (units[m[2] ?? 's'] ?? 1000)
+  const ms = Number(m[1]) * (units[m[2] ?? 's'] ?? 1000)
+  if (ms > MAX_INTERVAL_MS) throw new Error(`invalid interval: ${spec} (at most 24 days)`)
+  return ms
 }

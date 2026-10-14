@@ -32,6 +32,8 @@ export interface LdapDirectoryConfig {
   connectTimeoutMs?: number
   /** Per-operation timeout: a server that accepts the connection and never answers must not hang the request. */
   operationTimeoutMs?: number
+  /** Timeout of each page of a full listing (the synchronisation), which may take longer than a lookup. */
+  listTimeoutMs?: number
   /** PEM of the CA that signed the server certificate (ldaps), when it is not in the system store. */
   ca?: string
   rejectUnauthorized?: boolean
@@ -145,7 +147,7 @@ export class LdapDirectory implements ContactDirectory {
     const client = new Client({
       url: this.config.url,
       connectTimeout: this.config.connectTimeoutMs ?? 5000,
-      timeout: this.config.operationTimeoutMs ?? 10_000,
+      timeout: paged ? (this.config.listTimeoutMs ?? 120_000) : (this.config.operationTimeoutMs ?? 10_000),
       ...(Object.keys(tls).length ? { tlsOptions: tls } : {})
     })
     try {
@@ -155,8 +157,8 @@ export class LdapDirectory implements ContactDirectory {
         filter,
         attributes: this.attributes(),
         sizeLimit,
-        // A full listing may take a while on a large directory; a lookup must not.
-        timeLimit: paged ? 120 : 10,
+        // A full listing may take a while on a large directory; a lookup must not. Both limits (server and client) agree.
+        timeLimit: paged ? Math.ceil((this.config.listTimeoutMs ?? 120_000) / 1000) : 10,
         ...(paged ? { paged: { pageSize: PAGE } } : {})
       })
       return searchEntries.map(e => contactOf(e, this.config.attributes)).filter((c): c is Contact => c !== null)

@@ -39,7 +39,8 @@ if (env.BOOTSTRAP_PROVIDER_URL && !(await store.listProviders()).some(p => p.ten
   }
   await store.upsertProvider({ tenantId: tenant, type: 'asterisk', config })
 }
-for (const m of parseUserMap(env.DEV_USER_MAP)) await store.upsertMapping({ tenantId: tenant, ...m })
+// DEV_USER_MAP seeds a mapping once; it never overwrites what an administrator or the directory wrote since.
+for (const m of parseUserMap(env.DEV_USER_MAP)) if (!(await store.getMappingByUser(tenant, m.userId))) await store.upsertMapping({ tenantId: tenant, ...m })
 
 const key = env.SECRETS_KEY ? parseKey(env.SECRETS_KEY) : undefined
 const secretsFor = key ? (url: string, token: string) => new SipSecrets({ store, key, provisioner: miniPbxProvisioner({ url, token }) }) : undefined
@@ -82,7 +83,7 @@ const app = await buildApp(registry, {
   directory: new StoreDirectory(store),
   ...(contacts ? { contacts } : {}),
   ...(directorySync ? { directorySync } : {}),
-  ...(hstsMaxAge ? { security: { hstsMaxAge } } : {}),
+  ...(hstsMaxAge !== undefined ? { security: { hstsMaxAge, hstsIncludeSubDomains: env.HSTS_INCLUDE_SUBDOMAINS === '1' } } : {}),
   auth: authenticatorFromEnv(env),
   ...(conference ? { conference } : {})
 })

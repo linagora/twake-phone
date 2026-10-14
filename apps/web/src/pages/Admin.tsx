@@ -6,7 +6,10 @@ import { useT } from '../i18n/useT.js'
 
 type T = (key: Key, params?: Record<string, string | number>) => string
 
-const describeInterval = (t: T, ms: number) => (ms >= 3_600_000 ? t('admin.interval.hours', { hours: Math.round(ms / 3_600_000) }) : t('admin.interval.minutes', { minutes: Math.max(1, Math.round(ms / 60_000)) }))
+const describeInterval = (t: T, ms: number) => (ms >= 7_200_000 && ms % 3_600_000 === 0 ? t('admin.interval.hours', { hours: ms / 3_600_000 }) : t('admin.interval.minutes', { minutes: Math.max(1, Math.round(ms / 60_000)) }))
+const describeDuration = (t: T, ms: number) => (ms < 1000 ? t('admin.duration.ms', { ms }) : t('admin.duration.seconds', { seconds: Math.round(ms / 1000) }))
+/** While a run is in progress, the status is read again this often. */
+const POLL_MS = 1500
 
 const gatewayStatus = (err: unknown) => (err instanceof Error ? /Gateway (\d{3}) /.exec(err.message)?.[1] : undefined)
 
@@ -49,12 +52,14 @@ const Report = ({ report }: { report: SyncReport }) => {
 /** The directory source and its synchronisation into the extensions. Administrators only; the Gateway decides who. */
 export const Admin = () => {
   const { t, lang } = useT()
-  const { client, me, refreshMe } = useGateway()
+  const { client, me, meError, refreshMe } = useGateway()
   const admin = me?.features?.admin === true
   const [data, setData] = useState<DirectoryAdmin | null>(null)
   const [error, setError] = useState<{ status?: string; reason: string } | null>(null)
-  const [syncing, setSyncing] = useState(false)
-  const [outcome, setOutcome] = useState<{ ok: true; report: SyncReport } | { ok: false; reason: Key; detail: string } | null>(null)
+  // The run this screen started: its outcome is announced once it is over.
+  const [started, setStarted] = useState(false)
+  const [outcome, setOutcome] = useState<{ ok: true } | { ok: false; reason: Key; detail: string } | null>(null)
+  const running = data?.sync.running === true
 
   const load = useCallback(() => {
     if (!admin) return
@@ -67,24 +72,40 @@ export const Admin = () => {
       .catch((err: unknown) => setError({ status: gatewayStatus(err), reason: err instanceof Error ? err.message : String(err) }))
   }, [admin, client])
   useEffect(load, [load])
+  // A run in progress (this screen's, another administrator's, or the scheduled one) is followed until it ends.
+  useEffect(() => {
+    if (!running) return
+    const timer = setInterval(load, POLL_MS)
+    return () => clearInterval(timer)
+  }, [running, load])
+  useEffect(() => {
+    if (!started || running) return
+    setStarted(false)
+    setOutcome({ ok: true })
+    // The administrator may be among the synchronised accounts: their own extension in the header follows.
+    refreshMe()
+  }, [started, running, refreshMe])
 
   const sync = async () => {
-    setSyncing(true)
     setOutcome(null)
     try {
-      const report = await client.syncDirectory()
-      setOutcome({ ok: true, report })
-      // The administrator may be among the synchronised accounts: their own extension in the header follows.
-      refreshMe()
+      const status = await client.syncDirectory()
+      setStarted(true)
+      setData(d => (d ? { ...d, sync: status } : d))
     } catch (err) {
       setOutcome({ ok: false, reason: gatewayStatus(err) === '409' ? 'admin.syncBusy' : 'admin.syncFailed', detail: err instanceof Error ? err.message : String(err) })
-    } finally {
-      setSyncing(false)
       load()
     }
   }
 
-  if (!me) return <p role="status">{t('admin.loading')}</p>
+  if (!me) {
+    return (
+      <>
+        <h1>{t('admin.title')}</h1>
+        {meError ? <p className="alert alert-error" role="alert">{t('admin.error', { reason: meError })}</p> : <p role="status">{t('admin.loading')}</p>}
+      </>
+    )
+  }
   if (!admin) {
     return (
       <>
@@ -95,7 +116,7 @@ export const Admin = () => {
   }
   const source = data?.source
   const attributes = Object.entries(source?.attributes ?? {})
-  const last = outcome?.ok ? outcome.report : data?.sync.last
+  const last = data?.sync.last
   const formatDate = (iso: string) => new Date(iso).toLocaleString(lang === 'fr' ? 'fr-FR' : 'en-GB')
   return (
     <>
@@ -162,15 +183,13 @@ export const Admin = () => {
           {data.sync.available ? (
             <>
               <p>{data.sync.intervalMs ? t('admin.syncSchedule', { interval: describeInterval(t, data.sync.intervalMs) }) : t('admin.syncNoSchedule')}</p>
-              <p>{last ? t('admin.syncLast', { date: formatDate(last.finishedAt), duration: t('admin.duration.seconds', { seconds: Math.max(1, Math.round(last.durationMs / 1000)) }) }) : t('admin.syncNever')}</p>
+              <p>{last ? t('admin.syncLast', { date: formatDate(last.finishedAt), duration: describeDuration(t, last.durationMs) }) : t('admin.syncNever')}</p>
               <p>
-                <button type="button" className="btn btn-primary" onClick={() => void sync()} disabled={syncing || data.sync.running} aria-busy={syncing}>
+                <button type="button" className="btn btn-primary" onClick={() => void sync()} disabled={running} aria-busy={running}>
                   {t('admin.syncNow')}
                 </button>
               </p>
-              <div role="status">
-                {syncing || data.sync.running ? t('admin.syncRunning') : outcome ? (outcome.ok ? t('admin.syncDone') : t(outcome.reason, { reason: outcome.detail })) : ''}
-              </div>
+              <div role="status">{running ? t('admin.syncRunning') : outcome ? (outcome.ok ? t('admin.syncDone') : t(outcome.reason, { reason: outcome.detail })) : ''}</div>
               {last ? <Report report={last} /> : null}
             </>
           ) : (

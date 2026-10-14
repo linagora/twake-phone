@@ -8,7 +8,7 @@ La passerelle associe chaque utilisateur à un poste (`user_mappings`). Le POC r
 
 ## Décision
 
-La passerelle copie les comptes de l'annuaire dans ses correspondances, à intervalle régulier et à la demande d'un administrateur. L'annuaire fait foi pour les personnes qu'il connaît : leur poste, leur nom et leur service suivent l'annuaire. Les correspondances écrites à la main pour des personnes que l'annuaire ne connaît pas sont conservées, et leur poste n'est jamais repris. Un poste que l'annuaire donne à deux personnes est signalé ; la première le garde. Une personne qui quitte l'annuaire ou perd son poste perd la correspondance que la synchronisation avait écrite.
+La passerelle copie les comptes de l'annuaire dans ses correspondances, à intervalle régulier et à la demande d'un administrateur. L'annuaire fait foi pour les personnes qu'il connaît : leur poste, leur nom et leur service suivent l'annuaire. Les correspondances écrites à la main pour des personnes que l'annuaire ne connaît pas sont conservées, et leur poste n'est jamais repris. Un poste que l'annuaire donne à deux personnes est signalé ; celle qui l'a déjà le garde, sinon la première listée. Un conflit ne retire jamais le poste que la personne avait. Un listing vide ne retire rien. Une personne qui quitte l'annuaire ou perd son poste perd la correspondance que la synchronisation avait écrite.
 
 Les administrateurs sont désignés par le SSO (un rôle dans une revendication du jeton), avec une liste d'utilisateurs en repli pour un SSO qui n'émet pas de rôles. Aucune requête ne peut se déclarer administratrice.
 
@@ -17,6 +17,7 @@ Les administrateurs sont désignés par le SSO (un rôle dans une revendication 
 - `LDAP_ATTR_EXTENSION` doit être renseigné pour synchroniser ; sans lui, l'annuaire sert à chercher, pas à attribuer.
 - L'identifiant LDAP et l'identifiant du jeton doivent coïncider : c'est le cas sur une plateforme Twake (LemonLDAP::NG sur le même LDAP).
 - Les groupes d'appel et les renvois viendront de la même synchronisation à l'étape 4 (provider-opensips), pas d'une saisie manuelle.
+- Les écritures ne sont pas transactionnelles et le verrou d'exécution est en mémoire : un seul réplica de la passerelle synchronise pour l'instant ; l'exécution suivante répare ce qu'une panne au milieu d'une exécution aurait laissé. Un verrou en base (`pg_advisory_lock`) viendra avec l'exploitation multi-réplicas.
 - SCIM n'est pas retenu : la synchronisation tirée (pull) suffit tant qu'un seul annuaire sert un déploiement ; un déploiement multi-tenant demandera une source par tenant (étape 7).
 
 ## Alternatives écartées
