@@ -18,6 +18,8 @@ export interface Phone {
   /** Tones the far end sent by SIP INFO, per call id. */
   tones: Record<string, string>
   call(target: string): Promise<SoftCall>
+  /** Unregisters and stops the softphone, before the page leaves (sign-out): the SIP server forgets this window. */
+  shutdown(): Promise<void>
 }
 
 const PhoneContext = createContext<Phone | null>(null)
@@ -109,12 +111,21 @@ export const SoftphoneProvider = ({ children }: { children: ReactNode }) => {
     return c
   }, [])
 
-  const value = useMemo<Phone>(() => ({ state, detail, calls, lastEnded, tones, call }), [state, detail, calls, lastEnded, tones, call])
+  const shutdown = useCallback(async () => {
+    const softphone = phone.current
+    phone.current = null
+    if (!softphone) return
+    await softphone.stop().catch(() => undefined)
+    setCalls([])
+    setState('off')
+  }, [])
+
+  const value = useMemo<Phone>(() => ({ state, detail, calls, lastEnded, tones, call, shutdown }), [state, detail, calls, lastEnded, tones, call, shutdown])
   // What a test can read from outside: never actions, only counters (packets, calls, tones).
   useEffect(() => {
     window.twakephone = {
       state,
-      calls: calls.map(c => ({ id: c.id, direction: c.direction, state: c.state, remoteNumber: c.remoteNumber, remoteHold: c.remoteHold, muted: c.muted, renegotiating: c.renegotiating, transferring: c.transferring, ...(c.replacedCallId ? { replacedCallId: c.replacedCallId } : {}) })),
+      calls: calls.map(c => ({ id: c.id, direction: c.direction, state: c.state, remoteNumber: c.remoteNumber, remoteHold: c.remoteHold, muted: c.muted, renegotiating: c.renegotiating, transferring: c.transferring, ...(c.replacedCallId ? { replacedCallId: c.replacedCallId } : {}), ...(c.consultationOf ? { consultationOf: c.consultationOf } : {}) })),
       lastEnded: lastEnded ? { remoteNumber: lastEnded.remoteNumber, endReason: lastEnded.endReason, endStatus: lastEnded.endStatus } : null,
       tones,
       stats: () => Promise.all(calls.map(c => c.stats()))

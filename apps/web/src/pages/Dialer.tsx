@@ -3,6 +3,7 @@ import { useSearchParams } from 'react-router-dom'
 import { formatNumber, toDialTarget } from '@twake/telephony-client'
 import { useGateway } from '../gateway.js'
 import { useT } from '../i18n/useT.js'
+import { describeCallError } from '../components/callErrors.js'
 import { usePhone } from '../softphone.js'
 
 const KEYS: [string, string][] = [['1', ''], ['2', 'ABC'], ['3', 'DEF'], ['4', 'GHI'], ['5', 'JKL'], ['6', 'MNO'], ['7', 'PQRS'], ['8', 'TUV'], ['9', 'WXYZ'], ['*', ''], ['0', '+'], ['#', '']]
@@ -60,7 +61,7 @@ export const Dialer = () => {
         setStatus({ kind: 'error', text: t('dialer.notRegistered') })
       }
     } catch (err) {
-      setStatus({ kind: 'error', text: t('dialer.failed', { reason: err instanceof Error ? err.message : String(err) }) })
+      setStatus({ kind: 'error', text: t('dialer.failed', { reason: describeCallError(err, t) }) })
     }
   }
 

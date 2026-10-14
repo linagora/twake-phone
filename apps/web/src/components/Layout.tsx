@@ -53,7 +53,7 @@ export const Layout = () => {
               {t(`phone.${phone.state}`)}
             </span>
           ) : null}
-          <button type="button" className="btn" onClick={() => void signOut()}>
+          <button type="button" className="btn" onClick={() => void phone.shutdown().then(signOut)}>
             {t('auth.signout')}
           </button>
         </div>

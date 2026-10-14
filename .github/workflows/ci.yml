@@ -96,7 +96,7 @@ jobs:
         working-directory: apps/phone
 
   sip-e2e:
-    name: SIP (OpenSIPS, rtpengine, deux navigateurs)
+    name: SIP (OpenSIPS, rtpengine, trois navigateurs)
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -127,7 +127,7 @@ jobs:
       - name: Dépendances système de Chromium (cache ou non)
         if: steps.chromium-cache.outputs.cache-hit == 'true'
         run: npx playwright-core install-deps chromium
-      - name: e2e SIP (deux navigateurs, micro simulé, OpenSIPS et rtpengine en Docker)
+      - name: e2e SIP (trois navigateurs, micro simulé, OpenSIPS et rtpengine en Docker)
         run: node apps/web/test/sip.e2e.mjs
         env:
           SIP_WSS_URL: wss://127.0.0.1:8089
@@ -148,4 +148,4 @@ jobs:
 
   # yarn e2e:web et yarn e2e:sip tournent ci-dessus. Les e2e du POC sur sa stack (yarn e2e:live, yarn e2e:widget,
   # platform.e2e.mjs) demandent MiniPBX, LiveKit et la stack Twake : ils ne sont plus joués et partent avec le POC
-  # (étape 3c). Les e2e à trois navigateurs (transferts) arrivent avec la PR 3b.
+  # (étape 3c).

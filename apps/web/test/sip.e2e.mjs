@@ -64,9 +64,11 @@ const until = async (what, fn, { timeout = 15_000, every = 250 } = {}) => {
 const startRelay = (targetHost, targetPort, port) =>
   new Promise((resolve, reject) => {
     const sockets = new Set()
+    const pairs = []
     const server = createServer(client => {
       const upstream = connect(targetPort, targetHost)
       sockets.add(client).add(upstream)
+      pairs.push({ client, upstream })
       client.pipe(upstream).pipe(client)
       const drop = () => {
         client.destroy()
@@ -80,6 +82,15 @@ const startRelay = (targetHost, targetPort, port) =>
     server.on('error', reject)
     server.listen(port, '127.0.0.1', () =>
       resolve({
+        /** Drops the SIP server's side of the n-th connection only: the browser keeps its socket and suspects nothing. */
+        cutUpstream: n => {
+          const pair = pairs[n]
+          if (!pair) throw new Error(`no relayed connection ${n}`)
+          pair.upstream.removeAllListeners('close')
+          pair.upstream.removeAllListeners('error')
+          pair.client.unpipe(pair.upstream)
+          pair.upstream.destroy()
+        },
         cut: () => {
           const n = sockets.size
           for (const s of sockets) s.destroy()
@@ -283,7 +294,7 @@ try {
     await transferTarget(jean.page).fill('105')
     await jean.page.getByRole('button', { name: 'Transférer directement' }).click()
     // Alice (the transferee) was told to call 105, got 404 and reported it to Jean (NOTIFY), who resumed her.
-    await jean.page.getByRole('alert').getByText('Transfer failed: 404 Not Found').waitFor({ timeout: 20_000 })
+    await jean.page.getByRole('alert').getByText('Transfert impossible : le poste visé est injoignable (404).').waitFor({ timeout: 20_000 })
     await jean.page.getByText('En communication avec Alice Martin (101)').waitFor()
     await until('Alice back from hold with her one call', async () => {
       const c = await calls(alice.page)
@@ -298,8 +309,11 @@ try {
     await jean.page.getByRole('button', { name: 'Transférer directement' }).click()
     const ringing = bob.page.getByTestId('incoming-call')
     await ringing.getByText('Appel entrant de Alice Martin (101)').waitFor({ timeout: 20_000 })
+    // Until Bob answers, Jean is told the transfer is on its way, and can still hang up.
+    await jean.page.getByText('Transfert de Alice Martin (101) en cours…').waitFor()
+    if (await jean.page.getByRole('button', { name: 'Raccrocher' }).isDisabled()) throw new Error('hanging up during a transfer must stay possible')
     await ringing.getByRole('button', { name: 'Répondre' }).click()
-    await jean.page.getByText('Alice Martin (101) a été transféré.').waitFor()
+    await jean.page.getByText('Appel avec Alice Martin (101) transféré.').waitFor()
     expectEqual((await calls(jean.page)).length, 0, 'calls left on Jean side')
     await alice.page.getByText('En communication avec 103').waitFor()
     await until('Alice has only her call with Bob', async () => (await calls(alice.page)).length === 1)
@@ -327,6 +341,34 @@ try {
     await until('Alice back from hold', async () => !(await calls(alice.page))[0]?.remoteHold)
     await bothHearEachOther(alice, jean)
   })
+  await step('Jean consults an extension nobody registered: told so, and Alice is taken back without a click', async () => {
+    await transferButton(jean.page).click()
+    await transferTarget(jean.page).fill('105')
+    await jean.page.getByRole('button', { name: "Consulter d'abord" }).click()
+    // The end of the consultation is said even though the call with Alice goes on.
+    await jean.page.getByRole('status').getByText('105 est injoignable.').waitFor({ timeout: 20_000 })
+    await jean.page.getByText('En communication avec Alice Martin (101)').waitFor()
+    await until('Alice back from hold with her one call', async () => {
+      const c = await calls(alice.page)
+      return c.length === 1 && !c[0].remoteHold ? c : null
+    })
+    expectEqual((await calls(jean.page)).length, 1, 'calls left on Jean side')
+    await bothHearEachOther(alice, jean)
+  })
+  await step('Jean consults Bob, who hangs up: Alice is taken back without a click', async () => {
+    await transferButton(jean.page).click()
+    await transferTarget(jean.page).fill('103')
+    await jean.page.getByRole('button', { name: "Consulter d'abord" }).click()
+    const ringing = bob.page.getByTestId('incoming-call')
+    await ringing.getByText('Appel entrant de Jean Dupont (102)').waitFor({ timeout: 20_000 })
+    await ringing.getByRole('button', { name: 'Répondre' }).click()
+    await jean.page.getByTestId('consultation').getByText('En communication avec 103').waitFor()
+    await bob.page.getByRole('button', { name: 'Raccrocher' }).click()
+    await jean.page.getByRole('status').getByText('Appel avec 103 terminé.').waitFor()
+    await jean.page.getByText('En communication avec Alice Martin (101)').waitFor()
+    await until('Alice back from hold', async () => !(await calls(alice.page))[0]?.remoteHold)
+    await bothHearEachOther(alice, jean)
+  })
   await step('attended transfer: Jean consults Bob, then hands Alice over (REFER with Replaces); Jean is freed, Alice and Bob hear each other', async () => {
     await transferButton(jean.page).click()
     await transferTarget(jean.page).fill('103')
@@ -337,7 +379,7 @@ try {
     const consultation = jean.page.getByTestId('consultation')
     await consultation.getByText('En communication avec 103').waitFor()
     await consultation.getByRole('button', { name: 'Transférer Alice Martin (101) à 103' }).click()
-    await jean.page.getByText('Alice Martin (101) a été transféré.').waitFor({ timeout: 20_000 })
+    await jean.page.getByText('Appel avec Alice Martin (101) transféré.').waitFor({ timeout: 20_000 })
     await until('Jean has no call left', async () => (await calls(jean.page)).length === 0)
     await alice.page.getByText('En communication avec 103').waitFor()
     await bob.page.getByText('En communication avec Alice Martin (101)').waitFor()
@@ -349,6 +391,15 @@ try {
     await bothHearEachOther(alice, bob)
     await bob.page.getByRole('button', { name: 'Raccrocher' }).click()
     await alice.page.getByText('Appel avec 103 terminé.').waitFor()
+  })
+  await step('a registration left on a dead connection (the first one, Alice): the caller is told unreachable, not an error', async () => {
+    relay.cutUpstream(0)
+    await sleep(500)
+    await dial(jean.page, '101')
+    const ended = await until('the call to 101 to end', () => lastEnded(jean.page), { timeout: 20_000 })
+    // 477 "Send failed": OpenSIPS could not reach the contact; the person reads the same as for nobody registered.
+    expectEqual(`${ended.endStatus} ${ended.endReason}`, '477 unavailable', 'how the call to a dead contact ended')
+    await jean.page.getByText('101 est injoignable.').waitFor()
   })
   await step('the SIP connections drop: the header says offline, then the softphones come back on their own', async () => {
     const cut = relay.cut()
@@ -372,9 +423,10 @@ try {
     await alice.page.waitForURL(`${appOrigin}/`)
     await alice.page.getByRole('button', { name: 'Se connecter' }).waitFor()
     await dial(jean.page, '101')
-    await jean.page.getByText('101 est injoignable.').waitFor({ timeout: 20_000 })
+    const ended = await until('the call to 101 to end', () => lastEnded(jean.page), { timeout: 20_000 })
     // 404: no contact left for 101. A registration left behind would have given 480 (dead contact) or rung.
-    expectEqual((await lastEnded(jean.page))?.endStatus, 404, 'SIP status after Alice signed out')
+    expectEqual(`${ended.endStatus} ${ended.endReason}`, '404 unavailable', 'how the call to 101 ended after Alice signed out')
+    await jean.page.getByText('101 est injoignable.').waitFor()
   })
 } catch (err) {
   failed = true
