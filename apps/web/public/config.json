@@ -1,0 +1,8 @@
+{
+  "gatewayUrl": "http://localhost:8080",
+  "oidc": {
+    "authority": "http://localhost:4400",
+    "clientId": "twakephone-web",
+    "resource": "https://gateway.twakephone.test"
+  }
+}

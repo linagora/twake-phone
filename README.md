@@ -119,8 +119,8 @@ Pas de calendrier en semaines : le développement avance par étapes ordonnées,
 
 | # | Étape | Démo de sortie | État |
 |---|---|---|---|
-| 1 | **Monorepo** : import du POC avec tous ses tests, ADR, CI | `yarn test` vert, ADR relus | PR ouverte |
-| 2 | **App React autonome** : OIDC, annuaire LDAP et CardDAV, synchronisation des comptes, CSP, socle RGAA | Connexion SSO, recherche d'un collègue | |
+| 1 | **Monorepo** : import du POC avec tous ses tests, ADR, CI | `yarn test` vert, ADR relus | Fusionnée le 14 octobre 2026 |
+| 2 | **App React autonome** : OIDC, annuaire LDAP et CardDAV, synchronisation des comptes, CSP, socle RGAA | Connexion SSO, recherche d'un collègue | PR 2a (coquille et SSO) fusionnée, PR 2b (annuaire LDAP, favoris) ouverte |
 | 3 | **OpenSIPS et JsSIP** : Docker OpenSIPS + rtpengine, softphone réécrit, attente, transfert direct et supervisé, DTMF, trois navigateurs | Deux utilisateurs s'appellent, s'attendent, se transfèrent | |
 | 4 | **provider-opensips** : événements, présence, CDR, renvois, NPD planifié, groupes | La pastille change pendant un appel, un renvoi est appliqué | |
 | 5 | **Réception sans onglet** : service worker, Web Push, renvoi après délai | Navigateur fermé, la notification ouvre l'app sur l'appel | |
@@ -138,7 +138,8 @@ Ensuite : QoS, exploitation et haute disponibilité, pilote de 30 à 50 utilisat
 Ce qui existe à la fin de l'étape 1 (le POC importé) :
 
 ```
-apps/phone                   application Phone (React 18, encore Cozy et SIP.js : étapes 2 et 3)
+apps/web                     application TwakePhone (React 18, OIDC PKCE, client de la passerelle) : étape 2
+apps/phone                   application Phone du POC (React 18, Cozy, SIP.js), gardée jusqu'à l'étape 3
 apps/gateway                 Twake Telephony Gateway (Fastify, PostgreSQL, OpenAPI sur /docs)
 packages/telephony-types     modèle neutre : Call, Presence, Capabilities
 packages/provider-sdk        contrat TelephonyProvider / MediaProvider / ConferenceBridgeProvider
@@ -161,9 +162,10 @@ docs/                        documentation du POC, docs/adr/ : une décision, un
 Prérequis : Node 24 (`.nvmrc` ; la passerelle et les paquets acceptent 22+), Yarn 1, Docker.
 
 ```bash
-yarn install && yarn build && yarn test        # paquets et passerelle, aucun service externe
+yarn install && yarn build && yarn test        # paquets, passerelle et app web, aucun service externe
 (cd apps/phone && yarn install && yarn test)   # application (résout @twake/* vers packages/*/dist)
 yarn dev:gateway                               # passerelle sur http://localhost:8080, OpenAPI sur /docs
+yarn dev:web                                   # app TwakePhone sur http://localhost:4173 (config dans apps/web/public/config.json)
 ```
 
 Stack complète en local (Twake, Phone, passerelle, PBX de dev), encore celle du POC jusqu'à l'étape 3 :
@@ -179,13 +181,14 @@ Visio (accès téléphonique aux salles Meet) et trunk SIP réel : [docker/READM
 | Commande | Vérifie |
 |---|---|
 | `yarn test` | unitaires de tous les paquets et de la passerelle (vitest), contrat de stockage mémoire et, avec `TEST_DATABASE_URL`, PostgreSQL |
-| `cd apps/phone && yarn lint && yarn test` | application (eslint, stylint, jest) |
+| `cd apps/phone && yarn lint && yarn test` | application Phone du POC (eslint, stylint, jest) |
+| `yarn e2e:web` | app TwakePhone dans Chromium : connexion OIDC (fournisseur de test en Node), identité et poste donnés par la passerelle, clavier, langue, déconnexion, CSP. Sans Docker ; Chromium s'installe une fois avec `npx playwright-core install chromium` (ou `PLAYWRIGHT_CHROMIUM=/chemin/vers/chromium`) |
 | `yarn e2e:live` | passerelle ↔ PBX de dev (MiniPBX, ARI), avec de vrais appels SIP |
 | `yarn e2e:browser` | deux navigateurs, audio réel simulé (WebRTC) |
 | `yarn e2e:widget` | widget dans un hôte cozy-interapp réel |
 | `node docker/meet-sip/platform.e2e.mjs` | Meet sur la plateforme : jetons, LiveKit, SIP, PBX |
 
-La CI joue les deux premières lignes sur chaque PR ; les e2e demandent la stack Docker et se jouent à chaque porte de sortie. L'étape 3 remplace MiniPBX (hébergé chez un tiers, `git.oriatec.fr`) par OpenSIPS et rtpengine en Docker Compose, ce qui les fera entrer en CI.
+La CI joue les trois premières lignes sur chaque PR ; les e2e demandent la stack Docker et se jouent à chaque porte de sortie. L'étape 3 remplace MiniPBX (hébergé chez un tiers, `git.oriatec.fr`) par OpenSIPS et rtpengine en Docker Compose, ce qui les fera entrer en CI.
 
 ## Décisions
 

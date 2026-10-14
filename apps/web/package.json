@@ -1,0 +1,28 @@
+{
+  "name": "@twake/phone-web",
+  "version": "0.1.0",
+  "private": true,
+  "description": "TwakePhone web application: standalone React app, OIDC sign-in, Telephony Gateway client.",
+  "license": "AGPL-3.0",
+  "type": "module",
+  "scripts": {
+    "dev": "rsbuild dev",
+    "build": "rsbuild build",
+    "preview": "rsbuild preview",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@twake/telephony-client": "*",
+    "oidc-client-ts": "^3.5.0",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "react-router-dom": "^7.18.4"
+  },
+  "devDependencies": {
+    "@rsbuild/core": "^2.2.13",
+    "@rsbuild/plugin-react": "^2.1.1",
+    "@types/react": "18.3.12",
+    "@types/react-dom": "18.3.1",
+    "typescript": "^5.9.3"
+  }
+}

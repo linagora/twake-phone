@@ -18,7 +18,8 @@ Node 24 (`.nvmrc`) pour l'app ; la racine accepte 22+.
 
 ```bash
 yarn install && yarn build
-yarn typecheck && yarn test            # packages et Gateway
+yarn typecheck && yarn test            # packages, Gateway, app web
+yarn e2e:web                           # app web dans Chromium, sans Docker (une fois : npx playwright-core install chromium)
 (cd apps/phone && yarn install && yarn lint && yarn test)
 ```
 
