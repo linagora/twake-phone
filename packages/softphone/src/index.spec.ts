@@ -241,14 +241,18 @@ describe('Softphone', () => {
     const { phone, ua } = await setup()
     const response = (reason_phrase: string, headers: Record<string, string> = {}) => ({ status_code: 480, reason_phrase, getHeader: (name: string) => headers[name] })
     const dnd = await phone.call('102')
-    ua().lastCall!.emit('failed', { originator: 'remote', cause: 'Unavailable', message: response('Do Not Disturb', { 'Twake-Dnd-Message': ' En réunion jusqu’à 16 h ' }) })
+    ua().lastCall!.emit('failed', { originator: 'remote', cause: 'Unavailable', message: response('Do Not Disturb', { 'Twake-Dnd': '1', 'Twake-Dnd-Message': ' En réunion jusqu’à 16 h ' }) })
     expect([dnd.endReason, dnd.endStatus, dnd.endMessage]).toEqual(['dnd', 480, 'En réunion jusqu’à 16 h'])
     const silent = await phone.call('102')
-    ua().lastCall!.emit('failed', { originator: 'remote', cause: 'Unavailable', message: response('Do Not Disturb') })
+    ua().lastCall!.emit('failed', { originator: 'remote', cause: 'Unavailable', message: response('Do Not Disturb', { 'Twake-Dnd': '1' }) })
     expect([silent.endReason, silent.endMessage]).toEqual(['dnd', undefined])
-    // Nobody there: the usual 480, whatever header it carries.
+    // The header decides, not the reason phrase, which a proxy on the way may rewrite.
+    const rewritten = await phone.call('102')
+    ua().lastCall!.emit('failed', { originator: 'remote', cause: 'Unavailable', message: response('Temporarily Unavailable', { 'Twake-Dnd': '1' }) })
+    expect(rewritten.endReason).toBe('dnd')
+    // Nobody there: the usual 480, whatever reason phrase or message it carries.
     const away = await phone.call('103')
-    ua().lastCall!.emit('failed', { originator: 'remote', cause: 'Unavailable', message: response('Temporarily Unavailable', { 'Twake-Dnd-Message': 'x' }) })
+    ua().lastCall!.emit('failed', { originator: 'remote', cause: 'Unavailable', message: response('Do Not Disturb', { 'Twake-Dnd-Message': 'x' }) })
     expect([away.endReason, away.endMessage]).toEqual(['unavailable', undefined])
   })
 

@@ -22,62 +22,85 @@ describe('CALL_RULES_SCHEMA', () => {
 })
 
 describe('CallRules', () => {
-  it('reads the forwards of an extension, and none when it has no row', async () => {
+  /** Who holds which extension in these tests. */
+  const holderOf = async (extension: string) => ({ '102': 'bob', '103': 'carol', '104': 'dave' })[extension]
+
+  it('reads the forwards of an extension of its tenant, and none when it has no row', async () => {
     const db = recorder([{ forward_always: null, forward_busy: '103', forward_noanswer: '104', noanswer_delay: 15 }])
-    expect(await new CallRules({ pool: db.pool }).getForwarding('102')).toEqual({ busy: '103', noAnswer: { target: '104', delaySec: 15 } })
-    expect(db.queries[0]!.values).toEqual(['102'])
+    expect(await new CallRules({ pool: db.pool, tenantId: 'A' }).getForwarding('102')).toEqual({ busy: '103', noAnswer: { target: '104', delaySec: 15 } })
+    expect(db.queries[0]!.text).toMatch(/WHERE extension = \$1 AND tenant_id = \$2$/)
+    expect(db.queries[0]!.values).toEqual(['102', 'A'])
     expect(await new CallRules({ pool: recorder().pool }).getForwarding('102')).toEqual({})
   })
 
-  it('upserts the forwards, then removes the row if it says nothing any more', async () => {
+  it('upserts the forwards with who holds the extension and each target, then removes the row if it says nothing any more', async () => {
     const db = recorder()
-    const rules = new CallRules({ pool: db.pool })
-    await rules.setForwarding('102', { always: '103', noAnswer: { target: '104', delaySec: 3 } })
+    const rules = new CallRules({ pool: db.pool, tenantId: 'A', holderOf })
+    await rules.setForwarding('102', { always: '103', noAnswer: { target: '104', delaySec: 5 } }, 'bob')
     expect(db.queries[0]!.text).toMatch(/^INSERT INTO call_rules .* ON CONFLICT \(extension\) DO UPDATE/)
-    expect(db.queries[0]!.values).toEqual(['102', '103', null, '104', 3])
+    // Another holder's "do not disturb" is not kept with the extension.
+    expect(db.queries[0]!.text).toContain('dnd = call_rules.dnd AND call_rules.holder = EXCLUDED.holder')
+    expect(db.queries[0]!.values).toEqual(['102', 'A', 'bob', '103', 'carol', null, null, '104', 'dave', 5])
     expect(db.queries[1]!.text).toMatch(/^DELETE FROM call_rules WHERE extension = \$1 AND NOT dnd/)
-    await rules.setForwarding('102', {})
-    expect(db.queries[2]!.values).toEqual(['102', null, null, null, 20])
+    await rules.setForwarding('102', { busy: '199' }, 'bob')
+    // Nobody holds 199: an empty holder, which no mapping matches.
+    expect(db.queries[2]!.values).toEqual(['102', 'A', 'bob', null, null, '199', '', null, null, 20])
   })
 
   it('refuses what is not an extension, and a delay out of bounds, before any query', async () => {
     const db = recorder()
     const rules = new CallRules({ pool: db.pool })
-    await expect(rules.setForwarding("102' OR 1=1", {})).rejects.toMatchObject({ statusCode: 400 })
-    await expect(rules.setForwarding('102', { always: 'sip:103@elsewhere' })).rejects.toMatchObject({ statusCode: 400, message: /forward target/ })
-    await expect(rules.setForwarding('102', { busy: '' })).rejects.toMatchObject({ statusCode: 400 })
-    for (const delaySec of [1, 121, 2.5]) await expect(rules.setForwarding('102', { noAnswer: { target: '103', delaySec } })).rejects.toMatchObject({ statusCode: 400, message: /delay/ })
+    await expect(rules.setForwarding("102' OR 1=1", {}, 'bob')).rejects.toMatchObject({ statusCode: 400 })
+    await expect(rules.setForwarding('102', { always: 'sip:103@elsewhere' }, 'bob')).rejects.toMatchObject({ statusCode: 400, message: /forward target/ })
+    await expect(rules.setForwarding('102', { busy: '' }, 'bob')).rejects.toMatchObject({ statusCode: 400 })
+    for (const delaySec of [1, 4, 121, 5.5]) await expect(rules.setForwarding('102', { noAnswer: { target: '103', delaySec } }, 'bob')).rejects.toMatchObject({ statusCode: 400, message: /delay/ })
     await expect(rules.getForwarding('')).rejects.toMatchObject({ statusCode: 400 })
     expect(db.queries).toEqual([])
   })
 
-  it('writes a "do not disturb" with its end and message, and lifts it with null', async () => {
+  it('writes a "do not disturb" with its end, message and holder, and lifts it with null', async () => {
     const db = recorder()
-    const rules = new CallRules({ pool: db.pool })
-    await rules.setDnd('102', { until: '2026-10-15T16:00:00.000Z', message: 'En réunion' })
-    expect(db.queries[0]!.values).toEqual(['102', true, '2026-10-15T16:00:00.000Z', 'En réunion'])
-    await rules.setDnd('102', {})
-    expect(db.queries[2]!.values).toEqual(['102', true, null, ''])
-    await rules.setDnd('102', null)
-    expect(db.queries[4]!.values).toEqual(['102', false, null, ''])
+    const rules = new CallRules({ pool: db.pool, tenantId: 'A' })
+    await rules.setDnd('102', { until: '2026-10-15T16:00:00.000Z', message: 'En réunion' }, 'bob')
+    expect(db.queries[0]!.values).toEqual(['102', 'A', 'bob', true, '2026-10-15T16:00:00.000Z', 'En réunion'])
+    // Another holder's forwards are not kept with the extension.
+    expect(db.queries[0]!.text).toContain('forward_always = CASE WHEN call_rules.holder = EXCLUDED.holder THEN call_rules.forward_always END')
+    await rules.setDnd('102', {}, 'bob')
+    expect(db.queries[2]!.values).toEqual(['102', 'A', 'bob', true, null, ''])
+    await rules.setDnd('102', null, 'bob')
+    expect(db.queries[4]!.values).toEqual(['102', 'A', 'bob', false, null, ''])
     expect(db.queries[5]!.text).toMatch(/^DELETE FROM call_rules/)
   })
 
   it('refuses a message that would not fit in one SIP header line, and a date that is not one', async () => {
     const db = recorder()
     const rules = new CallRules({ pool: db.pool })
-    for (const message of ['two\r\nlines', 'tab\there', 'x'.repeat(DND_MESSAGE_MAX + 1)]) await expect(rules.setDnd('102', { message })).rejects.toMatchObject({ statusCode: 400 })
-    await expect(rules.setDnd('102', { until: 'tomorrow' })).rejects.toMatchObject({ statusCode: 400 })
+    for (const message of ['two\r\nlines', 'tab\there', 'x'.repeat(DND_MESSAGE_MAX + 1)]) await expect(rules.setDnd('102', { message }, 'bob')).rejects.toMatchObject({ statusCode: 400 })
+    await expect(rules.setDnd('102', { until: 'tomorrow' }, 'bob')).rejects.toMatchObject({ statusCode: 400 })
     expect(db.queries).toEqual([])
-    await rules.setDnd('102', { message: 'x'.repeat(DND_MESSAGE_MAX) })
+    await rules.setDnd('102', { message: 'x'.repeat(DND_MESSAGE_MAX) }, 'bob')
     expect(db.queries).toHaveLength(2)
   })
 
-  it('lifts the "do not disturb" of every extension but those kept, and drops the rows left empty', async () => {
+  it("lifts the \"do not disturb\" of every extension of its tenant but those kept, and drops the rows left empty", async () => {
     const db = recorder()
-    await new CallRules({ pool: db.pool }).clearDndExcept(['102'])
-    expect(db.queries[0]).toMatchObject({ text: expect.stringMatching(/^UPDATE call_rules SET dnd = false.*NOT \(extension = ANY\(\$1\)\)/), values: [['102']] })
-    expect(db.queries[1]!.text).toMatch(/^DELETE FROM call_rules WHERE NOT dnd AND/)
+    await new CallRules({ pool: db.pool, tenantId: 'A' }).clearDndExcept(['102'])
+    expect(db.queries[0]).toMatchObject({ text: expect.stringMatching(/^UPDATE call_rules SET dnd = false.* WHERE tenant_id = \$1 AND dnd AND \(NOT \(extension = ANY\(\$2\)\) OR dnd_until <= now\(\)\)/), values: ['A', ['102']] })
+    expect(db.queries[1]).toMatchObject({ text: expect.stringMatching(/^DELETE FROM call_rules WHERE tenant_id = \$1 AND NOT dnd AND/), values: ['A'] })
+  })
+
+  it('drops, in its tenant only, the rules of an extension that changed holder and the forwards to one', async () => {
+    const db = recorder()
+    await new CallRules({ pool: db.pool, tenantId: 'A' }).reconcile([{ extension: '101', userId: 'alice' }, { extension: '102', userId: 'bob' }])
+    expect(db.queries).toHaveLength(5)
+    for (const q of db.queries) expect(q.text).toContain('WHERE tenant_id = $1')
+    expect(db.queries[0]).toMatchObject({ text: expect.stringMatching(/^DELETE FROM call_rules WHERE tenant_id = \$1 AND NOT EXISTS .*m\.extension = call_rules\.extension AND m\.holder = call_rules\.holder/), values: ['A', ['101', '102'], ['alice', 'bob']] })
+    expect(db.queries.slice(1, 4).map(q => q.text.match(/^UPDATE call_rules SET (\w+) = NULL, (\w+) = NULL/)?.slice(1))).toEqual([
+      ['forward_always', 'forward_always_holder'],
+      ['forward_busy', 'forward_busy_holder'],
+      ['forward_noanswer', 'forward_noanswer_holder']
+    ])
+    expect(db.queries[4]!.text).toMatch(/^DELETE FROM call_rules WHERE tenant_id = \$1 AND NOT dnd/)
   })
 
   it('waits for the schema before each query', async () => {

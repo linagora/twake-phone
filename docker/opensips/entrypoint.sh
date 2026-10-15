@@ -21,7 +21,17 @@ set -eu
 : "${CFG_TEMPLATE:=/etc/opensips/opensips.cfg.tpl}"
 : "${CFG_OUT:=/etc/opensips/opensips.cfg}"
 : "${OPENSIPS_BIN:=/usr/sbin/opensips}"
-export SIP_DOMAIN LISTEN_IP SIP_PORT WS_PORT WSS_PORT OPENSIPS_DB_URL RTPENGINE_SOCK OPENSIPS_LOG_LEVEL OPENSIPS_MPATH MI_FIFO MI_LISTEN_IP MI_PORT TLS_CERT TLS_KEY
+# The call rules are read at each INVITE (sqlops, ADR 0013): on their own connections, whose queries PostgreSQL stops
+# after this many milliseconds (the call then goes on without rules), so that a slow database never holds a call.
+: "${RULES_QUERY_TIMEOUT_MS:=1000}"
+case "$RULES_QUERY_TIMEOUT_MS" in
+  '' | *[!0-9]*) echo "RULES_QUERY_TIMEOUT_MS must be a number of milliseconds" >&2; exit 1 ;;
+esac
+case "$OPENSIPS_DB_URL" in
+  *\?*) OPENSIPS_RULES_DB_URL="${OPENSIPS_DB_URL}&options=-cstatement_timeout=${RULES_QUERY_TIMEOUT_MS}" ;;
+  *) OPENSIPS_RULES_DB_URL="${OPENSIPS_DB_URL}?options=-cstatement_timeout=${RULES_QUERY_TIMEOUT_MS}" ;;
+esac
+export SIP_DOMAIN LISTEN_IP SIP_PORT WS_PORT WSS_PORT OPENSIPS_DB_URL OPENSIPS_RULES_DB_URL RTPENGINE_SOCK OPENSIPS_LOG_LEVEL OPENSIPS_MPATH MI_FIFO MI_LISTEN_IP MI_PORT TLS_CERT TLS_KEY
 
 # The MI socket (mi_datagram) has no authentication: whoever reaches it can stop OpenSIPS, drop registrations, end
 # calls, read who is registered and subscribe to the events (who calls whom). It listens on its own address, the
@@ -69,7 +79,7 @@ if [ ! -f "$TLS_CERT" ] || [ ! -f "$TLS_KEY" ]; then
 fi
 
 # Only the listed variables are substituted: a "$avp(...)" of the script must stay as it is.
-envsubst '$SIP_DOMAIN $LISTEN_IP $SIP_PORT $WS_PORT $WSS_PORT $OPENSIPS_DB_URL $RTPENGINE_SOCK $OPENSIPS_LOG_LEVEL $OPENSIPS_MPATH $MI_FIFO $MI_LISTEN_IP $MI_PORT $TLS_CERT $TLS_KEY' \
+envsubst '$SIP_DOMAIN $LISTEN_IP $SIP_PORT $WS_PORT $WSS_PORT $OPENSIPS_DB_URL $OPENSIPS_RULES_DB_URL $RTPENGINE_SOCK $OPENSIPS_LOG_LEVEL $OPENSIPS_MPATH $MI_FIFO $MI_LISTEN_IP $MI_PORT $TLS_CERT $TLS_KEY' \
   < "$CFG_TEMPLATE" > "$CFG_OUT"
 
 "$OPENSIPS_BIN" -C -f "$CFG_OUT"

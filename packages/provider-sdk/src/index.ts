@@ -33,6 +33,12 @@ export interface TelephonyProvider {
    * provider starts: the provider applies them, and forgets any it applied for someone not in the list.
    */
   restorePresences?(entries: { user: User; presence: Presence }[]): Promise<void>
+  /**
+   * Who holds each extension of the tenant now, handed when the provider starts and after any change of the
+   * mappings: what a provider keeps per extension for its holder (forwards, "do not disturb") does not pass to the
+   * next one.
+   */
+  syncExtensions?(holders: { extension: string; userId: string }[]): Promise<void>
   /** Where the calls of the user's extension go (capability `forwarding`). */
   getForwarding?(user: User): Promise<ForwardingRules>
   /** Replaces those rules; targets are extensions the Gateway checked. */

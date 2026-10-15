@@ -202,9 +202,10 @@ describe('OpensipsProvider call rules', () => {
     const dnd = new Map<string, DndRule>()
     const rules = {
       getForwarding: async (ext: string) => forwards.get(ext) ?? {},
-      setForwarding: async (ext: string, r: ForwardingRules) => void (calls.push(`forward ${ext}`), forwards.set(ext, r)),
-      setDnd: async (ext: string, d: DndRule | null) => void (calls.push(`dnd ${ext} ${JSON.stringify(d)}`), d ? dnd.set(ext, d) : dnd.delete(ext)),
-      clearDndExcept: async (keep: string[]) => void (calls.push(`clear except ${keep.join(',')}`), [...dnd.keys()].filter(e => !keep.includes(e)).forEach(e => dnd.delete(e)))
+      setForwarding: async (ext: string, r: ForwardingRules, holder: string) => void (calls.push(`forward ${ext} by ${holder}`), forwards.set(ext, r)),
+      setDnd: async (ext: string, d: DndRule | null, holder: string) => void (calls.push(`dnd ${ext} ${JSON.stringify(d)}${holder === user.id ? '' : ` by ${holder}`}`), d ? dnd.set(ext, d) : dnd.delete(ext)),
+      clearDndExcept: async (keep: string[]) => void (calls.push(`clear except ${keep.join(',')}`), [...dnd.keys()].filter(e => !keep.includes(e)).forEach(e => dnd.delete(e))),
+      reconcile: async (holders: { extension: string; userId: string }[]) => void calls.push(`reconcile ${holders.map(h => `${h.extension}=${h.userId}`).join(',')}`)
     }
     return { calls, dnd, rules: rules as unknown as CallRules }
   }
@@ -223,20 +224,47 @@ describe('OpensipsProvider call rules', () => {
     expect((await p.getCapabilities()).forwarding).toBe(true)
     await p.setForwarding(user, { busy: '103', noAnswer: { target: '104', delaySec: 10 } })
     expect(await p.getForwarding(user)).toEqual({ busy: '103', noAnswer: { target: '104', delaySec: 10 } })
-    expect(db.calls).toEqual(['forward 101'])
+    expect(db.calls).toEqual(['forward 101 by alice'])
     await expect(p.getForwarding({ ...user, extension: undefined })).rejects.toMatchObject({ statusCode: 404 })
     await expect(p.setForwarding({ ...user, extension: undefined }, {})).rejects.toMatchObject({ statusCode: 404 })
   })
 
-  it('writes a "do not disturb" in the table OpenSIPS reads, with its end and message, and lifts it for any other choice', async () => {
+  it('writes a "do not disturb" in the table OpenSIPS reads, with its end and message, and lifts it when it is left', async () => {
     const db = fakeRules()
     const p = make(db.rules)
     cleanups.push(() => p.close())
     await p.setPresence(user, { status: 'dnd', source: 'user', until: '2099-01-01T00:00:00.000Z', message: 'En réunion' })
     await p.setPresence(user, { status: 'dnd', source: 'user' })
     await p.setPresence(user, { status: 'away', source: 'user', message: 'Au déjeuner' })
+    // Away to available: nothing for OpenSIPS.
+    await p.setPresence(user, { status: 'available', source: 'user' })
     await p.setPresence({ ...user, extension: undefined }, { status: 'dnd', source: 'user' })
     expect(db.calls).toEqual(['dnd 101 {"until":"2099-01-01T00:00:00.000Z","message":"En réunion"}', 'dnd 101 {}', 'dnd 101 null'])
+    // A "do not disturb" past its end may still be in the table: leaving it lifts it there too.
+    await p.setPresence(user, { status: 'dnd', source: 'user', until: new Date(Date.now() - 1_000).toISOString() })
+    await p.setPresence(user, { status: 'away', source: 'user' })
+    expect(db.calls.slice(3)).toEqual([expect.stringMatching(/^dnd 101 \{"until"/), 'dnd 101 null'])
+  })
+
+  it("changes any other presence without OpenSIPS's database, even when it is down", async () => {
+    const down = () => Promise.reject(Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' }))
+    const p = make({ setDnd: down, clearDndExcept: down, reconcile: down } as unknown as CallRules)
+    cleanups.push(() => p.close())
+    await p.setPresence(user, { status: 'away', source: 'user', message: 'Au déjeuner' })
+    await p.setPresence(user, { status: 'available', source: 'user' })
+    expect((await p.getPresence(user)).status).toBe('offline')
+    expect(p['tracker'].userPresences().get('101')).toMatchObject({ status: 'available' })
+    // Entering a "do not disturb" needs it: refused, the choice not kept.
+    await expect(p.setPresence(user, { status: 'dnd', source: 'user' })).rejects.toMatchObject({ code: 'ECONNREFUSED' })
+    expect(p['tracker'].userPresences().get('101')).toMatchObject({ status: 'available' })
+  })
+
+  it('hands who holds each extension to the table, for the rules to follow the person', async () => {
+    const db = fakeRules()
+    const p = make(db.rules)
+    await p.syncExtensions([{ extension: '101', userId: 'alice' }, { extension: '102', userId: 'bob' }])
+    expect(db.calls).toEqual(['reconcile 101=alice,102=bob'])
+    await make().syncExtensions([])
   })
 
   it('keeps the choice out of the tracker when the table refuses it', async () => {
@@ -261,7 +289,8 @@ describe('OpensipsProvider call rules', () => {
       { user: bob, presence: { status: 'away', source: 'user' } },
       { user: carol, presence: { status: 'dnd', source: 'user' } }
     ])
-    expect(db.calls).toEqual(['clear except 101', 'dnd 101 {"message":"En congé"}', 'dnd 102 null'])
+    // Bob's absence is the Gateway's alone: nothing in the table for it.
+    expect(db.calls).toEqual(['clear except 101', 'dnd 101 {"message":"En congé"}'])
     expect([...db.dnd.keys()]).toEqual(['101'])
     expect([...p['tracker'].userPresences().keys()].sort()).toEqual(['101', '102'])
     expect((await p.getPresence(carol)).status).toBe('dnd')

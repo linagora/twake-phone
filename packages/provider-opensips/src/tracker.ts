@@ -14,8 +14,12 @@ interface TrackedCall {
   startedAt: string
   /** The callee's phone rang: it knows about the call (and is busy with it), so a call that does not go through is a missed one for it. */
   rang: boolean
-  /** Refused on the callee's behalf by their "do not disturb": theirs all the same, a missed call for them. */
-  dnd?: boolean
+  /**
+   * Refused on the callee's behalf by their "do not disturb": theirs all the same, a missed call for them. `told`:
+   * the caller was told (they called that extension); otherwise (a colleague the call was forwarded to) the caller
+   * only sees a call that did not go through.
+   */
+  dnd?: { told: boolean }
   connectedAt?: string
 }
 
@@ -220,11 +224,12 @@ export class CallTracker {
       }
       case 'E_TWAKEPHONE_DND': {
         // Refused for `callee`, who does not want to be disturbed (and has nowhere to forward to): the missed call
-        // event that follows ends it, as a missed call for them.
+        // event that follows ends it, as a missed call for them. `told` "0": the caller did not call them (a forward
+        // led there) and was not told why.
         const call = this.find(p, now)
         if (!call) return
         this.moveTo(call, userOf(str(p.callee)), 0, now)
-        call.dnd = true
+        call.dnd = { told: str(p.told) !== '0' }
         break
       }
       case 'E_TWAKEPHONE_RINGING': {
@@ -268,7 +273,7 @@ export class CallTracker {
         const at = epochMs(p.time)
         // Refused by a "do not disturb": the callee's phone stayed silent, but the call is theirs, missed.
         if (call.dnd) this.rings(call)
-        this.end(call, at !== undefined ? iso(at) : now, call.dnd ? 'rejected' : failedState(code), DECLINED.has(code) ? 'rejected' : 'missed')
+        this.end(call, at !== undefined ? iso(at) : now, call.dnd?.told ? 'rejected' : failedState(code), DECLINED.has(code) ? 'rejected' : 'missed')
         break
       }
       default:

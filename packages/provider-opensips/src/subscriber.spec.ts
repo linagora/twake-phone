@@ -141,31 +141,60 @@ if (process.env.TEST_DATABASE_URL) {
       const provisioner = new SubscriberProvisioner({ pool, realm: 'sip.example.test' })
       await provisioner.ensureSchema()
       const rules = provisioner.callRules()
-      await rules.setForwarding('101', { always: '103' })
-      await rules.setForwarding('101', { busy: '104', noAnswer: { target: '105', delaySec: 8 } })
+      await rules.setForwarding('101', { always: '103' }, 'alice')
+      await rules.setForwarding('101', { busy: '104', noAnswer: { target: '105', delaySec: 8 } }, 'alice')
       expect(await rules.getForwarding('101')).toEqual({ busy: '104', noAnswer: { target: '105', delaySec: 8 } })
-      await rules.setDnd('101', { message: 'En réunion' })
-      await rules.setForwarding('101', {})
+      await rules.setDnd('101', { message: 'En réunion' }, 'alice')
+      await rules.setForwarding('101', {}, 'alice')
       // The "do not disturb" still holds the row; lifting it removes it.
       expect((await pool.query('SELECT extension, dnd, dnd_message FROM call_rules')).rows).toEqual([{ extension: '101', dnd: true, dnd_message: 'En réunion' }])
-      await rules.setDnd('101', null)
+      await rules.setDnd('101', null, 'alice')
       expect((await pool.query('SELECT extension FROM call_rules')).rows).toEqual([])
     })
 
     it('holds a "do not disturb" until its date on the database clock, and lifts those no one holds', async () => {
       const rules = new SubscriberProvisioner({ pool, realm: 'sip.example.test' }).callRules()
-      await rules.setDnd('101', { until: new Date(Date.now() + 3_600_000).toISOString() })
-      await rules.setDnd('102', { until: new Date(Date.now() - 1_000).toISOString() })
-      await rules.setDnd('103', {})
-      await rules.setForwarding('104', { always: '101' })
+      await rules.setDnd('101', { until: new Date(Date.now() + 3_600_000).toISOString() }, 'alice')
+      await rules.setDnd('102', { until: new Date(Date.now() - 1_000).toISOString() }, 'bob')
+      await rules.setDnd('103', {}, 'carol')
+      await rules.setForwarding('104', { always: '101' }, 'dave')
       expect([await active('101'), await active('102'), await active('103'), await active('104')]).toEqual([1, 0, 1, 0])
-      await rules.clearDndExcept(['103'])
+      // 102's is past its end: lifted even if kept.
+      await rules.clearDndExcept(['102', '103'])
       expect((await pool.query('SELECT extension, dnd FROM call_rules ORDER BY extension')).rows).toEqual([
         { extension: '103', dnd: true },
         { extension: '104', dnd: false }
       ])
       await rules.clearDndExcept([])
-      await rules.setForwarding('104', {})
+      await rules.setForwarding('104', {}, 'dave')
+      expect((await pool.query('SELECT extension FROM call_rules')).rows).toEqual([])
+    })
+
+    it('makes the rules follow the person: a new holder inherits nothing, a forward to an extension that changed holder goes', async () => {
+      const holders: Record<string, string> = { '101': 'alice', '102': 'bob', '103': 'carol' }
+      const rules = new SubscriberProvisioner({ pool, realm: 'sip.example.test' }).callRules({ tenantId: 'A', holderOf: async e => holders[e] })
+      const other = new SubscriberProvisioner({ pool, realm: 'sip.example.test' }).callRules({ tenantId: 'B' })
+      await rules.setForwarding('101', { always: '103', busy: '102' }, 'alice')
+      await rules.setDnd('101', { message: 'En congé' }, 'alice')
+      await rules.setDnd('102', { message: 'En réunion' }, 'bob')
+      await rules.setForwarding('103', { noAnswer: { target: '102', delaySec: 10 } }, 'carol')
+      await other.setDnd('201', { message: 'Autre organisation' }, 'zoe')
+      // 102 goes to dave, 103 to nobody: 102's row goes with Bob's "do not disturb", Alice's busy forward to 102
+      // and her immediate one to 103 go; 103's own row goes.
+      await rules.reconcile([{ extension: '101', userId: 'alice' }, { extension: '102', userId: 'dave' }])
+      expect((await pool.query('SELECT extension, tenant_id, holder, forward_always, forward_busy, forward_noanswer, dnd, dnd_message FROM call_rules ORDER BY extension')).rows).toEqual([
+        { extension: '101', tenant_id: 'A', holder: 'alice', forward_always: null, forward_busy: null, forward_noanswer: null, dnd: true, dnd_message: 'En congé' },
+        { extension: '201', tenant_id: 'B', holder: 'zoe', forward_always: null, forward_busy: null, forward_noanswer: null, dnd: true, dnd_message: 'Autre organisation' }
+      ])
+      // Another tenant's start lifts only its own.
+      await other.clearDndExcept([])
+      expect((await pool.query('SELECT extension FROM call_rules ORDER BY extension')).rows).toEqual([{ extension: '101' }])
+      // A new holder writing a rule before any reconcile does not take over the previous one's.
+      await rules.setForwarding('101', { busy: '102' }, 'erin')
+      expect((await pool.query('SELECT holder, dnd, dnd_message, forward_busy FROM call_rules')).rows).toEqual([{ holder: 'erin', dnd: false, dnd_message: '', forward_busy: '102' }])
+      await rules.setDnd('101', {}, 'frank')
+      expect((await pool.query('SELECT holder, dnd, forward_busy FROM call_rules')).rows).toEqual([{ holder: 'frank', dnd: true, forward_busy: null }])
+      await rules.reconcile([])
       expect((await pool.query('SELECT extension FROM call_rules')).rows).toEqual([])
     })
   })

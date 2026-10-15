@@ -12,6 +12,8 @@ export interface ForwardingForm {
 }
 
 export const DEFAULT_DELAY_SEC = 20
+/** The delays the Gateway takes, in seconds of ringing (the forward comes about then: a second or two later at times). */
+export const DELAY_SEC = { min: 5, max: 120 } as const
 
 export const formFromRules = (r: ForwardingRules): ForwardingForm => ({
   always: r.always ?? '',
@@ -22,6 +24,14 @@ export const formFromRules = (r: ForwardingRules): ForwardingForm => ({
 
 const clean = (v: string) => v.replace(/\s/g, '')
 
+/** The delay typed is one the Gateway takes (empty: the default). Checked before sending: never replaced silently. */
+export const delayValid = (f: ForwardingForm): boolean => {
+  const typed = f.delaySec.trim()
+  if (!typed || !clean(f.noAnswer)) return true
+  const n = Number(typed)
+  return Number.isInteger(n) && n >= DELAY_SEC.min && n <= DELAY_SEC.max
+}
+
 export const rulesFromForm = (f: ForwardingForm): ForwardingRules => {
   const always = clean(f.always)
   const busy = clean(f.busy)
@@ -29,7 +39,7 @@ export const rulesFromForm = (f: ForwardingForm): ForwardingRules => {
   return {
     ...(always ? { always } : {}),
     ...(busy ? { busy } : {}),
-    ...(noAnswer ? { noAnswer: { target: noAnswer, delaySec: Number(f.delaySec) || DEFAULT_DELAY_SEC } } : {})
+    ...(noAnswer ? { noAnswer: { target: noAnswer, delaySec: f.delaySec.trim() ? Number(f.delaySec) : DEFAULT_DELAY_SEC } } : {})
   }
 }
 
@@ -64,9 +74,15 @@ export const fromLocalInput = (value: string): string | undefined => {
   return Number.isNaN(d.getTime()) ? undefined : d.toISOString()
 }
 
-/** The statuses one chooses oneself; busy and offline are the SIP server's to say. */
+/** The statuses one chooses oneself on this screen; busy and offline are the SIP server's to say. */
 export const CHOSEN_STATUSES = ['available', 'away', 'dnd'] as const
-export type ChosenStatus = (typeof CHOSEN_STATUSES)[number]
+export type ChosenStatus = PresenceChoice['status']
 
-export const chosenStatus = (choice: PresenceChoice | undefined): ChosenStatus =>
-  choice && (CHOSEN_STATUSES as readonly string[]).includes(choice.status) ? (choice.status as ChosenStatus) : 'available'
+/** The status chosen, as it is: one set through the API (busy, offline) is shown, and kept unless changed. */
+export const chosenStatus = (choice: PresenceChoice | undefined): ChosenStatus => choice?.status ?? 'available'
+
+/** What the status list offers: the usual three, and the one chosen if it is another. */
+export const statusOptions = (current: ChosenStatus): ChosenStatus[] => ((CHOSEN_STATUSES as readonly string[]).includes(current) ? [...CHOSEN_STATUSES] : [...CHOSEN_STATUSES, current])
+
+/** The statuses that take an end and a message. */
+export const timedStatus = (status: ChosenStatus) => status === 'away' || status === 'dnd'

@@ -1,6 +1,6 @@
 import { useEffect, useState, type FormEvent } from 'react'
 import type { MyPresence } from '@twake/telephony-client'
-import { CHOSEN_STATUSES, chosenStatus, DEFAULT_DELAY_SEC, formFromRules, fromLocalInput, refusalKey, rulesFromForm, toLocalInput, type ChosenStatus, type ForwardingForm } from '../callRules.js'
+import { chosenStatus, DEFAULT_DELAY_SEC, DELAY_SEC, delayValid, formFromRules, fromLocalInput, refusalKey, rulesFromForm, statusOptions, timedStatus, toLocalInput, type ChosenStatus, type ForwardingForm } from '../callRules.js'
 import { useGateway } from '../gateway.js'
 import { useT } from '../i18n/useT.js'
 
@@ -57,7 +57,7 @@ export const PresenceSettings = () => {
     }
   }, [client, t])
   if (hidden) return null
-  const timed = status !== 'available'
+  const timed = timedStatus(status)
   const save = async (e: FormEvent) => {
     e.preventDefault()
     setBusy(true)
@@ -85,7 +85,7 @@ export const PresenceSettings = () => {
       <div className="field">
         <label htmlFor="presence-status">{t('settings.presenceStatus')}</label>
         <select id="presence-status" value={status} onChange={e => setStatus(e.target.value as ChosenStatus)} disabled={busy}>
-          {CHOSEN_STATUSES.map(s => (
+          {statusOptions(chosenStatus(current?.choice)).map(s => (
             <option key={s} value={s}>
               {t(`presence.${s}`)}
             </option>
@@ -105,7 +105,7 @@ export const PresenceSettings = () => {
             <label htmlFor="presence-message">{t('settings.presenceMessage')}</label>
             <input id="presence-message" type="text" maxLength={140} value={message} onChange={e => setMessage(e.target.value)} disabled={busy} aria-describedby="presence-message-hint" />
             <span id="presence-message-hint" className="badge">
-              {t(status === 'dnd' ? 'settings.presenceMessageHintDnd' : 'settings.presenceMessageHint')}
+              {t('settings.presenceMessageHint')} {status === 'dnd' ? t('settings.presenceMessageHintDnd') : null}
             </span>
           </div>
         </>
@@ -173,8 +173,12 @@ export const ForwardingSettings = () => {
   const set = (key: keyof ForwardingForm) => (e: { target: { value: string } }) => setForm(f => ({ ...f, [key]: e.target.value }))
   const save = async (e: FormEvent) => {
     e.preventDefault()
-    setBusy(true)
     setNote(null)
+    if (!delayValid(form)) {
+      setNote({ kind: 'error', text: t('settings.forwardDelayInvalid') })
+      return
+    }
+    setBusy(true)
     try {
       setForm(formFromRules(await client.setForwarding(rulesFromForm(form))))
       setNote({ kind: 'ok', text: t('settings.forwardingSaved') })
@@ -205,7 +209,10 @@ export const ForwardingSettings = () => {
             {field('noAnswer', 'settings.forwardNoAnswer')}
             <div className="field">
               <label htmlFor="forward-delay">{t('settings.forwardDelay')}</label>
-              <input id="forward-delay" type="number" inputMode="numeric" min={2} max={120} step={1} value={form.delaySec} onChange={set('delaySec')} disabled={busy} />
+              <input id="forward-delay" type="number" inputMode="numeric" min={DELAY_SEC.min} max={DELAY_SEC.max} step={1} value={form.delaySec} onChange={set('delaySec')} disabled={busy} aria-describedby="forward-delay-hint" />
+              <span id="forward-delay-hint" className="badge">
+                {t('settings.forwardDelayHint')}
+              </span>
             </div>
           </fieldset>
           <div className="actions">

@@ -3,7 +3,9 @@ import type { ProviderFactory, TelephonyProvider } from '@twake/telephony-provid
 import type { ForwardingRules, Presence, User } from '@twake/telephony-types'
 import { buildApp, parseForwarding, parsePresence } from './app.js'
 import { TicketStore } from './auth.js'
+import type { ContactDirectory } from './contacts.js'
 import { StoreDirectory } from './directory.js'
+import { DirectorySync } from './directory-sync.js'
 import { EventBus } from './events.js'
 import { ProviderRegistry } from './registry.js'
 import { MemoryStore } from './store/memory.js'
@@ -54,17 +56,25 @@ describe('/me/presence and /me/forwarding', () => {
     const restored: { user: User; presence: Presence }[][] = []
     const presences = new Map<string, Presence>()
     const forwards = new Map<string, ForwardingRules>()
+    /** What reached the provider, in order. */
+    const log: string[] = []
     let failRestore = 0
+    /** While set, a restore waits for it (a database that is slow to answer). */
+    let gate: Promise<void> | undefined
     const provider = {
       getStatus: () => 'CONNECTED',
       getCapabilities: async () => ({ forwarding: withForwarding }),
       getPresence: async (u: User) => presences.get(u.extension ?? u.id) ?? { status: 'available', source: 'telephony' },
       setPresence: async (u: User, p: Presence) => {
         if (p.message === 'refused') throw Object.assign(new Error('refused by the platform'), { statusCode: 400 })
+        log.push(`set ${u.extension ?? u.id} ${p.status}`)
         presences.set(u.extension ?? u.id, p)
       },
+      syncExtensions: async (holders: { extension: string; userId: string }[]) => void log.push(`holders ${holders.map(h => `${h.extension}=${h.userId}`).sort().join(',')}`),
       restorePresences: async (entries: { user: User; presence: Presence }[]) => {
+        await gate
         if (failRestore-- > 0) throw new Error('database not ready')
+        log.push(`restore ${entries.map(e => `${e.user.extension}=${e.presence.status}`).join(',')}`)
         restored.push(entries)
       },
       ...(withForwarding
@@ -77,15 +87,15 @@ describe('/me/presence and /me/forwarding', () => {
       close: async () => {}
     }
     const factory: ProviderFactory<unknown> = { type: 'recording', create: () => provider as unknown as TelephonyProvider }
-    return { factory, restored, presences, forwards, failNextRestores: (n: number) => void (failRestore = n) }
+    return { factory, restored, presences, forwards, log, failNextRestores: (n: number) => void (failRestore = n), hold: (p: Promise<void> | undefined) => void (gate = p) }
   }
-  const setup = async (store = new MemoryStore(), rec = recording()) => {
+  const setup = async (store = new MemoryStore(), rec = recording(), directorySync?: DirectorySync) => {
     process.env.AUTH_MODE = 'dev'
     await store.upsertMapping({ tenantId: 'A', userId: 'alice', extension: '101' })
     await store.upsertMapping({ tenantId: 'A', userId: 'bob', extension: '102' })
     await store.upsertMapping({ tenantId: 'B', userId: 'carol', extension: '103' })
     const registry = new ProviderRegistry([{ tenantId: 'A', type: 'recording', config: {} }], [rec.factory])
-    const app = await buildApp(registry, { store, bus: new EventBus(), directory: new StoreDirectory(store), tickets: new TicketStore() })
+    const app = await buildApp(registry, { store, bus: new EventBus(), directory: new StoreDirectory(store), tickets: new TicketStore(), ...(directorySync ? { directorySync } : {}) })
     registry.startAll()
     const as = (user: string, tenant = 'A') => ({ 'x-dev-user': user, 'x-dev-tenant': tenant })
     return { app, as, store, rec }
@@ -134,6 +144,43 @@ describe('/me/presence and /me/forwarding', () => {
     // The first attempt fails (its database not ready): tried again a second later.
     await until('the restore', () => rec.restored.length === 1, 4_000)
     expect(rec.restored[0]).toEqual([{ user: { id: 'alice', tenantId: 'A', displayName: 'alice', extension: '101' }, presence: { status: 'dnd', source: 'user', since: '2026-10-15T08:00:00.000Z', message: 'En congé' } }])
+    await app.close()
+  })
+
+  it('tells the provider who holds each extension before the presences, at its start and after a synchronisation that changed it', async () => {
+    const store = new MemoryStore()
+    await store.setUserPresence({ tenantId: 'A', userId: 'bob', status: 'dnd', since: '2026-10-15T08:00:00.000Z' })
+    const people = [{ id: 'alice', displayName: 'alice', numbers: [{ type: 'extension' as const, number: '101' }] }]
+    const directory = { listAll: async () => people } as unknown as ContactDirectory
+    const sync = new DirectorySync({ store, directory, tenantId: 'A' })
+    const rec = recording()
+    const { app } = await setup(store, rec, sync)
+    await until('the restore', () => rec.restored.length === 1)
+    expect(rec.log).toEqual(['holders 101=alice,102=bob', 'restore 102=dnd'])
+    // The directory now lists Bob with 105: his extension changes, his rules on 102 must go, his choice follows him.
+    people.push({ id: 'bob', displayName: 'bob', numbers: [{ type: 'extension' as const, number: '105' }] })
+    await sync.run()
+    await until('the second restore', () => rec.restored.length === 2)
+    expect(rec.log.slice(2)).toEqual(['holders 101=alice,105=bob', 'restore 105=dnd'])
+    // A run that changes nothing tells nothing.
+    await sync.run()
+    await new Promise(r => setTimeout(r, 50))
+    expect(rec.restored).toHaveLength(2)
+    await app.close()
+  })
+
+  it('makes a presence written while the restore runs wait for it, so that the restore cannot undo it', async () => {
+    const rec = recording()
+    let release!: () => void
+    rec.hold(new Promise<void>(resolve => (release = resolve)))
+    const { app, as } = await setup(new MemoryStore(), rec)
+    await until('the restore to start', () => rec.log.length === 1)
+    const put = app.inject({ method: 'PUT', url: '/api/v1/me/presence', headers: as('alice'), payload: { status: 'dnd' } })
+    await new Promise(r => setTimeout(r, 50))
+    expect(rec.presences.get('101')).toBeUndefined()
+    release()
+    expect((await put).statusCode).toBe(200)
+    expect(rec.log).toEqual(['holders 101=alice,102=bob', 'restore ', 'set 101 dnd'])
     await app.close()
   })
 

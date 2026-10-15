@@ -20,8 +20,11 @@ export type SoftCallState = 'new' | 'ringing' | 'connected' | 'held' | 'ended'
  */
 export type EndReason = 'hangup' | 'rejected' | 'busy' | 'no-answer' | 'unavailable' | 'cancelled' | 'failed' | 'transferred' | 'dnd'
 
-/** How the SIP server refuses a call to someone in "do not disturb": 480 with this reason phrase, their message in DND_MESSAGE_HEADER. */
-export const DND_REASON_PHRASE = 'Do Not Disturb'
+/**
+ * How the SIP server refuses a call to someone in "do not disturb": 480 with DND_HEADER set to 1 (a reason phrase may
+ * be rewritten on the way), their message in DND_MESSAGE_HEADER.
+ */
+export const DND_HEADER = 'Twake-Dnd'
 export const DND_MESSAGE_HEADER = 'Twake-Dnd-Message'
 
 export type DtmfTransport = 'RFC2833' | 'INFO'
@@ -300,9 +303,9 @@ class WebCall implements SoftCall {
       // 477 "Send failed": the SIP server could not deliver to the far end (a registration left on a dead
       // connection); for the person it is the same as nobody there.
       if (this.endStatus === 477 && this.endReason === 'failed') this.endReason = 'unavailable'
-      // 480 "Do Not Disturb": refused on their behalf by the SIP server, with the message they left, if any.
-      const response = e.message as { reason_phrase?: unknown; getHeader?: (name: string) => string | undefined } | undefined
-      if (this.endStatus === 480 && response?.reason_phrase === DND_REASON_PHRASE) {
+      // 480 with `Twake-Dnd: 1`: refused on their behalf by the SIP server, with the message they left, if any.
+      const response = e.message as { getHeader?: (name: string) => string | undefined } | undefined
+      if (this.endStatus === 480 && response?.getHeader?.(DND_HEADER)?.trim() === '1') {
         this.endReason = 'dnd'
         const message = response.getHeader?.(DND_MESSAGE_HEADER)?.trim()
         if (message) this.endMessage = message

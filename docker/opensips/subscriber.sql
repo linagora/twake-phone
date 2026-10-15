@@ -58,11 +58,18 @@ INSERT INTO version (table_name, table_version) VALUES ('acc', 7), ('missed_call
 
 -- Our own table (step 4b, ADR 0013): forwards and "do not disturb" per extension, written by the Gateway
 -- (CallRules of provider-opensips), read by opensips.cfg.tpl at each INVITE (sqlops). OpenSIPS does not check it.
+-- tenant_id and the holders (who held the extension, and each target, when the rule was written) are the Gateway's:
+-- it drops the rules of an extension, or a forward, whose holder changed.
 CREATE TABLE IF NOT EXISTS call_rules (
     extension VARCHAR(64) PRIMARY KEY NOT NULL,
+    tenant_id TEXT NOT NULL,
+    holder TEXT NOT NULL,
     forward_always VARCHAR(64),
+    forward_always_holder TEXT,
     forward_busy VARCHAR(64),
+    forward_busy_holder TEXT,
     forward_noanswer VARCHAR(64),
+    forward_noanswer_holder TEXT,
     noanswer_delay INTEGER DEFAULT 20 NOT NULL,
     dnd BOOLEAN DEFAULT false NOT NULL,
     dnd_until TIMESTAMP WITH TIME ZONE,

@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
 import pg from 'pg'
 import type { SecretProvisioner } from '@twake/telephony-provider-sdk'
-import { CALL_RULES_SCHEMA, CallRules } from './call-rules.js'
+import { CALL_RULES_SCHEMA, CallRules, type CallRulesOptions } from './call-rules.js'
 
 // Everything about OpenSIPS's `subscriber` table (module auth_db) lives here: the Gateway only sees a SecretProvisioner.
 
@@ -199,9 +199,12 @@ export class SubscriberProvisioner implements SecretProvisioner {
     await this.pool.query('DELETE FROM subscriber WHERE username = $1 AND domain = $2', [extension, this.domain])
   }
 
-  /** The `call_rules` of the same database, on the same connections; `ready` runs before each query (the schema check). */
-  callRules(ready?: () => Promise<void>) {
-    return new CallRules({ pool: this.pool, ...(ready ? { ready } : {}) })
+  /**
+   * The `call_rules` of the same database, on the same connections: `ready` runs before each query (the schema
+   * check), `tenantId` and `holderOf` say whose extensions these are (see CallRulesOptions).
+   */
+  callRules(opts: Omit<CallRulesOptions, 'pool'> = {}) {
+    return new CallRules({ pool: this.pool, ...opts })
   }
 
   async close() {

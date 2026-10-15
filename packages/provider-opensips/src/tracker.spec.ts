@@ -404,6 +404,15 @@ describe('CallTracker', () => {
     tracker.handle('E_TWAKEPHONE_CALLING', call('d2', '101', '102'))
     tracker.handle('E_ACC_MISSED_EVENT', missed('d2', '101', '102', '480', 1792002801))
     expect(calls().slice(-1)).toEqual(['101:call.failed:outbound:102:failed'])
+    // Forwarded to a colleague who does not want to be disturbed: a missed call for them, a failed one for the caller,
+    // who was not told about their "do not disturb".
+    clear()
+    tracker.handle('E_UL_CONTACT_INSERT', contact('103', 'sip:103@x.invalid'))
+    clear()
+    tracker.handle('E_TWAKEPHONE_CALLING', { callid: 'd3', caller: '101', callee: '103', dialled: '102' })
+    tracker.handle('E_TWAKEPHONE_DND', { callid: 'd3', caller: '101', callee: '103', dialled: '102', told: '0' })
+    tracker.handle('E_ACC_MISSED_EVENT', missed('d3', '101', '103', '480', 1792002802))
+    expect(calls()).toEqual(['101:call.created:outbound:102:new', '101:call.failed:outbound:102:failed', '103:call.ended:inbound:101:missed'])
     // Unknown calls are left alone.
     clear()
     tracker.handle('E_TWAKEPHONE_DND', { callid: 'nope' })

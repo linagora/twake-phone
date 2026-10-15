@@ -30,8 +30,8 @@ const TIMED_STATUSES: PresenceStatus[] = ['away', 'dnd']
 const PRESENCE_MESSAGE_MAX = 140
 /** Furthest end of a chosen presence: a year (beyond, a forward is the tool). */
 const PRESENCE_MAX_MS = 366 * 86_400_000
-/** Seconds of ringing before a call goes to the no-answer target. */
-const NOANSWER_DELAY = { min: 2, max: 120, default: 20 }
+/** Seconds of ringing before a call goes to the no-answer target (about: the forward may come a second or two later). */
+const NOANSWER_DELAY = { min: 5, max: 120, default: 20 }
 /** Waits between two attempts at handing a provider the presences kept in the store (its database may be late). */
 const RESTORE_RETRY_MS = [1_000, 5_000, 15_000, 30_000]
 /** One line of text: no control character (a message for callers ends up in a SIP header). */
@@ -281,16 +281,32 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
     if (entry) await within(store.addHistory(entry), historyWriteMs, 'history write').catch(err => app.log.error({ err, callId: entry.callId }, 'could not record call history'))
     bus.publish(tenantId, userId, event)
   }
+  // One change at a time per tenant to what its provider keeps for each person (presences, forwards): a restore
+  // hands the store's state whole, and a choice written while it runs would be undone by it. The others wait.
+  const turns = new Map<string, Promise<unknown>>()
+  const inTurn = <T>(tenantId: string, run: () => Promise<T>): Promise<T> => {
+    const next = (turns.get(tenantId) ?? Promise.resolve()).then(run)
+    const settled = next.catch(() => undefined)
+    turns.set(tenantId, settled)
+    void settled.then(() => {
+      if (turns.get(tenantId) === settled) turns.delete(tenantId)
+    })
+    return next
+  }
   // What each person chose (absent, "do not disturb" until a date) is the store's: handed to the provider when it
-  // starts, so that a restart forgets nothing and nobody inherits someone else's choice with their extension.
+  // starts, and again once the mappings changed, so that a restart forgets nothing and nobody inherits someone
+  // else's choice, or rules, with their extension (who holds which extension goes first: syncExtensions).
   let closing = false
   const restorePresences = async (tenantId: string, provider: TelephonyProvider, attempt = 0): Promise<void> => {
     try {
-      const entries = await Promise.all(
-        (await store.listUserPresences(tenantId)).map(async r => ({ user: await dir.forUser(tenantId, r.userId), presence: presenceOfRecord(r) }))
-      )
-      if (provider.restorePresences) await provider.restorePresences(entries)
-      else for (const e of entries) await provider.setPresence(e.user, e.presence)
+      await inTurn(tenantId, async () => {
+        if (provider.syncExtensions) await provider.syncExtensions((await store.listMappings(tenantId)).map(m => ({ extension: m.extension, userId: m.userId })))
+        const entries = await Promise.all(
+          (await store.listUserPresences(tenantId)).map(async r => ({ user: await dir.forUser(tenantId, r.userId), presence: presenceOfRecord(r) }))
+        )
+        if (provider.restorePresences) await provider.restorePresences(entries)
+        else for (const e of entries) await provider.setPresence(e.user, e.presence)
+      })
     } catch (err) {
       if (closing) return
       const delay = RESTORE_RETRY_MS[Math.min(attempt, RESTORE_RETRY_MS.length - 1)]!
@@ -299,7 +315,14 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
       if (!closing) return restorePresences(tenantId, provider, attempt + 1)
     }
   }
+  const started = new Map<string, TelephonyProvider>()
+  // A synchronisation that changed who holds which extension: the provider hears it at once.
+  options.directorySync?.onChange(tenantId => {
+    const provider = started.get(tenantId)
+    if (provider) void restorePresences(tenantId, provider)
+  })
   registry.onCreate = (tenantId, provider) => {
+    started.set(tenantId, provider)
     void restorePresences(tenantId, provider)
     void (async () => {
       for await (const { extension, event } of provider.subscribe()) {
@@ -378,10 +401,12 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
       v1.put('/me/presence', async req => {
         const { user, provider } = await who(req)
         const { status, until, message } = parsePresence(req.body)
-        const since = new Date().toISOString()
-        await provider.setPresence(user, { status, source: 'user', since, ...(until ? { until } : {}), ...(message ? { message } : {}) })
-        if (status === 'available') await store.deleteUserPresence(user.tenantId, user.id)
-        else await store.setUserPresence({ tenantId: user.tenantId, userId: user.id, status, since, ...(until ? { until } : {}), ...(message ? { message } : {}) })
+        await inTurn(user.tenantId, async () => {
+          const since = new Date().toISOString()
+          await provider.setPresence(user, { status, source: 'user', since, ...(until ? { until } : {}), ...(message ? { message } : {}) })
+          if (status === 'available') await store.deleteUserPresence(user.tenantId, user.id)
+          else await store.setUserPresence({ tenantId: user.tenantId, userId: user.id, status, since, ...(until ? { until } : {}), ...(message ? { message } : {}) })
+        })
         // What the others see may differ (in a call, not registered): the provider's events say so.
         return presenceOf(user, provider)
       })
@@ -403,7 +428,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         const { user, provider } = await who(req)
         const forwarding = forwardingOf(provider)
         const rules = await parseForwarding(req.body, withExtension(user), async target => !!(await store.getMappingByExtension(user.tenantId, target)))
-        await forwarding.set(user, rules)
+        await inTurn(user.tenantId, () => forwarding.set(user, rules))
         return forwarding.get(user)
       })
 

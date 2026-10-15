@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { chosenStatus, DEFAULT_DELAY_SEC, formFromRules, fromLocalInput, refusalKey, rulesFromForm, toLocalInput } from './callRules.js'
+import { chosenStatus, DEFAULT_DELAY_SEC, delayValid, formFromRules, fromLocalInput, refusalKey, rulesFromForm, statusOptions, timedStatus, toLocalInput } from './callRules.js'
 import en from './i18n/en.json'
 import fr from './i18n/fr.json'
 
@@ -12,9 +12,17 @@ describe('forwarding form', () => {
   it('turns the fields back into rules, spaces removed, the empty ones left out', () => {
     expect(rulesFromForm({ always: ' 1 03 ', busy: '', noAnswer: '   ', delaySec: '5' })).toEqual({ always: '103' })
     expect(rulesFromForm({ always: '', busy: '104', noAnswer: '105', delaySec: '12' })).toEqual({ busy: '104', noAnswer: { target: '105', delaySec: 12 } })
-    // An emptied delay takes the default; one out of bounds goes as typed, for the Gateway to refuse it in words.
+    // An emptied delay takes the default; any other goes as typed, never replaced silently.
     expect(rulesFromForm({ always: '', busy: '', noAnswer: '105', delaySec: '' }).noAnswer).toEqual({ target: '105', delaySec: DEFAULT_DELAY_SEC })
     expect(rulesFromForm({ always: '', busy: '', noAnswer: '105', delaySec: '500' }).noAnswer).toEqual({ target: '105', delaySec: 500 })
+  })
+
+  it('refuses before sending a delay the Gateway would not take, when there is a no-answer forward', () => {
+    const form = (delaySec: string, noAnswer = '105') => ({ always: '', busy: '', noAnswer, delaySec })
+    for (const ok of ['', '5', '20', '120', ' 30 ']) expect(delayValid(form(ok)), ok).toBe(true)
+    for (const bad of ['4', '2', '121', '7.5', 'abc', '1e3x', '-10']) expect(delayValid(form(bad)), bad).toBe(false)
+    // Without a no-answer forward the delay says nothing.
+    expect(delayValid(form('abc', ' '))).toBe(true)
   })
 })
 
@@ -48,9 +56,13 @@ describe('end date of a presence', () => {
     expect(fromLocalInput('2026-13-45T99:99')).toBeUndefined()
   })
 
-  it('shows the status chosen, available when none was or it is not one a person chooses', () => {
+  it('shows the status chosen as it is, available when none was, and offers it back so a save keeps it', () => {
     expect(chosenStatus({ status: 'dnd', since: '2026-10-15T08:00:00.000Z' })).toBe('dnd')
-    expect(chosenStatus({ status: 'busy', since: '2026-10-15T08:00:00.000Z' })).toBe('available')
+    // Set through the API: shown, not turned into "available" (a save would overwrite it).
+    expect(chosenStatus({ status: 'busy', since: '2026-10-15T08:00:00.000Z' })).toBe('busy')
     expect(chosenStatus(undefined)).toBe('available')
+    expect(statusOptions('dnd')).toEqual(['available', 'away', 'dnd'])
+    expect(statusOptions('busy')).toEqual(['available', 'away', 'dnd', 'busy'])
+    expect(['available', 'away', 'dnd', 'busy', 'offline'].map(s => timedStatus(s as never))).toEqual([false, true, true, false, false])
   })
 })
