@@ -55,6 +55,8 @@ describe('the numbering plan (dialplan, dpid 1 then 2)', () => {
 
   it('fits the columns of the dialplan table and writes them in place of its own rules', () => {
     for (const r of DIALPLAN_RULES) {
+      // dp_translate's output is empty for a rule without a replacement.
+      expect(r.subst && r.repl, r.match).toBeTruthy()
       expect(r.match.length).toBeLessThanOrEqual(64)
       expect((r.subst ?? '').length).toBeLessThanOrEqual(64)
       expect((r.repl ?? '').length).toBeLessThanOrEqual(32)

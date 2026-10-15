@@ -503,7 +503,7 @@ route[trunk_out] {
 	$var(ext) = "";
 	if ($avp(caller) =~ "^[A-Za-z0-9._+-]{1,64}$")
 		$var(ext) = $avp(caller);
-	$var(trunk_query) = "SELECT t.setid, t.domain, t.number_format, t.assert_identity, t.auth_username, t.auth_password, t.auth_realm, t.codec_flags, coalesce(d.number, t.default_number) FROM trunks t LEFT JOIN LATERAL (SELECT CASE WHEN x.suffix_digits > 0 THEN left(x.first_number, length(x.first_number) - x.suffix_digits) || '" + $var(ext) + "' ELSE x.first_number END AS number FROM dids x WHERE x.trunk_id = t.id AND ((x.suffix_digits = 0 AND x.target = '" + $var(ext) + "') OR (x.suffix_digits = length('" + $var(ext) + "') AND left(x.first_number, length(x.first_number) - x.suffix_digits) || '" + $var(ext) + "' BETWEEN x.first_number AND x.last_number)) ORDER BY x.suffix_digits, x.first_number LIMIT 1) d ON true ORDER BY (d.number IS NULL), t.position LIMIT 1";
+	$var(trunk_query) = "SELECT t.setid, t.domain, t.number_format, t.assert_identity, t.auth_username, t.auth_password, t.auth_realm, t.codec_flags, coalesce(d.number, t.default_number) AS presented FROM trunks t LEFT JOIN LATERAL (SELECT CASE WHEN x.suffix_digits > 0 THEN left(x.first_number, length(x.first_number) - x.suffix_digits) || '" + $var(ext) + "' ELSE x.first_number END AS number FROM dids x WHERE x.trunk_id = t.id AND ((x.suffix_digits = 0 AND x.target = '" + $var(ext) + "') OR (x.suffix_digits = length('" + $var(ext) + "') AND left(x.first_number, length(x.first_number) - x.suffix_digits) || '" + $var(ext) + "' BETWEEN x.first_number AND x.last_number)) ORDER BY x.suffix_digits, x.first_number LIMIT 1) d ON true ORDER BY (d.number IS NULL), t.position LIMIT 1";
 	async(sql_query_one("$var(trunk_query)", "$avp(t_setid);$avp(t_domain);$avp(t_format);$avp(t_pai);$avp(t_user);$avp(t_pass);$avp(t_realm);$avp(t_codecs);$avp(t_presented)"), trunk_out_loaded);
 }
 
@@ -549,11 +549,10 @@ route[trunk_out_loaded] {
 		route(rtp_offer);
 	t_on_reply("rtp");
 	t_on_failure("trunk_failed");
-	# A call that does not go through is accounted (the caller's history tells how it ended).
-	route(account_missed);
 	route(calling);
 	if (!t_relay()) {
 		rtpengine_delete();
+		route(account_missed);
 		t_reply(503, "Trunk Unavailable");
 	}
 	exit;
@@ -579,10 +578,13 @@ route[trunk_number] {
 }
 
 # A call to the operator that failed. Its challenge (401, 407) is answered once with the trunk's credentials (the
-# realm it names when the trunk does not say); a server that did not answer or is out of order: the next one.
+# realm it names when the trunk does not say); a server that did not answer or is out of order: the next one. A call
+# that does not go through is accounted here, once nothing retries it (acc would report the challenge otherwise): the
+# caller's history tells how it ended.
 failure_route[trunk_failed] {
 	if (t_was_cancelled()) {
 		rtpengine_delete();
+		route(account_missed);
 		exit;
 	}
 	if (t_check_status("401|407") && $avp(t_challenged) == NULL && $avp(t_pass) != NULL && $avp(t_pass) != "") {
@@ -599,8 +601,8 @@ failure_route[trunk_failed] {
 			$socket_out = "udp:${TRUNK_LISTEN_IP}:${TRUNK_PORT}";
 			t_on_reply("rtp");
 			t_on_failure("trunk_failed");
-			t_relay();
-			exit;
+			if (t_relay())
+				exit;
 		}
 		xlog("L_WARN", "call $ci: the operator's challenge could not be answered\n");
 	}
@@ -609,17 +611,19 @@ failure_route[trunk_failed] {
 		$socket_out = "udp:${TRUNK_LISTEN_IP}:${TRUNK_PORT}";
 		t_on_reply("rtp");
 		t_on_failure("trunk_failed");
-		t_relay();
-		exit;
+		if (t_relay())
+			exit;
 	}
 	rtpengine_delete();
+	route(account_missed);
 }
 
 # A request on the trunk socket. Only from the operator: an address of its servers, or one its trunk declares
 # (`dispatcher`, any set, any port); anything else is refused. Its calls reach the extension or group of the direct
-# number called (`dids`): the Request-URI's number, else the To's (a registered trunk calls the address it
-# registered), in E.164. Then the path of every call (route[rules_next]): forwards, "do not disturb", groups, the
-# browsers to wake. The caller is its number in E.164, "anonymous" when it has none.
+# number called (`dids`), in E.164: the Request-URI's, else the To's; the To's first when the Request-URI is the
+# address a trunk registered (its user is the trunk's login, often its main number). Then the path of every call
+# (route[rules_next]): forwards, "do not disturb", groups, the browsers to wake. The caller is its number in E.164,
+# "anonymous" when it has none.
 route[trunk_in] {
 	if (!ds_is_in_list("$si", 0)) {
 		xlog("L_NOTICE", "trunk: $rm from $si:$sp refused, no address of the operator\n");
@@ -665,7 +669,11 @@ route[trunk_in] {
 		sl_reply_error();
 		exit;
 	}
-	$var(did_query) = "SELECT CASE WHEN d.suffix_digits > 0 THEN right(n.num, d.suffix_digits) ELSE d.target END, t.codec_flags FROM (VALUES (1, '" + $var(n1) + "'), (2, '" + $var(n2) + "')) AS n(o, num) JOIN dids d ON length(d.first_number) = length(n.num) AND n.num BETWEEN d.first_number AND d.last_number JOIN trunks t ON t.id = d.trunk_id ORDER BY n.o, d.suffix_digits LIMIT 1";
+	# The Request-URI's number first, unless it is the user a trunk registers (the binding it calls): the To's then.
+	$var(ru_user) = "";
+	if ($rU =~ "^[A-Za-z0-9._+-]{1,64}$")
+		$var(ru_user) = $rU;
+	$var(did_query) = "SELECT CASE WHEN d.suffix_digits > 0 THEN right(n.num, d.suffix_digits) ELSE d.target END, t.codec_flags FROM (VALUES (CASE WHEN EXISTS (SELECT 1 FROM trunks b WHERE b.reg_aor <> '' AND b.auth_username = '" + $var(ru_user) + "') THEN 3 ELSE 1 END, '" + $var(n1) + "'), (2, '" + $var(n2) + "')) AS n(o, num) JOIN dids d ON length(d.first_number) = length(n.num) AND n.num BETWEEN d.first_number AND d.last_number JOIN trunks t ON t.id = d.trunk_id ORDER BY n.o, d.suffix_digits LIMIT 1";
 	async(sql_query_one("$var(did_query)", "$avp(did_target);$avp(t_codecs)"), trunk_in_loaded);
 }
 

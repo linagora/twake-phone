@@ -26,7 +26,6 @@ const parse = raw => {
   return { raw, first, headers, body, ...(status ? { status: Number(status[1]), reason: status[2] } : { method: request?.[1], uri: request?.[2] }) }
 }
 const one = (msg, name) => msg.headers.get(name)?.[0] ?? ''
-const userOf = value => /sips?:([^@;>]+)@/.exec(value)?.[1] ?? ''
 const tagOf = value => /;tag=([^;>\s]+)/.exec(value)?.[1]
 const param = (header, name) => new RegExp(`${name}="([^"]*)"`, 'i').exec(header)?.[1]
 
@@ -94,7 +93,9 @@ const media = async () => {
       timer = undefined
       try {
         socket.close()
-      } catch {}
+      } catch {
+        // Closed already.
+      }
     }
   }
 }
@@ -134,7 +135,8 @@ export const startOperator = async ({ opensips, user, password, realm = 'operato
     return param(authorization, 'response') === expected
   }
 
-  const state = { options: 0, registrations: [], invites: [], challenged: 0, refused: [] }
+  // refuseWith: the final answer to the calls OpenSIPS sends ("486 Busy Here"), instead of answering them.
+  const state = { options: 0, registrations: [], invites: [], challenged: 0, refuseWith: undefined }
   const waiters = new Set()
   const changed = () => {
     for (const w of waiters) w()
@@ -193,6 +195,7 @@ export const startOperator = async ({ opensips, user, password, realm = 'operato
       case 'OPTIONS':
         state.options++
         await reply(msg, '200 OK')
+        changed()
         break
       case 'REGISTER': {
         if (!authorized(one(msg, 'authorization'), 'REGISTER')) {
@@ -225,6 +228,13 @@ export const startOperator = async ({ opensips, user, password, realm = 'operato
         await reply(msg, '180 Ringing', { toTag: call.tag })
         setTimeout(async () => {
           if (call.state !== 'ringing') return
+          if (state.refuseWith) {
+            call.state = 'refused'
+            call.media.stop()
+            await reply(msg, state.refuseWith, { toTag: call.tag })
+            changed()
+            return
+          }
           call.state = 'answered'
           await reply(msg, '200 OK', { body: sdpFor(call.media.port, call.sessionId), toTag: call.tag })
           call.media.start(call.far)

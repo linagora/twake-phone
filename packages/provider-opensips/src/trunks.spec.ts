@@ -72,7 +72,7 @@ describe('projectTrunks', () => {
       [{ password: undefined }, /registering/],
       [{ realm: undefined, password: 'x'.repeat(65) }, /64/]
     ]
-    for (const [change, message] of bad) expect(() => projectTrunks([{ ...OPERATOR, ...change } as Trunk], [], DEFAULT_TRUNK_SOCKET), JSON.stringify(change)).toThrow(message)
+    for (const [change, message] of bad) expect(() => projectTrunks([{ ...OPERATOR, ...change }], [], DEFAULT_TRUNK_SOCKET), JSON.stringify(change)).toThrow(message)
     const did = (d: Partial<DidRange>) => () => projectTrunks([OPERATOR], [{ ...DIDS[1]!, ...d }], DEFAULT_TRUNK_SOCKET)
     expect(did({ trunkId: 'other' })).toThrow(/no trunk/)
     expect(did({ first: '0199000101' })).toThrow(/E.164/)
@@ -88,6 +88,17 @@ describe('projectTrunks', () => {
     expect(codecFlags(['G722'])).toBe('codec-strip-all codec-except-G722 codec-except-telephone-event')
   })
 })
+
+const SCRIPT = readFileSync(new URL('../../../docker/opensips/opensips.cfg.tpl', import.meta.url), 'utf8')
+/** A query of opensips.cfg.tpl (`$var(name) = "..." + $var(x) + "...";`) with the script's variables given. */
+const scriptQuery = (name: string, vars: Record<string, string>) => {
+  const line = new RegExp(`\\$var\\(${name}\\) = (".*");$`, 'm').exec(SCRIPT)?.[1]
+  if (!line) throw new Error(`no $var(${name}) in opensips.cfg.tpl`)
+  return line.slice(1, -1).replace(/" \+ \$var\((\w+)\) \+ "/g, (_, v: string) => {
+    if (!(v in vars)) throw new Error(`$var(${v}) not given`)
+    return vars[v]!
+  })
+}
 
 // Against a real PostgreSQL (TEST_DATABASE_URL): the SQL itself, and the queries of opensips.cfg.tpl on what it writes.
 if (process.env.TEST_DATABASE_URL) {
@@ -127,25 +138,19 @@ if (process.env.TEST_DATABASE_URL) {
     it('answers the queries of opensips.cfg.tpl: the direct number called, the trunk and number of a caller', async () => {
       const tables = new TrunkTables({ pool, ready, tenantId: 'spec-A' })
       await tables.set([OPERATOR, { ...OPERATOR, id: 'backup', auth: 'ip', defaultNumber: '+33199000200' }], DIDS)
-      // route[trunk_in]: the Request-URI's number first, then the To's.
-      const inbound = async (n1: string, n2: string) =>
-        (
-          await pool.query(
-            `SELECT CASE WHEN d.suffix_digits > 0 THEN right(n.num, d.suffix_digits) ELSE d.target END AS target, n.num FROM (VALUES (1, '${n1}'), (2, '${n2}')) AS n(o, num) JOIN dids d ON length(d.first_number) = length(n.num) AND n.num BETWEEN d.first_number AND d.last_number ORDER BY n.o, d.suffix_digits LIMIT 1`
-          )
-        ).rows[0]
-      expect(await inbound('+33199000101', '')).toEqual({ target: '101', num: '+33199000101' })
-      expect(await inbound('', '+33199000113')).toEqual({ target: '113', num: '+33199000113' })
-      expect(await inbound('+33199000100', '+33199000113')).toEqual({ target: '113', num: '+33199000113' })
+      // route[trunk_in], as the script builds it: the Request-URI's number first, then the To's (the To's first when
+      // the Request-URI names the login a trunk registers with).
+      const inbound = async (n1: string, n2: string, ruUser = '') => (await pool.query(scriptQuery('did_query', { n1, n2, ru_user: ruUser }))).rows[0] as Record<string, unknown> | undefined
+      expect(await inbound('+33199000101', '')).toMatchObject({ target: '101' })
+      expect(await inbound('', '+33199000113')).toMatchObject({ target: '113' })
+      expect(await inbound('+33199000100', '+33199000113')).toMatchObject({ target: '113' })
+      expect(await inbound('+33199000101', '+33199000113')).toMatchObject({ target: '101' })
+      expect(await inbound('+33199000101', '+33199000113', '0033199000100')).toMatchObject({ target: '113' })
       expect(await inbound('+33199000120', '')).toBeUndefined()
       expect(await inbound('+331990001011', '')).toBeUndefined()
-      // route[trunk_out]: the trunk of the caller's direct number and that number, else the first trunk and its own.
-      const outbound = async (ext: string) =>
-        (
-          await pool.query(
-            `SELECT t.setid, t.domain, t.number_format, t.assert_identity, t.auth_username, t.auth_password, t.auth_realm, t.codec_flags, coalesce(d.number, t.default_number) AS presented FROM trunks t LEFT JOIN LATERAL (SELECT CASE WHEN x.suffix_digits > 0 THEN left(x.first_number, length(x.first_number) - x.suffix_digits) || '${ext}' ELSE x.first_number END AS number FROM dids x WHERE x.trunk_id = t.id AND ((x.suffix_digits = 0 AND x.target = '${ext}') OR (x.suffix_digits = length('${ext}') AND left(x.first_number, length(x.first_number) - x.suffix_digits) || '${ext}' BETWEEN x.first_number AND x.last_number)) ORDER BY x.suffix_digits, x.first_number LIMIT 1) d ON true ORDER BY (d.number IS NULL), t.position LIMIT 1`
-          )
-        ).rows[0]
+      // route[trunk_out], as the script builds it: the trunk of the caller's direct number and that number, else the
+      // first trunk and its own.
+      const outbound = async (ext: string) => (await pool.query(scriptQuery('trunk_query', { ext }))).rows[0] as Record<string, unknown> | undefined
       expect(await outbound('101')).toMatchObject({ setid: 1, presented: '+33199000101', number_format: 'international-00' })
       expect(await outbound('115')).toMatchObject({ setid: 1, presented: '+33199000115' })
       expect(await outbound('102')).toMatchObject({ setid: 1, presented: '+33199000100' })

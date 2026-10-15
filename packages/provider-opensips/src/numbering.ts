@@ -17,8 +17,8 @@ export type NumberClass = 'emergency' | 'e164' | 'invalid' | 'fixed' | 'mobile' 
 
 /**
  * A row of OpenSIPS's `dialplan` table (match_op 1, a PCRE; match_flags 0, case sensitive). `subst` and `repl`
- * together rewrite the number (`\1` names the first group); without them it goes through as it is. `attrs`: its
- * class, which dp_translate hands back.
+ * together rewrite the number (`\1` names the first group): dp_translate's output is empty without them, so each rule
+ * has them, KEEP for a number that goes through as it is. `attrs`: its class, which dp_translate hands back.
  */
 export interface DialplanRule {
   dpid: number
@@ -29,6 +29,9 @@ export interface DialplanRule {
   attrs: NumberClass
 }
 
+/** The rewrite of a rule that keeps the number as it is. */
+const KEEP = '^(.*)$'
+
 /** The emergency numbers of France: 15, 17, 18, 112, 114 (deaf and hard of hearing), 115, 119, 191, 196, 197, 116000, 116117. */
 const EMERGENCY = '^(1[578]|11[2459]|19[167]|116000|116117)$'
 
@@ -37,29 +40,29 @@ const EMERGENCY = '^(1[578]|11[2459]|19[167]|116000|116117)$'
  * matches is not a public number: an extension or a group, routed as before.
  */
 export const DIALPLAN_RULES: readonly DialplanRule[] = [
-  { dpid: DP_NORMALISE, pr: 10, match: EMERGENCY, attrs: 'emergency' },
+  { dpid: DP_NORMALISE, pr: 10, match: EMERGENCY, subst: KEEP, repl: '\\1', attrs: 'emergency' },
   // French numbers, whichever way they are written: national, +33, 0033, 33 (and a 0 left after the country code).
   { dpid: DP_NORMALISE, pr: 20, match: '^0([1-9][0-9]{8})$', subst: '^0([1-9][0-9]{8})$', repl: '+33\\1', attrs: 'e164' },
   { dpid: DP_NORMALISE, pr: 21, match: '^\\+330?([1-9][0-9]{8})$', subst: '^\\+330?([1-9][0-9]{8})$', repl: '+33\\1', attrs: 'e164' },
   { dpid: DP_NORMALISE, pr: 22, match: '^00330?([1-9][0-9]{8})$', subst: '^00330?([1-9][0-9]{8})$', repl: '+33\\1', attrs: 'e164' },
   { dpid: DP_NORMALISE, pr: 23, match: '^33([1-9][0-9]{8})$', subst: '^33([1-9][0-9]{8})$', repl: '+33\\1', attrs: 'e164' },
   // Any other country: + or 00, then 7 to 15 digits (E.164).
-  { dpid: DP_NORMALISE, pr: 30, match: '^\\+[1-9][0-9]{6,14}$', attrs: 'e164' },
+  { dpid: DP_NORMALISE, pr: 30, match: '^\\+[1-9][0-9]{6,14}$', subst: KEEP, repl: '\\1', attrs: 'e164' },
   { dpid: DP_NORMALISE, pr: 31, match: '^00([1-9][0-9]{6,14})$', subst: '^00([1-9][0-9]{6,14})$', repl: '+\\1', attrs: 'e164' },
   // Looks like a public number, is none: refused (484) rather than taken for an extension.
-  { dpid: DP_NORMALISE, pr: 90, match: '^[+0]', attrs: 'invalid' },
+  { dpid: DP_NORMALISE, pr: 90, match: '^[+0]', subst: KEEP, repl: '\\1', attrs: 'invalid' },
 
-  { dpid: DP_CLASSIFY, pr: 10, match: '^\\+33[1-59][0-9]{8}$', attrs: 'fixed' },
-  { dpid: DP_CLASSIFY, pr: 11, match: '^\\+33[67][0-9]{8}$', attrs: 'mobile' },
-  { dpid: DP_CLASSIFY, pr: 12, match: '^\\+3380[0-5][0-9]{6}$', attrs: 'freephone' },
-  { dpid: DP_CLASSIFY, pr: 13, match: '^\\+3380[6-9][0-9]{6}$', attrs: 'standard-rate' },
-  { dpid: DP_CLASSIFY, pr: 14, match: '^\\+338[1-9][0-9]{7}$', attrs: 'premium' },
+  { dpid: DP_CLASSIFY, pr: 10, match: '^\\+33[1-59][0-9]{8}$', subst: KEEP, repl: '\\1', attrs: 'fixed' },
+  { dpid: DP_CLASSIFY, pr: 11, match: '^\\+33[67][0-9]{8}$', subst: KEEP, repl: '\\1', attrs: 'mobile' },
+  { dpid: DP_CLASSIFY, pr: 12, match: '^\\+3380[0-5][0-9]{6}$', subst: KEEP, repl: '\\1', attrs: 'freephone' },
+  { dpid: DP_CLASSIFY, pr: 13, match: '^\\+3380[6-9][0-9]{6}$', subst: KEEP, repl: '\\1', attrs: 'standard-rate' },
+  { dpid: DP_CLASSIFY, pr: 14, match: '^\\+338[1-9][0-9]{7}$', subst: KEEP, repl: '\\1', attrs: 'premium' },
   // +33 of any other length or prefix: no French number.
-  { dpid: DP_CLASSIFY, pr: 15, match: '^\\+33', attrs: 'invalid' },
+  { dpid: DP_CLASSIFY, pr: 15, match: '^\\+33', subst: KEEP, repl: '\\1', attrs: 'invalid' },
   // Réunion and Mayotte, Saint-Pierre-et-Miquelon, Guadeloupe and the French Antilles, Guiana, Martinique, Wallis and
   // Futuna, New Caledonia, French Polynesia: charged as abroad by most operators.
-  { dpid: DP_CLASSIFY, pr: 20, match: '^\\+(262|508|59[046]|68[179])', attrs: 'overseas' },
-  { dpid: DP_CLASSIFY, pr: 30, match: '^\\+', attrs: 'international' }
+  { dpid: DP_CLASSIFY, pr: 20, match: '^\\+(262|508|59[046]|68[179])', subst: KEEP, repl: '\\1', attrs: 'overseas' },
+  { dpid: DP_CLASSIFY, pr: 30, match: '^\\+', subst: KEEP, repl: '\\1', attrs: 'international' }
 ]
 
 /**
@@ -73,7 +76,8 @@ export const translate = (dpid: number, input: string, rules: readonly DialplanR
   const candidates = rules.filter(r => r.dpid === dpid).sort((a, b) => a.pr - b.pr)
   for (const rule of candidates) {
     if (!new RegExp(rule.match).test(input)) continue
-    const output = rule.subst && rule.repl !== undefined ? input.replace(new RegExp(rule.subst), rule.repl.replace(/\\(\d)/g, '$$$1')) : input
+    // As dialplan does: no replacement, no output.
+    const output = rule.subst && rule.repl !== undefined ? input.replace(new RegExp(rule.subst), rule.repl.replace(/\\(\d)/g, '$$$1')) : ''
     return { output, attrs: rule.attrs }
   }
   return null
