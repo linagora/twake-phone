@@ -2118,6 +2118,8 @@ try {
     await dial(alice.page, '06 39 98 00 01')
     const call = await operator2.invited(invite => invite.uri === 'sip:+33639980001@operator.example')
     if (operator2.state.challenged <= challenged) throw new Error('the call was not challenged by the second server')
+    if (!plainRtp(call.invite.body)) throw new Error(`offer sent to the second server: ${call.invite.body}`)
+    if (!(call.invite.headers.get('to')?.[0] ?? '').startsWith('<sip:+33639980001@operator.example>')) throw new Error(`To sent to the second server: ${call.invite.headers.get('to')}`)
     await alice.page.getByText('En communication avec +33 6 39 98 00 01').waitFor()
     await alice.page.getByRole('button', { name: 'Raccrocher' }).click()
     await operator2.callState(call, 'ended')
@@ -2131,7 +2133,8 @@ try {
 
     operator.state.next.push({ reply: '403 Forbidden', headers: ['Twake-Call-Refused: emergency'] })
     ended = await dialUntilEnded(alice.page, '06 39 98 00 01')
-    expectEqual(`${ended.endStatus} ${ended.endReason} ${ended.endRefusal ?? '-'}`, '403 refused -', 'how the call refused by the operator ended')
+    // A plain refusal: the operator cannot have the app say "call 112 from another phone".
+    expectEqual(`${ended.endStatus} ${ended.endReason} ${ended.endRefusal ?? '-'}`, '403 rejected -', 'how the call refused by the operator ended')
 
     operator.state.next.push({ rejectAuth: true })
     ended = await dialUntilEnded(alice.page, '06 39 98 00 01')

@@ -642,6 +642,9 @@ route[trunk_out_loaded] {
 	route(trunk_number, $avp(t_presented));
 	$var(from_user) = $var(trunk_number);
 	$ru = "sip:" + $var(to_user) + "@" + $avp(t_domain);
+	# Kept for failure_route[trunk_failed]: a failure route starts again from the Request-URI the call came with.
+	$(avp(t_ruri)[*]) = NULL;
+	$avp(t_ruri) = $ru;
 	# The operator's first server up (failover to the next ones: failure_route[trunk_failed]), from the trunk socket.
 	if (!ds_select_dst($avp(t_setid), 8, "f")) {
 		xlog("L_WARN", "call $ci: no server of the trunk is up\n");
@@ -708,6 +711,8 @@ failure_route[trunk_failed] {
 		route(account_missed);
 		exit;
 	}
+	# The number at the operator's domain, as route[trunk_out_loaded] wrote it (here $ru is the one dialled again).
+	$ru = $avp(t_ruri);
 	if (t_check_status("401|407")) {
 		if ($avp(t_challenged) == NULL && $avp(t_pass) != NULL && $avp(t_pass) != "") {
 			$avp(t_challenged) = 1;

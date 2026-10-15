@@ -637,6 +637,10 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     const next = failed.slice(failed.indexOf('if (t_check_status("408|5[0-9][0-9]") && $avp(t_rang) == NULL && ds_next_dst()) {'))
     expect(next.length).toBeGreaterThan(0)
     expect(next).toContain('$(avp(t_challenged)[*]) = NULL;')
+    // Every retry goes to the number at the operator's domain, not back to what was dialled at ours.
+    expect(failed.indexOf('$ru = $avp(t_ruri);')).toBeGreaterThan(0)
+    expect(failed.indexOf('$ru = $avp(t_ruri);')).toBeLessThan(failed.indexOf('if (t_check_status("401|407")) {'))
+    expect(section('route[trunk_out_loaded]', 'route[trunk_number]')).toContain('$avp(t_ruri) = $ru;')
     expect(failed.replace(/#.*$/gm, '').trimEnd().endsWith('rtpengine_delete();\n\troute(account_missed);\n}')).toBe(true)
     // Any reply of the operator under 200 (100 Trying, 180...) holds the call to that server.
     expect(section('onreply_route[rtp]', 'route[event_attrs]')).toContain('if ($rs < 200 && $dlg_val(trunk) == "callee")\n\t\t$avp(t_rang) = 1;')
