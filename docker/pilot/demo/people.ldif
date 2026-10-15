@@ -1,0 +1,38 @@
+# Test people of the demo profile: the same identifiers as the Keycloak realm (twakephone-realm.json), their extension
+# in employeeNumber (LDAP_ATTR_EXTENSION). Loaded once, when the directory is created.
+dn: ou=people,dc=twakephone,dc=demo
+objectClass: organizationalUnit
+ou: people
+
+dn: uid=alice,ou=people,dc=twakephone,dc=demo
+objectClass: inetOrgPerson
+uid: alice
+cn: Alice Martin
+givenName: Alice
+sn: Martin
+mail: alice@twakephone.demo
+employeeNumber: 101
+ou: Direction
+title: Directrice
+
+dn: uid=bob,ou=people,dc=twakephone,dc=demo
+objectClass: inetOrgPerson
+uid: bob
+cn: Bob Durand
+givenName: Bob
+sn: Durand
+mail: bob@twakephone.demo
+employeeNumber: 102
+ou: Commercial
+title: Commercial
+
+dn: uid=carole,ou=people,dc=twakephone,dc=demo
+objectClass: inetOrgPerson
+uid: carole
+cn: Carole Bernard
+givenName: Carole
+sn: Bernard
+mail: carole@twakephone.demo
+employeeNumber: 103
+ou: Support
+title: Technicienne support
