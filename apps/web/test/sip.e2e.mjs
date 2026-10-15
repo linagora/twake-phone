@@ -545,6 +545,8 @@ try {
       await dial(alice.page, '102')
       // Hung up once OpenSIPS waits on the lock: the INVITE is there (a click before it leaves the browser sends nothing).
       await until("OpenSIPS's read of the rules to wait on the lock", async () => {
+        // `locker` is inside its transaction, which reads pg_stat_activity once: the snapshot is cleared each time.
+        await locker.query('SELECT pg_stat_clear_snapshot()')
         const { rows } = await locker.query("SELECT count(*)::int AS n FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE '%JOIN call_rules r ON r.extension = ''102''%'")
         return rows[0].n > 0
       }, { timeout: 5_000, every: 20 })
