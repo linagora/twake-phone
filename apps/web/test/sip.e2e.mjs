@@ -1399,9 +1399,19 @@ try {
       const [shown] = await until('the notification', async () => {
         const all = await notificationsOf(jean)
         return all.length ? all : null
-      }).catch(err => {
-        const workers = jean.context.serviceWorkers().map(w => w.url())
-        throw new Error(`${err.message}; workers: ${JSON.stringify(workers)}; DevTools: ${delivered.seen.join(', ')}`)
+      }).catch(async err => {
+        const workers = jean.context.serviceWorkers()
+        // Whether the worker can show a notification at all, asked to show one itself.
+        const probe = await workers[0]
+          ?.evaluate(() =>
+            self.registration
+              .showNotification('probe', { tag: 'probe' })
+              .then(() => self.registration.getNotifications().then(ns => `shown, ${ns.length} listed`))
+              .catch(e => `refused: ${e.name} ${e.message}`)
+              .then(r => `${Notification.permission}; ${r}; ${navigator.userAgent}`)
+          )
+          .catch(e => `not asked: ${e.message}`)
+        throw new Error(`${err.message}; workers: ${JSON.stringify(workers.map(w => w.url()))}; DevTools: ${delivered.seen.join(', ')}; probe: ${probe}`)
       })
       await delivered.detach()
       expectEqual(`${shown.title} | ${shown.body}`, 'Appel de Alice Martin (101) | Cliquez pour répondre dans TwakePhone.', 'the notification')
