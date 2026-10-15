@@ -18,9 +18,26 @@ export type SoftCallState = 'new' | 'ringing' | 'connected' | 'held' | 'ended'
  * Why a call ended, as the SIP layer reports it: the UI tells the user, the history keeps it. `dnd`: the person
  * called does not want to be disturbed (and gave no forward); their message, when they left one, is `endMessage`.
  * `answered-elsewhere`: a call ringing here was taken by another phone (a colleague of a ring group, or another
- * device of ours): the CANCEL said so (`Reason: SIP;cause=200`).
+ * device of ours): the CANCEL said so (`Reason: SIP;cause=200`). `refused`: the SIP server does not put this number
+ * through to the public network (an emergency number, a premium one...): why is `endRefusal`.
  */
-export type EndReason = 'hangup' | 'rejected' | 'busy' | 'no-answer' | 'unavailable' | 'cancelled' | 'failed' | 'transferred' | 'dnd' | 'answered-elsewhere'
+export type EndReason = 'hangup' | 'rejected' | 'busy' | 'no-answer' | 'unavailable' | 'cancelled' | 'failed' | 'transferred' | 'dnd' | 'answered-elsewhere' | 'refused'
+
+/**
+ * Why the SIP server refused a call to the public network (step 6, ADR 0016), as its REFUSED_HEADER says (with 403,
+ * 484 or 503): an emergency number (to call from another phone), a premium, international or overseas one (not
+ * allowed), a number that is none (`invalid`), no trunk to reach the operator (`no-trunk`). Any other word:
+ * `not-allowed`.
+ */
+export type CallRefusal = 'emergency' | 'premium' | 'international' | 'overseas' | 'invalid' | 'no-trunk' | 'not-allowed'
+export const REFUSED_HEADER = 'Twake-Call-Refused'
+const REFUSALS: readonly CallRefusal[] = ['emergency', 'premium', 'international', 'overseas', 'invalid', 'no-trunk']
+/** The refusal a response carries, if it is one of the SIP server's. */
+export const callRefusal = (status: number | undefined, header: string | undefined): CallRefusal | undefined => {
+  const word = header?.trim().toLowerCase()
+  if (!word || (status !== 403 && status !== 484 && status !== 503)) return undefined
+  return REFUSALS.includes(word as CallRefusal) ? (word as CallRefusal) : 'not-allowed'
+}
 
 /**
  * How the SIP server refuses a call to someone in "do not disturb": 480 with DND_HEADER set to 1 (a reason phrase may
@@ -105,6 +122,8 @@ export interface SoftCall {
   readonly endStatus?: number
   /** What the person called left for their callers (a "do not disturb" message), as the SIP server relayed it. */
   readonly endMessage?: string
+  /** Why the SIP server refused the number (endReason `refused`). */
+  readonly endRefusal?: CallRefusal
   /** The far end put us on hold (re-INVITE with sendonly or inactive). */
   readonly remoteHold: boolean
   readonly muted: boolean
@@ -245,6 +264,7 @@ class WebCall implements SoftCall {
   endReason?: EndReason
   endStatus?: number
   endMessage?: string
+  endRefusal?: CallRefusal
   remoteHold = false
   muted = false
   renegotiating = false
@@ -347,6 +367,12 @@ class WebCall implements SoftCall {
         this.endReason = 'dnd'
         const message = response.getHeader?.(DND_MESSAGE_HEADER)?.trim()
         if (message) this.endMessage = message
+      }
+      // A number the SIP server does not put through to the public network, and why.
+      const refusal = callRefusal(this.endStatus, response?.getHeader?.(REFUSED_HEADER))
+      if (refusal && direction === 'outbound') {
+        this.endReason = 'refused'
+        this.endRefusal = refusal
       }
       this.reofferPending?.reject(new CallError('call-ended', 'Call ended'))
       this.reofferPending = undefined

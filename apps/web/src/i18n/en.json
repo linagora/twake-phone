@@ -260,5 +260,15 @@
   "settings.notificationsUnsupported": "This browser cannot receive call notifications.",
   "settings.notificationsUnavailable": "Call notifications are not offered on this platform.",
   "settings.notificationsError": "Notifications could not be set.",
-  "auth.openingCall": "Signing in to take the call…"
+  "auth.openingCall": "Signing in to take the call…",
+  "dialer.zeroPlus": "0 (hold for +)",
+  "call.endedRefusedEmergency": "Emergency numbers are not routed from Twake Phone: call {who} from another phone (mobile or landline).",
+  "call.endedRefusedPremium": "Premium-rate numbers are not allowed: {who} was not called.",
+  "call.endedRefusedInternational": "Calls abroad are not allowed: {who} was not called.",
+  "call.endedRefusedOverseas": "Calls to the French overseas territories are not allowed: {who} was not called.",
+  "call.endedRefusedInvalid": "{who} is not a complete number: check it.",
+  "call.endedRefusedNoTrunk": "Outside calls are not set up on this platform: {who} was not called.",
+  "call.endedRefusedNotAllowed": "This number is not allowed: {who} was not called.",
+  "call.errorTransferNotAllowed": "Transfer not possible: this number is not allowed{status}.",
+  "call.hiddenNumber": "Hidden number"
 }
