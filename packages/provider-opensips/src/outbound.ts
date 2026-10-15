@@ -1,6 +1,7 @@
 import {
   FRAUD_DEFAULTS,
   FRAUD_PARAMS,
+  OUTBOUND_CAP_DEFAULTS,
   OUTBOUND_CAPS,
   TRUNK_OUTBOUND_CLASSES,
   type FraudRule,
@@ -13,24 +14,33 @@ import type { Queryable } from './subscriber.js'
 
 // The rules of the calls to the public network (step 6b, ADR 0017) in OpenSIPS's database. The Gateway keeps the
 // policy, the rights profiles and who has which; this writes their projection: our `outbound_settings`,
-// `outbound_profiles` and `outbound_users`, read with the trunk at each external call (route[trunk_out], through
-// twake_outbound()), and the volume thresholds of OpenSIPS's `fraud_detection` module, which it loads at its start and
-// on MI fraud_reload. Emergency calls are outside all of it: the script never asks.
+// `outbound_profiles` and `outbound_users`, read at each external call by twake_outbound() (route[outbound_loaded], a
+// query of its own after the trunk's), and the volume thresholds of OpenSIPS's `fraud_detection` module, which it
+// loads at its start and on MI fraud_reload. What was used is kept as it goes (`outbound_usage`, from the CDRs, by a
+// trigger on `acc`), never read from the CDRs during a call. Emergency calls are outside all of it: the script never
+// asks.
 
-/** Table versions OpenSIPS 3.6 checks in `version` (scripts/postgres/{fraud_detection,drouting}-create.sql). */
+/** Table versions OpenSIPS 3.6 checks in `version` (scripts/postgres/{fraud_detection,drouting,dialog}-create.sql). */
 export const FRAUD_TABLE_VERSION = 1
 export const DR_TABLE_VERSIONS = { dr_gateways: 6, dr_rules: 4, dr_carriers: 3, dr_groups: 2 } as const
+export const DIALOG_TABLE_VERSION = 12
 
 /** The profile of `fraud_detection` the script checks every call against (check_fraud's third argument). */
 export const FRAUD_PROFILE = 1
-/** Its two rules: numbers in France (+33: prefix 33, the number without its +) and every other one (no prefix). */
+/** Its rules: numbers in France (+33: prefix 33, the number without its +) and every other one (no prefix). */
 export const FRAUD_RULE_NATIONAL = 1
 export const FRAUD_RULE_INTERNATIONAL = 2
+/**
+ * The French overseas numbers of the French plan (numbering.ts, `overseas`: +33 262, 263, 269, 590, 594, 596, 639, 690
+ * to 697, 976), each a rule of its own (rule ids from 3, in this order) with the international thresholds: the same
+ * number dialled 0262... or +262... is held to the same thresholds.
+ */
+export const FRAUD_OVERSEAS_PREFIXES = ['33262', '33263', '33269', '33590', '33594', '33596', '33639', '33690', '33691', '33692', '33693', '33694', '33695', '33696', '33697', '33976'] as const
 
 /** What a cap may be: a whole number of calls or minutes, at least 1. */
 export const CAP_MAX = 1_000_000
-/** No cap, as twake_outbound() says it: more than any count. */
-export const NO_CAP_LEFT = 1_000_000_000
+/** The time zone of the days and months of the caps, whatever the servers' own. */
+export const OUTBOUND_TIME_ZONE = 'Europe/Paris'
 
 interface Projection {
   settings: unknown[]
@@ -46,11 +56,12 @@ const USER_ID = /^[^\s\p{Cc}]{1,255}$/u
 /** In byte order, as ORDER BY ... COLLATE "C" gives them back. */
 const byId = (a: unknown, b: unknown) => (String(a) < String(b) ? -1 : String(a) > String(b) ? 1 : 0)
 
-const capsRow = (caps: OutboundCaps | undefined, what: string) =>
+/** The caps as the tables hold them (0: none): each one absent takes its default, `null` none. */
+const capsRow = (caps: OutboundCaps | undefined, defaults: OutboundCaps, what: string) =>
   OUTBOUND_CAPS.map(k => {
-    const v = caps?.[k]
+    const v = caps?.[k] === undefined ? defaults[k] : caps[k]
     if (v === undefined || v === null) return 0
-    if (!Number.isInteger(v) || v < 1 || v > CAP_MAX) throw invalid(`${what}: ${k} is a whole number from 1 to ${CAP_MAX}`)
+    if (!Number.isInteger(v) || v < 1 || v > CAP_MAX) throw invalid(`${what}: ${k} is a whole number from 1 to ${CAP_MAX}, or null (no cap)`)
     return v
   })
 
@@ -78,12 +89,12 @@ export const projectOutbound = (policy: OutboundPolicy, profiles: OutboundProfil
     ids.add(p.id)
     if (!Array.isArray(p.allowed) || !p.allowed.every(c => (TRUNK_OUTBOUND_CLASSES as readonly string[]).includes(c))) throw invalid(`Profile ${p.id}: allowed is some of ${TRUNK_OUTBOUND_CLASSES.join(', ')}`)
     const allowed = TRUNK_OUTBOUND_CLASSES.filter(c => p.allowed.includes(c))
-    out.profiles.push([p.id, `,${allowed.join(',')},`, ...capsRow(p.caps, `Profile ${p.id}`)])
+    out.profiles.push([p.id, `,${allowed.join(',')},`, ...capsRow(p.caps, OUTBOUND_CAP_DEFAULTS.user, `Profile ${p.id}`)])
   }
   out.profiles.sort((a, b) => byId(a[0], b[0]))
   const def = policy.defaultProfile ?? ''
   if (def && !ids.has(def)) throw invalid(`Default profile ${def}: no such profile`)
-  out.settings = [def, ...capsRow(policy.caps, 'The organisation')]
+  out.settings = [def, ...capsRow(policy.caps, OUTBOUND_CAP_DEFAULTS.tenant, 'The organisation'), ...capsRow(policy.userCaps, OUTBOUND_CAP_DEFAULTS.user, 'Those without a profile')]
   const users = new Set<string>()
   for (const a of assignments) {
     if (!USER_ID.test(a.userId)) throw invalid(`User id ${a.userId} is not valid`)
@@ -93,30 +104,52 @@ export const projectOutbound = (policy: OutboundPolicy, profiles: OutboundProfil
     out.users.push([a.userId, a.profileId])
   }
   out.users.sort((a, b) => byId(a[0], b[0]))
+  const international = fraudRow(policy.fraud?.international, FRAUD_DEFAULTS.international, 'International thresholds')
   out.fraud = [
     [FRAUD_RULE_NATIONAL, FRAUD_PROFILE, '33', ...fraudRow(policy.fraud?.national, FRAUD_DEFAULTS.national, 'National thresholds')],
-    [FRAUD_RULE_INTERNATIONAL, FRAUD_PROFILE, '', ...fraudRow(policy.fraud?.international, FRAUD_DEFAULTS.international, 'International thresholds')]
+    [FRAUD_RULE_INTERNATIONAL, FRAUD_PROFILE, '', ...international],
+    ...FRAUD_OVERSEAS_PREFIXES.map((prefix, i) => [FRAUD_RULE_INTERNATIONAL + 1 + i, FRAUD_PROFILE, prefix, ...international])
   ]
   return out
 }
 
 /** The columns of `fraud_detection` in the order of fraudRow (FRAUD_PARAMS, warning then critical). */
 const FRAUD_COLUMNS = ['cpm', 'total_calls', 'concurrent_calls', 'sequential_calls', 'call_duration'] as const
-// FRAUD_PARAMS: callsPerMinute, dailyCalls, concurrentCalls, sequentialCalls, callSeconds.
+// FRAUD_PARAMS: callsPerMinute, dailyAttempts, concurrentCalls, sequentialCalls, callSeconds.
 const FRAUD_THRESHOLD_COLUMNS = FRAUD_COLUMNS.flatMap(c => [`${c}_warning`, `${c}_critical`])
 
+/** The caps of a scope before its Gateway wrote anything, in the order of OUTBOUND_CAPS (0: none). */
+const defaultCapsSql = (caps: OutboundCaps) => `ARRAY[${OUTBOUND_CAPS.map(k => caps[k] ?? 0).join(', ')}]`
+/** A key of pg_advisory_xact_lock that nothing else takes: the minute caps are shared out one call at a time. */
+const ALLOT_LOCK = 60170017
+
 /**
- * `outbound_settings`: the organisation's caps and its default profile ('' none), one row per tenant.
- * `outbound_profiles`: the rights profiles, `allowed` as `,fixed,mobile,` (`,,` internal calls only) and their caps
- * (0: none). `outbound_users`: the profile of each person an administrator gave one (`user_id`, the Gateway's user
- * id, as `subscriber.holder` holds it). `fraud_detection` and the four tables of `drouting`, which it needs loaded
- * (empty: no call is routed by it); its rules are the default thresholds (FRAUD_DEFAULTS) until the Gateway writes its
- * own. `twake_outbound(ext, tenant)`: what applies to a call of `ext`, one row: its
- * profile's `allowed` (NULL: no profile, the trunk's alone), the caps of calls at the same time (0: none), and what is
- * left of the others, today and this month, from the CDRs of calls to the public network (`acc.external` 'out';
- * answered calls, their duration): the least of the person's call caps and its name, the organisation's, and the
- * seconds left of the least of every minute cap, with its name and scope. NO_CAP_LEFT when none. The day and the
- * month are the database's (`localtimestamp`), as `acc.time` (OpenSIPS's clock): the same time zone for both.
+ * `outbound_settings`: the organisation's default profile ('' none), its caps and the caps of those without a profile
+ * (0: none), one row per tenant. `outbound_profiles`: the rights profiles, `allowed` as `,fixed,mobile,` (`,,` internal
+ * calls only) and their caps (0: none). `outbound_users`: the profile of each person an administrator gave one
+ * (`user_id`, the Gateway's user id, as `subscriber.holder` holds it). Every cap there is the effective one, defaults
+ * applied (OUTBOUND_CAP_DEFAULTS); with no row at all (a Gateway that never wrote), the defaults hold all the same.
+ *
+ * `outbound_usage`: what was used, per extension (`scope` user, `subject` the extension) and for the whole database
+ * (`tenant`, subject ''), per day ('d') and per month ('m', `start` its first day), in Europe/Paris whatever the
+ * servers' time zone: answered calls and their seconds, added by twake_outbound_cdr() as each CDR of a call to the
+ * public network is written (`acc.external` 'out'). Kept two months. `outbound_reservations`: the seconds allotted to
+ * each call in progress under a minute cap (`call_key` md5 of its Call-ID), released when its CDR or its missed call
+ * is written, else when `until` passes (a call that never ended, OpenSIPS gone).
+ *
+ * `twake_outbound(ext, class, number, user_active, tenant_active, call_key, max_sec, min_sec)`: what applies to a call
+ * of `ext` to `number` (E.164 without its +) of `class`, with `user_active` and `tenant_active` the calls to the public
+ * network in progress counted with it (the dialog profiles, under a lock). One row: `verdict` ok, `rights` (the class
+ * is not in the caller's profile; `reason` the class), or `limit` (`reason` the cap and `reason_scope` user or tenant);
+ * and `max_sec`, how long the call may last: the least of `max_sec`, its share of what is left of every minute cap
+ * (what is left divided by the calls that may still be placed at once, this one included, per the concurrency cap of
+ * the same scope; all of it without one), reserved for it, and the critical duration of the thresholds of its number.
+ * A share under `min_sec` refuses the call. The day and the month are those of Europe/Paris.
+ *
+ * `fraud_detection` and the four tables of `drouting`, which it needs loaded (empty: no call is routed by it); its rules
+ * are the default thresholds (FRAUD_DEFAULTS) until the Gateway writes its own. `dialog`: the calls in progress, which
+ * OpenSIPS writes there (dialog's db_mode 2) and reads back at its start: their timers, their CDR and the dialog
+ * profiles the caps count survive a restart.
  */
 export const OUTBOUND_SCHEMA = `
 CREATE TABLE IF NOT EXISTS outbound_settings (
@@ -128,6 +161,11 @@ CREATE TABLE IF NOT EXISTS outbound_settings (
     monthly_calls INTEGER DEFAULT 0 NOT NULL,
     monthly_minutes INTEGER DEFAULT 0 NOT NULL
 );
+ALTER TABLE outbound_settings ADD COLUMN IF NOT EXISTS user_concurrent INTEGER DEFAULT 0 NOT NULL;
+ALTER TABLE outbound_settings ADD COLUMN IF NOT EXISTS user_daily_calls INTEGER DEFAULT 0 NOT NULL;
+ALTER TABLE outbound_settings ADD COLUMN IF NOT EXISTS user_daily_minutes INTEGER DEFAULT 0 NOT NULL;
+ALTER TABLE outbound_settings ADD COLUMN IF NOT EXISTS user_monthly_calls INTEGER DEFAULT 0 NOT NULL;
+ALTER TABLE outbound_settings ADD COLUMN IF NOT EXISTS user_monthly_minutes INTEGER DEFAULT 0 NOT NULL;
 CREATE TABLE IF NOT EXISTS outbound_profiles (
     tenant_id TEXT DEFAULT '' NOT NULL,
     id VARCHAR(32) NOT NULL,
@@ -145,6 +183,22 @@ CREATE TABLE IF NOT EXISTS outbound_users (
     profile_id VARCHAR(32) NOT NULL,
     PRIMARY KEY (tenant_id, user_id)
 );
+CREATE TABLE IF NOT EXISTS outbound_usage (
+    scope VARCHAR(8) NOT NULL,
+    subject VARCHAR(64) NOT NULL,
+    period CHAR(1) NOT NULL,
+    start DATE NOT NULL,
+    calls INTEGER DEFAULT 0 NOT NULL,
+    seconds BIGINT DEFAULT 0 NOT NULL,
+    PRIMARY KEY (scope, subject, period, start)
+);
+CREATE TABLE IF NOT EXISTS outbound_reservations (
+    call_key VARCHAR(32) PRIMARY KEY NOT NULL,
+    subject VARCHAR(64) NOT NULL,
+    seconds INTEGER NOT NULL,
+    until TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS outbound_reservations_until_idx ON outbound_reservations (until);
 CREATE TABLE IF NOT EXISTS fraud_detection (
     ruleid SERIAL PRIMARY KEY NOT NULL,
     profileid INTEGER NOT NULL,
@@ -208,67 +262,207 @@ CREATE TABLE IF NOT EXISTS dr_groups (
     groupid INTEGER DEFAULT 0 NOT NULL,
     description VARCHAR(128) DEFAULT NULL
 );
+CREATE TABLE IF NOT EXISTS dialog (
+    dlg_id BIGINT PRIMARY KEY NOT NULL,
+    callid VARCHAR(255) NOT NULL,
+    from_uri VARCHAR(255) NOT NULL,
+    from_tag VARCHAR(64) NOT NULL,
+    to_uri VARCHAR(255) NOT NULL,
+    to_tag VARCHAR(64) NOT NULL,
+    mangled_from_uri VARCHAR(255) DEFAULT NULL,
+    mangled_to_uri VARCHAR(255) DEFAULT NULL,
+    caller_cseq VARCHAR(11) NOT NULL,
+    callee_cseq VARCHAR(11) NOT NULL,
+    caller_ping_cseq INTEGER NOT NULL,
+    callee_ping_cseq INTEGER NOT NULL,
+    caller_route_set TEXT,
+    callee_route_set TEXT,
+    caller_contact VARCHAR(255),
+    callee_contact VARCHAR(255),
+    caller_sock VARCHAR(64) NOT NULL,
+    callee_sock VARCHAR(64) NOT NULL,
+    state INTEGER NOT NULL,
+    start_time INTEGER NOT NULL,
+    timeout INTEGER NOT NULL,
+    vars BYTEA DEFAULT NULL,
+    profiles TEXT DEFAULT NULL,
+    script_flags VARCHAR(255) DEFAULT NULL,
+    module_flags INTEGER DEFAULT 0 NOT NULL,
+    flags INTEGER DEFAULT 0 NOT NULL,
+    rt_on_answer VARCHAR(64) DEFAULT NULL,
+    rt_on_timeout VARCHAR(64) DEFAULT NULL,
+    rt_on_hangup VARCHAR(64) DEFAULT NULL
+);
 INSERT INTO version (table_name, table_version) VALUES ('fraud_detection', ${FRAUD_TABLE_VERSION}), ${Object.entries(DR_TABLE_VERSIONS)
   .map(([t, v]) => `('${t}', ${v})`)
-  .join(', ')}
+  .join(', ')}, ('dialog', ${DIALOG_TABLE_VERSION})
   ON CONFLICT (table_name) DO NOTHING;
 INSERT INTO fraud_detection (ruleid, profileid, prefix, ${FRAUD_THRESHOLD_COLUMNS.join(', ')}) VALUES
 ${projectOutbound({}, [], []).fraud.map(r => `  (${r.map(v => (typeof v === 'string' ? `'${v}'` : v)).join(', ')})`).join(',\n')}
   ON CONFLICT (ruleid) DO NOTHING;
+DROP FUNCTION IF EXISTS twake_outbound(TEXT, TEXT);
 SET check_function_bodies = false;
-CREATE OR REPLACE FUNCTION twake_outbound(ext TEXT, tenant TEXT)
-RETURNS TABLE (allowed TEXT, user_concurrent INTEGER, tenant_concurrent INTEGER, user_calls_left INTEGER, user_calls_param TEXT, tenant_calls_left INTEGER, tenant_calls_param TEXT, seconds_left INTEGER, seconds_param TEXT, seconds_scope TEXT)
-LANGUAGE sql STABLE AS $twake$
-WITH s AS (SELECT * FROM outbound_settings WHERE tenant_id = tenant),
-p AS (
-  SELECT pr.* FROM s JOIN outbound_profiles pr ON pr.tenant_id = s.tenant_id AND pr.id = coalesce(
-    (SELECT ou.profile_id FROM outbound_users ou JOIN subscriber sb ON sb.holder = ou.user_id WHERE ou.tenant_id = tenant AND sb.username = ext LIMIT 1),
-    nullif(s.default_profile, ''))
-),
-u AS (
-  SELECT
-    count(*) FILTER (WHERE a.caller = ext AND a.time >= date_trunc('day', localtimestamp))::int AS user_day_calls,
-    count(*) FILTER (WHERE a.caller = ext)::int AS user_month_calls,
-    coalesce(sum(a.duration) FILTER (WHERE a.caller = ext AND a.time >= date_trunc('day', localtimestamp)), 0)::int AS user_day_sec,
-    coalesce(sum(a.duration) FILTER (WHERE a.caller = ext), 0)::int AS user_month_sec,
-    count(*) FILTER (WHERE a.time >= date_trunc('day', localtimestamp))::int AS day_calls,
-    count(*)::int AS month_calls,
-    coalesce(sum(a.duration) FILTER (WHERE a.time >= date_trunc('day', localtimestamp)), 0)::int AS day_sec,
-    coalesce(sum(a.duration), 0)::int AS month_sec
-  FROM acc a WHERE a.external = 'out' AND a.time >= date_trunc('month', localtimestamp) AND EXISTS (SELECT 1 FROM s)
-),
-c (scope, param, unit, left_) AS (
-  SELECT 'user', 'dailyCalls', 'calls', p.daily_calls - u.user_day_calls FROM p, u WHERE p.daily_calls > 0
-  UNION ALL SELECT 'user', 'monthlyCalls', 'calls', p.monthly_calls - u.user_month_calls FROM p, u WHERE p.monthly_calls > 0
-  UNION ALL SELECT 'user', 'dailyMinutes', 'seconds', p.daily_minutes * 60 - u.user_day_sec FROM p, u WHERE p.daily_minutes > 0
-  UNION ALL SELECT 'user', 'monthlyMinutes', 'seconds', p.monthly_minutes * 60 - u.user_month_sec FROM p, u WHERE p.monthly_minutes > 0
-  UNION ALL SELECT 'tenant', 'dailyCalls', 'calls', s.daily_calls - u.day_calls FROM s, u WHERE s.daily_calls > 0
-  UNION ALL SELECT 'tenant', 'monthlyCalls', 'calls', s.monthly_calls - u.month_calls FROM s, u WHERE s.monthly_calls > 0
-  UNION ALL SELECT 'tenant', 'dailyMinutes', 'seconds', s.daily_minutes * 60 - u.day_sec FROM s, u WHERE s.daily_minutes > 0
-  UNION ALL SELECT 'tenant', 'monthlyMinutes', 'seconds', s.monthly_minutes * 60 - u.month_sec FROM s, u WHERE s.monthly_minutes > 0
-),
-uc AS (SELECT * FROM c WHERE scope = 'user' AND unit = 'calls' ORDER BY left_ LIMIT 1),
-tc AS (SELECT * FROM c WHERE scope = 'tenant' AND unit = 'calls' ORDER BY left_ LIMIT 1),
-sc AS (SELECT * FROM c WHERE unit = 'seconds' ORDER BY left_, scope DESC LIMIT 1)
-SELECT
-  (SELECT p.allowed FROM p)::text,
-  coalesce((SELECT p.concurrent FROM p), 0),
-  coalesce((SELECT s.concurrent FROM s), 0),
-  coalesce((SELECT left_ FROM uc), ${NO_CAP_LEFT}), coalesce((SELECT param FROM uc), ''),
-  coalesce((SELECT left_ FROM tc), ${NO_CAP_LEFT}), coalesce((SELECT param FROM tc), ''),
-  coalesce((SELECT left_ FROM sc), ${NO_CAP_LEFT}), coalesce((SELECT param FROM sc), ''), coalesce((SELECT scope FROM sc), '')
+CREATE OR REPLACE FUNCTION twake_outbound(p_ext TEXT, p_class TEXT, p_number TEXT, p_user_active INTEGER, p_tenant_active INTEGER, p_key TEXT, p_max INTEGER, p_min INTEGER)
+RETURNS TABLE (verdict TEXT, reason TEXT, reason_scope TEXT, max_sec INTEGER)
+LANGUAGE plpgsql VOLATILE AS $twake$
+#variable_conflict use_column
+DECLARE
+  st outbound_settings%ROWTYPE;
+  rights TEXT;
+  uc INTEGER[] := ${defaultCapsSql(OUTBOUND_CAP_DEFAULTS.user)};
+  tc INTEGER[] := ${defaultCapsSql(OUTBOUND_CAP_DEFAULTS.tenant)};
+  pc INTEGER[];
+  today DATE := (now() AT TIME ZONE '${OUTBOUND_TIME_ZONE}')::date;
+  month DATE := date_trunc('month', now() AT TIME ZONE '${OUTBOUND_TIME_ZONE}')::date;
+  u_dc BIGINT; u_ds BIGINT; u_mc BIGINT; u_ms BIGINT;
+  t_dc BIGINT; t_ds BIGINT; t_mc BIGINT; t_ms BIGINT;
+  r_user BIGINT; r_tenant BIGINT;
+  allot BIGINT := p_max;
+  share BIGINT;
+  slots BIGINT;
+  why TEXT := '';
+  why_scope TEXT := '';
+  dur INTEGER;
+  i INTEGER;
+  caps INTEGER[];
+  used BIGINT[];
+  reserved BIGINT[];
+  conc INTEGER[];
+  active INTEGER[];
+  names TEXT[] := ARRAY['dailyMinutes', 'monthlyMinutes', 'dailyMinutes', 'monthlyMinutes'];
+  scopes TEXT[] := ARRAY['user', 'user', 'tenant', 'tenant'];
+BEGIN
+  SELECT * INTO st FROM outbound_settings LIMIT 1;
+  IF FOUND THEN
+    tc := ARRAY[st.concurrent, st.daily_calls, st.daily_minutes, st.monthly_calls, st.monthly_minutes];
+    uc := ARRAY[st.user_concurrent, st.user_daily_calls, st.user_daily_minutes, st.user_monthly_calls, st.user_monthly_minutes];
+    SELECT pr.allowed, ARRAY[pr.concurrent, pr.daily_calls, pr.daily_minutes, pr.monthly_calls, pr.monthly_minutes] INTO rights, pc
+      FROM outbound_profiles pr WHERE pr.tenant_id = st.tenant_id AND pr.id = coalesce(
+        (SELECT ou.profile_id FROM outbound_users ou JOIN subscriber sb ON sb.holder = ou.user_id WHERE ou.tenant_id = st.tenant_id AND sb.username = p_ext LIMIT 1),
+        nullif(st.default_profile, ''));
+    IF FOUND THEN
+      uc := pc;
+    END IF;
+  END IF;
+  IF rights IS NOT NULL AND position(',' || p_class || ',' IN rights) = 0 THEN
+    RETURN QUERY SELECT 'rights'::text, p_class, 'user'::text, 0;
+    RETURN;
+  END IF;
+  IF uc[1] > 0 AND p_user_active > uc[1] THEN
+    RETURN QUERY SELECT 'limit'::text, 'concurrent'::text, 'user'::text, 0;
+    RETURN;
+  END IF;
+  IF tc[1] > 0 AND p_tenant_active > tc[1] THEN
+    RETURN QUERY SELECT 'limit'::text, 'concurrent'::text, 'tenant'::text, 0;
+    RETURN;
+  END IF;
+  SELECT coalesce(sum(u.calls) FILTER (WHERE u.period = 'd'), 0), coalesce(sum(u.seconds) FILTER (WHERE u.period = 'd'), 0), coalesce(sum(u.calls) FILTER (WHERE u.period = 'm'), 0), coalesce(sum(u.seconds) FILTER (WHERE u.period = 'm'), 0)
+    INTO u_dc, u_ds, u_mc, u_ms FROM outbound_usage u WHERE u.scope = 'user' AND u.subject = p_ext AND ((u.period = 'd' AND u.start = today) OR (u.period = 'm' AND u.start = month));
+  SELECT coalesce(sum(u.calls) FILTER (WHERE u.period = 'd'), 0), coalesce(sum(u.seconds) FILTER (WHERE u.period = 'd'), 0), coalesce(sum(u.calls) FILTER (WHERE u.period = 'm'), 0), coalesce(sum(u.seconds) FILTER (WHERE u.period = 'm'), 0)
+    INTO t_dc, t_ds, t_mc, t_ms FROM outbound_usage u WHERE u.scope = 'tenant' AND u.subject = '' AND ((u.period = 'd' AND u.start = today) OR (u.period = 'm' AND u.start = month));
+  -- Answered calls of the period, and the calls in progress (this one counted).
+  IF uc[2] > 0 AND u_dc + p_user_active > uc[2] THEN
+    RETURN QUERY SELECT 'limit'::text, 'dailyCalls'::text, 'user'::text, 0;
+    RETURN;
+  END IF;
+  IF uc[4] > 0 AND u_mc + p_user_active > uc[4] THEN
+    RETURN QUERY SELECT 'limit'::text, 'monthlyCalls'::text, 'user'::text, 0;
+    RETURN;
+  END IF;
+  IF tc[2] > 0 AND t_dc + p_tenant_active > tc[2] THEN
+    RETURN QUERY SELECT 'limit'::text, 'dailyCalls'::text, 'tenant'::text, 0;
+    RETURN;
+  END IF;
+  IF tc[4] > 0 AND t_mc + p_tenant_active > tc[4] THEN
+    RETURN QUERY SELECT 'limit'::text, 'monthlyCalls'::text, 'tenant'::text, 0;
+    RETURN;
+  END IF;
+  IF uc[3] > 0 OR uc[5] > 0 OR tc[3] > 0 OR tc[5] > 0 THEN
+    -- One call at a time shares the minutes out: what the others hold is known.
+    PERFORM pg_advisory_xact_lock(${ALLOT_LOCK});
+    SELECT coalesce(sum(r.seconds) FILTER (WHERE r.subject = p_ext), 0), coalesce(sum(r.seconds), 0) INTO r_user, r_tenant
+      FROM outbound_reservations r WHERE r.until > now() AND r.call_key <> p_key;
+    caps := ARRAY[uc[3], uc[5], tc[3], tc[5]];
+    used := ARRAY[u_ds, u_ms, t_ds, t_ms];
+    reserved := ARRAY[r_user, r_user, r_tenant, r_tenant];
+    conc := ARRAY[uc[1], uc[1], tc[1], tc[1]];
+    active := ARRAY[p_user_active, p_user_active, p_tenant_active, p_tenant_active];
+    FOR i IN 1..4 LOOP
+      IF caps[i] > 0 THEN
+        slots := 1;
+        IF conc[i] > 0 THEN
+          slots := greatest(1, conc[i] - (active[i] - 1));
+        END IF;
+        share := floor((caps[i]::bigint * 60 - used[i] - reserved[i])::numeric / slots);
+        IF share < allot THEN
+          allot := share;
+          why := names[i];
+          why_scope := scopes[i];
+        END IF;
+      END IF;
+    END LOOP;
+    IF allot < p_min THEN
+      RETURN QUERY SELECT 'limit'::text, why, why_scope, 0;
+      RETURN;
+    END IF;
+    INSERT INTO outbound_reservations AS r (call_key, subject, seconds, until) VALUES (p_key, p_ext, allot, now() + make_interval(secs => allot + 300))
+      ON CONFLICT (call_key) DO UPDATE SET subject = EXCLUDED.subject, seconds = EXCLUDED.seconds, until = EXCLUDED.until;
+  END IF;
+  -- The critical duration of the thresholds of this number (the longest prefix, as fraud_detection matches it).
+  SELECT f.call_duration_critical INTO dur FROM fraud_detection f WHERE f.profileid = ${FRAUD_PROFILE} AND p_number LIKE f.prefix || '%' ORDER BY length(f.prefix) DESC LIMIT 1;
+  IF dur > 0 AND dur < allot THEN
+    allot := dur;
+  END IF;
+  RETURN QUERY SELECT 'ok'::text, why, why_scope, allot::integer;
+END
+$twake$;
+CREATE OR REPLACE FUNCTION twake_outbound_cdr() RETURNS trigger
+LANGUAGE plpgsql AS $twake$
+#variable_conflict use_column
+DECLARE
+  d DATE;
+  m DATE;
+  secs BIGINT;
+  who TEXT;
+BEGIN
+  -- Never a CDR lost for this: whatever fails here is only logged.
+  BEGIN
+    DELETE FROM outbound_reservations r WHERE r.call_key = md5(NEW.callid);
+    IF TG_TABLE_NAME = 'acc' THEN
+      secs := greatest(coalesce(NEW.duration, 0), 0);
+      who := coalesce(NEW.caller, '');
+      -- The day the call was answered, in Europe/Paris: the CDR is written at its end.
+      d := ((now() - make_interval(secs => secs)) AT TIME ZONE '${OUTBOUND_TIME_ZONE}')::date;
+      m := date_trunc('month', d)::date;
+      -- The first CDR of a day: what is two months old goes, with the reservations past.
+      IF NOT EXISTS (SELECT 1 FROM outbound_usage u WHERE u.scope = 'tenant' AND u.subject = '' AND u.period = 'd' AND u.start = d) THEN
+        DELETE FROM outbound_usage u WHERE u.start < (m - interval '1 month');
+        DELETE FROM outbound_reservations r WHERE r.until < now();
+      END IF;
+      INSERT INTO outbound_usage AS u (scope, subject, period, start, calls, seconds) VALUES
+        ('user', who, 'd', d, 1, secs), ('user', who, 'm', m, 1, secs), ('tenant', '', 'd', d, 1, secs), ('tenant', '', 'm', m, 1, secs)
+        ON CONFLICT (scope, subject, period, start) DO UPDATE SET calls = u.calls + 1, seconds = u.seconds + EXCLUDED.seconds;
+    END IF;
+  EXCEPTION WHEN others THEN
+    RAISE WARNING 'twake_outbound_cdr: %', SQLERRM;
+  END;
+  RETURN NULL;
+END
 $twake$;
 RESET check_function_bodies;
 `
 
 /**
- * The column `acc` gains for the caps (`external`: 'out' for a call to the public network, 'emergency' for an
- * emergency call, which counts for nothing; `missed_calls` too, acc writes its extras in both) and the index their
- * reads take. On a database created before step 6b,
- * before OpenSIPS starts (docker/opensips/trunk.sql: OpenSIPS writes the column in every CDR), where it lacks only:
- * no lock is taken on `acc` otherwise.
+ * The column `acc` and `missed_calls` gain for the caps (`external`: 'out' for a call to the public network, 'emergency'
+ * for an emergency call, which counts for nothing; acc writes its extras in both), on a database created before step
+ * 6b, and the triggers that count what was used as each CDR is written (twake_outbound_cdr()): only where they lack,
+ * so that no lock is taken on `acc` otherwise, and never waiting more than 5 s for one (OpenSIPS writes its CDRs in
+ * its SIP processes: a lock held long would hold the calls). Run by docker/opensips/trunk.sql before OpenSIPS starts,
+ * and by the provider at its start. No index on `acc`: nothing reads it during a call.
  */
-export const ACC_EXTERNAL_SQL = `DO $twake$
+export const ACC_EXTERNAL_SQL = `BEGIN;
+SET LOCAL lock_timeout = '5s';
+DO $twake$
 BEGIN
   IF to_regclass('acc') IS NOT NULL AND NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'acc' AND column_name = 'external') THEN
     ALTER TABLE acc ADD COLUMN external VARCHAR(64) DEFAULT '' NOT NULL;
@@ -276,12 +470,19 @@ BEGIN
   IF to_regclass('missed_calls') IS NOT NULL AND NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'missed_calls' AND column_name = 'external') THEN
     ALTER TABLE missed_calls ADD COLUMN external VARCHAR(64) DEFAULT '' NOT NULL;
   END IF;
-  IF to_regclass('acc') IS NOT NULL AND to_regclass('acc_external_idx') IS NULL THEN
-    CREATE INDEX acc_external_idx ON acc (external, time);
+  IF to_regclass('acc') IS NOT NULL AND NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'twake_outbound_acc' AND tgrelid = to_regclass('acc')) THEN
+    CREATE TRIGGER twake_outbound_acc AFTER INSERT ON acc FOR EACH ROW WHEN (NEW.external = 'out') EXECUTE FUNCTION twake_outbound_cdr();
+  END IF;
+  IF to_regclass('missed_calls') IS NOT NULL AND NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'twake_outbound_missed' AND tgrelid = to_regclass('missed_calls')) THEN
+    CREATE TRIGGER twake_outbound_missed AFTER INSERT ON missed_calls FOR EACH ROW WHEN (NEW.external = 'out') EXECUTE FUNCTION twake_outbound_cdr();
   END IF;
 END
 $twake$;
+COMMIT;
 `
+
+/** The columns of `outbound_settings` in the order of the projection's `settings`. */
+const SETTINGS_COLUMNS = ['default_profile', 'concurrent', 'daily_calls', 'daily_minutes', 'monthly_calls', 'monthly_minutes', 'user_concurrent', 'user_daily_calls', 'user_daily_minutes', 'user_monthly_calls', 'user_monthly_minutes'] as const
 
 export interface OutboundTablesOptions {
   pool: Queryable
@@ -303,7 +504,7 @@ export class OutboundTables {
   private async current(q: Queryable): Promise<Projection> {
     const rows = async (text: string, values: unknown[] = [this.tenantId]) => (((await q.query(text, values)) as { rows?: Record<string, unknown>[] } | undefined)?.rows ?? []).map(r => Object.values(r))
     return {
-      settings: (await rows('SELECT default_profile, concurrent, daily_calls, daily_minutes, monthly_calls, monthly_minutes FROM outbound_settings WHERE tenant_id = $1'))[0] ?? [],
+      settings: (await rows(`SELECT ${SETTINGS_COLUMNS.join(', ')} FROM outbound_settings WHERE tenant_id = $1`))[0] ?? [],
       profiles: await rows('SELECT id, allowed, concurrent, daily_calls, daily_minutes, monthly_calls, monthly_minutes FROM outbound_profiles WHERE tenant_id = $1 ORDER BY id COLLATE "C"'),
       users: await rows('SELECT user_id, profile_id FROM outbound_users WHERE tenant_id = $1 ORDER BY user_id COLLATE "C"'),
       fraud: await rows(`SELECT ruleid, profileid, prefix, ${FRAUD_THRESHOLD_COLUMNS.join(', ')} FROM fraud_detection ORDER BY ruleid`, [])
@@ -334,7 +535,7 @@ export class OutboundTables {
       await q.query('DELETE FROM outbound_users WHERE tenant_id = $1', [this.tenantId])
       await q.query('DELETE FROM outbound_profiles WHERE tenant_id = $1', [this.tenantId])
       await q.query(
-        'INSERT INTO outbound_settings (tenant_id, default_profile, concurrent, daily_calls, daily_minutes, monthly_calls, monthly_minutes) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (tenant_id) DO UPDATE SET default_profile = EXCLUDED.default_profile, concurrent = EXCLUDED.concurrent, daily_calls = EXCLUDED.daily_calls, daily_minutes = EXCLUDED.daily_minutes, monthly_calls = EXCLUDED.monthly_calls, monthly_minutes = EXCLUDED.monthly_minutes',
+        `INSERT INTO outbound_settings (tenant_id, ${SETTINGS_COLUMNS.join(', ')}) VALUES ($1, ${SETTINGS_COLUMNS.map((_, i) => `$${i + 2}`).join(', ')}) ON CONFLICT (tenant_id) DO UPDATE SET ${SETTINGS_COLUMNS.map(c => `${c} = EXCLUDED.${c}`).join(', ')}`,
         [this.tenantId, ...wanted.settings]
       )
       for (const r of wanted.profiles) await q.query('INSERT INTO outbound_profiles (tenant_id, id, allowed, concurrent, daily_calls, daily_minutes, monthly_calls, monthly_minutes) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)', [this.tenantId, ...r])

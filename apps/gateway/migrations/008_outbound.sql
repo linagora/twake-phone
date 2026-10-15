@@ -10,15 +10,23 @@ CREATE TABLE outbound_policies (
   updated_at  timestamptz NOT NULL DEFAULT now()
 );
 
--- What the SIP server raised for the administrators: a volume threshold crossed, a cap reached (TelephonyAlert, as
--- JSON). Kept 90 days.
+-- What the SIP server raised for the administrators: a volume threshold crossed, a cap reached, a number outside the
+-- caller's rights, emergency calls in a row (TelephonyAlert, as JSON). One row while it repeats (`count`, the last at
+-- `last_at`; `dedup_key`: its kind, param, scope and extension), a new one past an hour of silence. Kept 90 days from
+-- the last repeat (the Gateway purges every hour).
 CREATE TABLE telephony_alerts (
   id        bigserial PRIMARY KEY,
   tenant_id text NOT NULL,
   at        timestamptz NOT NULL DEFAULT clock_timestamp(),
+  last_at   timestamptz NOT NULL DEFAULT clock_timestamp(),
+  count     integer NOT NULL DEFAULT 1,
+  dedup_key text NOT NULL,
   alert     jsonb NOT NULL
 );
-CREATE INDEX telephony_alerts_tenant_at_idx ON telephony_alerts (tenant_id, at DESC);
+CREATE INDEX telephony_alerts_tenant_id_idx ON telephony_alerts (tenant_id, id DESC);
+CREATE INDEX telephony_alerts_open_idx ON telephony_alerts (tenant_id, dedup_key, id DESC);
+CREATE INDEX telephony_alerts_last_at_idx ON telephony_alerts (last_at);
 
--- The fallback number of a range of direct numbers (FR-C8), in place of its trunk's (`fallbackNumber` of its config).
-ALTER TABLE direct_numbers ADD COLUMN fallback_number text;
+-- The fallback of a range of direct numbers (FR-C8: an extension or a ring group), in place of its trunk's
+-- (`fallbackTarget` of its config).
+ALTER TABLE direct_numbers ADD COLUMN fallback_target text;

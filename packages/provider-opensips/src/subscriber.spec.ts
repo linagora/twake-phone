@@ -59,10 +59,12 @@ describe('SubscriberProvisioner', () => {
   })
 
   /** A database whose answers the test gives: the columns information_schema lists, the versions OpenSIPS expects. */
-  const database = (columns: [string, string][], failAlter = false) => {
+  const database = (columns: [string, string][], failAlter = false, triggers = 2) => {
     const queries: string[] = []
     const query = async (text: string) => {
       queries.push(text.trim().split('\n')[0]!)
+      if (text.includes('pg_trigger')) return { rows: [{ n: triggers }] }
+      if (text.includes("column_name = 'external'")) return { rows: [{ n: columns.filter(([, c]) => c === 'external').length }] }
       if (text.includes('information_schema.columns')) return { rows: columns.map(([table_name, column_name]) => ({ table_name, column_name })) }
       if (text.startsWith('SELECT table_name, table_version')) return { rows: [{ table_name: 'subscriber', table_version: 8 }, { table_name: 'acc', table_version: 7 }, { table_name: 'missed_calls', table_version: 5 }] }
       if (failAlter && text.startsWith('ALTER')) throw new Error('must be owner of table acc')
@@ -81,6 +83,13 @@ describe('SubscriberProvisioner', () => {
     await new SubscriberProvisioner({ pool: lacking.pool, realm: 'r' }).ensureSchema()
     expect(lacking.queries.slice(2, 6)).toEqual(['BEGIN', "SET LOCAL lock_timeout = '2s'", "ALTER TABLE missed_calls ADD COLUMN IF NOT EXISTS dialled VARCHAR(64) DEFAULT '' NOT NULL;", 'COMMIT'])
     expect(lacking.released()).toBe(1)
+    // The triggers that count the caps' use (step 6b), created where they lack only, in a transaction of their own.
+    const untriggered = database(all, false, 0)
+    const p = new SubscriberProvisioner({ pool: untriggered.pool, realm: 'r' })
+    await p.ensureSchema()
+    expect(untriggered.queries.filter(q => /^BEGIN/.test(q))).toHaveLength(1)
+    expect(untriggered.released()).toBe(1)
+    expect(p.schemaProblem).toBeUndefined()
   })
 
   it('still provisions the secrets when a missing column cannot be added (a table of another owner), and says so', async () => {
@@ -90,7 +99,12 @@ describe('SubscriberProvisioner', () => {
     await p.ensureSchema()
     expect(db.queries).toContain('ROLLBACK')
     expect(db.released()).toBe(1)
-    expect(warnings).toEqual([expect.stringMatching(/could not add subscriber\.holder, acc\.caller, acc\.callee, acc\.dialled, acc\.external, missed_calls\.caller, .*, call_rules\.forward_noanswer_holder, push_targets\.alive_until \(must be owner of table acc\)/)])
+    expect(warnings).toEqual([
+      expect.stringMatching(/could not add subscriber\.holder, acc\.caller, acc\.callee, acc\.dialled, acc\.external, missed_calls\.caller, .*, call_rules\.forward_noanswer_holder, push_targets\.alive_until \(must be owner of table acc\)/),
+      expect.stringMatching(/acc\.external is missing: OpenSIPS cannot write the CDRs nor the missed calls, and the caps count nothing/)
+    ])
+    // Said in the provider's status (DEGRADED).
+    expect(p.schemaProblem).toMatch(/^acc\.external is missing/)
     // Without the holder column: the accounts are written without it, and none is removed.
     db.queries.length = 0
     await p.setSipSecret('101', 'x', 'alice')

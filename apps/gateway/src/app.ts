@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import Fastify, { type FastifyRequest } from 'fastify'
 import cors from '@fastify/cors'
 import websocket from '@fastify/websocket'
@@ -5,7 +6,7 @@ import swagger from '@fastify/swagger'
 import swaggerUi from '@fastify/swagger-ui'
 import { splitParticipantId, verifyWebhook, type LiveKitConferenceBridge, type MeetApi, type MeetRoom } from '@twake/conference-livekit'
 import type { MediaProvider, TelephonyProvider } from '@twake/telephony-provider-sdk'
-import { EXTENSION_FORMAT, FRAUD_DEFAULTS, isReservedNumber, type CallDirection, type DidRange, type Endpoint, type ForwardingRules, type Presence, type PresenceStatus, type RingGroup, type TelephonyEvent, type User } from '@twake/telephony-types'
+import { EXTENSION_FORMAT, FRAUD_DEFAULTS, OUTBOUND_CAP_DEFAULTS, isReservedNumber, type CallDirection, type DidRange, type Endpoint, type ForwardingRules, type Presence, type PresenceStatus, type RingGroup, type TelephonyEvent, type User } from '@twake/telephony-types'
 import { adminPolicyFromEnv, isAdmin, type AdminPolicy } from './admin.js'
 import { authenticatorFromEnv, TicketStore, type Authenticator, type Identity } from './auth.js'
 import { MAX_CONTACT_ID, MAX_FAVORITES, MAX_QUERY, MAX_SEARCH, RateLimiter, type ContactDirectory } from './contacts.js'
@@ -16,10 +17,15 @@ import { historyEntryFor } from './history.js'
 import { ENDED_TTL_SEC, MISSED_TTL_SEC, type PushMessage, type WebPush } from './push.js'
 import type { ProviderRegistry } from './registry.js'
 import { securityHeadersFor, type SecurityOptions } from './security.js'
-import { MAX_DIDS, MAX_TRUNKS, TRUNK_ID, checkFallbackLoop, defaultTrunk, parseDid, parseTrunk, providerTrunks, publicDid, publicTrunk, trunkRecord } from './trunks.js'
+import { MAX_DIDS, MAX_TRUNKS, TRUNK_ID, defaultTrunk, parseDid, parseTrunk, providerTrunks, publicDid, publicTrunk, trunkRecord } from './trunks.js'
 import { EMPTY_OUTBOUND, PROFILE_ID, parseOutbound, type Outbound } from './outbound.js'
 import { MemoryStore } from './store/memory.js'
-import { isMissed, type HistoryEntry, type HistoryQuery, type Store, type TrunkRecord, type UserPresenceRecord } from './store/types.js'
+import { ALERT_RETENTION_DAYS, clampLimit, isMissed, type HistoryEntry, type HistoryQuery, type Store, type TrunkRecord, type UserPresenceRecord } from './store/types.js'
+
+/** What the SIP server raises for the administrators (TelephonyAlert). */
+const ALERT_KINDS = ['fraud-warning', 'fraud-critical', 'limit', 'rights', 'emergency'] as const
+/** An extension as the log names it: the same short hash for the same tenant and extension, never the extension. */
+const pseudonym = (tenantId: string, extension: string) => createHash('sha256').update(`${tenantId}\u0000${extension}`).digest('hex').slice(0, 12)
 
 const STATUSES: PresenceStatus[] = ['available', 'busy', 'away', 'dnd', 'offline']
 const DIRECTIONS: CallDirection[] = ['inbound', 'outbound']
@@ -87,6 +93,8 @@ export interface BuildOptions {
    * provider can hold a call for them (capability `push`). Absent: the endpoints say it is not available.
    */
   push?: WebPush
+  /** How often the alerts past their retention are removed (step 6b). Default: every hour. */
+  alertPurgeIntervalMs?: number
   /**
    * The key the passwords of the trunks are encrypted with (SECRETS_KEY, step 6). Absent: a trunk can be kept without
    * a password only.
@@ -340,7 +348,10 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
     if (event.type === 'alert.raised') {
       const userId = await within(dir.userIdForExtension(tenantId, extension), historyWriteMs, 'alert user').catch(() => undefined)
       const alert = { ...event.payload.alert, ...(userId ? { userId } : {}) }
-      app.log.warn({ tenantId, alert }, `telephony alert: ${alert.kind} ${alert.param}`)
+      // The log says what and how much, never whom nor the number called: the extension as a hash only (the same one
+      // across lines, to follow it), the rest in the store, for the administrators.
+      const { kind, param, scope, value, threshold } = alert
+      app.log.warn({ tenantId, alert: { kind, param, scope, value, threshold, ...(alert.extension ? { ext: pseudonym(tenantId, alert.extension) } : {}) } }, `telephony alert: ${kind} ${param}`)
       await within(store.addAlert({ tenantId, at: event.timestamp, alert }), historyWriteMs, 'alert write').catch(err => app.log.error({ err, tenantId }, 'could not record the alert'))
       return
     }
@@ -616,8 +627,22 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
       }
     })().catch(err => app.log.error({ err }, 'provider event stream failed'))
   }
+  // The alerts past their retention go every hour (and once at start), whoever they belong to (step 6b).
+  const purgeAlerts = () =>
+    store.purgeAlerts(new Date(Date.now() - ALERT_RETENTION_DAYS * 86_400_000).toISOString()).then(
+      n => {
+        if (n) app.log.info({ purged: n }, 'alerts past their retention removed')
+      },
+      err => app.log.error({ err }, 'alerts not purged')
+    )
+  const alertPurge = setInterval(() => void purgeAlerts(), options.alertPurgeIntervalMs ?? 3_600_000)
+  alertPurge.unref()
+  app.addHook('onReady', async () => {
+    void purgeAlerts()
+  })
   app.addHook('onClose', async () => {
     closing = true
+    clearInterval(alertPurge)
     await registry.closeAll()
     await store.close()
   })
@@ -961,6 +986,12 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         await apply(providerTrunks(trunks, options.secretsKey), dids).catch(undo)
         await keep().catch(undo)
       }
+      // A number rings an extension someone holds, or a ring group of the tenant: nothing else; so does a fallback.
+      const checkTarget = async (tenantId: string, provider: TelephonyProvider, field: string, target: string | undefined, code: string) => {
+        if (!target || (await store.getMappingByExtension(tenantId, target))) return
+        if (provider.listGroups && (await provider.listGroups()).some(g => g.number === target)) return
+        throw Object.assign(new Error(`${field}: ${target} is no extension nor ring group of this platform`), { statusCode: 400, code })
+      }
       v1.get('/admin/trunks', async req => {
         const user = await administrator(req)
         trunksOf(registry.forTenant(user.tenantId))
@@ -984,7 +1015,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
           if (given === false && current && defaultTrunk(records)?.id === id)
             throw Object.assign(new Error('This is the default trunk: make another one the default instead'), { statusCode: 409, code: 'TRUNK_DEFAULT' })
           const dids = (await store.listDids(user.tenantId)).map(publicDid)
-          checkFallbackLoop(parsed.config.fallbackNumber, dids)
+          await checkTarget(user.tenantId, registry.forTenant(user.tenantId), 'fallbackTarget', parsed.config.fallbackTarget, 'FALLBACK_TARGET')
           const record = trunkRecord(user.tenantId, id, parsed, current, options.secretsKey)
           // One default trunk: the one marked now, the others no longer.
           const unmark = (t: TrunkRecord): TrunkRecord => {
@@ -1030,10 +1061,8 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
           const current = dids.find(d => d.id === req.params.id)
           if (!current && dids.length >= MAX_DIDS) throw Object.assign(new Error(`At most ${MAX_DIDS} ranges of direct numbers`), { statusCode: 409 })
           const did = parseDid(req.params.id, req.body, records, dids)
-          for (const t of records) checkFallbackLoop(t.config.fallbackNumber, [did])
-          // A number rings an extension someone holds, or a ring group of the tenant: nothing else.
-          if (did.target && !(await store.getMappingByExtension(user.tenantId, did.target)) && !(provider.listGroups && (await provider.listGroups()).some(g => g.number === did.target)))
-            throw Object.assign(new Error(`target: ${did.target} is no extension nor ring group of this platform`), { statusCode: 400, code: 'DID_TARGET' })
+          await checkTarget(user.tenantId, provider, 'target', did.target, 'DID_TARGET')
+          await checkTarget(user.tenantId, provider, 'fallbackTarget', did.fallbackTarget, 'FALLBACK_TARGET')
           await changeTrunks(user.tenantId, apply, records, current ? dids.map(d => (d.id === did.id ? did : d)) : [...dids, did], () => store.upsertDid({ tenantId: user.tenantId, ...did }))
           return { did, created: !current }
         })
@@ -1072,7 +1101,8 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         await apply(next.policy, next.profiles, next.assignments).catch(undo)
         await store.setOutbound({ tenantId, ...next }).catch(undo)
       }
-      const outboundView = (o: Outbound) => ({ ...o, defaults: { fraud: FRAUD_DEFAULTS } })
+      // What holds when an administrator says nothing (ADR 0017): shown with what they said.
+      const outboundView = (o: Outbound) => ({ ...o, defaults: { fraud: FRAUD_DEFAULTS, caps: OUTBOUND_CAP_DEFAULTS } })
       v1.get('/admin/outbound', async req => {
         const user = await administrator(req)
         outboundOf(registry.forTenant(user.tenantId))
@@ -1101,10 +1131,20 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
           return { userId, profileId: profileId ?? null }
         })
       })
-      v1.get<{ Querystring: { limit?: string } }>('/admin/alerts', async req => {
+      // The alerts, the newest opened first, a page at a time (`next`: the `before` of the next page), of one kind or
+      // param if asked. Each one once while it repeats: `count` times, the last at `lastAt`.
+      v1.get<{ Querystring: { limit?: string; before?: string; kind?: string; param?: string } }>('/admin/alerts', async req => {
         const user = await administrator(req)
-        const limit = Number(req.query.limit ?? 50)
-        return { items: (await store.listAlerts(user.tenantId, Number.isFinite(limit) ? limit : 50)).map(({ at, alert }) => ({ at, ...alert })) }
+        const q = req.query
+        const bad = (message: string) => Object.assign(new Error(message), { statusCode: 400, code: 'ALERTS_QUERY' })
+        if (q.before !== undefined && !/^[1-9][0-9]{0,17}$/.test(q.before)) throw bad('before: the `next` of a previous page')
+        if (q.kind !== undefined && !(ALERT_KINDS as readonly string[]).includes(q.kind)) throw bad(`kind: one of ${ALERT_KINDS.join(', ')}`)
+        if (q.param !== undefined && !/^[A-Za-z-]{1,32}$/.test(q.param)) throw bad('param: a threshold, a cap or a class of numbers')
+        const asked = q.limit === undefined ? 50 : Number(q.limit)
+        if (!Number.isInteger(asked)) throw bad('limit: a whole number')
+        const limit = clampLimit(asked)
+        const items = await store.listAlerts(user.tenantId, { limit, ...(q.before ? { before: q.before } : {}), ...(q.kind ? { kind: q.kind as (typeof ALERT_KINDS)[number] } : {}), ...(q.param ? { param: q.param } : {}) })
+        return { items: items.map(({ id, at, lastAt, count, alert }) => ({ id, at, lastAt, count, ...alert })), ...(items.length === limit ? { next: items.at(-1)!.id } : {}) }
       })
 
       // Right to erasure of one's own call history.

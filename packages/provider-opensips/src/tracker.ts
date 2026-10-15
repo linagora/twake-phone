@@ -77,17 +77,22 @@ const iso = (ms: number) => new Date(ms).toISOString()
 /** The names fraud_detection gives its thresholds, as the Gateway's (FraudRule). */
 const FRAUD_PARAM: Record<string, string> = {
   'calls-per-minute': 'callsPerMinute',
-  'total-calls': 'dailyCalls',
+  'total-calls': 'dailyAttempts',
   'concurrent-calls': 'concurrentCalls',
   'sequential-calls': 'sequentialCalls',
   'call-duration': 'callSeconds'
 }
 const CAP_PARAMS = new Set(['concurrent', 'dailyCalls', 'dailyMinutes', 'monthlyCalls', 'monthlyMinutes'])
 
+/** Emergency calls from one extension within EMERGENCY_BURST_WINDOW_MS that raise an alert (never a refusal). */
+export const EMERGENCY_BURST = 3
+export const EMERGENCY_BURST_WINDOW_MS = 10 * 60_000
+
 /**
  * An alert for the administrators (step 6b): a threshold of fraud_detection crossed (E_FRD_WARNING, the call goes on;
- * E_FRD_CRITICAL, refused; `user` the extension, `called_number` the number without its +), or a cap reached
- * (E_TWAKEPHONE_LIMIT of opensips.cfg.tpl, the call refused). Null for anything else.
+ * E_FRD_CRITICAL, refused; `user` the extension, `called_number` the number without its +), a cap reached
+ * (E_TWAKEPHONE_LIMIT of opensips.cfg.tpl, the call refused), or a number outside the caller's rights
+ * (E_TWAKEPHONE_RIGHTS, refused; `param` its class). Null for anything else.
  */
 export const alertOf = (method: string, p: Record<string, unknown>): TelephonyAlert | null => {
   if (method === 'E_FRD_WARNING' || method === 'E_FRD_CRITICAL') {
@@ -104,6 +109,17 @@ export const alertOf = (method: string, p: Record<string, unknown>): TelephonyAl
       ...(threshold !== undefined ? { threshold } : {}),
       ...(str(p.user) ? { extension: userOf(str(p.user)) } : {}),
       ...(/^[0-9]{2,15}$/.test(number) ? { number: `+${number}` } : {})
+    }
+  }
+  if (method === 'E_TWAKEPHONE_RIGHTS') {
+    const param = str(p.param)
+    if (!/^[a-z-]{1,32}$/.test(param)) return null
+    return {
+      kind: 'rights',
+      param,
+      scope: 'user',
+      ...(str(p.caller) ? { extension: userOf(str(p.caller)) } : {}),
+      ...(/^\+[0-9]{2,15}$/.test(str(p.number)) ? { number: str(p.number) } : {})
     }
   }
   if (method === 'E_TWAKEPHONE_LIMIT') {
@@ -148,6 +164,8 @@ export class CallTracker {
   private readonly userPresence = new Map<string, Presence>()
   /** The presence last told for each extension, so that only changes are told; offline ones are forgotten once told. */
   private readonly told = new Map<string, Presence>()
+  /** The emergency calls of each extension within EMERGENCY_BURST_WINDOW_MS (ms since the epoch). */
+  private readonly emergencies = new Map<string, number[]>()
 
   private readonly emit: Emit
 
@@ -296,7 +314,14 @@ export class CallTracker {
         // `code`, the status that made it go): for the one it leaves, a call its phone rang for is missed (or
         // declined); the new one hears of it when its phone rings.
         const call = this.find(p, now)
-        if (call && !call.group) this.moveTo(call, userOf(str(p.callee)), Number(p.code) || 0, now)
+        if (!call) break
+        // A ring group nobody answered, its call gone to the fallback of a direct number (step 6b): a missed call for
+        // each member whose phone rang, and the call is no group's any more.
+        if (call.group && !str(p.group)) this.leaveGroup(call, now)
+        if (call.group) break
+        this.moveTo(call, userOf(str(p.callee)), Number(p.code) || 0, now)
+        // To a ring group (the fallback of a direct number): its members ring from here on.
+        if (str(p.group)) call.group = { ringing: new Set(), told: false }
         break
       }
       case 'E_TWAKEPHONE_DND': {
@@ -312,10 +337,29 @@ export class CallTracker {
       }
       case 'E_FRD_WARNING':
       case 'E_FRD_CRITICAL':
-      case 'E_TWAKEPHONE_LIMIT': {
+      case 'E_TWAKEPHONE_LIMIT':
+      case 'E_TWAKEPHONE_RIGHTS': {
         // For the administrators only: the Gateway keeps it, nobody's phone hears of it.
         const alert = alertOf(method, p)
         if (alert?.extension) this.emit(alert.extension, { type: 'alert.raised', timestamp: now, payload: { alert } })
+        return
+      }
+      case 'E_TWAKEPHONE_EMERGENCY': {
+        // Never refused, never counted by a cap: emergency calls in a row from one extension (EMERGENCY_BURST within
+        // EMERGENCY_BURST_WINDOW_MS) are told to the administrators, each one from there on.
+        const ext = userOf(str(p.caller))
+        if (!ext || isExternalParty(ext)) return
+        const at = Date.parse(now)
+        const recent = (this.emergencies.get(ext) ?? []).filter(t => at - t < EMERGENCY_BURST_WINDOW_MS)
+        recent.push(at)
+        this.emergencies.set(ext, recent)
+        if (recent.length >= EMERGENCY_BURST) {
+          const number = str(p.number)
+          const alert: TelephonyAlert = { kind: 'emergency', param: 'burst', scope: 'user', value: recent.length, threshold: EMERGENCY_BURST, extension: ext, ...(/^[0-9]{2,6}$/.test(number) ? { number } : {}) }
+          this.emit(ext, { type: 'alert.raised', timestamp: now, payload: { alert } })
+        }
+        // Bounded: the oldest extension goes past 10 000.
+        if (this.emergencies.size > MAX_TOMBSTONES) this.emergencies.delete(this.emergencies.keys().next().value!)
         return
       }
       case 'E_TWAKEPHONE_WAKE': {
@@ -505,6 +549,16 @@ export class CallTracker {
     call.woken?.clear()
     call.callee = member
     call.rang = rang
+  }
+
+  /** A group call leaves its group: each member whose phone rang has it missed; the group's number is its callee. */
+  private leaveGroup(call: TrackedCall, now: string) {
+    for (const m of call.group?.ringing ?? []) {
+      this.count(m, -1)
+      if (m !== call.caller) this.emit(m, { type: 'call.ended', timestamp: this.now(), payload: { call: this.toCall(call, m, 'missed', now) } })
+    }
+    delete call.group
+    call.rang = false
   }
 
   /** The call goes to `to` now: the callee it leaves is told it ended (missed, or declined) if its phone rang for it. */

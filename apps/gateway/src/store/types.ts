@@ -149,8 +149,31 @@ export interface AlertRecord {
   alert: TelephonyAlert
 }
 
-/** How long the alerts are kept. */
+/**
+ * An alert as kept: one per kind, param, scope and extension while it repeats (`count` times, the last at `lastAt`,
+ * what the last one said in `alert`), a new one past ALERT_DEDUP_MS of silence. `id` orders them (the newest opened
+ * first) and pages them.
+ */
+export interface StoredAlert extends AlertRecord {
+  id: string
+  lastAt: string
+  count: number
+}
+
+/** A page of the alerts of a tenant: `before` an id (the next page), of one `kind` or `param`, `limit` at most. */
+export interface AlertQuery {
+  limit?: number
+  before?: string
+  kind?: TelephonyAlert['kind']
+  param?: string
+}
+
+/** How long the alerts are kept (from their last repeat): purged by the Gateway every hour (purgeAlerts). */
 export const ALERT_RETENTION_DAYS = 90
+/** An alert that repeats within this time of its last one counts in it, instead of a new one. */
+export const ALERT_DEDUP_MS = 3_600_000
+/** What makes two alerts the same one. */
+export const alertKey = (a: TelephonyAlert) => [a.kind, a.param, a.scope ?? '', a.extension ?? ''].join('|')
 
 export interface Store {
   listProviders(): Promise<ProviderRecord[]>
@@ -228,10 +251,12 @@ export interface Store {
   getOutbound(tenantId: string): Promise<OutboundRecord | null>
   /** Replaces them whole. */
   setOutbound(record: OutboundRecord): Promise<void>
-  /** Keeps an alert; those older than ALERT_RETENTION_DAYS go. */
+  /** Keeps an alert: a repeat of an open one (same alertKey, within ALERT_DEDUP_MS of its last) counts in it. */
   addAlert(record: AlertRecord): Promise<void>
-  /** The alerts of a tenant, the newest first, `limit` at most (clamped as a page). */
-  listAlerts(tenantId: string, limit?: number): Promise<AlertRecord[]>
+  /** The alerts of a tenant, the newest opened first, `limit` at most (clamped as a page). */
+  listAlerts(tenantId: string, query?: AlertQuery): Promise<StoredAlert[]>
+  /** Removes the alerts of every tenant whose last repeat is before `before` (ISO); how many. */
+  purgeAlerts(before: string): Promise<number>
 
   close(): Promise<void>
 }

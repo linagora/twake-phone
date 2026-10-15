@@ -129,6 +129,8 @@ export const storedOpensipsFactory = ({ store, key, env = process.env, provision
             return provisioner.reconcileAccounts(holders)
           }
         },
+        // Its tables lacking what the CDRs and the caps need: DEGRADED, and said why.
+        schemaProblem: () => provisioner.schemaProblem,
         ...(config.events ? { events: config.events } : {}),
         ...(logger ? { logger } : {})
       })

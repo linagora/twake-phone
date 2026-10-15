@@ -209,7 +209,7 @@ export const storeContract = (name: string, make: () => Promise<Store>) =>
       await s.close()
     })
 
-    it('keeps the outbound rules of each tenant whole, and its alerts newest first, past ones dropped (step 6b)', async () => {
+    it('keeps the outbound rules of each tenant whole (step 6b)', async () => {
       const s = await make()
       expect(await s.getOutbound('A')).toBeNull()
       const rules = { tenantId: 'A', policy: { defaultProfile: 'internal', caps: { concurrent: 4 } }, profiles: [{ id: 'internal', allowed: [] }, { id: 'national', allowed: ['fixed' as const], caps: { dailyMinutes: 60 } }], assignments: [{ userId: 'alice', profileId: 'national' }] }
@@ -219,29 +219,56 @@ export const storeContract = (name: string, make: () => Promise<Store>) =>
       await s.setOutbound({ ...rules, assignments: [] })
       expect((await s.getOutbound('A'))?.assignments).toEqual([])
       expect((await s.getOutbound('B'))?.profiles).toEqual([])
-      const alert = { kind: 'limit' as const, param: 'concurrent', scope: 'user' as const, extension: '101' }
-      await s.addAlert({ tenantId: 'A', at: '2026-10-15T10:00:00.000Z', alert })
-      await s.addAlert({ tenantId: 'A', at: '2026-10-15T11:00:00.000Z', alert: { ...alert, param: 'dailyCalls' } })
-      await s.addAlert({ tenantId: 'B', at: '2026-10-15T12:00:00.000Z', alert })
-      // Older than the retention: dropped at the next one.
-      await s.addAlert({ tenantId: 'A', at: '2020-01-01T00:00:00.000Z', alert })
-      await s.addAlert({ tenantId: 'A', at: new Date().toISOString(), alert: { ...alert, param: 'monthlyCalls' } })
-      const a = await s.listAlerts('A', 10)
-      expect(a.map(r => r.alert.param)).toEqual(['monthlyCalls', 'dailyCalls', 'concurrent'])
-      expect(a[1]).toEqual({ tenantId: 'A', at: '2026-10-15T11:00:00.000Z', alert: { ...alert, param: 'dailyCalls' } })
-      expect(await s.listAlerts('A', 1)).toHaveLength(1)
-      expect(await s.listAlerts('C')).toEqual([])
       await s.close()
     })
 
-    it('keeps the fallback number of a range of direct numbers (step 6b)', async () => {
+    it('keeps one alert while it repeats (count, last time), a new one after an hour of silence, per tenant (review 6b, n°7)', async () => {
       const s = await make()
-      await s.upsertTrunk({ tenantId: 'A', id: 'main', config: { auth: 'ip', domain: 'operator.example', codecs: ['PCMA'], numberFormat: 'e164', defaultNumber: '+33199000100', fallbackNumber: '+33199000199' } })
-      await s.upsertDid({ tenantId: 'A', id: 'desk', trunkId: 'main', first: '+33199000101', last: '+33199000101', target: '101', fallbackNumber: '+33199000198' })
-      expect(await s.listDids('A')).toEqual([{ tenantId: 'A', id: 'desk', trunkId: 'main', first: '+33199000101', last: '+33199000101', target: '101', fallbackNumber: '+33199000198' }])
-      expect((await s.listTrunks('A'))[0]!.config.fallbackNumber).toBe('+33199000199')
+      const alert = { kind: 'limit' as const, param: 'concurrent', scope: 'user' as const, extension: '101', number: '+33199000201' }
+      await s.addAlert({ tenantId: 'A', at: '2026-10-15T10:00:00.000Z', alert })
+      // The same one 30 and 80 minutes later (each within an hour of the one before): counted in it, its last words kept.
+      await s.addAlert({ tenantId: 'A', at: '2026-10-15T10:30:00.000Z', alert: { ...alert, number: '+33199000202' } })
+      await s.addAlert({ tenantId: 'A', at: '2026-10-15T11:20:00.000Z', alert })
+      await s.addAlert({ tenantId: 'B', at: '2026-10-15T10:31:00.000Z', alert })
+      // Another extension, another param, another kind: other alerts.
+      await s.addAlert({ tenantId: 'A', at: '2026-10-15T10:40:00.000Z', alert: { ...alert, extension: '102' } })
+      await s.addAlert({ tenantId: 'A', at: '2026-10-15T10:41:00.000Z', alert: { ...alert, param: 'dailyMinutes' } })
+      await s.addAlert({ tenantId: 'A', at: '2026-10-15T10:42:00.000Z', alert: { kind: 'rights', param: 'international', scope: 'user', extension: '101' } })
+      // Past an hour of silence: a new one.
+      await s.addAlert({ tenantId: 'A', at: '2026-10-15T12:30:00.000Z', alert })
+      const a = await s.listAlerts('A', { limit: 10 })
+      expect(a.map(r => [r.alert.kind, r.alert.param, r.alert.extension, r.count])).toEqual([
+        ['limit', 'concurrent', '101', 1],
+        ['rights', 'international', '101', 1],
+        ['limit', 'dailyMinutes', '101', 1],
+        ['limit', 'concurrent', '102', 1],
+        ['limit', 'concurrent', '101', 3]
+      ])
+      expect(a[4]).toMatchObject({ tenantId: 'A', at: '2026-10-15T10:00:00.000Z', lastAt: '2026-10-15T11:20:00.000Z', count: 3, alert })
+      expect((await s.listAlerts('B'))[0]).toMatchObject({ count: 1 })
+      expect(await s.listAlerts('C')).toEqual([])
+      // A page at a time (before the last id of the page before), of one kind or param.
+      const first = await s.listAlerts('A', { limit: 2 })
+      expect(first).toHaveLength(2)
+      const second = await s.listAlerts('A', { limit: 2, before: first[1]!.id })
+      expect(second.map(r => r.id)).toEqual(a.slice(2, 4).map(r => r.id))
+      expect((await s.listAlerts('A', { kind: 'rights' })).map(r => r.alert.param)).toEqual(['international'])
+      expect((await s.listAlerts('A', { param: 'concurrent' })).map(r => r.alert.extension)).toEqual(['101', '102', '101'])
+      // Purged from their last repeat on, every tenant's.
+      expect(await s.purgeAlerts('2026-10-15T11:00:00.000Z')).toBe(4)
+      expect((await s.listAlerts('A')).map(r => r.lastAt)).toEqual(['2026-10-15T12:30:00.000Z', '2026-10-15T11:20:00.000Z'])
+      expect(await s.listAlerts('B')).toEqual([])
+      await s.close()
+    })
+
+    it('keeps the fallback of a trunk and of a range of direct numbers (step 6b)', async () => {
+      const s = await make()
+      await s.upsertTrunk({ tenantId: 'A', id: 'main', config: { auth: 'ip', domain: 'operator.example', codecs: ['PCMA'], numberFormat: 'e164', defaultNumber: '+33199000100', fallbackTarget: '199' } })
+      await s.upsertDid({ tenantId: 'A', id: 'desk', trunkId: 'main', first: '+33199000101', last: '+33199000101', target: '101', fallbackTarget: '198' })
+      expect(await s.listDids('A')).toEqual([{ tenantId: 'A', id: 'desk', trunkId: 'main', first: '+33199000101', last: '+33199000101', target: '101', fallbackTarget: '198' }])
+      expect((await s.listTrunks('A'))[0]!.config.fallbackTarget).toBe('199')
       await s.upsertDid({ tenantId: 'A', id: 'desk', trunkId: 'main', first: '+33199000101', last: '+33199000101', target: '101' })
-      expect((await s.listDids('A'))[0]).not.toHaveProperty('fallbackNumber')
+      expect((await s.listDids('A'))[0]).not.toHaveProperty('fallbackTarget')
       await s.close()
     })
 

@@ -277,6 +277,8 @@ describe('Softphone', () => {
       ['+442079460124', 403, 'rights', 'rights'],
       ['0199000004', 403, 'limit', 'limit'],
       ['0199000005', 403, 'fraud', 'fraud'],
+      // Review 6b, n°2: the rules not read in time (503): its own reason, not "no trunk".
+      ['0199000006', 503, 'policy-unavailable', 'policy-unavailable'],
       ['0639980002', 403, 'satellite', 'not-allowed']
     ] as const) {
       const call = await phone.call(number)

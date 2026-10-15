@@ -72,6 +72,8 @@ services:
       # A call with the operator ends by itself after this long (seconds, 60 to 86400), a BYE to both sides; an
       # emergency call excepted.
       TRUNK_MAX_CALL_SEC: ${TRUNK_MAX_CALL_SEC:-14400}
+      # The shortest call the minutes left of a cap allow (seconds, 1 to 600): less left, the call is refused.
+      TRUNK_MIN_CALL_SEC: ${TRUNK_MIN_CALL_SEC:-60}
       # Every this long (seconds, 5 to 300), the phone in a call with the operator is sent an OPTIONS in the call: one
       # that does not answer it any more (its page closed, put to sleep, its network gone) has the call ended.
       CALL_PING_SEC: ${CALL_PING_SEC:-30}

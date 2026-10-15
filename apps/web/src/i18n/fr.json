@@ -274,6 +274,7 @@
   "call.endedRefusedNotAllowed": "Ce numéro n'est pas autorisé : {who} n'a pas été appelé.",
   "call.endedRefusedRights": "Vos droits d'appel ne permettent pas d'appeler ce type de numéro : {who} n'a pas été appelé. Voyez avec votre administrateur.",
   "call.endedRefusedLimit": "Le plafond d'appels vers l'extérieur est atteint (appels simultanés, du jour ou du mois) : {who} n'a pas été appelé. Les numéros d'urgence restent joignables.",
+  "call.endedRefusedPolicyUnavailable": "Les règles des appels vers l'extérieur n'ont pas pu être lues à temps : {who} n'a pas été appelé. Réessayez dans un instant ; les numéros d'urgence restent joignables.",
   "call.endedRefusedFraud": "Trop d'appels vers l'extérieur en peu de temps : {who} n'a pas été appelé et votre administrateur est prévenu. Les numéros d'urgence restent joignables.",
   "call.errorTransferNotAllowed": "Transfert impossible : ce numéro n'est pas autorisé, ou l'appel est avec un correspondant extérieur, que Twake Phone ne transfère pas encore{status}.",
   "call.hiddenNumber": "Numéro masqué",

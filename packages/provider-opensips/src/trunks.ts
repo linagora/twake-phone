@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
-import { TRUNK_COUNTRY, TRUNK_COUNTRY_EXCLUDED, TRUNK_OUTBOUND_CLASSES, TRUNK_OUTBOUND_DEFAULT, type DidRange, type Trunk } from '@twake/telephony-types'
-import { classify, countryAllowed, DIALPLAN_SQL } from './numbering.js'
+import { TRUNK_COUNTRY, TRUNK_COUNTRY_EXCLUDED, TRUNK_OUTBOUND_CLASSES, TRUNK_OUTBOUND_DEFAULT, isValidExtension, type DidRange, type Trunk } from '@twake/telephony-types'
+import { DIALPLAN_SQL } from './numbering.js'
 import { ACC_EXTERNAL_SQL, OUTBOUND_SCHEMA } from './outbound.js'
 import type { Queryable } from './subscriber.js'
 
@@ -21,10 +21,10 @@ export const REGISTRANT_TABLE_VERSION = 3
  * with what the script needs for an outbound call (where, as whom, how numbers are written, which codecs, the number
  * presented by default, the kinds of numbers it may call as `,fixed,mobile,`, the country codes of the international
  * ones as `,32,44,`) and `setid`, its set of `dispatcher` (its servers; the other addresses its calls may come from are
- * in set `setid + SOURCES_SET`, which no call is ever sent to), and its fallback number (step 6b, `fallback`, '' none).
- * `dids`: the direct numbers, a range of E.164 numbers
- * of the same length, to an extension or group (`target`) or to the extension that ends with their last
- * `suffix_digits` digits, and their own fallback number. `tenant_id` is whose they are: OpenSIPS does not read it, and one tenant only may have trunks
+ * in set `setid + SOURCES_SET`, which no call is ever sent to), and the fallback of its direct numbers (step 6b,
+ * `fallback`: an extension or a ring group, '' none). `dids`: the direct numbers, a range of E.164 numbers of the same
+ * length, to an extension or group (`target`) or to the extension that ends with their last `suffix_digits` digits,
+ * and their own fallback. `tenant_id` is whose they are: OpenSIPS does not read it, and one tenant only may have trunks
  * in a database (TrunkTables refuses a second one). Then the tables of the outbound policy (outbound.ts, step 6b).
  * Run as a whole by docker/opensips/entrypoint.sh before OpenSIPS starts (a database created before step 6 has none
  * of these tables, and OpenSIPS would not start without them) and at each start of the Gateway.
@@ -159,13 +159,11 @@ interface Projection {
 const invalid = (message: string) => Object.assign(new Error(message), { statusCode: 400 })
 
 /**
- * A fallback number (FR-C8) is one the operator is asked to forward the call to: one its trunk may call (its class in
- * `allowed`, an international one to its `countries`), never an emergency, premium or short number.
+ * A fallback (FR-C8) is an extension or a ring group of the organisation, rung inside: the internal plan, never a
+ * number that goes out (the operator's own forward is set at the operator, ADR 0017).
  */
-const checkFallback = (number: string, allowed: readonly string[], countries: readonly string[], what: string) => {
-  const c = E164.test(number) ? classify(number) : null
-  if (!c || c.number !== number || !allowed.includes(c.class) || (c.class === 'international' && !countryAllowed(number, countries)))
-    throw invalid(`${what}: the fallback number is a number in E.164 the trunk may call (${allowed.join(', ')})`)
+const checkFallback = (target: string, what: string) => {
+  if (!isValidExtension(target)) throw invalid(`${what}: the fallback is an extension or a ring group (2 to 6 digits, the first not 0, not a short number of the French plan)`)
 }
 
 /**
@@ -201,8 +199,8 @@ export const projectTrunks = (trunks: (Trunk & { password?: string })[], dids: D
     const countries = t.countries ?? []
     if (!countries.every(c => TRUNK_COUNTRY.test(c) && !TRUNK_COUNTRY_EXCLUDED.test(c))) throw invalid(`Trunk ${t.id}: countries are country codes of one to three digits or areas of the North American plan (1876), neither France nor its overseas ones, nor a code of no country`)
     if (allowed.includes('international') !== countries.length > 0) throw invalid(`Trunk ${t.id}: international numbers are called to the countries listed only (countries), and countries go with international`)
-    const fallback = t.fallbackNumber ?? ''
-    if (fallback) checkFallback(fallback, allowed, countries, `Trunk ${t.id}`)
+    const fallback = t.fallbackTarget ?? ''
+    if (fallback) checkFallback(fallback, `Trunk ${t.id}`)
     out.trunks.push([t.id, setid, position, t.domain, t.numberFormat, t.assertIdentity ? 1 : 0, username, secret, t.realm ?? '', codecFlags(t.codecs), t.defaultNumber, aor, `,${allowed.join(',')},`, countries.length ? `,${countries.join(',')},` : '', fallback])
     // The operator's servers, in order, each probed with OPTIONS (probe_mode 1): it keeps the NAT open towards each
     // (ARCHITECTURE §13). The dispatcher tries the highest priority first (algorithm 8): the first server has the
@@ -223,8 +221,9 @@ export const projectTrunks = (trunks: (Trunk & { password?: string })[], dids: D
     const target = d.target ?? ''
     const suffix = d.suffixDigits ?? 0
     if (suffix ? target || suffix < 2 || suffix > 6 : !SIP_USER.test(target)) throw invalid(`Direct number ${d.first}: a target or a number of digits`)
-    const fallback = d.fallbackNumber ?? ''
-    if (fallback) checkFallback(fallback, trunk.allowed ?? TRUNK_OUTBOUND_DEFAULT, trunk.countries ?? [], `Direct number ${d.first}`)
+    const fallback = d.fallbackTarget ?? ''
+    if (fallback) checkFallback(fallback, `Direct number ${d.first}`)
+    if (fallback && fallback === target) throw invalid(`Direct number ${d.first}: the fallback is where the number rings already`)
     out.dids.push([d.id.slice(0, 64), d.trunkId, d.first, d.last, target, suffix, fallback])
   }
   return out

@@ -11,13 +11,13 @@ import { CallTracker } from './tracker.js'
 
 export { SubscriberProvisioner, digestHashes, SUBSCRIBER_SCHEMA, SUBSCRIBER_SQL, EXTRA_COLUMNS, SUBSCRIBER_TABLE_VERSION, ACC_TABLE_VERSION, MISSED_CALLS_TABLE_VERSION, type SubscriberProvisionerOptions, type Queryable } from './subscriber.js'
 export { OpensipsEvents, parseDlgList, parseUlDump, parseUdpUrl, type EventsLogger, type OpensipsEventsOptions, type RegisteredContact } from './events.js'
-export { CallTracker, alertOf, userOf, isExternalParty, type ContactRegistration, type TelephonyPresence } from './tracker.js'
+export { CallTracker, alertOf, userOf, isExternalParty, EMERGENCY_BURST, EMERGENCY_BURST_WINDOW_MS, type ContactRegistration, type TelephonyPresence } from './tracker.js'
 export { CallRules, CALL_RULES_SCHEMA, DND_MESSAGE_MAX, NOANSWER_DELAY, type CallRulesOptions, type DndRule, type ExtensionHolder } from './call-rules.js'
 export { CallGroups, CALL_GROUPS_SCHEMA, DISPLAY_NAMES_SCHEMA, GROUP_MEMBERS_MAX, NAME_MAX, sipDisplayName, type CallGroupsOptions } from './call-groups.js'
 export { PushTargets, PUSH_TARGETS_SCHEMA, type PushTargetsOptions } from './push-targets.js'
 export { AsyncQueue } from './queue.js'
 export { TrunkTables, TRUNK_SCHEMA, TRUNK_SQL, DEFAULT_TRUNK_SOCKET, SOURCES_SET, DISPATCHER_TABLE_VERSION, DIALPLAN_TABLE_VERSION, REGISTRANT_TABLE_VERSION, codecFlags, projectTrunks, trunkSecret, type TrunkTablesOptions } from './trunks.js'
-export { OutboundTables, OUTBOUND_SCHEMA, ACC_EXTERNAL_SQL, FRAUD_PROFILE, FRAUD_RULE_INTERNATIONAL, FRAUD_RULE_NATIONAL, FRAUD_TABLE_VERSION, DR_TABLE_VERSIONS, NO_CAP_LEFT, CAP_MAX, PROFILE_ID, fraudRow, projectOutbound, type OutboundTablesOptions } from './outbound.js'
+export { OutboundTables, OUTBOUND_SCHEMA, ACC_EXTERNAL_SQL, FRAUD_PROFILE, FRAUD_RULE_INTERNATIONAL, FRAUD_RULE_NATIONAL, FRAUD_TABLE_VERSION, FRAUD_OVERSEAS_PREFIXES, DR_TABLE_VERSIONS, DIALOG_TABLE_VERSION, OUTBOUND_TIME_ZONE, CAP_MAX, PROFILE_ID, fraudRow, projectOutbound, type OutboundTablesOptions } from './outbound.js'
 export { DIALPLAN_RULES, DIALPLAN_SQL, DP_CLASSIFY, DP_INBOUND, DP_NORMALISE, OUTBOUND_ALLOWABLE, OUTBOUND_ALLOWED, classify, countryAllowed, translate, type DialplanRule, type NumberClass } from './numbering.js'
 
 /**
@@ -46,7 +46,9 @@ export const SUBSCRIBED_EVENTS = [
   'E_ACC_MISSED_EVENT',
   'E_FRD_WARNING',
   'E_FRD_CRITICAL',
-  'E_TWAKEPHONE_LIMIT'
+  'E_TWAKEPHONE_LIMIT',
+  'E_TWAKEPHONE_RIGHTS',
+  'E_TWAKEPHONE_EMERGENCY'
 ]
 
 // Everything OpenSIPS-specific stays inside this package: the Gateway and the app only see the provider contract.
@@ -107,6 +109,8 @@ export interface OpensipsConfig {
    * reconcileAccounts). Without it, an account outlives its holder's mapping.
    */
   accounts?: { reconcile(holders: { extension: string; userId: string }[]): Promise<string[]> }
+  /** What is wrong with OpenSIPS's tables (SubscriberProvisioner's schemaProblem): the provider is DEGRADED while so. */
+  schemaProblem?: () => string | undefined
   logger?: EventsLogger
 }
 
@@ -209,13 +213,17 @@ export class OpensipsProvider implements TelephonyProvider, MediaProvider {
     this.tracker.seedDialogs(parseDlgList(await this.events.call('dlg_list')), calls)
   }
 
-  /** DEGRADED while the events are configured but not subscribed (OpenSIPS down or restarting): calls still go through. */
+  /**
+   * DEGRADED while the events are configured but not subscribed (OpenSIPS down or restarting: calls still go through),
+   * or while OpenSIPS's tables lack what the CDRs and the caps need (`schemaProblem`).
+   */
   getStatus(): ProviderStatus {
+    if (this.config.schemaProblem?.()) return 'DEGRADED'
     return !this.events || this.events.connected ? 'CONNECTED' : 'DEGRADED'
   }
 
   getStatusReason(): string | undefined {
-    return this.events?.reason
+    return this.config.schemaProblem?.() ?? this.events?.reason
   }
 
   async getCapabilities(): Promise<Capabilities> {

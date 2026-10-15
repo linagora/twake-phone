@@ -274,6 +274,7 @@
   "call.endedRefusedNotAllowed": "This number is not allowed: {who} was not called.",
   "call.endedRefusedRights": "Your calling rights do not allow this kind of number: {who} was not called. Ask your administrator.",
   "call.endedRefusedLimit": "The cap on outside calls is reached (at the same time, today or this month): {who} was not called. Emergency numbers can still be called.",
+  "call.endedRefusedPolicyUnavailable": "The rules of outside calls could not be read in time: {who} was not called. Try again in a moment; emergency numbers can still be called.",
   "call.endedRefusedFraud": "Too many outside calls in a short time: {who} was not called and your administrator has been told. Emergency numbers can still be called.",
   "call.errorTransferNotAllowed": "Transfer not possible: this number is not allowed, or the call is with an external party, which Twake Phone does not transfer yet{status}.",
   "call.hiddenNumber": "Hidden number",

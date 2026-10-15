@@ -2153,6 +2153,10 @@ try {
       return res.json().items.find(a => a.kind === 'limit' && a.number === '+33639980005') ?? null
     })
     expectEqual(`${alert.param} ${alert.scope} ${alert.extension} ${alert.userId}`, 'concurrent tenant 103 bdurand', 'the alert')
+    // Review 6b, n°7: kept once while it repeats (count, lastAt), a page at a time.
+    expectEqual(`${alert.count >= 1} ${typeof alert.lastAt} ${typeof alert.id}`, 'true string string', 'the alert as kept')
+    const defaults = (await api('GET', '/admin/outbound')).json().defaults
+    expectEqual(JSON.stringify(defaults.caps), JSON.stringify({ user: { concurrent: 2, dailyMinutes: 300 }, tenant: { concurrent: 20, dailyMinutes: 3000 } }), 'the default caps shown')
     operator.state.next.push({ reply: '486 Busy Here' })
     const sos = await dialUntilEnded(bob.page, '112')
     await operator.invited(invite => invite.uri === 'sip:112@operator.example' && (invite.headers.get('from')?.[0] ?? '').includes('<sip:+33199000103@operator.example>'))

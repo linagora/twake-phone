@@ -38,6 +38,19 @@ esac
 if [ "$TRUNK_MAX_CALL_SEC" -lt 60 ] || [ "$TRUNK_MAX_CALL_SEC" -gt 86400 ]; then
   echo "TRUNK_MAX_CALL_SEC must be 60 to 86400 seconds" >&2; exit 1
 fi
+# The shortest a call to the public network may be allotted under a minute cap (step 6b, ADR 0017): with less left
+# (shared between the calls that may still be placed at once), it is refused rather than charged its first unit and
+# cut. In seconds, 60 by default.
+: "${TRUNK_MIN_CALL_SEC:=60}"
+case "$TRUNK_MIN_CALL_SEC" in
+  '' | *[!0-9]*) echo "TRUNK_MIN_CALL_SEC must be a number of seconds" >&2; exit 1 ;;
+esac
+if [ "$TRUNK_MIN_CALL_SEC" -lt 1 ] || [ "$TRUNK_MIN_CALL_SEC" -gt 600 ]; then
+  echo "TRUNK_MIN_CALL_SEC must be 1 to 600 seconds" >&2; exit 1
+fi
+# The days and months of the caps are those of Europe/Paris whatever the clock (SQL); OpenSIPS's own (its logs, the
+# day of fraud_detection's daily counters) too unless TZ says otherwise.
+: "${TZ:=Europe/Paris}"
 # How often the phone of a call with the operator is asked whether it is still there (an OPTIONS in the dialog), and
 # how long it has to answer: one that does not answer within CALL_PING_TIMEOUT_SEC (put to sleep, its page closed or
 # reloaded, its network gone) has the call ended, a BYE to the operator; a shorter silence (a network that switches)
@@ -96,7 +109,7 @@ case "$TRUNK_ADVERTISE" in
   '') TRUNK_SOCKET_AS='' ;;
   *) TRUNK_SOCKET_AS=" as $TRUNK_ADVERTISE" ;;
 esac
-export SIP_DOMAIN LISTEN_IP SIP_PORT WS_PORT WSS_PORT OPENSIPS_DB_URL OPENSIPS_RULES_DB_URL PUSH_WAIT_SEC RTPENGINE_SOCK OPENSIPS_LOG_LEVEL OPENSIPS_MPATH MI_FIFO MI_LISTEN_IP MI_PORT TLS_CERT TLS_KEY TRUNK_LISTEN_IP TRUNK_PORT TRUNK_SOCKET_AS TRUNK_MAX_CALL_SEC CALL_PING_SEC CALL_PING_TIMEOUT_SEC
+export SIP_DOMAIN LISTEN_IP SIP_PORT WS_PORT WSS_PORT OPENSIPS_DB_URL OPENSIPS_RULES_DB_URL PUSH_WAIT_SEC RTPENGINE_SOCK OPENSIPS_LOG_LEVEL OPENSIPS_MPATH MI_FIFO MI_LISTEN_IP MI_PORT TLS_CERT TLS_KEY TRUNK_LISTEN_IP TRUNK_PORT TRUNK_SOCKET_AS TRUNK_MAX_CALL_SEC TRUNK_MIN_CALL_SEC CALL_PING_SEC CALL_PING_TIMEOUT_SEC TZ
 
 # The MI socket (mi_datagram) has no authentication: whoever reaches it can stop OpenSIPS, drop registrations, end
 # calls, read who is registered and subscribe to the events (who calls whom). It listens on its own address, the
@@ -148,7 +161,7 @@ if [ ! -f "$TLS_CERT" ] || [ ! -f "$TLS_KEY" ]; then
 fi
 
 # Only the listed variables are substituted: a "$avp(...)" of the script must stay as it is.
-envsubst '$SIP_DOMAIN $LISTEN_IP $SIP_PORT $WS_PORT $WSS_PORT $OPENSIPS_DB_URL $OPENSIPS_RULES_DB_URL $PUSH_WAIT_SEC $RTPENGINE_SOCK $OPENSIPS_LOG_LEVEL $OPENSIPS_MPATH $MI_FIFO $MI_LISTEN_IP $MI_PORT $TLS_CERT $TLS_KEY $TRUNK_LISTEN_IP $TRUNK_PORT $TRUNK_SOCKET_AS $TRUNK_MAX_CALL_SEC $CALL_PING_SEC $CALL_PING_TIMEOUT_SEC' \
+envsubst '$SIP_DOMAIN $LISTEN_IP $SIP_PORT $WS_PORT $WSS_PORT $OPENSIPS_DB_URL $OPENSIPS_RULES_DB_URL $PUSH_WAIT_SEC $RTPENGINE_SOCK $OPENSIPS_LOG_LEVEL $OPENSIPS_MPATH $MI_FIFO $MI_LISTEN_IP $MI_PORT $TLS_CERT $TLS_KEY $TRUNK_LISTEN_IP $TRUNK_PORT $TRUNK_SOCKET_AS $TRUNK_MAX_CALL_SEC $TRUNK_MIN_CALL_SEC $CALL_PING_SEC $CALL_PING_TIMEOUT_SEC' \
   < "$CFG_TEMPLATE" > "$CFG_OUT"
 
 # The tables of the trunks (step 6): dispatcher, dialplan and uac_registrant read theirs at start and OpenSIPS stops

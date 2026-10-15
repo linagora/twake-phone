@@ -153,5 +153,6 @@ umask 077
   echo "# TRUNK_DIDS="
 } > .env
 echo "Wrote $(pwd)/.env (media address $interface)."
+echo "Firewall (machine and cloud): open 80/tcp, 443/tcp and 30000-30999/udp (the media), nothing else."
 [ $demo = 0 ] || echo "Demo accounts alice (administrator), bob and carole: their passwords are ALICE_PASSWORD, BOB_PASSWORD and CAROLE_PASSWORD in .env."
 echo "Next: docker compose up -d --build --wait --wait-timeout 600"

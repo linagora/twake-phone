@@ -183,6 +183,8 @@ export class SubscriberProvisioner implements SecretProvisioner {
   private readonly removedBound: { min: number; ratio: number }
   /** Whether `subscriber` has its `holder` column (one that could not be added: accounts written without, none removed). */
   private holderColumn = true
+  /** What is wrong with OpenSIPS's tables (schemaProblem). */
+  private problem: string | undefined
 
   constructor(opts: SubscriberProvisionerOptions) {
     if (!opts.realm) throw new Error('SubscriberProvisioner needs the SIP realm')
@@ -228,12 +230,54 @@ export class SubscriberProvisioner implements SecretProvisioner {
       )
       if (added) this.holderColumn = true
     }
-    // The index the caps read `acc` by (step 6b), once its column is there: created once, never again.
-    await this.pool.query(ACC_EXTERNAL_SQL).catch((err: unknown) => this.log.warn(`OpenSIPS tables: acc.external or its index not added (${err instanceof Error ? err.message : String(err)}); the caps of calls to the public network read the CDRs without it`))
+    // The triggers that count what the calls to the public network used (step 6b), once `external` is there: created
+    // where they lack only, waiting 5 s at most for the lock of `acc`.
+    this.problem = undefined
+    if (missing.some(([table, column]) => column === 'external' && (table === 'acc' || table === 'missed_calls')) && !(await this.hasExternal())) {
+      this.problem = 'acc.external is missing: OpenSIPS cannot write the CDRs nor the missed calls, and the caps count nothing'
+      this.log.warn(`OpenSIPS tables: ${this.problem} (add the column as the owner of acc: docker/opensips/trunk.sql)`)
+    } else if (!(await this.hasUsageTriggers())) {
+      await this.inTransaction(ACC_EXTERNAL_SQL.replace(/^BEGIN;\n/, '').replace(/COMMIT;\n$/, '')).catch((err: unknown) => {
+        this.problem = 'the triggers of acc that count what the calls to the public network use are missing: the minute and call caps count nothing'
+        this.log.warn(`OpenSIPS tables: ${this.problem} (${err instanceof Error ? err.message : String(err)})`)
+      })
+    }
     const { rows } = (await this.pool.query("SELECT table_name, table_version FROM version WHERE table_name IN ('subscriber', 'acc', 'missed_calls')")) as { rows: { table_name: string; table_version: number }[] }
     for (const [table, expected] of [['subscriber', SUBSCRIBER_TABLE_VERSION], ['acc', ACC_TABLE_VERSION], ['missed_calls', MISSED_CALLS_TABLE_VERSION]] as const) {
       const version = rows.find(r => r.table_name === table)?.table_version
       if (version !== expected) throw new Error(`${table} table version ${version} in the database, ${expected} expected`)
+    }
+  }
+
+  /**
+   * What is wrong with OpenSIPS's tables, for the provider's status (DEGRADED): `acc.external` missing (no CDR is
+   * written), or the triggers that count the use of the caps. Undefined when nothing is, or before ensureSchema().
+   */
+  get schemaProblem(): string | undefined {
+    return this.problem
+  }
+
+  private async hasUsageTriggers() {
+    const { rows } = (await this.pool.query("SELECT count(*)::int AS n FROM pg_trigger WHERE (tgname = 'twake_outbound_acc' AND tgrelid = to_regclass('acc')) OR (tgname = 'twake_outbound_missed' AND tgrelid = to_regclass('missed_calls'))")) as { rows: { n: number }[] }
+    return rows[0]?.n === 2
+  }
+
+  private async hasExternal() {
+    const { rows } = (await this.pool.query("SELECT count(*)::int AS n FROM information_schema.columns WHERE table_schema = current_schema() AND table_name IN ('acc', 'missed_calls') AND column_name = 'external'")) as { rows: { n: number }[] }
+    return rows[0]?.n === 2
+  }
+
+  /** `sql` in one transaction (several statements), rolled back on any failure. */
+  private async inTransaction(sql: string) {
+    const client = this.pool.connect ? await this.pool.connect() : undefined
+    const q = client ?? this.pool
+    try {
+      await q.query(`BEGIN;\n${sql}COMMIT;`)
+    } catch (err) {
+      await q.query('ROLLBACK').catch(() => undefined)
+      throw err
+    } finally {
+      client?.release()
     }
   }
 

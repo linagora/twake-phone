@@ -18,7 +18,7 @@ import {
 export const PROFILE_ID = /^[a-z0-9][a-z0-9-]{0,31}$/
 export const MAX_PROFILES = 32
 export const MAX_ASSIGNMENTS = 10_000
-/** A cap: whole calls or minutes, from 1 (absent: none). */
+/** A cap: whole calls or minutes, from 1 (absent: its default, OUTBOUND_CAP_DEFAULTS; null: none). */
 export const CAP_MAX = 1_000_000
 /** A threshold: whole calls or seconds, from 0 (none). */
 export const THRESHOLD_MAX = 1_000_000
@@ -31,15 +31,16 @@ const invalid = (message: string) => Object.assign(new Error(message), { statusC
 
 const isObject = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v)
 
+/** Caps as an administrator writes them: each one a whole number, `null` for none, absent for its default. */
 export const parseCaps = (v: unknown, field: string): OutboundCaps | undefined => {
   if (v === undefined || v === null) return undefined
   if (!isObject(v)) throw invalid(`${field}: an object of ${OUTBOUND_CAPS.join(', ')}`)
   const caps: OutboundCaps = {}
   for (const [k, n] of Object.entries(v)) {
     if (!(OUTBOUND_CAPS as readonly string[]).includes(k)) throw invalid(`${field}.${k}: not a cap (${OUTBOUND_CAPS.join(', ')})`)
-    if (n === null || n === undefined) continue
-    if (!Number.isInteger(n) || (n as number) < 1 || (n as number) > CAP_MAX) throw invalid(`${field}.${k}: a whole number from 1 to ${CAP_MAX} (absent: no cap)`)
-    caps[k as keyof OutboundCaps] = n as number
+    if (n === undefined) continue
+    if (n !== null && (!Number.isInteger(n) || (n as number) < 1 || (n as number) > CAP_MAX)) throw invalid(`${field}.${k}: a whole number from 1 to ${CAP_MAX}, or null for no cap (absent: its default)`)
+    caps[k as keyof OutboundCaps] = n as number | null
   }
   return Object.keys(caps).length ? caps : undefined
 }
@@ -108,12 +109,14 @@ export const parseOutbound = (body: unknown): Outbound => {
   const defaultProfile = p.defaultProfile
   if (defaultProfile !== undefined && defaultProfile !== null && (typeof defaultProfile !== 'string' || !ids.has(defaultProfile))) throw invalid('policy.defaultProfile: one of the profiles')
   const caps = parseCaps(p.caps, 'policy.caps')
+  const userCaps = parseCaps(p.userCaps, 'policy.userCaps')
   const f = p.fraud
   if (f !== undefined && f !== null && !isObject(f)) throw invalid('policy.fraud: { national, international }')
   const national = parseFraudRule(f?.national, 'policy.fraud.national')
   const international = parseFraudRule(f?.international, 'policy.fraud.international')
   const policy: OutboundPolicy = {
     ...(typeof defaultProfile === 'string' ? { defaultProfile } : {}),
+    ...(userCaps ? { userCaps } : {}),
     ...(caps ? { caps } : {}),
     ...(national || international ? { fraud: { ...(national ? { national } : {}), ...(international ? { international } : {}) } } : {})
   }
@@ -130,5 +133,5 @@ export const parseOutbound = (body: unknown): Outbound => {
   return { policy, profiles, assignments }
 }
 
-/** Nothing set: no profile (what the trunks call), no cap, the default thresholds. */
+/** Nothing set: no profile (what the trunks call), the default caps and thresholds. */
 export const EMPTY_OUTBOUND: Outbound = { policy: {}, profiles: [], assignments: [] }

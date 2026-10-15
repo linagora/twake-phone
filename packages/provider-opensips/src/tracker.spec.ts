@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { TelephonyEvent } from '@twake/telephony-types'
-import { CallTracker, isExternalParty, userOf } from './tracker.js'
+import { CallTracker, EMERGENCY_BURST_WINDOW_MS, alertOf, isExternalParty, userOf } from './tracker.js'
 
 // The events as OpenSIPS 3.6 sends them (captured on the Docker stack), trimmed to what the tracker reads.
 // usrloc's `expires` is an absolute time (seconds since the epoch).
@@ -556,6 +556,61 @@ describe('CallTracker', () => {
     tracker.handle('E_TWAKEPHONE_CALLING', g('g3', '200'))
     tracker.handle('E_ACC_MISSED_EVENT', { ...missed('g3', '101', '200', '480', 1792002801), dialled: '200' })
     expect(calls()).toEqual(['101:call.created:outbound:200:new', '101:call.failed:outbound:200:failed'])
+  })
+
+  it('makes a group call from the operator gone to its direct number\'s fallback a missed call for the members that rang, the fallback ringing on (review 6b, n°3)', () => {
+    const { tracker, calls, clear } = make()
+    for (const ext of ['102', '103', '104']) tracker.handle('E_UL_CONTACT_INSERT', contact(ext, `sip:${ext}@x.invalid`))
+    clear()
+    const g = (callee: string, group?: string) => ({ ...call('f1', '+33199000555', callee), dialled: '200', ...(group ? { group } : {}) })
+    tracker.handle('E_TWAKEPHONE_CALLING', g('200', '200'))
+    tracker.handle('E_TWAKEPHONE_RINGING', g('102', '200'))
+    tracker.handle('E_TWAKEPHONE_RINGING', g('103', '200'))
+    clear()
+    // Nobody of the group answered: the fallback (an extension) rings, then answers.
+    tracker.handle('E_TWAKEPHONE_FORWARDED', { ...g('104'), code: '480' })
+    expect(calls()).toEqual(['102:call.ended:inbound:+33199000555:missed', '103:call.ended:inbound:+33199000555:missed'])
+    clear()
+    tracker.handle('E_TWAKEPHONE_RINGING', g('104'))
+    tracker.handle('E_TWAKEPHONE_ANSWERED', g('104'))
+    expect(calls()).toEqual(['104:call.ringing:inbound:+33199000555:ringing', '104:call.connected:inbound:+33199000555:connected'])
+  })
+
+  it('tells the administrators of a number outside the rights and of emergency calls in a row, never the person; the thresholds by the Gateway\'s names (review 6b, n°11, n°20)', () => {
+    const { tracker, events, clear } = make()
+    clear()
+    tracker.handle('E_TWAKEPHONE_RIGHTS', { caller: '101', number: '+442079460123', param: 'international', callid: 'r1' })
+    expect(events.map(e => [e.extension, e.event.type === 'alert.raised' && e.event.payload.alert])).toEqual([['101', { kind: 'rights', param: 'international', scope: 'user', extension: '101', number: '+442079460123' }]])
+    expect(alertOf('E_TWAKEPHONE_RIGHTS', { caller: '101', param: 'Not A Class' })).toBeNull()
+    expect(alertOf('E_FRD_WARNING', { param: 'total-calls', value: 150, threshold: 150, user: '101', called_number: '33199000201' })).toMatchObject({ param: 'dailyAttempts' })
+    clear()
+    // Two emergency calls: nothing; the third within ten minutes: an alert, and each one after it.
+    for (const id of ['e1', 'e2']) tracker.handle('E_TWAKEPHONE_EMERGENCY', { caller: '102', number: '112', callid: id })
+    expect(events).toEqual([])
+    tracker.handle('E_TWAKEPHONE_EMERGENCY', { caller: '102', number: '112', callid: 'e3' })
+    tracker.handle('E_TWAKEPHONE_EMERGENCY', { caller: '102', number: '15', callid: 'e4' })
+    expect(events.map(e => e.event.type === 'alert.raised' && [e.extension, e.event.payload.alert.value, e.event.payload.alert.number])).toEqual([
+      ['102', 3, '112'],
+      ['102', 4, '15']
+    ])
+    // Another extension counts on its own; a number of the public network never.
+    tracker.handle('E_TWAKEPHONE_EMERGENCY', { caller: '103', number: '112', callid: 'e5' })
+    tracker.handle('E_TWAKEPHONE_EMERGENCY', { caller: '+33199000555', number: '112', callid: 'e6' })
+    expect(events).toHaveLength(2)
+  })
+
+  it('forgets the emergency calls older than the window, on the clock it was given (review 6b, n°11, n°21)', () => {
+    const events: unknown[] = []
+    let t = Date.parse('2026-10-14T18:00:00.000Z')
+    const tracker = new CallTracker((_, event) => void events.push(event), () => new Date(t).toISOString())
+    tracker.handle('E_TWAKEPHONE_EMERGENCY', { caller: '102', number: '112', callid: 'e1' })
+    tracker.handle('E_TWAKEPHONE_EMERGENCY', { caller: '102', number: '112', callid: 'e2' })
+    t += EMERGENCY_BURST_WINDOW_MS
+    tracker.handle('E_TWAKEPHONE_EMERGENCY', { caller: '102', number: '112', callid: 'e3' })
+    expect(events).toEqual([])
+    tracker.handle('E_TWAKEPHONE_EMERGENCY', { caller: '102', number: '112', callid: 'e4' })
+    tracker.handle('E_TWAKEPHONE_EMERGENCY', { caller: '102', number: '112', callid: 'e5' })
+    expect(events).toHaveLength(1)
   })
 
   it('creates a ring group call whose CALLING was lost from its first ringing, with the group as callee until a member answers', () => {

@@ -385,14 +385,28 @@ describe('OpensipsProvider call rules', () => {
       for await (const e of p.subscribe()) got.push(e)
     })()
     await until('the subscription', () => p.getStatus() === 'CONNECTED')
-    for (const e of ['E_FRD_WARNING', 'E_FRD_CRITICAL', 'E_TWAKEPHONE_LIMIT']) expect(sips.subscriptions.map(s => s.event)).toContain(e)
-    sips.push('E_FRD_CRITICAL', { param: 'calls-per-minute', value: 6, threshold: 6, user: '101', called_number: '442079460123', rule_id: 2, profile_id: 1 })
+    for (const e of ['E_FRD_WARNING', 'E_FRD_CRITICAL', 'E_TWAKEPHONE_LIMIT', 'E_TWAKEPHONE_RIGHTS', 'E_TWAKEPHONE_EMERGENCY']) expect(sips.subscriptions.map(s => s.event)).toContain(e)
+    sips.push('E_FRD_CRITICAL', { param: 'total-calls', value: 500, threshold: 500, user: '101', called_number: '442079460123', rule_id: 2, profile_id: 1 })
     sips.push('E_TWAKEPHONE_LIMIT', { caller: '102', number: '+33639980001', param: 'dailyMinutes', scope: 'tenant', callid: 'x1' })
-    await until('the alerts', () => got.filter(e => e.event.type === 'alert.raised').length === 2)
+    // Review 6b, n°11: a number outside the caller's rights, and emergency calls in a row (the third raises it).
+    sips.push('E_TWAKEPHONE_RIGHTS', { caller: '103', number: '+442079460123', param: 'international', callid: 'x2' })
+    for (const id of ['e1', 'e2', 'e3']) sips.push('E_TWAKEPHONE_EMERGENCY', { caller: '104', number: '112', callid: id })
+    await until('the alerts', () => got.filter(e => e.event.type === 'alert.raised').length === 4)
     expect(got.map(e => [e.extension, e.event.type === 'alert.raised' ? e.event.payload.alert : e.event.type])).toEqual([
-      ['101', { kind: 'fraud-critical', param: 'callsPerMinute', scope: 'user', value: 6, threshold: 6, extension: '101', number: '+442079460123' }],
-      ['102', { kind: 'limit', param: 'dailyMinutes', scope: 'tenant', extension: '102', number: '+33639980001' }]
+      ['101', { kind: 'fraud-critical', param: 'dailyAttempts', scope: 'user', value: 500, threshold: 500, extension: '101', number: '+442079460123' }],
+      ['102', { kind: 'limit', param: 'dailyMinutes', scope: 'tenant', extension: '102', number: '+33639980001' }],
+      ['103', { kind: 'rights', param: 'international', scope: 'user', extension: '103', number: '+442079460123' }],
+      ['104', { kind: 'emergency', param: 'burst', scope: 'user', value: 3, threshold: 3, extension: '104', number: '112' }]
     ])
+  })
+
+  it('says it is degraded while OpenSIPS\'s tables cannot count what the caps need, and why (review 6b)', () => {
+    let problem: string | undefined = 'acc.external is missing'
+    const p = new OpensipsProvider({ websocketUrl: 'wss://sip.example.test', domain: 'sip.example.test', sipSecretFor: async () => 's', schemaProblem: () => problem, logger: quiet })
+    expect(p.getStatus()).toBe('DEGRADED')
+    expect(p.getStatusReason()).toBe('acc.external is missing')
+    problem = undefined
+    expect(p.getStatus()).toBe('CONNECTED')
   })
 
   it('writes who can be woken where OpenSIPS reads it, only while it hears the events that say whom to wake', async () => {

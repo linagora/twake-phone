@@ -36,6 +36,15 @@ describe('parseOutbound', () => {
     expect(parseOutbound({})).toEqual({ profiles: [], policy: {}, assignments: [] })
   })
 
+  it('keeps a cap lifted (null) apart from one left to its default (absent), and the caps of those without a profile (review 6b, n°6)', () => {
+    expect(parseOutbound({ policy: { userCaps: { concurrent: 3, dailyMinutes: null }, caps: { concurrent: null } }, profiles: [{ id: 'a', allowed: [], caps: { dailyMinutes: null } }] })).toEqual({
+      profiles: [{ id: 'a', allowed: [], caps: { dailyMinutes: null } }],
+      policy: { userCaps: { concurrent: 3, dailyMinutes: null }, caps: { concurrent: null } },
+      assignments: []
+    })
+    expect(() => parseOutbound({ policy: { userCaps: { concurrent: 0 } } })).toThrow(/userCaps\.concurrent/)
+  })
+
   it('refuses what is not a profile, a cap, a threshold or a profile that exists, naming the field', () => {
     const bad: [Record<string, unknown>, RegExp][] = [
       [{ profiles: [{ id: 'National', allowed: [] }] }, /^id/],
@@ -62,26 +71,25 @@ describe('parseOutbound', () => {
   })
 })
 
-describe('the fallback number (FR-C8)', () => {
+describe('the fallback (FR-C8, review 6b, n°1)', () => {
   const trunk = { auth: 'ip', domain: 'operator.example', codecs: ['PCMA'], defaultNumber: '+33199000100' }
   const trunks = [{ id: 'operator' }]
-  it('is a number in E.164 of a trunk or of a range, never one of our own direct numbers (the call would come back)', () => {
-    expect(parseTrunk({ ...trunk, fallbackNumber: '+33199000199' }).config.fallbackNumber).toBe('+33199000199')
-    expect(() => parseTrunk({ ...trunk, fallbackNumber: '0199000199' })).toThrow(/^fallbackNumber/)
-    const others = [{ id: 'sales', trunkId: 'operator', first: '+33199000130', last: '+33199000139', suffixDigits: 3, fallbackNumber: '+33199000120' }]
-    expect(parseDid('desk', { trunkId: 'operator', first: '+33199000101', target: '101', fallbackNumber: '+33199000199' }, trunks, others).fallbackNumber).toBe('+33199000199')
-    expect(() => parseDid('desk', { trunkId: 'operator', first: '+33199000101', target: '101', fallbackNumber: '+33199000135' }, trunks, others)).toThrow(expect.objectContaining({ statusCode: 409, code: 'FALLBACK_LOOP' }))
-    expect(() => parseDid('desk', { trunkId: 'operator', first: '+33199000101', target: '101', fallbackNumber: '+33199000101' }, trunks, others)).toThrow(/come back/)
-    // A new range that takes in another one's fallback number.
-    expect(() => parseDid('desk', { trunkId: 'operator', first: '+33199000120', target: '101' }, trunks, others)).toThrow(expect.objectContaining({ code: 'FALLBACK_LOOP' }))
-    expect(trunkFromEnv({ TRUNK_DOMAIN: 'operator.example', TRUNK_AUTH: 'ip', TRUNK_DEFAULT_NUMBER: '+33199000100', TRUNK_FALLBACK_NUMBER: '+33199000199' })?.parsed.config.fallbackNumber).toBe('+33199000199')
-    expect(() => trunkFromEnv({ TRUNK_DOMAIN: 'operator.example', TRUNK_AUTH: 'ip', TRUNK_DEFAULT_NUMBER: '+33199000100', TRUNK_FALLBACK_NUMBER: '+33199000101', TRUNK_DIDS: '+33199000101=101' })).toThrow(/^TRUNK_FALLBACK_NUMBER/)
+  it('is an extension or a ring group of a trunk or of a range, never a number outside, nor where the number rings already', () => {
+    expect(parseTrunk({ ...trunk, fallbackTarget: '199' }).config.fallbackTarget).toBe('199')
+    for (const bad of ['+33199000199', '0199000199', '112', '1', 'abc']) expect(() => parseTrunk({ ...trunk, fallbackTarget: bad }), bad).toThrow(/^fallbackTarget/)
+    expect(parseDid('desk', { trunkId: 'operator', first: '+33199000101', target: '101', fallbackTarget: '199' }, trunks, []).fallbackTarget).toBe('199')
+    expect(() => parseDid('desk', { trunkId: 'operator', first: '+33199000101', target: '101', fallbackTarget: '101' }, trunks, [])).toThrow(expect.objectContaining({ statusCode: 409, code: 'FALLBACK_LOOP' }))
+    expect(() => parseDid('desk', { trunkId: 'operator', first: '+33199000101', target: '101', fallbackTarget: '+33199000199' }, trunks, [])).toThrow(/^fallbackTarget/)
+    // A range by suffix: the fallback is any extension or group.
+    expect(parseDid('staff', { trunkId: 'operator', first: '+33199000130', last: '+33199000139', suffixDigits: 3, fallbackTarget: '130' }, trunks, []).fallbackTarget).toBe('130')
+    expect(trunkFromEnv({ TRUNK_DOMAIN: 'operator.example', TRUNK_AUTH: 'ip', TRUNK_DEFAULT_NUMBER: '+33199000100', TRUNK_FALLBACK_TARGET: '199' })?.parsed.config.fallbackTarget).toBe('199')
+    expect(() => trunkFromEnv({ TRUNK_DOMAIN: 'operator.example', TRUNK_AUTH: 'ip', TRUNK_DEFAULT_NUMBER: '+33199000100', TRUNK_FALLBACK_TARGET: '+33199000199' })).toThrow(/fallbackTarget/)
   })
 })
 
 describe('outbound routes', () => {
   type Handed = [OutboundPolicy, OutboundProfile[], OutboundAssignment[]]
-  const setup = async (opts: { store?: MemoryStore; without?: boolean; events?: RoutedEvent[] } = {}) => {
+  const setup = async (opts: { store?: MemoryStore; without?: boolean; events?: RoutedEvent[]; beforeStart?: (app: Awaited<ReturnType<typeof buildApp>>) => void } = {}) => {
     process.env.AUTH_MODE = 'dev'
     const store = opts.store ?? new MemoryStore()
     await store.upsertMapping({ tenantId: 'A', userId: 'alice', extension: '101' })
@@ -115,6 +123,7 @@ describe('outbound routes', () => {
       publish(tenantId, userId, event)
     }
     const app = await buildApp(registry, { store, bus, directory: new StoreDirectory(store), tickets: new TicketStore(), admin: { adminRole: 'twakephone-admin', adminUsers: new Set() }, secretsKey: randomBytes(32) })
+    opts.beforeStart?.(app)
     registry.startAll()
     const as = (user: string, roles?: string, tenant = 'A') => ({ 'x-dev-user': user, 'x-dev-tenant': tenant, ...(roles ? { 'x-dev-roles': roles } : {}) })
     return { app, as, admin: as('root', 'twakephone-admin'), handed, store, control, published }
@@ -126,9 +135,9 @@ describe('outbound routes', () => {
 
   it('lets an administrator set the rights profiles, caps and thresholds, hands them whole to the provider, then keeps them', async () => {
     const { app, admin, handed, store } = await setup()
-    // Nothing set: no profile, no cap, the default thresholds (shown).
+    // Nothing set: no profile, the default caps and thresholds (shown, review 6b, n°6).
     const empty = await app.inject({ url: '/api/v1/admin/outbound', headers: admin })
-    expect(empty.json()).toMatchObject({ policy: {}, profiles: [], assignments: [], defaults: { fraud: { national: { callsPerMinute: { warning: 6, critical: 20 } } } } })
+    expect(empty.json()).toMatchObject({ policy: {}, profiles: [], assignments: [], defaults: { fraud: { national: { callsPerMinute: { warning: 6, critical: 20 } } }, caps: { user: { concurrent: 2, dailyMinutes: 300 }, tenant: { concurrent: 20, dailyMinutes: 3000 } } } })
     const body = { profiles, policy: { defaultProfile: 'internal', caps: { concurrent: 4 } }, assignments: [{ userId: 'alice', profileId: 'national' }] }
     const put = await app.inject({ method: 'PUT', url: '/api/v1/admin/outbound', headers: admin, payload: body })
     expect(put.statusCode).toBe(200)
@@ -194,10 +203,75 @@ describe('outbound routes', () => {
     await settle(async () => (await store.listAlerts('A')).length === 2)
     const list = await app.inject({ url: '/api/v1/admin/alerts?limit=10', headers: admin })
     expect(list.json().items).toEqual([
-      { at: '2026-10-15T10:01:00.000Z', ...limit, userId: 'alice' },
-      { at: '2026-10-15T10:00:00.000Z', ...alert, userId: 'alice' }
+      { id: expect.any(String), at: '2026-10-15T10:01:00.000Z', lastAt: '2026-10-15T10:01:00.000Z', count: 1, ...limit, userId: 'alice' },
+      { id: expect.any(String), at: '2026-10-15T10:00:00.000Z', lastAt: '2026-10-15T10:00:00.000Z', count: 1, ...alert, userId: 'alice' }
     ])
+    expect(list.json()).not.toHaveProperty('next')
     expect(published).toEqual([])
   })
 
+  it('counts an alert that repeats in one, pages them (next), filters them, and logs neither the number nor the extension nor who (review 6b, n°7)', async () => {
+    const limit = { kind: 'limit' as const, param: 'concurrent', scope: 'user' as const, extension: '101', number: '+33199000004' }
+    const at = (min: number) => new Date(Date.parse('2026-10-15T10:00:00.000Z') + min * 60_000).toISOString()
+    const events: RoutedEvent[] = [
+      ...Array.from({ length: 50 }, (_, i): RoutedEvent => ({ extension: '101', event: { type: 'alert.raised', timestamp: at(i), payload: { alert: limit } } })),
+      { extension: '101', event: { type: 'alert.raised', timestamp: at(51), payload: { alert: { kind: 'rights', param: 'international', scope: 'user', extension: '101', number: '+442079460123' } } } },
+      { extension: '101', event: { type: 'alert.raised', timestamp: at(52), payload: { alert: { kind: 'emergency', param: 'burst', scope: 'user', value: 3, threshold: 3, extension: '101', number: '112' } } } }
+    ]
+    const logged: unknown[] = []
+    const { app, admin, store } = await setup({
+      events,
+      beforeStart: built => {
+        const warn = built.log.warn.bind(built.log)
+        built.log.warn = ((...args: Parameters<typeof warn>) => {
+          logged.push(args)
+          return warn(...args)
+        })
+      }
+    })
+    await settle(async () => (await store.listAlerts('A')).length === 3)
+    // Tenant A's lines (the provider of tenant B tells the same).
+    const ofA = () => logged.filter(l => (l as [{ tenantId: string }])[0].tenantId === 'A')
+    await settle(() => ofA().length === 52)
+    const all = (await app.inject({ url: '/api/v1/admin/alerts', headers: admin })).json()
+    expect(all.items.map((a: { kind: string; count: number }) => [a.kind, a.count])).toEqual([['emergency', 1], ['rights', 1], ['limit', 50]])
+    expect(all.items[2]).toMatchObject({ at: at(0), lastAt: at(49) })
+    const first = (await app.inject({ url: '/api/v1/admin/alerts?limit=2', headers: admin })).json()
+    expect(first.items.map((a: { kind: string }) => a.kind)).toEqual(['emergency', 'rights'])
+    const second = (await app.inject({ url: `/api/v1/admin/alerts?limit=2&before=${first.next}`, headers: admin })).json()
+    expect(second.items.map((a: { kind: string }) => a.kind)).toEqual(['limit'])
+    expect(second).not.toHaveProperty('next')
+    expect((await app.inject({ url: '/api/v1/admin/alerts?kind=rights', headers: admin })).json().items).toHaveLength(1)
+    expect((await app.inject({ url: '/api/v1/admin/alerts?param=burst', headers: admin })).json().items).toMatchObject([{ kind: 'emergency', value: 3 }])
+    for (const bad of ['kind=other', 'before=abc', 'param=a%20b', 'limit=x']) {
+      const res = await app.inject({ url: `/api/v1/admin/alerts?${bad}`, headers: admin })
+      expect(res.statusCode, bad).toBe(400)
+      expect(res.json()).toMatchObject({ code: 'ALERTS_QUERY' })
+    }
+    // The log: what and how much, the extension as a hash (the same each time), never the number, the extension nor who.
+    const text = JSON.stringify(logged)
+    for (const secret of ['+33199000004', '+442079460123', '"101"', 'alice']) expect(text, secret).not.toContain(secret)
+    expect(ofA()).toHaveLength(52)
+    const hashes = new Set(ofA().map(l => (l as [{ alert: { ext: string } }])[0].alert.ext))
+    expect([...hashes]).toEqual([expect.stringMatching(/^[0-9a-f]{12}$/)])
+    expect((ofA()[0] as unknown[])[0]).toMatchObject({ alert: { kind: 'limit', param: 'concurrent', scope: 'user' } })
+  })
+
+  it('purges the alerts past their retention every hour, from their last repeat (review 6b, n°7)', async () => {
+    const store = new MemoryStore()
+    const old = new Date(Date.now() - 91 * 86_400_000).toISOString()
+    await store.addAlert({ tenantId: 'A', at: old, alert: { kind: 'limit', param: 'concurrent', scope: 'user', extension: '101' } })
+    await store.addAlert({ tenantId: 'A', at: new Date().toISOString(), alert: { kind: 'limit', param: 'dailyMinutes', scope: 'user', extension: '101' } })
+    const purged: string[] = []
+    const purge = store.purgeAlerts.bind(store)
+    store.purgeAlerts = async before => {
+      purged.push(before)
+      return purge(before)
+    }
+    const { app } = await setup({ store })
+    await app.ready()
+    await settle(async () => (await store.listAlerts('A')).length === 1)
+    expect((await store.listAlerts('A')).map(a => a.alert.param)).toEqual(['dailyMinutes'])
+    expect(purged.length).toBeGreaterThanOrEqual(1)
+  })
 })
