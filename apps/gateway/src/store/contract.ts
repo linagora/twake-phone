@@ -89,6 +89,14 @@ export const storeContract = (name: string, make: () => Promise<Store>) =>
       await s.close()
     })
 
+    it('does not count an inbound call the user declined as missed', async () => {
+      const s = await make()
+      await s.addHistory(entry({ callId: 'declined', direction: 'inbound', answered: false, durationSec: 0, state: 'rejected', remoteNumber: '102' }))
+      await s.addHistory(entry({ callId: 'missed', direction: 'inbound', answered: false, durationSec: 0, state: 'missed', remoteNumber: '103', startedAt: '2026-10-05T11:00:00.000Z' }))
+      expect((await s.listHistory('A', 'alice', { status: 'missed' })).items.map(e => e.callId)).toEqual(['missed'])
+      await s.close()
+    })
+
     it('filters and paginates, newest first', async () => {
       const s = await make()
       await s.addHistory(entry({ callId: '1', startedAt: '2026-10-05T08:00:00.000Z' }))

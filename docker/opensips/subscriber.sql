@@ -20,7 +20,8 @@ INSERT INTO version (table_name, table_version) VALUES ('subscriber', 8)
   ON CONFLICT (table_name) DO NOTHING;
 
 -- OpenSIPS acc schema (acc, missed_calls: the CDRs, the reference of the call history), plus the caller and callee
--- as dialled (acc extra fields), which the default columns do not carry.
+-- as dialled (acc extra fields), which the default columns do not carry; added to tables created beforehand by
+-- OpenSIPS's own scripts, or every CDR insert would fail.
 CREATE TABLE IF NOT EXISTS acc (
     id SERIAL PRIMARY KEY NOT NULL,
     method VARCHAR(16) DEFAULT '' NOT NULL,
@@ -38,6 +39,8 @@ CREATE TABLE IF NOT EXISTS acc (
     callee VARCHAR(64) DEFAULT '' NOT NULL
 );
 CREATE INDEX IF NOT EXISTS acc_callid_idx ON acc (callid);
+ALTER TABLE acc ADD COLUMN IF NOT EXISTS caller VARCHAR(64) DEFAULT '' NOT NULL;
+ALTER TABLE acc ADD COLUMN IF NOT EXISTS callee VARCHAR(64) DEFAULT '' NOT NULL;
 CREATE TABLE IF NOT EXISTS missed_calls (
     id SERIAL PRIMARY KEY NOT NULL,
     method VARCHAR(16) DEFAULT '' NOT NULL,
@@ -53,5 +56,7 @@ CREATE TABLE IF NOT EXISTS missed_calls (
     callee VARCHAR(64) DEFAULT '' NOT NULL
 );
 CREATE INDEX IF NOT EXISTS missed_calls_callid_idx ON missed_calls (callid);
+ALTER TABLE missed_calls ADD COLUMN IF NOT EXISTS caller VARCHAR(64) DEFAULT '' NOT NULL;
+ALTER TABLE missed_calls ADD COLUMN IF NOT EXISTS callee VARCHAR(64) DEFAULT '' NOT NULL;
 INSERT INTO version (table_name, table_version) VALUES ('acc', 7), ('missed_calls', 5)
   ON CONFLICT (table_name) DO NOTHING;

@@ -12,6 +12,7 @@
 //   OPENSIPS_DB_URL      the database auth_db reads (default postgres://twake:twake@127.0.0.1:54320/twake)
 //   OPENSIPS_MI_URL      the MI socket of OpenSIPS, where the Gateway subscribes to its events (default udp:127.0.0.1:8880)
 //   RTPENGINE_DTMF_LOG   where rtpengine reports the tones it sees (default 127.0.0.1:22223); "off" skips the check
+//   SIP_E2E_PRESENCE_MS  how long a presence change may take to show in the directory (default 3000; raise it on a loaded runner)
 import { randomBytes } from 'node:crypto'
 import { createSocket } from 'node:dgram'
 import { createServer, connect } from 'node:net'
@@ -37,6 +38,7 @@ const OPENSIPS_MI_URL = process.env.OPENSIPS_MI_URL ?? 'udp:127.0.0.1:8880'
 const DTMF_LOG = process.env.RTPENGINE_DTMF_LOG ?? '127.0.0.1:22223'
 const TENANT = 'e2e'
 const BROWSER = process.env.BROWSER ?? 'chromium'
+const PRESENCE_MS = Number(process.env.SIP_E2E_PRESENCE_MS) || 3_000
 
 const freePort = () =>
   new Promise((resolve, reject) => {
@@ -168,8 +170,9 @@ const web = await serveApp({
   policy: { connectSrc: [new URL(relayUrl).origin] }
 })
 const db = new pg.Pool({ connectionString: OPENSIPS_DB_URL, max: 1 })
-// The CDRs of this run only (a local stack keeps those of the previous runs).
-await db.query('TRUNCATE acc, missed_calls')
+// The CDRs of this run only: the rows written after it started (the database may keep other runs', or be shared).
+const lastId = async table => (await db.query(`SELECT coalesce(max(id), 0) AS id FROM ${table}`)).rows[0].id
+const since = { acc: await lastId('acc'), missed_calls: await lastId('missed_calls') }
 
 // A microphone that produces a tone, no permission prompt, sound allowed without a gesture, OpenSIPS's self-signed
 // certificate accepted (Firefox: through the context's ignoreHTTPSErrors). Firefox ignores ICE candidates on the
@@ -376,12 +379,12 @@ try {
     await alice.page.getByText('Appel avec 102 terminé.').waitFor()
     expectEqual((await calls(alice.page)).length, 0, 'calls left on Alice side')
   })
-  await step('the Gateway heard the calls from OpenSIPS: Récents on both sides (Jean missed the one he refused), the CDR in acc', async () => {
+  await step('the Gateway heard the calls from OpenSIPS: Récents on both sides (Jean declined one, it reads Refusé), the CDR in acc', async () => {
     expectEqual(await recents(alice.page, 3), ['102: Sortant', '102: Sortant', '105: Sortant'], "Alice's recent calls")
-    expectEqual(await recents(jean.page, 2), ['101: Entrant', '101: Manqué'], "Jean's recent calls")
-    const { rows } = await db.query('SELECT caller, callee, sip_code, duration FROM acc ORDER BY id')
+    expectEqual(await recents(jean.page, 2), ['101: Entrant', '101: Refusé'], "Jean's recent calls")
+    const { rows } = await db.query('SELECT caller, callee, sip_code, duration FROM acc WHERE id > $1 ORDER BY id', [since.acc])
     expectEqual(rows.map(r => `${r.caller}>${r.callee} ${r.sip_code} ${r.duration > 0 ? 'talked' : 'silent'}`), ['101>102 200 talked'], 'CDRs in acc')
-    const missed = await db.query('SELECT caller, callee, sip_code FROM missed_calls ORDER BY id')
+    const missed = await db.query('SELECT caller, callee, sip_code FROM missed_calls WHERE id > $1 ORDER BY id', [since.missed_calls])
     expectEqual(missed.rows.map(r => `${r.caller}>${r.callee} ${r.sip_code}`), ['101>105 404', '101>102 603'], 'rows in missed_calls')
   })
   await step('the directory says who is free: Jean is available, Bob (not signed in) is offline', async () => {
@@ -389,17 +392,17 @@ try {
     await presenceIs(alice.page, 'Durand', '103', 'Hors ligne')
     await presenceIs(jean.page, 'Martin', '101', 'Disponible')
   })
-  await step('Jean calls Alice, who answers from the directory: Jean reads as in a call within 3 s, available again once they hang up', async () => {
+  await step(`Jean calls Alice, who answers from the directory: Jean reads as in a call within ${PRESENCE_MS / 1000} s, available again once they hang up`, async () => {
     await presenceIs(alice.page, 'Dupont', '102', 'Disponible')
     await dial(jean.page, '101')
-    await alice.page.getByTestId('presence-102').filter({ hasText: 'En communication' }).waitFor({ timeout: 3_000 })
+    await alice.page.getByTestId('presence-102').filter({ hasText: 'En communication' }).waitFor({ timeout: PRESENCE_MS })
     await alice.page.getByTestId('incoming-call').getByRole('button', { name: 'Répondre' }).click()
     await jean.page.getByText('En communication avec 101').waitFor()
-    await presenceIs(jean.page, 'Martin', '101', 'En communication', 3_000)
+    await presenceIs(jean.page, 'Martin', '101', 'En communication', PRESENCE_MS)
     await alice.page.getByRole('button', { name: 'Raccrocher' }).click()
     await jean.page.getByText('Appel avec 101 terminé.').waitFor()
-    await alice.page.getByTestId('presence-102').filter({ hasText: 'Disponible' }).waitFor({ timeout: 3_000 })
-    await jean.page.getByTestId('presence-101').filter({ hasText: 'Disponible' }).waitFor({ timeout: 3_000 })
+    await alice.page.getByTestId('presence-102').filter({ hasText: 'Disponible' }).waitFor({ timeout: PRESENCE_MS })
+    await jean.page.getByTestId('presence-101').filter({ hasText: 'Disponible' }).waitFor({ timeout: PRESENCE_MS })
   })
   await step('Alice calls Jean and gives up while it rings: a missed call for Jean, in his Récents and in missed_calls (487)', async () => {
     await dial(alice.page, '102')
@@ -408,7 +411,7 @@ try {
     await jean.page.getByTestId('incoming-call').waitFor({ state: 'hidden' })
     expectEqual((await recents(jean.page, 4))[0], '101: Manqué', "Jean's newest recent call")
     expectEqual((await recents(alice.page, 5)).slice(0, 2), ['102: Sortant', '102: Entrant'], "Alice's newest recent calls")
-    const missed = await db.query("SELECT caller, callee, sip_code FROM missed_calls WHERE sip_code = '487'")
+    const missed = await db.query("SELECT caller, callee, sip_code FROM missed_calls WHERE sip_code = '487' AND id > $1", [since.missed_calls])
     expectEqual(missed.rows.map(r => `${r.caller}>${r.callee}`), ['101>102'], 'cancelled call in missed_calls')
   })
   await step('Alice chooses a microphone and outputs in the settings: the next call uses them, the ringtone can be tested', async () => {

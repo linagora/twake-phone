@@ -2,10 +2,12 @@ import { describe, expect, it } from 'vitest'
 import { buildApp } from './app.js'
 import { TicketStore } from './auth.js'
 import { StoreDirectory } from './directory.js'
+import { EventBus } from './events.js'
 import { MemoryStore } from './store/memory.js'
 import { ProviderRegistry } from './registry.js'
 import type { ProviderFactory, RoutedEvent, TelephonyProvider } from '@twake/telephony-provider-sdk'
 import type { Presence, TelephonyEvent, User } from '@twake/telephony-types'
+import type { HistoryEntry } from './store/types.js'
 
 const caps = { calling: { outbound: true, inbound: true, answer: false, hangup: true, hold: true, transfer: false, dtmf: true }, media: { browserAudio: true }, presence: { read: true, write: true, realtime: true, statuses: [] }, history: false, conference: { dialIn: false, dialOut: false } }
 const fakeFactory: ProviderFactory<unknown> = {
@@ -36,6 +38,22 @@ describe('gateway', () => {
       headers: { 'x-dev-user': 'user1' }
     })
     expect(res.json().calling.outbound).toBe(true)
+  })
+
+  it('is ready while every provider can place calls, and says which are degraded', async () => {
+    const statuses = new Map<string, string>([['A', 'CONNECTED'], ['B', 'DEGRADED']])
+    const factory: ProviderFactory<unknown> = { type: 'fake', create: (_c: unknown, ctx?: { tenantId: string }) => ({ ...fakeFactory.create({}), getStatus: () => statuses.get(ctx?.tenantId ?? '') }) as unknown as TelephonyProvider }
+    const registry = new ProviderRegistry([{ tenantId: 'A', type: 'fake', config: {} }, { tenantId: 'B', type: 'fake', config: {} }], [factory])
+    const app = await buildApp(registry)
+    registry.startAll()
+    let res = await app.inject('/ready')
+    expect([res.statusCode, res.json()]).toEqual([200, { ready: true, degraded: 1 }])
+    statuses.set('B', 'CONNECTED')
+    res = await app.inject('/ready')
+    expect([res.statusCode, res.json()]).toEqual([200, { ready: true }])
+    statuses.set('A', 'DISCONNECTED')
+    res = await app.inject('/ready')
+    expect([res.statusCode, res.json()]).toEqual([503, { ready: false }])
   })
 
   it('rejects unauthenticated calls', async () => {
@@ -122,6 +140,14 @@ describe('history, tenants and tickets', () => {
     expect(page.next).toBeTruthy()
   })
 
+  it('flags a call the user declined as declined, not missed', async () => {
+    const { app, store, as, entry } = await setup()
+    await store.addHistory(entry({ callId: 'd', direction: 'inbound', answered: false, durationSec: 0, state: 'rejected' }))
+    const items = (await app.inject({ url: '/api/v1/calls/history', headers: as('alice') })).json().items
+    expect(items).toEqual([expect.objectContaining({ id: 'd', state: 'rejected', missed: false })])
+    expect((await app.inject({ url: '/api/v1/calls/history?status=missed', headers: as('alice') })).json().items).toEqual([])
+  })
+
   it('rejects malformed filters instead of passing them on', async () => {
     const { app, as } = await setup()
     for (const q of ['direction=sideways', 'status=x', 'limit=abc', 'limit=0', 'from=yesterday', `number=${'9'.repeat(40)}`]) {
@@ -193,19 +219,56 @@ describe('presence of the tenant', () => {
     return { factory: { type: 'pushing', create } as ProviderFactory<unknown>, push }
   }
   const presence = (status: Presence['status']): TelephonyEvent => ({ type: 'presence.changed', timestamp: '2026-10-14T18:00:00.000Z', payload: { userId: '', presence: { status, source: 'telephony' } } })
-  const setup = async () => {
+  const setup = async (store = new MemoryStore(), bus = new EventBus()) => {
     process.env.AUTH_MODE = 'dev'
-    const store = new MemoryStore()
     await store.upsertMapping({ tenantId: 'A', userId: 'alice', extension: '101' })
     await store.upsertMapping({ tenantId: 'A', userId: 'bob', extension: '102' })
     await store.upsertMapping({ tenantId: 'B', userId: 'carol', extension: '101' })
     const { factory, push } = pushing()
     const registry = new ProviderRegistry([{ tenantId: 'A', type: 'pushing', config: {} }, { tenantId: 'B', type: 'pushing', config: {} }], [factory])
-    const app = await buildApp(registry, { store, directory: new StoreDirectory(store), tickets: new TicketStore() })
+    const app = await buildApp(registry, { store, bus, directory: new StoreDirectory(store), tickets: new TicketStore() })
     registry.startAll()
     const as = (user: string, tenant = 'A') => ({ 'x-dev-user': user, 'x-dev-tenant': tenant })
     return { app, push, as }
   }
+  const ended = (id: string): TelephonyEvent => ({ type: 'call.ended', timestamp: '2026-10-14T18:01:00.000Z', payload: { call: { id, direction: 'outbound', state: 'ended', remoteNumber: '102', startedAt: '2026-10-14T18:00:00.000Z', connectedAt: '2026-10-14T18:00:05.000Z', endedAt: '2026-10-14T18:01:00.000Z' } } })
+
+  it('keeps pumping when one event fails (the directory down a moment)', async () => {
+    let failures = 1
+    const store = new (class extends MemoryStore {
+      override async getMappingByExtension(tenantId: string, extension: string) {
+        if (extension === '101' && failures-- > 0) throw new Error('database gone for a moment')
+        return super.getMappingByExtension(tenantId, extension)
+      }
+    })()
+    const { app, push, as } = await setup(store)
+    push('101', presence('busy'))
+    push('101', presence('available'))
+    push('102', presence('busy'))
+    await new Promise(r => setTimeout(r, 50))
+    const items = (await app.inject({ url: '/api/v1/presence', headers: as('bob') })).json().items
+    expect(items.map((i: { extension: string; presence: Presence }) => `${i.extension}:${i.presence.status}`)).toEqual(['101:available', '102:busy'])
+    await app.close()
+  })
+
+  it('records the history of a call before telling it ended (the app reloads its history then)', async () => {
+    const recorded: HistoryEntry[] = []
+    const store = new (class extends MemoryStore {
+      override async addHistory(entry: HistoryEntry) {
+        await new Promise(r => setTimeout(r, 20))
+        recorded.push(entry)
+        return super.addHistory(entry)
+      }
+    })()
+    const bus = new EventBus()
+    const { app, push } = await setup(store, bus)
+    const seen: number[] = []
+    bus.subscribe('A', 'alice', () => seen.push(recorded.length))
+    push('101', ended('c1'))
+    await new Promise(r => setTimeout(r, 100))
+    expect(seen).toEqual([1])
+    await app.close()
+  })
 
   it('lists the presence of every extension the provider told about, to anyone of the tenant and to nobody else', async () => {
     const { app, push, as } = await setup()
@@ -248,6 +311,22 @@ describe('presence of the tenant', () => {
     expect(carol.got).toEqual([])
     for (const w of [alice, bob, carol]) w.ws.close()
     await app.close()
+  })
+
+  it('keeps the tenant channel apart from the users: a user named "*" hears only their own calls', () => {
+    const bus = new EventBus()
+    const star: TelephonyEvent[] = []
+    const tenant: TelephonyEvent[] = []
+    bus.subscribe('A', '*', e => star.push(e))
+    const stop = bus.subscribeTenant('A', e => tenant.push(e))
+    bus.publish('A', '*', ended('mine'))
+    bus.broadcast('A', presence('busy'))
+    bus.broadcast('B', presence('dnd'))
+    expect(star.map(e => e.type)).toEqual(['call.ended'])
+    expect(tenant.map(e => e.type)).toEqual(['presence.changed'])
+    stop()
+    bus.broadcast('A', presence('away'))
+    expect(tenant).toHaveLength(1)
   })
 
   it('answers a presence set by the user with what the others see', async () => {

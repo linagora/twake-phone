@@ -55,6 +55,8 @@ services:
     environment:
       SIP_DOMAIN: ${SIP_DOMAIN:-127.0.0.1}
       LISTEN_IP: ${LISTEN_IP:-127.0.0.1}
+      # The MI (no authentication) stays on the loopback whatever LISTEN_IP is: the Gateway runs on this host.
+      MI_LISTEN_IP: ${MI_LISTEN_IP:-127.0.0.1}
       OPENSIPS_DB_URL: postgres://twake:twake@127.0.0.1:54320/twake
       RTPENGINE_SOCK: udp:127.0.0.1:22222
       OPENSIPS_LOG_LEVEL: ${OPENSIPS_LOG_LEVEL:-2}

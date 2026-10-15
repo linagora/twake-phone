@@ -138,7 +138,7 @@ Mécanismes :
 - **Secrets de configuration** : la configuration d'un provider ne contient que des références (`env:ARI_PASSWORD`), résolues au démarrage.
 - **Registre de providers par tenant** (`registry.ts`) : point d'extension multi-tenant et multi-provider.
 - **Bus d'événements** (`events.ts`) : diffuse chaque appel à ses seuls participants et chaque changement de présence à tout le tenant ; la passerelle garde la présence courante par poste pour `GET /presence`. Mémoire aujourd'hui, interface prévue pour Redis (qui devra aussi porter la présence entre réplicas).
-- **Prêt à fonctionner** : `/ready` n'est vert que si tous les providers sont `CONNECTED` ; `originate` refuse (503) si la liaison PBX est coupée.
+- **Prêt à fonctionner** : `/ready` est vert tant que tous les providers sont `CONNECTED` ou `DEGRADED` (les appels passent ; le corps donne alors `degraded`, leur nombre), 503 sinon ; `originate` refuse (503) si la liaison PBX est coupée.
 - Les journaux masquent les en-têtes d'autorisation et les tickets.
 
 ## 4. provider-asterisk (provider de référence du POC, retiré à l'étape 4)

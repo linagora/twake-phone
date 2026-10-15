@@ -9,6 +9,12 @@ describe('SUBSCRIBER_SCHEMA', () => {
     const statements = (sql: string) => sql.split('\n').filter(l => !l.startsWith('--')).join('\n').trim()
     expect(statements(file)).toBe(statements(SUBSCRIBER_SCHEMA))
   })
+
+  it('adds the caller and callee columns to acc tables created beforehand by OpenSIPS (its scripts lack them)', () => {
+    for (const table of ['acc', 'missed_calls']) {
+      for (const column of ['caller', 'callee']) expect(SUBSCRIBER_SCHEMA).toContain(`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS ${column} VARCHAR(64) DEFAULT '' NOT NULL;`)
+    }
+  })
 })
 
 describe('digestHashes', () => {
@@ -70,6 +76,15 @@ if (process.env.TEST_DATABASE_URL) {
       expect(version.rows[0]).toEqual({ table_version: SUBSCRIBER_TABLE_VERSION })
       await p.removeSipSecret('101')
       expect((await pool.query('SELECT username FROM subscriber')).rows).toEqual([{ username: '102' }])
+    })
+
+    it('adds caller and callee to an acc table OpenSIPS created without them', async () => {
+      await pool.query('DROP TABLE IF EXISTS acc; CREATE TABLE acc (id SERIAL PRIMARY KEY NOT NULL, callid VARCHAR(64) DEFAULT \'\' NOT NULL, time TIMESTAMP WITHOUT TIME ZONE NOT NULL)')
+      await new SubscriberProvisioner({ pool, realm: 'sip.example.test' }).ensureSchema()
+      const { rows } = await pool.query("SELECT column_name FROM information_schema.columns WHERE table_name = 'acc' AND column_name IN ('caller', 'callee') ORDER BY column_name")
+      expect(rows.map(r => r.column_name)).toEqual(['callee', 'caller'])
+      // Recreated whole by the next ensureSchema.
+      await pool.query('DROP TABLE acc')
     })
   })
 }

@@ -1,10 +1,10 @@
-import { clampLimit, type HistoryEntry, type HistoryPage, type HistoryQuery, type ConferenceRecord, type ProviderRecord, type Store, type UserMapping } from './types.js'
+import { clampLimit, isMissed, type HistoryEntry, type HistoryPage, type HistoryQuery, type ConferenceRecord, type ProviderRecord, type Store, type UserMapping } from './types.js'
 
 const key = (...parts: string[]) => parts.join('\u0000')
 
 export const matchesHistory = (e: HistoryEntry, q: HistoryQuery): boolean => {
   if (q.direction && e.direction !== q.direction) return false
-  if (q.status === 'missed' && !(e.direction === 'inbound' && !e.answered)) return false
+  if (q.status === 'missed' && !isMissed(e)) return false
   if (q.status === 'answered' && !e.answered) return false
   if (q.status === 'failed' && e.state !== 'failed') return false
   if (q.number && !e.remoteNumber.includes(q.number)) return false

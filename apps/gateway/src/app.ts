@@ -16,7 +16,7 @@ import { historyEntryFor } from './history.js'
 import type { ProviderRegistry } from './registry.js'
 import { securityHeadersFor, type SecurityOptions } from './security.js'
 import { MemoryStore } from './store/memory.js'
-import type { HistoryEntry, HistoryQuery, Store } from './store/types.js'
+import { isMissed, type HistoryEntry, type HistoryQuery, type Store } from './store/types.js'
 
 const STATUSES: PresenceStatus[] = ['available', 'busy', 'away', 'dnd', 'offline']
 const DIRECTIONS: CallDirection[] = ['inbound', 'outbound']
@@ -93,7 +93,8 @@ const publicEntry = (e: HistoryEntry) => ({
   durationSec: e.durationSec,
   state: e.state,
   answered: e.answered,
-  missed: e.direction === 'inbound' && !e.answered
+  // Missed: the phone rang and nobody took the call. One the user declined (state `rejected`) is not.
+  missed: isMissed(e)
 })
 
 export const buildApp = async (registry: ProviderRegistry, options: BuildOptions = {}) => {
@@ -169,22 +170,31 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
     return map
   }
   // Pump provider events to the Twake users they concern, and keep the history of finished calls. A presence is
-  // everyone's business in the tenant (the directory shows it); a call is its two parties' only.
+  // everyone's business in the tenant (the directory shows it); a call is its two parties' only. One event that
+  // fails (the directory or the database down a moment) is logged and skipped: the stream goes on.
+  const deliver = async (tenantId: string, extension: string, event: TelephonyEvent) => {
+    const userId = await dir.userIdForExtension(tenantId, extension)
+    if (!userId) return
+    if (event.type === 'presence.changed') {
+      const mapped: TelephonyEvent = { ...event, payload: { ...event.payload, userId, extension } }
+      presencesOf(tenantId).set(extension, { userId, presence: event.payload.presence })
+      bus.broadcast(tenantId, mapped)
+      return
+    }
+    trackOwner(tenantId, userId, event)
+    // Recorded before it is told: the app reloads its history when it hears that a call ended.
+    const entry = historyEntryFor(tenantId, userId, event)
+    if (entry) await store.addHistory(entry).catch(err => app.log.error({ err }, 'could not record call history'))
+    bus.publish(tenantId, userId, event)
+  }
   registry.onCreate = (tenantId, provider) => {
     void (async () => {
       for await (const { extension, event } of provider.subscribe()) {
-        const userId = await dir.userIdForExtension(tenantId, extension)
-        if (!userId) continue
-        if (event.type === 'presence.changed') {
-          const mapped: TelephonyEvent = { ...event, payload: { ...event.payload, userId, extension } }
-          presencesOf(tenantId).set(extension, { userId, presence: event.payload.presence })
-          bus.broadcast(tenantId, mapped)
-          continue
+        try {
+          await deliver(tenantId, extension, event)
+        } catch (err) {
+          app.log.error({ err, tenantId, type: event.type }, 'provider event not delivered')
         }
-        trackOwner(tenantId, userId, event)
-        bus.publish(tenantId, userId, event)
-        const entry = historyEntryFor(tenantId, userId, event)
-        if (entry) await store.addHistory(entry).catch(err => app.log.error({ err }, 'could not record call history'))
       }
     })().catch(err => app.log.error({ err }, 'provider event stream failed'))
   }
@@ -194,9 +204,13 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
   })
 
   app.get('/health', async () => ({ status: 'ok' }))
+  // Ready while every provider can place calls: DEGRADED (events lost, calls still going through) says so in the
+  // body without taking the Gateway out of service.
   app.get('/ready', async (_req, reply) => {
-    const ready = registry.all().every(p => p.getStatus() === 'CONNECTED')
-    return reply.code(ready ? 200 : 503).send({ ready })
+    const statuses = registry.all().map(p => p.getStatus())
+    const ready = statuses.every(s => s === 'CONNECTED' || s === 'DEGRADED')
+    const degraded = statuses.filter(s => s === 'DEGRADED').length
+    return reply.code(ready ? 200 : 503).send({ ready, ...(degraded ? { degraded } : {}) })
   })
   app.get('/openapi.json', async () => app.swagger())
 

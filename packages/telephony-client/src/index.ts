@@ -90,7 +90,7 @@ export class TelephonyClient {
         ...init.headers
       }
     })
-    if (!res.ok) throw new Error(`Gateway ${res.status} on ${path}`)
+    if (!res.ok) throw Object.assign(new Error(`Gateway ${res.status} on ${path}`), { status: res.status })
     if (res.status === 204) {
       // Drain the empty body: a response left unread shows up as an aborted request in the browser.
       await res.text()
@@ -220,9 +220,10 @@ export class TelephonyClient {
   /**
    * Opens the event stream and keeps it open (exponential backoff + jitter). A browser cannot send headers on a
    * WebSocket, so each attempt first trades the credentials for a single-use ticket over an authenticated call.
-   * Returns a function that stops it.
+   * `onOpen` runs each time the stream opens, the first time and after each reconnection: what was told while it
+   * was closed is lost, so that is when to read the state again. Returns a function that stops it.
    */
-  connect(onEvent: (event: TelephonyEvent) => void): () => void {
+  connect(onEvent: (event: TelephonyEvent) => void, { onOpen }: { onOpen?: () => void } = {}): () => void {
     let stopped = false
     let attempt = 0
     let ws: WebSocket | undefined
@@ -241,6 +242,7 @@ export class TelephonyClient {
       }
       ws.onopen = () => {
         attempt = 0
+        onOpen?.()
       }
       ws.onmessage = e => onEvent(JSON.parse(String(e.data)) as TelephonyEvent)
       ws.onclose = retry

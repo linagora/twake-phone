@@ -3,9 +3,10 @@
 # authentication on the `subscriber` table the Gateway fills, calls between registered users through rtpengine
 # (DTLS-SRTP on both legs), hold by re-INVITE, transfers by REFER and Replaces between the browsers (ADR 0010: the
 # proxy relays them, it does not implement them). Step 4: what happens here is told to the Gateway through the
-# Event Interface (registrations, ringing, answered, CDR, missed calls; `event_datagram` on the loopback, the
-# Gateway subscribes through MI) and accounted in the database (`acc`, `missed_calls`). Trunk, forwards and groups
-# come with steps 4b and 6. Everything in here is OpenSIPS-specific; the Gateway only knows `provider-opensips`.
+# Event Interface (registrations, ringing, answered, CDR, missed calls; `event_datagram` to the address the
+# Gateway gives when it subscribes through MI, the loopback by default) and accounted in the database (`acc`,
+# `missed_calls`). Trunk, forwards and groups come with steps 4b and 6. Everything in here is OpenSIPS-specific;
+# the Gateway only knows `provider-opensips`.
 
 log_level=${OPENSIPS_LOG_LEVEL}
 xlog_level=${OPENSIPS_LOG_LEVEL}
@@ -64,9 +65,11 @@ loadmodule "sipmsgops.so"
 loadmodule "mi_fifo.so"
 modparam("mi_fifo", "fifo_name", "${MI_FIFO}")
 modparam("mi_fifo", "fifo_mode", 0666)
-# MI for the Gateway (provider-opensips): JSON-RPC over UDP on the loopback (event subscriptions, ul_dump).
+# MI for the Gateway (provider-opensips): JSON-RPC over UDP (event subscriptions, uptime, ul_dump, dlg_list), on its
+# own address, the loopback by default: it has no authentication, and opening SIP to a network (LISTEN_IP) must not
+# open it too. entrypoint.sh refuses a MI_LISTEN_IP that is neither loopback nor private unless told otherwise.
 loadmodule "mi_datagram.so"
-modparam("mi_datagram", "socket_name", "udp:${LISTEN_IP}:${MI_PORT}")
+modparam("mi_datagram", "socket_name", "udp:${MI_LISTEN_IP}:${MI_PORT}")
 
 #### Events towards the Gateway: JSON-RPC notifications over UDP to whoever subscribed through MI (event_subscribe)
 loadmodule "event_datagram.so"
@@ -250,12 +253,11 @@ route {
 	$acc_extra(caller) = $fU;
 	$acc_extra(callee) = $rU;
 	do_accounting("db|evi", "cdr|missed");
-	# The call starts: told to the Gateway (ringing, answer and end follow; the end comes from acc).
-	route(event_attrs);
-	raise_event("E_TWAKEPHONE_CALLING", $avp(ev_attr), $avp(ev_val));
 
 	# Every registered window of the callee rings (parallel forking); the first that answers takes the call.
 	if (!lookup("location")) {
+		# Refused through a transaction: acc tells the Gateway (missed event, 404) how the call it announces ended.
+		route(calling);
 		t_reply(404, "Not Found");
 		exit;
 	}
@@ -264,7 +266,16 @@ route {
 		route(rtp_offer);
 	t_on_reply("rtp");
 	t_on_failure("call_failed");
+	# The call starts: told to the Gateway only now, once nothing can refuse it without a transaction (rtp_offer
+	# answers 503 statelessly, which acc never sees): from here on, acc always tells how it ended.
+	route(calling);
 	route(relay);
+}
+
+# Ringing, answer and end follow: our own events, then acc's CDR or missed call.
+route[calling] {
+	route(event_attrs);
+	raise_event("E_TWAKEPHONE_CALLING", $avp(ev_attr), $avp(ev_val));
 }
 
 route[relay] {
@@ -297,8 +308,9 @@ onreply_route[rtp] {
 
 # The attributes of our events (E_TWAKEPHONE_*): who calls whom as dialled, and the Call-ID the CDR carries too.
 route[event_attrs] {
-	$avp(ev_attr) = NULL;
-	$avp(ev_val) = NULL;
+	# Every value: `$avp(x) = NULL` only removes the last one, and these lists are built anew for each event.
+	$(avp(ev_attr)[*]) = NULL;
+	$(avp(ev_val)[*]) = NULL;
 	$avp(ev_attr) = "callee";
 	$avp(ev_val) = $avp(callee);
 	$avp(ev_attr) = "caller";

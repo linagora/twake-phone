@@ -28,6 +28,7 @@
   "recents.inbound": "Incoming",
   "recents.outbound": "Outgoing",
   "recents.missed": "Missed",
+  "recents.declined": "Declined",
   "directory.title": "Directory",
   "settings.title": "Settings",
   "settings.account": "Account",

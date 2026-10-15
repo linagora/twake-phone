@@ -24,7 +24,8 @@ export const digestHashes = (username: string, realm: string, secret: string) =>
 /**
  * The schema OpenSIPS 3.6 ships for PostgreSQL (`subscriber` of auth_db; `acc` and `missed_calls` of acc, the
  * CDRs, with the caller and callee as dialled as extra columns), plus the rows of the `version` table it checks
- * at startup.
+ * at startup. Tables created beforehand by OpenSIPS's own scripts lack the extra columns: they are added, or
+ * every CDR insert would fail.
  */
 export const SUBSCRIBER_SCHEMA = `
 CREATE TABLE IF NOT EXISTS version (
@@ -63,6 +64,8 @@ CREATE TABLE IF NOT EXISTS acc (
     callee VARCHAR(64) DEFAULT '' NOT NULL
 );
 CREATE INDEX IF NOT EXISTS acc_callid_idx ON acc (callid);
+ALTER TABLE acc ADD COLUMN IF NOT EXISTS caller VARCHAR(64) DEFAULT '' NOT NULL;
+ALTER TABLE acc ADD COLUMN IF NOT EXISTS callee VARCHAR(64) DEFAULT '' NOT NULL;
 CREATE TABLE IF NOT EXISTS missed_calls (
     id SERIAL PRIMARY KEY NOT NULL,
     method VARCHAR(16) DEFAULT '' NOT NULL,
@@ -78,6 +81,8 @@ CREATE TABLE IF NOT EXISTS missed_calls (
     callee VARCHAR(64) DEFAULT '' NOT NULL
 );
 CREATE INDEX IF NOT EXISTS missed_calls_callid_idx ON missed_calls (callid);
+ALTER TABLE missed_calls ADD COLUMN IF NOT EXISTS caller VARCHAR(64) DEFAULT '' NOT NULL;
+ALTER TABLE missed_calls ADD COLUMN IF NOT EXISTS callee VARCHAR(64) DEFAULT '' NOT NULL;
 INSERT INTO version (table_name, table_version) VALUES ('acc', ${ACC_TABLE_VERSION}), ('missed_calls', ${MISSED_CALLS_TABLE_VERSION})
   ON CONFLICT (table_name) DO NOTHING;
 `
