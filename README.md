@@ -148,6 +148,7 @@ packages/phone-link          <PhoneLink> et requestCall : numéro cliquable (int
 packages/phone-widget        widget d'appel à monter dans les autres apps Twake Workplace
 packages/conference-livekit  Meet : API externe, LiveKit SIP, dial-in, dial-out ; rebranché sur OpenSIPS à l'étape 8
 docker/                      serveur SIP du MVP (docker-compose.sip.yml) : OpenSIPS 3.6, rtpengine, PostgreSQL ; images de la passerelle et de l'app
+docker/pilot/                kit pilote : tout le MVP sur une machine, HTTPS par Caddy, Keycloak et LDAP de démo (ADR 0012)
 docs/                        architecture, PBX, widget ; docs/POC.md, README d'origine du POC ; docs/adr/ : une décision, un fichier
 ```
 
@@ -156,6 +157,8 @@ Le code du POC (app Phone Cozy, PBX de dev MiniPBX, `sip-media`, stack de dev) a
 À venir : `packages/provider-ovh` (étape 10), `packages/provider-wazo` (étape 11).
 
 ## Démarrer
+
+Pour essayer TwakePhone à plusieurs, sur une machine joignable depuis Internet : le kit pilote, [docker/pilot/README.md](docker/pilot/README.md) (une machine Linux avec Docker, un nom de domaine, trois commandes). Ce qui suit est pour développer.
 
 Prérequis : Node 22 ou plus récent (24 dans `.nvmrc`), Yarn 1, Docker.
 
@@ -184,8 +187,9 @@ OPENSIPS_WS_URL=wss://127.0.0.1:8089 OPENSIPS_DB_URL=postgres://twake:twake@127.
 | `yarn test` | unitaires de tous les paquets et de la passerelle (vitest), contrat de stockage mémoire et, avec `TEST_DATABASE_URL`, PostgreSQL |
 | `yarn e2e:web` | app TwakePhone dans Chromium, servie par son serveur de production : connexion OIDC (fournisseur de test en Node, rôle d'administrateur dans le jeton), synchronisation des comptes depuis l'écran d'administration (LDAP de test en Node) puis poste affiché, clavier, annuaire et favoris, langue, déconnexion, en-têtes de sécurité de l'app et de la passerelle, encadrement par un autre site refusé, CSP. Sans Docker ; Chromium s'installe une fois avec `npx playwright-core install chromium` (ou `PLAYWRIGHT_CHROMIUM=/chemin/vers/chromium`) |
 | `yarn e2e:sip` | trois personnes s'appellent et se transfèrent depuis trois fenêtres du même navigateur (`BROWSER=chromium`, `firefox` ou `msedge`, micro simulé) à travers OpenSIPS et rtpengine (`docker compose -f docker/docker-compose.sip.yml up --build --wait` d'abord) : enregistrement WSS, empreintes dans `subscriber`, poste injoignable, refus, réponse, paquets RTP dans les deux sens, attente et reprise, micro, DTMF vus par rtpengine (RFC 4733), raccrochage, choix du micro et des sorties dans les réglages (appliqué à l'appel suivant, sonnerie testée), seconde fenêtre de la même personne (les deux sonnent, celle qui répond prend l'appel, l'autre est prévenue), transfert vers un poste absent (404 rendu en français), transfert direct (REFER, raccrocher reste possible pendant), consultation abandonnée par le transférant, vers un poste absent ou par le collègue (reprise automatique), transfert supervisé (REFER avec Replaces) avec RTP compté après chaque transfert, inscription sur une connexion morte (477 rendu comme injoignable), coupure des WebSockets et retour en ligne, déconnexion qui désinscrit ; et ce que la passerelle en entend (étape 4) : Récents des deux côtés et CDR dans `acc`, présence des collègues dans l'annuaire (disponible, en communication en moins de 3 s, hors ligne après la déconnexion), appel abandonné pendant la sonnerie rendu manqué. `SIP_WSS_URL`, `OPENSIPS_DB_URL`, `OPENSIPS_MI_URL`, `RTPENGINE_DTMF_LOG` (`off` sur une machine sans IPv6, où rtpengine ne peut pas ouvrir ce socket), `SIP_E2E_DEBUG=1` pour les messages SIP |
+| `yarn e2e:pilot` | un kit pilote déployé (profil `demo`), depuis un navigateur seulement : Alice et Bob se connectent par Keycloak, s'enregistrent par `wss://<domaine>/sip`, se trouvent dans l'annuaire LDAP avec leur présence, s'appellent et s'entendent à travers rtpengine, retrouvent l'appel dans les Récents, Alice administre et Bob non, consoles de Keycloak fermées depuis Internet, déconnexion. `PILOT_URL`, `ALICE_PASSWORD` et `BOB_PASSWORD` (dans `.env`), `PILOT_RESOLVE` (adresse à utiliser pour le domaine), `PILOT_INSECURE=1` (certificat de `TLS=internal`), `BROWSER` |
 
-La CI joue `yarn test`, `yarn e2e:web` et `yarn e2e:sip` (stack SIP en Docker Compose sur le runner, une fois par navigateur : Chromium, Firefox, Edge) sur chaque PR. Les e2e du POC sur sa propre stack (passerelle ↔ MiniPBX, widget, Meet sur la plateforme) sont partis avec lui ; Meet par téléphone est rejoué sur OpenSIPS à l'étape 8.
+La CI joue `yarn test`, `yarn e2e:web` et `yarn e2e:sip` (stack SIP en Docker Compose sur le runner, une fois par navigateur : Chromium, Firefox, Edge) sur chaque PR, et `yarn e2e:pilot` sur le kit pilote construit et démarré sur le runner (images Docker comprises, `TLS=internal`), avec un contrôle que seuls 80, 443 et la plage RTP écoutent hors de la boucle, puis rejoué après un arrêt et un second démarrage. Les e2e du POC sur sa propre stack (passerelle ↔ MiniPBX, widget, Meet sur la plateforme) sont partis avec lui ; Meet par téléphone est rejoué sur OpenSIPS à l'étape 8.
 
 ## Décisions
 

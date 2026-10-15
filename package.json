@@ -17,7 +17,8 @@
     "dev:gateway": "yarn workspace @twake/telephony-gateway dev",
     "dev:web": "yarn workspace @twake/phone-web dev",
     "e2e:web": "yarn build && node apps/web/test/web.e2e.mjs",
-    "e2e:sip": "yarn build && node apps/web/test/sip.e2e.mjs"
+    "e2e:sip": "yarn build && node apps/web/test/sip.e2e.mjs",
+    "e2e:pilot": "node apps/web/test/pilot.e2e.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

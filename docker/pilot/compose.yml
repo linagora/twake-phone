@@ -1,0 +1,245 @@
+# TwakePhone pilot: the whole web MVP on one Linux machine with a public address, for a real test by a few people.
+# Caddy (HTTPS on one domain), the app, the Gateway, OpenSIPS + rtpengine, PostgreSQL; with `--profile demo`, a
+# Keycloak and an OpenLDAP with three test people. Read docker/pilot/README.md first; `./init.sh` writes the .env.
+#
+#   ./init.sh phone.example.org you@example.org --demo      (without --demo: your own SSO and LDAP, see .env)
+#   docker compose up -d --build --wait --wait-timeout 600   (.env says COMPOSE_PROFILES=demo with --demo)
+#
+# Public ports: 80/tcp and 443/tcp (Caddy), and the RTP range 30000-30100/udp (rtpengine). Everything else listens on
+# the loopback: host networking for the services that talk to each other and to the browsers' media, loopback port
+# mappings for the demo ones.
+name: twakephone
+
+x-logging: &logging
+  logging:
+    options:
+      max-size: 10m
+      max-file: "3"
+
+x-host: &host
+  network_mode: host
+  restart: unless-stopped
+  <<: *logging
+
+services:
+  caddy:
+    <<: *host
+    image: caddy:2.10
+    environment:
+      DOMAIN: "${DOMAIN:?DOMAIN is required (./init.sh writes it)}"
+      TLS: "${TLS:?TLS is required, an email for Let's Encrypt or the word internal}"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    # Started with the others, not after them: a service that never gets healthy must not leave 443 silent.
+    depends_on:
+      - web
+      - gateway
+
+  postgres:
+    <<: *host
+    image: postgres:16
+    environment:
+      POSTGRES_USER: twake
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}"
+      POSTGRES_DB: twake
+      # The image trusts the loopback by default: on the host network that is every process of the machine.
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256 --auth-local=scram-sha-256
+    command: ["postgres", "-p", "54320", "-c", "listen_addresses=127.0.0.1"]
+    volumes:
+      - ../opensips/subscriber.sql:/docker-entrypoint-initdb.d/01-subscriber.sql:ro
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U twake -h 127.0.0.1 -p 54320"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  rtpengine:
+    <<: *host
+    build: ../rtpengine
+    image: twakephone-rtpengine:local
+    environment:
+      # The address written in the SDP, which the browsers send their media to: the machine's public address, or
+      # "<private>!<public>" when the machine only has a private one behind a 1:1 NAT (most cloud providers).
+      RTPENGINE_INTERFACE: "${RTPENGINE_INTERFACE:?RTPENGINE_INTERFACE is required (the public IP or private!public)}"
+      RTPENGINE_LISTEN: 127.0.0.1:22222
+      RTPENGINE_PORT_MIN: "30000"
+      RTPENGINE_PORT_MAX: "30100"
+    healthcheck:
+      test: ["CMD-SHELL", "rtpengine-ctl -ip 127.0.0.1 -port 9900 list numsessions >/dev/null 2>&1"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  opensips:
+    <<: *host
+    build: ../opensips
+    image: twakephone-opensips:local
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rtpengine:
+        condition: service_healthy
+    environment:
+      # The SIP domain is the public name: realm of the digest hashes, host of Via and Record-Route. The browsers
+      # reach OpenSIPS's WebSocket (loopback, port 8088) through Caddy at wss://DOMAIN/sip.
+      SIP_DOMAIN: ${DOMAIN}
+      LISTEN_IP: 127.0.0.1
+      OPENSIPS_DB_URL: postgres://twake:${POSTGRES_PASSWORD}@127.0.0.1:54320/twake
+      RTPENGINE_SOCK: udp:127.0.0.1:22222
+      OPENSIPS_LOG_LEVEL: ${OPENSIPS_LOG_LEVEL:-2}
+    healthcheck:
+      # One MI request over UDP (mi_datagram, loopback): healthy once OpenSIPS answers, not once its fifo exists.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/udp/127.0.0.1/8880 && printf '{\"jsonrpc\":\"2.0\",\"method\":\"version\",\"id\":\"health\"}' >&3 && read -r -t 2 -n 1 _ <&3"]
+      start_period: 60s
+      start_interval: 2s
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  gateway:
+    <<: *host
+    build:
+      context: ../..
+      dockerfile: docker/Dockerfile.gateway
+    image: twakephone-gateway:local
+    depends_on:
+      postgres:
+        condition: service_healthy
+      opensips:
+        condition: service_healthy
+      # Demo profile only: the first directory sync waits for the test people.
+      openldap:
+        condition: service_healthy
+        required: false
+    environment:
+      HOST: 127.0.0.1
+      PORT: "8080"
+      DATABASE_URL: postgres://twake:${POSTGRES_PASSWORD}@127.0.0.1:54320/twake
+      SECRETS_KEY: "${SECRETS_KEY:?SECRETS_KEY is required (64 hex characters, openssl rand -hex 32)}"
+      # Who is calling: the access token of your SSO, a JWT whose audience is the Gateway (README, "Identité").
+      AUTH_MODE: jwt
+      JWT_ISSUER: "${JWT_ISSUER:?JWT_ISSUER is required}"
+      JWT_JWKS_URL: "${JWT_JWKS_URL:?JWT_JWKS_URL is required}"
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-twakephone-gateway}
+      JWT_USER_CLAIM:
+      JWT_ROLES_CLAIM:
+      ADMIN_ROLE:
+      ADMIN_USERS:
+      HSTS_MAX_AGE:
+      # The SIP server, created once in the database at the first start (the administration screen shows it).
+      OPENSIPS_WS_URL: wss://${DOMAIN}/sip
+      SIP_DOMAIN: ${DOMAIN}
+      OPENSIPS_MI_URL: udp:127.0.0.1:8880
+      # Who has which extension: the LDAP attribute LDAP_ATTR_EXTENSION, or USER_EXTENSIONS ("alice:101,bob:102",
+      # read at each start, never over an extension already given).
+      DEV_USER_MAP: ${USER_EXTENSIONS:-}
+      LDAP_URL:
+      LDAP_BASE_DN:
+      LDAP_BIND_DN:
+      LDAP_BIND_PASSWORD:
+      LDAP_USER_FILTER:
+      LDAP_ATTR_ID:
+      LDAP_ATTR_EXTENSION:
+      LDAP_SYNC_INTERVAL:
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/ready').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"]
+      start_period: 120s
+      start_interval: 2s
+      interval: 30s
+      timeout: 3s
+      retries: 3
+
+  web:
+    <<: *host
+    build:
+      context: ../..
+      dockerfile: docker/Dockerfile.web
+    image: twakephone-web:local
+    environment:
+      HOST: 127.0.0.1
+      PORT: "8081"
+      GATEWAY_URL: https://${DOMAIN}
+      OIDC_AUTHORITY: "${OIDC_AUTHORITY:?OIDC_AUTHORITY is required}"
+      OIDC_CLIENT_ID: ${OIDC_CLIENT_ID:-twakephone-web}
+      OIDC_SCOPE:
+      # Passed only when .env sets it (even empty): unset, the app asks for consent when the scope has offline_access.
+      OIDC_PROMPT:
+      OIDC_RESOURCE:
+      HSTS_MAX_AGE:
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8081/config.json').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"]
+      start_period: 60s
+      start_interval: 2s
+      interval: 30s
+      timeout: 3s
+      retries: 3
+
+  # ---- demo profile: an identity provider and a directory with three test people (README, "Démo") ----
+  keycloak:
+    profiles: ["demo"]
+    image: quay.io/keycloak/keycloak:26.4
+    command: ["start-dev", "--import-realm"]
+    restart: unless-stopped
+    <<: *logging
+    ports:
+      - "127.0.0.1:8180:8080"
+    environment:
+      KC_HTTP_RELATIVE_PATH: /auth
+      KC_HOSTNAME: https://${DOMAIN}/auth
+      KC_PROXY_HEADERS: xforwarded
+      KC_HEALTH_ENABLED: "true"
+      KC_HTTP_MANAGEMENT_RELATIVE_PATH: /
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-}
+      # Read by the realm file (demo/twakephone-realm.json) when it is imported, at the first start only.
+      DOMAIN: ${DOMAIN}
+      ALICE_PASSWORD: ${ALICE_PASSWORD:-}
+      BOB_PASSWORD: ${BOB_PASSWORD:-}
+      CAROLE_PASSWORD: ${CAROLE_PASSWORD:-}
+    volumes:
+      - ./demo/twakephone-realm.json:/opt/keycloak/data/import/twakephone-realm.json:ro
+      - keycloak-data:/opt/keycloak/data
+    healthcheck:
+      # No curl in the image: bash sends one HTTP/1.0 request to the management port, 200 or unhealthy.
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/9000 && printf 'GET /health/ready HTTP/1.0\\r\\n\\r\\n' >&3 && read -r status <&3 && case \"$$status\" in *' 200 '*) exit 0 ;; *) exit 1 ;; esac"]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+
+  openldap:
+    profiles: ["demo"]
+    image: osixia/openldap:1.5.0
+    command: ["--copy-service"]
+    restart: unless-stopped
+    <<: *logging
+    ports:
+      - "127.0.0.1:3890:389"
+    environment:
+      LDAP_ORGANISATION: TwakePhone demo
+      LDAP_DOMAIN: twakephone.demo
+      LDAP_ADMIN_PASSWORD:
+      # The Gateway binds with this read-only account (LDAP_BIND_DN=cn=readonly,dc=twakephone,dc=demo).
+      LDAP_READONLY_USER: "true"
+      LDAP_READONLY_USER_USERNAME: readonly
+      LDAP_READONLY_USER_PASSWORD: ${LDAP_READONLY_PASSWORD:-}
+      LDAP_TLS: "false"
+    volumes:
+      - ./demo/people.ldif:/container/service/slapd/assets/config/bootstrap/ldif/custom/50-people.ldif:ro
+      - openldap-data:/var/lib/ldap
+      - openldap-config:/etc/ldap/slapd.d
+    healthcheck:
+      test: ["CMD-SHELL", "ldapsearch -x -H ldap://127.0.0.1:389 -b dc=twakephone,dc=demo -D cn=readonly,dc=twakephone,dc=demo -w \"$$LDAP_READONLY_USER_PASSWORD\" '(uid=alice)' uid | grep -q '^uid: alice'"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+
+volumes:
+  caddy-data:
+  caddy-config:
+  postgres-data:
+  keycloak-data:
+  openldap-data:
+  openldap-config:
