@@ -16,8 +16,11 @@ export interface SyncReport {
   unchanged: number
   /** Mappings the synchronisation had written earlier for people the directory no longer lists with an extension. */
   removed: number
-  /** Extensions the directory gives to two people, or that someone else keeps: these people keep the mapping they had. */
-  conflicts: { userId: string; extension: string; heldBy: string }[]
+  /**
+   * Extensions the directory gives to two people, or that someone else keeps, or that are the number of a call group
+   * (`group`, `heldBy` empty): these people keep the mapping they had.
+   */
+  conflicts: { userId: string; extension: string; heldBy: string; group?: true }[]
   /** Why the run failed, in words safe to show (no address, no filter, no credential). */
   error?: string
 }
@@ -35,6 +38,11 @@ export interface DirectorySyncOptions {
   tenantId: string
   log?: { info: (o: object, msg: string) => void; error: (o: object, msg: string) => void }
   now?: () => Date
+  /**
+   * The numbers of the tenant that are not extensions (its call groups, ADR 0014): nobody is given one. A failure to
+   * read them stops the run before any change.
+   */
+  reserved?: (tenantId: string) => Promise<Iterable<string>>
 }
 
 /** The first extension of a contact: what the PBX rings. */
@@ -123,6 +131,14 @@ export class DirectorySync {
       return finish()
     }
     report.seen = people.length
+    let reserved: Set<string>
+    try {
+      reserved = new Set(this.opts.reserved ? await this.opts.reserved(tenantId) : [])
+    } catch (err) {
+      this.opts.log?.error({ err }, 'directory synchronisation: the call groups could not be read')
+      report.error = 'the call groups could not be read: nothing was changed (see the Gateway log)'
+      return finish()
+    }
     const syncedAt = started.toISOString()
     const previous = new Map((await store.listMappings(tenantId)).map(m => [m.userId, m]))
     const synced = [...previous.values()].filter(m => m.source === 'ldap')
@@ -140,10 +156,17 @@ export class DirectorySync {
     const byExtension = new Map([...previous.values()].map(m => [m.extension, m]))
     const wanted = new Map<string, UserMapping>()
     const claimed = new Map<string, { userId: string; mapping: UserMapping }>()
+    // People the directory gives a group's number: a conflict, and they keep what they had.
+    const blocked = new Set<string>()
     for (const person of people) {
       const extension = extensionOf(person)
       if (!extension) continue
       report.withExtension++
+      if (reserved.has(extension)) {
+        report.conflicts.push({ userId: person.id, extension, heldBy: '', group: true })
+        blocked.add(person.id)
+        continue
+      }
       const mapping: UserMapping = { tenantId, userId: person.id, extension, ...(person.displayName ? { displayName: person.displayName } : {}), ...(person.department ? { department: person.department } : {}), source: 'ldap', syncedAt }
       const other = claimed.get(extension)
       if (!other) {
@@ -164,6 +187,7 @@ export class DirectorySync {
     const released = new Set<string>()
     for (const m of previous.values()) {
       const next = wanted.get(m.userId)
+      if (blocked.has(m.userId)) continue
       if (next ? next.extension !== m.extension : m.source === 'ldap') released.add(m.userId)
     }
     // An extension someone else keeps (a manual mapping of a person unknown to the directory, above all) is not

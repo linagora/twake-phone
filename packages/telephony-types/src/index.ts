@@ -62,6 +62,19 @@ export interface ForwardingRules {
   noAnswer?: { target: string; delaySec: number }
 }
 
+/**
+ * A simultaneous ring group of the organisation: a number of its own (never an extension) that rings every member
+ * extension at once; the first to answer takes the call. Set by an administrator.
+ */
+export interface RingGroup {
+  /** What callers dial. */
+  number: string
+  /** What the members and the directory call it. */
+  name: string
+  /** The extensions that ring, in the order the administrator gave. */
+  members: string[]
+}
+
 export type CallState =
   | 'new'
   | 'ringing'
@@ -112,6 +125,8 @@ export interface Capabilities {
   history: boolean
   /** The person can set where their calls go (`ForwardingRules`) and a "do not disturb" that refuses or forwards them. */
   forwarding?: boolean
+  /** Administrators can set simultaneous ring groups (`RingGroup`). */
+  groups?: boolean
   conference: { dialIn: boolean; dialOut: boolean }
 }
 

@@ -26,7 +26,7 @@ Les trois doivent être verts. `yarn e2e:sip` demande la stack SIP en Docker Com
 
 ## Conventions
 
-- **Frontières** : aucune notion d'un fournisseur hors de son `packages/provider-*` (OpenSIPS, Asterisk jusqu'à l'étape 4, OVHcloud à l'étape 10, Wazo à l'étape 11), aucune notion LiveKit/Meet hors `packages/conference-livekit`. Le Gateway et l'application ne parlent que le modèle de `telephony-types`.
+- **Frontières** : aucune notion d'un fournisseur hors de son `packages/provider-*` (OpenSIPS, OVHcloud à l'étape 10, Wazo à l'étape 11), aucune notion LiveKit/Meet hors `packages/conference-livekit`. Le Gateway et l'application ne parlent que le modèle de `telephony-types`.
 - **Application** (`apps/web`) : React 18, aucune chaîne visible en dur (`fr` et `en` ensemble), tests Testing Library sans instantanés.
 - **Gateway** : toute lecture ou écriture de données passe par le `Store` avec le tenant ; un nouveau comportement de stockage s'ajoute au contrat partagé (`src/store/contract.ts`), qui tourne contre la mémoire et PostgreSQL (`TEST_DATABASE_URL`).
 - **Tests** : un test n'est jamais désactivé ni mis en quarantaine pour passer. Un test qui simule le réseau ne remplace pas un essai réel. Pour tout ce qui touche au serveur SIP, au média ou à l'authentification, ajouter ou étendre une étape de `yarn e2e:sip` ou de `yarn e2e:web`. Les erreurs de type `tsc` d'un fichier de test font échouer le build Docker du Gateway : toujours lire la sortie complète d'un `docker compose build`.

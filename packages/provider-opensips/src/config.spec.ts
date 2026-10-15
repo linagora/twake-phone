@@ -78,7 +78,7 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
 
   it('takes the no-answer forward when no window of the callee can be reached, else answers 477, a missed call either way', () => {
     const { cfg } = render()
-    const relay = cfg.slice(cfg.indexOf('route[relay_call] {'), cfg.indexOf('onreply_route[rtp]'))
+    const relay = cfg.slice(cfg.indexOf('route[relay_call] {'), cfg.indexOf('onreply_route[rtp] {'))
     expect(relay).toContain('if (!t_relay())\n\t\t$var(relay_rc) = $rc;')
     const forward = relay.indexOf('if ($var(relay_rc) == -6 && $avp(r_noanswer) != NULL) {')
     expect(forward).toBeGreaterThan(0)
@@ -97,15 +97,20 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
   it('answers 487 to a call cancelled while its rules were read, before anything rings or is told', () => {
     const { cfg } = render()
     const section = (name: string, next: string) => cfg.slice(cfg.indexOf(`${name} {`), cfg.indexOf(`${next} {`))
-    for (const [resume, next, goOn] of [['route[rules_loaded]', 'route[rules_step]', 'route(rules_step);'], ['route[ring_loaded]', 'route[ring_now]', 'route(ring_now);']] as const) {
+    for (const [resume, next, goOn] of [
+      ['route[rules_loaded]', 'route[rules_step]', 'route(rules_step);'],
+      ['route[ring_loaded]', 'route[ring_now]', 'route(ring_now);'],
+      ['route[names_loaded]', 'route[caller_name]', 'route(ring);'],
+      ['route[group_loaded]', 'route[group_ring]', 'route(group_ring);']
+    ] as const) {
       const body = section(resume, next)
       const check = body.indexOf('if (t_was_cancelled())\n\t\troute(cancelled);')
       expect(check, resume).toBeGreaterThan(0)
       expect(body.indexOf(goOn), resume).toBeGreaterThan(check)
     }
-    const cancelled = section('route[cancelled]', 'route[replaces_target]')
+    const cancelled = section('route[cancelled]', 'route[name_sql]')
     expect(cancelled).toContain('route(account_missed);\n\tt_reply(487, "Request Terminated");\n\texit;')
-    expect(cancelled).not.toMatch(/rtp|calling|raise_event/)
+    expect(cancelled.replace(/#.*$/gm, '')).not.toMatch(/rtp|calling|raise_event/)
   })
 
   it('reads nothing in failure_route: the rules a failure may need are read before the ringing, asynchronously', () => {
@@ -121,10 +126,13 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(preload).toContain(`WHERE c.extension = '" + $avp(callee) + "'`)
     expect(preload).toContain('r.depth < 3')
     // Every list emptied first: sql_query adds to them.
-    for (const avp of ['p_ext', 'p_always', 'p_busy', 'p_noanswer', 'p_delay', 'p_dnd', 'p_message', 'p_retry']) expect(preload).toContain(`$(avp(${avp})[*]) = NULL;`)
-    // Each query is asynchronous, none is run where async is not available.
-    expect(cfg.match(/sql_query/g)).toHaveLength(2)
-    expect(cfg.match(/async\(sql_query/g)).toHaveLength(2)
+    for (const avp of ['p_ext', 'p_always', 'p_busy', 'p_noanswer', 'p_delay', 'p_dnd', 'p_message', 'p_retry', 'p_name']) expect(preload).toContain(`$(avp(${avp})[*]) = NULL;`)
+    // One row per extension reached, with or without rules, and no NULL (sql_query would add "<null>"): the lists stay aligned.
+    expect(preload).toContain('FROM (SELECT DISTINCT extension FROM reach) AS x LEFT JOIN call_rules r ON r.extension = x.extension')
+    // Each query is asynchronous (the rules, the first of them with the caller's name, the names of a Replaces, the
+    // members of a group, the preload), none is run where async is not available.
+    expect(cfg.match(/sql_query/g)).toHaveLength(5)
+    expect(cfg.match(/async\(sql_query/g)).toHaveLength(5)
     expect(cfg.slice(cfg.indexOf('failure_route['))).not.toMatch(/sql_query|async\(/)
     expect(cfg.slice(cfg.indexOf('failure_route['))).toContain('route(rules_local);')
     expect(section('route[rules_local]', 'route[rules_preloaded]')).toContain('route(rules_preloaded);')
@@ -146,10 +154,10 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     const check = query.indexOf('if (!($rU =~ "^[A-Za-z0-9._+-]{1,64}$"))')
     expect(check).toBeGreaterThan(0)
     expect(query.indexOf('$var(rules_query) = "SELECT')).toBeGreaterThan(check)
-    expect(query).toContain(`FROM call_rules WHERE extension = '" + $rU + "'"`)
+    expect(query).toContain(`FROM (SELECT 1) AS one LEFT JOIN call_rules r ON r.extension = '" + $rU + "'"`)
     expect(query).toContain('dnd_until > now()')
-    // One query, built in one place, read asynchronously.
-    expect(cfg.match(/sql_query_one\("\$var\(rules_query\)"/g)).toHaveLength(1)
+    // One query, built in one place (the first read adds the caller's name and the group check), read asynchronously.
+    expect(cfg.match(/sql_query_one\("\$var\(rules_query\)"/g)).toHaveLength(2)
     expect(cfg.slice(cfg.indexOf('route[rules_next] {'), cfg.indexOf('route[rules_loaded] {'))).toContain('async(sql_query_one("$var(rules_query)", ')
     // At most 3 connections of their own per process for these reads.
     expect(cfg).toContain('\ndb_max_async_connections=3\n')
@@ -202,8 +210,10 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     const main = cfg.slice(cfg.indexOf('\nroute {'), cfg.indexOf('\nroute[ring] {'))
     const replaces = main.slice(main.indexOf('if (is_present_hf("Replaces")) {'), main.indexOf('route(rules_next);'))
     expect(replaces).toContain('$ru = "sip:" + $var(replaces_to) + "@" + $avp(domain);')
-    expect(replaces).toContain('route(ring);\n\t\texit;')
+    // The names of both parties are read (route[names_loaded] rings), not the rules.
+    expect(replaces).toContain('route(names_next);\n\t\texit;')
     expect(replaces.replace(/#.*$/gm, '')).not.toContain('rules')
+    expect(section('route[names_loaded]', 'route[caller_name]')).toContain('route(caller_name);\n\troute(ring);')
     // A failure forwards on the statuses the ADR names, and only then; a 486 that comes once the windows rang for
     // the delay (one in a call, another not answered: tm prefers the 486 to its own 408) is a no answer.
     const failure = cfg.slice(cfg.indexOf('failure_route['))
@@ -254,5 +264,65 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(cfg).toContain('modparam("acc", "extra_fields", "evi: caller; callee; dialled")')
     expect(cfg).toContain('$acc_extra(dialled) = $rU;')
     expect(cfg.match(/\$acc_extra\(dialled\)/g)).toHaveLength(1)
+  })
+
+  it('shows each party the directory name of the other, never one a phone claims, never one that can break a header', () => {
+    const { cfg } = render()
+    const section = (name: string, next: string) => cfg.slice(cfg.indexOf(`${name} {`), cfg.indexOf(`${next} {`))
+    // The display name of the From only: no URI, no tags, nothing to restore.
+    expect(cfg).toContain('loadmodule "uac.so"')
+    expect(cfg).toContain('modparam("uac", "restore_mode", "none")')
+    const callerName = section('route[caller_name]', 'route[group_next]')
+    expect(callerName).toContain('if ($avp(named) != NULL)\n\t\treturn(1);')
+    expect(callerName.indexOf('if (!($hdr(From) =~ "<"))')).toBeLessThan(callerName.indexOf('uac_replace_from("$var(caller_name)", "");'))
+    expect(cfg.match(/uac_replace_from\(/g)).toHaveLength(1)
+    // Once the first read resumed (the rules, or the names of a Replaces), before anything rings.
+    expect(section('route[rules_loaded]', 'route[rules_step]').indexOf('route(caller_name);')).toBeLessThan(section('route[rules_loaded]', 'route[rules_step]').indexOf('route(rules_step);'))
+    // Every name is read through one expression that drops what could end or escape a quoted display name.
+    expect(section('route[name_sql]', 'route[names_next]')).toContain(`regexp_replace(translate(n.display_name, chr(34) || chr(92), ''), '[[:cntrl:]]', '', 'g')`)
+    expect(cfg.match(/n\.display_name/g)).toHaveLength(1)
+    expect(cfg.match(/FROM display_names/g)?.length).toBe(cfg.match(/\$var\(name_sql\) \+ " FROM display_names n WHERE/g)?.length)
+    // No identity a phone asserts passes, in a request or in a reply; the answer's is the script's.
+    const main = cfg.slice(cfg.indexOf('\nroute {'), cfg.indexOf('\nroute[ring] {'))
+    for (const header of ['P-Asserted-Identity', 'P-Preferred-Identity', 'Remote-Party-ID']) expect(main.indexOf(`remove_hf("${header}");`), header).toBeLessThan(main.indexOf('if (!t_newtran()) {'))
+    const onreply = cfg.slice(cfg.indexOf('onreply_route[rtp] {'), cfg.indexOf('route[event_attrs]'))
+    expect(onreply.indexOf('remove_hf("P-Asserted-Identity");')).toBeLessThan(onreply.indexOf('append_hf("P-Asserted-Identity: '))
+    expect(onreply).toContain('append_hf("P-Asserted-Identity: \\"$var(pai_name)\\" <sip:$var(pai_ext)@$avp(domain)>\\r\\n");')
+    expect(onreply.indexOf('if ($var(pai_ext) =~ "^[A-Za-z0-9._+-]{1,64}$") {')).toBeLessThan(onreply.indexOf('append_hf('))
+  })
+
+  it('rings every member of a ring group at once, as dialled only, without anyone in "do not disturb" or anyone\'s rules', () => {
+    const { cfg } = render()
+    const section = (name: string, next: string) => cfg.slice(cfg.indexOf(`${name} {`), cfg.indexOf(`${next} {`))
+    // A group is a number no account has, checked in the first read; its members are read asynchronously.
+    const next = section('route[rules_next]', 'route[rules_loaded]')
+    expect(next).toContain(`CASE WHEN EXISTS (SELECT 1 FROM call_groups g WHERE g.number = '" + $rU + "') AND NOT EXISTS (SELECT 1 FROM subscriber s WHERE s.username = '" + $rU + "') THEN 1 ELSE 0 END`)
+    const step = section('route[rules_step]', 'route[rules_decide]')
+    expect(step).toContain('if ($avp(fwd_hops) == 0 && $avp(d_loaded) == NULL && $avp(r_group) == 1) {')
+    expect(step.indexOf('route(group_next);')).toBeLessThan(step.indexOf('route(rules_decide);'))
+    const query = section('route[group_next]', 'route[group_loaded]')
+    expect(query).toContain(`WHERE g.number = '" + $rU + "' AND x.ext <> '" + $var(group_caller) + "'`)
+    expect(query).toContain('NOT EXISTS (SELECT 1 FROM call_rules r WHERE r.extension = x.ext AND r.dnd AND (r.dnd_until IS NULL OR r.dnd_until > now()))')
+    expect(query).toContain('ORDER BY x.pos')
+    for (const avp of ['g_ext', 'g_name']) expect(query).toContain(`$(avp(${avp})[*]) = NULL;`)
+    // Each window is a branch that knows its member; nobody to ring is a refusal through the transaction.
+    const ring = section('route[group_ring]', 'route[replaces_target]')
+    expect(ring).toContain('if ($var(ext) =~ "^[A-Za-z0-9._+-]{1,64}$") {')
+    expect(ring).toContain('lookup("location", "to-branches-only", "$var(aor)")')
+    expect(ring).toContain('$(msg.branch.attr(gext)[$var(b)]) = $var(ext);')
+    for (const avp of ['r_always', 'r_busy', 'r_noanswer', 'r_dnd']) expect(ring).toContain(`$(avp(${avp})[*]) = NULL;`)
+    expect(ring).toContain('route(account_missed);\n\t\troute(calling);\n\t\tt_reply(480, "Temporarily Unavailable");')
+    expect(ring.replace(/#.*$/gm, '').trimEnd().endsWith('route(ring);\n}')).toBe(true)
+    // A member declining leaves the colleagues ringing; any other call is declined as a whole, as tm would.
+    expect(cfg).toContain('modparam("tm", "disable_6xx_block", 1)')
+    const onreply = cfg.slice(cfg.indexOf('onreply_route[rtp] {'), cfg.indexOf('route[event_attrs]'))
+    expect(onreply).toContain('if ($rs >= 600 && $avp(group) == NULL)\n\t\t\tt_cancel_branch("o");')
+    // The member who answers becomes the callee: CDR, dialog (Replaces), events.
+    for (const line of ['$avp(callee) = $var(member);', '$acc_extra(callee) = $var(member);', '$dlg_val(callee) = $var(member);']) expect(onreply).toContain(line)
+    expect(onreply).toContain('$avp(ev_callee) = $var(member);')
+    // A group nobody answered: no forward from failure_route.
+    const failure = cfg.slice(cfg.indexOf('failure_route['))
+    expect(failure.indexOf('if ($avp(group) != NULL) {')).toBeLessThan(failure.indexOf('route(forward_to, $var(next))'))
+    expect(section('route[event_attrs]', 'failure_route[call_failed]')).toContain('$avp(ev_attr) = "group";')
   })
 })

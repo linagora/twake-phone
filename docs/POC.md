@@ -1,12 +1,12 @@
 # Twake Phone (README d'origine du POC)
 
-*Le code du POC décrit ici (app Phone Cozy, PBX de dev MiniPBX, `sip-media`, stack de dev et ses scripts) a été retiré du dépôt à la PR 3c ; l'historique Git avant le 14 octobre 2026 le conserve.*
+*Le code du POC décrit ici (app Phone Cozy, PBX de dev MiniPBX, `sip-media`, stack de dev et ses scripts) a été retiré du dépôt à la PR 3c, `provider-asterisk` et le guide du PBX externe (`PBX-REQUIREMENTS.md`) à la PR 4c ; l'historique Git les conserve.*
 
 *README du POC <https://ci.linagora.com/tdelobelle/poc-twake-phone>, conservé tel quel sauf les liens, réécrits pour ce dossier. Le README courant du dépôt est [à la racine](../README.md).*
 
 Couche téléphonique native de Twake Workplace : une application **Phone** (clavier, récents, présence, appel en cours), un **widget** d'appel monté dans les autres applications, et la **Twake Telephony Gateway**, qui isole Twake de tout fournisseur de téléphonie. Le premier fournisseur est Asterisk (ARI) ; l'accès téléphonique aux salles **Twake Visio / Meet** passe par LiveKit SIP.
 
-Documentation : [architecture](ARCHITECTURE.md) · [widget](WIDGET.md) · [PBX externe à brancher](PBX-REQUIREMENTS.md) · [PBX et trunk de dev](../docker/README.md) · [analyse des dépôts Twake](REFERENCES-ANALYSIS.md) · [spike appels entrants](SPIKE-INCOMING-CALLS.md)
+Documentation : [architecture](ARCHITECTURE.md) · [widget](WIDGET.md) · PBX externe à brancher (`PBX-REQUIREMENTS.md`, retiré) · [PBX et trunk de dev](../docker/README.md) · [analyse des dépôts Twake](REFERENCES-ANALYSIS.md) · [spike appels entrants](SPIKE-INCOMING-CALLS.md)
 
 ```
 apps/phone                      app Twake/Cozy (React 18, cozy-ui, cozy-client), issue de cozy-app-template

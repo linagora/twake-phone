@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto'
 import pg from 'pg'
 import type { SecretProvisioner } from '@twake/telephony-provider-sdk'
+import { CALL_GROUPS_SCHEMA, CallGroups, DISPLAY_NAMES_SCHEMA, type CallGroupsOptions } from './call-groups.js'
 import { CALL_RULES_SCHEMA, CallRules, type CallRulesOptions } from './call-rules.js'
 
 // Everything about OpenSIPS's `subscriber` table (module auth_db) lives here: the Gateway only sees a SecretProvisioner.
@@ -25,8 +26,9 @@ export const digestHashes = (username: string, realm: string, secret: string) =>
 /**
  * The schema OpenSIPS 3.6 ships for PostgreSQL (`subscriber` of auth_db; `acc` and `missed_calls` of acc, the
  * CDRs, with the caller, the extension the call reached and the one dialled as extra columns), plus the rows of the
- * `version` table it checks at startup, and our own `call_rules` (forwards and "do not disturb", read by the script
- * through sqlops: no version row, OpenSIPS does not check it). Tables created beforehand (by OpenSIPS's own scripts,
+ * `version` table it checks at startup, and our own tables, read by the script through sqlops (no version row,
+ * OpenSIPS does not check them): `call_rules` (forwards and "do not disturb"), `call_groups` (simultaneous ring
+ * groups) and `display_names` (the directory name of each extension). Tables created beforehand (by OpenSIPS's own scripts,
  * or by an earlier version of this schema) lack columns (EXTRA_COLUMNS): `ensureSchema()` adds those that are
  * missing, or every CDR insert, or every write of the rules, would fail.
  */
@@ -86,7 +88,7 @@ CREATE TABLE IF NOT EXISTS missed_calls (
 CREATE INDEX IF NOT EXISTS missed_calls_callid_idx ON missed_calls (callid);
 INSERT INTO version (table_name, table_version) VALUES ('acc', ${ACC_TABLE_VERSION}), ('missed_calls', ${MISSED_CALLS_TABLE_VERSION})
   ON CONFLICT (table_name) DO NOTHING;
-${CALL_RULES_SCHEMA}`
+${CALL_RULES_SCHEMA}${CALL_GROUPS_SCHEMA}${DISPLAY_NAMES_SCHEMA}`
 
 const ACC_EXTRA = "VARCHAR(64) DEFAULT '' NOT NULL"
 /**
@@ -238,6 +240,11 @@ export class SubscriberProvisioner implements SecretProvisioner {
    */
   callRules(opts: Omit<CallRulesOptions, 'pool'> = {}) {
     return new CallRules({ pool: this.pool, ...opts })
+  }
+
+  /** The `call_groups` and `display_names` of the same database, on the same connections (see CallGroupsOptions). */
+  callGroups(opts: Omit<CallGroupsOptions, 'pool'> = {}) {
+    return new CallGroups({ pool: this.pool, ...opts })
   }
 
   async close() {

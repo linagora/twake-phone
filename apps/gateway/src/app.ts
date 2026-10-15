@@ -5,7 +5,7 @@ import swagger from '@fastify/swagger'
 import swaggerUi from '@fastify/swagger-ui'
 import { splitParticipantId, verifyWebhook, type LiveKitConferenceBridge, type MeetApi, type MeetRoom } from '@twake/conference-livekit'
 import type { MediaProvider, TelephonyProvider } from '@twake/telephony-provider-sdk'
-import type { CallDirection, Endpoint, ForwardingRules, Presence, PresenceStatus, TelephonyEvent, User } from '@twake/telephony-types'
+import type { CallDirection, Endpoint, ForwardingRules, Presence, PresenceStatus, RingGroup, TelephonyEvent, User } from '@twake/telephony-types'
 import { adminPolicyFromEnv, isAdmin, type AdminPolicy } from './admin.js'
 import { authenticatorFromEnv, TicketStore, type Authenticator, type Identity } from './auth.js'
 import { MAX_CONTACT_ID, MAX_FAVORITES, MAX_QUERY, MAX_SEARCH, RateLimiter, type ContactDirectory } from './contacts.js'
@@ -178,6 +178,37 @@ export const parseForwarding = async (body: unknown, user: User, isExtension: (t
   return out
 }
 
+/** Most members of a group: each rings every window of theirs, all in one call. */
+const GROUP_MEMBERS_MAX = 20
+const GROUP_NAME_MAX = 64
+/** What a caller dials and a SIP server routes: the characters of an extension. */
+const NUMBER = /^[A-Za-z0-9._+-]{1,64}$/
+
+/**
+ * Validates a simultaneous ring group an administrator sets: a number that is no extension of the organisation (a
+ * group and a person would share it), a name, and 1 to 20 members, each an extension of the organisation (in the
+ * order given, once each). A 400 or 409 with a `code` the app turns into words.
+ */
+export const parseGroup = async (number: string, body: unknown, isExtension: (extension: string) => Promise<boolean>): Promise<RingGroup> => {
+  if (!NUMBER.test(number)) throw refused('GROUP_NUMBER', 'invalid group number')
+  if (await isExtension(number)) throw Object.assign(new Error(`${number} is an extension: a group needs a number of its own`), { statusCode: 409, code: 'GROUP_NUMBER_TAKEN' })
+  if (!body || typeof body !== 'object' || Array.isArray(body)) throw bad('invalid group')
+  const b = body as { name?: unknown; members?: unknown }
+  const name = typeof b.name === 'string' ? b.name.trim() : ''
+  if (!name || name.length > GROUP_NAME_MAX || CONTROL.test(name)) throw refused('GROUP_NAME', `the name must be one line of 1 to ${GROUP_NAME_MAX} characters`)
+  if (!Array.isArray(b.members)) throw refused('GROUP_MEMBERS', 'members must be a list of extensions')
+  const members: string[] = []
+  for (const value of b.members) {
+    if (typeof value !== 'string') throw refused('GROUP_MEMBER_NOT_EXTENSION', 'only an extension of your organisation can be a member')
+    const m = value.replace(/\s/g, '')
+    if (!m) continue
+    if (!NUMBER.test(m) || !(await isExtension(m))) throw refused('GROUP_MEMBER_NOT_EXTENSION', `${m.slice(0, 64)}: only an extension of your organisation can be a member`)
+    if (!members.includes(m)) members.push(m)
+  }
+  if (members.length === 0 || members.length > GROUP_MEMBERS_MAX) throw refused('GROUP_MEMBERS', `a group has 1 to ${GROUP_MEMBERS_MAX} members`)
+  return { number, name, members }
+}
+
 const publicEntry = (e: HistoryEntry) => ({
   id: e.callId,
   direction: e.direction,
@@ -314,7 +345,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
   const restoring = new Map<string, { again: boolean }>()
   const restoreOnce = (tenantId: string, provider: TelephonyProvider) =>
     inTurn(tenantId, async () => {
-      if (provider.syncExtensions) await provider.syncExtensions((await store.listMappings(tenantId)).map(m => ({ extension: m.extension, userId: m.userId })))
+      if (provider.syncExtensions) await provider.syncExtensions((await store.listMappings(tenantId)).map(m => ({ extension: m.extension, userId: m.userId, ...(m.displayName ? { displayName: m.displayName } : {}) })))
       const entries = await Promise.all(
         (await store.listUserPresences(tenantId)).map(async r => ({ user: await dir.forUser(tenantId, r.userId), presence: presenceOfRecord(r) }))
       )
@@ -592,6 +623,31 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         // A large directory takes a while: the run goes on in the background, GET /admin/directory follows it.
         void sync.run()
         return reply.code(202).send(sync.status())
+      })
+
+      // Simultaneous ring groups (capability `groups`): administrators only, one change at a time per tenant (with
+      // the presences and forwards: the same provider database). A group number is never an extension (a directory
+      // synchronisation refuses to give one away either).
+      const groupsOf = (provider: TelephonyProvider) => {
+        if (!provider.listGroups || !provider.setGroup || !provider.deleteGroup) throw Object.assign(new Error('Call groups are not available on this platform'), { statusCode: 501 })
+        return { list: provider.listGroups.bind(provider), set: provider.setGroup.bind(provider), remove: provider.deleteGroup.bind(provider) }
+      }
+      v1.get('/admin/groups', async req => {
+        const user = await administrator(req)
+        return { items: await groupsOf(registry.forTenant(user.tenantId)).list() }
+      })
+      v1.put<{ Params: { number: string } }>('/admin/groups/:number', async req => {
+        const user = await administrator(req)
+        const groups = groupsOf(registry.forTenant(user.tenantId))
+        const group = await parseGroup(req.params.number, req.body, async extension => !!(await store.getMappingByExtension(user.tenantId, extension)))
+        await inTurn(user.tenantId, () => groups.set(group))
+        return group
+      })
+      v1.delete<{ Params: { number: string } }>('/admin/groups/:number', async (req, reply) => {
+        const user = await administrator(req)
+        const groups = groupsOf(registry.forTenant(user.tenantId))
+        if (!(await inTurn(user.tenantId, () => groups.remove(req.params.number)))) throw Object.assign(new Error('No such group'), { statusCode: 404 })
+        return reply.code(204).send()
       })
 
       // Right to erasure of one's own call history.

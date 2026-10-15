@@ -10,6 +10,7 @@ import type {
   OriginateRequest,
   Presence,
   ProviderStatus,
+  RingGroup,
   TelephonyEvent,
   User
 } from '@twake/telephony-types'
@@ -36,13 +37,19 @@ export interface TelephonyProvider {
   /**
    * Who holds each extension of the tenant now, handed when the provider starts and after any change of the
    * mappings: what a provider keeps per extension for its holder (forwards, "do not disturb") does not pass to the
-   * next one.
+   * next one. `displayName` is the holder's name in the directory: what the SIP server shows the people they call.
    */
-  syncExtensions?(holders: { extension: string; userId: string }[]): Promise<void>
+  syncExtensions?(holders: { extension: string; userId: string; displayName?: string }[]): Promise<void>
   /** Where the calls of the user's extension go (capability `forwarding`). */
   getForwarding?(user: User): Promise<ForwardingRules>
   /** Replaces those rules; targets are extensions the Gateway checked. */
   setForwarding?(user: User, rules: ForwardingRules): Promise<void>
+  /** The simultaneous ring groups of the tenant (capability `groups`), by number. */
+  listGroups?(): Promise<RingGroup[]>
+  /** Creates or replaces a group; the Gateway checked its number is no extension and its members are. */
+  setGroup?(group: RingGroup): Promise<void>
+  /** Removes a group; false when the tenant has none with that number. */
+  deleteGroup?(number: string): Promise<boolean>
   originate(request: OriginateRequest): Promise<Call>
   /** Releases connections and stops event streams. */
   close(): Promise<void>

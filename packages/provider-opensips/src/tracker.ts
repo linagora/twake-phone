@@ -20,6 +20,12 @@ interface TrackedCall {
    * only sees a call that did not go through.
    */
   dnd?: { told: boolean }
+  /**
+   * A call to a simultaneous ring group (ADR 0014): `callee` is the group's number until a member answers, and
+   * `ringing` the members whose phone rings meanwhile (each busy with it). The first to answer becomes the callee;
+   * the others hear nothing more of it. Nobody answered: each one that rang has a missed call.
+   */
+  group?: { ringing: Set<string>; told: boolean }
   connectedAt?: string
 }
 
@@ -211,7 +217,9 @@ export class CallTracker {
         const caller = userOf(str(p.caller))
         const callee = userOf(str(p.callee))
         if (!id || !caller || !callee || this.calls.has(id) || this.ended.has(id)) return
-        this.tell(this.start(id, caller, callee, now, userOf(str(p.dialled)) || undefined), caller, 'call.created', 'new')
+        const call = this.start(id, caller, callee, now, userOf(str(p.dialled)) || undefined)
+        if (str(p.group)) call.group = { ringing: new Set(), told: false }
+        this.tell(call, caller, 'call.created', 'new')
         break
       }
       case 'E_TWAKEPHONE_FORWARDED': {
@@ -219,7 +227,7 @@ export class CallTracker {
         // `code`, the status that made it go): for the one it leaves, a call its phone rang for is missed (or
         // declined); the new one hears of it when its phone rings.
         const call = this.find(p, now)
-        if (call) this.moveTo(call, userOf(str(p.callee)), Number(p.code) || 0, now)
+        if (call && !call.group) this.moveTo(call, userOf(str(p.callee)), Number(p.code) || 0, now)
         break
       }
       case 'E_TWAKEPHONE_DND': {
@@ -228,13 +236,18 @@ export class CallTracker {
         // led there) and was not told why. The refusal may be the dialled extension's after its forward rang
         // someone else (`code`: how it ended there), who is left with a missed (or declined) call.
         const call = this.find(p, now)
-        if (!call) return
+        if (!call || call.group) return
         this.moveTo(call, userOf(str(p.callee)), Number(p.code) || 0, now)
         call.dnd = { told: str(p.told) !== '0' }
         break
       }
       case 'E_TWAKEPHONE_RINGING': {
         const call = this.find(p, now)
+        // A group call: `callee` is the member whose phone rings.
+        if (call?.group) {
+          this.memberRings(call, userOf(str(p.callee)))
+          break
+        }
         if (!call || call.rang) return
         this.rings(call)
         this.tellBoth(call, 'call.ringing', 'ringing')
@@ -243,6 +256,7 @@ export class CallTracker {
       case 'E_TWAKEPHONE_ANSWERED': {
         const call = this.find(p, now)
         if (!call || call.connectedAt) return
+        if (call.group) this.memberAnswers(call, userOf(str(p.callee)))
         this.rings(call)
         call.connectedAt = now
         this.tellBoth(call, 'call.connected', 'connected')
@@ -254,7 +268,8 @@ export class CallTracker {
         const created = epochMs(p.created)
         const call = this.find(p, created !== undefined ? iso(created) : now)
         if (!call) return
-        // Answered: both sides knew of it.
+        // Answered (by the member acc names, for a group whose answer was not told): both sides knew of it.
+        if (call.group && !call.connectedAt) this.memberAnswers(call, userOf(str(p.callee)))
         this.rings(call)
         const answeredMs = epochMs(p.time)
         const ms = num(p.ms_duration)
@@ -272,7 +287,8 @@ export class CallTracker {
         if (!call) return
         const code = Number(p.sip_code) || 0
         const at = epochMs(p.time)
-        // Refused by a "do not disturb": the callee's phone stayed silent, but the call is theirs, missed.
+        // Refused by a "do not disturb": the callee's phone stayed silent, but the call is theirs, missed. A group's
+        // members who rang have it as missed whatever its final status (one declining is not the group refusing).
         if (call.dnd) this.rings(call)
         this.end(call, at !== undefined ? iso(at) : now, call.dnd?.told ? 'rejected' : failedState(code), DECLINED.has(code) ? 'rejected' : 'missed')
         break
@@ -359,7 +375,42 @@ export class CallTracker {
     if (call) return call
     const caller = userOf(str(p.caller))
     const callee = userOf(str(p.callee))
-    return caller && callee ? this.start(id, caller, callee, startedAt, userOf(str(p.dialled)) || undefined) : undefined
+    const dialled = userOf(str(p.dialled)) || undefined
+    if (!caller || !callee) return undefined
+    // A group call born late: its callee is the group until a member answers (the event names that member).
+    if (str(p.group)) {
+      const call = this.start(id, caller, dialled ?? callee, startedAt, dialled)
+      call.group = { ringing: new Set(), told: false }
+      return call
+    }
+    return this.start(id, caller, callee, startedAt, dialled)
+  }
+
+  /** A member's phone rings for a group call: it is busy with it, and told; the caller hears it rings once. */
+  private memberRings(call: TrackedCall, member: string) {
+    const group = call.group!
+    if (!member || member === call.caller || call.connectedAt || group.ringing.has(member)) return
+    group.ringing.add(member)
+    this.count(member, 1)
+    this.tell(call, member, 'call.ringing', 'ringing')
+    if (!group.told) {
+      group.told = true
+      this.tell(call, call.caller, 'call.ringing', 'ringing')
+    }
+  }
+
+  /**
+   * A member answers a group call: it becomes the callee (busy already if its phone rang). The others stop ringing
+   * and hear nothing more of it: the call was answered, by a colleague.
+   */
+  private memberAnswers(call: TrackedCall, member: string) {
+    const group = call.group!
+    if (!member) return
+    for (const other of group.ringing) if (other !== member) this.count(other, -1)
+    const rang = group.ringing.has(member)
+    group.ringing.clear()
+    call.callee = member
+    call.rang = rang
   }
 
   /** The call goes to `to` now: the callee it leaves is told it ended (missed, or declined) if its phone rang for it. */
@@ -422,6 +473,10 @@ export class CallTracker {
     this.calls.delete(c.id)
     this.count(c.caller, -1)
     if (c.rang) this.count(c.callee, -1)
+    // The members of a group whose phone rang and nobody answered: a missed call for each.
+    const members = [...(c.group?.ringing ?? [])]
+    for (const m of members) this.count(m, -1)
+    c.group?.ringing.clear()
     if (tombstone) {
       this.ended.add(c.id)
       if (this.ended.size > MAX_TOMBSTONES) this.ended.delete(this.ended.values().next().value!)
@@ -430,6 +485,7 @@ export class CallTracker {
     const event = (ext: string, state: CallState): TelephonyEvent => ({ type: state === 'failed' ? 'call.failed' : 'call.ended', timestamp, payload: { call: this.toCall(c, ext, state, endedAt) } })
     this.emit(c.caller, event(c.caller, callerState))
     if (c.rang && c.callee !== c.caller) this.emit(c.callee, event(c.callee, calleeState))
+    for (const m of members) this.emit(m, event(m, 'missed'))
   }
 
   /** Tells the presence of every extension whose effective presence changed since it was last told. */

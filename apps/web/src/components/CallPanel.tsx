@@ -17,7 +17,8 @@ const REASON_KEY: Record<NonNullable<SoftCall['endReason']>, Key> = {
   cancelled: 'call.endedCancelled',
   failed: 'call.endedFailed',
   transferred: 'call.endedTransferred',
-  dnd: 'call.endedDnd'
+  dnd: 'call.endedDnd',
+  'answered-elsewhere': 'call.endedAnsweredElsewhere'
 }
 
 const who = (call: SoftCall) => (call.remoteName ? `${call.remoteName} (${formatNumber(call.remoteNumber)})` : formatNumber(call.remoteNumber))

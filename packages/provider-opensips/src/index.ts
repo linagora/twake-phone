@@ -1,5 +1,6 @@
 import type { MediaProvider, ProviderFactory, RoutedEvent, TelephonyProvider } from '@twake/telephony-provider-sdk'
-import type { Call, Capabilities, Endpoint, ForwardingRules, MediaSession, OriginateRequest, Presence, ProviderStatus, User } from '@twake/telephony-types'
+import type { Call, Capabilities, Endpoint, ForwardingRules, MediaSession, OriginateRequest, Presence, ProviderStatus, RingGroup, User } from '@twake/telephony-types'
+import type { CallGroups } from './call-groups.js'
 import type { CallRules } from './call-rules.js'
 import { OpensipsEvents, parseDlgList, parseUlDump, type EventsLogger } from './events.js'
 import { AsyncQueue } from './queue.js'
@@ -9,6 +10,7 @@ export { SubscriberProvisioner, digestHashes, SUBSCRIBER_SCHEMA, SUBSCRIBER_SQL,
 export { OpensipsEvents, parseDlgList, parseUlDump, parseUdpUrl, type EventsLogger, type OpensipsEventsOptions, type RegisteredContact } from './events.js'
 export { CallTracker, userOf, type ContactRegistration, type TelephonyPresence } from './tracker.js'
 export { CallRules, CALL_RULES_SCHEMA, DND_MESSAGE_MAX, NOANSWER_DELAY, type CallRulesOptions, type DndRule, type ExtensionHolder } from './call-rules.js'
+export { CallGroups, CALL_GROUPS_SCHEMA, DISPLAY_NAMES_SCHEMA, GROUP_MEMBERS_MAX, NAME_MAX, sipDisplayName, type CallGroupsOptions } from './call-groups.js'
 export { AsyncQueue } from './queue.js'
 
 /** The events the Gateway listens to: registrations and their refreshes (usrloc), our own call events (opensips.cfg.tpl), the CDRs and missed calls (acc). */
@@ -57,6 +59,11 @@ export interface OpensipsConfig {
    * chose one. Without it, no forwarding, and a "do not disturb" is only a presence.
    */
   callRules?: CallRules
+  /**
+   * The `call_groups` and `display_names` OpenSIPS reads at each call (ADR 0014): simultaneous ring groups, and the
+   * directory name each party is shown of the other. Without it, no groups, and the names are the phones' own.
+   */
+  callGroups?: CallGroups
   logger?: EventsLogger
 }
 
@@ -166,6 +173,7 @@ export class OpensipsProvider implements TelephonyProvider, MediaProvider {
       presence: { read: true, write: true, realtime: !!this.events?.live, statuses: ['available', 'busy', 'away', 'dnd', 'offline'] },
       history: !!this.events,
       forwarding: !!this.config.callRules,
+      groups: !!this.config.callGroups,
       conference: { dialIn: false, dialOut: false }
     }
   }
@@ -215,11 +223,13 @@ export class OpensipsProvider implements TelephonyProvider, MediaProvider {
 
   /**
    * Who holds each extension of the tenant now, after any change (a synchronisation, an administrator): the rules
-   * of an extension that changed holder go, and so do the forwards to one (ADR 0013). The presences follow with
+   * of an extension that changed holder go, and so do the forwards to one (ADR 0013); the names OpenSIPS shows are
+   * those of the directory, and an extension nobody holds leaves the groups (ADR 0014). The presences follow with
    * `restorePresences`.
    */
-  async syncExtensions(holders: { extension: string; userId: string }[]) {
+  async syncExtensions(holders: { extension: string; userId: string; displayName?: string }[]) {
     await this.config.callRules?.reconcile(holders)
+    await this.config.callGroups?.reconcile(holders)
   }
 
   /** One timer, for the earliest end of a chosen presence: the others are told it ended when it does. */
@@ -244,6 +254,23 @@ export class OpensipsProvider implements TelephonyProvider, MediaProvider {
     if (!user.extension) throw noExtension()
     if (!this.config.callRules) throw Object.assign(new Error('Forwarding is not available on this platform'), { statusCode: 501 })
     await this.config.callRules.setForwarding(user.extension, rules, user.id)
+  }
+
+  private groups() {
+    if (!this.config.callGroups) throw Object.assign(new Error('Call groups are not available on this platform'), { statusCode: 501 })
+    return this.config.callGroups
+  }
+
+  async listGroups(): Promise<RingGroup[]> {
+    return this.groups().list()
+  }
+
+  async setGroup(group: RingGroup) {
+    await this.groups().set(group)
+  }
+
+  async deleteGroup(number: string) {
+    return this.groups().delete(number)
   }
 
   /** The presence of every extension the SIP server told about. */

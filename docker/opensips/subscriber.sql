@@ -78,6 +78,25 @@ CREATE TABLE IF NOT EXISTS call_rules (
     dnd_message VARCHAR(140) DEFAULT '' NOT NULL,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL
 );
+
+-- Our own tables (step 4c, ADR 0014), written by the Gateway (CallGroups of provider-opensips), read by
+-- opensips.cfg.tpl at each INVITE: the simultaneous ring groups an administrator sets (a number that is no
+-- extension, the member extensions in order), and the directory name of each extension, that each party of a call
+-- is shown of the other.
+CREATE TABLE IF NOT EXISTS call_groups (
+    number VARCHAR(64) PRIMARY KEY NOT NULL,
+    tenant_id TEXT DEFAULT '' NOT NULL,
+    name VARCHAR(64) DEFAULT '' NOT NULL,
+    members VARCHAR(64)[] DEFAULT '{}' NOT NULL,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS display_names (
+    extension VARCHAR(64) PRIMARY KEY NOT NULL,
+    tenant_id TEXT DEFAULT '' NOT NULL,
+    display_name VARCHAR(64) DEFAULT '' NOT NULL,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL
+);
 -- Tables created beforehand (by OpenSIPS's own scripts, or by an earlier version of this file) lack columns: added
 -- here, once, by the owner (the Gateway only adds a missing one, see SubscriberProvisioner.ensureSchema), or every
 -- CDR insert, or every write of the rules, would fail. An older call_rules row gets an empty tenant: the Gateway's

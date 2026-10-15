@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { SubscriberProvisioner } from '@twake/provider-opensips'
 import { parseKey } from './crypto.js'
 import { storedOpensipsFactory } from './providers.js'
+import { ProviderRegistry } from './registry.js'
 import { MemoryStore } from './store/memory.js'
 
 const key = parseKey('0'.repeat(64))
@@ -18,7 +19,7 @@ describe('storedOpensipsFactory', () => {
           queries.push(text)
           values.push((params as unknown[] | undefined) ?? [])
           // The version check of ensureSchema() reads the row OpenSIPS's schema holds.
-          return /SELECT table_name, table_version/.test(text) ? { rows: [{ table_name: 'subscriber', table_version: 8 }, { table_name: 'acc', table_version: 7 }, { table_name: 'missed_calls', table_version: 5 }] } : { rows: [] }
+          return /SELECT table_name, table_version/.test(text) ? { rows: [{ table_name: 'subscriber', table_version: 8 }, { table_name: 'acc', table_version: 7 }, { table_name: 'missed_calls', table_version: 5 }] } : { rows: [], rowCount: 1 }
         }
       },
       realm: 'sip.test'
@@ -58,6 +59,20 @@ describe('storedOpensipsFactory', () => {
     expect(values[insert]).toEqual(['101', 't', 'alice', '102', 'bob', '103', '', null, null, 20])
   })
 
+  it('keeps the ring groups and the directory names in the same database, for its tenant', async () => {
+    const { queries, values, provider } = setup()
+    expect((await provider.getCapabilities()).groups).toBe(true)
+    await provider.setGroup!({ number: '200', name: 'Accueil', members: ['101', '102'] })
+    const create = queries.findIndex(q => /CREATE TABLE IF NOT EXISTS call_groups/.test(q))
+    const insert = queries.findIndex(q => /INSERT INTO call_groups/.test(q))
+    expect(create).toBeGreaterThanOrEqual(0)
+    expect(insert).toBeGreaterThan(create)
+    expect(values[insert]).toEqual(['200', 't', 'Accueil', ['101', '102']])
+    await provider.syncExtensions!([{ extension: '101', userId: 'alice', displayName: 'Alice Martin' }])
+    const names = queries.findIndex(q => /INSERT INTO display_names/.test(q))
+    expect(values[names]).toEqual(['t', ['101'], ['Alice Martin']])
+  })
+
   it('refuses an extension nobody is mapped to', async () => {
     const { provider } = setup()
     await expect(provider.getSession!({ id: 'x', tenantId: 't', displayName: 'X', extension: '999' }, browser)).rejects.toMatchObject({ statusCode: 404 })
@@ -83,5 +98,25 @@ describe('storedOpensipsFactory', () => {
   it('refuses to start without the secrets key', () => {
     const factory = storedOpensipsFactory({ store: new MemoryStore(), env: { OPENSIPS_DB_URL: 'postgres://x' } })
     expect(() => factory.create({ websocketUrl: 'wss://sip.test/ws', domain: 'sip.test', subscriberDbUrlRef: 'env:OPENSIPS_DB_URL' })).toThrow(/SECRETS_KEY/)
+  })
+})
+
+describe('ProviderRegistry', () => {
+  it('skips, and reports, a tenant whose provider type this Gateway no longer builds (an asterisk row from before step 4c)', () => {
+    const created: string[] = []
+    const factory = { type: 'opensips', create: (_: unknown, ctx?: { tenantId: string }) => (created.push(ctx!.tenantId), { close: async () => {} }) as never }
+    const registry = new ProviderRegistry(
+      [
+        { tenantId: 'old', type: 'asterisk', config: {} },
+        { tenantId: 'new', type: 'opensips', config: {} }
+      ],
+      [factory]
+    )
+    const warnings: string[] = []
+    registry.startAll(w => void warnings.push(w))
+    expect(created).toEqual(['new'])
+    expect(warnings).toEqual(['Tenant old: no provider of type "asterisk" in this Gateway; remove or replace its provider_configs row'])
+    expect([registry.serves('old'), registry.serves('new'), registry.serves('none')]).toEqual([false, true, false])
+    expect(() => registry.forTenant('old')).toThrow(expect.objectContaining({ statusCode: 404 }))
   })
 })

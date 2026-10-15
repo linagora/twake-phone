@@ -111,6 +111,29 @@ describe('DirectorySync', () => {
     expect(await store.getMappingByUser('acme', 'bob')).toMatchObject({ extension: '101' })
   })
 
+  it("never gives a person a ring group's number: a conflict, and they keep the extension they had", async () => {
+    const store = new MemoryStore()
+    const people = [person('alice', 'Alice', '101'), person('bob', 'Bob', '102')]
+    const directory = new MemoryContactDirectory(people)
+    const groups = new Set<string>(['200'])
+    const asked: string[] = []
+    const sync = new DirectorySync({ store, directory, tenantId: 'acme', reserved: async tenantId => (asked.push(tenantId), groups) })
+    await sync.run()
+    expect(asked).toEqual(['acme'])
+    // Alice is given 200 in the directory: the group keeps its number, Alice her 101; Carol, new, gets nothing.
+    directory.listAll = async () => [person('alice', 'Alice', '200'), person('bob', 'Bob', '102'), person('carol', 'Carol', '200')]
+    const report = await sync.run()
+    expect(report).toMatchObject({ created: 0, updated: 0, removed: 0, conflicts: [{ userId: 'alice', extension: '200', heldBy: '', group: true }, { userId: 'carol', extension: '200', heldBy: '', group: true }] })
+    expect(await store.getMappingByUser('acme', 'alice')).toMatchObject({ extension: '101' })
+    expect(await store.getMappingByUser('acme', 'carol')).toBeNull()
+    // The groups cannot be read: nothing changes, and the report says so without detail.
+    const failing = new DirectorySync({ store, directory, tenantId: 'acme', reserved: async () => { throw new Error('connect ECONNREFUSED 10.0.0.5:5432') } })
+    const failed = await failing.run()
+    expect(failed.error).toMatch(/call groups could not be read/)
+    expect(JSON.stringify(failed)).not.toMatch(/10\.0\.0\.5/)
+    expect(await store.getMappingByUser('acme', 'alice')).toMatchObject({ extension: '101' })
+  })
+
   it('refuses to remove anything when the directory lists nobody', async () => {
     const people = [person('alice', 'Alice', '101')]
     const { store, directory, sync } = setup(people)
