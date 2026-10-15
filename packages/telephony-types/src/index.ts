@@ -80,6 +80,70 @@ export interface RingGroup {
   vacant?: string[]
 }
 
+/**
+ * How the platform authenticates to its operator: it registers with a login and a password (`register`), or the
+ * operator recognises the address it sends from (`ip`; a password may still answer its challenges).
+ */
+export type TrunkAuth = 'register' | 'ip'
+/** How numbers are written to the operator: +33612345678, 33612345678, 0033612345678 or 0612345678 (French numbers). */
+export type TrunkNumberFormat = 'e164' | 'e164-no-plus' | 'international-00' | 'national'
+/** The audio codecs a trunk may carry (the browser's side is always Opus or G.711 over DTLS-SRTP). */
+export const TRUNK_CODECS = ['PCMA', 'PCMU', 'G722', 'opus'] as const
+export type TrunkCodec = (typeof TRUNK_CODECS)[number]
+
+/**
+ * A SIP trunk: where calls to and from the public network go (step 6, ADR 0016). The password is write-only: it is
+ * never returned, `hasPassword` tells whether one is kept.
+ */
+export interface Trunk {
+  /** Lower case letters, digits and dashes. */
+  id: string
+  /** What administrators call it. */
+  name?: string
+  auth: TrunkAuth
+  /** The operator's SIP domain: host of the Request-URI, the From of outbound calls, the address of record. */
+  domain: string
+  /** The operator's servers, `host[:port]`, tried in this order (the outbound proxy); the domain by default. */
+  proxies?: string[]
+  /** Other IP addresses the operator's calls may come from (its servers' own are accepted already). */
+  sources?: string[]
+  /** Login (authentication user name) at the operator; the user part of the address of record when it registers. */
+  username?: string
+  /** Digest realm of the operator, when known: the password is then kept by OpenSIPS as a hash for it. */
+  realm?: string
+  /** Where to register, `host[:port]` (the domain by default). */
+  registrar?: string
+  /** Seconds a registration lasts (60 to 3600, 600 by default). */
+  registerExpires?: number
+  /** In order of preference. */
+  codecs: TrunkCodec[]
+  numberFormat: TrunkNumberFormat
+  /** Also asserts the number presented in a P-Asserted-Identity (some operators want it). */
+  assertIdentity?: boolean
+  /** E.164 number presented for those who have no direct number of their own. */
+  defaultNumber: string
+  /** Read only. */
+  hasPassword?: boolean
+}
+
+/** What an administrator writes: the trunk without its id, with a password to keep (or to change). */
+export type TrunkInput = Omit<Trunk, 'id' | 'hasPassword'> & { password?: string }
+
+/**
+ * Direct numbers (SDA/DID): one E.164 number or a range of them (same length, at most 10 000) and where their calls
+ * go: an extension or a group (`target`), or the extension that ends with the last `suffixDigits` digits of the number
+ * called. The extension a direct number reaches presents it when it calls out.
+ */
+export interface DidRange {
+  id: string
+  trunkId: string
+  first: string
+  /** Same as `first` for a single number. */
+  last: string
+  target?: string
+  suffixDigits?: number
+}
+
 export type CallState =
   | 'new'
   | 'ringing'
@@ -138,6 +202,8 @@ export interface Capabilities {
    * woken (`setWakeable`).
    */
   push?: boolean
+  /** Calls to and from the public network through SIP trunks that administrators set (`Trunk`, `DidRange`). */
+  trunks?: boolean
   conference: { dialIn: boolean; dialOut: boolean }
 }
 

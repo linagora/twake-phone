@@ -21,6 +21,14 @@ set -eu
 : "${CFG_TEMPLATE:=/etc/opensips/opensips.cfg.tpl}"
 : "${CFG_OUT:=/etc/opensips/opensips.cfg}"
 : "${OPENSIPS_BIN:=/usr/sbin/opensips}"
+: "${TRUNK_SQL:=/etc/opensips/trunk.sql}"
+# The trunk's UDP socket (step 6, ADR 0016): the address OpenSIPS registers to the operator and calls from, the
+# loopback like LISTEN_IP by default (set the machine's own address to reach an operator), never port 5060 by default
+# (ARCHITECTURE §13). TRUNK_ADVERTISE (host[:port]) only when the operator must be told another address: by default
+# none is declared, the operator answers where the packets come from.
+: "${TRUNK_LISTEN_IP:=$LISTEN_IP}"
+: "${TRUNK_PORT:=5070}"
+: "${TRUNK_ADVERTISE:=}"
 # The call rules are read at each INVITE (sqlops, ADR 0013): on their own connections, whose queries PostgreSQL stops
 # after this many milliseconds (the call then goes on without rules), so that a slow database never holds a call.
 : "${RULES_QUERY_TIMEOUT_MS:=1000}"
@@ -45,7 +53,21 @@ case "${OPENSIPS_DB_URL##*@}" in
   *\?*) OPENSIPS_RULES_DB_URL="${OPENSIPS_DB_URL}&options=-cstatement_timeout=${RULES_QUERY_TIMEOUT_MS}" ;;
   *) OPENSIPS_RULES_DB_URL="${OPENSIPS_DB_URL}?options=-cstatement_timeout=${RULES_QUERY_TIMEOUT_MS}" ;;
 esac
-export SIP_DOMAIN LISTEN_IP SIP_PORT WS_PORT WSS_PORT OPENSIPS_DB_URL OPENSIPS_RULES_DB_URL PUSH_WAIT_SEC RTPENGINE_SOCK OPENSIPS_LOG_LEVEL OPENSIPS_MPATH MI_FIFO MI_LISTEN_IP MI_PORT TLS_CERT TLS_KEY
+case "$TRUNK_PORT" in
+  '' | *[!0-9]*) echo "TRUNK_PORT must be a port number" >&2; exit 1 ;;
+esac
+if [ "$TRUNK_PORT" -lt 1 ] || [ "$TRUNK_PORT" -gt 65535 ]; then
+  echo "TRUNK_PORT must be 1 to 65535" >&2; exit 1
+fi
+if [ "$TRUNK_LISTEN_IP" = "$LISTEN_IP" ] && [ "$TRUNK_PORT" = "$SIP_PORT" ]; then
+  echo "TRUNK_PORT must differ from SIP_PORT on the same address: the trunk has a socket of its own" >&2; exit 1
+fi
+case "$TRUNK_ADVERTISE" in
+  *[!A-Za-z0-9.:-]*) echo "TRUNK_ADVERTISE must be host or host:port" >&2; exit 1 ;;
+  '') TRUNK_SOCKET_AS='' ;;
+  *) TRUNK_SOCKET_AS=" as $TRUNK_ADVERTISE" ;;
+esac
+export SIP_DOMAIN LISTEN_IP SIP_PORT WS_PORT WSS_PORT OPENSIPS_DB_URL OPENSIPS_RULES_DB_URL PUSH_WAIT_SEC RTPENGINE_SOCK OPENSIPS_LOG_LEVEL OPENSIPS_MPATH MI_FIFO MI_LISTEN_IP MI_PORT TLS_CERT TLS_KEY TRUNK_LISTEN_IP TRUNK_PORT TRUNK_SOCKET_AS
 
 # The MI socket (mi_datagram) has no authentication: whoever reaches it can stop OpenSIPS, drop registrations, end
 # calls, read who is registered and subscribe to the events (who calls whom). It listens on its own address, the
@@ -78,6 +100,10 @@ mi_address_is_private() {
     *) return 1 ;;
   esac
 }
+# The trunk socket is a real address of the machine: OpenSIPS registers it with the operator.
+if ! is_ipv4 "$TRUNK_LISTEN_IP" || [ "$TRUNK_LISTEN_IP" = "0.0.0.0" ]; then
+  echo "TRUNK_LISTEN_IP=$TRUNK_LISTEN_IP must be an IPv4 address of this machine (not 0.0.0.0)" >&2; exit 1
+fi
 if ! mi_address_is_private "$MI_LISTEN_IP" && [ "$MI_ALLOW_PUBLIC" != "1" ]; then
   echo "MI_LISTEN_IP=$MI_LISTEN_IP is not a loopback or private IPv4 address: the MI has no authentication." >&2
   echo "Keep it on 127.0.0.1 (or the private network the Gateway reaches it on), or set MI_ALLOW_PUBLIC=1 behind a firewall." >&2
@@ -93,8 +119,21 @@ if [ ! -f "$TLS_CERT" ] || [ ! -f "$TLS_KEY" ]; then
 fi
 
 # Only the listed variables are substituted: a "$avp(...)" of the script must stay as it is.
-envsubst '$SIP_DOMAIN $LISTEN_IP $SIP_PORT $WS_PORT $WSS_PORT $OPENSIPS_DB_URL $OPENSIPS_RULES_DB_URL $PUSH_WAIT_SEC $RTPENGINE_SOCK $OPENSIPS_LOG_LEVEL $OPENSIPS_MPATH $MI_FIFO $MI_LISTEN_IP $MI_PORT $TLS_CERT $TLS_KEY' \
+envsubst '$SIP_DOMAIN $LISTEN_IP $SIP_PORT $WS_PORT $WSS_PORT $OPENSIPS_DB_URL $OPENSIPS_RULES_DB_URL $PUSH_WAIT_SEC $RTPENGINE_SOCK $OPENSIPS_LOG_LEVEL $OPENSIPS_MPATH $MI_FIFO $MI_LISTEN_IP $MI_PORT $TLS_CERT $TLS_KEY $TRUNK_LISTEN_IP $TRUNK_PORT $TRUNK_SOCKET_AS' \
   < "$CFG_TEMPLATE" > "$CFG_OUT"
 
+# The tables of the trunks (step 6): dispatcher, dialplan and uac_registrant read theirs at start and OpenSIPS stops
+# without them; a database created before step 6 has none. Created when missing, with the numbering plan of this
+# version (trunk.sql, generated from provider-opensips), tried for a minute while the database comes up.
+if [ -f "$TRUNK_SQL" ]; then
+  tries=0
+  until PGOPTIONS="-c client_min_messages=warning" psql "$OPENSIPS_DB_URL" -v ON_ERROR_STOP=1 -q -f "$TRUNK_SQL" >/dev/null; do
+    tries=$((tries + 1))
+    if [ "$tries" -ge 30 ]; then
+      echo "The tables of the trunks could not be written into the database of OPENSIPS_DB_URL" >&2; exit 1
+    fi
+    sleep 2
+  done
+fi
 "$OPENSIPS_BIN" -C -f "$CFG_OUT"
 exec "$OPENSIPS_BIN" -F -f "$CFG_OUT" "$@"

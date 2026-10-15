@@ -40,6 +40,12 @@ export type TelephonyPresence = 'offline' | 'available' | 'busy'
 
 type Emit = (extension: string, event: TelephonyEvent) => void
 
+/**
+ * A party of the public network, through a trunk (step 6): an E.164 number, or a caller who hid theirs. Nobody's
+ * extension: nothing is told to it and it is never busy; it is only the other party of someone's call.
+ */
+export const isExternalParty = (party: string) => party.startsWith('+') || party === 'anonymous'
+
 /** A contact with an expiry, as the events and `ul_dump` give it. */
 export interface ContactRegistration {
   uri: string
@@ -95,10 +101,16 @@ export class CallTracker {
   /** The presence last told for each extension, so that only changes are told; offline ones are forgotten once told. */
   private readonly told = new Map<string, Presence>()
 
+  private readonly emit: Emit
+
   constructor(
-    private readonly emit: Emit,
+    emit: Emit,
     private readonly now: () => string = () => new Date().toISOString()
-  ) {}
+  ) {
+    this.emit = (extension, event) => {
+      if (!isExternalParty(extension)) emit(extension, event)
+    }
+  }
 
   /** The contacts known now, to take before asking `ul_dump`: a resync only removes what was known before it. */
   knownContacts(): Map<string, Set<string>> {
@@ -462,6 +474,7 @@ export class CallTracker {
   }
 
   private count(extension: string, delta: number) {
+    if (isExternalParty(extension)) return
     const n = (this.busy.get(extension) ?? 0) + delta
     if (n > 0) this.busy.set(extension, n)
     else this.busy.delete(extension)
