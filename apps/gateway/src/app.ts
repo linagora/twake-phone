@@ -178,18 +178,23 @@ export const parseForwarding = async (body: unknown, user: User, isExtension: (t
   return out
 }
 
-/** Most members of a group: each rings every window of theirs, all in one call. */
-const GROUP_MEMBERS_MAX = 20
+/**
+ * Most members of a group: a call of the SIP server carries 12 destinations at most (MAX_BRANCHES of the packaged
+ * OpenSIPS), and the first window of each member must always ring (ADR 0014).
+ */
+export const GROUP_MEMBERS_MAX = 12
 const GROUP_NAME_MAX = 64
 /** What a caller dials and a SIP server routes: the characters of an extension. */
 const NUMBER = /^[A-Za-z0-9._+-]{1,64}$/
 
 /**
  * Validates a simultaneous ring group an administrator sets: a number that is no extension of the organisation (a
- * group and a person would share it), a name, and 1 to 20 members, each an extension of the organisation (in the
- * order given, once each). A 400 or 409 with a `code` the app turns into words.
+ * group and a person would share it), a name, and 1 to GROUP_MEMBERS_MAX members, each an extension of the
+ * organisation or one the group already has (`keep`: a vacant extension stays a member until an administrator takes
+ * it out, ADR 0014), in the order given, once each. The size is checked before any member is looked up. A 400 or
+ * 409 with a `code` the app turns into words.
  */
-export const parseGroup = async (number: string, body: unknown, isExtension: (extension: string) => Promise<boolean>): Promise<RingGroup> => {
+export const parseGroup = async (number: string, body: unknown, isExtension: (extension: string) => Promise<boolean>, keep: readonly string[] = []): Promise<RingGroup> => {
   if (!NUMBER.test(number)) throw refused('GROUP_NUMBER', 'invalid group number')
   if (await isExtension(number)) throw Object.assign(new Error(`${number} is an extension: a group needs a number of its own`), { statusCode: 409, code: 'GROUP_NUMBER_TAKEN' })
   if (!body || typeof body !== 'object' || Array.isArray(body)) throw bad('invalid group')
@@ -201,11 +206,14 @@ export const parseGroup = async (number: string, body: unknown, isExtension: (ex
   for (const value of b.members) {
     if (typeof value !== 'string') throw refused('GROUP_MEMBER_NOT_EXTENSION', 'only an extension of your organisation can be a member')
     const m = value.replace(/\s/g, '')
-    if (!m) continue
-    if (!NUMBER.test(m) || !(await isExtension(m))) throw refused('GROUP_MEMBER_NOT_EXTENSION', `${m.slice(0, 64)}: only an extension of your organisation can be a member`)
-    if (!members.includes(m)) members.push(m)
+    if (m && !members.includes(m)) members.push(m)
+    // One too many is enough to refuse: a huge list costs no lookup.
+    if (members.length > GROUP_MEMBERS_MAX) break
   }
   if (members.length === 0 || members.length > GROUP_MEMBERS_MAX) throw refused('GROUP_MEMBERS', `a group has 1 to ${GROUP_MEMBERS_MAX} members`)
+  for (const m of members) {
+    if (!NUMBER.test(m) || !(keep.includes(m) || (await isExtension(m)))) throw refused('GROUP_MEMBER_NOT_EXTENSION', `${m.slice(0, 64)}: only an extension of your organisation can be a member`)
+  }
   return { number, name, members }
 }
 
@@ -626,22 +634,46 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
       })
 
       // Simultaneous ring groups (capability `groups`): administrators only, one change at a time per tenant (with
-      // the presences and forwards: the same provider database). A group number is never an extension (a directory
-      // synchronisation refuses to give one away either).
+      // the presences and forwards: the same provider database). A group number is never an extension: the check
+      // and the write happen while no directory synchronisation runs (which refuses to give a group's number away
+      // either), so neither can slip between the other's check and write.
       const groupsOf = (provider: TelephonyProvider) => {
         if (!provider.listGroups || !provider.setGroup || !provider.deleteGroup) throw Object.assign(new Error('Call groups are not available on this platform'), { statusCode: 501 })
         return { list: provider.listGroups.bind(provider), set: provider.setGroup.bind(provider), remove: provider.deleteGroup.bind(provider) }
       }
+      const exclusive = <T>(tenantId: string, fn: () => Promise<T>) => {
+        const sync = options.directorySync
+        return sync ? sync.exclusive(() => inTurn(tenantId, fn)) : inTurn(tenantId, fn)
+      }
+      const isExtensionOf = (tenantId: string) => async (extension: string) => !!(await store.getMappingByExtension(tenantId, extension))
       v1.get('/admin/groups', async req => {
         const user = await administrator(req)
-        return { items: await groupsOf(registry.forTenant(user.tenantId)).list() }
+        const groups = await groupsOf(registry.forTenant(user.tenantId)).list()
+        // Members nobody holds right now: they stay in the group (a position), with no window to ring.
+        const held = new Set((await store.listMappings(user.tenantId)).map(m => m.extension))
+        return { items: groups.map(g => ({ ...g, vacant: g.members.filter(m => !held.has(m)) })) }
+      })
+      v1.post<{ Body: { number?: unknown } | undefined }>('/admin/groups', async (req, reply) => {
+        const user = await administrator(req)
+        const groups = groupsOf(registry.forTenant(user.tenantId))
+        const number = typeof req.body?.number === 'string' ? req.body.number.trim() : ''
+        const group = await exclusive(user.tenantId, async () => {
+          const g = await parseGroup(number, req.body, isExtensionOf(user.tenantId))
+          await groups.set(g, 'create')
+          return g
+        })
+        return reply.code(201).send(group)
       })
       v1.put<{ Params: { number: string } }>('/admin/groups/:number', async req => {
         const user = await administrator(req)
         const groups = groupsOf(registry.forTenant(user.tenantId))
-        const group = await parseGroup(req.params.number, req.body, async extension => !!(await store.getMappingByExtension(user.tenantId, extension)))
-        await inTurn(user.tenantId, () => groups.set(group))
-        return group
+        return exclusive(user.tenantId, async () => {
+          const current = (await groups.list()).find(g => g.number === req.params.number)
+          if (!current) throw Object.assign(new Error('No such group'), { statusCode: 404 })
+          const group = await parseGroup(req.params.number, req.body, isExtensionOf(user.tenantId), current.members)
+          await groups.set(group, 'replace')
+          return group
+        })
       })
       v1.delete<{ Params: { number: string } }>('/admin/groups/:number', async (req, reply) => {
         const user = await administrator(req)

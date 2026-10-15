@@ -47,15 +47,27 @@ describe('CallGroups', () => {
     expect(db.queries[0]).toMatchObject({ text: 'SELECT number, name, members FROM call_groups WHERE tenant_id = $1 ORDER BY number', values: ['A'] })
   })
 
-  it("upserts a group without taking another tenant's number", async () => {
+  it('creates a group only on a number that is no account of OpenSIPS and no group yet', async () => {
     const db = recorder()
     const groups = new CallGroups({ pool: db.pool, tenantId: 'A' })
-    await groups.set({ number: '200', name: ' Accueil  "central" ', members: ['101', '102', '101'] })
-    expect(db.queries[0]!.text).toMatch(/^INSERT INTO call_groups .* ON CONFLICT \(number\) DO UPDATE .* WHERE call_groups.tenant_id = EXCLUDED.tenant_id$/)
+    await groups.set({ number: '200', name: ' Accueil  "central" ', members: ['101', '102', '101'] }, 'create')
+    expect(db.queries[0]!.text).toMatch(/^INSERT INTO call_groups .* WHERE NOT EXISTS \(SELECT 1 FROM subscriber s WHERE s.username = \$1::text\) ON CONFLICT \(number\) DO NOTHING$/)
     // The name as SIP will carry it, the members once each, in order.
     expect(db.queries[0]!.values).toEqual(['200', 'A', 'Accueil central', ['101', '102']])
-    // Nothing written: the number is another tenant's.
-    await expect(new CallGroups({ pool: recorder([], 0).pool, tenantId: 'A' }).set({ number: '200', name: 'x', members: ['101'] })).rejects.toMatchObject({ statusCode: 409, code: 'GROUP_NUMBER_TAKEN' })
+    // Nothing written, a group of the tenant has the number: said so.
+    await expect(new CallGroups({ pool: recorder([{ tenant_id: 'A' }], 0).pool, tenantId: 'A' }).set({ number: '200', name: 'x', members: ['101'] }, 'create')).rejects.toMatchObject({ statusCode: 409, code: 'GROUP_EXISTS' })
+    // Nothing written, an account or another tenant's group has it: the same words for both, nothing about the other tenant.
+    for (const rows of [[], [{ tenant_id: 'B' }]]) {
+      const err = await new CallGroups({ pool: recorder(rows, 0).pool, tenantId: 'A' }).set({ number: '200', name: 'x', members: ['101'] }, 'create').catch((e: Error) => e)
+      expect(err).toMatchObject({ statusCode: 409, code: 'GROUP_NUMBER_TAKEN', message: 'this number is taken' })
+    }
+  })
+
+  it('replaces a group of its tenant only, and says when it has none', async () => {
+    const db = recorder()
+    await new CallGroups({ pool: db.pool, tenantId: 'A' }).set({ number: '200', name: 'Accueil', members: ['102'] }, 'replace')
+    expect(db.queries[0]).toMatchObject({ text: 'UPDATE call_groups SET name = $3, members = $4, updated_at = now() WHERE number = $1 AND tenant_id = $2', values: ['200', 'A', 'Accueil', ['102']] })
+    await expect(new CallGroups({ pool: recorder([], 0).pool, tenantId: 'A' }).set({ number: '200', name: 'x', members: ['101'] }, 'replace')).rejects.toMatchObject({ statusCode: 404 })
   })
 
   it('refuses what OpenSIPS could not use, before any query', async () => {
@@ -99,21 +111,44 @@ if (process.env.TEST_DATABASE_URL) {
       const a = new CallGroups({ pool, ready, tenantId: 'spec-A' })
       const b = new CallGroups({ pool, ready, tenantId: 'spec-B' })
       await pool.query("DELETE FROM call_groups WHERE number IN ('9200', '9201')")
-      await a.set({ number: '9200', name: 'Accueil', members: ['9103', '9101', '9102'] })
-      await a.set({ number: '9200', name: 'Accueil', members: ['9102', '9101'] })
-      await expect(b.set({ number: '9200', name: 'Pris', members: ['9101'] })).rejects.toMatchObject({ statusCode: 409 })
-      await b.set({ number: '9201', name: 'Support', members: ['9104'] })
+      await a.set({ number: '9200', name: 'Accueil', members: ['9103', '9101', '9102'] }, 'create')
+      await expect(a.set({ number: '9200', name: 'Autre', members: ['9101'] }, 'create')).rejects.toMatchObject({ statusCode: 409, code: 'GROUP_EXISTS' })
+      await a.set({ number: '9200', name: 'Accueil', members: ['9102', '9101'] }, 'replace')
+      await expect(b.set({ number: '9200', name: 'Pris', members: ['9101'] }, 'create')).rejects.toMatchObject({ statusCode: 409, code: 'GROUP_NUMBER_TAKEN', message: 'this number is taken' })
+      await expect(b.set({ number: '9200', name: 'Pris', members: ['9101'] }, 'replace')).rejects.toMatchObject({ statusCode: 404 })
+      await b.set({ number: '9201', name: 'Support', members: ['9104'] }, 'create')
       expect(await a.list()).toEqual([{ number: '9200', name: 'Accueil', members: ['9102', '9101'] }])
       expect(await b.list()).toEqual([{ number: '9201', name: 'Support', members: ['9104'] }])
       expect(await b.delete('9200')).toBe(false)
       expect(await a.delete('9200')).toBe(true)
+      expect(await b.delete('9201')).toBe(true)
       expect(await a.list()).toEqual([])
     })
 
-    it('writes the directory names of the extensions held, and takes the extensions nobody holds out of the groups', async () => {
+    it('never creates a group on the number of an account OpenSIPS has (an extension wins there)', async () => {
+      const a = new CallGroups({ pool, ready, tenantId: 'spec-A' })
+      const accounts = new SubscriberProvisioner({ pool, realm: 'sip.example.test' })
+      await ready()
+      await accounts.setSipSecret('9299', 'secret')
+      try {
+        await expect(a.set({ number: '9299', name: 'Accueil', members: ['9101'] }, 'create')).rejects.toMatchObject({ statusCode: 409, code: 'GROUP_NUMBER_TAKEN' })
+        expect(await a.list()).toEqual([])
+        // Once the account is gone (its holder left), the number is free.
+        await accounts.keepOnly(['9101'])
+        expect((await pool.query("SELECT 1 FROM subscriber WHERE username = '9299'")).rowCount).toBe(0)
+        await a.set({ number: '9299', name: 'Accueil', members: ['9101'] }, 'create')
+        expect(await a.list()).toEqual([{ number: '9299', name: 'Accueil', members: ['9101'] }])
+      } finally {
+        await a.delete('9299')
+        await accounts.removeSipSecret('9299')
+      }
+    })
+
+    it('writes the directory names of the extensions held, and keeps the members nobody holds now in the groups', async () => {
       const a = new CallGroups({ pool, ready, tenantId: 'spec-A' })
       await pool.query("DELETE FROM display_names WHERE extension LIKE '91%'")
-      await a.set({ number: '9200', name: 'Accueil', members: ['9103', '9101', '9102'] })
+      await pool.query("DELETE FROM call_groups WHERE number = '9200'")
+      await a.set({ number: '9200', name: 'Accueil', members: ['9103', '9101', '9102'] }, 'create')
       await pool.query("INSERT INTO display_names (extension, tenant_id, display_name) VALUES ('9109', '', 'Nobody''s')")
       await a.reconcile([
         { extension: '9101', displayName: 'Alice "Al" Martin' },
@@ -126,14 +161,27 @@ if (process.env.TEST_DATABASE_URL) {
         { extension: '9101', tenant_id: 'spec-A', display_name: 'Alice Al Martin' },
         { extension: '9103', tenant_id: 'spec-A', display_name: 'Bob Durand' }
       ])
-      // 9102 is nobody's now: out of the group, the others keep their order.
-      expect(await a.list()).toEqual([{ number: '9200', name: 'Accueil', members: ['9103', '9101'] }])
-      // Bob leaves: his name goes, and so does he from the group; an empty group stays until an administrator changes it.
+      // 9102 is nobody's now: still a member (a position), in its place.
+      expect(await a.list()).toEqual([{ number: '9200', name: 'Accueil', members: ['9103', '9101', '9102'] }])
+      // Bob leaves, then everyone: the names go, the members stay until an administrator changes the group.
       await a.reconcile([{ extension: '9101', displayName: 'Alice Martin' }])
       expect((await pool.query("SELECT extension, display_name FROM display_names WHERE extension LIKE '91%'")).rows).toEqual([{ extension: '9101', display_name: 'Alice Martin' }])
       await a.reconcile([])
-      expect(await a.list()).toEqual([{ number: '9200', name: 'Accueil', members: [] }])
+      expect(await a.list()).toEqual([{ number: '9200', name: 'Accueil', members: ['9103', '9101', '9102'] }])
       await a.delete('9200')
+    })
+
+    it("never takes over another tenant's name of an extension", async () => {
+      const a = new CallGroups({ pool, ready, tenantId: 'spec-A' })
+      const b = new CallGroups({ pool, ready, tenantId: 'spec-B' })
+      await ready()
+      await pool.query("DELETE FROM display_names WHERE extension LIKE '91%'")
+      await a.reconcile([{ extension: '9101', displayName: 'Alice Martin' }])
+      // Two tenants on one database (the Gateway refuses it, ADR 0013): B's reconcile leaves A's row alone, both ways.
+      await b.reconcile([{ extension: '9101', displayName: 'Mallory' }])
+      await a.reconcile([{ extension: '9101', displayName: 'Alice Martin' }])
+      await b.reconcile([{ extension: '9101', displayName: 'Mallory' }])
+      expect((await pool.query("SELECT tenant_id, display_name FROM display_names WHERE extension = '9101'")).rows).toEqual([{ tenant_id: 'spec-A', display_name: 'Alice Martin' }])
     })
   })
 }

@@ -73,6 +73,11 @@ export interface RingGroup {
   name: string
   /** The extensions that ring, in the order the administrator gave. */
   members: string[]
+  /**
+   * When listed: the members nobody holds right now (a person left). They stay members, as positions; nothing rings
+   * there until someone holds the extension again.
+   */
+  vacant?: string[]
 }
 
 export type CallState =

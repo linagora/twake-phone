@@ -46,8 +46,12 @@ export interface TelephonyProvider {
   setForwarding?(user: User, rules: ForwardingRules): Promise<void>
   /** The simultaneous ring groups of the tenant (capability `groups`), by number. */
   listGroups?(): Promise<RingGroup[]>
-  /** Creates or replaces a group; the Gateway checked its number is no extension and its members are. */
-  setGroup?(group: RingGroup): Promise<void>
+  /**
+   * Creates a group (`create`: 409 with code GROUP_EXISTS when the tenant has one of that number, GROUP_NUMBER_TAKEN
+   * when the PBX has that number already) or replaces one (`replace`: 404 when the tenant has none). The Gateway
+   * checked its number is no extension and its members are, or were already members.
+   */
+  setGroup?(group: RingGroup, mode: 'create' | 'replace'): Promise<void>
   /** Removes a group; false when the tenant has none with that number. */
   deleteGroup?(number: string): Promise<boolean>
   originate(request: OriginateRequest): Promise<Call>

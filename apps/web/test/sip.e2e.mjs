@@ -22,11 +22,12 @@ import pg from 'pg'
 import { chromium, firefox } from 'playwright-core'
 import { buildApp } from '../../gateway/dist/app.js'
 import { JwtAuthenticator } from '../../gateway/dist/auth.js'
+import { DirectorySync } from '../../gateway/dist/directory-sync.js'
 import { DEFAULT_ATTRIBUTES, LdapDirectory } from '../../gateway/dist/ldap-directory.js'
 import { storedOpensipsFactory } from '../../gateway/dist/providers.js'
 import { ProviderRegistry } from '../../gateway/dist/registry.js'
 import { MemoryStore } from '../../gateway/dist/store/memory.js'
-import { BASE_DN, READER_DN, READER_PASSWORD, startLdapMock } from '../../gateway/test/ldap-mock.mjs'
+import { BASE_DN, PEOPLE, READER_DN, READER_PASSWORD, startLdapMock } from '../../gateway/test/ldap-mock.mjs'
 import { startOidcMock } from './oidc-mock.mjs'
 import { serveApp } from '../server/serve.mjs'
 
@@ -159,10 +160,14 @@ await store.upsertMapping({ tenantId: TENANT, userId: 'accueil', extension: '104
 await store.upsertProvider({ tenantId: TENANT, type: 'opensips', config: { websocketUrl: relayUrl, domain: SIP_DOMAIN, subscriberDbUrlRef: 'env:OPENSIPS_DB_URL', events: { miUrl: OPENSIPS_MI_URL } } })
 const key = randomBytes(32)
 const registry = new ProviderRegistry(await store.listProviders(), [storedOpensipsFactory({ store, key, env: { OPENSIPS_DB_URL } })])
-// The directory (same people as the web e2e; the ipPhone attribute holds the extension), for the presence next to each contact.
-const ldap = await startLdapMock()
+// The directory (same people as the web e2e; the ipPhone attribute holds the extension), for the presence next to each
+// contact, and Paul Leroy (105), who leaves the organisation during the run. The test changes the entries in place.
+const people = [...PEOPLE.map(p => ({ ...p })), { uid: 'pleroy', cn: 'Paul Leroy', sn: 'Leroy', givenName: 'Paul', mail: 'paul.leroy@example.test', ipPhone: '105', ou: 'Support' }]
+const ldap = await startLdapMock({ people })
 const contacts = new LdapDirectory({ url: ldap.url, tenantId: TENANT, bindDn: READER_DN, bindPassword: READER_PASSWORD, baseDn: BASE_DN, userFilter: '(objectClass=inetOrgPerson)', attributes: { ...DEFAULT_ATTRIBUTES, extension: 'ipPhone' } })
-const gateway = await buildApp(registry, { auth, store, contacts, admin: { adminRole: 'twakephone-admin', adminUsers: new Set() } })
+// The synchronisation of the directory into the mappings, as main.ts builds it: run from Administration only here.
+const directorySync = new DirectorySync({ store, directory: contacts, tenantId: TENANT, reserved: async () => (await registry.forTenant(TENANT).listGroups()).map(g => g.number) })
+const gateway = await buildApp(registry, { auth, store, contacts, directorySync, admin: { adminRole: 'twakephone-admin', adminUsers: new Set() } })
 registry.startAll()
 await gateway.listen({ host: '127.0.0.1', port: GATEWAY_PORT })
 const web = await serveApp({
@@ -180,9 +185,9 @@ const since = { acc: await lastId('acc'), missed_calls: await lastId('missed_cal
 // The forwards and "do not disturb" of this cast that an interrupted run may have left: every run starts without.
 // The provider creates the table as it starts (a fresh database): waited for, and a missing table fails the run.
 await until('the call_rules table', async () => (await db.query("SELECT to_regclass('call_rules') AS t")).rows[0].t)
-await db.query("DELETE FROM call_rules WHERE extension IN ('101', '102', '103', '104')")
-// Nor the ring group of an interrupted run.
-await db.query("DELETE FROM call_groups WHERE number = '200'")
+await db.query("DELETE FROM call_rules WHERE extension IN ('101', '102', '103', '104', '105')")
+// Nor the ring groups of an interrupted run.
+await db.query("DELETE FROM call_groups WHERE number IN ('200', '105', '106')")
 
 // A microphone that produces a tone, no permission prompt, sound allowed without a gesture, OpenSIPS's self-signed
 // certificate accepted (Firefox: through the context's ignoreHTTPSErrors). Firefox ignores ICE candidates on the
@@ -366,9 +371,21 @@ const aliceCallsJean = async (alice, jean) => {
   await alice.page.getByText('En communication avec Jean Dupont (102)').waitFor()
 }
 
+/** Starts a synchronisation of the directory as `who` (an administrator) and resolves with its report once it ended. */
+const synchronise = async who => {
+  const api = await asPerson(who)
+  const res = await api('POST', '/admin/directory/sync')
+  expectEqual(res.statusCode, 202, 'POST /admin/directory/sync')
+  return until('the synchronisation to end', async () => {
+    const { sync } = (await api('GET', '/admin/directory')).json()
+    return !sync.running && sync.last ? sync.last : null
+  })
+}
+
 let failed = false
 let alice
 let jean
+let jean2
 let bob
 let desk
 try {
@@ -942,26 +959,42 @@ try {
     const { rows } = await db.query("SELECT extension, tenant_id, display_name FROM display_names WHERE extension IN ('101', '102', '103', '104') ORDER BY extension")
     expectEqual(rows.map(r => `${r.extension} ${r.tenant_id} ${r.display_name}`), ['101 e2e Alice Martin', '102 e2e Jean Dupont', '103 e2e Bob Durand', '104 e2e Accueil'], 'display_names rows')
   })
-  await step('Alice, an administrator, creates ring group 200 (101, 102, 103) in Administration; an extension is no group number, a group no forward target, and nobody else may manage groups (403)', async () => {
+  await step('Alice, an administrator, creates ring group 200 (101, 102, 103) in Administration; an extension, or an account OpenSIPS still has, is no group number; "Nouveau groupe" never replaces one; a group is no forward target, and nobody else may manage groups (403)', async () => {
     await alice.page.getByRole('link', { name: 'Administration' }).click()
     await alice.page.getByRole('heading', { level: 2, name: "Groupes d'appel" }).waitFor()
-    const save = async number => {
+    // Fills and sends the form; resolves with what the Gateway answered ("status code"), and the words shown.
+    const save = async (number, name = 'Accueil commun') => {
       await alice.page.getByLabel('Numéro du groupe').fill(number)
-      await alice.page.getByLabel('Nom affiché').fill('Accueil commun')
+      await alice.page.getByLabel('Nom affiché').fill(name)
       await alice.page.getByLabel('Postes membres').fill('101, 102, 103')
+      const answered = alice.page.waitForResponse(r => r.request().method() === 'POST' && r.url().endsWith('/admin/groups'))
       await alice.page.getByRole('button', { name: 'Enregistrer le groupe' }).click()
+      const res = await answered
+      return `${res.status()} ${res.ok() ? '' : (await res.json()).code}`.trim()
     }
-    await save('102')
-    await alice.page.getByRole('alert').filter({ hasText: 'Ce numéro est déjà un poste' }).waitFor()
-    await save('200')
+    expectEqual(await save('102'), '409 GROUP_NUMBER_TAKEN', 'creating group 102')
+    await alice.page.getByRole('alert').filter({ hasText: 'Ce numéro est déjà pris' }).waitFor()
+    // An account an older Gateway left in subscriber (nobody's extension any more): OpenSIPS would route 106 as an
+    // extension, so no group gets it either (the provider checks subscriber).
+    await db.query("INSERT INTO subscriber (username, domain, password, ha1, ha1_sha256, ha1_sha512t256) VALUES ('106', '', '', 'x', 'x', 'x') ON CONFLICT DO NOTHING")
+    expectEqual(await save('106'), '409 GROUP_NUMBER_TAKEN', 'creating group 106')
+    await alice.page.getByRole('alert').filter({ hasText: 'Ce numéro est déjà pris' }).waitFor()
+    expectEqual((await db.query("SELECT 1 FROM call_groups WHERE number = '106'")).rows.length, 0, 'call_groups rows of 106')
+    expectEqual(await save('200'), '201', 'creating group 200')
     await alice.page.getByRole('status').filter({ hasText: 'Groupe 200 enregistré.' }).waitFor()
     await alice.page.getByRole('list', { name: 'Groupes existants' }).getByText('101, 102, 103').waitFor()
+    // The creation form again, with the same number: refused, the group stays as it was.
+    expectEqual(await save('200', 'Autre chose'), '409 GROUP_EXISTS', 'creating group 200 again')
+    await alice.page.getByRole('alert').filter({ hasText: 'Un groupe de votre organisation a déjà ce numéro' }).waitFor()
     const { rows } = await db.query("SELECT tenant_id, name, members FROM call_groups WHERE number = '200'")
     expectEqual(rows, [{ tenant_id: TENANT, name: 'Accueil commun', members: ['101', '102', '103'] }], 'the group OpenSIPS reads')
+    await alice.page.getByLabel('Numéro du groupe').fill('')
+    await alice.page.getByLabel('Nom affiché').fill('')
+    await alice.page.getByLabel('Postes membres').fill('')
     // Bob is no administrator: no link to the screen, and the Gateway refuses whatever he sends.
     expectEqual(await bob.page.getByRole('link', { name: 'Administration' }).count(), 0, 'Administration links on Bob side')
     const api = await asPerson(bob)
-    for (const [method, url, payload] of [['GET', '/admin/groups'], ['PUT', '/admin/groups/201', { name: 'Pirate', members: ['103'] }], ['DELETE', '/admin/groups/200']])
+    for (const [method, url, payload] of [['GET', '/admin/groups'], ['POST', '/admin/groups', { number: '201', name: 'Pirate', members: ['103'] }], ['PUT', '/admin/groups/200', { name: 'Pirate', members: ['103'] }], ['DELETE', '/admin/groups/200']])
       expectEqual((await api(method, url, payload)).statusCode, 403, `${method} ${url} as Bob`)
     expectEqual((await db.query("SELECT number FROM call_groups WHERE number IN ('200', '201')")).rows.map(r => r.number), ['200'], 'groups after Bob tried')
     // A forward to the group is refused like any number that is not a colleague's extension.
@@ -1010,15 +1043,84 @@ try {
     expectEqual(rows.map(r => `${r.caller}>${r.callee} via ${r.dialled} ${r.sip_code}`), ['104>102 via 200 200'], 'CDR of the group call')
     expectEqual(await missedSince(missedFrom), [], 'missed_calls rows of the group call')
   })
-  await step('Bob does not want to be disturbed: a call to 200 rings Alice and Jean only; the desk gives up: a missed call for each of them, one for the group in missed_calls', async () => {
+  await step('Jean and Bob are in a call together (their windows answer busy at once) and Alice declines: the desk is told the group cannot be reached (480), not that it declined; the missed call of the group says 480', async () => {
+    await dial(jean.page, '103')
+    await bob.page.getByTestId('incoming-call').getByRole('button', { name: 'Répondre' }).click()
+    await jean.page.getByText('En communication avec Bob Durand (103)').waitFor()
+    const missedFrom = await lastId('missed_calls')
+    const ended = dialUntilEnded(desk.page, '200')
+    const ringing = alice.page.getByTestId('incoming-call')
+    await ringing.getByText('Appel entrant de Accueil (104)').waitFor({ timeout: 20_000 })
+    await ringing.getByRole('button', { name: 'Refuser' }).click()
+    // One refusal out of three windows: tm would pick it (a 6xx) and tell the desk the group declined.
+    const { endStatus, endReason } = await ended
+    expectEqual(`${endStatus} ${endReason}`, '480 unavailable', 'how the call to 200 ended')
+    await desk.page.getByText('200 est injoignable.').waitFor()
+    await until('the missed call in missed_calls', async () => ((await missedSince(missedFrom)).length ? true : null))
+    expectEqual(await missedSince(missedFrom), ['104>200 480'], 'missed_calls rows of the group call nobody took')
+    // Jean and Bob talk on, undisturbed.
+    expectEqual((await calls(bob.page)).length, 1, 'calls on Bob side')
+    await jean.page.getByRole('button', { name: 'Raccrocher' }).click()
+    await bob.page.getByText('Appel avec Jean Dupont (102) terminé.').waitFor()
+  })
+  await step('Jean opens a second window; the desk calls 200: Alice declines while the others ring (Bob, Jean on both windows); Jean answers on his second window, his first and Bob are told it was answered elsewhere', async () => {
+    jean2 = await open('jdupont', 'Jean Dupont')
+    await phoneState(jean2.page).getByText('En ligne').waitFor({ timeout: 20_000 })
+    const cdrFrom = await lastId('acc')
+    const missedFrom = await lastId('missed_calls')
+    await dial(desk.page, '200')
+    for (const who of [alice, jean, jean2, bob]) await who.page.getByTestId('incoming-call').getByText('Appel entrant de Accueil (104)').waitFor({ timeout: 20_000 })
+    await alice.page.getByTestId('incoming-call').getByRole('button', { name: 'Refuser' }).click()
+    await until('Alice to stop ringing', async () => (await calls(alice.page)).length === 0)
+    // Her refusal leaves her colleagues ringing: the call is still to be taken.
+    for (const who of [jean, jean2, bob]) await ringerPlaying(who.page, true)
+    await jean2.page.getByTestId('incoming-call').getByRole('button', { name: 'Répondre' }).click()
+    await jean2.page.getByText('En communication avec Accueil (104)').waitFor()
+    await desk.page.getByText('En communication avec Jean Dupont (102)').waitFor()
+    for (const who of [jean, bob]) {
+      await who.page.getByText('Appel de Accueil (104) pris sur un autre poste.').waitFor()
+      expectEqual((await calls(who.page)).length, 0, `calls left on ${who.name} side (${who === jean ? 'first window' : 'Bob'})`)
+    }
+    await bothHearEachOther(desk, jean2)
+    await desk.page.getByRole('button', { name: 'Raccrocher' }).click()
+    await jean2.page.getByText('Appel avec Accueil (104) terminé.').waitFor()
+    await cdrsSince(cdrFrom)
+    const { rows } = await db.query('SELECT caller, callee, dialled, sip_code FROM acc WHERE id > $1 ORDER BY id', [cdrFrom])
+    expectEqual(rows.map(r => `${r.caller}>${r.callee} via ${r.dialled} ${r.sip_code}`), ['104>102 via 200 200'], 'CDR of the group call')
+    expectEqual(await missedSince(missedFrom), [], 'missed_calls rows of the group call')
+  })
+  await step('Jean, on two windows, forwards on busy to Bob; Alice calls 102 and one of his windows declines while the other rings: the call goes to Bob (the OpenSIPS of step 4b answered 500 there)', async () => {
+    await setForwarding(jean, { busy: '103' })
+    await dial(alice.page, '102')
+    for (const who of [jean, jean2]) await who.page.getByTestId('incoming-call').getByText('Appel entrant de Alice Martin (101)').waitFor({ timeout: 20_000 })
+    await jean.page.getByTestId('incoming-call').getByRole('button', { name: 'Refuser' }).click()
+    // The other window stops ringing (the refusal declines the call), and the busy forward follows.
+    const ringing = bob.page.getByTestId('incoming-call')
+    await ringing.getByText('Appel entrant de Alice Martin (101)').waitFor({ timeout: 10_000 })
+    await until("Jean's second window to stop ringing", async () => (await calls(jean2.page)).length === 0)
+    await ringing.getByRole('button', { name: 'Répondre' }).click()
+    await alice.page.getByText('En communication avec Bob Durand (103)').waitFor()
+    await alice.page.getByRole('button', { name: 'Raccrocher' }).click()
+    await bob.page.getByText('Appel avec Alice Martin (101) terminé.').waitFor()
+    await setForwarding(jean, {})
+    await signOut(jean2)
+    jean2 = undefined
+  })
+  await step('Bob does not want to be disturbed: a call to 200 rings Alice and Jean only; the desk gives up: a missed call for each of them, one for the group in missed_calls, and Bob never saw the call', async () => {
     await setStatus(bob, 'Ne pas déranger')
+    // Whatever shows on Bob's page from now on is seen, even if it goes away at once.
+    await bob.page.evaluate(() => {
+      window.e2eSawIncoming = false
+      window.e2eObserver?.disconnect()
+      window.e2eObserver = new MutationObserver(() => {
+        if (document.querySelector('[data-testid=incoming-call]')) window.e2eSawIncoming = true
+      })
+      window.e2eObserver.observe(document.body, { childList: true, subtree: true })
+    })
     const started = new Date().toISOString()
     const missedFrom = await lastId('missed_calls')
     await dial(desk.page, '200')
     for (const who of [alice, jean]) await who.page.getByTestId('incoming-call').getByText('Appel entrant de Accueil (104)').waitFor({ timeout: 20_000 })
-    // Long enough for Bob's phone to have rung, were it to.
-    await sleep(2_000)
-    expectEqual(await bob.page.getByTestId('incoming-call').count(), 0, 'incoming calls on Bob side')
     await desk.page.getByRole('button', { name: 'Raccrocher' }).click()
     for (const who of [alice, jean]) {
       await who.page.getByText('Appel de Accueil (104) pris sur un autre poste ou abandonné.').waitFor()
@@ -1026,18 +1128,25 @@ try {
       expectEqual(`${call.direction} ${call.remoteNumber} ${call.state}`, 'inbound 104 missed', `${who.name}'s newest call`)
       expectEqual((await recents(who.page, 1))[0], '104: Manqué', `${who.name}'s newest recent call`)
     }
-    const [bobEntry] = (await store.listHistory(TENANT, 'bdurand', { limit: 1 })).items
-    if (bobEntry && bobEntry.startedAt > started) throw new Error(`a call in Bob's history: ${JSON.stringify(bobEntry)}`)
+    // The transaction is over (its missed call is written once every window answered): had Bob been rung, his page
+    // would have shown it by now.
     await until('the missed call in missed_calls', async () => ((await missedSince(missedFrom)).length ? true : null))
     expectEqual(await missedSince(missedFrom), ['104>200 487'], 'missed_calls rows of the group call given up')
+    expectEqual(await bob.page.evaluate(() => window.e2eSawIncoming), false, 'an incoming call shown on Bob side')
+    const [bobEntry] = (await store.listHistory(TENANT, 'bdurand', { limit: 1 })).items
+    if (bobEntry && bobEntry.startedAt > started) throw new Error(`a call in Bob's history: ${JSON.stringify(bobEntry)}`)
+    await bob.page.evaluate(() => window.e2eObserver?.disconnect())
     await setStatus(bob, 'Disponible')
   })
-  await step('OpenSIPS shows the name the directory gives, not the one a phone claims: Bob, renamed in the directory, calls Alice as Robert Durand', async () => {
-    const holders = async rename => (await store.listMappings(TENANT)).map(m => ({ extension: m.extension, userId: m.userId, displayName: rename && m.extension === '103' ? 'Robert Durand' : m.displayName }))
-    const provider = registry.forTenant(TENANT)
-    await provider.syncExtensions(await holders(true))
+  await step('OpenSIPS shows the name the directory gives: Bob, renamed in the directory, calls Alice as Robert Durand once Alice synchronised it from Administration (POST /admin/directory/sync); the account an older Gateway left (106) goes', async () => {
+    const bobEntry = people.find(p => p.uid === 'bdurand')
+    const nameOf103 = async () => (await db.query("SELECT display_name FROM display_names WHERE extension = '103'")).rows[0]?.display_name
+    bobEntry.cn = 'Robert Durand'
     try {
-      // Bob's softphone still says "Bob Durand" (its own name, from the app): OpenSIPS puts the directory's in its place.
+      await synchronise(alice)
+      await until('the new name in display_names', async () => (await nameOf103()) === 'Robert Durand')
+      // Nobody holds 106: its account goes with the synchronisation (the provider keeps those of the mappings only).
+      await until('the account of 106 to go', async () => (await db.query("SELECT 1 FROM subscriber WHERE username = '106'")).rows.length === 0)
       await dial(bob.page, '101')
       const ringing = alice.page.getByTestId('incoming-call')
       await ringing.getByText('Appel entrant de Robert Durand (103)').waitFor({ timeout: 20_000 })
@@ -1047,14 +1156,45 @@ try {
       await alice.page.getByRole('button', { name: 'Raccrocher' }).click()
       await bob.page.getByText('Appel avec Alice Martin (101) terminé.').waitFor()
     } finally {
-      await provider.syncExtensions(await holders(false))
+      bobEntry.cn = 'Bob Durand'
+      await synchronise(alice)
+      await until('the name back in display_names', async () => (await nameOf103()) === 'Bob Durand')
     }
   })
-  await step('Alice deletes ring group 200 in Administration: a call to 200 is a number nobody has again', async () => {
+  await step('Paul Leroy (105) signs in, then out: his account stays; he leaves the directory: the synchronisation removes his mapping and his account, 105 becomes a group of its own and the desk rings it', async () => {
+    const paul = await open('pleroy', 'Paul Leroy')
+    await phoneState(paul.page).getByText('En ligne').waitFor({ timeout: 20_000 })
+    await signOut(paul)
+    // Signing out unregisters; the account is his as long as he holds 105.
+    expectEqual((await db.query("SELECT 1 FROM subscriber WHERE username = '105'")).rows.length, 1, 'subscriber rows of 105 after Paul signed out')
+    people.splice(people.findIndex(p => p.uid === 'pleroy'), 1)
+    const report = await synchronise(alice)
+    expectEqual(report.removed, 1, 'mappings the synchronisation removed')
+    await until('the account of 105 to go', async () => (await db.query("SELECT 1 FROM subscriber WHERE username = '105'")).rows.length === 0)
     await alice.page.getByRole('link', { name: 'Administration' }).click()
+    await alice.page.getByLabel('Numéro du groupe').fill('105')
+    await alice.page.getByLabel('Nom affiché').fill('Support')
+    await alice.page.getByLabel('Postes membres').fill('101')
+    await alice.page.getByRole('button', { name: 'Enregistrer le groupe' }).click()
+    await alice.page.getByRole('status').filter({ hasText: 'Groupe 105 enregistré.' }).waitFor()
+    // OpenSIPS takes 105 for the group (no account has it any more): Alice rings.
+    await dial(desk.page, '105')
+    await alice.page.getByTestId('incoming-call').getByText('Appel entrant de Accueil (104)').waitFor({ timeout: 20_000 })
+    await desk.page.getByRole('button', { name: 'Raccrocher' }).click()
+    await alice.page.getByText('Appel de Accueil (104) pris sur un autre poste ou abandonné.').waitFor()
+  })
+  await step('Alice deletes ring groups 105 and 200 in Administration, each once she confirmed: a call to 200 is a number nobody has again', async () => {
+    await alice.page.getByRole('link', { name: 'Administration' }).click()
+    // Not without a confirmation: "Non, garder" keeps the group.
     await alice.page.getByRole('button', { name: 'Supprimer le groupe 200' }).click()
-    await alice.page.getByRole('status').filter({ hasText: 'Groupe 200 supprimé.' }).waitFor()
-    expectEqual((await db.query("SELECT 1 FROM call_groups WHERE number = '200'")).rows.length, 0, 'call_groups rows of 200')
+    await alice.page.getByRole('group', { name: 'Supprimer le groupe 200 ?' }).getByRole('button', { name: 'Non, garder' }).click()
+    expectEqual((await db.query("SELECT 1 FROM call_groups WHERE number = '200'")).rows.length, 1, 'call_groups rows of 200 once kept')
+    for (const number of ['105', '200']) {
+      await alice.page.getByRole('button', { name: `Supprimer le groupe ${number}` }).click()
+      await alice.page.getByRole('group', { name: `Supprimer le groupe ${number} ?` }).getByRole('button', { name: 'Oui, supprimer' }).click()
+      await alice.page.getByRole('status').filter({ hasText: `Groupe ${number} supprimé.` }).waitFor()
+    }
+    expectEqual((await db.query("SELECT 1 FROM call_groups WHERE number IN ('105', '200')")).rows.length, 0, 'call_groups rows of 105 and 200')
     const ended = await dialUntilEnded(desk.page, '200')
     expectEqual(`${ended.endStatus} ${ended.endReason}`, '404 unavailable', 'how the call to 200 ended')
     await signOut(desk)
@@ -1115,7 +1255,7 @@ try {
 } catch (err) {
   failed = true
   console.error(err)
-  for (const who of [alice, jean, bob, desk]) {
+  for (const who of [alice, jean, jean2, bob, desk]) {
     if (!who || who.page.isClosed()) continue
     console.log(`[${who.name}] url:`, who.page.url())
     console.log(`[${who.name}] text:`, (await who.page.locator('body').innerText().catch(() => '')).slice(0, 600))

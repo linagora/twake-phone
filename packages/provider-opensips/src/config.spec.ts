@@ -251,7 +251,7 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     const dialled = failure.lastIndexOf('if ($avp(d_dnd) == 1)\n\t\troute(dnd_refuse_dialled);')
     expect(dialled).toBeGreaterThan(failure.lastIndexOf('route(relay_call);'))
     expect(dialled).toBeLessThan(failure.lastIndexOf('route(account_missed);'))
-    expect(section('route[arm_failure]', 'route[account_missed]')).toContain('if ($avp(d_dnd) != 1)\n\t\t\troute(account_missed);')
+    expect(section('route[arm_failure]', 'route[account_missed]')).toContain('if ($avp(d_dnd) != 1 && $avp(group) == NULL)\n\t\t\troute(account_missed);')
     // Only the script tells a "do not disturb": an UA's own Twake-Dnd headers are removed from its replies.
     const onreply = cfg.slice(cfg.indexOf('onreply_route[rtp] {'), cfg.indexOf('route[event_attrs]'))
     expect(onreply.indexOf('remove_hf_glob("Twake-Dnd*");')).toBeGreaterThan(0)
@@ -285,6 +285,16 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     // No identity a phone asserts passes, in a request or in a reply; the answer's is the script's.
     const main = cfg.slice(cfg.indexOf('\nroute {'), cfg.indexOf('\nroute[ring] {'))
     for (const header of ['P-Asserted-Identity', 'P-Preferred-Identity', 'Remote-Party-ID']) expect(main.indexOf(`remove_hf("${header}");`), header).toBeLessThan(main.indexOf('if (!t_newtran()) {'))
+    // Nor in a request within a dialog (re-INVITE, UPDATE, BYE...), nor in any reply relayed (the global onreply_route
+    // runs for every one, before onreply_route[rtp] asserts who answered).
+    const inDialog = main.slice(main.indexOf('if (has_totag()) {'), main.indexOf('route(relay);\n\t\texit;'))
+    const anyReply = cfg.slice(cfg.indexOf('\nonreply_route {'), cfg.indexOf('\nonreply_route[rtp] {'))
+    for (const header of ['P-Asserted-Identity', 'P-Preferred-Identity', 'Remote-Party-ID']) {
+      expect(inDialog, header).toContain(`remove_hf("${header}");`)
+      expect(anyReply, header).toContain(`remove_hf("${header}");`)
+    }
+    // Names not read: the From is left as the phone sent it (never emptied).
+    expect(callerName.indexOf('if ($avp(names_read) != 1)\n\t\treturn(-1);')).toBeLessThan(callerName.indexOf('uac_replace_from('))
     const onreply = cfg.slice(cfg.indexOf('onreply_route[rtp] {'), cfg.indexOf('route[event_attrs]'))
     expect(onreply.indexOf('remove_hf("P-Asserted-Identity");')).toBeLessThan(onreply.indexOf('append_hf("P-Asserted-Identity: '))
     expect(onreply).toContain('append_hf("P-Asserted-Identity: \\"$var(pai_name)\\" <sip:$var(pai_ext)@$avp(domain)>\\r\\n");')
@@ -306,23 +316,62 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(query).toContain('ORDER BY x.pos')
     for (const avp of ['g_ext', 'g_name']) expect(query).toContain(`$(avp(${avp})[*]) = NULL;`)
     // Each window is a branch that knows its member; nobody to ring is a refusal through the transaction.
-    const ring = section('route[group_ring]', 'route[replaces_target]')
+    const ring = section('route[group_ring]', 'route[group_window]')
     expect(ring).toContain('if ($var(ext) =~ "^[A-Za-z0-9._+-]{1,64}$") {')
     expect(ring).toContain('lookup("location", "to-branches-only", "$var(aor)")')
-    expect(ring).toContain('$(msg.branch.attr(gext)[$var(b)]) = $var(ext);')
+    // At most 12 destinations (MAX_BRANCHES): rank by rank, each member's first window before anyone's second; the
+    // windows left out are logged.
+    expect(ring).toContain('if ($(avp(w_rank)[$var(j)]) == $var(rank)) {')
+    expect(ring).toContain('if ($var(placed) >= 12) {')
+    expect(ring).toContain('while ($msg.branch.last_idx > 0)\n\t\t\t\tremove_msg_branch(0);')
+    expect(ring).toContain('xlog("L_WARN", "call $ci: group $avp(group): $var(left) of its $var(windows) windows left out, a call rings 12 at most\\n");')
+    expect(ring).toContain('$avp(g_windows) = $var(placed);')
+    const window = section('route[group_window]', 'route[replaces_target]')
+    expect(window).toContain('$(msg.branch.attr(gext)[$var(k)]) = $(avp(w_ext)[$var(w)]);')
+    expect(window).toContain('$(msg.branch.attr(gname)[$var(k)]) = $(avp(w_name)[$var(w)]);')
     for (const avp of ['r_always', 'r_busy', 'r_noanswer', 'r_dnd']) expect(ring).toContain(`$(avp(${avp})[*]) = NULL;`)
     expect(ring).toContain('route(account_missed);\n\t\troute(calling);\n\t\tt_reply(480, "Temporarily Unavailable");')
     expect(ring.replace(/#.*$/gm, '').trimEnd().endsWith('route(ring);\n}')).toBe(true)
-    // A member declining leaves the colleagues ringing; any other call is declined as a whole, as tm would.
+    // A member declining leaves the colleagues ringing; any other call is declined as a whole (its windows that
+    // answered something are cancelled).
     expect(cfg).toContain('modparam("tm", "disable_6xx_block", 1)')
     const onreply = cfg.slice(cfg.indexOf('onreply_route[rtp] {'), cfg.indexOf('route[event_attrs]'))
     expect(onreply).toContain('if ($rs >= 600 && $avp(group) == NULL)\n\t\t\tt_cancel_branch("o");')
     // The member who answers becomes the callee: CDR, dialog (Replaces), events.
     for (const line of ['$avp(callee) = $var(member);', '$acc_extra(callee) = $var(member);', '$dlg_val(callee) = $var(member);']) expect(onreply).toContain(line)
     expect(onreply).toContain('$avp(ev_callee) = $var(member);')
-    // A group nobody answered: no forward from failure_route.
+    // A group nobody answered: no forward from failure_route; the refusal only when every window declined (counted
+    // once per branch in onreply_route[rtp]), else 480; the missed call says what the caller was told.
     const failure = cfg.slice(cfg.indexOf('failure_route['))
     expect(failure.indexOf('if ($avp(group) != NULL) {')).toBeLessThan(failure.indexOf('route(forward_to, $var(next))'))
+    const group = failure.slice(failure.indexOf('if ($avp(group) != NULL) {'), failure.indexOf('$var(dnd_code) = $T_reply_code;'))
+    expect(group).toContain('if ($avp(g_declines) != NULL && $avp(g_declines) >= $avp(g_windows)) {')
+    expect(group).toContain('route(group_missed, "480 Temporarily Unavailable");\n\t\tt_reply(480, "Temporarily Unavailable");')
+    expect(onreply).toContain('$var(mark) = "," + $T_branch_idx + ",";')
+    expect(failure).toContain('route(group_missed, "487 Request Terminated");')
+    const missed = section('route[group_missed]', 'route[dnd_refuse]')
+    expect(missed).toContain('acc_db_request("$param(1)", "missed_calls");')
+    expect(missed).toContain('acc_evi_request("$param(1)");')
     expect(section('route[event_attrs]', 'failure_route[call_failed]')).toContain('$avp(ev_attr) = "group";')
+  })
+
+  it('reads the forwards and the "do not disturb" of step 4b even where the tables of step 4c are missing', () => {
+    const { cfg } = render()
+    const section = (name: string, next: string) => cfg.slice(cfg.indexOf(`${name} {`), cfg.indexOf(`${next} {`))
+    expect(cfg).toContain('modparam("cfgutils", "shvset", "no4c_until=i:0")')
+    // Each query names call_groups or display_names only while they may be (route[tables_4c]), else NULL columns.
+    const query = section('route[rules_query]', 'route[rules_next]')
+    expect(query.indexOf('$var(name_col) = "NULL";')).toBeLessThan(query.indexOf('if (route(tables_4c)) {'))
+    const next = section('route[rules_next]', 'route[rules_loaded]')
+    expect(next.indexOf('$var(first_cols) = ", NULL, 0";')).toBeLessThan(next.indexOf('if ($avp(q4c) == 1)'))
+    expect(section('route[preload_query]', 'route[rules_local]').indexOf('$var(name_col) = "\'\'";')).toBeLessThan(section('route[preload_query]', 'route[rules_local]').indexOf('if (route(tables_4c)) {'))
+    expect(section('route[names_next]', 'route[names_loaded]')).toContain('if (!route(tables_4c)) {')
+    // A query that named them and failed at once: they are off for 30 s, the same read again without them.
+    const retry = section('route[q4c_retry]', 'route[group_next]')
+    expect(retry).toContain('if ($var(q_ms) >= 250)\n\t\treturn(-1);')
+    expect(retry).toContain('$shv(no4c_until) = $Ts + 30;')
+    expect(section('route[rules_loaded]', 'route[rules_step]')).toContain('if ($var(rules_rc) < 0 && $var(rules_rc) != -2 && route(q4c_retry)) {\n\t\troute(rules_next);\n\t\texit;\n\t}')
+    expect(section('route[ring_loaded]', 'route[ring_now]')).toContain('route(q4c_retry)')
+    for (const r of ['route[rules_next]', 'route[names_next]', 'route[ring]']) expect(section(r, r === 'route[ring]' ? 'route[ring_loaded]' : r === 'route[names_next]' ? 'route[names_loaded]' : 'route[rules_loaded]'), r).toContain('route(q_start);')
   })
 })

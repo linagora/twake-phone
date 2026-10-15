@@ -235,6 +235,14 @@ export class SubscriberProvisioner implements SecretProvisioner {
   }
 
   /**
+   * Forgets every extension but these (the ones someone holds): what OpenSIPS routes as an extension is then what
+   * the Gateway maps. One OpenSIPS database serves one tenant (the Gateway refuses a second one).
+   */
+  async keepOnly(extensions: string[]) {
+    await this.pool.query('DELETE FROM subscriber WHERE domain = $2 AND NOT (username = ANY($1::text[]))', [extensions, this.domain])
+  }
+
+  /**
    * The `call_rules` of the same database, on the same connections: `ready` runs before each query (the schema
    * check), `tenantId` and `holderOf` say whose extensions these are (see CallRulesOptions).
    */

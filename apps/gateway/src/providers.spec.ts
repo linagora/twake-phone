@@ -62,15 +62,28 @@ describe('storedOpensipsFactory', () => {
   it('keeps the ring groups and the directory names in the same database, for its tenant', async () => {
     const { queries, values, provider } = setup()
     expect((await provider.getCapabilities()).groups).toBe(true)
-    await provider.setGroup!({ number: '200', name: 'Accueil', members: ['101', '102'] })
+    await provider.setGroup!({ number: '200', name: 'Accueil', members: ['101', '102'] }, 'create')
     const create = queries.findIndex(q => /CREATE TABLE IF NOT EXISTS call_groups/.test(q))
     const insert = queries.findIndex(q => /INSERT INTO call_groups/.test(q))
     expect(create).toBeGreaterThanOrEqual(0)
     expect(insert).toBeGreaterThan(create)
+    // Created only where OpenSIPS has no account of that number.
+    expect(queries[insert]).toMatch(/NOT EXISTS \(SELECT 1 FROM subscriber/)
     expect(values[insert]).toEqual(['200', 't', 'Accueil', ['101', '102']])
     await provider.syncExtensions!([{ extension: '101', userId: 'alice', displayName: 'Alice Martin' }])
     const names = queries.findIndex(q => /INSERT INTO display_names/.test(q))
     expect(values[names]).toEqual(['t', ['101'], ['Alice Martin']])
+  })
+
+  it('removes the SIP account of an extension nobody holds any more, or whose holder changed', async () => {
+    const { queries, values, provider } = setup()
+    const deletes = () => queries.flatMap((q, i) => (/DELETE FROM subscriber/.test(q) ? [values[i]] : []))
+    await provider.syncExtensions!([{ extension: '101', userId: 'alice' }, { extension: '102', userId: 'bob' }])
+    // Everything but the extensions held goes (domain '' as the provisioner writes it).
+    expect(deletes()).toEqual([[['101', '102'], '']])
+    await provider.syncExtensions!([{ extension: '101', userId: 'carol' }])
+    // 102 is nobody's: gone with the others; 101 changed holder: alice's hashes go, carol's session provisions hers.
+    expect(deletes().slice(1)).toEqual([[['101'], ''], ['101', '']])
   })
 
   it('refuses an extension nobody is mapped to', async () => {

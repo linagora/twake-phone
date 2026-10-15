@@ -64,6 +64,11 @@ export interface OpensipsConfig {
    * directory name each party is shown of the other. Without it, no groups, and the names are the phones' own.
    */
   callGroups?: CallGroups
+  /**
+   * The SIP accounts (`subscriber`) OpenSIPS authenticates and routes by: `keepOnly` removes those of extensions
+   * nobody holds, `remove` one account. Without it, an account outlives its holder's mapping.
+   */
+  accounts?: { keepOnly(extensions: string[]): Promise<void>; remove(extension: string): Promise<void> }
   logger?: EventsLogger
 }
 
@@ -91,6 +96,8 @@ export class OpensipsProvider implements TelephonyProvider, MediaProvider {
   private readonly events?: OpensipsEvents
   private subscribed = false
   private closed = false
+  /** Who held each extension at the last syncExtensions: a change of holder removes the account. */
+  private holders = new Map<string, string>()
   private startTimer?: ReturnType<typeof setTimeout>
   /** Tells the end of a chosen presence (a "do not disturb" until a date) when it comes. */
   private expiryTimer?: ReturnType<typeof setTimeout>
@@ -224,12 +231,22 @@ export class OpensipsProvider implements TelephonyProvider, MediaProvider {
   /**
    * Who holds each extension of the tenant now, after any change (a synchronisation, an administrator): the rules
    * of an extension that changed holder go, and so do the forwards to one (ADR 0013); the names OpenSIPS shows are
-   * those of the directory, and an extension nobody holds leaves the groups (ADR 0014). The presences follow with
-   * `restorePresences`.
+   * those of the directory (ADR 0014). The SIP account of an extension nobody holds goes, and so does that of an
+   * extension whose holder changed while this process ran (the newcomer's session provisions their own): the
+   * former holder's windows fail at their next registration, and the number is free for a group. The presences
+   * follow with `restorePresences`.
    */
   async syncExtensions(holders: { extension: string; userId: string; displayName?: string }[]) {
     await this.config.callRules?.reconcile(holders)
     await this.config.callGroups?.reconcile(holders)
+    const accounts = this.config.accounts
+    if (!accounts) return
+    await accounts.keepOnly(holders.map(h => h.extension))
+    for (const h of holders) {
+      const before = this.holders.get(h.extension)
+      if (before !== undefined && before !== h.userId) await accounts.remove(h.extension)
+    }
+    this.holders = new Map(holders.map(h => [h.extension, h.userId]))
   }
 
   /** One timer, for the earliest end of a chosen presence: the others are told it ended when it does. */
@@ -265,8 +282,8 @@ export class OpensipsProvider implements TelephonyProvider, MediaProvider {
     return this.groups().list()
   }
 
-  async setGroup(group: RingGroup) {
-    await this.groups().set(group)
+  async setGroup(group: RingGroup, mode: 'create' | 'replace') {
+    await this.groups().set(group, mode)
   }
 
   async deleteGroup(number: string) {

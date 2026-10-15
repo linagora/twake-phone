@@ -15,8 +15,9 @@ const EMPTY: Form = { number: '', name: '', members: '' }
 const statusOf = (err: unknown) => (err as { status?: unknown } | null)?.status
 
 /**
- * The organisation's simultaneous ring groups (ADR 0014): a number of its own that rings every member at once, the
- * first to answer takes the call. Administrators only; the Gateway decides who, and checks every field again.
+ * The organisation's simultaneous ring groups (ADR 0014): a number of its own that rings its members at once, the
+ * first to answer takes the call. Administrators only; the Gateway decides who, and checks every field again. "New
+ * group" never replaces one (409), a deletion is confirmed first, and a member nobody holds now is shown as vacant.
  */
 export const RingGroups = () => {
   const { t } = useT()
@@ -28,6 +29,8 @@ export const RingGroups = () => {
   const [editing, setEditing] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const [note, setNote] = useState<Note>(null)
+  // The group whose deletion waits for a confirmation.
+  const [confirming, setConfirming] = useState<string | null>(null)
 
   const load = useCallback(() => {
     client
@@ -48,7 +51,8 @@ export const RingGroups = () => {
     setNote(null)
     setBusy(true)
     try {
-      const saved = await client.setGroup({ number: form.number.trim(), name: form.name, members: parseMembers(form.members) })
+      const group = { number: editing ?? form.number.trim(), name: form.name, members: parseMembers(form.members) }
+      const saved = editing ? await client.setGroup(group) : await client.createGroup(group)
       setNote({ kind: 'ok', text: t('admin.groupSaved', { number: saved.number }) })
       setForm(EMPTY)
       setEditing(null)
@@ -68,6 +72,7 @@ export const RingGroups = () => {
 
   const remove = async (g: RingGroup) => {
     setNote(null)
+    setConfirming(null)
     setBusy(true)
     try {
       await client.deleteGroup(g.number)
@@ -101,14 +106,31 @@ export const RingGroups = () => {
           {groups.map(g => (
             <li key={g.number}>
               <span>
-                <strong>{g.number}</strong> {g.name} : {g.members.length ? g.members.join(', ') : t('admin.groupNoMembers')}
+                <strong>{g.number}</strong> {g.name} :{' '}
+                {g.members.length
+                  ? g.members.map(m => `${m}${g.vacant?.includes(m) ? ` ${t('admin.groupMemberVacant')}` : ''}`).join(', ')
+                  : t('admin.groupNoMembers')}
               </span>{' '}
-              <button type="button" className="btn" onClick={() => edit(g)} disabled={busy} aria-label={t('admin.groupEdit', { number: g.number })}>
-                {t('admin.groupEditShort')}
-              </button>{' '}
-              <button type="button" className="btn" onClick={() => void remove(g)} disabled={busy} aria-label={t('admin.groupDelete', { number: g.number })}>
-                {t('admin.groupDeleteShort')}
-              </button>
+              {confirming === g.number ? (
+                <span role="group" aria-label={t('admin.groupDeleteConfirm', { number: g.number })}>
+                  {t('admin.groupDeleteConfirm', { number: g.number })}{' '}
+                  <button type="button" className="btn" onClick={() => void remove(g)} disabled={busy}>
+                    {t('admin.groupDeleteYes')}
+                  </button>{' '}
+                  <button type="button" className="btn" onClick={() => setConfirming(null)} disabled={busy}>
+                    {t('admin.groupDeleteNo')}
+                  </button>
+                </span>
+              ) : (
+                <>
+                  <button type="button" className="btn" onClick={() => edit(g)} disabled={busy} aria-label={t('admin.groupEdit', { number: g.number })}>
+                    {t('admin.groupEditShort')}
+                  </button>{' '}
+                  <button type="button" className="btn" onClick={() => setConfirming(g.number)} disabled={busy} aria-label={t('admin.groupDelete', { number: g.number })}>
+                    {t('admin.groupDeleteShort')}
+                  </button>
+                </>
+              )}
             </li>
           ))}
         </ul>

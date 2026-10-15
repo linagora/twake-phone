@@ -57,6 +57,9 @@ const same = (a: UserMapping, b: UserMapping) => a.extension === b.extension && 
  */
 export class DirectorySync {
   private current: Promise<SyncReport> | null = null
+  /** The runs and the `exclusive` tasks, one after the other. */
+  private chain: Promise<void> = Promise.resolve()
+  private pending = 0
   private last: SyncReport | undefined
   private timer: NodeJS.Timeout | undefined
   private intervalMs: number | undefined
@@ -101,11 +104,37 @@ export class DirectorySync {
   /** One run at a time: a second caller gets the run in progress. */
   run(): Promise<SyncReport> {
     if (!this.current) {
-      this.current = this.execute().finally(() => {
+      this.current = this.serial(() => this.execute()).finally(() => {
         this.current = null
       })
     }
     return this.current
+  }
+
+  /**
+   * Runs `fn` while no synchronisation runs, and holds the next one back until it ends: what checks that a number
+   * is no extension and writes a group with it (ADR 0014), so that a run cannot give that number away in between.
+   */
+  exclusive<T>(fn: () => Promise<T>): Promise<T> {
+    return this.serial(fn)
+  }
+
+  /** Starts `fn` at once when nothing runs, else after what runs and waits. */
+  private serial<T>(fn: () => Promise<T>): Promise<T> {
+    const start = () => {
+      try {
+        return fn()
+      } catch (err) {
+        return Promise.reject(err)
+      }
+    }
+    const next = this.pending === 0 ? start() : this.chain.then(start)
+    this.pending++
+    const done = () => {
+      this.pending--
+    }
+    this.chain = next.then(done, done)
+    return next
   }
 
   private async execute(): Promise<SyncReport> {

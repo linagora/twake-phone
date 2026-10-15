@@ -182,6 +182,31 @@ describe('DirectorySync', () => {
     expect(sync.status().running).toBe(false)
   })
 
+  it('runs an exclusive task between two synchronisations, never during one', async () => {
+    const { directory, sync } = setup([person('alice', 'Alice', '101')])
+    const order: string[] = []
+    let release!: () => void
+    directory.listAll = () => new Promise(resolve => (release = () => (order.push('run ends'), resolve([person('alice', 'Alice', '101')]))))
+    const run = sync.run()
+    // Waits for the run in progress, and the next run waits for it.
+    const task = sync.exclusive(async () => {
+      order.push('task')
+      await new Promise(r => setTimeout(r, 20))
+      order.push('task ends')
+      return 42
+    })
+    release()
+    await run
+    directory.listAll = async () => (order.push('second run'), [person('alice', 'Alice', '101')])
+    const second = sync.run()
+    expect(await task).toBe(42)
+    await second
+    expect(order).toEqual(['run ends', 'task', 'task ends', 'second run'])
+    // A task that fails holds nothing back.
+    await expect(sync.exclusive(async () => Promise.reject(new Error('no')))).rejects.toThrow('no')
+    await expect(sync.run()).resolves.toMatchObject({ unchanged: 1 })
+  })
+
   it('schedules runs and stops cleanly', async () => {
     const { sync } = setup([person('alice', 'Alice', '101')])
     sync.start(60_000, 5)

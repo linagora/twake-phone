@@ -142,10 +142,16 @@ export class TelephonyClient {
     return this.request<{ items: RingGroup[] }>('/admin/groups')
   }
 
-  /** Creates or replaces the group of that number; refusals carry a `code` (GROUP_NUMBER_TAKEN…). */
+  /** Creates a group; refusals carry a `code` (GROUP_EXISTS when the organisation has one of that number, GROUP_NUMBER_TAKEN…). */
+  createGroup(group: RingGroup) {
+    const { number, name, members } = group
+    return this.request<RingGroup>('/admin/groups', { method: 'POST', body: JSON.stringify({ number, name, members }) })
+  }
+
+  /** Replaces the name and members of an existing group (404: there is none of that number). */
   setGroup(group: RingGroup) {
-    const { number, ...rest } = group
-    return this.request<RingGroup>(`/admin/groups/${encodeURIComponent(number)}`, { method: 'PUT', body: JSON.stringify(rest) })
+    const { number, name, members } = group
+    return this.request<RingGroup>(`/admin/groups/${encodeURIComponent(number)}`, { method: 'PUT', body: JSON.stringify({ name, members }) })
   }
 
   async deleteGroup(number: string) {

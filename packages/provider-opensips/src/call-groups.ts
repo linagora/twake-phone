@@ -36,8 +36,11 @@ CREATE TABLE IF NOT EXISTS display_names (
 
 /** A SIP user part, as `subscriber` holds it: what OpenSIPS may put in its queries, and nothing else. */
 const SIP_USER = /^[A-Za-z0-9._+-]{1,64}$/
-/** Most members a group rings: as many browser windows each, all in one transaction. */
-export const GROUP_MEMBERS_MAX = 20
+/**
+ * Most members a group has: a call of the packaged OpenSIPS carries 12 destinations at most (MAX_BRANCHES of its
+ * build), so that each member's first window always rings; the script shares what is left among their other windows.
+ */
+export const GROUP_MEMBERS_MAX = 12
 /** Longest group or display name, in characters. */
 export const NAME_MAX = 64
 
@@ -87,23 +90,34 @@ export class CallGroups {
   }
 
   /**
-   * Creates or replaces a group of the tenant. Checked again here (the Gateway did): a number and members that can
-   * be SIP user parts, a name that can be a display name. Another tenant's group of that number is not overwritten.
+   * Writes a group of the tenant: `create` a new one (409 `GROUP_EXISTS` when the tenant already has a group of
+   * that number, 409 `GROUP_NUMBER_TAKEN` when the number is an account of OpenSIPS or another tenant's group: the
+   * same words for both, nothing said of another tenant), or `replace` one the tenant has (404 otherwise). Checked
+   * again here (the Gateway did): a number and members that can be SIP user parts, a name that can be a display
+   * name. The account check reads `subscriber`, what OpenSIPS routes by (an extension wins over a group there).
    */
-  async set(group: RingGroup) {
+  async set(group: RingGroup, mode: 'create' | 'replace' = 'replace') {
     if (!SIP_USER.test(group.number)) throw invalid('the group number is not a valid number')
     const name = sipDisplayName(group.name)
     if (!name) throw invalid('the group needs a name')
     const members = [...new Set(group.members)]
     if (members.length === 0 || members.length > GROUP_MEMBERS_MAX) throw invalid(`a group has 1 to ${GROUP_MEMBERS_MAX} members`)
     for (const m of members) if (!SIP_USER.test(m)) throw invalid('a member is not a valid extension')
+    if (mode === 'replace') {
+      const { rowCount } = await this.query('UPDATE call_groups SET name = $3, members = $4, updated_at = now() WHERE number = $1 AND tenant_id = $2', [group.number, this.tenantId, name, members])
+      if (rowCount === 0) throw Object.assign(new Error('No such group'), { statusCode: 404 })
+      return
+    }
     const { rowCount } = await this.query(
-      `INSERT INTO call_groups (number, tenant_id, name, members) VALUES ($1, $2, $3, $4)
-       ON CONFLICT (number) DO UPDATE SET name = EXCLUDED.name, members = EXCLUDED.members, updated_at = now()
-       WHERE call_groups.tenant_id = EXCLUDED.tenant_id`,
+      `INSERT INTO call_groups (number, tenant_id, name, members)
+       SELECT $1::text, $2::text, $3::text, $4::text[] WHERE NOT EXISTS (SELECT 1 FROM subscriber s WHERE s.username = $1::text)
+       ON CONFLICT (number) DO NOTHING`,
       [group.number, this.tenantId, name, members]
     )
-    if (rowCount === 0) throw Object.assign(new Error('this number belongs to another organisation'), { statusCode: 409, code: 'GROUP_NUMBER_TAKEN' })
+    if (rowCount > 0) return
+    const { rows } = await this.query<{ tenant_id: string }>('SELECT tenant_id FROM call_groups WHERE number = $1', [group.number])
+    if (rows[0]?.tenant_id === this.tenantId) throw Object.assign(new Error('a group of the organisation already has this number'), { statusCode: 409, code: 'GROUP_EXISTS' })
+    throw Object.assign(new Error('this number is taken'), { statusCode: 409, code: 'GROUP_NUMBER_TAKEN' })
   }
 
   async delete(number: string): Promise<boolean> {
@@ -114,29 +128,25 @@ export class CallGroups {
 
   /**
    * Given who holds each extension of the tenant now (and their name in the directory): the names OpenSIPS shows
-   * are replaced by those, and an extension nobody holds leaves every group (a group of nobody stays, and rings
-   * nobody, until an administrator changes it). An extension that changed holder stays: a group rings positions
-   * (the reception desk, the support line), whoever holds them.
+   * are replaced by those; a name of another tenant's extension is not taken over (one OpenSIPS database serves one
+   * tenant: the Gateway refuses a second one, ADR 0013). The groups keep their members: a group rings positions
+   * (the reception desk, the support line), whoever holds them, and a vacant one simply has no window to ring until
+   * someone holds it again (the administration screen says which).
    */
   async reconcile(holders: { extension: string; displayName?: string }[]) {
     const extensions = holders.map(h => h.extension)
     const names = holders.map(h => sipDisplayName(h.displayName))
-    await this.query(
-      `INSERT INTO display_names (extension, tenant_id, display_name)
-       SELECT n.extension, $1, n.display_name FROM unnest($2::text[], $3::text[]) AS n(extension, display_name) WHERE n.display_name <> ''
-       ON CONFLICT (extension) DO UPDATE SET tenant_id = EXCLUDED.tenant_id, display_name = EXCLUDED.display_name, updated_at = now()
-       WHERE display_names.tenant_id IS DISTINCT FROM EXCLUDED.tenant_id OR display_names.display_name IS DISTINCT FROM EXCLUDED.display_name`,
-      [this.tenantId, extensions, names]
-    )
     // A row of no tenant, or of an extension the tenant no longer has (or whose holder has no name), is nobody's name.
     await this.query(
       `DELETE FROM display_names WHERE tenant_id = '' OR (tenant_id = $1 AND NOT EXISTS (SELECT 1 FROM unnest($2::text[], $3::text[]) AS n(extension, display_name) WHERE n.extension = display_names.extension AND n.display_name <> ''))`,
       [this.tenantId, extensions, names]
     )
     await this.query(
-      `UPDATE call_groups SET members = ARRAY(SELECT m FROM unnest(members) WITH ORDINALITY AS u(m, i) WHERE m = ANY($2::text[]) ORDER BY i), updated_at = now()
-       WHERE tenant_id = $1 AND NOT (members <@ $2::varchar[])`,
-      [this.tenantId, extensions]
+      `INSERT INTO display_names (extension, tenant_id, display_name)
+       SELECT n.extension, $1, n.display_name FROM unnest($2::text[], $3::text[]) AS n(extension, display_name) WHERE n.display_name <> ''
+       ON CONFLICT (extension) DO UPDATE SET display_name = EXCLUDED.display_name, updated_at = now()
+       WHERE display_names.tenant_id = EXCLUDED.tenant_id AND display_names.display_name IS DISTINCT FROM EXCLUDED.display_name`,
+      [this.tenantId, extensions, names]
     )
   }
 }
