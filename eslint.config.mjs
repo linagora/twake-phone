@@ -1,6 +1,8 @@
 // The one lint of the monorepo: `yarn lint`. A warning fails it like an error (--max-warnings 0).
 // Run it after `yarn build`: the gateway and the packages read each other's sources through their project references,
 // but the web app and the specs (tsconfig.eslint.json) read the packages through their built `dist/*.d.ts`.
+import { fileURLToPath } from 'node:url'
+import { includeIgnoreFile } from '@eslint/compat'
 import js from '@eslint/js'
 import { defineConfig } from 'eslint/config'
 import reactHooks from 'eslint-plugin-react-hooks'
@@ -13,7 +15,8 @@ const inPackageTsconfig = ['packages/*/src/**/*.{ts,tsx}', 'apps/gateway/src/**/
 const inLintTsconfig = ['packages/*/src/**/*.spec.{ts,tsx}', 'packages/*/test/**/*.ts', 'apps/gateway/src/**/*.spec.ts', 'apps/gateway/src/store/contract.ts']
 
 export default defineConfig(
-  { ignores: ['**/node_modules/', '**/dist/', '**/build/', '**/coverage/'] },
+  // What the repository ignores (.gitignore), ESLint does too: build output, and the agents' worktrees under .claude/.
+  includeIgnoreFile(fileURLToPath(new URL('.gitignore', import.meta.url))),
   js.configs.recommended,
   tseslint.configs.recommended,
   {

@@ -25,7 +25,7 @@ Puis ouvrir `https://phone.example.org`, « Se connecter », et entrer avec `ali
 
 `init.sh` déduit l'adresse du son (`RTPENGINE_INTERFACE`) : l'adresse de la machine, et l'adresse publique que le domaine résout, sous la forme `privée!publique` quand elles diffèrent. Il s'arrête plutôt que de deviner : un domaine qui ne résout pas encore, une adresse privée ou de boucle, ou une adresse qui n'est pas celle par laquelle la machine sort sur Internet (demandée à `api.ipify.org` quand `curl` est installé). `--public-ip` donne l'adresse publique quand le DNS n'est pas encore à jour. Il ne réécrit jamais un `.env` existant, et refuse tant que les volumes du kit existent (« Repartir de zéro »).
 
-Vérifier l'installation, avec le profil `demo` : deux personnes se connectent, se trouvent, s'appellent, s'entendent, retrouvent l'appel dans leurs Récents, et la console d'administration de Keycloak ne répond pas depuis Internet. Depuis un autre poste que la machine (depuis elle-même, le son vers sa propre adresse publique dépend de l'hébergeur), avec Node 22.13 ou plus, Yarn 1 et Chromium (`npx playwright-core install --with-deps chromium`) :
+Vérifier l'installation, avec le profil `demo` : deux personnes se connectent, se trouvent, s'appellent, s'entendent, retrouvent l'appel dans leurs Récents, et la console d'administration de Keycloak ne répond pas depuis Internet. Depuis un autre poste que la machine (depuis elle-même, le son vers sa propre adresse publique dépend de l'hébergeur), avec Node 22.13 et plus ou 24 et plus, Yarn 1 et Chromium (`npx playwright-core install --with-deps chromium`) :
 
 ```bash
 yarn install --frozen-lockfile

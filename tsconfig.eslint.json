@@ -1,5 +1,5 @@
 {
-  "//": "For ESLint only (eslint.config.mjs): the files no package tsconfig compiles (specs, test helpers, the storage contract), so the type-checked rules read them too.",
+  "//": "The files no package tsconfig compiles (specs, test helpers, the storage contract): checked by `yarn typecheck`, and read by ESLint for its type-checked rules.",
   "extends": "./tsconfig.base.json",
   "compilerOptions": {
     "noEmit": true,

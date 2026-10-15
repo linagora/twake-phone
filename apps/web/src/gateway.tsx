@@ -41,7 +41,7 @@ export const GatewayProvider = ({ config, children }: { config: AppConfig; child
 
   useEffect(() => {
     if (!signedIn) {
-      // eslint-disable-next-line react-hooks/set-state-in-effect -- signed out: who the Gateway says they are is forgotten at once
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- never under Gate (App.tsx mounts this only signed in); mounted elsewhere, a sign-out forgets the user at once
       setMe(null)
       setMeError(null)
       return

@@ -5,10 +5,11 @@ import { clampLimit, type ConferenceRecord, type HistoryEntry, type HistoryPage,
 
 const MIGRATIONS = fileURLToPath(new URL('../../migrations/', import.meta.url))
 
-// The rows as the tables hold them (migrations/), as pg hands them: timestamptz as Date, NULL as null.
+// The rows as the tables hold them (migrations/), as pg hands them: timestamptz as Date, NULL as null. `query<Row>`
+// is a claim the compiler cannot check: the storage contract (contract.ts), run against PostgreSQL, is what checks it.
 type Timestamp = Date | string
 type ProviderRow = { tenant_id: string; site: string; type: string; config: unknown }
-type MappingRow = { tenant_id: string; user_id: string; extension: string; display_name: string | null; department: string | null; source: MappingSource | null; synced_at: Timestamp | null }
+type MappingRow = { tenant_id: string; user_id: string; extension: string; display_name: string | null; department: string | null; source: MappingSource; synced_at: Timestamp | null }
 type HistoryRow = { tenant_id: string; user_id: string; call_id: string; direction: HistoryEntry['direction']; remote_number: string; started_at: Timestamp; ended_at: Timestamp | null; duration_sec: number; state: HistoryEntry['state']; answered: boolean }
 type PresenceRow = { tenant_id: string; user_id: string; status: UserPresenceRecord['status']; since: Timestamp; until: Timestamp | null; message: string | null }
 type ConferenceRow = { tenant_id: string; meeting_id: string; owner_user_id: string; pin: string | null; created_at: Timestamp }
@@ -77,7 +78,7 @@ export class PgStore implements Store {
       extension: r.extension,
       ...(r.display_name ? { displayName: r.display_name } : {}),
       ...(r.department ? { department: r.department } : {}),
-      source: r.source ?? 'manual',
+      source: r.source,
       ...(r.synced_at ? { syncedAt: new Date(r.synced_at).toISOString() } : {})
     }
   }
@@ -250,7 +251,7 @@ export class PgStore implements Store {
   async savePushSubscription(s: PushSubscriptionRecord): Promise<PushSaveResult> {
     // One statement: the row as it was (the snapshot every part of it sees), and whether it was written. Another
     // tenant's row, or this person's with the same keys, is left as it is.
-    const { rows } = await this.pool.query(
+    const { rows } = await this.pool.query<{ old_tenant: string | null; old_user: string | null; written: number; inserted: boolean | null }>(
       `WITH old AS (SELECT tenant_id, user_id FROM push_subscriptions WHERE endpoint = $1),
        up AS (
          INSERT INTO push_subscriptions (endpoint, tenant_id, user_id, p256dh, auth, created_at) VALUES ($1, $2, $3, $4, $5, $6)
@@ -263,7 +264,8 @@ export class PgStore implements Store {
          (SELECT bool_and(inserted) FROM up) AS inserted`,
       [s.endpoint, s.tenantId, s.userId, s.p256dh, s.auth, s.createdAt]
     )
-    const { old_tenant: oldTenant, old_user: oldUser, written, inserted } = rows[0] as { old_tenant: string | null; old_user: string | null; written: number; inserted: boolean | null }
+    // One row, always: a SELECT of scalar subqueries.
+    const { old_tenant: oldTenant, old_user: oldUser, written, inserted } = rows[0]!
     if (oldTenant !== null && oldTenant !== s.tenantId) return { outcome: 'refused' }
     // Added meanwhile by a request of the same browser (its insert won): nothing more to do.
     if (!written) return { outcome: 'unchanged' }

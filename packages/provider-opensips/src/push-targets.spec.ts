@@ -43,15 +43,15 @@ describe('PushTargets', () => {
       ['A', ['102'], ['jean']],
       ['A', ['102'], ['jean'], null]
     ])
-    expect(db.queries[1].text).toContain('coalesce($4::timestamptz, now())')
-    expect(db.queries[0].text).toMatch(/^DELETE FROM push_targets p WHERE p.tenant_id = \$1 AND NOT EXISTS/)
+    expect(db.queries[1]!.text).toContain('coalesce($4::timestamptz, now())')
+    expect(db.queries[0]!.text).toMatch(/^DELETE FROM push_targets p WHERE p.tenant_id = \$1 AND NOT EXISTS/)
     // Another tenant's row on the same extension stays theirs; a row already right is not written again.
-    expect(db.queries[1].text).toContain('WHERE push_targets.tenant_id = EXCLUDED.tenant_id AND push_targets.holder IS DISTINCT FROM EXCLUDED.holder')
+    expect(db.queries[1]!.text).toContain('WHERE push_targets.tenant_id = EXCLUDED.tenant_id AND push_targets.holder IS DISTINCT FROM EXCLUDED.holder')
     // Nobody: the tenant's rows go, nothing is inserted.
     const none = recorder()
     await new PushTargets({ pool: none.pool }).set([])
     expect(none.queries).toHaveLength(1)
-    expect(none.queries[0].values).toEqual(['default', [], []])
+    expect(none.queries[0]!.values).toEqual(['default', [], []])
   })
 })
 
@@ -73,11 +73,11 @@ describe('PushTargets, one person and the lease', () => {
       ['A', '102', 'jean']
     ])
     // Never shorter than another Gateway of the tenant made them; the life as the database wrote it.
-    expect(db.queries[0].text).toBe(
+    expect(db.queries[0]!.text).toBe(
       'WITH t AS (SELECT now() + make_interval(secs => $2) AS until), u AS (UPDATE push_targets p SET alive_until = t.until FROM t WHERE p.tenant_id = $1 AND p.alive_until < t.until) SELECT until::text AS until FROM t'
     )
-    expect(db.queries[1].text).toContain('VALUES ($2, $1, $3, coalesce($4::timestamptz, now()))')
-    expect(db.queries[2].text).toBe('DELETE FROM push_targets WHERE tenant_id = $1 AND extension = $2 AND holder = $3')
+    expect(db.queries[1]!.text).toContain('VALUES ($2, $1, $3, coalesce($4::timestamptz, now()))')
+    expect(db.queries[2]!.text).toBe('DELETE FROM push_targets WHERE tenant_id = $1 AND extension = $2 AND holder = $3')
     // Released (the Gateway stops): the rows that still have the life it gave them, not those another one renewed.
     await t.release()
     await t.setOne({ extension: '103', userId: 'bob' }, true)

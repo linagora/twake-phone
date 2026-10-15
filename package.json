@@ -3,7 +3,7 @@
   "private": true,
   "license": "AGPL-3.0",
   "engines": {
-    "node": ">=22.13"
+    "node": "^22.13.0 || >=24"
   },
   "workspaces": [
     "packages/*",
@@ -12,7 +12,7 @@
   ],
   "scripts": {
     "build": "yarn workspaces run build",
-    "typecheck": "tsc -b packages/telephony-types packages/provider-sdk packages/telephony-client packages/softphone packages/phone-link packages/provider-opensips packages/conference-livekit apps/gateway && tsc -p apps/web --noEmit",
+    "typecheck": "tsc -b packages/telephony-types packages/provider-sdk packages/telephony-client packages/softphone packages/phone-link packages/provider-opensips packages/conference-livekit apps/gateway && tsc -p apps/web --noEmit && tsc -p tsconfig.eslint.json",
     "lint": "eslint . --max-warnings 0",
     "test": "vitest run",
     "dev:gateway": "yarn workspace @twake/telephony-gateway dev",
@@ -22,6 +22,7 @@
     "e2e:pilot": "node apps/web/test/pilot.e2e.mjs"
   },
   "devDependencies": {
+    "@eslint/compat": "^2.1.1",
     "@eslint/js": "^10.0.1",
     "@types/node": "^22.0.0",
     "@types/react": "18.3.12",
