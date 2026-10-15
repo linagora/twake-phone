@@ -154,6 +154,23 @@ describe('DirectorySync', () => {
     expect(await store.getMappingByUser('acme', 'fay')).toMatchObject({ extension: '1120' })
   })
 
+  it('never gives a person an extension out of the internal plan (2 to 6 digits, the first not 0): dialled, it would go to the operator', async () => {
+    const { store, directory, sync } = setup([person('alice', 'Alice', '101')])
+    await sync.run()
+    directory.listAll = async () => [person('alice', 'Alice', '0101'), person('bob', 'Bob', '0199000102'), person('carol', 'Carol', '1234567'), person('dan', 'Dan', '7'), person('eve', 'Eve', '104')]
+    const report = await sync.run()
+    expect(report.conflicts).toEqual([
+      { userId: 'alice', extension: '0101', heldBy: '', invalid: true },
+      { userId: 'bob', extension: '0199000102', heldBy: '', invalid: true },
+      { userId: 'carol', extension: '1234567', heldBy: '', invalid: true },
+      { userId: 'dan', extension: '7', heldBy: '', invalid: true }
+    ])
+    // Alice keeps the extension she had; the others get none; Eve's is of the plan.
+    expect(await store.getMappingByUser('acme', 'alice')).toMatchObject({ extension: '101' })
+    for (const userId of ['bob', 'carol', 'dan']) expect(await store.getMappingByUser('acme', userId), userId).toBeNull()
+    expect(await store.getMappingByUser('acme', 'eve')).toMatchObject({ extension: '104' })
+  })
+
   it('refuses to remove anything when the directory lists nobody', async () => {
     const people = [person('alice', 'Alice', '101')]
     const { store, directory, sync } = setup(people)
@@ -287,6 +304,15 @@ describe('the short numbers of the French plan (an emergency number...) as exten
     expect((await store.listMappings('acme')).map(m => `${m.userId}:${m.extension}`).sort()).toEqual(['alice:101', 'bob:150'])
     expect(warned).toHaveLength(3)
     expect(warned[0]).toMatch(/^carol:112 left out: 112 is an emergency number/)
+  })
+
+  it('seeds DEV_USER_MAP with extensions of the internal plan only (2 to 6 digits, the first not 0)', async () => {
+    const store = new MemoryStore()
+    const warned: string[] = []
+    await seedUserMap(store, 'acme', 'alice:101,bob:0102,carol:1234567,dan:+33199000104,eve:105', m => warned.push(m))
+    expect((await store.listMappings('acme')).map(m => `${m.userId}:${m.extension}`).sort()).toEqual(['alice:101', 'eve:105'])
+    expect(warned).toHaveLength(3)
+    expect(warned[0]).toMatch(/^bob:0102 left out: an extension is 2 to 6 digits, the first not 0/)
   })
 
   it('names the extensions and ring groups kept from before that are one, to be changed', async () => {

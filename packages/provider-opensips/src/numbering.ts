@@ -11,6 +11,11 @@ export const DP_CLASSIFY = 2
  * use and nobody dials (nine digits without the 0). Never for what a person dials: 612345678 could be an extension.
  */
 export const DP_INBOUND = 3
+/**
+ * dpid of the areas of the North American plan (+1) that are not the United States nor Canada (the Caribbean, Bermuda):
+ * countries of their own behind the same code, which a trunk lists by area ("1876", Jamaica), never opened by `1`.
+ */
+export const DP_NANP_AREA = 4
 
 /**
  * What a number is. `emergency`: a French emergency number (routed to the operator as dialled, whatever the policy);
@@ -53,6 +58,39 @@ const EMERGENCY = '^(1[578]|11[2459]|19[167]|116000|116117)$'
  * destinations of fraud (IRSF). Never called (premium), whatever a trunk allows.
  */
 const NON_GEOGRAPHIC = '^\\+(80[08]|87[08]|88[1238]|979|991)'
+/**
+ * The premium, shared-cost and personal ranges of the countries a trunk lists most (their regulators' plans): a
+ * country code opens its geographic and mobile numbers (and free ones), never these, charged whatever the operator
+ * and the classic destinations of fraud (IRSF, wangiri). The North American plan: 900 (premium), 976 (premium
+ * exchanges, in any area), 700 and the 5XX personal numbers. United Kingdom: 9 (premium), 70 (personal), 84 and 87
+ * (service charge). Germany: 900, 137 and 138 (mass calling), 180 (shared cost), 118 (directory), 700 (personal), 12.
+ * Belgium: 90x, 070, 077. Switzerland: 090x, 084x, 0878. Spain: 803 to 807, 901 to 907, 118. Italy: 89x, 84x, 178,
+ * 12. Netherlands: 090x, 084, 087. Austria: 9, 81x, 82x, 118. Portugal: 6, 707, 708, 808, 809. Luxembourg: 90x, 801.
+ * Poland: 70x. Another country's own ranges of the kind are not known: listing it opens them.
+ */
+const PREMIUM_BY_COUNTRY = [
+  '^\\+1(900|700|5(00|2[1-9]|33|44|66|77|88))',
+  '^\\+1[2-9][0-9]{2}976',
+  '^\\+44(9|70|8[47])',
+  '^\\+49(900|13[78]|180|118|700|12)',
+  '^\\+32(90|70|77)',
+  '^\\+41(90|84|878)',
+  '^\\+34(80[3-7]|90[1-7]|118)',
+  '^\\+39(89|84|178|12)',
+  '^\\+31(90|84|87)',
+  '^\\+43(9|8[12]|118)',
+  '^\\+351(6|70[78]|80[89])',
+  '^\\+352(90|801)',
+  '^\\+48(70)'
+]
+/**
+ * The areas of the North American plan that are other countries (DP_NANP_AREA): Bahamas, Barbados, Anguilla, Antigua
+ * and Barbuda, British Virgin Islands, Cayman Islands, Bermuda, Grenada, Turks and Caicos, Jamaica (658, 876),
+ * Montserrat, Sint Maarten, Saint Lucia, Dominica, Saint Vincent, Dominican Republic (809, 829, 849), Trinidad and
+ * Tobago, Saint Kitts and Nevis. The territories of the United States (Puerto Rico, Virgin Islands, Guam...) are of
+ * the United States.
+ */
+const NANP_OTHER_COUNTRIES = ['^\\+1(24[26]|26[48]|284|345|441|473|649|658|664|721)', '^\\+1(758|767|784|8[024]9|86[89]|876)']
 
 /**
  * The rules, by dpid and priority (dp_translate tries them in ascending `pr`). A number no rule of DP_NORMALISE
@@ -91,11 +129,15 @@ export const DIALPLAN_RULES: readonly DialplanRule[] = [
   // Réunion and Mayotte, Saint-Pierre-et-Miquelon, Guadeloupe and the French Antilles, Guiana, Martinique, Wallis and
   // Futuna, New Caledonia, French Polynesia: charged as abroad by most operators.
   { dpid: DP_CLASSIFY, pr: 20, match: '^\\+(262|508|59[046]|68[179])', subst: KEEP, repl: '\\1', attrs: 'overseas' },
+  // Premium, shared-cost and personal ranges of the countries a trunk may list (PREMIUM_BY_COUNTRY).
+  ...PREMIUM_BY_COUNTRY.map(match => ({ dpid: DP_CLASSIFY, pr: 21, match, subst: KEEP, repl: '\\1', attrs: 'premium' as const })),
   { dpid: DP_CLASSIFY, pr: 25, match: NON_GEOGRAPHIC, subst: KEEP, repl: '\\1', attrs: 'premium' },
   // Any other country: as far as the trunk lists its country code (`countries`).
   { dpid: DP_CLASSIFY, pr: 30, match: '^\\+', subst: KEEP, repl: '\\1', attrs: 'international' },
 
-  { dpid: DP_INBOUND, pr: 10, match: '^([1-9][0-9]{8})$', subst: '^([1-9][0-9]{8})$', repl: '+33\\1', attrs: 'e164' }
+  { dpid: DP_INBOUND, pr: 10, match: '^([1-9][0-9]{8})$', subst: '^([1-9][0-9]{8})$', repl: '+33\\1', attrs: 'e164' },
+
+  ...NANP_OTHER_COUNTRIES.map(match => ({ dpid: DP_NANP_AREA, pr: 10, match, subst: KEEP, repl: '\\1', attrs: 'international' as const }))
 ]
 
 /**
@@ -131,13 +173,23 @@ export const classify = (input: string, { inbound = false } = {}): { number: str
   return { number: normalised.output, class: kind?.attrs ?? 'invalid' }
 }
 
+/**
+ * Whether a trunk whose `countries` are these calls the international number `e164` (in E.164), as
+ * route[trunk_out_loaded] decides: one of them is its country code (one to three digits, none the start of another);
+ * for the North American plan, its area ("1876") or, for the United States and Canada only, `1`.
+ */
+export const countryAllowed = (e164: string, countries: readonly string[]): boolean => {
+  if (e164.startsWith('+1')) return countries.includes(e164.slice(1, 5)) || (countries.includes('1') && !translate(DP_NANP_AREA, e164))
+  return [1, 2, 3].some(n => countries.includes(e164.slice(1, 1 + n)))
+}
+
 const quote = (s: string | undefined) => (s === undefined ? 'NULL' : `'${s.replace(/'/g, "''")}'`)
 
 /**
  * The SQL that puts these rules in place of those of the same dpids, in one statement list (one implicit
  * transaction): OpenSIPS loads them at its start, and again on MI `dp_reload`.
  */
-export const DIALPLAN_SQL = `DELETE FROM dialplan WHERE dpid IN (${DP_NORMALISE}, ${DP_CLASSIFY}, ${DP_INBOUND});
+export const DIALPLAN_SQL = `DELETE FROM dialplan WHERE dpid IN (${DP_NORMALISE}, ${DP_CLASSIFY}, ${DP_INBOUND}, ${DP_NANP_AREA});
 INSERT INTO dialplan (dpid, pr, match_op, match_exp, match_flags, subst_exp, repl_exp, disabled, attrs) VALUES
 ${DIALPLAN_RULES.map(r => `  (${r.dpid}, ${r.pr}, 1, ${quote(r.match)}, 0, ${quote(r.subst)}, ${quote(r.repl)}, 0, ${quote(r.attrs)})`).join(',\n')};
 `

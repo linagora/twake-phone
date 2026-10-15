@@ -1,4 +1,4 @@
-import { RESERVED_NUMBER, TRUNK_CODECS, TRUNK_COUNTRY_EXCLUDED, TRUNK_OUTBOUND_CLASSES, type DidRange, type Trunk, type TrunkAuth, type TrunkCodec, type TrunkNumberFormat, type TrunkOutboundClass } from '@twake/telephony-types'
+import { EXTENSION_FORMAT, RESERVED_NUMBER, TRUNK_CODECS, TRUNK_COUNTRY, TRUNK_COUNTRY_EXCLUDED, TRUNK_OUTBOUND_CLASSES, type DidRange, type Trunk, type TrunkAuth, type TrunkCodec, type TrunkNumberFormat, type TrunkOutboundClass } from '@twake/telephony-types'
 import { decrypt, encrypt } from './crypto.js'
 import type { DidRecord, TrunkRecord } from './store/types.js'
 
@@ -26,8 +26,6 @@ export const MAX_RANGE = 10_000
 const MAX_PROXIES = 4
 const MAX_SOURCES = 16
 const MAX_COUNTRIES = 64
-/** An E.164 country code, without the +. */
-const COUNTRY = /^[1-9][0-9]{0,2}$/
 
 /** A 400 whose `code` the app turns into the administrator's words; the message names the field. */
 const invalid = (message: string) => Object.assign(new Error(message), { statusCode: 400, code: 'TRUNK_INVALID' })
@@ -91,8 +89,9 @@ export const parseTrunk = (body: unknown, current?: Pick<TrunkRecord, 'passwordE
     allowed = a as TrunkOutboundClass[]
   }
   // International numbers to the countries listed only, never to a whole world: `countries` goes with `international`.
-  const countries = list(b, 'countries', MAX_COUNTRIES, v => COUNTRY.test(v) && !TRUNK_COUNTRY_EXCLUDED.test(v), 'country codes (32, 44, 1...), not France nor its overseas ones (their own classes), nor a code of no country (satellites, international premium rate: never called)')
-  if (countries?.some(c => countries.some(o => o !== c && o.startsWith(c)))) throw invalid('countries: country codes, none the start of another')
+  const countries = list(b, 'countries', MAX_COUNTRIES, v => TRUNK_COUNTRY.test(v) && !TRUNK_COUNTRY_EXCLUDED.test(v), 'country codes (32, 44, 1...) or areas of the North American plan (1876...), not France nor its overseas ones (their own classes), nor a code of no country (satellites, international premium rate: never called)')
+  // `1` (the United States and Canada) and an area of another country of its plan ("1876") are two countries.
+  if (countries?.some(c => c !== '1' && countries.some(o => o !== c && o.startsWith(c)))) throw invalid('countries: country codes, none the start of another')
   if (allowed?.includes('international') && !countries) throw invalid('countries: the country codes international numbers may have are required with international')
   if (countries && !allowed?.includes('international')) throw invalid('countries: only with international in allowed')
   if (b.default !== undefined && typeof b.default !== 'boolean') throw invalid('default: true or false')
@@ -158,7 +157,8 @@ export const parseDid = (id: string, body: unknown, trunks: readonly Pick<TrunkR
   const last = text(b, 'last', v => E164.test(v), 'an E.164 number (+ then 7 to 15 digits)') ?? first
   if (last.length !== first.length || last < first) throw invalid('last: a number of the same length, from first on')
   if (Number(last.slice(1)) - Number(first.slice(1)) + 1 > MAX_RANGE) throw invalid(`last: ${MAX_RANGE} numbers in a range at most`)
-  const target = text(b, 'target', v => SIP_USER.test(v), 'an extension or a group number')
+  // An extension or a group: the internal plan (2 to 6 digits, not 0 first), never a number that goes out.
+  const target = text(b, 'target', v => EXTENSION_FORMAT.test(v), 'an extension or a group number (2 to 6 digits, the first not 0)')
   let suffixDigits: number | undefined
   if (b.suffixDigits !== undefined && b.suffixDigits !== null) {
     if (!Number.isInteger(b.suffixDigits) || (b.suffixDigits as number) < 2 || (b.suffixDigits as number) > 6) throw invalid('suffixDigits: from 2 to 6')

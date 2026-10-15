@@ -102,8 +102,11 @@ services:
       # emergency call excepted.
       TRUNK_MAX_CALL_SEC:
       # How often the phone in a call with the operator is asked whether it is still there (an OPTIONS in the call;
-      # seconds, 5 to 300, 30 by default): one that no longer answers has the call ended.
+      # seconds, 5 to 300, 30 by default): one that no longer answers has the call ended. Never an emergency call.
       CALL_PING_SEC:
+      # How long that OPTIONS waits for its answer (seconds, 5 to 60, 15 by default): the first one unanswered ends the
+      # call, so a phone gone is noticed within CALL_PING_SEC + CALL_PING_TIMEOUT_SEC.
+      CALL_PING_TIMEOUT_SEC:
     healthcheck:
       # One MI request over UDP (mi_datagram, loopback): healthy once OpenSIPS answers, not once its fifo exists.
       test: ["CMD", "bash", "-c", "exec 3<>/dev/udp/127.0.0.1/8880 && printf '{\"jsonrpc\":\"2.0\",\"method\":\"version\",\"id\":\"health\"}' >&3 && read -r -t 2 -n 1 _ <&3"]

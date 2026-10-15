@@ -42,7 +42,7 @@ const Report = ({ report }: { report: SyncReport }) => {
       {report.conflicts.length ? (
         <ul className="list">
           {report.conflicts.map(c => (
-            <li key={`${c.userId}:${c.extension}`}>{t(c.reserved ? 'admin.conflictReserved' : c.group ? 'admin.conflictGroup' : 'admin.conflict', { userId: c.userId, extension: c.extension, heldBy: c.heldBy })}</li>
+            <li key={`${c.userId}:${c.extension}`}>{t(c.reserved ? 'admin.conflictReserved' : c.invalid ? 'admin.conflictInvalid' : c.group ? 'admin.conflictGroup' : 'admin.conflict', { userId: c.userId, extension: c.extension, heldBy: c.heldBy })}</li>
           ))}
         </ul>
       ) : null}

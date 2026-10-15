@@ -2075,7 +2075,8 @@ try {
       return s && s.packetsReceived > before.packetsReceived + 20 && s.packetsSent > before.packetsSent + 20 && placed.media.stats.voiced > 20 ? s : null
     })
     await jean.context.close()
-    await operator.callState(placed, 'ended', 30_000)
+    // Within CALL_PING_SEC + CALL_PING_TIMEOUT_SEC (5 + 15 in CI), the OPTIONS of OpenSIPS retransmitted meanwhile.
+    await operator.callState(placed, 'ended', 45_000)
   })
   await step('Jean opens TwakePhone again; the operator calls Bob\'s direct number and gives up while it rings (CANCEL): Bob stops ringing', async () => {
     jean = await open('jdupont', 'Jean Dupont')

@@ -1,6 +1,6 @@
-import { RESERVED_NUMBER } from '@twake/telephony-types'
+import { EXTENSION_FORMAT, RESERVED_NUMBER } from '@twake/telephony-types'
 import { describe, expect, it } from 'vitest'
-import { DIALPLAN_RULES, DIALPLAN_SQL, DP_CLASSIFY, DP_INBOUND, DP_NORMALISE, OUTBOUND_ALLOWABLE, OUTBOUND_ALLOWED, classify, translate } from './numbering.js'
+import { DIALPLAN_RULES, DIALPLAN_SQL, DP_CLASSIFY, DP_INBOUND, DP_NANP_AREA, DP_NORMALISE, OUTBOUND_ALLOWABLE, OUTBOUND_ALLOWED, classify, countryAllowed, translate } from './numbering.js'
 
 // Fictional numbers only: ARCEP reserves 01 99 00 xx xx and 06 39 98 xx xx for fiction (the latter in the block of
 // Mayotte, 0639: an overseas number), Ofcom 020 7946 0xxx. The other kinds of numbers are written with a subscriber
@@ -55,6 +55,54 @@ describe('the numbering plan (dialplan, dpid 1 then 2)', () => {
     for (const n of ['+870000000000', '+881600000000', '+882340000000', '+883130000000', '+979000000000', '+80012345678', '+80812345678', '+878100000000', '+888000000000', '+991000000000', '00881600000000'])
       expect(classify(n)?.class, n).toBe('premium')
     for (const n of ['+87100000000', '+88000000000', '+886200000000', '+97100000000', '+3220000000', '+12025550100']) expect(classify(n)?.class, n).toBe('international')
+  })
+
+  it('opens with a country code its geographic and mobile numbers only, never its premium, shared-cost or personal ranges', () => {
+    // United States, Canada: 900, 976 in any area, 700, the 5XX personal numbers; their ordinary numbers are international.
+    for (const n of ['+19005550123', '+12129760123', '+14169760000', '+17005550123', '+15005550123', '+15215550123', '+15885550123'])
+      expect(classify(n)?.class, n).toBe('premium')
+    for (const n of ['+12125550123', '+14165550123', '+18005550123', '+15105550123', '+12129750123', '+19095550123']) expect(classify(n)?.class, n).toBe('international')
+    // United Kingdom: 9, 70, 84, 87; Germany: 900, 137, 138, 180, 118, 700, 12.
+    for (const n of ['+449098790000', '+447000000000', '+448450000000', '+448700000000', '+499000000000', '+491370000000', '+491380000000', '+491800000000', '+49118000', '+497000000000', '+4912000000'])
+      expect(classify(n)?.class, n).toBe('premium')
+    for (const n of ['+442079460123', '+447700900123', '+448000000000', '+493000000000', '+491510000000']) expect(classify(n)?.class, n).toBe('international')
+    // And the others listed most: Belgium, Switzerland, Spain, Italy, Netherlands, Austria, Portugal, Luxembourg, Poland.
+    for (const n of ['+3290000000', '+3270000000', '+41900000000', '+41840000000', '+34803000000', '+34901000000', '+39899000000', '+31900000000', '+43900000000', '+43810000000', '+351600000000', '+351707000000', '+35290000000', '+48700000000'])
+      expect(classify(n)?.class, n).toBe('premium')
+    for (const n of ['+3220000000', '+41210000000', '+34910000000', '+390600000000', '+31200000000', '+4310000000', '+351210000000', '+352200000', '+48220000000']) expect(classify(n)?.class, n).toBe('international')
+  })
+
+  it('takes the North American plan per area: `1` for the United States and Canada, every other country by its own area', () => {
+    // The countries of the plan that are not the United States nor Canada (dialplan's set 4), Caribbean and Bermuda.
+    for (const n of ['+18765550123', '+18095550123', '+18295550123', '+12425550123', '+12465550123', '+14415550123', '+16585550123', '+17215550123', '+18685550123'])
+      expect(translate(DP_NANP_AREA, n), n).not.toBeNull()
+    for (const n of ['+12125550123', '+14165550123', '+17875550123', '+16715550123', '+13405550123']) expect(translate(DP_NANP_AREA, n), n).toBeNull()
+    expect(countryAllowed('+12125550123', ['1'])).toBe(true)
+    expect(countryAllowed('+14165550123', ['1'])).toBe(true)
+    expect(countryAllowed('+18765550123', ['1'])).toBe(false)
+    expect(countryAllowed('+18095550123', ['1', '1876'])).toBe(false)
+    expect(countryAllowed('+18765550123', ['1876'])).toBe(true)
+    expect(countryAllowed('+12125550123', ['1876'])).toBe(false)
+    // Any other code: its one to three digits.
+    expect(countryAllowed('+442079460123', ['44'])).toBe(true)
+    expect(countryAllowed('+442079460123', ['33', '1'])).toBe(false)
+    expect(countryAllowed('+35220000000', ['352'])).toBe(true)
+    expect(countryAllowed('+35220000000', ['351'])).toBe(false)
+  })
+
+  it('leaves to the internal plan every extension or group number it allows: none of them is a public number', () => {
+    // EXTENSION_FORMAT (2 to 6 digits, the first not 0) less the reserved short numbers: never classified, so never
+    // sent to the operator, and no public number is ever dialled for one.
+    const normalise = DIALPLAN_RULES.filter(r => r.dpid === DP_NORMALISE).map(r => new RegExp(r.match))
+    let checked = 0
+    for (let i = 10; i <= 999999; i++) {
+      const n = String(i)
+      if (!EXTENSION_FORMAT.test(n) || RESERVED_NUMBER.test(n)) continue
+      checked++
+      if (normalise.some(r => r.test(n))) expect(classify(n), n).toBeNull()
+    }
+    expect(checked).toBeGreaterThan(900000)
+    for (const n of ['0101', '01', '+33199000101', '1234567', '1', 'alice']) expect(EXTENSION_FORMAT.test(n), n).toBe(false)
   })
 
   it('classes the overseas numbers of the French plan as overseas however they are written, not as fixed or mobile', () => {
@@ -114,7 +162,7 @@ describe('the numbering plan (dialplan, dpid 1 then 2)', () => {
       expect((r.repl ?? '').length).toBeLessThanOrEqual(32)
       expect(() => new RegExp(r.match)).not.toThrow()
     }
-    expect(DIALPLAN_SQL).toMatch(/^DELETE FROM dialplan WHERE dpid IN \(1, 2, 3\);/)
+    expect(DIALPLAN_SQL).toMatch(/^DELETE FROM dialplan WHERE dpid IN \(1, 2, 3, 4\);/)
     expect(DIALPLAN_SQL).toContain("(1, 21, 1, '^\\+330?([1-9][0-9]{8})$', 0, '^\\+330?([1-9][0-9]{8})$', '+33\\1', 0, 'e164')")
     expect(DIALPLAN_SQL.match(/\n {2}\(/g)).toHaveLength(DIALPLAN_RULES.length)
   })

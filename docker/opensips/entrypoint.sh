@@ -38,15 +38,24 @@ esac
 if [ "$TRUNK_MAX_CALL_SEC" -lt 60 ] || [ "$TRUNK_MAX_CALL_SEC" -gt 86400 ]; then
   echo "TRUNK_MAX_CALL_SEC must be 60 to 86400 seconds" >&2; exit 1
 fi
-# How often the phone of a call with the operator is asked whether it is still there (an OPTIONS in the dialog): one
-# that does not answer (put to sleep, its page closed or reloaded, its network gone) has the call ended, a BYE to the
-# operator. In seconds, 30 by default.
+# How often the phone of a call with the operator is asked whether it is still there (an OPTIONS in the dialog), and
+# how long it has to answer: one that does not answer within CALL_PING_TIMEOUT_SEC (put to sleep, its page closed or
+# reloaded, its network gone) has the call ended, a BYE to the operator; a shorter silence (a network that switches)
+# keeps it. A phone gone is noticed within CALL_PING_SEC + CALL_PING_TIMEOUT_SEC. Never an emergency call. In
+# seconds, 30 and 15 by default.
 : "${CALL_PING_SEC:=30}"
 case "$CALL_PING_SEC" in
   '' | *[!0-9]*) echo "CALL_PING_SEC must be a number of seconds" >&2; exit 1 ;;
 esac
 if [ "$CALL_PING_SEC" -lt 5 ] || [ "$CALL_PING_SEC" -gt 300 ]; then
   echo "CALL_PING_SEC must be 5 to 300 seconds" >&2; exit 1
+fi
+: "${CALL_PING_TIMEOUT_SEC:=15}"
+case "$CALL_PING_TIMEOUT_SEC" in
+  '' | *[!0-9]*) echo "CALL_PING_TIMEOUT_SEC must be a number of seconds" >&2; exit 1 ;;
+esac
+if [ "$CALL_PING_TIMEOUT_SEC" -lt 5 ] || [ "$CALL_PING_TIMEOUT_SEC" -gt 60 ]; then
+  echo "CALL_PING_TIMEOUT_SEC must be 5 to 60 seconds" >&2; exit 1
 fi
 # The call rules are read at each INVITE (sqlops, ADR 0013): on their own connections, whose queries PostgreSQL stops
 # after this many milliseconds (the call then goes on without rules), so that a slow database never holds a call.
@@ -87,7 +96,7 @@ case "$TRUNK_ADVERTISE" in
   '') TRUNK_SOCKET_AS='' ;;
   *) TRUNK_SOCKET_AS=" as $TRUNK_ADVERTISE" ;;
 esac
-export SIP_DOMAIN LISTEN_IP SIP_PORT WS_PORT WSS_PORT OPENSIPS_DB_URL OPENSIPS_RULES_DB_URL PUSH_WAIT_SEC RTPENGINE_SOCK OPENSIPS_LOG_LEVEL OPENSIPS_MPATH MI_FIFO MI_LISTEN_IP MI_PORT TLS_CERT TLS_KEY TRUNK_LISTEN_IP TRUNK_PORT TRUNK_SOCKET_AS TRUNK_MAX_CALL_SEC CALL_PING_SEC
+export SIP_DOMAIN LISTEN_IP SIP_PORT WS_PORT WSS_PORT OPENSIPS_DB_URL OPENSIPS_RULES_DB_URL PUSH_WAIT_SEC RTPENGINE_SOCK OPENSIPS_LOG_LEVEL OPENSIPS_MPATH MI_FIFO MI_LISTEN_IP MI_PORT TLS_CERT TLS_KEY TRUNK_LISTEN_IP TRUNK_PORT TRUNK_SOCKET_AS TRUNK_MAX_CALL_SEC CALL_PING_SEC CALL_PING_TIMEOUT_SEC
 
 # The MI socket (mi_datagram) has no authentication: whoever reaches it can stop OpenSIPS, drop registrations, end
 # calls, read who is registered and subscribe to the events (who calls whom). It listens on its own address, the
@@ -139,7 +148,7 @@ if [ ! -f "$TLS_CERT" ] || [ ! -f "$TLS_KEY" ]; then
 fi
 
 # Only the listed variables are substituted: a "$avp(...)" of the script must stay as it is.
-envsubst '$SIP_DOMAIN $LISTEN_IP $SIP_PORT $WS_PORT $WSS_PORT $OPENSIPS_DB_URL $OPENSIPS_RULES_DB_URL $PUSH_WAIT_SEC $RTPENGINE_SOCK $OPENSIPS_LOG_LEVEL $OPENSIPS_MPATH $MI_FIFO $MI_LISTEN_IP $MI_PORT $TLS_CERT $TLS_KEY $TRUNK_LISTEN_IP $TRUNK_PORT $TRUNK_SOCKET_AS $TRUNK_MAX_CALL_SEC $CALL_PING_SEC' \
+envsubst '$SIP_DOMAIN $LISTEN_IP $SIP_PORT $WS_PORT $WSS_PORT $OPENSIPS_DB_URL $OPENSIPS_RULES_DB_URL $PUSH_WAIT_SEC $RTPENGINE_SOCK $OPENSIPS_LOG_LEVEL $OPENSIPS_MPATH $MI_FIFO $MI_LISTEN_IP $MI_PORT $TLS_CERT $TLS_KEY $TRUNK_LISTEN_IP $TRUNK_PORT $TRUNK_SOCKET_AS $TRUNK_MAX_CALL_SEC $CALL_PING_SEC $CALL_PING_TIMEOUT_SEC' \
   < "$CFG_TEMPLATE" > "$CFG_OUT"
 
 # The tables of the trunks (step 6): dispatcher, dialplan and uac_registrant read theirs at start and OpenSIPS stops

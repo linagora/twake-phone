@@ -1,4 +1,4 @@
-import { isReservedNumber, type TenantId, type User } from '@twake/telephony-types'
+import { EXTENSION_FORMAT, isReservedNumber, type TenantId, type User } from '@twake/telephony-types'
 import type { Store } from './store/types.js'
 
 /** Twake user <-> telephony identity mapping (cahier §34). */
@@ -40,6 +40,10 @@ export const seedUserMap = async (store: Store, tenantId: TenantId, spec: string
   for (const m of parseUserMap(spec)) {
     if (isReservedNumber(m.extension)) {
       warn(`${m.userId}:${m.extension} left out: ${m.extension} is an emergency number or another short number of the French plan, which goes to the operator when dialled; give another extension`)
+      continue
+    }
+    if (!EXTENSION_FORMAT.test(m.extension)) {
+      warn(`${m.userId}:${m.extension} left out: an extension is 2 to 6 digits, the first not 0 (anything else, dialled, is taken for a public number)`)
       continue
     }
     if (!(await store.getMappingByUser(tenantId, m.userId))) await store.upsertMapping({ tenantId, ...m })

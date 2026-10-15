@@ -166,7 +166,7 @@ CREATE TABLE IF NOT EXISTS dids (
     suffix_digits SMALLINT DEFAULT 0 NOT NULL
 );
 CREATE INDEX IF NOT EXISTS dids_first_number_idx ON dids (first_number);
-DELETE FROM dialplan WHERE dpid IN (1, 2, 3);
+DELETE FROM dialplan WHERE dpid IN (1, 2, 3, 4);
 INSERT INTO dialplan (dpid, pr, match_op, match_exp, match_flags, subst_exp, repl_exp, disabled, attrs) VALUES
   (1, 10, 1, '^(1[578]|11[2459]|19[167]|116000|116117)$', 0, '^(.*)$', '\1', 0, 'emergency'),
   (1, 11, 1, '^116[0-9]{3}$', 0, '^(.*)$', '\1', 0, 'freephone'),
@@ -186,9 +186,24 @@ INSERT INTO dialplan (dpid, pr, match_op, match_exp, match_flags, subst_exp, rep
   (2, 14, 1, '^\+338[1-9][0-9]{7}$', 0, '^(.*)$', '\1', 0, 'premium'),
   (2, 15, 1, '^\+33', 0, '^(.*)$', '\1', 0, 'invalid'),
   (2, 20, 1, '^\+(262|508|59[046]|68[179])', 0, '^(.*)$', '\1', 0, 'overseas'),
+  (2, 21, 1, '^\+1(900|700|5(00|2[1-9]|33|44|66|77|88))', 0, '^(.*)$', '\1', 0, 'premium'),
+  (2, 21, 1, '^\+1[2-9][0-9]{2}976', 0, '^(.*)$', '\1', 0, 'premium'),
+  (2, 21, 1, '^\+44(9|70|8[47])', 0, '^(.*)$', '\1', 0, 'premium'),
+  (2, 21, 1, '^\+49(900|13[78]|180|118|700|12)', 0, '^(.*)$', '\1', 0, 'premium'),
+  (2, 21, 1, '^\+32(90|70|77)', 0, '^(.*)$', '\1', 0, 'premium'),
+  (2, 21, 1, '^\+41(90|84|878)', 0, '^(.*)$', '\1', 0, 'premium'),
+  (2, 21, 1, '^\+34(80[3-7]|90[1-7]|118)', 0, '^(.*)$', '\1', 0, 'premium'),
+  (2, 21, 1, '^\+39(89|84|178|12)', 0, '^(.*)$', '\1', 0, 'premium'),
+  (2, 21, 1, '^\+31(90|84|87)', 0, '^(.*)$', '\1', 0, 'premium'),
+  (2, 21, 1, '^\+43(9|8[12]|118)', 0, '^(.*)$', '\1', 0, 'premium'),
+  (2, 21, 1, '^\+351(6|70[78]|80[89])', 0, '^(.*)$', '\1', 0, 'premium'),
+  (2, 21, 1, '^\+352(90|801)', 0, '^(.*)$', '\1', 0, 'premium'),
+  (2, 21, 1, '^\+48(70)', 0, '^(.*)$', '\1', 0, 'premium'),
   (2, 25, 1, '^\+(80[08]|87[08]|88[1238]|979|991)', 0, '^(.*)$', '\1', 0, 'premium'),
   (2, 30, 1, '^\+', 0, '^(.*)$', '\1', 0, 'international'),
-  (3, 10, 1, '^([1-9][0-9]{8})$', 0, '^([1-9][0-9]{8})$', '+33\1', 0, 'e164');
+  (3, 10, 1, '^([1-9][0-9]{8})$', 0, '^([1-9][0-9]{8})$', '+33\1', 0, 'e164'),
+  (4, 10, 1, '^\+1(24[26]|26[48]|284|345|441|473|649|658|664|721)', 0, '^(.*)$', '\1', 0, 'international'),
+  (4, 10, 1, '^\+1(758|767|784|8[024]9|86[89]|876)', 0, '^(.*)$', '\1', 0, 'international');
 ALTER TABLE subscriber ADD COLUMN IF NOT EXISTS holder TEXT;
 ALTER TABLE acc ADD COLUMN IF NOT EXISTS caller VARCHAR(64) DEFAULT '' NOT NULL;
 ALTER TABLE acc ADD COLUMN IF NOT EXISTS callee VARCHAR(64) DEFAULT '' NOT NULL;

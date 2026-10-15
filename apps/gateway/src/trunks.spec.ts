@@ -76,6 +76,8 @@ describe('parseTrunk', () => {
 
   it('calls abroad only the countries listed with international, never every country nor a code of no country', () => {
     expect(parseTrunk({ ...trunk, allowed: ['fixed', 'international'], countries: ['44', '32', '1'] }).config).toMatchObject({ allowed: ['fixed', 'international'], countries: ['44', '32', '1'] })
+    // The North American plan per area: `1` (the United States and Canada) does not start Jamaica's 1876, listed apart.
+    expect(parseTrunk({ ...trunk, allowed: ['international'], countries: ['1', '1876'] }).config).toMatchObject({ countries: ['1', '1876'] })
     const bad: [Record<string, unknown>, RegExp][] = [
       // `international` alone would be the whole world.
       [{ allowed: ['international'] }, /^countries: .* required with international/],
@@ -88,6 +90,10 @@ describe('parseTrunk', () => {
       [{ allowed: ['international'], countries: ['+44'] }, /^countries/],
       [{ allowed: ['international'], countries: ['044'] }, /^countries/],
       [{ allowed: ['international'], countries: ['4444'] }, /^countries/],
+      // An area of the North American plan is four digits, 1 then its area code (2 to 9 first).
+      [{ allowed: ['international'], countries: ['1034'] }, /^countries/],
+      [{ allowed: ['international'], countries: ['18'] }, /^countries/],
+      [{ allowed: ['international'], countries: ['18765'] }, /^countries/],
       [{ allowed: ['international'], countries: ['*'] }, /^countries/],
       [{ allowed: ['international'], countries: ['44', '44'] }, /^countries/],
       // A code that starts another would call it too.
@@ -151,6 +157,8 @@ describe('parseDid', () => {
       ['x', { trunkId: 'operator', first: '+33199000101', last: '+331990001011', target: '101' }, /^last/],
       ['x', { trunkId: 'operator', first: '+33199000000', last: '+33199099999', suffixDigits: 5 }, /10000 numbers/],
       ['x', { trunkId: 'operator', first: '+33199000101', target: "101' --" }, /^target/],
+      // An extension or a group of the internal plan (2 to 6 digits, the first not 0), never a number of the public network.
+      ...['0101', '0199000101', '+33199000101', '1234567', '7', 'alice'].map(target => ['x', { trunkId: 'operator', first: '+33199000101', target }, /^target/] as [string, Record<string, unknown>, RegExp]),
       ['x', { trunkId: 'operator', first: '+33199000101' }, /one of them/],
       ['x', { trunkId: 'operator', first: '+33199000101', target: '101', suffixDigits: 3 }, /one of them/],
       ['x', { trunkId: 'operator', first: '+33199000101', suffixDigits: 7 }, /^suffixDigits/]

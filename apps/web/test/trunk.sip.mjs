@@ -12,7 +12,9 @@
 //   OPENSIPS_DB_URL      its database (default postgres://twake:twake@127.0.0.1:54320/twake)
 //   OPENSIPS_MI_URL      its MI (default udp:127.0.0.1:8880)
 //   CALL_PING_SEC        its CALL_PING_SEC (default 30): how long the steps on calls whose phone went wait
+//   CALL_PING_TIMEOUT_SEC its CALL_PING_TIMEOUT_SEC (default 15): how long a phone may be silent and keep its call
 //   TRUNK_MAX_CALL_SEC   its TRUNK_MAX_CALL_SEC (default 14400)
+//   RTPENGINE_NG         rtpengine's control socket (default 127.0.0.1:22222): whether a call's media is freed
 import { randomBytes } from 'node:crypto'
 import { createSocket } from 'node:dgram'
 import pg from 'pg'
@@ -28,6 +30,8 @@ const TRUNK_ADVERTISE = process.env.TRUNK_ADVERTISE ?? ''
 const DB_URL = process.env.OPENSIPS_DB_URL ?? 'postgres://twake:twake@127.0.0.1:54320/twake'
 const MI_URL = process.env.OPENSIPS_MI_URL ?? 'udp:127.0.0.1:8880'
 const PING_SEC = Number(process.env.CALL_PING_SEC ?? 30)
+const PING_TIMEOUT_SEC = Number(process.env.CALL_PING_TIMEOUT_SEC ?? 15)
+const RTPENGINE_NG = process.env.RTPENGINE_NG ?? '127.0.0.1:22222'
 const MAX_CALL_SEC = Number(process.env.TRUNK_MAX_CALL_SEC ?? 14400)
 const TENANT = 'trunk-sip'
 const LOGIN = '0033199000300'
@@ -60,6 +64,24 @@ const mi = (method, params) =>
 const reload = async () => {
   for (const m of ['ds_reload', 'reg_reload', 'dp_reload']) await mi(m)
 }
+// rtpengine's NG protocol (bencode over UDP): `query` of a call, 'ok' while rtpengine holds its media, 'error' once
+// freed.
+const bencode = v => (typeof v === 'string' ? `${Buffer.byteLength(v)}:${v}` : `d${Object.entries(v).map(([k, x]) => bencode(k) + bencode(x)).join('')}e`)
+const rtpQuery = callId =>
+  new Promise((resolve, reject) => {
+    const [host, port] = RTPENGINE_NG.split(':')
+    const s = createSocket('udp4')
+    const cookie = randomBytes(4).toString('hex')
+    const t = setTimeout(() => (s.close(), reject(new Error('rtpengine: no answer'))), 3000)
+    s.on('message', m => {
+      const text = m.toString()
+      if (!text.startsWith(cookie)) return
+      clearTimeout(t)
+      s.close()
+      resolve(/6:result\d+:(ok|error)/.exec(text)?.[1] ?? text)
+    })
+    s.send(`${cookie} ${bencode({ command: 'query', 'call-id': callId })}`, Number(port), host)
+  })
 
 const prov = new SubscriberProvisioner({ databaseUrl: DB_URL, realm: SIP_DOMAIN })
 await prov.ensureSchema()
@@ -78,7 +100,7 @@ const S = await startOperator({ opensips: SIP_TRUNK, user: LOGIN, password: PASS
 const X = await startOperator({ opensips: SIP_TRUNK, user: LOGIN, password: PASSWORD, nat, bind: '127.0.0.4' })
 operators.push(A, B, C)
 const tables = prov.trunkTables({ tenantId: TENANT, socket: `udp:${SIP_TRUNK}`, ...(TRUNK_ADVERTISE ? { advertise: TRUNK_ADVERTISE } : {}) })
-const main = { id: 'main', auth: 'register', domain: 'operator.example', proxies: [A.address, B.address], sources: ['127.0.0.3'], username: LOGIN, password: PASSWORD, codecs: ['PCMA', 'PCMU'], numberFormat: 'e164', defaultNumber: '+33199000300', allowed: ['fixed', 'mobile', 'freephone', 'standard-rate', 'international'], countries: ['44'] }
+const main = { id: 'main', auth: 'register', domain: 'operator.example', proxies: [A.address, B.address], sources: ['127.0.0.3'], username: LOGIN, password: PASSWORD, codecs: ['PCMA', 'PCMU'], numberFormat: 'e164', defaultNumber: '+33199000300', allowed: ['fixed', 'mobile', 'freephone', 'standard-rate', 'international'], countries: ['44', '1', '1876'] }
 const backup = { id: 'backup', auth: 'ip', domain: 'backup.example', proxies: [C.address], username: 'backup', password: PASSWORD, codecs: ['PCMA'], numberFormat: 'e164', defaultNumber: '+33199000310' }
 const dids = [
   { id: 'staff', trunkId: 'main', first: '+33199000300', last: '+33199000302', suffixDigits: 3 },
@@ -96,7 +118,11 @@ await db.connect()
 /** The call `phone` placed, as the operator `op` got it (same Call-ID). */
 const atOperator = (op, call) => op.until('the call at the operator', () => op.state.invites.find(c => c.callId === call.callId), 10_000)
 const busy = op => op.state.next.push({ reply: '486 Busy Here' })
-const pingWait = (PING_SEC * 2 + 12) * 1000
+// A phone gone is noticed within CALL_PING_SEC + CALL_PING_TIMEOUT_SEC (and the dialog's timer, every second).
+const pingWait = (PING_SEC * 2 + PING_TIMEOUT_SEC + 12) * 1000
+/** A silence shorter than CALL_PING_TIMEOUT_SEC, longer than the 5 s that ended a call before. */
+const shortSilenceMs = 6_500
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 
 try {
   await tables.set([main, backup], dids)
@@ -141,6 +167,24 @@ try {
     expect('headers of the phone at the operator', leaked.length === 0, leaked.join(', '))
     expect('From', header(at, 'from').includes('<sip:+33199000301@operator.example>'), header(at, 'from'))
     expect('the offer', at.headers.has('content-type') && plainRtp(at.body), at.body)
+    // Review 3, n°8: the phone's Contact without its extension, once.
+    expect('one Contact, without the extension', at.headers.get('contact')?.length === 1 && !/sip:301@|\+sip\.instance/.test(header(at, 'contact')) && header(at, 'contact').includes(p301.contactUri.replace('301@', '')), (at.headers.get('contact') ?? []).join(' | '))
+  })
+
+  await step('review 3, n°3: to the operator, a request says once what it is (a second From or To, compact forms too: 400) and carries SDP only (multipart with ISUP: 415)', async () => {
+    const attempts = A.state.attempts.length + B.state.attempts.length
+    const from = await p301.dial('0199000015', { extra: ['From: "+33612345678" <sip:301@127.0.0.1>;tag=second'] })
+    expect('a second From', from.final.status === 400, from.final.first)
+    const to = await p301.dial('0199000015', { extra: ['t: <sip:+33899999999@127.0.0.1>'] })
+    expect('a second To (compact form)', to.final.status === 400, to.final.first)
+    const sdp = p301.sdp()
+    const isup = Buffer.from([0x01, 0x00, 0x49, 0x00, 0x00, 0x03, 0x02, 0x00, 0x07, 0x04, 0x10, 0x00, 0x33, 0x63, 0x21, 0x43, 0x00]).toString('latin1')
+    const body = ['--b1', 'Content-Type: application/sdp', '', sdp, '--b1', 'Content-Type: application/isup;version=itu-t92+', 'Content-Disposition: signal;handling=optional', '', isup, '--b1--', ''].join('\r\n')
+    const multipart = await p301.dial('0199000015', { body, type: 'multipart/mixed;boundary=b1' })
+    expect('a multipart body', multipart.final.status === 415, multipart.final.first)
+    const sos = await p301.dial('112', { extra: ['f: <sip:301@127.0.0.1>;tag=second'] })
+    expect('112 with a second From', sos.final.status === 400 && header(sos.final, 'twake-call-refused') === 'emergency', `${sos.final.first} ${header(sos.final, 'twake-call-refused')}`)
+    expect('calls the operator was sent', A.state.attempts.length + B.state.attempts.length === attempts, `${A.state.attempts.length + B.state.attempts.length - attempts}`)
   })
 
   await step('n°6: international numbers go to the countries the trunk lists only (44), never satellites or international premium rate', async () => {
@@ -155,6 +199,30 @@ try {
       ['+8820000000', 'premium'],
       ['+8830000000', 'premium'],
       ['+979000000000', 'premium']
+    ]) {
+      const refused = await p301.dial(number)
+      expect(`${number}`, refused.final.status === 403 && header(refused.final, 'twake-call-refused') === refusal, `${refused.final.first} ${header(refused.final, 'twake-call-refused')}`)
+    }
+    expect('calls the operator was sent', A.state.attempts.length + B.state.attempts.length === attempts)
+  })
+
+  await step('review 3, n°4: a country code opens its geographic and mobile numbers, never its premium ranges; the North American plan is listed per area (1: the United States and Canada; 1876: Jamaica)', async () => {
+    for (const number of ['+12125550123', '+18765550123']) {
+      busy(A)
+      const call = await p301.dial(number)
+      expect(`${number} at the operator`, (await atOperator(A, call)).invite.uri === `sip:${number}@operator.example`)
+    }
+    const attempts = A.state.attempts.length + B.state.attempts.length
+    for (const [number, refusal] of [
+      ['+18095550123', 'international'],
+      ['+19005550123', 'premium'],
+      ['+12129760123', 'premium'],
+      ['+15005550123', 'premium'],
+      ['+449098790000', 'premium'],
+      ['+447000000000', 'premium'],
+      ['+448450000000', 'premium'],
+      ['+499000000000', 'premium'],
+      ['+491370000000', 'premium']
     ]) {
       const refused = await p301.dial(number)
       expect(`${number}`, refused.final.status === 403 && header(refused.final, 'twake-call-refused') === refusal, `${refused.final.first} ${header(refused.final, 'twake-call-refused')}`)
@@ -177,9 +245,30 @@ try {
     const call = await p301.dial('0199000007')
     expect('final answer', call.final.status === 200, call.final.first)
     const at = await atOperator(A, call)
+    // Review 3, n°5: from that address, only what a media gateway sends in a call (BYE, re-INVITE, ACK, UPDATE,
+    // PRACK), and to the phone of the call only, whatever its Request-URI names.
+    expect('OPTIONS from that address in the call', (await X.request(at, 'OPTIONS')).status === 403)
+    const elsewhere = createSocket('udp4')
+    let leaked = 0
+    elsewhere.on('message', () => leaked++)
+    await new Promise(resolve => elsewhere.bind(5099, '127.0.0.6', resolve))
+    try {
+      const target = at.remoteTarget
+      at.remoteTarget = 'sip:evil@127.0.0.6:5099'
+      const reinvite = await X.reinvite(at)
+      at.remoteTarget = target
+      expect('re-INVITE from that address', reinvite.status === 200, reinvite.first)
+      const got = call.reinvites.at(-1)
+      expect('at the phone, at its own Contact', got?.uri === p301.contactUri, got?.uri)
+      await sleep(500)
+      expect('requests sent elsewhere', leaked === 0, `${leaked}`)
+    } finally {
+      elsewhere.close()
+    }
     const bye = await X.request(at, 'BYE')
     expect('answer to the BYE', bye.status === 200, bye.first)
     await p301.callState(call, 'ended', 5_000)
+    expect('the BYE at the phone, at its own Contact', call.requests.at(-1)?.uri === p301.contactUri, call.requests.at(-1)?.uri)
     expect('INVITE from that address', (await X.raw('INVITE', '+33199000301')).status === 403)
     expect('BYE in no call from that address', (await X.raw('BYE', '+33199000301', { toTag: 'forged' })).status === 403)
   })
@@ -234,6 +323,7 @@ try {
     const call = await p301.dial('0199000010')
     expect('final answer', call.final.status === 200, call.final.first)
     const at = await atOperator(A, call)
+    expect('the media in rtpengine', (await rtpQuery(call.callId)) === 'ok')
     p301.st.asleep = true
     try {
       await A.callState(at, 'ended', pingWait)
@@ -242,6 +332,50 @@ try {
       await other.close()
       phones.splice(phones.indexOf(other), 1)
     }
+    // Review 3, n°8: the BYE OpenSIPS sent carries the operator's URIs, as the INVITE did (uac's auto restore),
+    // never the extension nor the internal domain.
+    const bye = at.requests.find(r => r.method === 'BYE')
+    expect('From and To of the BYE OpenSIPS sent', header(bye, 'from').includes('<sip:+33199000301@operator.example>') && header(bye, 'to').includes('<sip:+33199000010@operator.example>'), `${header(bye, 'from')} | ${header(bye, 'to')}`)
+    // Review 3, n°7: the BYEs OpenSIPS sent free the media at once.
+    await sleep(500)
+    expect('the media in rtpengine once ended', (await rtpQuery(call.callId)) === 'error')
+  })
+
+  await step(`review 3, n°1: a phone silent for less than CALL_PING_TIMEOUT_SEC (${shortSilenceMs} ms, an OPTIONS waiting) keeps its call with the operator`, async () => {
+    const call = await p303.dial('0199000016')
+    expect('final answer', call.final.status === 200, call.final.first)
+    const at = await atOperator(C, call)
+    await p303.until('an OPTIONS in the dialog', () => call.requests.some(r => r.method === 'OPTIONS'), pingWait)
+    p303.st.asleep = true
+    await sleep(shortSilenceMs)
+    p303.st.asleep = false
+    const answered = call.requests.filter(r => r.method === 'OPTIONS').length
+    await p303.until('another OPTIONS in the dialog', () => call.requests.filter(r => r.method === 'OPTIONS').length > answered, pingWait)
+    expect('the call at the operator', at.state === 'answered', at.state)
+    await p303.hangup(call)
+  })
+
+  await step(`review 3, n°1: an emergency call is never asked whether its phone is there: no OPTIONS, a phone silent ${shortSilenceMs} ms and more keeps it`, async () => {
+    const call = await p301.dial('112')
+    expect('final answer', call.final.status === 200, call.final.first)
+    const at = await atOperator(A, call)
+    p301.st.asleep = true
+    await sleep(shortSilenceMs)
+    p301.st.asleep = false
+    await sleep((PING_SEC + PING_TIMEOUT_SEC + 2) * 1000)
+    expect('the call at the operator', at.state === 'answered', at.state)
+    expect('OPTIONS in the dialog', !p301.st.received.some(r => r.method === 'OPTIONS' && header(r, 'call-id') === call.callId))
+    await p301.hangup(call)
+  })
+
+  await step('review 3, n°6: one of our own direct numbers dialled stays an internal call: its phones are not asked whether they are there (no OPTIONS)', async () => {
+    const call = await p303.dial('0199000301')
+    expect('final answer', call.final.status === 200, call.final.first)
+    const got = await p301.incoming(i => header(i, 'call-id') === call.callId)
+    await sleep((PING_SEC * 2 + 2) * 1000)
+    expect('OPTIONS to the caller', !call.requests.some(r => r.method === 'OPTIONS'), call.requests.map(r => r.method).join(', '))
+    expect('OPTIONS to the callee', !got.requests.some(r => r.method === 'OPTIONS'), got.requests.map(r => r.method).join(', '))
+    await p303.hangup(call)
   })
 
   await step('n°5: a browser\'s window reloaded in a call (its WebSocket closed): OpenSIPS ends the call, a BYE to the operator', async () => {
@@ -250,6 +384,17 @@ try {
     const at = await atOperator(A, call)
     await p302.drop()
     await A.callState(at, 'ended', pingWait)
+  })
+
+  await step('review 3, n°8: the answer of a desk phone to a call from the operator carries no extension in its Contact; the operator\'s BYE reaches the phone at its own', async () => {
+    const placed = await A.call('+33199000301', { from: '+33639980002' })
+    const answer = await placed.final
+    expect('final answer', answer.status === 200, answer.first)
+    expect('one Contact, without the extension', answer.headers.get('contact')?.length === 1 && !/sip:301@/.test(header(answer, 'contact')), (answer.headers.get('contact') ?? []).join(' | '))
+    const got = await p301.incoming(i => header(i, 'call-id') === placed.callId)
+    expect('BYE', (await placed.hangup()).status === 200)
+    await p301.callState(got, 'ended', 5_000)
+    expect('the BYE at the phone, at its own Contact', got.requests.at(-1)?.uri === p301.contactUri, got.requests.at(-1)?.uri)
   })
 
   await step('n°5: a call from the operator whose phone went: ended, a BYE to the operator', async () => {
@@ -295,6 +440,17 @@ try {
     expect('the other call', left(other.callId) <= MAX_CALL_SEC, `${left(other.callId)} s left`)
     await p301.hangup(sos)
     await p301.hangup(other)
+  })
+
+  await step('review 3, n°2: the trunk of the caller\'s direct number refuses an emergency call (403): it goes through the default trunk', async () => {
+    C.state.next.push({ reply: '403 Forbidden' })
+    const call = await p303.dial('112')
+    expect('the refusal at the first trunk', C.state.invites.some(c => c.callId === call.callId && c.state === 'refused'))
+    const at = await atOperator(A, call)
+    expect('Request-URI at the default trunk', at.invite.uri === 'sip:112@operator.example', at.invite.uri)
+    expect('From', header(at.invite, 'from').includes('<sip:+33199000300@operator.example>'), header(at.invite, 'from'))
+    expect('final answer', call.final.status === 200, call.final.first)
+    await p303.hangup(call)
   })
 
   await step('n°7: none of the servers of the trunk of the caller\'s direct number is up: an emergency call goes through the default trunk', async () => {

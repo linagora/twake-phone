@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { TRUNK_COUNTRY_EXCLUDED, TRUNK_OUTBOUND_CLASSES, TRUNK_OUTBOUND_DEFAULT, type DidRange, type Trunk } from '@twake/telephony-types'
+import { TRUNK_COUNTRY, TRUNK_COUNTRY_EXCLUDED, TRUNK_OUTBOUND_CLASSES, TRUNK_OUTBOUND_DEFAULT, type DidRange, type Trunk } from '@twake/telephony-types'
 import { DIALPLAN_SQL } from './numbering.js'
 import type { Queryable } from './subscriber.js'
 
@@ -130,7 +130,6 @@ const SOCKET = /^udp:([0-9]{1,3}(?:\.[0-9]{1,3}){3}):(\d{1,5})$/
 const HOST_PORT = /^([A-Za-z0-9.-]+)(:\d{1,5})?$/
 const IP = /^[0-9]{1,3}(\.[0-9]{1,3}){3}$/
 const E164 = /^\+[1-9][0-9]{6,14}$/
-const COUNTRY = /^[1-9][0-9]{0,2}$/
 /** What may go into a SIP URI's user part or a quoted SQL literal here, and nothing else. */
 const SIP_USER = /^[A-Za-z0-9._+-]{1,64}$/
 
@@ -187,7 +186,7 @@ export const projectTrunks = (trunks: (Trunk & { password?: string })[], dids: D
     const allowed = t.allowed ?? TRUNK_OUTBOUND_DEFAULT
     if (!allowed.every(c => (TRUNK_OUTBOUND_CLASSES as readonly string[]).includes(c))) throw invalid(`Trunk ${t.id}: allowed is some of ${TRUNK_OUTBOUND_CLASSES.join(', ')}`)
     const countries = t.countries ?? []
-    if (!countries.every(c => COUNTRY.test(c) && !TRUNK_COUNTRY_EXCLUDED.test(c))) throw invalid(`Trunk ${t.id}: countries are country codes of one to three digits, neither France nor its overseas ones, nor a code of no country`)
+    if (!countries.every(c => TRUNK_COUNTRY.test(c) && !TRUNK_COUNTRY_EXCLUDED.test(c))) throw invalid(`Trunk ${t.id}: countries are country codes of one to three digits or areas of the North American plan (1876), neither France nor its overseas ones, nor a code of no country`)
     if (allowed.includes('international') !== countries.length > 0) throw invalid(`Trunk ${t.id}: international numbers are called to the countries listed only (countries), and countries go with international`)
     out.trunks.push([t.id, setid, position, t.domain, t.numberFormat, t.assertIdentity ? 1 : 0, username, secret, t.realm ?? '', codecFlags(t.codecs), t.defaultNumber, aor, `,${allowed.join(',')},`, countries.length ? `,${countries.join(',')},` : ''])
     // The operator's servers, in order, each probed with OPTIONS (probe_mode 1): it keeps the NAT open towards each

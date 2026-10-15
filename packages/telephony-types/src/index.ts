@@ -110,11 +110,29 @@ export const RESERVED_NUMBER = /^(1[578]|11[2459]|19[167]|116[0-9]{3}|118[0-9]{3
 export const isReservedNumber = (number: string) => RESERVED_NUMBER.test(number)
 
 /**
+ * The internal plan: an extension, or the number of a ring group, is 2 to 6 digits, the first not 0. Dialled, anything
+ * else would be taken for a public number by the SIP server's numbering plan (a 0 or a + first, 33 and nine digits: to
+ * the operator, or refused as incomplete) or be no number at all. With RESERVED_NUMBER left out, the plan reads none of
+ * these as a public number (proven against its rules in provider-opensips).
+ */
+export const EXTENSION_FORMAT = /^[1-9][0-9]{1,5}$/
+/** Whether `number` may be an extension or a group's number: the internal plan (EXTENSION_FORMAT), not reserved. */
+export const isValidExtension = (number: string) => EXTENSION_FORMAT.test(number) && !isReservedNumber(number)
+
+/**
  * E.164 country codes no trunk may list in `countries`: France and its overseas departments and territories (their
  * own classes, `overseas`), and the codes of no country, charged as premium (satellites, international networks and
  * premium rate: never called).
  */
 export const TRUNK_COUNTRY_EXCLUDED = /^(33|262|508|59[046]|68[179]|80[08]|87[08]|88[1238]|979|991)$/
+/**
+ * What a trunk lists in `countries`: an E.164 country code, without the + ("32", "44"), or an area of the North
+ * American plan ("1876"). A country code opens the country's geographic, mobile and free numbers, never the premium,
+ * shared-cost and personal ranges the SIP server knows for it (step 6a: the countries most listed). `1` opens the
+ * United States and Canada only; another country of that plan (Jamaica, the Dominican Republic, Bermuda...) is listed
+ * by its area.
+ */
+export const TRUNK_COUNTRY = /^(1|[2-9][0-9]{0,2}|1[2-9][0-9]{2})$/
 
 /**
  * A SIP trunk: where calls to and from the public network go (step 6, ADR 0016). The password is write-only: it is
@@ -153,8 +171,9 @@ export interface Trunk {
   /** The kinds of numbers it calls (TRUNK_OUTBOUND_DEFAULT when absent). */
   allowed?: TrunkOutboundClass[]
   /**
-   * The countries its international numbers may be in, as E.164 country codes without the + ("32", "44", "1"):
-   * required with `international` in `allowed`, which calls these only, never a whole world.
+   * The countries its international numbers may be in, as E.164 country codes without the + ("32", "44", "1"), or
+   * areas of the North American plan ("1876", TRUNK_COUNTRY): required with `international` in `allowed`, which calls
+   * these only, never a whole world, nor their premium ranges.
    */
   countries?: string[]
   /**

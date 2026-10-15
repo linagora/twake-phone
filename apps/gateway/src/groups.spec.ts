@@ -21,6 +21,8 @@ describe('parseGroup', () => {
   it('refuses a number that is an extension, or not a number, a bad name, members that are not extensions', async () => {
     await expect(parseGroup('101', { name: 'G', members: ['102'] }, ours)).rejects.toMatchObject({ statusCode: 409, code: 'GROUP_NUMBER_TAKEN' })
     for (const number of ["200' OR 1=1", 'sip:200@x', '2 00', 'x'.repeat(65)]) await expect(parseGroup(number, { name: 'G', members: ['102'] }, ours)).rejects.toMatchObject({ statusCode: 400, code: 'GROUP_NUMBER' })
+    // The internal plan only (2 to 6 digits, the first not 0): anything else, dialled, is taken for a public number.
+    for (const number of ['0101', '01', '0199000101', '+33199000101', '1234567', '2', 'sales']) await expect(parseGroup(number, { name: 'G', members: ['102'] }, ours), number).rejects.toMatchObject({ statusCode: 400, code: 'GROUP_NUMBER' })
     for (const name of ['', '   ', 'two\nlines', 'x'.repeat(65), 42]) await expect(parseGroup('200', { name, members: ['102'] }, ours)).rejects.toMatchObject({ statusCode: 400, code: 'GROUP_NAME' })
     for (const members of [[], ['', ' '], 'not a list', Array.from({ length: 13 }, () => '101')]) {
       const res = parseGroup('200', { name: 'G', members }, anyButGroup)

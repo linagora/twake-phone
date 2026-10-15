@@ -1,4 +1,4 @@
-import { isReservedNumber, type Contact } from '@twake/telephony-types'
+import { EXTENSION_FORMAT, isReservedNumber, type Contact } from '@twake/telephony-types'
 import type { ContactDirectory } from './contacts.js'
 import type { Store, UserMapping } from './store/types.js'
 
@@ -19,9 +19,10 @@ export interface SyncReport {
   /**
    * Extensions the directory gives to two people, or that someone else keeps, or that are the number of a call group
    * (`group`, `heldBy` empty), or an emergency number or another short number of the French plan, which calls go to
-   * the operator with (`reserved`, `heldBy` empty): these people keep the mapping they had.
+   * the operator with (`reserved`, `heldBy` empty), or no extension of the internal plan, 2 to 6 digits, the first not 0
+   * (`invalid`, `heldBy` empty): these people keep the mapping they had.
    */
-  conflicts: { userId: string; extension: string; heldBy: string; group?: true; reserved?: true }[]
+  conflicts: { userId: string; extension: string; heldBy: string; group?: true; reserved?: true; invalid?: true }[]
   /** Why the run failed, in words safe to show (no address, no filter, no credential). */
   error?: string
 }
@@ -224,6 +225,12 @@ export class DirectorySync {
       // Dialled, it would reach the emergency services (or the operator), never this person.
       if (isReservedNumber(extension)) {
         report.conflicts.push({ userId: person.id, extension, heldBy: '', reserved: true })
+        blocked.add(person.id)
+        continue
+      }
+      // Not of the internal plan (2 to 6 digits, not 0 first): dialled, it would be taken for a public number.
+      if (!EXTENSION_FORMAT.test(extension)) {
+        report.conflicts.push({ userId: person.id, extension, heldBy: '', invalid: true })
         blocked.add(person.id)
         continue
       }

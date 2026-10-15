@@ -105,7 +105,7 @@ export const sipPhone = async ({ proxy, ws, domain, user, password }) => {
     send = text => new Promise(resolve => udp.send(text, Number(proxyPort), proxyHost, () => resolve()))
     udp.on('message', buf => onMessage(buf.toString()))
   }
-  const withBody = (lines, body = '') => [...lines, ...(body ? ['Content-Type: application/sdp'] : []), `Content-Length: ${Buffer.byteLength(body)}`, '', body].join('\r\n')
+  const withBody = (lines, body = '', type = 'application/sdp') => [...lines, ...(body ? [`Content-Type: ${type}`] : []), `Content-Length: ${Buffer.byteLength(body)}`, '', body].join('\r\n')
 
   // asleep: answers and sends nothing (a phone put to sleep, a window gone without a word). answerWith: how the calls
   // it gets are answered ("200 OK", "486 Busy Here"...), after a 180 and `answerDelayMs`. received: every request.
@@ -204,17 +204,18 @@ export const sipPhone = async ({ proxy, ws, domain, user, password }) => {
   }
 
   /**
-   * Calls `target` (`offer: false`: no SDP, a late offer whose answer goes in the ACK; `extra`: more headers):
-   * resolves with the call once the final answer came (`call.final`), ACKed; `call.provisional` lists the 1xx.
+   * Calls `target` (`offer: false`: no SDP, a late offer whose answer goes in the ACK; `extra`: more headers; `body`
+   * and `type`: another body than our SDP): resolves with the call once the final answer came (`call.final`), ACKed;
+   * `call.provisional` lists the 1xx.
    */
-  const dial = async (target, { offer = true, extra = [], timeoutMs = 30_000 } = {}) => {
+  const dial = async (target, { offer = true, extra = [], timeoutMs = 30_000, body: otherBody, type } = {}) => {
     const uri = `sip:${target}@${domain}`
     const callId = `phone-${token()}`
     const tag = token()
     const call = { callId, state: 'calling', rtpPort: rtpPort(), version: 1, reinvites: [], requests: [], acks: [], cseq: 1, local: `<sip:${user}@${domain}>;tag=${tag}`, remote: `<sip:${target}@${domain}>`, route: [], target: uri }
     calls.set(callId, call)
-    const body = offer ? sdpOf(call.rtpPort) : ''
-    const invite = (cseq, branch, more = []) => withBody([`INVITE ${uri} SIP/2.0`, `Via: ${via()};branch=${branch};rport`, 'Max-Forwards: 70', `From: ${call.local}`, `To: ${call.remote}`, `Call-ID: ${callId}`, `CSeq: ${cseq} INVITE`, `Contact: ${contact}`, ...extra, ...more], body)
+    const body = otherBody ?? (offer ? sdpOf(call.rtpPort) : '')
+    const invite = (cseq, branch, more = []) => withBody([`INVITE ${uri} SIP/2.0`, `Via: ${via()};branch=${branch};rport`, 'Max-Forwards: 70', `From: ${call.local}`, `To: ${call.remote}`, `Call-ID: ${callId}`, `CSeq: ${cseq} INVITE`, `Contact: ${contact}`, ...extra, ...more], body, type)
     const ackFailure = (cseq, branch, answer) => send(withBody([`ACK ${uri} SIP/2.0`, `Via: ${via()};branch=${branch};rport`, 'Max-Forwards: 70', `From: ${call.local}`, `To: ${one(answer, 'to')}`, `Call-ID: ${callId}`, `CSeq: ${cseq} ACK`]))
     let branch = `z9hG4bK${token()}`
     await send(invite(1, branch))
@@ -243,6 +244,10 @@ export const sipPhone = async ({ proxy, ws, domain, user, password }) => {
   return {
     user,
     st,
+    /** The URI of our Contact: where requests in our dialogs must arrive. */
+    contactUri: /<([^>]+)>/.exec(contact)[1],
+    /** An offer of ours (plain RTP), for a body built by hand. */
+    sdp: () => sdpOf(rtpPort()),
     calls,
     until,
     register: () => registerFor(300),

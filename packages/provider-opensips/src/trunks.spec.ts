@@ -85,11 +85,13 @@ describe('projectTrunks', () => {
     const row = (t: Partial<Trunk>) => projectTrunks([{ ...OPERATOR, ...t }], [], DEFAULT_TRUNK_SOCKET).trunks[0]![13]
     expect(row({})).toBe('')
     expect(row({ allowed: ['fixed', 'international'], countries: ['44', '32', '1'] })).toBe(',44,32,1,')
+    // The North American plan per area: `1` for the United States and Canada, Jamaica by its own (1876).
+    expect(row({ allowed: ['international'], countries: ['1', '1876'] })).toBe(',1,1876,')
     // `international` without countries would be every country: refused, as countries without it.
     expect(() => row({ allowed: ['international'] })).toThrow(/countries/)
     expect(() => row({ allowed: ['international'], countries: [] })).toThrow(/countries/)
     expect(() => row({ countries: ['44'] })).toThrow(/countries/)
-    for (const c of ['33', '262', '590', '689', '870', '881', '882', '883', '979', '800', '808', '991', '0', '044', '+44', '1234', '', '4 4', "4'"])
+    for (const c of ['33', '262', '590', '689', '870', '881', '882', '883', '979', '800', '808', '991', '0', '044', '+44', '1034', '12345', '18', '', '4 4', "4'"])
       expect(() => row({ allowed: ['international'], countries: [c] }), c).toThrow(/countries/)
   })
 

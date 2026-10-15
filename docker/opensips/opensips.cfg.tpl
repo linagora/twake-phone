@@ -126,10 +126,14 @@ loadmodule "dialog.so"
 modparam("dialog", "db_mode", 0)
 modparam("dialog", "default_timeout", 14400)
 # A call with the operator (ADR 0016) lives as long as its phone does: OpenSIPS sends that side an OPTIONS in the
-# dialog every CALL_PING_SEC (create_dialog flags P and p), and a phone that does not answer it (408: put to sleep,
-# its page closed or reloaded, its network gone) or no longer knows the call (481) has the call ended, a BYE to both
-# sides: the operator's leg is never left open and charged. Any other answer (200, 405, 501...) says the phone is
-# there. Nothing else ends a call: not the app's own connection to the Gateway, an emergency call least of all. Past
+# dialog every CALL_PING_SEC (create_dialog flags P and p), and a phone that does not answer it within
+# CALL_PING_TIMEOUT_SEC (local_route: put to sleep, its page closed or reloaded, its network gone) or no longer knows
+# the call (481) has the call ended, a BYE to both sides: the operator's leg is never left open and charged. One
+# missed OPTIONS is enough (dialog has no count of failures): a phone silent for less than CALL_PING_TIMEOUT_SEC keeps
+# its call (over UDP, tm sends the OPTIONS again meanwhile, every 4 s at most), one silent for longer while an OPTIONS
+# waits loses it, so a phone gone is noticed within CALL_PING_SEC + CALL_PING_TIMEOUT_SEC. Any other answer (200,
+# 405, 501...) says the phone is there. Never an emergency call (route[trunk_out_loaded]: no P): the emergency
+# services hang up themselves. Nothing else ends a call: not the app's own connection to the Gateway. Past
 # TRUNK_MAX_CALL_SEC, a call with the operator ends too (create_dialog("B")), an emergency call excepted.
 modparam("dialog", "options_ping_interval", ${CALL_PING_SEC})
 loadmodule "rtpengine.so"
@@ -138,8 +142,12 @@ modparam("rtpengine", "rtpengine_sock", "${RTPENGINE_SOCK}")
 #### Directory names (step 4c, ADR 0014): the display name of the From is replaced by the caller's, as `display_names`
 #### holds it (route[caller_name]). Only the display changes, never the URI or the tags: nothing to restore on the
 #### way back, and the digest the caller computed (on the Request-URI) is checked before.
+#### A call with the operator (step 6a) has its From and To URIs replaced (branch_route[trunk_out], route[caller_name]):
+#### restored automatically (`auto`, kept in the dialog) in the answers and in every request of the call, both ways,
+#### so that the operator only ever sees its own URIs and ours, never an extension nor the internal domain, including
+#### in the BYE the dialog sends itself.
 loadmodule "uac.so"
-modparam("uac", "restore_mode", "none")
+modparam("uac", "restore_mode", "auto")
 
 #### Call rules (step 4b, ADR 0013): forwards and "do not disturb" per extension, written by the Gateway in
 #### `call_rules` (same database as `subscriber`), read at each call, asynchronously (the process serves other
@@ -300,9 +308,15 @@ route {
 	# The trunk socket (step 6) hears the operator only: an address of its servers, or one its trunk declares
 	# (`dispatcher`, any set, any port). From any other address, only a request in a call with the operator that is
 	# under way (below: our Record-Route, a dialog of ours with the trunk, Call-ID and tags), as an operator's media
-	# gateway or SBC sends its BYE or re-INVITE; anything else is refused.
+	# gateway or SBC sends its BYE or re-INVITE, and the CANCEL of an INVITE of the operator still ringing; anything
+	# else is refused.
 	$var(stranger) = 0;
 	if ($socket_in(ip) == "${TRUNK_LISTEN_IP}" && $socket_in(port) == ${TRUNK_PORT} && !ds_is_in_list("$si", 0)) {
+		if (is_method("CANCEL") && t_check_trans()) {
+			xlog("L_NOTICE", "trunk: CANCEL of call $ci from $si:$sp, an address the trunk does not declare\n");
+			t_relay();
+			exit;
+		}
 		if (!has_totag()) {
 			xlog("L_NOTICE", "trunk: $rm from $si:$sp refused, no address of the operator\n");
 			if (!is_method("ACK"))
@@ -344,15 +358,29 @@ route {
 				send_reply(481, "Call/Transaction Does Not Exist");
 			exit;
 		}
-		# From an address the trunk does not declare: only the operator's side of one of its calls.
+		# From an address the trunk does not declare: only the operator's side of one of its calls, and only what a
+		# media gateway or SBC sends in it (hang up, renegotiate the media, acknowledge).
 		if ($var(stranger) == 1) {
-			if ($dlg_val(trunk) == NULL || route(to_trunk)) {
-				xlog("L_NOTICE", "trunk: $rm from $si:$sp refused, in no call with the operator\n");
+			if ($dlg_val(trunk) == NULL || route(to_trunk) || !is_method("BYE|INVITE|ACK|UPDATE|PRACK")) {
+				xlog("L_NOTICE", "trunk: $rm from $si:$sp refused, in no call with the operator or not allowed in one\n");
 				if (!is_method("ACK"))
 					send_reply(403, "Forbidden");
 				exit;
 			}
 			xlog("L_NOTICE", "trunk: $rm of call $ci from $si:$sp, an address the trunk does not declare (accepted in this call)\n");
+		}
+		# From the operator's side of a call to the phone's: to the phone of this dialog, at the Contact it gave
+		# (fix_route_dialog), whatever the Request-URI says: the operator never had the phone's own (route[trunk_contact])
+		# and nothing it sends can go anywhere else. Its answers go back to the operator (onreply_route[rtp]).
+		$var(from_trunk) = 0;
+		if ($dlg_val(trunk) != NULL && !route(to_trunk)) {
+			$var(from_trunk) = 1;
+			if (!fix_route_dialog()) {
+				xlog("L_ERR", "call $ci: $rm from the operator not routed to the phone\n");
+				if (!is_method("ACK"))
+					send_reply(500, "Internal Error");
+				exit;
+			}
 		}
 		if (!is_method("INVITE|UPDATE|ACK|BYE|INFO|REFER|NOTIFY|PRACK|OPTIONS")) {
 			send_reply(405, "Method Not Allowed");
@@ -366,6 +394,16 @@ route {
 			if (route(to_trunk))
 				append_to_reply("Twake-Call-Refused: transfer-external\r\n");
 			send_reply(403, "Transfer Not Allowed");
+			exit;
+		}
+		# To the operator, a request that says once what it is, with SDP as its only body (route[trunk_request]).
+		if (route(to_trunk) && !route(trunk_request)) {
+			xlog("L_NOTICE", "call $ci: $rm to the operator refused ($var(refuse_code))\n");
+			if (is_method("ACK"))
+				exit;
+			if ($var(refuse_code) == 415)
+				append_to_reply("Accept: application/sdp\r\n");
+			send_reply($var(refuse_code), "$var(refuse_reason)");
 			exit;
 		}
 		# A browser's Contact names a ".invalid" host (RFC 7118): point it at the WebSocket it came from, so the
@@ -392,9 +430,17 @@ route {
 		remove_hf("P-Asserted-Identity");
 		remove_hf("P-Preferred-Identity");
 		remove_hf("Remote-Party-ID");
-		# To the operator, only what a call needs (route[trunk_headers]).
-		if (route(to_trunk))
+		# To the operator, only what a call needs (route[trunk_headers]), and a Contact without the extension
+		# (route[trunk_contact]).
+		if (route(to_trunk)) {
 			route(trunk_headers);
+			route(trunk_contact);
+		}
+		# From the operator to the phone: the phone's answers carry its Contact (onreply_route[rtp] rewrites it too).
+		if ($var(from_trunk) == 1) {
+			$avp(reply_to_trunk) = 1;
+			t_on_reply("rtp");
+		}
 		route(relay);
 		exit;
 	}
@@ -501,14 +547,27 @@ route {
 		exit;
 	}
 
+	# To the operator, an INVITE that says once what it is, with SDP as its only body (route[trunk_request]).
+	if ($var(pstn) == 1 && !route(trunk_request)) {
+		xlog("L_NOTICE", "call $ci: $fU to $var(num) refused ($var(refuse_code))\n");
+		if ($var(num_class) == "emergency")
+			append_to_reply("Twake-Call-Refused: emergency\r\n");
+		if ($var(refuse_code) == 415)
+			append_to_reply("Accept: application/sdp\r\n");
+		send_reply($var(refuse_code), "$var(refuse_reason)");
+		exit;
+	}
+
 	record_route();
 	fix_nated_contact();
-	# A call to the operator: its caller's phone is asked whether it is still there (P), and the call ends by itself
-	# past its longest duration (route[trunk_out_loaded]): BYE to both.
+	# The Contact the operator will get (route[trunk_contact]), read now, as fix_nated_contact just made it: before the
+	# trunk is read asynchronously, after which the request is tm's copy of it.
 	if ($var(pstn) == 1)
-		create_dialog("BP");
-	else
-		create_dialog();
+		$avp(t_contact) = $(ct.fields(uri){re.subst,/^(sips?):[^@;]*@/\1:/});
+	# A call to the operator gets its flags once it is known to go there (route[trunk_out_loaded]): its caller's
+	# phone asked whether it is still there (P), the call ended past its longest duration (B). One of our own direct
+	# numbers dialled stays an internal call, without either.
+	create_dialog();
 
 	# Who calls whom, as dialled (the Request-URI changes with the lookup): for the CDR and the events. `callee` is
 	# where the call goes now (the callee's rules may move it), `dialled` stays what the caller dialled.
@@ -721,9 +780,18 @@ route[trunk_out_loaded] {
 		route(rules_next);
 		exit;
 	}
+	# A call to the operator from here on: the caller's phone is asked whether it is still there (P, not for an
+	# emergency call: the emergency services hang up themselves, a phone silent a few seconds must never cut them), the
+	# call ends past its longest duration (B, $DLG_timeout below): BYE to both.
+	if ($avp(num_class) == "emergency")
+		create_dialog("B");
+	else
+		create_dialog("BP");
 	# What the trunk may call: an emergency number always, anything else as its `allowed` says (",fixed,mobile,"),
 	# an international number only to a country code its `countries` lists (",32,44,": E.164 country codes, of one to
-	# three digits, are none the start of another).
+	# three digits, are none the start of another). The North American plan (+1) is one code for many countries: `1`
+	# opens the United States and Canada only, any other of its countries is listed by its area ("1876", Jamaica),
+	# as dialplan's set 4 knows them (numbering.ts).
 	if ($avp(num_class) != "emergency") {
 		$var(mark) = "," + $avp(num_class) + ",";
 		$var(allowed) = 1;
@@ -731,12 +799,24 @@ route[trunk_out_loaded] {
 			$var(allowed) = 0;
 		if ($avp(num_class) == "international" && $var(allowed) == 1) {
 			$var(allowed) = 0;
-			$var(i) = 1;
-			while ($var(i) <= 3) {
-				$var(cc) = "," + $(avp(callee){s.substr,1,$var(i)}) + ",";
-				if ($avp(t_countries) != NULL && $(avp(t_countries){s.index,$var(cc)}) != NULL)
+			if ($avp(t_countries) == NULL) {
+				$var(allowed) = 0;
+			} else if ($avp(callee) =~ "^\+1") {
+				# Its area, listed ("1876"); or "1" for an area of the United States or Canada (none of set 4).
+				$var(cc) = "," + $(avp(callee){s.substr,1,4}) + ",";
+				if ($(avp(t_countries){s.index,$var(cc)}) != NULL)
 					$var(allowed) = 1;
-				$var(i) = $var(i) + 1;
+				$var(cc) = ",1,";
+				if ($(avp(t_countries){s.index,$var(cc)}) != NULL && !dp_translate(4, "$avp(callee)", $var(nanp)))
+					$var(allowed) = 1;
+			} else {
+				$var(i) = 1;
+				while ($var(i) <= 3) {
+					$var(cc) = "," + $(avp(callee){s.substr,1,$var(i)}) + ",";
+					if ($(avp(t_countries){s.index,$var(cc)}) != NULL)
+						$var(allowed) = 1;
+					$var(i) = $var(i) + 1;
+				}
 			}
 		}
 		if ($var(allowed) == 0) {
@@ -760,29 +840,16 @@ route[trunk_out_loaded] {
 			exit;
 		}
 	}
-	$socket_out = "udp:${TRUNK_LISTEN_IP}:${TRUNK_PORT}";
-	# The numbers as the operator wants them written; a short one (112, 15, 116006...) as dialled.
-	$var(to_user) = $avp(callee);
-	if ($avp(callee) =~ "^\+") {
-		route(trunk_number, $avp(callee));
-		$var(to_user) = $var(trunk_number);
-	}
-	route(trunk_number, $avp(t_presented));
-	$var(from_user) = $var(trunk_number);
-	$ru = "sip:" + $var(to_user) + "@" + $avp(t_domain);
-	# Kept for failure_route[trunk_failed]: a failure route starts again from the Request-URI the call came with.
-	$(avp(t_ruri)[*]) = NULL;
-	$avp(t_ruri) = $ru;
-	# Only what a call needs goes to the operator (route[trunk_headers]); who calls, for it: the number presented, never
-	# a name of the directory nor the extension; whom: the number as it writes them, at its domain (not what the caller
-	# dialled, nor our address).
+	route(trunk_target);
+	# Only what a call needs goes to the operator (route[trunk_headers]), a Contact without the extension
+	# (route[trunk_contact]); who calls, for it: the number presented, never a name of the directory nor the extension;
+	# whom: the number as it writes them, at its domain (not what the caller dialled, nor our address), both written
+	# for each branch (branch_route[trunk_out]).
 	route(trunk_headers);
-	uac_replace_from("", "sip:$var(from_user)@$avp(t_domain)");
-	uac_replace_to("", "sip:$var(to_user)@$avp(t_domain)");
-	if ($avp(t_pai) == 1)
-		append_hf("P-Asserted-Identity: <sip:$var(from_user)@$avp(t_domain)>\r\n");
-	# An emergency call lasts as long as its parties are there (the phone answers the dialog's OPTIONS): never cut at
-	# TRUNK_MAX_CALL_SEC. A week bounds what the dialog module keeps.
+	route(trunk_contact, $avp(t_contact));
+	t_on_branch("trunk_out");
+	# An emergency call lasts until a party hangs up (no OPTIONS to the phone, above): never cut at TRUNK_MAX_CALL_SEC.
+	# A week bounds what the dialog module keeps.
 	if ($avp(num_class) == "emergency")
 		$DLG_timeout = 604800;
 	else
@@ -829,6 +896,69 @@ route[trunk_headers] {
 	}
 }
 
+# A request to the operator says once what it is: one From, To, Call-ID and CSeq, at most one Max-Forwards,
+# Content-Type and Content-Length, compact forms counted (a second From would reach the operator as the phone wrote
+# it: uac_replace_from rewrites the first). Its body, if any, is SDP only: a multipart one could carry an ISUP part
+# (SIP-I: calling and charged numbers) the operator would read. -1 otherwise, with the answer in $var(refuse_code) and
+# $var(refuse_reason) (400, 415).
+route[trunk_request] {
+	if ($hdrcnt(From) != 1 || $hdrcnt(To) != 1 || $hdrcnt(Call-ID) != 1 || $hdrcnt(CSeq) != 1 || $hdrcnt(Max-Forwards) > 1 || $hdrcnt(Content-Type) > 1 || $hdrcnt(Content-Length) > 1) {
+		$var(refuse_code) = 400;
+		$var(refuse_reason) = "Duplicate Header";
+		return(-1);
+	}
+	if ($rb != NULL && $(rb{s.len}) > 0 && !($(hdr(Content-Type){s.tolower}) =~ "^application/sdp[[:space:]]*(;.*)?$")) {
+		$var(refuse_code) = 415;
+		$var(refuse_reason) = "Unsupported Media Type";
+		return(-1);
+	}
+	return(1);
+}
+
+# The Contact a phone gives, to the operator: one, its address as fix_nated_contact made it ($param(1) when read
+# earlier), without its user part (a desk phone's extension, a browser's token) nor the parameters of the header
+# (+sip.instance...). The operator's requests in the call come back through our Record-Route, and fix_route_dialog
+# takes them to the phone's own Contact (main route).
+route[trunk_contact] {
+	if (!is_present_hf("Contact"))
+		return(1);
+	$var(ct) = $param(1);
+	if ($var(ct) == NULL || $var(ct) == "")
+		$var(ct) = $(ct.fields(uri){re.subst,/^(sips?):[^@;]*@/\1:/});
+	remove_hf("Contact");
+	if ($var(ct) != NULL && $var(ct) != "")
+		append_hf("Contact: <$var(ct)>\r\n");
+}
+
+# The call as the trunk in hand ($avp(t_*)) wants it: the number called and the number presented written its way (a
+# short one, 112, 15, 116006..., as dialled), at its domain, from the trunk socket. $avp(t_ruri) keeps the
+# Request-URI for failure_route[trunk_failed], which starts again from the one the call came with.
+route[trunk_target] {
+	$socket_out = "udp:${TRUNK_LISTEN_IP}:${TRUNK_PORT}";
+	$var(to_user) = $avp(callee);
+	if ($avp(callee) =~ "^\+") {
+		route(trunk_number, $avp(callee));
+		$var(to_user) = $var(trunk_number);
+	}
+	route(trunk_number, $avp(t_presented));
+	$(avp(t_from_user)[*]) = NULL;
+	$avp(t_from_user) = $var(trunk_number);
+	$(avp(t_to_user)[*]) = NULL;
+	$avp(t_to_user) = $var(to_user);
+	$ru = "sip:" + $var(to_user) + "@" + $avp(t_domain);
+	$(avp(t_ruri)[*]) = NULL;
+	$avp(t_ruri) = $ru;
+}
+
+# Each INVITE to the operator, from the trunk it goes to (route[trunk_target]; another one for an emergency call that
+# failed on its own, failure_route[trunk_failed]): From and To its way, and the P-Asserted-Identity it may want.
+branch_route[trunk_out] {
+	uac_replace_from("", "sip:$avp(t_from_user)@$avp(t_domain)");
+	uac_replace_to("", "sip:$avp(t_to_user)@$avp(t_domain)");
+	if ($avp(t_pai) == 1)
+		append_hf("P-Asserted-Identity: <sip:$avp(t_from_user)@$avp(t_domain)>\r\n");
+}
+
 # $param(1), in E.164, as the trunk writes numbers ($avp(t_format)), in $var(trunk_number).
 route[trunk_number] {
 	$var(trunk_number) = $param(1);
@@ -854,8 +984,9 @@ route[trunk_number] {
 # (the browser would answer it with its own credentials). A server that did not answer at all (408) or is out of order
 # (5xx) before the person was called (no 180 or 183 yet, $avp(t_rang); a 100 Trying says nothing of that): the next
 # one. Once the person's phone rang, the call stays with that server: another one would call the person again. A
-# redirection (3xx) is not followed and its Contact never reaches the phone: 480. An emergency call that does not go
-# through tells the caller to call from another phone (route[emergency_failed]). A call that does not go through is
+# redirection (3xx) is not followed and its Contact never reaches the phone: 480. An emergency call its trunk does not
+# put through goes once more through the default trunk (route[emergency_fallback]); one that does not go through at
+# all tells the caller to call from another phone (route[emergency_failed]). A call that does not go through is
 # accounted here, once nothing retries it (acc would report the challenge otherwise): the caller's history tells how
 # it ended.
 failure_route[trunk_failed] {
@@ -880,6 +1011,7 @@ failure_route[trunk_failed] {
 				$du = $avp(ds_dst_failover);
 				$socket_out = "udp:${TRUNK_LISTEN_IP}:${TRUNK_PORT}";
 				$(avp(t_rang)[*]) = NULL;
+				t_on_branch("trunk_out");
 				t_on_reply("rtp");
 				t_on_failure("trunk_failed");
 				if (t_relay())
@@ -887,6 +1019,8 @@ failure_route[trunk_failed] {
 			}
 		}
 		xlog("L_WARN", "call $ci: the operator's challenge ($T_reply_code) could not be answered: check the trunk's login, password and realm\n");
+		if (route(emergency_fallback))
+			exit;
 		rtpengine_delete();
 		route(account_missed);
 		if ($avp(num_class) == "emergency") {
@@ -902,11 +1036,14 @@ failure_route[trunk_failed] {
 		$socket_out = "udp:${TRUNK_LISTEN_IP}:${TRUNK_PORT}";
 		$(avp(t_challenged)[*]) = NULL;
 		$(avp(t_rang)[*]) = NULL;
+		t_on_branch("trunk_out");
 		t_on_reply("rtp");
 		t_on_failure("trunk_failed");
 		if (t_relay())
 			exit;
 	}
+	if (route(emergency_fallback))
+		exit;
 	rtpengine_delete();
 	route(account_missed);
 	if ($avp(num_class) == "emergency") {
@@ -918,6 +1055,30 @@ failure_route[trunk_failed] {
 		xlog("L_NOTICE", "call $ci: the operator redirected the call ($T_reply_code), not followed\n");
 		t_reply(480, "Temporarily Unavailable");
 	}
+}
+
+# An emergency call its trunk did not put through, whatever the reason (refused, failed, a challenge it could not
+# answer; its other servers tried as for any call): once more, through the default trunk (route[default_trunk]: none
+# when that is the trunk tried, or this process never read one), from its first server up, with its own number and
+# credentials. The offer made to the first trunk stays (its codecs). 1 when sent.
+route[emergency_fallback] {
+	if ($avp(num_class) != "emergency" || $avp(t_fallback) != NULL)
+		return(-1);
+	$avp(t_fallback) = 1;
+	$var(failed) = "" + $T_reply_code;
+	if (!route(default_trunk) || !ds_select_dst($avp(t_setid), 8, "f"))
+		return(-1);
+	xlog("L_WARN", "call $ci: emergency call failed on its trunk ($var(failed)), through the default trunk\n");
+	route(trunk_target);
+	$dlg_val(codecs) = $avp(t_codecs);
+	$(avp(t_challenged)[*]) = NULL;
+	$(avp(t_rang)[*]) = NULL;
+	t_on_branch("trunk_out");
+	t_on_reply("rtp");
+	t_on_failure("trunk_failed");
+	if (t_relay())
+		return(1);
+	return(-1);
 }
 
 # A request on the trunk socket, from the operator (the main route refused any other address). Its calls reach the
@@ -965,6 +1126,8 @@ route[trunk_in] {
 	create_dialog("Bp");
 	$DLG_timeout = ${TRUNK_MAX_CALL_SEC};
 	$dlg_val(trunk) = "caller";
+	# The phone's answers go to the operator: their Contact without the extension (onreply_route[rtp]).
+	$avp(reply_to_trunk) = 1;
 	# A call without SDP: the browser that answers makes the offer (route[late_offer]).
 	if (!has_body_part("application/sdp")) {
 		$(avp(late_offer)[*]) = NULL;
@@ -2343,6 +2506,20 @@ route[relay_failed] {
 	exit;
 }
 
+# Requests OpenSIPS sends of its own (tm). The dialog's OPTIONS to the phone of a call with the operator wait
+# CALL_PING_TIMEOUT_SEC for an answer, not the 5 s of fr_timeout: the dialog ends the call on the first one that times
+# out (408). The BYEs the dialog sends to end a call (its phone gone, TRUNK_MAX_CALL_SEC) free the call's media in
+# rtpengine, once for the two of them, as a party's BYE does in the main route, and at once (delete-delay=0, not
+# rtpengine's 30 s): neither party sends media any more, and its ports go back to the range.
+local_route {
+	if (is_method("OPTIONS") && has_totag()) {
+		$T_fr_timeout = ${CALL_PING_TIMEOUT_SEC};
+	} else if (is_method("BYE") && $dlg_val(rtp_freed) != "1") {
+		$dlg_val(rtp_freed) = "1";
+		rtpengine_delete("delete-delay=0");
+	}
+}
+
 # Every reply relayed: no identity a phone asserts passes on (onreply_route[rtp] asserts who answered, after this),
 # nor a refusal that only this script tells (Twake-Call-Refused: a phone or the operator would have the app show it).
 onreply_route {
@@ -2360,6 +2537,10 @@ onreply_route[rtp] {
 	remove_hf("P-Asserted-Identity");
 	# The callee's Contact: same ".invalid" host, same fix (see above).
 	fix_nated_contact();
+	# An answer of the phone to the operator (its call, or its request in one): a Contact without the extension
+	# (route[trunk_contact]); the dialog keeps the phone's own, as fix_nated_contact made it.
+	if ($avp(reply_to_trunk) == 1)
+		route(trunk_contact);
 	# An offer in the 2xx of an INVITE without SDP (route[late_offer]); else the answer to the offer of the request.
 	if (has_body_part("application/sdp")) {
 		if ($avp(late_offer) != NULL) {
