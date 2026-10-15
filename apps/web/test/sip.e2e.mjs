@@ -1428,7 +1428,25 @@ try {
           )
           .catch(e => `not asked: ${e.message}`)
         const log = await workers[0]?.evaluate(() => JSON.stringify(self.__e2e ?? null)).catch(e => `not read: ${e.message}`)
-        throw new Error(`${err.message}; workers: ${JSON.stringify(workers.map(w => w.url()))}; DevTools: ${delivered.seen.join(', ')}; worker: ${log}; probe: ${probe}`)
+        // The same notification asked for outside a push, then the push again, then a push of something else.
+        const again = []
+        again.push(
+          await workers[0]
+            ?.evaluate(() =>
+              self.registration
+                .showNotification('Appel de Alice Martin (101)', { body: 'Cliquez pour répondre dans TwakePhone.', tag: 'call-same', renotify: true, requireInteraction: true, data: { url: '/?call=x' } })
+                .then(() => self.registration.getNotifications().then(ns => `same outside a push: ${ns.map(n => n.tag).join(' ')}`))
+            )
+            .catch(e => `same outside a push failed: ${e.message}`)
+        )
+        for (const text of [woken.text, JSON.stringify({ type: 'other' })]) {
+          const d = await deliverPush(jean, text)
+          await sleep(1_500)
+          const listed = await workers[0]?.evaluate(() => self.registration.getNotifications().then(ns => ns.map(n => n.tag).join(' '))).catch(e => e.message)
+          again.push(`push again: ${listed}; worker ${await workers[0]?.evaluate(() => JSON.stringify(self.__e2e ?? null)).catch(e => e.message)}; DevTools ${d.seen.join(', ')}`)
+          await d.detach()
+        }
+        throw new Error(`${err.message}; workers: ${JSON.stringify(workers.map(w => w.url()))}; DevTools: ${delivered.seen.join(', ')}; worker: ${log}; probe: ${probe}; then: ${again.join(' | ')}`)
       })
       await delivered.detach()
       expectEqual(`${shown.title} | ${shown.body}`, 'Appel de Alice Martin (101) | Cliquez pour répondre dans TwakePhone.', 'the notification')
