@@ -20,6 +20,11 @@ interface Gateway {
   refreshMe: () => void
   /** What the Gateway tells as it happens (the presence of the others, calls); one stream for the whole app. */
   onEvent: (listener: (event: TelephonyEvent) => void) => () => void
+  /**
+   * Each time that stream is established, and at once when it already is: what was told while it was closed is
+   * lost, time to read the state (and the only time: a part of the app reads it then, not also when it appears).
+   */
+  onConnected: (listener: () => void) => () => void
 }
 
 const GatewayContext = createContext<Gateway | null>(null)
@@ -59,18 +64,40 @@ export const GatewayProvider = ({ config, children }: { config: AppConfig; child
 
   // The event stream stays open while signed in; each part of the app listens to what concerns it.
   const listeners = useRef(new Set<(event: TelephonyEvent) => void>())
+  const connectedListeners = useRef(new Set<() => void>())
+  const established = useRef(false)
   useEffect(() => {
     if (!signedIn) return
-    return client.connect(event => {
-      for (const listener of listeners.current) listener(event)
-    })
+    const stop = client.connect(
+      event => {
+        for (const listener of listeners.current) listener(event)
+      },
+      {
+        onOpen: () => {
+          established.current = true
+          for (const listener of connectedListeners.current) listener()
+        },
+        onClose: () => {
+          established.current = false
+        }
+      }
+    )
+    return () => {
+      established.current = false
+      stop()
+    }
   }, [client, signedIn])
   const onEvent = useCallback((listener: (event: TelephonyEvent) => void) => {
     listeners.current.add(listener)
     return () => void listeners.current.delete(listener)
   }, [])
+  const onConnected = useCallback((listener: () => void) => {
+    connectedListeners.current.add(listener)
+    if (established.current) listener()
+    return () => void connectedListeners.current.delete(listener)
+  }, [])
 
-  const value = useMemo(() => ({ client, me, meError, refreshMe, onEvent }), [client, me, meError, refreshMe, onEvent])
+  const value = useMemo(() => ({ client, me, meError, refreshMe, onEvent, onConnected }), [client, me, meError, refreshMe, onEvent, onConnected])
   return <GatewayContext.Provider value={value}>{children}</GatewayContext.Provider>
 }
 

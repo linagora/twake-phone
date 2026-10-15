@@ -4,13 +4,15 @@ import { OpensipsEvents, parseDlgList, parseUlDump, type EventsLogger } from './
 import { AsyncQueue } from './queue.js'
 import { CallTracker } from './tracker.js'
 
-export { SubscriberProvisioner, digestHashes, SUBSCRIBER_SCHEMA, SUBSCRIBER_TABLE_VERSION, ACC_TABLE_VERSION, MISSED_CALLS_TABLE_VERSION, type SubscriberProvisionerOptions, type Queryable } from './subscriber.js'
-export { OpensipsEvents, parseDlgList, parseUlDump, parseUdpUrl, type EventsLogger, type OpensipsEventsOptions } from './events.js'
-export { CallTracker, userOf, type TelephonyPresence } from './tracker.js'
+export { SubscriberProvisioner, digestHashes, SUBSCRIBER_SCHEMA, SUBSCRIBER_SQL, EXTRA_COLUMNS, SUBSCRIBER_TABLE_VERSION, ACC_TABLE_VERSION, MISSED_CALLS_TABLE_VERSION, type SubscriberProvisionerOptions, type Queryable } from './subscriber.js'
+export { OpensipsEvents, parseDlgList, parseUlDump, parseUdpUrl, type EventsLogger, type OpensipsEventsOptions, type RegisteredContact } from './events.js'
+export { CallTracker, userOf, type ContactRegistration, type TelephonyPresence } from './tracker.js'
+export { AsyncQueue } from './queue.js'
 
-/** The events the Gateway listens to: registrations (usrloc), our own call events (opensips.cfg.tpl), the CDRs and missed calls (acc). */
+/** The events the Gateway listens to: registrations and their refreshes (usrloc), our own call events (opensips.cfg.tpl), the CDRs and missed calls (acc). */
 export const SUBSCRIBED_EVENTS = [
   'E_UL_CONTACT_INSERT',
+  'E_UL_CONTACT_UPDATE',
   'E_UL_CONTACT_DELETE',
   'E_UL_AOR_DELETE',
   'E_TWAKEPHONE_CALLING',
@@ -39,13 +41,17 @@ export interface OpensipsConfig {
   /** Releases what `sipSecretFor` holds (the provisioner's connection pool) when the Gateway stops. */
   onClose?(): Promise<void>
   /**
-   * Where to hear OpenSIPS (ADR 0011): its MI socket (`mi_datagram`, `udp:host:port`) and the address this process
-   * listens on for the events (`host[:port]`, reachable from OpenSIPS; the loopback by default). Without it the
-   * provider has no events: no presence of the others, no history.
+   * Where to hear OpenSIPS (ADR 0011): its MI socket (`mi_datagram`, `udp:host:port`), the address this process
+   * listens on for the events (`host[:port]`; the loopback by default) and, when OpenSIPS must be given another
+   * one (a wildcard `listen`, a container), the address it sends them to (`advertise`), and the addresses they may
+   * come from besides the MI host (`from`: OpenSIPS sends them from the address the kernel picks). Without it the provider has
+   * no events: no presence of the others, no history.
    */
-  events?: { miUrl: string; listen?: string; expireSec?: number }
+  events?: { miUrl: string; listen?: string; advertise?: string; from?: string[]; expireSec?: number; timeoutMs?: number }
   logger?: EventsLogger
 }
+
+const START_RETRY_MS = [1_000, 2_000, 5_000, 10_000, 30_000]
 
 const notYet = (what: string) => Object.assign(new Error(`${what} through the Gateway is not available yet; the softphone does it directly for now`), { statusCode: 501 })
 
@@ -58,37 +64,71 @@ export class OpensipsProvider implements TelephonyProvider, MediaProvider {
   readonly id = 'opensips'
   /** The presence of users without an extension: nothing but what they set themselves. */
   private readonly unmapped = new Map<string, Presence>()
-  private readonly queue = new AsyncQueue<RoutedEvent>()
+  private readonly queue: AsyncQueue<RoutedEvent>
   private readonly tracker: CallTracker
   private readonly events?: OpensipsEvents
   private subscribed = false
+  private closed = false
+  private startTimer?: ReturnType<typeof setTimeout>
 
   constructor(private readonly config: OpensipsConfig) {
     for (const [name, value] of Object.entries({ websocketUrl: config.websocketUrl, domain: config.domain })) {
       if (typeof value !== 'string' || !value) throw new Error(`OpenSIPS provider: ${name} is required`)
     }
     if (!/^wss?:\/\//.test(config.websocketUrl)) throw new Error('OpenSIPS provider: websocketUrl must be a ws:// or wss:// URL')
+    const log = config.logger ?? console
+    // A consumer stuck (a database that hangs) must not make the Gateway grow without bound: past 10 000 waiting
+    // events, some are dropped, and said so. Presences go first: the next one replaces them, a call event has none.
+    this.queue = new AsyncQueue<RoutedEvent>(
+      10_000,
+      dropped => log.warn(`OpenSIPS events: the Gateway does not keep up, events dropped (${dropped} so far)`),
+      e => e.event.type === 'presence.changed'
+    )
     this.tracker = new CallTracker((extension, event) => this.queue.push({ extension, event }))
     if (config.events) {
-      const log = config.logger ?? console
       this.events = new OpensipsEvents({
         miUrl: config.events.miUrl,
         ...(config.events.listen ? { listen: config.events.listen } : {}),
+        ...(config.events.advertise ? { advertise: config.events.advertise } : {}),
+        ...(config.events.from?.length ? { from: config.events.from } : {}),
         ...(config.events.expireSec ? { expireSec: config.events.expireSec } : {}),
+        ...(config.events.timeoutMs ? { timeoutMs: config.events.timeoutMs } : {}),
         events: SUBSCRIBED_EVENTS,
         onEvent: (method, params) => this.tracker.handle(method, params),
         onResync: () => this.resync(),
+        onRenewed: () => this.tracker.sweep(),
+        // The subscription lapsed in OpenSIPS: the registrations it told no longer hold (everyone offline) until
+        // the next resync, which also ends the calls it no longer has. A failed renewal alone changes nothing.
+        onExpired: () => {
+          if (!this.closed) this.tracker.reset()
+        },
         logger: log
       })
-      this.events.start().catch(err => log.warn(`OpenSIPS events not started: ${err instanceof Error ? err.message : String(err)}`))
+      this.startEvents(0, log)
     }
   }
 
-  /** What OpenSIPS holds now, read again after each (re)subscription: registrations, then dialogs. */
+  /** Binds the event socket; a failure (address in use, not ours yet) is tried again with a growing delay. */
+  private startEvents(attempt: number, log: EventsLogger) {
+    this.events?.start().catch(err => {
+      if (this.closed) return
+      const delay = START_RETRY_MS[Math.min(attempt, START_RETRY_MS.length - 1)]!
+      log.warn(`OpenSIPS events not started: ${err instanceof Error ? err.message : String(err)}; retrying in ${delay / 1000} s`)
+      this.startTimer = setTimeout(() => this.startEvents(attempt + 1, log), delay)
+      this.startTimer.unref?.()
+    })
+  }
+
+  /**
+   * What OpenSIPS holds now, read again after each (re)subscription and restart: registrations, then dialogs. What
+   * is known is taken before each question: an event that comes while the answer is on its way is newer than it.
+   */
   private async resync() {
     if (!this.events) return
-    this.tracker.seedRegistrations(parseUlDump(await this.events.call('ul_dump')))
-    this.tracker.seedDialogs(parseDlgList(await this.events.call('dlg_list')))
+    const contacts = this.tracker.knownContacts()
+    this.tracker.seedRegistrations(parseUlDump(await this.events.call('ul_dump')), contacts)
+    const calls = this.tracker.knownCalls()
+    this.tracker.seedDialogs(parseDlgList(await this.events.call('dlg_list')), calls)
   }
 
   /** DEGRADED while the events are configured but not subscribed (OpenSIPS down or restarting): calls still go through. */
@@ -96,13 +136,18 @@ export class OpensipsProvider implements TelephonyProvider, MediaProvider {
     return !this.events || this.events.connected ? 'CONNECTED' : 'DEGRADED'
   }
 
+  getStatusReason(): string | undefined {
+    return this.events?.reason
+  }
+
   async getCapabilities(): Promise<Capabilities> {
     return {
       // The browser does the calling; the Gateway cannot originate for it yet.
       calling: { outbound: false, inbound: true, answer: false, hangup: false, hold: false, transfer: false, dtmf: false },
       media: { browserAudio: true },
-      presence: { read: true, write: true, realtime: !!this.events, statuses: ['available', 'busy', 'away', 'dnd', 'offline'] },
-      history: false,
+      // Presences are told as they change only while OpenSIPS's events come; the history is filled from them.
+      presence: { read: true, write: true, realtime: !!this.events?.live, statuses: ['available', 'busy', 'away', 'dnd', 'offline'] },
+      history: !!this.events,
       conference: { dialIn: false, dialOut: false }
     }
   }
@@ -166,7 +211,9 @@ export class OpensipsProvider implements TelephonyProvider, MediaProvider {
   }
 
   async close() {
-    this.events?.stop()
+    this.closed = true
+    clearTimeout(this.startTimer)
+    await this.events?.stop()
     this.queue.close()
     await this.config.onClose?.()
   }

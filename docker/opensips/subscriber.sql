@@ -55,3 +55,9 @@ CREATE TABLE IF NOT EXISTS missed_calls (
 CREATE INDEX IF NOT EXISTS missed_calls_callid_idx ON missed_calls (callid);
 INSERT INTO version (table_name, table_version) VALUES ('acc', 7), ('missed_calls', 5)
   ON CONFLICT (table_name) DO NOTHING;
+-- Tables created beforehand by OpenSIPS's own scripts lack caller and callee: added here, once, by the owner (the
+-- Gateway only adds a missing one, see SubscriberProvisioner.ensureSchema), or every CDR insert would fail.
+ALTER TABLE acc ADD COLUMN IF NOT EXISTS caller VARCHAR(64) DEFAULT '' NOT NULL;
+ALTER TABLE acc ADD COLUMN IF NOT EXISTS callee VARCHAR(64) DEFAULT '' NOT NULL;
+ALTER TABLE missed_calls ADD COLUMN IF NOT EXISTS caller VARCHAR(64) DEFAULT '' NOT NULL;
+ALTER TABLE missed_calls ADD COLUMN IF NOT EXISTS callee VARCHAR(64) DEFAULT '' NOT NULL;

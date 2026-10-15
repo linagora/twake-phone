@@ -8,21 +8,27 @@ type Listener = (event: TelephonyEvent) => void
  * (same interface), see cahier §108-109.
  */
 export class EventBus {
+  /** Per user. */
   private readonly listeners = new Map<string, Set<Listener>>()
+  /** Per tenant, apart: no user id, whatever it looks like, reaches the whole tenant. */
+  private readonly tenantListeners = new Map<TenantId, Set<Listener>>()
 
   private key(tenantId: TenantId, userId: UserId) {
-    return `${tenantId}:${userId}`
+    return `${tenantId}\u0000${userId}`
+  }
+
+  private static add<K>(map: Map<K, Set<Listener>>, key: K, listener: Listener): () => void {
+    const set = map.get(key) ?? new Set()
+    set.add(listener)
+    map.set(key, set)
+    return () => {
+      set.delete(listener)
+      if (set.size === 0 && map.get(key) === set) map.delete(key)
+    }
   }
 
   subscribe(tenantId: TenantId, userId: UserId, listener: Listener): () => void {
-    const key = this.key(tenantId, userId)
-    const set = this.listeners.get(key) ?? new Set()
-    set.add(listener)
-    this.listeners.set(key, set)
-    return () => {
-      set.delete(listener)
-      if (set.size === 0) this.listeners.delete(key)
-    }
+    return EventBus.add(this.listeners, this.key(tenantId, userId), listener)
   }
 
   publish(tenantId: TenantId, userId: UserId, event: TelephonyEvent) {
@@ -31,13 +37,10 @@ export class EventBus {
 
   /** What everyone of a tenant hears (the presence of the others). */
   subscribeTenant(tenantId: TenantId, listener: Listener): () => void {
-    return this.subscribe(tenantId, ALL, listener)
+    return EventBus.add(this.tenantListeners, tenantId, listener)
   }
 
   broadcast(tenantId: TenantId, event: TelephonyEvent) {
-    this.publish(tenantId, ALL, event)
+    this.tenantListeners.get(tenantId)?.forEach(l => l(event))
   }
 }
-
-/** No user id looks like this: the tenant-wide channel. */
-const ALL = '*'

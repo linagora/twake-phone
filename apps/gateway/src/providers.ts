@@ -77,10 +77,12 @@ export interface StoredOpensipsConfig {
   /** `env:NAME` holding the URL of the database OpenSIPS's auth_db reads; may be the Gateway's own. */
   subscriberDbUrlRef: string
   /**
-   * Where to hear OpenSIPS (ADR 0011): its MI socket (`udp:host:port` of `mi_datagram`) and the address this
-   * Gateway listens on for the events (`host[:port]`, reachable from OpenSIPS). Without it: no presence, no history.
+   * Where to hear OpenSIPS (ADR 0011): its MI socket (`udp:host:port` of `mi_datagram`), the address this Gateway
+   * listens on for the events (`host[:port]`) and, when OpenSIPS must be given another one (a wildcard `listen`, a
+   * container), the address it sends them to (`advertise`), and the addresses they may come from besides the MI
+   * host (`from`: OpenSIPS sends them from the address its kernel picks). Without it: no presence, no history.
    */
-  events?: { miUrl: string; listen?: string }
+  events?: { miUrl: string; listen?: string; advertise?: string; from?: string[] }
 }
 
 export interface OpensipsFactoryDeps {

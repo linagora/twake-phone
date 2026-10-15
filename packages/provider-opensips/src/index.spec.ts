@@ -1,6 +1,7 @@
+import dgram from 'node:dgram'
 import { afterEach, describe, expect, it } from 'vitest'
 import type { RoutedEvent } from '@twake/telephony-provider-sdk'
-import { OpensipsProvider, SUBSCRIBED_EVENTS } from './index.js'
+import { AsyncQueue, OpensipsProvider, SUBSCRIBED_EVENTS } from './index.js'
 import { fakeOpensips } from '../test/fake-opensips.js'
 
 const user = { id: 'alice', tenantId: 't', displayName: 'Alice', extension: '101' }
@@ -37,6 +38,7 @@ describe('OpensipsProvider', () => {
     expect(caps.media.browserAudio).toBe(true)
     expect(caps.calling.outbound).toBe(false)
     expect(caps.presence.realtime).toBe(false)
+    expect(caps.history).toBe(false)
     await expect(make().originate({ user, target: '102' })).rejects.toMatchObject({ statusCode: 501 })
   })
 
@@ -69,32 +71,157 @@ describe('OpensipsProvider', () => {
     await until('the subscription', () => p.getStatus() === 'CONNECTED')
     expect(sips.subscriptions.map(s => s.event)).toEqual(SUBSCRIBED_EVENTS)
     expect((await p.getCapabilities()).presence.realtime).toBe(true)
+    expect((await p.getCapabilities()).history).toBe(true)
     await until('the seeded presence', () => got.length === 1)
     expect(got[0]).toMatchObject({ extension: '102', event: { type: 'presence.changed', payload: { presence: { status: 'available', source: 'telephony' } } } })
     expect((await p.getPresence({ ...user, extension: '102' })).status).toBe('available')
     expect((await p.getPresence(user)).status).toBe('offline')
     sips.push('E_UL_CONTACT_INSERT', { domain: 'location', aor: '101', uri: 'sip:a@x.invalid' })
     sips.push('E_TWAKEPHONE_CALLING', { callid: 'c1', caller: '101', callee: '102' })
-    await until('the call', () => got.length >= 6)
-    expect(got.slice(1).map(e => `${e.extension}:${e.event.type}`)).toEqual(['101:presence.changed', '101:call.created', '102:call.created', '102:presence.changed', '101:presence.changed'])
+    sips.push('E_TWAKEPHONE_RINGING', { callid: 'c1', caller: '101', callee: '102' })
+    await until('the call', () => got.length >= 7)
+    expect(got.slice(1).map(e => `${e.extension}:${e.event.type}`)).toEqual(['101:presence.changed', '101:call.created', '101:presence.changed', '101:call.ringing', '102:call.ringing', '102:presence.changed'])
     expect([...p.presences().entries()].map(([ext, pr]) => `${ext}:${pr.status}`)).toEqual(['102:busy', '101:busy'])
     // What the user sets shows once the call is over.
     await p.setPresence(user, { status: 'away', source: 'user' })
     expect((await p.getPresence(user)).status).toBe('busy')
-    sips.push('E_ACC_CDR', { callid: 'c1', caller: '101', callee: '102', duration: 3, time: 1792002800, created: 1792002797 })
+    sips.push('E_ACC_CDR', { callid: 'c1', caller: '101', callee: '102', duration: 3, ms_duration: 2500, time: 1792002800, setuptime: 3, created: 1792002797 })
     await until('the end', () => got.some(e => e.event.type === 'call.ended'))
     expect((await p.getPresence(user))).toMatchObject({ status: 'away', source: 'user' })
     await p.close()
     expect(p.getStatus()).toBe('DEGRADED')
+    // Unsubscribed on the way out.
+    expect(sips.subscriptions).toEqual([])
   })
 
-  it('is DEGRADED while OpenSIPS does not answer its MI', async () => {
+  it('is DEGRADED once an attempt to reach OpenSIPS failed, and not realtime', async () => {
     const sips = await fakeOpensips()
     cleanups.push(sips.close)
     sips.state.down = true
+    const warnings: string[] = []
+    const p = new OpensipsProvider({ websocketUrl: 'wss://sip.example.test', domain: 'sip.example.test', sipSecretFor: async () => 's', events: { miUrl: sips.url, timeoutMs: 50 }, logger: { info: () => undefined, warn: m => warnings.push(m) } })
+    cleanups.push(() => p.close())
+    await until('a failed attempt', () => warnings.some(w => /no reply within 50 ms; retrying/.test(w)))
+    expect(sips.state.received).toBeGreaterThan(0)
+    expect(p.getStatus()).toBe('DEGRADED')
+    expect(p.getStatusReason()).toMatch(/MI does not answer/)
+    expect((await p.getCapabilities()).presence.realtime).toBe(false)
+  })
+
+  it('keeps what OpenSIPS told through a failed renewal, forgets the registrations once the subscription lapsed, and ends the lost calls when it is back', async () => {
+    const sips = await fakeOpensips()
+    cleanups.push(sips.close)
+    const p = new OpensipsProvider({ websocketUrl: 'wss://sip.example.test', domain: 'sip.example.test', sipSecretFor: async () => 's', events: { miUrl: sips.url, expireSec: 1, timeoutMs: 50 }, logger: quiet })
+    cleanups.push(() => p.close())
+    const got: string[] = []
+    void (async () => {
+      for await (const e of p.subscribe()) got.push(`${e.extension}:${e.event.type}:${e.event.type === 'presence.changed' ? e.event.payload.presence.status : (e.event.payload as { call: { state: string } }).call.state}`)
+    })()
+    await until('the subscription', () => p.getStatus() === 'CONNECTED')
+    for (const aor of ['101', '102', '103']) sips.push('E_UL_CONTACT_INSERT', { aor, uri: `sip:${aor}@x.invalid`, expires: Math.floor(Date.now() / 1000) + 300 })
+    for (const [callid, callee] of [['c1', '102'], ['c2', '103']]) {
+      sips.push('E_TWAKEPHONE_CALLING', { callid, caller: '101', callee })
+      sips.push('E_TWAKEPHONE_ANSWERED', { callid, caller: '101', callee })
+    }
+    await until('both calls', () => got.filter(g => g.endsWith(':call.connected:connected')).length === 4)
+    got.splice(0)
+    // One lost MI reply: degraded, but the subscription still lives and nothing is forgotten.
+    sips.state.down = true
+    await p['events']!['renew']()
+    expect(p.getStatus()).toBe('DEGRADED')
+    expect((await p.getCapabilities()).presence.realtime).toBe(true)
+    expect(got).toEqual([])
+    // A call ends meanwhile: its CDR still makes its history.
+    sips.push('E_ACC_CDR', { callid: 'c1', caller: '101', callee: '102', time: Math.floor(Date.now() / 1000) - 3, duration: 3, ms_duration: 3000, created: Math.floor(Date.now() / 1000) - 4 })
+    await until('the end of c1', () => got.includes('101:call.ended:ended'))
+    expect(got).toEqual(['101:call.ended:ended', '102:call.ended:ended', '102:presence.changed:available'])
+    got.splice(0)
+    // No renewal for the whole life of the subscription: the registrations no longer hold; c2 is kept, not dropped.
+    await until('the expiry', () => got.length > 0, 3_000)
+    expect(got.sort()).toEqual(['102:presence.changed:offline'])
+    expect((await p.getCapabilities()).presence.realtime).toBe(false)
+    expect(p['tracker'].activeCalls().map(c => c.id)).toEqual(['c2'])
+    got.splice(0)
+    // Back, with 101 and 103 registered and c2 gone while nobody listened: it ends, with its history.
+    sips.state.dump.Domains[0]!.AORs.push(...['101', '103'].map(aor => ({ AOR: aor, Contacts: [{ Contact: `sip:${aor}@x.invalid`, Expires: 300 }] })))
+    sips.state.down = false
+    await until('the resync', () => p.getStatus() === 'CONNECTED', 5_000)
+    expect(got.sort()).toEqual(['101:call.ended:ended', '101:presence.changed:available', '103:call.ended:ended', '103:presence.changed:available'])
+    expect(p['tracker'].activeCalls()).toEqual([])
+  })
+
+  it('reads OpenSIPS again when it restarted between two renewals, and lets unrefreshed registrations lapse', async () => {
+    const sips = await fakeOpensips()
+    cleanups.push(sips.close)
     const p = new OpensipsProvider({ websocketUrl: 'wss://sip.example.test', domain: 'sip.example.test', sipSecretFor: async () => 's', events: { miUrl: sips.url }, logger: quiet })
     cleanups.push(() => p.close())
-    await new Promise(r => setTimeout(r, 50))
-    expect(p.getStatus()).toBe('DEGRADED')
+    const got: string[] = []
+    void (async () => {
+      for await (const e of p.subscribe()) if (e.event.type === 'presence.changed') got.push(`${e.extension}:${e.event.payload.presence.status}`)
+    })()
+    await until('the subscription', () => p.getStatus() === 'CONNECTED')
+    // 102 registered for a moment that is already over (its deletion was lost); 103 for long.
+    const now = Math.floor(Date.now() / 1000)
+    sips.push('E_UL_CONTACT_INSERT', { aor: '102', uri: 'sip:b@x.invalid', expires: now - 60 })
+    sips.push('E_UL_CONTACT_INSERT', { aor: '103', uri: 'sip:c@x.invalid', expires: now + 3600 })
+    await until('both available', () => got.length === 2)
+    await p['events']!['renew']()
+    expect(got.slice(2)).toEqual(['102:offline'])
+    // OpenSIPS restarted (registrations in memory: none left) without any renewal failing.
+    const reads = sips.requests.filter(r => r.method === 'ul_dump').length
+    sips.restart('Wed Oct 14 18:20:00 2026')
+    await p['events']!['renew']()
+    expect(sips.requests.filter(r => r.method === 'ul_dump').length).toBe(reads + 1)
+    expect(got.slice(3)).toEqual(['103:offline'])
+  })
+
+  it('tries again to listen when the address is not free yet', async () => {
+    const sips = await fakeOpensips()
+    cleanups.push(sips.close)
+    const squatter = dgram.createSocket('udp4')
+    await new Promise<void>(r => squatter.bind(0, '127.0.0.1', r))
+    const port = squatter.address().port
+    const warnings: string[] = []
+    const p = new OpensipsProvider({ websocketUrl: 'wss://sip.example.test', domain: 'sip.example.test', sipSecretFor: async () => 's', events: { miUrl: sips.url, listen: `127.0.0.1:${port}` }, logger: { info: () => undefined, warn: m => warnings.push(m) } })
+    cleanups.push(() => p.close())
+    await until('the failure', () => warnings.some(w => /not started: .*EADDRINUSE.*retrying in 1 s/.test(w)))
+    await new Promise<void>(r => squatter.close(() => r()))
+    expect(p.getStatusReason()).toMatch(/cannot listen/)
+    await until('the subscription', () => p.getStatus() === 'CONNECTED', 5_000)
+    expect(p.getStatusReason()).toBeUndefined()
+    expect(sips.subscriptions[0]!.socket).toBe(`udp:127.0.0.1:${port}`)
+  })
+})
+
+describe('AsyncQueue', () => {
+  it('keeps at most its bound waiting, drops the rest and says so once per overflow', async () => {
+    const drops: number[] = []
+    const q = new AsyncQueue<number>(3, n => drops.push(n))
+    for (let i = 0; i < 6; i++) q.push(i)
+    expect(q.dropped).toBe(3)
+    expect(drops).toEqual([1])
+    const it = q[Symbol.asyncIterator]()
+    expect([(await it.next()).value, (await it.next()).value, (await it.next()).value]).toEqual([0, 1, 2])
+    // Drained: the next overflow is told again.
+    for (let i = 0; i < 5; i++) q.push(i)
+    expect(drops).toEqual([1, 4])
+    q.close()
+  })
+
+  it('drops what can be dropped first: the oldest presence makes room for a call event, a new presence is dropped', async () => {
+    const q = new AsyncQueue<string>(3, undefined, s => s.startsWith('presence'))
+    for (const s of ['presence1', 'call1', 'presence2', 'call2', 'presence3', 'call3', 'call4']) q.push(s)
+    // presence1 then presence2 made room for call2 and call3; presence3 was dropped; call4 had no room left.
+    expect(q.dropped).toBe(4)
+    const it = q[Symbol.asyncIterator]()
+    expect([(await it.next()).value, (await it.next()).value, (await it.next()).value]).toEqual(['call1', 'call2', 'call3'])
+    q.close()
+  })
+
+  it('a provider queue drops the presences before the call events when the Gateway does not keep up', () => {
+    const p = new OpensipsProvider({ websocketUrl: 'wss://sip.example.test', domain: 'sip.example.test', sipSecretFor: async () => 's', logger: quiet })
+    const q = p['queue'] as AsyncQueue<RoutedEvent>
+    expect(q['droppable']({ extension: '101', event: { type: 'presence.changed', timestamp: '', payload: { userId: '', presence: { status: 'busy', source: 'telephony' } } } })).toBe(true)
+    expect(q['droppable']({ extension: '101', event: { type: 'call.ended', timestamp: '', payload: { call: { id: 'c', direction: 'inbound', state: 'ended', remoteNumber: '102', startedAt: '' } } } })).toBe(false)
   })
 })

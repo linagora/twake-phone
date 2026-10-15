@@ -118,7 +118,8 @@ export class PgStore implements Store {
       where.push(sql.replace('?', `$${args.length}`))
     }
     if (q.direction) add('direction = ?', q.direction)
-    if (q.status === 'missed') where.push("direction = 'inbound' AND answered = false")
+    if (q.status === 'missed') where.push("direction = 'inbound' AND answered = false AND state = 'missed'")
+    if (q.status === 'declined') where.push("direction = 'inbound' AND answered = false AND state = 'rejected'")
     if (q.status === 'answered') where.push('answered = true')
     if (q.status === 'failed') where.push("state = 'failed'")
     if (q.number) add("remote_number LIKE '%' || ? || '%'", q.number.replace(/[\\%_]/g, c => `\\${c}`))

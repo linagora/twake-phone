@@ -4,6 +4,9 @@ export type { Contact, ContactNumber } from '@twake/telephony-types'
 
 import { backoffDelay } from './backoff.js'
 
+/** How long a stream the Gateway did not acknowledge must stay open to count as established. */
+const ESTABLISHED_AFTER_MS = 2_000
+
 export { formatNumber, toDialTarget, toE164 } from './phoneNumber.js'
 export { backoffDelay } from './backoff.js'
 
@@ -28,7 +31,7 @@ export interface HistoryItem {
 
 export interface HistoryFilter {
   direction?: 'inbound' | 'outbound'
-  status?: 'missed' | 'answered' | 'failed'
+  status?: 'missed' | 'declined' | 'answered' | 'failed'
   number?: string
   from?: string
   to?: string
@@ -90,7 +93,7 @@ export class TelephonyClient {
         ...init.headers
       }
     })
-    if (!res.ok) throw new Error(`Gateway ${res.status} on ${path}`)
+    if (!res.ok) throw Object.assign(new Error(`Gateway ${res.status} on ${path}`), { status: res.status })
     if (res.status === 204) {
       // Drain the empty body: a response left unread shows up as an aborted request in the browser.
       await res.text()
@@ -220,13 +223,26 @@ export class TelephonyClient {
   /**
    * Opens the event stream and keeps it open (exponential backoff + jitter). A browser cannot send headers on a
    * WebSocket, so each attempt first trades the credentials for a single-use ticket over an authenticated call.
-   * Returns a function that stops it.
+   * `onOpen` runs each time the stream is established, the first time and after each reconnection: what was told
+   * while it was closed is lost, so that is when to read the state again. Established means the Gateway accepted
+   * the session (its first message, `stream.ready`) or kept it open for a while: a socket it closes right after
+   * the upgrade (its directory or database down) is a failed attempt, and the next one waits longer. `onClose`
+   * runs when an established stream closes. Returns a function that stops it.
    */
-  connect(onEvent: (event: TelephonyEvent) => void): () => void {
+  connect(onEvent: (event: TelephonyEvent) => void, { onOpen, onClose }: { onOpen?: () => void; onClose?: () => void } = {}): () => void {
     let stopped = false
     let attempt = 0
     let ws: WebSocket | undefined
     let timer: ReturnType<typeof setTimeout> | undefined
+    let settle: ReturnType<typeof setTimeout> | undefined
+    let established = false
+    const establish = () => {
+      clearTimeout(settle)
+      if (established || stopped) return
+      established = true
+      attempt = 0
+      onOpen?.()
+    }
 
     const open = async () => {
       if (stopped) return
@@ -239,11 +255,22 @@ export class TelephonyClient {
       } catch {
         return retry()
       }
+      established = false
+      // A Gateway that does not say `stream.ready` (an older one): open for a while is accepted.
       ws.onopen = () => {
-        attempt = 0
+        settle = setTimeout(establish, ESTABLISHED_AFTER_MS)
       }
-      ws.onmessage = e => onEvent(JSON.parse(String(e.data)) as TelephonyEvent)
-      ws.onclose = retry
+      ws.onmessage = e => {
+        establish()
+        const message = JSON.parse(String(e.data)) as TelephonyEvent | { type: 'stream.ready' }
+        if (message.type !== 'stream.ready') onEvent(message)
+      }
+      ws.onclose = () => {
+        clearTimeout(settle)
+        if (established && !stopped) onClose?.()
+        established = false
+        retry()
+      }
     }
     const retry = () => {
       if (stopped) return
@@ -254,6 +281,7 @@ export class TelephonyClient {
     return () => {
       stopped = true
       clearTimeout(timer)
+      clearTimeout(settle)
       ws?.close()
     }
   }

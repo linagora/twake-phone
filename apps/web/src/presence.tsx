@@ -1,6 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react'
 import type { Presence } from '@twake/telephony-types'
 import { useGateway } from './gateway.js'
+import { PresenceSync } from './presenceSync.js'
 import { useT } from './i18n/useT.js'
 
 export interface Presences {
@@ -12,37 +13,31 @@ export interface Presences {
 
 const PresenceContext = createContext<Presences | null>(null)
 
-/** The presence of everyone, by extension: loaded once from the Gateway, then kept up to date by its events. */
+/** The presence of everyone, by extension: loaded from the Gateway each time the event stream is established, then kept up to date by its events. */
 export const PresenceProvider = ({ children }: { children: ReactNode }) => {
-  const { client, onEvent } = useGateway()
+  const { client, onEvent, onConnected } = useGateway()
   const [realtime, setRealtime] = useState(false)
   const [items, setItems] = useState<Map<string, Presence>>(() => new Map())
 
   useEffect(() => {
-    let cancelled = false
-    // Changes heard before the list arrives win over it; the list fills the rest.
-    const stop = onEvent(event => {
-      if (event.type !== 'presence.changed' || !event.payload.extension) return
-      const { extension, presence } = event.payload
-      setItems(current => new Map(current).set(extension, presence))
+    const sync = new PresenceSync(
+      () => client.getPresences(),
+      state => {
+        setRealtime(state.realtime)
+        setItems(state.items)
+      }
+    )
+    const stopEvents = onEvent(event => {
+      if (event.type === 'presence.changed' && event.payload.extension) sync.changed(event.payload.extension, event.payload.presence)
     })
-    client
-      .getPresences()
-      .then(page => {
-        if (cancelled) return
-        setRealtime(page.realtime)
-        setItems(current => {
-          const next = new Map(page.items.map(i => [i.extension, i.presence] as const))
-          for (const [extension, presence] of current) next.set(extension, presence)
-          return next
-        })
-      })
-      .catch(() => undefined)
+    // Nothing to show before the stream is established (realtime is false): read then, not also at start.
+    const stopConnected = onConnected(() => sync.load())
     return () => {
-      cancelled = true
-      stop()
+      sync.stop()
+      stopEvents()
+      stopConnected()
     }
-  }, [client, onEvent])
+  }, [client, onEvent, onConnected])
 
   const of = useCallback((extension: string): Presence => items.get(extension) ?? { status: 'offline', source: 'telephony' }, [items])
   const value = useMemo(() => ({ realtime, of }), [realtime, of])
