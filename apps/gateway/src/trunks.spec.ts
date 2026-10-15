@@ -434,6 +434,20 @@ describe('trunk routes', () => {
     expect(await store.listDids('A')).toEqual([])
   })
 
+  it('refuses a fallback number that is one of our own direct numbers, set on the trunk or taken in by a new range (step 6b)', async () => {
+    const { app, admin, handed } = await setup()
+    expect((await app.inject({ method: 'PUT', url: '/api/v1/admin/trunks/operator', headers: admin, payload: { ...trunk, fallbackNumber: '+33199000199' } })).statusCode).toBe(201)
+    expect(handed.at(-1)!.trunks[0]).toMatchObject({ fallbackNumber: '+33199000199' })
+    const taken = await app.inject({ method: 'PUT', url: '/api/v1/admin/dids/desk', headers: admin, payload: { trunkId: 'operator', first: '+33199000199', target: '101' } })
+    expect(taken.statusCode).toBe(409)
+    expect(taken.json()).toMatchObject({ code: 'FALLBACK_LOOP' })
+    expect((await app.inject({ method: 'PUT', url: '/api/v1/admin/dids/desk', headers: admin, payload: { trunkId: 'operator', first: '+33199000101', target: '101', fallbackNumber: '+33199000198' } })).statusCode).toBe(201)
+    expect(handed.at(-1)!.dids).toEqual([{ id: 'desk', trunkId: 'operator', first: '+33199000101', last: '+33199000101', target: '101', fallbackNumber: '+33199000198' }])
+    const loop = await app.inject({ method: 'PUT', url: '/api/v1/admin/trunks/operator', headers: admin, payload: { ...trunk, fallbackNumber: '+33199000101' } })
+    expect(loop.statusCode).toBe(409)
+    expect(loop.json()).toMatchObject({ code: 'FALLBACK_LOOP' })
+  })
+
   it('hands the provider the trunks the store kept as soon as it starts', async () => {
     const key = randomBytes(32)
     const store = new MemoryStore()

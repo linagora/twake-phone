@@ -209,6 +209,42 @@ export const storeContract = (name: string, make: () => Promise<Store>) =>
       await s.close()
     })
 
+    it('keeps the outbound rules of each tenant whole, and its alerts newest first, past ones dropped (step 6b)', async () => {
+      const s = await make()
+      expect(await s.getOutbound('A')).toBeNull()
+      const rules = { tenantId: 'A', policy: { defaultProfile: 'internal', caps: { concurrent: 4 } }, profiles: [{ id: 'internal', allowed: [] }, { id: 'national', allowed: ['fixed' as const], caps: { dailyMinutes: 60 } }], assignments: [{ userId: 'alice', profileId: 'national' }] }
+      await s.setOutbound(rules)
+      await s.setOutbound({ tenantId: 'B', policy: {}, profiles: [], assignments: [] })
+      expect(await s.getOutbound('A')).toEqual(rules)
+      await s.setOutbound({ ...rules, assignments: [] })
+      expect((await s.getOutbound('A'))?.assignments).toEqual([])
+      expect((await s.getOutbound('B'))?.profiles).toEqual([])
+      const alert = { kind: 'limit' as const, param: 'concurrent', scope: 'user' as const, extension: '101' }
+      await s.addAlert({ tenantId: 'A', at: '2026-10-15T10:00:00.000Z', alert })
+      await s.addAlert({ tenantId: 'A', at: '2026-10-15T11:00:00.000Z', alert: { ...alert, param: 'dailyCalls' } })
+      await s.addAlert({ tenantId: 'B', at: '2026-10-15T12:00:00.000Z', alert })
+      // Older than the retention: dropped at the next one.
+      await s.addAlert({ tenantId: 'A', at: '2020-01-01T00:00:00.000Z', alert })
+      await s.addAlert({ tenantId: 'A', at: new Date().toISOString(), alert: { ...alert, param: 'monthlyCalls' } })
+      const a = await s.listAlerts('A', 10)
+      expect(a.map(r => r.alert.param)).toEqual(['monthlyCalls', 'dailyCalls', 'concurrent'])
+      expect(a[1]).toEqual({ tenantId: 'A', at: '2026-10-15T11:00:00.000Z', alert: { ...alert, param: 'dailyCalls' } })
+      expect(await s.listAlerts('A', 1)).toHaveLength(1)
+      expect(await s.listAlerts('C')).toEqual([])
+      await s.close()
+    })
+
+    it('keeps the fallback number of a range of direct numbers (step 6b)', async () => {
+      const s = await make()
+      await s.upsertTrunk({ tenantId: 'A', id: 'main', config: { auth: 'ip', domain: 'operator.example', codecs: ['PCMA'], numberFormat: 'e164', defaultNumber: '+33199000100', fallbackNumber: '+33199000199' } })
+      await s.upsertDid({ tenantId: 'A', id: 'desk', trunkId: 'main', first: '+33199000101', last: '+33199000101', target: '101', fallbackNumber: '+33199000198' })
+      expect(await s.listDids('A')).toEqual([{ tenantId: 'A', id: 'desk', trunkId: 'main', first: '+33199000101', last: '+33199000101', target: '101', fallbackNumber: '+33199000198' }])
+      expect((await s.listTrunks('A'))[0]!.config.fallbackNumber).toBe('+33199000199')
+      await s.upsertDid({ tenantId: 'A', id: 'desk', trunkId: 'main', first: '+33199000101', last: '+33199000101', target: '101' })
+      expect((await s.listDids('A'))[0]).not.toHaveProperty('fallbackNumber')
+      await s.close()
+    })
+
     it('keeps the trunks and direct numbers of each tenant, in order, and removes the numbers with their trunk', async () => {
       const s = await make()
       const config = { auth: 'register' as const, domain: 'operator.example', proxies: ['192.0.2.20'], username: '0033199000100', codecs: ['PCMA' as const, 'PCMU' as const], numberFormat: 'e164' as const, defaultNumber: '+33199000100' }

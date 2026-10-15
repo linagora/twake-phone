@@ -1,4 +1,4 @@
-import type { Call, CallState, Presence, PresenceStatus, TelephonyEvent } from '@twake/telephony-types'
+import type { Call, CallState, Presence, PresenceStatus, TelephonyAlert, TelephonyEvent } from '@twake/telephony-types'
 
 // Turns what OpenSIPS tells (registrations from usrloc, our own E_TWAKEPHONE_* events, the CDRs and missed calls of
 // acc) into the vendor-neutral call and presence events of the Gateway. Pure state machine: no I/O, unit-tested
@@ -73,6 +73,54 @@ const epochMs = (v: unknown): number | undefined => {
   return n !== undefined && n > 0 ? n * 1000 : undefined
 }
 const iso = (ms: number) => new Date(ms).toISOString()
+
+/** The names fraud_detection gives its thresholds, as the Gateway's (FraudRule). */
+const FRAUD_PARAM: Record<string, string> = {
+  'calls-per-minute': 'callsPerMinute',
+  'total-calls': 'dailyCalls',
+  'concurrent-calls': 'concurrentCalls',
+  'sequential-calls': 'sequentialCalls',
+  'call-duration': 'callSeconds'
+}
+const CAP_PARAMS = new Set(['concurrent', 'dailyCalls', 'dailyMinutes', 'monthlyCalls', 'monthlyMinutes'])
+
+/**
+ * An alert for the administrators (step 6b): a threshold of fraud_detection crossed (E_FRD_WARNING, the call goes on;
+ * E_FRD_CRITICAL, refused; `user` the extension, `called_number` the number without its +), or a cap reached
+ * (E_TWAKEPHONE_LIMIT of opensips.cfg.tpl, the call refused). Null for anything else.
+ */
+export const alertOf = (method: string, p: Record<string, unknown>): TelephonyAlert | null => {
+  if (method === 'E_FRD_WARNING' || method === 'E_FRD_CRITICAL') {
+    const param = FRAUD_PARAM[str(p.param)]
+    if (!param) return null
+    const number = str(p.called_number).replace(/^\+/, '')
+    const value = num(p.value)
+    const threshold = num(p.threshold)
+    return {
+      kind: method === 'E_FRD_WARNING' ? 'fraud-warning' : 'fraud-critical',
+      param,
+      scope: 'user',
+      ...(value !== undefined ? { value } : {}),
+      ...(threshold !== undefined ? { threshold } : {}),
+      ...(str(p.user) ? { extension: userOf(str(p.user)) } : {}),
+      ...(/^[0-9]{2,15}$/.test(number) ? { number: `+${number}` } : {})
+    }
+  }
+  if (method === 'E_TWAKEPHONE_LIMIT') {
+    const param = str(p.param)
+    const scope = str(p.scope)
+    if (!CAP_PARAMS.has(param) || (scope !== 'user' && scope !== 'tenant')) return null
+    return {
+      kind: 'limit',
+      param,
+      scope,
+      ...(str(p.caller) ? { extension: userOf(str(p.caller)) } : {}),
+      ...(/^\+[0-9]{2,15}$/.test(str(p.number)) ? { number: str(p.number) } : {})
+    }
+  }
+  return null
+}
+
 /** usrloc's `expires`: an absolute time in seconds; a small number would be seconds from now; 0 never expires. */
 const expiryOf = (v: unknown, nowMs: number): number | undefined => {
   const n = typeof v === 'number' ? v : Number(v)
@@ -261,6 +309,14 @@ export class CallTracker {
         this.moveTo(call, userOf(str(p.callee)), Number(p.code) || 0, now)
         call.dnd = { told: str(p.told) !== '0' }
         break
+      }
+      case 'E_FRD_WARNING':
+      case 'E_FRD_CRITICAL':
+      case 'E_TWAKEPHONE_LIMIT': {
+        // For the administrators only: the Gateway keeps it, nobody's phone hears of it.
+        const alert = alertOf(method, p)
+        if (alert?.extension) this.emit(alert.extension, { type: 'alert.raised', timestamp: now, payload: { alert } })
+        return
       }
       case 'E_TWAKEPHONE_WAKE': {
         // Nobody of `callee` (the extension the call reached, or a member of the group dialled) is registered:

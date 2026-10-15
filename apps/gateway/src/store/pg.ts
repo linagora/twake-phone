@@ -1,7 +1,7 @@
 import { readdir, readFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import pg from 'pg'
-import { clampLimit, type ConferenceRecord, type DidRecord, type HistoryEntry, type HistoryPage, type HistoryQuery, type MappingSource, type ProviderRecord, type PushSaveResult, type PushSubscriptionRecord, type Store, type TrunkRecord, type UserMapping, type UserPresenceRecord, type VapidKeysRecord } from './types.js'
+import { ALERT_RETENTION_DAYS, clampLimit, type AlertRecord, type ConferenceRecord, type DidRecord, type OutboundRecord, type HistoryEntry, type HistoryPage, type HistoryQuery, type MappingSource, type ProviderRecord, type PushSaveResult, type PushSubscriptionRecord, type Store, type TrunkRecord, type UserMapping, type UserPresenceRecord, type VapidKeysRecord } from './types.js'
 
 const MIGRATIONS = fileURLToPath(new URL('../../migrations/', import.meta.url))
 
@@ -15,7 +15,9 @@ type PresenceRow = { tenant_id: string; user_id: string; status: UserPresenceRec
 type ConferenceRow = { tenant_id: string; meeting_id: string; owner_user_id: string; pin: string | null; created_at: Timestamp }
 type PushRow = { tenant_id: string; user_id: string; endpoint: string; p256dh: string; auth: string; created_at: Timestamp }
 type TrunkRow = { tenant_id: string; id: string; config: TrunkRecord['config']; password_enc: string | null }
-type DidRow = { tenant_id: string; id: string; trunk_id: string; first_number: string; last_number: string; target: string | null; suffix_digits: number }
+type DidRow = { tenant_id: string; id: string; trunk_id: string; first_number: string; last_number: string; target: string | null; suffix_digits: number; fallback_number: string | null }
+type OutboundRow = { tenant_id: string; policy: OutboundRecord['policy']; profiles: OutboundRecord['profiles']; assignments: OutboundRecord['assignments'] }
+type AlertRow = { tenant_id: string; at: Timestamp; alert: AlertRecord['alert'] }
 
 const toEntry = (r: HistoryRow): HistoryEntry => ({
   tenantId: r.tenant_id,
@@ -339,22 +341,47 @@ export class PgStore implements Store {
       first: r.first_number,
       last: r.last_number,
       ...(r.target !== null ? { target: r.target } : {}),
-      ...(r.suffix_digits ? { suffixDigits: r.suffix_digits } : {})
+      ...(r.suffix_digits ? { suffixDigits: r.suffix_digits } : {}),
+      ...(r.fallback_number !== null ? { fallbackNumber: r.fallback_number } : {})
     }))
   }
 
   async upsertDid(d: DidRecord) {
     await this.pool.query(
-      `INSERT INTO direct_numbers (tenant_id, id, trunk_id, first_number, last_number, target, suffix_digits) VALUES ($1, $2, $3, $4, $5, $6, $7)
+      `INSERT INTO direct_numbers (tenant_id, id, trunk_id, first_number, last_number, target, suffix_digits, fallback_number) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
        ON CONFLICT (tenant_id, id) DO UPDATE SET trunk_id = EXCLUDED.trunk_id, first_number = EXCLUDED.first_number, last_number = EXCLUDED.last_number,
-         target = EXCLUDED.target, suffix_digits = EXCLUDED.suffix_digits`,
-      [d.tenantId, d.id, d.trunkId, d.first, d.last, d.target ?? null, d.suffixDigits ?? 0]
+         target = EXCLUDED.target, suffix_digits = EXCLUDED.suffix_digits, fallback_number = EXCLUDED.fallback_number`,
+      [d.tenantId, d.id, d.trunkId, d.first, d.last, d.target ?? null, d.suffixDigits ?? 0, d.fallbackNumber ?? null]
     )
   }
 
   async deleteDid(tenantId: string, id: string) {
     const r = await this.pool.query('DELETE FROM direct_numbers WHERE tenant_id = $1 AND id = $2', [tenantId, id])
     return (r.rowCount ?? 0) > 0
+  }
+
+  async getOutbound(tenantId: string): Promise<OutboundRecord | null> {
+    const { rows } = await this.pool.query<OutboundRow>('SELECT tenant_id, policy, profiles, assignments FROM outbound_policies WHERE tenant_id = $1', [tenantId])
+    const r = rows[0]
+    return r ? { tenantId: r.tenant_id, policy: r.policy, profiles: r.profiles, assignments: r.assignments } : null
+  }
+
+  async setOutbound(o: OutboundRecord) {
+    await this.pool.query(
+      `INSERT INTO outbound_policies (tenant_id, policy, profiles, assignments) VALUES ($1, $2, $3, $4)
+       ON CONFLICT (tenant_id) DO UPDATE SET policy = EXCLUDED.policy, profiles = EXCLUDED.profiles, assignments = EXCLUDED.assignments, updated_at = now()`,
+      [o.tenantId, JSON.stringify(o.policy), JSON.stringify(o.profiles), JSON.stringify(o.assignments)]
+    )
+  }
+
+  async addAlert(a: AlertRecord) {
+    await this.pool.query('INSERT INTO telephony_alerts (tenant_id, at, alert) VALUES ($1, $2, $3)', [a.tenantId, a.at, JSON.stringify(a.alert)])
+    await this.pool.query(`DELETE FROM telephony_alerts WHERE tenant_id = $1 AND at < now() - interval '${ALERT_RETENTION_DAYS} days'`, [a.tenantId])
+  }
+
+  async listAlerts(tenantId: string, limit?: number): Promise<AlertRecord[]> {
+    const { rows } = await this.pool.query<AlertRow>('SELECT tenant_id, at, alert FROM telephony_alerts WHERE tenant_id = $1 ORDER BY at DESC, id DESC LIMIT $2', [tenantId, clampLimit(limit)])
+    return rows.map(r => ({ tenantId: r.tenant_id, at: new Date(r.at).toISOString(), alert: r.alert }))
   }
 
   async close() {

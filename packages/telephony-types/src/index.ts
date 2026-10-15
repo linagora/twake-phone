@@ -135,6 +135,97 @@ export const TRUNK_COUNTRY_EXCLUDED = /^(33|262|508|59[046]|68[179]|80[08]|87[08
 export const TRUNK_COUNTRY = /^(1|[2-9][0-9]{0,2}|1[2-9][0-9]{2})$/
 
 /**
+ * Caps on the calls to the public network (step 6b, ADR 0017), of a person (their rights profile) or of the whole
+ * organisation: calls at the same time, and answered calls or minutes per calendar day and month. Each one absent: no
+ * cap. Emergency calls are outside every cap and never count.
+ */
+export interface OutboundCaps {
+  /** Calls to the public network at the same time. */
+  concurrent?: number
+  dailyCalls?: number
+  dailyMinutes?: number
+  monthlyCalls?: number
+  monthlyMinutes?: number
+}
+export const OUTBOUND_CAPS = ['concurrent', 'dailyCalls', 'dailyMinutes', 'monthlyCalls', 'monthlyMinutes'] as const
+
+/**
+ * A rights profile (FR-H3): what its holders may call on the public network, among what the trunk calls
+ * (`allowed` of the trunk; international to its countries only); none of them (`allowed` empty): internal calls only.
+ * Emergency numbers are always called, whatever the profile. Set by an administrator.
+ */
+export interface OutboundProfile {
+  /** Lower case letters, digits and dashes. */
+  id: string
+  name?: string
+  allowed: TrunkOutboundClass[]
+  caps?: OutboundCaps
+}
+
+/** The rights profile an administrator gave a person (FR-H3); one without: the organisation's default profile. */
+export interface OutboundAssignment {
+  userId: UserId
+  profileId: string
+}
+
+/** A warning (an alert to the administrators) and a critical (the call is refused) threshold; 0 or absent: none. */
+export interface FraudThreshold {
+  warning?: number
+  critical?: number
+}
+/**
+ * Volume thresholds per person, as the SIP server watches them (OpenSIPS `fraud_detection`, ADR 0017): calls in the
+ * last minute, calls of the day, calls at the same time, calls in a row to the same number, and the duration of a call
+ * in seconds (warning only: a call is not cut by it).
+ */
+export interface FraudRule {
+  callsPerMinute?: FraudThreshold
+  dailyCalls?: FraudThreshold
+  concurrentCalls?: FraudThreshold
+  sequentialCalls?: FraudThreshold
+  callSeconds?: FraudThreshold
+}
+export const FRAUD_PARAMS = ['callsPerMinute', 'dailyCalls', 'concurrentCalls', 'sequentialCalls', 'callSeconds'] as const
+
+/**
+ * The thresholds when an administrator says nothing: a person dialling numbers in France faster than a person does,
+ * or abroad more than a few times, raises an alert; far beyond, the calls are refused.
+ */
+export const FRAUD_DEFAULTS: { national: FraudRule; international: FraudRule } = {
+  national: { callsPerMinute: { warning: 6, critical: 20 }, dailyCalls: { warning: 150, critical: 500 }, concurrentCalls: { warning: 3 }, sequentialCalls: { warning: 10, critical: 40 }, callSeconds: { warning: 14400 } },
+  international: { callsPerMinute: { warning: 3, critical: 6 }, dailyCalls: { warning: 20, critical: 60 }, concurrentCalls: { warning: 2, critical: 4 }, sequentialCalls: { warning: 5, critical: 15 }, callSeconds: { warning: 3600 } }
+}
+
+/**
+ * What applies to the calls of the organisation to the public network (step 6b): the profile of those an
+ * administrator gave none (none: what the trunk calls), the caps of the organisation as a whole, and the volume
+ * thresholds of numbers in France (+33) and elsewhere (FRAUD_DEFAULTS for those not given).
+ */
+export interface OutboundPolicy {
+  defaultProfile?: string
+  caps?: OutboundCaps
+  fraud?: { national?: FraudRule; international?: FraudRule }
+}
+
+/**
+ * Something the administrators should look at, raised by the SIP server: a volume threshold crossed (`fraud-warning`,
+ * the call goes on; `fraud-critical`, it is refused) or a cap reached (`limit`, the call refused). `param`: which
+ * (callsPerMinute... for a threshold; concurrent, dailyCalls... for a cap, with `scope` user or tenant).
+ */
+export interface TelephonyAlert {
+  kind: 'fraud-warning' | 'fraud-critical' | 'limit'
+  param: string
+  scope?: 'user' | 'tenant'
+  value?: number
+  threshold?: number
+  /** The extension that called, and the number it called (E.164). */
+  extension?: string
+  number?: string
+  /** Who holds the extension, as the Gateway knows them. */
+  userId?: UserId
+}
+
+/**
  * A SIP trunk: where calls to and from the public network go (step 6, ADR 0016). The password is write-only: it is
  * never returned, `hasPassword` tells whether one is kept.
  */
@@ -181,6 +272,11 @@ export interface Trunk {
    * every trunk: the first one written.
    */
   default?: boolean
+  /**
+   * The fallback number (FR-C8, E.164): a call to one of its direct numbers that nobody answers or that cannot be
+   * delivered is sent back to the operator redirected there (302), unless the direct number has its own.
+   */
+  fallbackNumber?: string
   /** Read only. */
   hasPassword?: boolean
 }
@@ -201,6 +297,8 @@ export interface DidRange {
   last: string
   target?: string
   suffixDigits?: number
+  /** Its own fallback number (E.164), in place of its trunk's (`Trunk.fallbackNumber`). */
+  fallbackNumber?: string
 }
 
 export type CallState =
@@ -263,6 +361,11 @@ export interface Capabilities {
   push?: boolean
   /** Calls to and from the public network through SIP trunks that administrators set (`Trunk`, `DidRange`). */
   trunks?: boolean
+  /**
+   * Administrators set rights profiles, caps and volume thresholds for the calls to the public network
+   * (`OutboundProfile`, `OutboundPolicy`), and the provider raises alerts (`alert.raised`).
+   */
+  outboundPolicy?: boolean
   conference: { dialIn: boolean; dialOut: boolean }
 }
 
@@ -317,5 +420,7 @@ export type TelephonyEvent =
   | { type: 'presence.changed'; timestamp: string; payload: { userId: UserId; extension?: string; presence: Presence } }
   | { type: 'endpoint.connected' | 'endpoint.disconnected'; timestamp: string; payload: { userId: UserId; endpoint: Endpoint } }
   | { type: 'conference.participant.joined' | 'conference.participant.left'; timestamp: string; payload: { participant: ConferenceParticipant } }
+  /** For the administrators, never the person: a volume threshold crossed or a cap reached (step 6b). */
+  | { type: 'alert.raised'; timestamp: string; payload: { alert: TelephonyAlert } }
 
 export type ProviderStatus = 'CONNECTED' | 'DEGRADED' | 'DISCONNECTED' | 'ERROR'

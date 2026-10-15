@@ -1,4 +1,4 @@
-import type { CallDirection, CallState, DidRange, PresenceStatus, Trunk } from '@twake/telephony-types'
+import type { CallDirection, CallState, DidRange, OutboundAssignment, OutboundPolicy, OutboundProfile, PresenceStatus, TelephonyAlert, Trunk } from '@twake/telephony-types'
 
 export interface ProviderRecord {
   tenantId: string
@@ -134,6 +134,24 @@ export interface DidRecord extends DidRange {
   tenantId: string
 }
 
+/** The rules of a tenant's calls to the public network (step 6b, ADR 0017), as an administrator set them. */
+export interface OutboundRecord {
+  tenantId: string
+  policy: OutboundPolicy
+  profiles: OutboundProfile[]
+  assignments: OutboundAssignment[]
+}
+
+/** What the SIP server raised for the administrators (step 6b): when, and what. */
+export interface AlertRecord {
+  tenantId: string
+  at: string
+  alert: TelephonyAlert
+}
+
+/** How long the alerts are kept. */
+export const ALERT_RETENTION_DAYS = 90
+
 export interface Store {
   listProviders(): Promise<ProviderRecord[]>
   upsertProvider(record: ProviderRecord): Promise<void>
@@ -205,6 +223,15 @@ export interface Store {
   /** Adds or replaces a range; its trunk must exist in the tenant (else it throws). */
   upsertDid(record: DidRecord): Promise<void>
   deleteDid(tenantId: string, id: string): Promise<boolean>
+
+  /** The outbound rules of a tenant; null when none was ever set. */
+  getOutbound(tenantId: string): Promise<OutboundRecord | null>
+  /** Replaces them whole. */
+  setOutbound(record: OutboundRecord): Promise<void>
+  /** Keeps an alert; those older than ALERT_RETENTION_DAYS go. */
+  addAlert(record: AlertRecord): Promise<void>
+  /** The alerts of a tenant, the newest first, `limit` at most (clamped as a page). */
+  listAlerts(tenantId: string, limit?: number): Promise<AlertRecord[]>
 
   close(): Promise<void>
 }

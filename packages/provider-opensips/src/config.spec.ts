@@ -83,7 +83,8 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     // Nobody to ring: the refusal goes through a transaction (acc sees it), announced just before.
     const unreachable = lines(section('route[unreachable]', 'route[forward_to]'))
     const missed = unreachable.indexOf('route(account_missed);')
-    expect(unreachable.slice(missed, missed + 4)).toEqual(['route(account_missed);', 'route(calling);', 'if ($avp(fwd_hops) == 0 && $avp(dialled_unread) != 1)', 't_reply(404, "Not Found");'])
+    // A call from the operator goes to its fallback number instead (step 6b, route[trunk_fallback]).
+    expect(unreachable.slice(missed, missed + 6)).toEqual(['route(account_missed);', 'route(calling);', 'if (route(trunk_fallback, "unreachable"))', 'exit;', 'if ($avp(fwd_hops) == 0 && $avp(dialled_unread) != 1)', 't_reply(404, "Not Found");'])
     expect(cfg.match(/raise_event\("E_TWAKEPHONE_CALLING"/g)).toHaveLength(1)
     // The transaction of every call exists before its rules are read and before its relay: a relay that cannot send
     // returns to the script (route[relay_call]) instead of tm answering on its own, unaccounted.
@@ -276,9 +277,9 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(told).toBeGreaterThan(0)
     for (const header of ['append_to_reply("Twake-Dnd: 1\\r\\n");', 'append_to_reply("Twake-Dnd-Message: $var(dnd_message)\\r\\n");', 'append_to_reply("Retry-After: $var(dnd_retry)\\r\\n");'])
       expect(reply.indexOf(header), header).toBeGreaterThan(told)
-    // The other headers added to a reply say why a call to the public network was refused (step 6), and the only body
-    // the operator may be sent (415).
-    expect(cfg.match(/append_to_reply\((?!"Twake-Call-Refused: |"Accept: application\/sdp\\r\\n"\))/g)).toHaveLength(3)
+    // The other headers added to a reply say why a call to the public network was refused (step 6), the only body
+    // the operator may be sent (415), and where the operator should take a call that does not go through (step 6b).
+    expect(cfg.match(/append_to_reply\((?!"Twake-Call-Refused: |"Accept: application\/sdp\\r\\n"\)|"Contact: <sip:\$var\(trunk_number\)@\$avp\(t_domain\)>\\r\\n"\))/g)).toHaveLength(3)
     expect(reply).toContain('t_reply(480, "Do Not Disturb");')
     expect(reply).toContain('t_reply(480, "Temporarily Unavailable");')
     // Nobody to ring at the end of a forward: the dialled extension's "do not disturb" first.
@@ -299,7 +300,7 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
 
   it('keeps what the caller dialled in the CDRs, next to the extension the call reached', () => {
     const { cfg } = render()
-    expect(cfg).toContain('modparam("acc", "extra_fields", "db: caller; callee; dialled")')
+    expect(cfg).toContain('modparam("acc", "extra_fields", "db: caller; callee; dialled; external")')
     expect(cfg).toContain('modparam("acc", "extra_fields", "evi: caller; callee; dialled")')
     expect(cfg).toContain('$acc_extra(dialled) = $rU;')
     // A number of the public network, in E.164 (step 6); the extension a direct number reaches.
@@ -380,7 +381,7 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(window).toContain('$(msg.branch.attr(gext)[$var(k)]) = $(avp(w_ext)[$var(w)]);')
     expect(window).toContain('$(msg.branch.attr(gname)[$var(k)]) = $(avp(w_name)[$var(w)]);')
     for (const avp of ['r_always', 'r_busy', 'r_noanswer', 'r_dnd']) expect(ring).toContain(`$(avp(${avp})[*]) = NULL;`)
-    expect(ring).toContain('route(account_missed);\n\t\troute(calling);\n\t\tt_reply(480, "Temporarily Unavailable");')
+    expect(ring).toContain('route(account_missed);\n\t\troute(calling);\n\t\tif (route(trunk_fallback, "nobody of the group"))\n\t\t\texit;\n\t\tt_reply(480, "Temporarily Unavailable");')
     expect(ring.replace(/#.*$/gm, '').trimEnd().endsWith('route(ring);\n}')).toBe(true)
     // A member declining leaves the colleagues ringing; any other call is declined as a whole (its windows that
     // answered something are cancelled).
@@ -396,7 +397,7 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(failure.indexOf('if ($avp(group) != NULL) {')).toBeLessThan(failure.indexOf('route(forward_to, $var(next))'))
     const group = failure.slice(failure.indexOf('if ($avp(group) != NULL) {'), failure.indexOf('$var(dnd_code) = $T_reply_code;'))
     expect(group).toContain('if ($avp(g_declines) != NULL && $avp(g_declines) >= $avp(g_windows)) {')
-    expect(group).toContain('route(group_missed, "480 Temporarily Unavailable");\n\t\tt_reply(480, "Temporarily Unavailable");')
+    expect(group).toContain('route(group_missed, "480 Temporarily Unavailable");\n\t\tif (route(trunk_fallback, "the group did not answer"))\n\t\t\texit;\n\t\tt_reply(480, "Temporarily Unavailable");')
     expect(onreply).toContain('$var(mark) = ",b" + $T_branch_idx + ",";')
     // A member woken by a push (step 5) declines once, whatever the number of windows they opened.
     expect(onreply).toContain('if ($var(woken_window) == 1)\n\t\t\t\t$var(mark) = ",m" + $var(member) + ",";')
@@ -687,7 +688,7 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(loaded).toContain('if ($avp(num_class) == "emergency" && route(default_trunk)) {')
     expect(loaded).toContain('if (!route(default_trunk) || !ds_select_dst($avp(t_setid), 8, "f")) {\n\t\t\troute(emergency_failed, "no server up");')
     // Never cut at TRUNK_MAX_CALL_SEC.
-    expect(loaded).toContain('if ($avp(num_class) == "emergency")\n\t\t$DLG_timeout = 604800;\n\telse\n\t\t$DLG_timeout = 7200;')
+    expect(loaded).toContain('if ($avp(num_class) == "emergency")\n\t\t$DLG_timeout = 604800;\n\telse if ($avp(o_max_sec) != NULL)\n\t\t$DLG_timeout = $avp(o_max_sec);\n\telse\n\t\t$DLG_timeout = 7200;')
     // Every failure of it, the operator's refusal included: "call from another phone".
     expect(section('route[emergency_failed]', 'route[trunk_out_loaded]')).toContain('append_to_reply("Twake-Call-Refused: emergency\\r\\n");\n\tt_reply(503, "Emergency Call Failed");')
     const failed = section('failure_route[trunk_failed]', 'route[trunk_in]')
@@ -794,7 +795,7 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     // direct numbers stays an internal call, route[trunk_out_loaded]).
     expect(cfg.slice(cfg.indexOf('\nroute {'), cfg.indexOf('\nroute[outbound_policy] {'))).toContain('\n\tcreate_dialog();\n')
     const loaded = section('route[trunk_out_loaded]', 'route[trunk_headers]')
-    const flags = loaded.indexOf('if ($avp(num_class) == "emergency")\n\t\tcreate_dialog("B");\n\telse\n\t\tcreate_dialog("BP");')
+    const flags = loaded.indexOf('if ($avp(num_class) == "emergency") {\n\t\tcreate_dialog("B");\n\t\t$acc_extra(external) = "emergency";\n\t} else {\n\t\tcreate_dialog("BP");\n\t\t$acc_extra(external) = "out";\n\t}')
     expect(flags).toBeGreaterThan(loaded.indexOf('route(rules_next);\n\t\texit;'))
     expect(cfg.match(/\$DLG_timeout = 7200;/g)).toHaveLength(2)
     expect(cfg).toContain('\tcreate_dialog("Bp");\n\t$DLG_timeout = 7200;\n\t$dlg_val(trunk) = "caller";')

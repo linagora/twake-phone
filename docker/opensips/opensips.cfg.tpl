@@ -136,6 +136,10 @@ modparam("dialog", "default_timeout", 14400)
 # services hang up themselves. Nothing else ends a call: not the app's own connection to the Gateway. Past
 # TRUNK_MAX_CALL_SEC, a call with the operator ends too (create_dialog("B")), an emergency call excepted.
 modparam("dialog", "options_ping_interval", ${CALL_PING_SEC})
+# The calls to the public network in progress (step 6b, route[outbound_caps]): per caller's extension, and all of them
+# (one organisation per OpenSIPS). An emergency call is in neither.
+modparam("dialog", "profiles_with_value", "trunk_caller")
+modparam("dialog", "profiles_no_value", "trunk_out")
 loadmodule "rtpengine.so"
 modparam("rtpengine", "rtpengine_sock", "${RTPENGINE_SOCK}")
 
@@ -177,10 +181,11 @@ loadmodule "event_routing.so"
 #### Accounting: CDRs in the database (the reference history) and the same as events for the Gateway (E_ACC_EVENT at
 #### the answer, E_ACC_CDR at the end of the dialog, E_ACC_MISSED_EVENT for a call that did not go through). Caller,
 #### callee (the extension the call reached) and dialled (what the caller dialled) as extra fields: the default ones
-#### only carry tags and the Call-ID.
+#### only carry tags and the Call-ID. In the database, `external` too (step 6b): "out" for a call to the public
+#### network, which the caps count (route[outbound_caps]), "emergency" for an emergency call, which they never do.
 loadmodule "acc.so"
 modparam("acc", "db_url", "${OPENSIPS_DB_URL}")
-modparam("acc", "extra_fields", "db: caller; callee; dialled")
+modparam("acc", "extra_fields", "db: caller; callee; dialled; external")
 modparam("acc", "extra_fields", "evi: caller; callee; dialled")
 
 #### Trunks (step 6, ADR 0016): the Gateway writes the operator's servers (`dispatcher`), the registrations
@@ -213,6 +218,16 @@ loadmodule "uac_registrant.so"
 modparam("uac_registrant", "db_url", "${OPENSIPS_DB_URL}")
 modparam("uac_registrant", "timer_interval", 10)
 modparam("uac_registrant", "failure_retry_interval", 300)
+# Volume thresholds (step 6b, ADR 0017): fraud_detection counts, per caller and per rule (numbers in France, +33, and
+# every other one), the calls of the last minute, of the day, at the same time, in a row to the same number, and the
+# duration of each; past a warning threshold it raises E_FRD_WARNING (the Gateway keeps it for the administrators),
+# past a critical one E_FRD_CRITICAL and the call is refused (route[outbound_fraud]). Its rules, in `fraud_detection`,
+# are the Gateway's (outbound.ts), reloaded on MI fraud_reload. It matches numbers through drouting's prefix tree:
+# drouting is loaded for it alone, its tables empty, no call is ever routed by it.
+loadmodule "drouting.so"
+modparam("drouting", "db_url", "${OPENSIPS_DB_URL}")
+loadmodule "fraud_detection.so"
+modparam("fraud_detection", "db_url", "${OPENSIPS_DB_URL}")
 # The default trunk as last read (timer_route[default_trunk]): what an emergency call takes when the database cannot
 # say (route[default_trunk]). None until read.
 modparam("cfgutils", "shvset", "dt_setid=i:0")
@@ -639,7 +654,8 @@ route {
 # free, standard-rate, overseas and international numbers, as far as the trunk allows them (its `allowed`: by default
 # the metropolitan fixed, mobile, free and standard-rate ones, OUTBOUND_ALLOWED; an international number only to the
 # country codes its `countries` lists); premium numbers never, satellite and international premium ones included
-# (6b: rights per profile, caps, fraud_detection). A refusal comes before any transaction, with its reason for the app
+# (then, once the trunk is read, the caller's rights, the caps and the volume thresholds of step 6b:
+# route[trunk_out_loaded]). A refusal comes before any transaction, with its reason for the app
 # in Twake-Call-Refused; a malformed number is 484. $var(num) is the number in E.164 (a short one as dialled); sets
 # $var(pstn) when it may go to the trunk.
 route[outbound_policy] {
@@ -672,8 +688,9 @@ route[outbound_policy] {
 # The trunk of the caller's direct number, and that number to present; else the first trunk (the default one) and its
 # own number. With them, what the trunk may call (`allowed`, `countries`) and, when the number called is one of our
 # own direct numbers, the extension or group it rings (`internal`: the call stays inside, never through the
-# operator). The caller is one of our accounts (digest), its user name has only the characters of `subscriber`; the
-# number called, digits and a +.
+# operator). Then what applies to the caller (step 6b, twake_outbound() of outbound.ts): their rights profile's
+# classes, the caps of calls at the same time, what is left of the others. The caller is one of our accounts
+# (digest), its user name has only the characters of `subscriber`; the number called, digits and a +.
 route[trunk_out] {
 	$var(ext) = "";
 	if ($avp(caller) =~ "^[A-Za-z0-9._+-]{1,64}$")
@@ -681,8 +698,8 @@ route[trunk_out] {
 	$var(called) = "";
 	if ($avp(callee) =~ "^\+?[0-9]{2,16}$")
 		$var(called) = $avp(callee);
-	$var(trunk_query) = "SELECT t.setid, t.domain, t.number_format, t.assert_identity, t.auth_username, t.auth_password, t.auth_realm, t.codec_flags, coalesce(d.number, t.default_number) AS presented, t.allowed, t.countries, (SELECT CASE WHEN i.suffix_digits > 0 THEN right('" + $var(called) + "', i.suffix_digits) ELSE i.target END FROM dids i WHERE length(i.first_number) = length('" + $var(called) + "') AND '" + $var(called) + "' BETWEEN i.first_number AND i.last_number ORDER BY i.suffix_digits LIMIT 1) AS internal FROM trunks t LEFT JOIN LATERAL (SELECT CASE WHEN x.suffix_digits > 0 THEN left(x.first_number, length(x.first_number) - x.suffix_digits) || '" + $var(ext) + "' ELSE x.first_number END AS number FROM dids x WHERE x.trunk_id = t.id AND ((x.suffix_digits = 0 AND x.target = '" + $var(ext) + "') OR (x.suffix_digits = length('" + $var(ext) + "') AND left(x.first_number, length(x.first_number) - x.suffix_digits) || '" + $var(ext) + "' BETWEEN x.first_number AND x.last_number)) ORDER BY x.suffix_digits, x.first_number LIMIT 1) d ON true ORDER BY (d.number IS NULL), t.position LIMIT 1";
-	async(sql_query_one("$var(trunk_query)", "$avp(t_setid);$avp(t_domain);$avp(t_format);$avp(t_pai);$avp(t_user);$avp(t_pass);$avp(t_realm);$avp(t_codecs);$avp(t_presented);$avp(t_allowed);$avp(t_countries);$avp(t_internal)"), trunk_out_loaded);
+	$var(trunk_query) = "SELECT x.setid, x.domain, x.number_format, x.assert_identity, x.auth_username, x.auth_password, x.auth_realm, x.codec_flags, x.presented, x.allowed, x.countries, x.internal, o.allowed AS rights, o.user_concurrent, o.tenant_concurrent, o.user_calls_left, o.user_calls_param, o.tenant_calls_left, o.tenant_calls_param, o.seconds_left, o.seconds_param, o.seconds_scope FROM (SELECT t.tenant_id, t.setid, t.domain, t.number_format, t.assert_identity, t.auth_username, t.auth_password, t.auth_realm, t.codec_flags, coalesce(d.number, t.default_number) AS presented, t.allowed, t.countries, (SELECT CASE WHEN i.suffix_digits > 0 THEN right('" + $var(called) + "', i.suffix_digits) ELSE i.target END FROM dids i WHERE length(i.first_number) = length('" + $var(called) + "') AND '" + $var(called) + "' BETWEEN i.first_number AND i.last_number ORDER BY i.suffix_digits LIMIT 1) AS internal FROM trunks t LEFT JOIN LATERAL (SELECT CASE WHEN x.suffix_digits > 0 THEN left(x.first_number, length(x.first_number) - x.suffix_digits) || '" + $var(ext) + "' ELSE x.first_number END AS number FROM dids x WHERE x.trunk_id = t.id AND ((x.suffix_digits = 0 AND x.target = '" + $var(ext) + "') OR (x.suffix_digits = length('" + $var(ext) + "') AND left(x.first_number, length(x.first_number) - x.suffix_digits) || '" + $var(ext) + "' BETWEEN x.first_number AND x.last_number)) ORDER BY x.suffix_digits, x.first_number LIMIT 1) d ON true ORDER BY (d.number IS NULL), t.position LIMIT 1) x LEFT JOIN LATERAL twake_outbound('" + $var(ext) + "', x.tenant_id) o ON true";
+	async(sql_query_one("$var(trunk_query)", "$avp(t_setid);$avp(t_domain);$avp(t_format);$avp(t_pai);$avp(t_user);$avp(t_pass);$avp(t_realm);$avp(t_codecs);$avp(t_presented);$avp(t_allowed);$avp(t_countries);$avp(t_internal);$avp(o_allowed);$avp(o_uconc);$avp(o_tconc);$avp(o_ucalls);$avp(o_ucalls_p);$avp(o_tcalls);$avp(o_tcalls_p);$avp(o_secs);$avp(o_secs_p);$avp(o_secs_s)"), trunk_out_loaded);
 }
 
 # An emergency call must not depend on the database (ADR 0016): the default trunk as this process last read it
@@ -783,10 +800,13 @@ route[trunk_out_loaded] {
 	# A call to the operator from here on: the caller's phone is asked whether it is still there (P, not for an
 	# emergency call: the emergency services hang up themselves, a phone silent a few seconds must never cut them), the
 	# call ends past its longest duration (B, $DLG_timeout below): BYE to both.
-	if ($avp(num_class) == "emergency")
+	if ($avp(num_class) == "emergency") {
 		create_dialog("B");
-	else
+		$acc_extra(external) = "emergency";
+	} else {
 		create_dialog("BP");
+		$acc_extra(external) = "out";
+	}
 	# What the trunk may call: an emergency number always, anything else as its `allowed` says (",fixed,mobile,"),
 	# an international number only to a country code its `countries` lists (",32,44,": E.164 country codes, of one to
 	# three digits, are none the start of another). The North American plan (+1) is one code for many countries: `1`
@@ -825,6 +845,16 @@ route[trunk_out_loaded] {
 			t_reply(403, "Destination Not Allowed");
 			exit;
 		}
+		# The caller's rights (step 6b, FR-H3): the classes of their profile, among the trunk's; without a profile (none
+		# given, no default one), the trunk's alone.
+		if ($avp(o_allowed) != NULL && $(avp(o_allowed){s.index,$var(mark)}) == NULL) {
+			xlog("L_NOTICE", "call $ci: $avp(caller) to $avp(callee) refused ($avp(num_class), not in the caller's rights)\n");
+			append_to_reply("Twake-Call-Refused: rights\r\n");
+			t_reply(403, "Destination Not Allowed");
+			exit;
+		}
+		route(outbound_caps);
+		route(outbound_fraud);
 	}
 	# The operator's first server up (failover to the next ones: failure_route[trunk_failed]); for an emergency call,
 	# the default trunk's when none of this one's is up.
@@ -850,8 +880,11 @@ route[trunk_out_loaded] {
 	t_on_branch("trunk_out");
 	# An emergency call lasts until a party hangs up (no OPTIONS to the phone, above): never cut at TRUNK_MAX_CALL_SEC.
 	# A week bounds what the dialog module keeps.
+	# A minute cap nearly reached: the call ends when it is (route[outbound_caps], $avp(o_max_sec)).
 	if ($avp(num_class) == "emergency")
 		$DLG_timeout = 604800;
+	else if ($avp(o_max_sec) != NULL)
+		$DLG_timeout = $avp(o_max_sec);
 	else
 		$DLG_timeout = ${TRUNK_MAX_CALL_SEC};
 	$(avp(t_rang)[*]) = NULL;
@@ -880,6 +913,72 @@ route[trunk_out_loaded] {
 		t_reply(503, "Trunk Unavailable");
 	}
 	exit;
+}
+
+# The caps of the calls to the public network (step 6b, ADR 0017), of the caller's profile and of the organisation,
+# as twake_outbound() read them with the trunk: calls at the same time (the dialog profiles, this call counted in,
+# so that two calls at once never both pass), answered calls of the day or month (the CDRs, plus the calls in
+# progress), minutes of the day or month. A cap reached refuses the call (route[outbound_limit]); minutes nearly
+# reached end it when they are ($avp(o_max_sec), route[trunk_out_loaded]). Never an emergency call.
+route[outbound_caps] {
+	set_dlg_profile("trunk_caller", "$avp(caller)");
+	set_dlg_profile("trunk_out");
+	get_profile_size("trunk_caller", "$avp(caller)", $var(u_active));
+	get_profile_size("trunk_out", , $var(t_active));
+	if ($avp(o_uconc) != NULL && $avp(o_uconc) > 0 && $var(u_active) > $avp(o_uconc))
+		route(outbound_limit, "concurrent", "user");
+	if ($avp(o_tconc) != NULL && $avp(o_tconc) > 0 && $var(t_active) > $avp(o_tconc))
+		route(outbound_limit, "concurrent", "tenant");
+	if ($avp(o_ucalls) != NULL && $avp(o_ucalls) < $var(u_active))
+		route(outbound_limit, $avp(o_ucalls_p), "user");
+	if ($avp(o_tcalls) != NULL && $avp(o_tcalls) < $var(t_active))
+		route(outbound_limit, $avp(o_tcalls_p), "tenant");
+	if ($avp(o_secs) != NULL && $avp(o_secs) <= 0)
+		route(outbound_limit, $avp(o_secs_p), $avp(o_secs_s));
+	if ($avp(o_secs) != NULL && $avp(o_secs) < ${TRUNK_MAX_CALL_SEC})
+		$avp(o_max_sec) = $avp(o_secs);
+}
+
+# A cap reached ($param(1), of $param(2): user or tenant): the caller is told why (Twake-Call-Refused: limit), the
+# Gateway hears it for the administrators (E_TWAKEPHONE_LIMIT).
+route[outbound_limit] {
+	xlog("L_WARN", "call $ci: $avp(caller) to $avp(callee) refused, cap $param(1) of the $param(2) reached\n");
+	$(avp(ev_attr)[*]) = NULL;
+	$(avp(ev_val)[*]) = NULL;
+	$avp(ev_attr) = "caller";
+	$avp(ev_val) = $avp(caller);
+	$avp(ev_attr) = "number";
+	$avp(ev_val) = $avp(callee);
+	$avp(ev_attr) = "param";
+	$avp(ev_val) = $param(1);
+	$avp(ev_attr) = "scope";
+	$avp(ev_val) = $param(2);
+	$avp(ev_attr) = "callid";
+	$avp(ev_val) = $ci;
+	raise_event("E_TWAKEPHONE_LIMIT", $avp(ev_attr), $avp(ev_val));
+	append_to_reply("Twake-Call-Refused: limit\r\n");
+	t_reply(403, "Limit Reached");
+	exit;
+}
+
+# The volume thresholds (step 6b, fraud_detection): the caller's calls to this number's rule (+33, or any other),
+# the number without its +. Past a critical threshold, refused (Twake-Call-Refused: fraud); past a warning one, the
+# call goes on. The module raises the events itself. A number that is not E.164 (116xxx, as dialled) is not counted.
+route[outbound_fraud] {
+	if (!($avp(callee) =~ "^\+[0-9]{2,15}$"))
+		return(1);
+	$var(fraud_number) = $(avp(callee){s.substr,1,0});
+	check_fraud("$avp(caller)", "$var(fraud_number)", 1);
+	$var(fraud_rc) = $rc;
+	if ($var(fraud_rc) == -2) {
+		xlog("L_WARN", "call $ci: $avp(caller) to $avp(callee) refused, critical volume threshold crossed\n");
+		append_to_reply("Twake-Call-Refused: fraud\r\n");
+		t_reply(403, "Volume Threshold Reached");
+		exit;
+	}
+	if ($var(fraud_rc) == -3)
+		xlog("L_ERR", "call $ci: volume thresholds not checked (fraud_detection failed)\n");
+	return(1);
 }
 
 # What goes to the operator in a request of ours: only the headers a call needs, every other one a phone may have set
@@ -1148,8 +1247,8 @@ route[trunk_in] {
 	$var(ru_user) = "";
 	if ($rU =~ "^[A-Za-z0-9._+-]{1,64}$")
 		$var(ru_user) = $rU;
-	$var(did_query) = "SELECT CASE WHEN d.suffix_digits > 0 THEN right(n.num, d.suffix_digits) ELSE d.target END, t.codec_flags FROM (VALUES (CASE WHEN EXISTS (SELECT 1 FROM trunks b WHERE b.reg_aor <> '' AND b.auth_username = '" + $var(ru_user) + "') THEN 3 ELSE 1 END, '" + $var(n1) + "'), (2, '" + $var(n2) + "')) AS n(o, num) JOIN dids d ON length(d.first_number) = length(n.num) AND n.num BETWEEN d.first_number AND d.last_number JOIN trunks t ON t.id = d.trunk_id ORDER BY n.o, d.suffix_digits LIMIT 1";
-	async(sql_query_one("$var(did_query)", "$avp(did_target);$avp(t_codecs)"), trunk_in_loaded);
+	$var(did_query) = "SELECT CASE WHEN d.suffix_digits > 0 THEN right(n.num, d.suffix_digits) ELSE d.target END, t.codec_flags, coalesce(nullif(d.fallback, ''), t.fallback), t.domain, t.number_format FROM (VALUES (CASE WHEN EXISTS (SELECT 1 FROM trunks b WHERE b.reg_aor <> '' AND b.auth_username = '" + $var(ru_user) + "') THEN 3 ELSE 1 END, '" + $var(n1) + "'), (2, '" + $var(n2) + "')) AS n(o, num) JOIN dids d ON length(d.first_number) = length(n.num) AND n.num BETWEEN d.first_number AND d.last_number JOIN trunks t ON t.id = d.trunk_id ORDER BY n.o, d.suffix_digits LIMIT 1";
+	async(sql_query_one("$var(did_query)", "$avp(did_target);$avp(t_codecs);$avp(fallback_number);$avp(t_domain);$avp(t_format)"), trunk_in_loaded);
 }
 
 # $param(1), a number the operator sent, in E.164 ($var(inbound_number)): as the numbering plan reads what is dialled
@@ -1176,6 +1275,8 @@ route[trunk_in_loaded] {
 	if ($var(did_rc) < 0 && $var(did_rc) != -2)
 		xlog("L_WARN", "call $ci: direct numbers not read ($var(did_rc))\n");
 	if ($var(did_rc) < 0 || $avp(did_target) == NULL || !($avp(did_target) =~ "^[A-Za-z0-9._+-]{1,64}$")) {
+		if ($var(did_rc) > 0 && route(trunk_fallback, "no target"))
+			exit;
 		t_reply(404, "Not Found");
 		exit;
 	}
@@ -1189,6 +1290,22 @@ route[trunk_in_loaded] {
 	$avp(fwd_seen) = "," + $avp(did_target) + ",";
 	route(rules_next);
 	exit;
+}
+
+# The fallback number (step 6b, FR-C8) of a call from the operator to one of our direct numbers that does not go
+# through: nobody answers, everyone refuses or is busy, "do not disturb", no window can be reached, the number rings
+# nobody. The operator is asked to take the call there (302, its Contact the number as the trunk writes numbers, at
+# its domain), never told the failure the caller would hear; the direct number's own, else its trunk's
+# ($avp(fallback_number), read with it). Not a call the caller cancelled. 1 when answered so. When the trunk itself or
+# our Internet access is down, nothing reaches us: the forward is the operator's, set on its side (ADR 0017).
+route[trunk_fallback] {
+	if ($avp(fallback_number) == NULL || !($avp(fallback_number) =~ "^\+[1-9][0-9]{6,14}$") || t_was_cancelled())
+		return(-1);
+	route(trunk_number, $avp(fallback_number));
+	xlog("L_NOTICE", "call $ci: from the operator to $avp(callee), not through ($param(1)): to the fallback number $avp(fallback_number)\n");
+	append_to_reply("Contact: <sip:$var(trunk_number)@$avp(t_domain)>\r\n");
+	t_reply(302, "Moved Temporarily");
+	return(1);
 }
 
 # The call rings the windows found by the lookup ($ru and the branches). When the extension it rings has a busy or a
@@ -1925,6 +2042,8 @@ route[group_ring] {
 			rtpengine_delete();
 		route(account_missed);
 		route(calling);
+		if (route(trunk_fallback, "nobody of the group"))
+			exit;
 		t_reply(480, "Temporarily Unavailable");
 		exit;
 	}
@@ -2255,6 +2374,8 @@ route[unreachable] {
 		rtpengine_delete();
 	route(account_missed);
 	route(calling);
+	if (route(trunk_fallback, "unreachable"))
+		exit;
 	if ($avp(fwd_hops) == 0 && $avp(dialled_unread) != 1)
 		t_reply(404, "Not Found");
 	else
@@ -2394,6 +2515,8 @@ route[dnd_reply] {
 	$avp(ev_attr) = "code";
 	$avp(ev_val) = $var(dnd_code);
 	raise_event("E_TWAKEPHONE_DND", $avp(ev_attr), $avp(ev_val));
+	if (route(trunk_fallback, "do not disturb"))
+		exit;
 	if ($var(dnd_told) == 1)
 		t_reply(480, "Do Not Disturb");
 	else
@@ -2499,6 +2622,8 @@ route[relay_failed] {
 	if ($avp(rtp_on) != NULL)
 		rtpengine_delete();
 	route(account_missed);
+	if (route(trunk_fallback, "not sent"))
+		exit;
 	if ($var(relay_rc) == -6)
 		t_reply(477, "Send failed");
 	else
@@ -2726,9 +2851,12 @@ failure_route[call_failed] {
 		if ($avp(g_declines) != NULL && $avp(g_declines) >= $avp(g_windows)) {
 			$var(group_reply) = "" + $T_reply_code + " " + $(<reply>rr);
 			route(group_missed, $var(group_reply));
+			route(trunk_fallback, "the group declined");
 			exit;
 		}
 		route(group_missed, "480 Temporarily Unavailable");
+		if (route(trunk_fallback, "the group did not answer"))
+			exit;
 		t_reply(480, "Temporarily Unavailable");
 		exit;
 	}
@@ -2774,7 +2902,9 @@ failure_route[call_failed] {
 	if ($avp(d_dnd) == 1)
 		route(dnd_refuse_dialled);
 	# Else the caller gets the best failure (the one tm picked, for the extension that rang), the media session is
-	# freed, the missed call accounted.
+	# freed, the missed call accounted; a call from the operator goes to its fallback number instead.
 	rtpengine_delete();
 	route(account_missed);
+	$var(failed) = "" + $T_reply_code;
+	route(trunk_fallback, $var(failed));
 }

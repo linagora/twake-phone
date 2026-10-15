@@ -189,6 +189,7 @@ services:
       TRUNK_ALLOWED:
       TRUNK_COUNTRIES:
       TRUNK_DIDS:
+      TRUNK_FALLBACK_NUMBER:
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/ready').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"]
       start_period: 120s

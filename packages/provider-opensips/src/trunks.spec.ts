@@ -38,7 +38,7 @@ describe('projectTrunks', () => {
   it("writes the operator's servers in order, probed, its other addresses only recognised, and the registration", () => {
     const p = projectTrunks([OPERATOR], DIDS, 'udp:192.0.2.1:5070')
     const ha1 = `0x${createHash('md5').update('0033199000100:operator.example:not-a-real-password').digest('hex')}`
-    expect(p.trunks).toEqual([['operator', 1, 0, 'sip.operator.example', 'international-00', 0, '0033199000100', ha1, 'operator.example', 'codec-strip-all codec-except-PCMA codec-except-PCMU codec-except-telephone-event', '+33199000100', 'sip:0033199000100@sip.operator.example', ',fixed,mobile,freephone,standard-rate,', '']])
+    expect(p.trunks).toEqual([['operator', 1, 0, 'sip.operator.example', 'international-00', 0, '0033199000100', ha1, 'operator.example', 'codec-strip-all codec-except-PCMA codec-except-PCMU codec-except-telephone-event', '+33199000100', 'sip:0033199000100@sip.operator.example', ',fixed,mobile,freephone,standard-rate,', '', '']])
     // The dispatcher tries the highest priority first (algorithm 8): the first server gets the calls, the second one
     // takes over. The other addresses: in a set of their own that no call is sent to (ds_select_dst is only ever given
     // a trunk's own set), never probed: with every server down, a call fails at once rather than going to one of them.
@@ -60,8 +60,8 @@ describe('projectTrunks', () => {
     // Registered from the trunk socket, with no other address declared (ARCHITECTURE §13), through the first server.
     expect(p.registrant).toEqual([['sip:sip.operator.example', 'sip:sbc1.operator.example:5060', 'sip:0033199000100@sip.operator.example', '0033199000100', ha1, 'sip:0033199000100@192.0.2.1:5070', 600, 'udp:192.0.2.1:5070']])
     expect(p.dids).toEqual([
-      ['d2', 'operator', '+33199000110', '+33199000119', '', 3],
-      ['d1', 'operator', '+33199000101', '+33199000101', '101', 0]
+      ['d2', 'operator', '+33199000110', '+33199000119', '', 3, ''],
+      ['d1', 'operator', '+33199000101', '+33199000101', '101', 0, '']
     ])
   })
 
@@ -162,6 +162,8 @@ if (process.env.TEST_DATABASE_URL) {
     const ready = async () => undefined
     beforeAll(async () => {
       await pool.query('DROP SCHEMA IF EXISTS spec_trunks CASCADE; CREATE SCHEMA spec_trunks')
+      // The tables the outbound rules read too (`subscriber`, `acc`: step 6b), as the Compose stack creates them.
+      await pool.query(SUBSCRIBER_SQL)
       await pool.query(TRUNK_SQL)
       // Twice: what entrypoint.sh does at each start.
       await pool.query(TRUNK_SQL)
@@ -262,6 +264,8 @@ if (process.env.TEST_DATABASE_URL) {
       // first trunk and its own; what it may call; and, for a number called that is one of ours, what it rings.
       const outbound = async (ext: string, called = '+33639980001') => (await pool.query(scriptQuery('trunk_query', { ext, called }))).rows[0] as Record<string, unknown> | undefined
       expect(await outbound('101')).toMatchObject({ setid: 1, presented: '+33199000101', number_format: 'international-00', allowed: ',fixed,mobile,freephone,standard-rate,', internal: null })
+      // No outbound rules (step 6b): no rights profile, no cap.
+      expect(await outbound('101')).toMatchObject({ rights: null, user_concurrent: 0, tenant_concurrent: 0, user_calls_left: 1_000_000_000, seconds_left: 1_000_000_000, seconds_param: '' })
       expect(await outbound('115')).toMatchObject({ setid: 1, presented: '+33199000115' })
       expect(await outbound('102')).toMatchObject({ setid: 1, presented: '+33199000100' })
       expect(await outbound('1150')).toMatchObject({ presented: '+33199000100' })

@@ -97,6 +97,8 @@ export const parseTrunk = (body: unknown, current?: Pick<TrunkRecord, 'passwordE
   if (b.default !== undefined && typeof b.default !== 'boolean') throw invalid('default: true or false')
   const defaultNumber = text(b, 'defaultNumber', v => E164.test(v), 'an E.164 number (+ then 7 to 15 digits)')
   if (!defaultNumber) throw invalid('defaultNumber: the number presented by those without a direct number is required')
+  // Step 6b (FR-C8): where the operator is asked to take a call to one of its direct numbers that does not go through.
+  const fallbackNumber = text(b, 'fallbackNumber', v => E164.test(v), 'an E.164 number (+ then 7 to 15 digits) the trunk may call')
   let password: string | null | undefined
   if (b.password === null) password = null
   else if (b.password !== undefined) {
@@ -122,7 +124,8 @@ export const parseTrunk = (body: unknown, current?: Pick<TrunkRecord, 'passwordE
       ...(allowed ? { allowed } : {}),
       ...(countries ? { countries } : {}),
       ...(b.default ? { default: true } : {}),
-      defaultNumber
+      defaultNumber,
+      ...(fallbackNumber ? { fallbackNumber } : {})
     },
     password
   }
@@ -142,6 +145,16 @@ const reservedSuffixes = (first: string, last: string, digits: number): string[]
 
 /** Whether two ranges share a number. */
 const overlap = (a: Pick<DidRange, 'first' | 'last'>, b: Pick<DidRange, 'first' | 'last'>) => a.first.length === b.first.length && a.first <= b.last && b.first <= a.last
+
+/**
+ * A fallback number that is one of the tenant's own direct numbers: the operator would send the call back to us, and
+ * we to it again. Refused (409, FALLBACK_LOOP).
+ */
+export const checkFallbackLoop = (number: string | undefined, ranges: readonly Pick<DidRange, 'id' | 'first' | 'last'>[]) => {
+  if (!number) return
+  const own = ranges.find(r => overlap(r, { first: number, last: number }))
+  if (own) throw Object.assign(new Error(`fallbackNumber: ${number} is one of our own direct numbers (${own.id}): the call would come back`), { statusCode: 409, code: 'FALLBACK_LOOP' })
+}
 
 /**
  * A range of direct numbers as an administrator writes it (PUT /admin/dids/:id), checked against the trunks and the
@@ -174,7 +187,13 @@ export const parseDid = (id: string, body: unknown, trunks: readonly Pick<TrunkR
   }
   const clash = others.find(o => o.id !== id && overlap(o, { first, last }))
   if (clash) throw Object.assign(new Error(`${clash.first}${clash.last !== clash.first ? ` to ${clash.last}` : ''} (${clash.id}) has some of these numbers already`), { statusCode: 409, code: 'DID_OVERLAP' })
-  return { id, trunkId: b.trunkId, first, last, ...(target ? { target } : {}), ...(suffixDigits ? { suffixDigits } : {}) }
+  // Its own fallback number (step 6b), in place of its trunk's.
+  const fallbackNumber = text(b, 'fallbackNumber', v => E164.test(v), 'an E.164 number (+ then 7 to 15 digits) the trunk may call')
+  const ranges = [...others.filter(o => o.id !== id), { id, first, last }]
+  checkFallbackLoop(fallbackNumber, ranges)
+  // This range must not take in a fallback number of another range either.
+  for (const o of others) if (o.id !== id && o.fallbackNumber) checkFallbackLoop(o.fallbackNumber, [{ id, first, last }])
+  return { id, trunkId: b.trunkId, first, last, ...(target ? { target } : {}), ...(suffixDigits ? { suffixDigits } : {}), ...(fallbackNumber ? { fallbackNumber } : {}) }
 }
 
 /** A trunk as the API shows it: never its password, whether it has one. */
@@ -214,7 +233,7 @@ export const providerTrunks = (records: readonly TrunkRecord[], key: Buffer | un
  * (comma-separated), TRUNK_USERNAME, TRUNK_PASSWORD, TRUNK_REALM, TRUNK_REGISTRAR, TRUNK_EXPIRES, TRUNK_CODECS
  * (PCMA,PCMU by default), TRUNK_NUMBER_FORMAT, TRUNK_ASSERT_IDENTITY=1, TRUNK_ALLOWED (comma-separated classes:
  * fixed, mobile, freephone, standard-rate by default; overseas, international on demand), TRUNK_COUNTRIES (with
- * international: the country codes it calls, comma-separated); TRUNK_DIDS, comma-separated
+ * international: the country codes it calls, comma-separated), TRUNK_FALLBACK_NUMBER (step 6b); TRUNK_DIDS, comma-separated
  * `FIRST[..LAST]=TARGET` where TARGET is an extension or a group, or `last:N` for the extension made of the last N
  * digits of the number called. Undefined without TRUNK_DOMAIN; throws on anything invalid (named).
  */
@@ -244,7 +263,8 @@ export const trunkFromEnv = (env: NodeJS.ProcessEnv): { id: string; parsed: Retu
       ...(env.TRUNK_ASSERT_IDENTITY === '1' ? { assertIdentity: true } : {}),
       ...(env.TRUNK_ALLOWED ? { allowed: csv(env.TRUNK_ALLOWED) } : {}),
       ...(env.TRUNK_COUNTRIES ? { countries: csv(env.TRUNK_COUNTRIES) } : {}),
-      defaultNumber: env.TRUNK_DEFAULT_NUMBER
+      defaultNumber: env.TRUNK_DEFAULT_NUMBER,
+      ...(env.TRUNK_FALLBACK_NUMBER ? { fallbackNumber: env.TRUNK_FALLBACK_NUMBER } : {})
     })
   } catch (err) {
     return at('TRUNK_*')(err)
@@ -259,5 +279,10 @@ export const trunkFromEnv = (env: NodeJS.ProcessEnv): { id: string; parsed: Retu
       at(`TRUNK_DIDS ${entry}`)(err)
     }
   })
+  try {
+    checkFallbackLoop(parsed.config.fallbackNumber, dids)
+  } catch (err) {
+    at('TRUNK_FALLBACK_NUMBER')(err)
+  }
   return { id, parsed, dids }
 }

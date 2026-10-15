@@ -4,6 +4,7 @@ import type { SecretProvisioner } from '@twake/telephony-provider-sdk'
 import { CALL_GROUPS_SCHEMA, CallGroups, DISPLAY_NAMES_SCHEMA, type CallGroupsOptions } from './call-groups.js'
 import { CALL_RULES_SCHEMA, CallRules, type CallRulesOptions } from './call-rules.js'
 import { PUSH_TARGETS_SCHEMA, PushTargets, type PushTargetsOptions } from './push-targets.js'
+import { ACC_EXTERNAL_SQL, OutboundTables, type OutboundTablesOptions } from './outbound.js'
 import { TRUNK_SCHEMA, TrunkTables, type TrunkTablesOptions } from './trunks.js'
 
 // Everything about OpenSIPS's `subscriber` table (module auth_db) lives here: the Gateway only sees a SecretProvisioner.
@@ -109,9 +110,11 @@ export const EXTRA_COLUMNS = [
   ['acc', 'caller', ACC_EXTRA],
   ['acc', 'callee', ACC_EXTRA],
   ['acc', 'dialled', ACC_EXTRA],
+  ['acc', 'external', ACC_EXTRA],
   ['missed_calls', 'caller', ACC_EXTRA],
   ['missed_calls', 'callee', ACC_EXTRA],
   ['missed_calls', 'dialled', ACC_EXTRA],
+  ['missed_calls', 'external', ACC_EXTRA],
   ['call_rules', 'tenant_id', "TEXT DEFAULT '' NOT NULL"],
   ['call_rules', 'holder', "TEXT DEFAULT '' NOT NULL"],
   ['call_rules', 'forward_always_holder', 'TEXT'],
@@ -126,7 +129,7 @@ const addColumn = ([table, column, definition]: (typeof EXTRA_COLUMNS)[number]) 
  * docker/opensips/subscriber.sql: the schema then the extra columns, plainly (it runs once, when the Compose stack
  * creates the database, as its owner).
  */
-export const SUBSCRIBER_SQL = `${SUBSCRIBER_SCHEMA.trimEnd()}\n${EXTRA_COLUMNS.map(addColumn).join('\n')}\n`
+export const SUBSCRIBER_SQL = `${SUBSCRIBER_SCHEMA.trimEnd()}\n${EXTRA_COLUMNS.map(addColumn).join('\n')}\n${ACC_EXTERNAL_SQL}`
 
 /** How long adding a missing column may wait for its lock (an acc table busy with CDR inserts) before giving up. */
 const ALTER_LOCK_TIMEOUT = '2s'
@@ -225,6 +228,8 @@ export class SubscriberProvisioner implements SecretProvisioner {
       )
       if (added) this.holderColumn = true
     }
+    // The index the caps read `acc` by (step 6b), once its column is there: created once, never again.
+    await this.pool.query(ACC_EXTERNAL_SQL).catch((err: unknown) => this.log.warn(`OpenSIPS tables: acc.external or its index not added (${err instanceof Error ? err.message : String(err)}); the caps of calls to the public network read the CDRs without it`))
     const { rows } = (await this.pool.query("SELECT table_name, table_version FROM version WHERE table_name IN ('subscriber', 'acc', 'missed_calls')")) as { rows: { table_name: string; table_version: number }[] }
     for (const [table, expected] of [['subscriber', SUBSCRIBER_TABLE_VERSION], ['acc', ACC_TABLE_VERSION], ['missed_calls', MISSED_CALLS_TABLE_VERSION]] as const) {
       const version = rows.find(r => r.table_name === table)?.table_version
@@ -336,6 +341,11 @@ export class SubscriberProvisioner implements SecretProvisioner {
   /** The trunks and direct numbers of the same database, on the same connections (see TrunkTablesOptions). */
   trunkTables(opts: Omit<TrunkTablesOptions, 'pool'> = {}) {
     return new TrunkTables({ pool: this.pool, ...opts })
+  }
+
+  /** The outbound policy of the same database (step 6b), on the same connections. */
+  outboundTables(opts: Omit<OutboundTablesOptions, 'pool'> = {}) {
+    return new OutboundTables({ pool: this.pool, ...opts })
   }
 
   async close() {

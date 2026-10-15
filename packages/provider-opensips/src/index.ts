@@ -1,8 +1,9 @@
 import type { MediaProvider, ProviderFactory, RoutedEvent, TelephonyProvider } from '@twake/telephony-provider-sdk'
-import type { Call, Capabilities, DidRange, Endpoint, ForwardingRules, MediaSession, OriginateRequest, Presence, ProviderStatus, RingGroup, Trunk, User } from '@twake/telephony-types'
+import type { Call, Capabilities, DidRange, Endpoint, ForwardingRules, MediaSession, OriginateRequest, OutboundAssignment, OutboundPolicy, OutboundProfile, Presence, ProviderStatus, RingGroup, Trunk, User } from '@twake/telephony-types'
 import type { CallGroups } from './call-groups.js'
 import type { CallRules } from './call-rules.js'
 import type { PushTargets } from './push-targets.js'
+import type { OutboundTables } from './outbound.js'
 import type { TrunkTables } from './trunks.js'
 import { OpensipsEvents, parseDlgList, parseUlDump, type EventsLogger } from './events.js'
 import { AsyncQueue } from './queue.js'
@@ -10,13 +11,14 @@ import { CallTracker } from './tracker.js'
 
 export { SubscriberProvisioner, digestHashes, SUBSCRIBER_SCHEMA, SUBSCRIBER_SQL, EXTRA_COLUMNS, SUBSCRIBER_TABLE_VERSION, ACC_TABLE_VERSION, MISSED_CALLS_TABLE_VERSION, type SubscriberProvisionerOptions, type Queryable } from './subscriber.js'
 export { OpensipsEvents, parseDlgList, parseUlDump, parseUdpUrl, type EventsLogger, type OpensipsEventsOptions, type RegisteredContact } from './events.js'
-export { CallTracker, userOf, isExternalParty, type ContactRegistration, type TelephonyPresence } from './tracker.js'
+export { CallTracker, alertOf, userOf, isExternalParty, type ContactRegistration, type TelephonyPresence } from './tracker.js'
 export { CallRules, CALL_RULES_SCHEMA, DND_MESSAGE_MAX, NOANSWER_DELAY, type CallRulesOptions, type DndRule, type ExtensionHolder } from './call-rules.js'
 export { CallGroups, CALL_GROUPS_SCHEMA, DISPLAY_NAMES_SCHEMA, GROUP_MEMBERS_MAX, NAME_MAX, sipDisplayName, type CallGroupsOptions } from './call-groups.js'
 export { PushTargets, PUSH_TARGETS_SCHEMA, type PushTargetsOptions } from './push-targets.js'
 export { AsyncQueue } from './queue.js'
 export { TrunkTables, TRUNK_SCHEMA, TRUNK_SQL, DEFAULT_TRUNK_SOCKET, SOURCES_SET, DISPATCHER_TABLE_VERSION, DIALPLAN_TABLE_VERSION, REGISTRANT_TABLE_VERSION, codecFlags, projectTrunks, trunkSecret, type TrunkTablesOptions } from './trunks.js'
-export { DIALPLAN_RULES, DIALPLAN_SQL, DP_CLASSIFY, DP_INBOUND, DP_NORMALISE, OUTBOUND_ALLOWABLE, OUTBOUND_ALLOWED, classify, translate, type DialplanRule, type NumberClass } from './numbering.js'
+export { OutboundTables, OUTBOUND_SCHEMA, ACC_EXTERNAL_SQL, FRAUD_PROFILE, FRAUD_RULE_INTERNATIONAL, FRAUD_RULE_NATIONAL, FRAUD_TABLE_VERSION, DR_TABLE_VERSIONS, NO_CAP_LEFT, CAP_MAX, PROFILE_ID, fraudRow, projectOutbound, type OutboundTablesOptions } from './outbound.js'
+export { DIALPLAN_RULES, DIALPLAN_SQL, DP_CLASSIFY, DP_INBOUND, DP_NORMALISE, OUTBOUND_ALLOWABLE, OUTBOUND_ALLOWED, classify, countryAllowed, translate, type DialplanRule, type NumberClass } from './numbering.js'
 
 /**
  * The event the Gateway raises itself through the MI after each subscription to tell it hears OpenSIPS
@@ -24,7 +26,10 @@ export { DIALPLAN_RULES, DIALPLAN_SQL, DP_CLASSIFY, DP_INBOUND, DP_NORMALISE, OU
  */
 export const PROBE_EVENT = 'E_TWAKEPHONE_PROBE'
 
-/** The events the Gateway listens to: registrations and their refreshes (usrloc), our own call events (opensips.cfg.tpl), the CDRs and missed calls (acc). */
+/**
+ * The events the Gateway listens to: registrations and their refreshes (usrloc), our own call events (opensips.cfg.tpl),
+ * the CDRs and missed calls (acc), the thresholds crossed (fraud_detection) and the caps reached (step 6b).
+ */
 export const SUBSCRIBED_EVENTS = [
   'E_UL_CONTACT_INSERT',
   'E_UL_CONTACT_UPDATE',
@@ -38,7 +43,10 @@ export const SUBSCRIBED_EVENTS = [
   'E_TWAKEPHONE_WAKE',
   PROBE_EVENT,
   'E_ACC_CDR',
-  'E_ACC_MISSED_EVENT'
+  'E_ACC_MISSED_EVENT',
+  'E_FRD_WARNING',
+  'E_FRD_CRITICAL',
+  'E_TWAKEPHONE_LIMIT'
 ]
 
 // Everything OpenSIPS-specific stays inside this package: the Gateway and the app only see the provider contract.
@@ -88,6 +96,11 @@ export interface OpensipsConfig {
    * reloaded through the MI when they change. Without it, no call to or from the public network.
    */
   trunks?: TrunkTables
+  /**
+   * The rights profiles, caps and volume thresholds OpenSIPS applies to the calls to the public network (ADR 0017):
+   * its fraud_detection reloads the thresholds through the MI when they change. Without it, what the trunks allow.
+   */
+  outbound?: OutboundTables
   /**
    * The SIP accounts (`subscriber`) OpenSIPS authenticates and routes by: `reconcile` removes those the Gateway
    * wrote for a user who no longer holds the extension, and returns their extensions (SubscriberProvisioner's
@@ -217,6 +230,7 @@ export class OpensipsProvider implements TelephonyProvider, MediaProvider {
       groups: !!this.config.callGroups,
       push: !!this.config.pushTargets && !!this.events,
       trunks: !!this.config.trunks,
+      outboundPolicy: !!this.config.trunks && !!this.config.outbound,
       conference: { dialIn: false, dialOut: false }
     }
   }
@@ -345,6 +359,31 @@ export class OpensipsProvider implements TelephonyProvider, MediaProvider {
     if (failed.length) {
       log.warn(`OpenSIPS: trunks written, ${failed.join(', ')} failed: not applied until it reloads them or restarts`)
       throw Object.assign(new Error(`OpenSIPS did not reload the trunks: ${failed.join(', ')}`), { statusCode: 502, code: 'TRUNK_RELOAD_FAILED' })
+    }
+  }
+
+  /**
+   * The outbound policy of the tenant (ADR 0017), written into OpenSIPS's database: the next call reads the rights
+   * and caps; the thresholds apply once OpenSIPS reloaded them (fraud_reload, only when they changed). A reload that
+   * fails fails the change (502, code OUTBOUND_RELOAD_FAILED: written, asked again at the next change). Without the
+   * MI, OpenSIPS reads them at its next start.
+   */
+  async setOutboundPolicy(policy: OutboundPolicy, profiles: OutboundProfile[], assignments: OutboundAssignment[]) {
+    if (!this.config.outbound) throw Object.assign(new Error('Outbound policies are not available on this platform'), { statusCode: 501 })
+    const changed = await this.config.outbound.set(policy, profiles, assignments)
+    if (!changed.fraud && !this.pendingReloads.has('fraud_reload')) return
+    if (!this.events) {
+      ;(this.config.logger ?? console).warn('OpenSIPS: thresholds written, fraud_reload not asked (no MI): OpenSIPS reads them at its next start')
+      return
+    }
+    try {
+      await this.events.call('fraud_reload')
+      this.pendingReloads.delete('fraud_reload')
+    } catch (err) {
+      this.pendingReloads.add('fraud_reload')
+      const why = err instanceof Error ? err.message : String(err)
+      ;(this.config.logger ?? console).warn(`OpenSIPS: thresholds written, fraud_reload failed (${why}): not applied until it reloads them or restarts`)
+      throw Object.assign(new Error(`OpenSIPS did not reload the thresholds: ${why}`), { statusCode: 502, code: 'OUTBOUND_RELOAD_FAILED' })
     }
   }
 

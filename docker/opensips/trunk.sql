@@ -74,6 +74,148 @@ CREATE TABLE IF NOT EXISTS dids (
     suffix_digits SMALLINT DEFAULT 0 NOT NULL
 );
 CREATE INDEX IF NOT EXISTS dids_first_number_idx ON dids (first_number);
+ALTER TABLE trunks ADD COLUMN IF NOT EXISTS fallback VARCHAR(16) DEFAULT '' NOT NULL;
+ALTER TABLE dids ADD COLUMN IF NOT EXISTS fallback VARCHAR(16) DEFAULT '' NOT NULL;
+
+CREATE TABLE IF NOT EXISTS outbound_settings (
+    tenant_id TEXT PRIMARY KEY NOT NULL,
+    default_profile VARCHAR(32) DEFAULT '' NOT NULL,
+    concurrent INTEGER DEFAULT 0 NOT NULL,
+    daily_calls INTEGER DEFAULT 0 NOT NULL,
+    daily_minutes INTEGER DEFAULT 0 NOT NULL,
+    monthly_calls INTEGER DEFAULT 0 NOT NULL,
+    monthly_minutes INTEGER DEFAULT 0 NOT NULL
+);
+CREATE TABLE IF NOT EXISTS outbound_profiles (
+    tenant_id TEXT DEFAULT '' NOT NULL,
+    id VARCHAR(32) NOT NULL,
+    allowed VARCHAR(128) DEFAULT ',,' NOT NULL,
+    concurrent INTEGER DEFAULT 0 NOT NULL,
+    daily_calls INTEGER DEFAULT 0 NOT NULL,
+    daily_minutes INTEGER DEFAULT 0 NOT NULL,
+    monthly_calls INTEGER DEFAULT 0 NOT NULL,
+    monthly_minutes INTEGER DEFAULT 0 NOT NULL,
+    PRIMARY KEY (tenant_id, id)
+);
+CREATE TABLE IF NOT EXISTS outbound_users (
+    tenant_id TEXT DEFAULT '' NOT NULL,
+    user_id TEXT NOT NULL,
+    profile_id VARCHAR(32) NOT NULL,
+    PRIMARY KEY (tenant_id, user_id)
+);
+CREATE TABLE IF NOT EXISTS fraud_detection (
+    ruleid SERIAL PRIMARY KEY NOT NULL,
+    profileid INTEGER NOT NULL,
+    prefix VARCHAR(64) NOT NULL,
+    start_hour VARCHAR(5) DEFAULT '00:00' NOT NULL,
+    end_hour VARCHAR(5) DEFAULT '23:59' NOT NULL,
+    daysoftheweek VARCHAR(64) DEFAULT 'Mon-Sun' NOT NULL,
+    cpm_warning INTEGER DEFAULT 0 NOT NULL,
+    cpm_critical INTEGER DEFAULT 0 NOT NULL,
+    call_duration_warning INTEGER DEFAULT 0 NOT NULL,
+    call_duration_critical INTEGER DEFAULT 0 NOT NULL,
+    total_calls_warning INTEGER DEFAULT 0 NOT NULL,
+    total_calls_critical INTEGER DEFAULT 0 NOT NULL,
+    concurrent_calls_warning INTEGER DEFAULT 0 NOT NULL,
+    concurrent_calls_critical INTEGER DEFAULT 0 NOT NULL,
+    sequential_calls_warning INTEGER DEFAULT 0 NOT NULL,
+    sequential_calls_critical INTEGER DEFAULT 0 NOT NULL
+);
+CREATE TABLE IF NOT EXISTS dr_gateways (
+    id SERIAL PRIMARY KEY NOT NULL,
+    gwid VARCHAR(64) NOT NULL,
+    type INTEGER DEFAULT 0 NOT NULL,
+    address VARCHAR(128) NOT NULL,
+    strip INTEGER DEFAULT 0 NOT NULL,
+    pri_prefix VARCHAR(16) DEFAULT NULL,
+    attrs VARCHAR(255) DEFAULT NULL,
+    probe_mode INTEGER DEFAULT 0 NOT NULL,
+    state INTEGER DEFAULT 0 NOT NULL,
+    socket VARCHAR(128) DEFAULT NULL,
+    description VARCHAR(128) DEFAULT NULL,
+    CONSTRAINT dr_gateways_dr_gw_idx UNIQUE (gwid)
+);
+CREATE TABLE IF NOT EXISTS dr_rules (
+    ruleid SERIAL PRIMARY KEY NOT NULL,
+    groupid VARCHAR(255) NOT NULL,
+    prefix VARCHAR(64) NOT NULL,
+    timerec VARCHAR(255) DEFAULT NULL,
+    priority INTEGER DEFAULT 0 NOT NULL,
+    routeid VARCHAR(255) DEFAULT NULL,
+    gwlist VARCHAR(255),
+    sort_alg VARCHAR(1) DEFAULT 'N' NOT NULL,
+    sort_profile INTEGER DEFAULT NULL,
+    attrs VARCHAR(255) DEFAULT NULL,
+    description VARCHAR(128) DEFAULT NULL
+);
+CREATE TABLE IF NOT EXISTS dr_carriers (
+    id SERIAL PRIMARY KEY NOT NULL,
+    carrierid VARCHAR(64) NOT NULL,
+    gwlist VARCHAR(255) NOT NULL,
+    flags INTEGER DEFAULT 0 NOT NULL,
+    sort_alg VARCHAR(1) DEFAULT 'N' NOT NULL,
+    state INTEGER DEFAULT 0 NOT NULL,
+    attrs VARCHAR(255) DEFAULT NULL,
+    description VARCHAR(128) DEFAULT NULL,
+    CONSTRAINT dr_carriers_dr_carrier_idx UNIQUE (carrierid)
+);
+CREATE TABLE IF NOT EXISTS dr_groups (
+    id SERIAL PRIMARY KEY NOT NULL,
+    username VARCHAR(64) NOT NULL,
+    domain VARCHAR(128) DEFAULT NULL,
+    groupid INTEGER DEFAULT 0 NOT NULL,
+    description VARCHAR(128) DEFAULT NULL
+);
+INSERT INTO version (table_name, table_version) VALUES ('fraud_detection', 1), ('dr_gateways', 6), ('dr_rules', 4), ('dr_carriers', 3), ('dr_groups', 2)
+  ON CONFLICT (table_name) DO NOTHING;
+INSERT INTO fraud_detection (ruleid, profileid, prefix, cpm_warning, cpm_critical, total_calls_warning, total_calls_critical, concurrent_calls_warning, concurrent_calls_critical, sequential_calls_warning, sequential_calls_critical, call_duration_warning, call_duration_critical) VALUES
+  (1, 1, '33', 6, 20, 150, 500, 3, 0, 10, 40, 14400, 0),
+  (2, 1, '', 3, 6, 20, 60, 2, 4, 5, 15, 3600, 0)
+  ON CONFLICT (ruleid) DO NOTHING;
+SET check_function_bodies = false;
+CREATE OR REPLACE FUNCTION twake_outbound(ext TEXT, tenant TEXT)
+RETURNS TABLE (allowed TEXT, user_concurrent INTEGER, tenant_concurrent INTEGER, user_calls_left INTEGER, user_calls_param TEXT, tenant_calls_left INTEGER, tenant_calls_param TEXT, seconds_left INTEGER, seconds_param TEXT, seconds_scope TEXT)
+LANGUAGE sql STABLE AS $twake$
+WITH s AS (SELECT * FROM outbound_settings WHERE tenant_id = tenant),
+p AS (
+  SELECT pr.* FROM s JOIN outbound_profiles pr ON pr.tenant_id = s.tenant_id AND pr.id = coalesce(
+    (SELECT ou.profile_id FROM outbound_users ou JOIN subscriber sb ON sb.holder = ou.user_id WHERE ou.tenant_id = tenant AND sb.username = ext LIMIT 1),
+    nullif(s.default_profile, ''))
+),
+u AS (
+  SELECT
+    count(*) FILTER (WHERE a.caller = ext AND a.time >= date_trunc('day', localtimestamp))::int AS user_day_calls,
+    count(*) FILTER (WHERE a.caller = ext)::int AS user_month_calls,
+    coalesce(sum(a.duration) FILTER (WHERE a.caller = ext AND a.time >= date_trunc('day', localtimestamp)), 0)::int AS user_day_sec,
+    coalesce(sum(a.duration) FILTER (WHERE a.caller = ext), 0)::int AS user_month_sec,
+    count(*) FILTER (WHERE a.time >= date_trunc('day', localtimestamp))::int AS day_calls,
+    count(*)::int AS month_calls,
+    coalesce(sum(a.duration) FILTER (WHERE a.time >= date_trunc('day', localtimestamp)), 0)::int AS day_sec,
+    coalesce(sum(a.duration), 0)::int AS month_sec
+  FROM acc a WHERE a.external = 'out' AND a.time >= date_trunc('month', localtimestamp) AND EXISTS (SELECT 1 FROM s)
+),
+c (scope, param, unit, left_) AS (
+  SELECT 'user', 'dailyCalls', 'calls', p.daily_calls - u.user_day_calls FROM p, u WHERE p.daily_calls > 0
+  UNION ALL SELECT 'user', 'monthlyCalls', 'calls', p.monthly_calls - u.user_month_calls FROM p, u WHERE p.monthly_calls > 0
+  UNION ALL SELECT 'user', 'dailyMinutes', 'seconds', p.daily_minutes * 60 - u.user_day_sec FROM p, u WHERE p.daily_minutes > 0
+  UNION ALL SELECT 'user', 'monthlyMinutes', 'seconds', p.monthly_minutes * 60 - u.user_month_sec FROM p, u WHERE p.monthly_minutes > 0
+  UNION ALL SELECT 'tenant', 'dailyCalls', 'calls', s.daily_calls - u.day_calls FROM s, u WHERE s.daily_calls > 0
+  UNION ALL SELECT 'tenant', 'monthlyCalls', 'calls', s.monthly_calls - u.month_calls FROM s, u WHERE s.monthly_calls > 0
+  UNION ALL SELECT 'tenant', 'dailyMinutes', 'seconds', s.daily_minutes * 60 - u.day_sec FROM s, u WHERE s.daily_minutes > 0
+  UNION ALL SELECT 'tenant', 'monthlyMinutes', 'seconds', s.monthly_minutes * 60 - u.month_sec FROM s, u WHERE s.monthly_minutes > 0
+),
+uc AS (SELECT * FROM c WHERE scope = 'user' AND unit = 'calls' ORDER BY left_ LIMIT 1),
+tc AS (SELECT * FROM c WHERE scope = 'tenant' AND unit = 'calls' ORDER BY left_ LIMIT 1),
+sc AS (SELECT * FROM c WHERE unit = 'seconds' ORDER BY left_, scope DESC LIMIT 1)
+SELECT
+  (SELECT p.allowed FROM p)::text,
+  coalesce((SELECT p.concurrent FROM p), 0),
+  coalesce((SELECT s.concurrent FROM s), 0),
+  coalesce((SELECT left_ FROM uc), 1000000000), coalesce((SELECT param FROM uc), ''),
+  coalesce((SELECT left_ FROM tc), 1000000000), coalesce((SELECT param FROM tc), ''),
+  coalesce((SELECT left_ FROM sc), 1000000000), coalesce((SELECT param FROM sc), ''), coalesce((SELECT scope FROM sc), '')
+$twake$;
+RESET check_function_bodies;
 DELETE FROM dialplan WHERE dpid IN (1, 2, 3, 4);
 INSERT INTO dialplan (dpid, pr, match_op, match_exp, match_flags, subst_exp, repl_exp, disabled, attrs) VALUES
   (1, 10, 1, '^(1[578]|11[2459]|19[167]|116000|116117)$', 0, '^(.*)$', '\1', 0, 'emergency'),
@@ -112,3 +254,16 @@ INSERT INTO dialplan (dpid, pr, match_op, match_exp, match_flags, subst_exp, rep
   (3, 10, 1, '^([1-9][0-9]{8})$', 0, '^([1-9][0-9]{8})$', '+33\1', 0, 'e164'),
   (4, 10, 1, '^\+1(24[26]|26[48]|284|345|441|473|649|658|664|721)', 0, '^(.*)$', '\1', 0, 'international'),
   (4, 10, 1, '^\+1(758|767|784|8[024]9|86[89]|876)', 0, '^(.*)$', '\1', 0, 'international');
+DO $twake$
+BEGIN
+  IF to_regclass('acc') IS NOT NULL AND NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'acc' AND column_name = 'external') THEN
+    ALTER TABLE acc ADD COLUMN external VARCHAR(64) DEFAULT '' NOT NULL;
+  END IF;
+  IF to_regclass('missed_calls') IS NOT NULL AND NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'missed_calls' AND column_name = 'external') THEN
+    ALTER TABLE missed_calls ADD COLUMN external VARCHAR(64) DEFAULT '' NOT NULL;
+  END IF;
+  IF to_regclass('acc') IS NOT NULL AND to_regclass('acc_external_idx') IS NULL THEN
+    CREATE INDEX acc_external_idx ON acc (external, time);
+  END IF;
+END
+$twake$;

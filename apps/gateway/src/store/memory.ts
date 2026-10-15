@@ -1,4 +1,4 @@
-import { clampLimit, isDeclined, isMissed, type HistoryEntry, type HistoryPage, type HistoryQuery, type ConferenceRecord, type DidRecord, type ProviderRecord, type PushSaveResult, type PushSubscriptionRecord, type Store, type TrunkRecord, type UserMapping, type UserPresenceRecord, type VapidKeysRecord } from './types.js'
+import { clampLimit, isDeclined, isMissed, type HistoryEntry, type HistoryPage, type HistoryQuery, type ConferenceRecord, type AlertRecord, type DidRecord, type OutboundRecord, ALERT_RETENTION_DAYS, type ProviderRecord, type PushSaveResult, type PushSubscriptionRecord, type Store, type TrunkRecord, type UserMapping, type UserPresenceRecord, type VapidKeysRecord } from './types.js'
 
 const key = (...parts: string[]) => parts.join('\u0000')
 
@@ -28,6 +28,8 @@ export class MemoryStore implements Store {
   private vapid: VapidKeysRecord | null = null
   private trunks: TrunkRecord[] = []
   private dids = new Map<string, DidRecord>()
+  private outbound = new Map<string, OutboundRecord>()
+  private alerts: AlertRecord[] = []
 
   constructor(private readonly now: () => number = Date.now) {}
 
@@ -230,6 +232,28 @@ export class MemoryStore implements Store {
 
   async deleteDid(tenantId: string, id: string) {
     return this.dids.delete(key(tenantId, id))
+  }
+
+  async getOutbound(tenantId: string) {
+    const r = this.outbound.get(tenantId)
+    return r ? structuredClone(r) : null
+  }
+
+  async setOutbound(record: OutboundRecord) {
+    this.outbound.set(record.tenantId, structuredClone(record))
+  }
+
+  async addAlert(record: AlertRecord) {
+    const oldest = new Date(Date.now() - ALERT_RETENTION_DAYS * 86_400_000).toISOString()
+    this.alerts = [...this.alerts.filter(a => a.at >= oldest), structuredClone(record)]
+  }
+
+  async listAlerts(tenantId: string, limit?: number) {
+    return this.alerts
+      .filter(a => a.tenantId === tenantId)
+      .sort((a, b) => (a.at < b.at ? 1 : a.at > b.at ? -1 : 0))
+      .slice(0, clampLimit(limit))
+      .map(a => structuredClone(a))
   }
 
   async close() {}

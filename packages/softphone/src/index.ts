@@ -30,9 +30,11 @@ export type EndReason = 'hangup' | 'rejected' | 'busy' | 'no-answer' | 'unavaila
  * one that does not work (`no-trunk`). Any other word: `not-allowed`. A transfer refused because the call is with the
  * public network says `transfer-external` (a CallError of that code).
  */
-export type CallRefusal = 'emergency' | 'premium' | 'international' | 'overseas' | 'invalid' | 'no-trunk' | 'not-allowed'
+export type CallRefusal = 'emergency' | 'premium' | 'international' | 'overseas' | 'invalid' | 'no-trunk' | 'rights' | 'limit' | 'fraud' | 'not-allowed'
 export const REFUSED_HEADER = 'Twake-Call-Refused'
-const REFUSALS: readonly CallRefusal[] = ['emergency', 'premium', 'international', 'overseas', 'invalid', 'no-trunk']
+// Step 6b: `rights` (the caller's profile does not call that kind of number), `limit` (a cap reached), `fraud` (a
+// volume threshold crossed).
+const REFUSALS: readonly CallRefusal[] = ['emergency', 'premium', 'international', 'overseas', 'invalid', 'no-trunk', 'rights', 'limit', 'fraud']
 /** The refusal a response carries, if it is one of the SIP server's. */
 export const callRefusal = (status: number | undefined, header: string | undefined): CallRefusal | undefined => {
   const word = header?.trim().toLowerCase()

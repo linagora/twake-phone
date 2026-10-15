@@ -273,6 +273,10 @@ describe('Softphone', () => {
       ['+262262000000', 403, 'overseas', 'overseas'],
       ['063998', 484, 'invalid', 'invalid'],
       ['0639980001', 503, 'no-trunk', 'no-trunk'],
+      // Step 6b: the caller's rights profile, a cap reached, a volume threshold crossed.
+      ['+442079460124', 403, 'rights', 'rights'],
+      ['0199000004', 403, 'limit', 'limit'],
+      ['0199000005', 403, 'fraud', 'fraud'],
       ['0639980002', 403, 'satellite', 'not-allowed']
     ] as const) {
       const call = await phone.call(number)
