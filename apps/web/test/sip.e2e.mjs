@@ -1446,7 +1446,19 @@ try {
           again.push(`push again: ${listed}; worker ${await workers[0]?.evaluate(() => JSON.stringify(self.__e2e ?? null)).catch(e => e.message)}; DevTools ${d.seen.join(', ')}`)
           await d.detach()
         }
-        throw new Error(`${err.message}; workers: ${JSON.stringify(workers.map(w => w.url()))}; DevTools: ${delivered.seen.join(', ')}; worker: ${log}; probe: ${probe}; then: ${again.join(' | ')}`)
+        // What the browser itself counted of its notifications and pushes (its histograms).
+        const counted = []
+        try {
+          const bcdp = await browser.newBrowserCDPSession()
+          for (const query of ['Notification', 'Push', 'ENP']) {
+            const { histograms } = await bcdp.send('Browser.getHistograms', { query })
+            for (const h of histograms) counted.push(`${h.name} ${JSON.stringify(h.buckets.map(b => [b.low, b.count]))}`)
+          }
+          await bcdp.detach()
+        } catch (e) {
+          counted.push(`not read: ${e.message}`)
+        }
+        throw new Error(`${err.message}; workers: ${JSON.stringify(workers.map(w => w.url()))}; DevTools: ${delivered.seen.join(', ')}; worker: ${log}; probe: ${probe}; then: ${again.join(' | ')}; histograms: ${[...new Set(counted)].join('; ')}`)
       })
       await delivered.detach()
       expectEqual(`${shown.title} | ${shown.body}`, 'Appel de Alice Martin (101) | Cliquez pour répondre dans TwakePhone.', 'the notification')
