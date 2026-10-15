@@ -298,12 +298,14 @@ export class OpensipsEvents {
     }
     const msg = parsed as Rpc
     if (msg.id !== undefined && msg.id !== null) {
-      const p = this.pending.get(String(msg.id))
+      // Our requests carry a string id: a reply with any other id answers none of them.
+      const id = typeof msg.id === 'string' ? msg.id : ''
+      const p = this.pending.get(id)
       if (!p) return
-      this.pending.delete(String(msg.id))
+      this.pending.delete(id)
       clearTimeout(p.timer)
       const error = msg.error && typeof msg.error === 'object' ? msg.error : undefined
-      if (error) p.reject(Object.assign(new Error(`OpenSIPS MI: ${error.message ?? 'error'}`), { code: error.code }) as MiError)
+      if (error) p.reject(Object.assign(new Error(`OpenSIPS MI: ${error.message ?? 'error'}`), { code: error.code }))
       else p.resolve(msg.result)
       return
     }
@@ -351,7 +353,7 @@ export class OpensipsEvents {
       if ((err as MiError).code !== undefined) return false
       throw err
     }
-    const since = (result && typeof result === 'object' ? (result as Record<string, unknown>)['Up since'] : undefined) as unknown
+    const since = result && typeof result === 'object' ? (result as Record<string, unknown>)['Up since'] : undefined
     if (typeof since !== 'string') return false
     const restarted = this.upSince !== undefined && since !== this.upSince
     this.upSince = since

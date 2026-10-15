@@ -30,6 +30,7 @@ const TEXT = {
 }
 const text = () => TEXT[String(self.navigator?.language ?? '').toLowerCase().startsWith('fr') ? 'fr' : 'en']
 /** A short single line: whatever a push says, a notification shows no more. */
+// eslint-disable-next-line no-control-regex -- control characters are exactly what is removed here
 const line = (value, max = 64) => (typeof value === 'string' ? value.replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, max) : '')
 const who = (name, number) => (line(name) ? `${line(name)} (${line(number, 32)})` : line(number, 32))
 /** How long a window of the app has to say it rings the call itself. */

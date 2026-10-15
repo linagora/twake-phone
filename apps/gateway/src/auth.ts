@@ -56,7 +56,7 @@ export const hostAwareFetch = (input: string, init: { headers?: Record<string, s
     const url = new URL(input)
     const req = (url.protocol === 'https:' ? httpsRequest : httpRequest)(url, { method: 'GET', headers: init.headers, signal: init.signal }, res => {
       const chunks: Buffer[] = []
-      res.on('data', c => chunks.push(c))
+      res.on('data', (c: Buffer) => chunks.push(c))
       res.on('end', () => resolve(new Response(res.statusCode === 204 ? null : Buffer.concat(chunks), { status: res.statusCode ?? 502 })))
     })
     req.on('error', reject)
@@ -225,5 +225,5 @@ export const authenticatorFromEnv = (env: NodeJS.ProcessEnv): Authenticator => {
       ...(env.JWT_ROLES_CLAIM ? { rolesClaim: env.JWT_ROLES_CLAIM } : {})
     })
   }
-  throw new Error(`Unknown AUTH_MODE: ${mode}`)
+  throw new Error(`Unknown AUTH_MODE: ${String(mode)}`)
 }

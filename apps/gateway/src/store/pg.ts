@@ -1,3 +1,6 @@
+/* eslint-disable @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-return --
+   pg hands untyped rows: this file maps them to the Store's types, and the storage contract (contract.ts), run
+   against PostgreSQL, checks the mapping. */
 import { readdir, readFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import pg from 'pg'

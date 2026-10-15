@@ -31,7 +31,7 @@ export const Layout = () => {
   // Opened by the notification of a call: signed in, the softphone registers and the call rings here. The address
   // keeps no trace of it (a reload is no reason to do anything about that call).
   useEffect(() => {
-    if (calledFor(search) !== null) navigate(pathname, { replace: true })
+    if (calledFor(search) !== null) void navigate(pathname, { replace: true })
   }, [search, pathname, navigate])
   // The subscription to notifications this person made on this browser, handed to the Gateway again at each start.
   useEffect(() => {

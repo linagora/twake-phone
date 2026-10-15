@@ -37,6 +37,8 @@ jobs:
       - run: yarn install --frozen-lockfile
       - run: yarn build
       - run: yarn typecheck
+      # ESLint sur tout le monorepo (eslint.config.mjs), après le build : les règles typées lisent les dist/*.d.ts.
+      - run: yarn lint
       - name: Tests unitaires et contrat de stockage (mémoire et PostgreSQL)
         run: yarn test
         env:

@@ -24,12 +24,14 @@ const CSP = [
   "form-action 'self'"
 ].join('; ')
 
+const meta = (env: string): MetaOptions => (env === 'production' ? { 'Content-Security-Policy': { 'http-equiv': 'Content-Security-Policy', content: CSP } } : {})
+
 export default defineConfig(({ env }) => ({
   plugins: [pluginReact()],
   html: {
     title: 'TwakePhone',
     template: './index.html',
-    meta: (env === 'production' ? { 'Content-Security-Policy': { 'http-equiv': 'Content-Security-Policy', content: CSP } } : {}) as MetaOptions
+    meta: meta(env)
   },
   source: { entry: { index: './src/main.tsx' } },
   // Runtime configuration (gateway URL, OIDC) is public/config.json, copied to dist with the rest of public/.

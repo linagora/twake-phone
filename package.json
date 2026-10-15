@@ -13,6 +13,7 @@
   "scripts": {
     "build": "yarn workspaces run build",
     "typecheck": "tsc -b packages/telephony-types packages/provider-sdk packages/telephony-client packages/softphone packages/phone-link packages/provider-opensips packages/conference-livekit apps/gateway && tsc -p apps/web --noEmit",
+    "lint": "eslint . --max-warnings 0",
     "test": "vitest run",
     "dev:gateway": "yarn workspace @twake/telephony-gateway dev",
     "dev:web": "yarn workspace @twake/phone-web dev",
@@ -21,15 +22,20 @@
     "e2e:pilot": "node apps/web/test/pilot.e2e.mjs"
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
     "@types/node": "^22.0.0",
     "@types/react": "18.3.12",
     "esbuild": "^0.28.2",
+    "eslint": "^10.12.0",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "globals": "^17.13.0",
     "jsdom": "26",
     "ldapjs": "^3.0.7",
     "oidc-provider": "^9.12.2",
     "playwright-core": "^1.63.0",
     "react": "18.3.1",
     "typescript": "^5.9.3",
+    "typescript-eslint": "^8.71.2",
     "vitest": "^3.2.4"
   }
 }

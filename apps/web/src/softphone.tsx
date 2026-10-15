@@ -40,7 +40,7 @@ const readDevices = (): AudioDevices => {
     const parsed: unknown = raw ? JSON.parse(raw) : null
     if (!parsed || typeof parsed !== 'object') return {}
     const d = parsed as Record<string, unknown>
-    const pick = (k: string) => (typeof d[k] === 'string' && d[k] ? { [k]: d[k] as string } : {})
+    const pick = (k: string) => (typeof d[k] === 'string' && d[k] ? { [k]: d[k] } : {})
     return { ...pick('microphoneId'), ...pick('outputId'), ...pick('ringerId') }
   } catch {
     return {}

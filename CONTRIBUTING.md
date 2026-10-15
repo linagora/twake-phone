@@ -4,7 +4,7 @@
 
 1. Une fonctionnalité ou un correctif = une branche depuis `main` = une PR. Rien n'est poussé sur `main` directement.
 2. La PR suit le gabarit (`.github/pull_request_template.md`) : avant, après, comment, étape du plan, preuves.
-3. La CI (`.github/workflows/ci.yml`) joue build, typecheck, tests unitaires et contrat de stockage sur PostgreSQL, puis les e2e de l'app web et de la stack SIP.
+3. La CI (`.github/workflows/ci.yml`) joue build, typecheck, lint (ESLint, `eslint.config.mjs`), tests unitaires et contrat de stockage sur PostgreSQL, puis les e2e de l'app web et de la stack SIP.
 4. Une revue indépendante « roast » est menée par un relecteur sans le contexte de l'auteur, avec consigne de chercher ce qui casse. Chaque constat est corrigé ou reçoit une réponse argumentée dans la PR.
 5. À la fin d'une étape du plan (README), les e2e de la stack Docker sont joués et le scénario de démo est rejoué avant fusion.
 
@@ -18,7 +18,7 @@ Node 22 ou plus récent.
 
 ```bash
 yarn install && yarn build
-yarn typecheck && yarn test            # packages, Gateway, app web
+yarn typecheck && yarn lint && yarn test   # packages, Gateway, app web (lint après build : il lit les types)
 yarn e2e:web                           # app web dans Chromium, sans Docker (une fois : npx playwright-core install chromium)
 ```
 

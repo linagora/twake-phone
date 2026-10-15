@@ -29,7 +29,7 @@ const withTimeout = <T>(promise: Promise<T>, ms: number) =>
     const timer = setTimeout(() => reject(new Error('the service worker did not start')), ms)
     promise.then(
       v => (clearTimeout(timer), resolve(v)),
-      e => (clearTimeout(timer), reject(e))
+      (e: unknown) => (clearTimeout(timer), reject(e))
     )
   })
 
@@ -218,7 +218,7 @@ export const calledFor = (search: string) => {
  * its softphone on its way back (a WebSocket that dropped: the call may ring here, or not in time, a quiet
  * notification shows meanwhile), null otherwise.
  */
-export const ringsHere = (phone: string, visibility: DocumentVisibilityState | string): 'registered' | 'connecting' | null => {
+export const ringsHere = (phone: string, visibility: string): 'registered' | 'connecting' | null => {
   if (visibility !== 'visible') return null
   if (phone === 'registered') return 'registered'
   return ['connecting', 'unregistered'].includes(phone) ? 'connecting' : null

@@ -298,7 +298,7 @@ describe('Softphone', () => {
   })
 
   it('hands an incoming call to the app ringing, answers it with audio and attaches the remote track', async () => {
-    const { phone, ua, incoming, changes } = await setup()
+    const { ua, incoming, changes } = await setup()
     const s = new FakeSession('incoming')
     ua().emit('newRTCSession', { originator: 'remote', session: s })
     expect(incoming).toHaveLength(1)
@@ -759,7 +759,7 @@ describe('Softphone', () => {
   it('answers with the chosen microphone and stops it with the call', async () => {
     const media = withMediaDevices()
     try {
-      const { phone, ua, incoming } = await setup({ devices: { microphoneId: 'mic-bt' } })
+      const { ua, incoming } = await setup({ devices: { microphoneId: 'mic-bt' } })
       const s = new FakeSession('incoming')
       ua().emit('newRTCSession', { originator: 'remote', session: s })
       await incoming[0]!.answer()

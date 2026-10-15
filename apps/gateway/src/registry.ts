@@ -4,13 +4,13 @@ import type { ProviderRecord } from './store/types.js'
 /** Resolves the provider of a tenant (one per tenant and site; sites are not routed yet). */
 export class ProviderRegistry {
   private readonly cache = new Map<string, TelephonyProvider>()
-  private readonly factories = new Map<string, ProviderFactory<any>>()
+  private readonly factories = new Map<string, ProviderFactory>()
   /** Called once per provider instance, e.g. to start pumping its events. */
   onCreate?: (tenantId: string, provider: TelephonyProvider) => void
 
   constructor(
     private readonly records: ProviderRecord[],
-    factories: ProviderFactory<any>[] = []
+    factories: ProviderFactory[] = []
   ) {
     for (const f of factories) this.factories.set(f.type, f)
   }
