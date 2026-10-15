@@ -301,9 +301,11 @@ export const startOperator = async ({ opensips, user, password, realm = 'operato
       const body = sdpFor(m.port, sessionId)
       const call = { callId, media: m, state: 'calling', provisional: [] }
       placed.set(callId, call)
-      const head = (method, cseq, b, extra = []) =>
+      // In the dialog (the ACK of a 2xx, the BYE), the Request-URI is the remote target (the answer's Contact), the
+      // Route the route set: a Request-URI naming OpenSIPS itself would read as coming from a strict router.
+      const head = (method, cseq, b, extra = [], target = uri) =>
         [
-          `${method} ${uri} SIP/2.0`,
+          `${method} ${target} SIP/2.0`,
           `Via: SIP/2.0/UDP ${address};branch=${b};rport`,
           'Max-Forwards: 70',
           `From: <sip:${from}@${domain}>;tag=${fromTag}`,
@@ -328,7 +330,7 @@ export const startOperator = async ({ opensips, user, password, realm = 'operato
         call.route = [...(answer.headers.get('record-route') ?? [])].flatMap(v => v.split(/,\s*(?=<)/)).reverse()
         call.remoteTarget = /<([^>]+)>/.exec(one(answer, 'contact'))?.[1]
         call.state = 'answered'
-        await send(withBody(head('ACK', 1, `z9hG4bK${token()}`)))
+        await send(withBody(head('ACK', 1, `z9hG4bK${token()}`, [], call.remoteTarget ?? uri)))
         m.start(remoteMedia(answer.body))
         changed()
         return answer
@@ -337,7 +339,7 @@ export const startOperator = async ({ opensips, user, password, realm = 'operato
       call.cancel = () => send(withBody(head('CANCEL', 1, branch)))
       call.hangup = async () => {
         const b = `z9hG4bK${token()}`
-        await send(withBody(head('BYE', 2, b)))
+        await send(withBody(head('BYE', 2, b, [], call.remoteTarget ?? uri)))
         call.state = 'ended'
         m.stop()
         return response(callId, '2 BYE', r => r.status >= 200, 'the answer to our BYE')
