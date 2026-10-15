@@ -2,6 +2,7 @@ import type { MediaProvider, ProviderFactory, RoutedEvent, TelephonyProvider } f
 import type { Call, Capabilities, Endpoint, ForwardingRules, MediaSession, OriginateRequest, Presence, ProviderStatus, RingGroup, User } from '@twake/telephony-types'
 import type { CallGroups } from './call-groups.js'
 import type { CallRules } from './call-rules.js'
+import type { PushTargets } from './push-targets.js'
 import { OpensipsEvents, parseDlgList, parseUlDump, type EventsLogger } from './events.js'
 import { AsyncQueue } from './queue.js'
 import { CallTracker } from './tracker.js'
@@ -11,7 +12,14 @@ export { OpensipsEvents, parseDlgList, parseUlDump, parseUdpUrl, type EventsLogg
 export { CallTracker, userOf, type ContactRegistration, type TelephonyPresence } from './tracker.js'
 export { CallRules, CALL_RULES_SCHEMA, DND_MESSAGE_MAX, NOANSWER_DELAY, type CallRulesOptions, type DndRule, type ExtensionHolder } from './call-rules.js'
 export { CallGroups, CALL_GROUPS_SCHEMA, DISPLAY_NAMES_SCHEMA, GROUP_MEMBERS_MAX, NAME_MAX, sipDisplayName, type CallGroupsOptions } from './call-groups.js'
+export { PushTargets, PUSH_TARGETS_SCHEMA, type PushTargetsOptions } from './push-targets.js'
 export { AsyncQueue } from './queue.js'
+
+/**
+ * The event the Gateway raises itself through the MI after each subscription to tell it hears OpenSIPS
+ * (opensips.cfg.tpl declares it, and never raises it).
+ */
+export const PROBE_EVENT = 'E_TWAKEPHONE_PROBE'
 
 /** The events the Gateway listens to: registrations and their refreshes (usrloc), our own call events (opensips.cfg.tpl), the CDRs and missed calls (acc). */
 export const SUBSCRIBED_EVENTS = [
@@ -24,6 +32,8 @@ export const SUBSCRIBED_EVENTS = [
   'E_TWAKEPHONE_ANSWERED',
   'E_TWAKEPHONE_FORWARDED',
   'E_TWAKEPHONE_DND',
+  'E_TWAKEPHONE_WAKE',
+  PROBE_EVENT,
   'E_ACC_CDR',
   'E_ACC_MISSED_EVENT'
 ]
@@ -64,6 +74,12 @@ export interface OpensipsConfig {
    * directory name each party is shown of the other. Without it, no groups, and the names are the phones' own.
    */
   callGroups?: CallGroups
+  /**
+   * The `push_targets` OpenSIPS reads when a call finds no window of the extension it reaches (ADR 0015): who can be
+   * woken. Without it (or without the events, which tell whom to wake), a call to someone without a window fails or
+   * forwards at once, as before.
+   */
+  pushTargets?: PushTargets
   /**
    * The SIP accounts (`subscriber`) OpenSIPS authenticates and routes by: `reconcile` removes those the Gateway
    * wrote for a user who no longer holds the extension, and returns their extensions (SubscriberProvisioner's
@@ -127,6 +143,13 @@ export class OpensipsProvider implements TelephonyProvider, MediaProvider {
         onEvent: (method, params) => this.tracker.handle(method, params),
         onResync: () => this.resync(),
         onRenewed: () => this.tracker.sweep(),
+        // The rows of push_targets live as long as this subscription, once the Gateway heard OpenSIPS since it was
+        // made or renewed: OpenSIPS holds a call for someone to wake only while a Gateway hears it (a Gateway gone, or
+        // deaf, its rows lapse with its subscription).
+        probeEvent: PROBE_EVENT,
+        onHeard: expireSec => {
+          void this.config.pushTargets?.keepAlive(expireSec).catch((err: unknown) => log.warn(`push_targets not kept alive: ${err instanceof Error ? err.message : String(err)}`))
+        },
         // The subscription lapsed in OpenSIPS: the registrations it told no longer hold (everyone offline) until
         // the next resync, which also ends the calls it no longer has. A failed renewal alone changes nothing.
         onExpired: () => {
@@ -180,6 +203,7 @@ export class OpensipsProvider implements TelephonyProvider, MediaProvider {
       history: !!this.events,
       forwarding: !!this.config.callRules,
       groups: !!this.config.callGroups,
+      push: !!this.config.pushTargets && !!this.events,
       conference: { dialIn: false, dialOut: false }
     }
   }
@@ -238,6 +262,7 @@ export class OpensipsProvider implements TelephonyProvider, MediaProvider {
   async syncExtensions(holders: { extension: string; userId: string; displayName?: string }[]) {
     await this.config.callRules?.reconcile(holders)
     await this.config.callGroups?.reconcile(holders)
+    await this.config.pushTargets?.reconcile(holders)
     const removed = (await this.config.accounts?.reconcile(holders.map(({ extension, userId }) => ({ extension, userId })))) ?? []
     for (const extension of removed) {
       // Without the MI (no events, OpenSIPS down), the windows go when their registration ends: it can no longer be renewed.
@@ -258,6 +283,21 @@ export class OpensipsProvider implements TelephonyProvider, MediaProvider {
       this.armExpiry()
     }, Math.min(Math.max(end - Date.now(), 0) + 50, MAX_TIMER_MS))
     this.expiryTimer.unref?.()
+  }
+
+  /**
+   * Who can be woken for a call (ADR 0015): written in `push_targets`, which OpenSIPS reads when a call finds no
+   * window. Without the events, nobody: OpenSIPS would hold the call, and nobody would hear whom to wake.
+   */
+  async setWakeable(holders: { extension: string; userId: string }[]) {
+    if (!this.config.pushTargets) return
+    await this.config.pushTargets.set(this.events ? holders : [])
+  }
+
+  /** One person's line of setWakeable: whether `holder` can be woken now; the others are not written. */
+  async setWakeableOne(holder: { extension: string; userId: string }, on: boolean) {
+    if (!this.config.pushTargets) return
+    await this.config.pushTargets.setOne(holder, on && !!this.events)
   }
 
   async getForwarding(user: User): Promise<ForwardingRules> {
@@ -341,6 +381,9 @@ export class OpensipsProvider implements TelephonyProvider, MediaProvider {
     clearTimeout(this.startTimer)
     clearTimeout(this.expiryTimer)
     await this.events?.stop()
+    // Nobody hears whom to wake any more: no call waits for this tenant's browsers (best effort, bounded by the
+    // database's own timeout).
+    await this.config.pushTargets?.release().catch(() => undefined)
     this.queue.close()
     await this.config.onClose?.()
   }

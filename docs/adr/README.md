@@ -18,5 +18,6 @@ Une décision, un fichier, numéroté dans l'ordre où elle a été prise. Un AD
 | [0012](0012-pilote-un-domaine.md) | Pilote sur une machine, un seul domaine derrière Caddy, SIP sur WebSocket par le port 443 | acceptée |
 | [0013](0013-renvois-et-ne-pas-deranger.md) | Renvois et « ne pas déranger » dans `call_rules`, lue par OpenSIPS à chaque appel ; la présence choisie rangée par personne | acceptée |
 | [0014](0014-groupes-et-noms-de-l-annuaire.md) | Groupes d'appel simultané dans `call_groups`, lue par OpenSIPS à chaque appel ; le nom de chaque partie vient de l'annuaire (`display_names`), posé par OpenSIPS | acceptée |
+| [0015](0015-reception-sans-onglet-web-push.md) | Sans fenêtre ouverte, OpenSIPS retient l'appel (`push_targets`) pendant que la passerelle réveille le navigateur par Web Push (VAPID) | acceptée |
 
 Gabarit : date, état et « remplacé par », contexte, décision, conséquences, alternatives écartées. Dix lignes suffisent. Une décision cite le fil ou le compte rendu où elle a été prise, pas une personne.

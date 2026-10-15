@@ -330,6 +330,9 @@ class WebCall implements SoftCall {
       // 477 "Send failed": the SIP server could not deliver to the far end (a registration left on a dead
       // connection); for the person it is the same as nobody there.
       if (this.endStatus === 477 && this.endReason === 'failed') this.endReason = 'unavailable'
+      // 408: nobody answered in time (JsSIP counts it as unavailable), such as a call held for someone without a
+      // window whose browser did not wake.
+      if (this.endStatus === 408 && this.endReason === 'unavailable') this.endReason = 'no-answer'
       // A call ringing here, cancelled because another phone took it (the SIP server's CANCEL says so).
       const request = e.message as { method?: string; getHeader?: (name: string) => string | undefined } | undefined
       if (direction === 'inbound' && this.endReason === 'cancelled' && request?.method === 'CANCEL' && answeredElsewhere(request.getHeader?.('Reason'))) this.endReason = 'answered-elsewhere'
@@ -645,6 +648,16 @@ const MAX_CALLS = 2
 
 const restartDelay = (attempt: number) => Math.floor(Math.random() * Math.min(30_000, 500 * 2 ** attempt))
 
+/** Random bytes as lowercase hex (getRandomValues: also on a page served over plain HTTP, unlike randomUUID). */
+const randomHex = (bytes: number) => Array.from(crypto.getRandomValues(new Uint8Array(bytes)), b => b.toString(16).padStart(2, '0')).join('')
+
+/** A random version 4 UUID (RFC 9562), for the `+sip.instance` of the registration (RFC 5626). */
+const randomUuid = () => {
+  const h = randomHex(16)
+  const variant = ((parseInt(h[16]!, 16) & 0x3) | 0x8).toString(16)
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-4${h.slice(13, 16)}-${variant}${h.slice(17, 20)}-${h.slice(20, 32)}`
+}
+
 /**
  * One registration for the page. JsSIP reconnects the WebSocket by itself (and registers again) when the network
  * or the SIP server blinks; what it cannot do alone is pick up a rotated secret, hence the restart on a refused
@@ -685,6 +698,14 @@ export class Softphone {
   }
   private pagehideBound = false
   private readonly calls = new Map<string, WebCall>()
+  /**
+   * The Contact this softphone registers, and its instance, kept across the restarts of its user agent (JsSIP draws
+   * new ones for each): the registration of the new user agent replaces that of the old one, which may sit on a
+   * connection that died (the restart came from a REGISTER lost with its WebSocket). New ones would leave it behind
+   * until it expires: OpenSIPS would keep trying it, and the unregistration at sign-out would not remove it.
+   */
+  private readonly contactUri = `sip:${randomHex(6)}@${randomHex(6)}.invalid;transport=ws`
+  private readonly instanceId = randomUuid()
 
   constructor(private readonly options: SoftphoneOptions) {
     this.devices = { ...options.devices }
@@ -810,6 +831,8 @@ export class Softphone {
       ...(this.options.displayName ? { display_name: this.options.displayName } : {}),
       register: true,
       register_expires: 300,
+      contact_uri: this.contactUri,
+      instance_id: this.instanceId,
       session_timers: false,
       user_agent: 'TwakePhone'
     }

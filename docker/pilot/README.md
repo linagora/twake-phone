@@ -2,7 +2,7 @@
 
 Tout le MVP web sur une seule machine Linux joignable depuis Internet, pour que quelques personnes s'appellent depuis leur navigateur : l'app, la passerelle, OpenSIPS et rtpengine, PostgreSQL, derrière Caddy qui sert le tout en HTTPS sur un seul nom de domaine. Le profil `demo` ajoute un fournisseur d'identité (Keycloak) et un annuaire (OpenLDAP) avec trois personnes de test, pour essayer sans rien brancher. Sans ce profil, le kit se raccorde à votre SSO et à votre annuaire.
 
-Ce que le pilote permet : se connecter, trouver un collègue dans l'annuaire avec sa présence, l'appeler de navigateur à navigateur, le mettre en attente, le transférer, retrouver ses appels dans les Récents. Ce qu'il ne permet pas encore : appeler ou recevoir des numéros extérieurs (étape 6, trunk OVH), sonner quand aucun onglet n'est ouvert (étape 5, Web Push), le mobile.
+Ce que le pilote permet : se connecter, trouver un collègue dans l'annuaire avec sa présence, l'appeler de navigateur à navigateur, le mettre en attente, le transférer, retrouver ses appels dans les Récents, être prévenu d'un appel quand aucune fenêtre de l'app n'est ouverte (notifications d'appel à activer dans Réglages, navigateur lancé ; la machine doit joindre en HTTPS les services de push des navigateurs, `PUSH_PROXY` pour passer par un proxy). Ce qu'il ne permet pas encore : appeler ou recevoir des numéros extérieurs (étape 6, trunk OVH), le mobile.
 
 ## Ce qu'il faut
 
@@ -10,7 +10,7 @@ Ce que le pilote permet : se connecter, trouver un collègue dans l'annuaire ave
 - Docker Engine 25 ou plus avec le plugin Compose (`curl -fsSL https://get.docker.com | sh` l'installe ; le paquet `docker.io` de certaines distributions est trop ancien).
 - Une adresse IPv4 publique, directe ou en NAT 1:1 (le cas de la plupart des clouds).
 - Un nom de domaine qui pointe sur cette adresse (enregistrement A), avant le premier démarrage : Let's Encrypt le vérifie, et OpenSIPS le résout à son démarrage. Un enregistrement **DNS seul** : un proxy (le nuage orange de Cloudflare) cache l'adresse de la machine et le son ne passe pas.
-- Ouverts depuis Internet : `80/tcp` et `443/tcp` (Caddy), `30000-30100/udp` (le son, rtpengine). Rien d'autre : tout le reste écoute sur la boucle locale.
+- Ouverts depuis Internet : `80/tcp` et `443/tcp` (Caddy), `30000-30100/udp` (le son, rtpengine). Rien d'autre : tout le reste écoute sur la boucle locale, sauf les sockets d'où OpenSIPS envoie ses événements, sur un port éphémère de toutes les adresses, où il ne lit rien (« Ce qui tourne ») ; un pare-feu qui n'ouvre que ces ports les ferme aussi.
 - Pour les testeurs : Chrome, Edge ou Firefox récent, un casque, un réseau qui laisse passer l'UDP sortant (pas de serveur TURN dans le pilote, voir « Limites »).
 
 ## Démarrer
@@ -75,7 +75,7 @@ docker compose up -d --build --wait --wait-timeout 600
 | caddy | `:80/tcp`, `:443/tcp`, `:443/udp` (HTTP/3) | HTTPS (Let's Encrypt, ou sa propre autorité avec `TLS=internal`) ; `/api/*` vers la passerelle, `/sip` vers le WebSocket d'OpenSIPS, `/auth/*` vers Keycloak (sauf ses consoles), le reste vers l'app ; pas d'API d'administration |
 | web | `127.0.0.1:8081` | l'app (fichiers, `config.json`, CSP) |
 | gateway | `127.0.0.1:8080`, événements d'OpenSIPS sur un port UDP libre de la boucle | API, WebSocket des événements, comptes SIP |
-| opensips | `127.0.0.1` : `8088` (WS), `8089` (WSS, certificat auto-signé, inutilisé ici), `5060/udp`, MI `8880/udp` | registrar et routage ; le navigateur le joint par `wss://<domaine>/sip` |
+| opensips | `127.0.0.1` : `8088` (WS), `8089` (WSS, certificat auto-signé, inutilisé ici), `5060/udp`, MI `8880/udp` ; et un port UDP éphémère sur toutes les adresses par processus qui a envoyé un événement à la passerelle (le socket d'envoi d'`event_datagram`, que le module ne lie pas et où OpenSIPS ne lit rien ; dès le démarrage, la passerelle en levant un pour s'assurer qu'elle entend OpenSIPS) | registrar et routage ; le navigateur le joint par `wss://<domaine>/sip` |
 | rtpengine | `30000-30100/udp` sur `RTPENGINE_INTERFACE` ; contrôle `127.0.0.1:22222/udp`, CLI `127.0.0.1:9900` | le son (DTLS-SRTP, ICE) |
 | postgres | `127.0.0.1:54320`, mot de passe exigé | comptes SIP (`subscriber`), CDR, données de la passerelle |
 | keycloak (`demo`) | `127.0.0.1:8180` | royaume `twakephone`, client `twakephone-web`, trois personnes |

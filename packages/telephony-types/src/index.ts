@@ -132,6 +132,12 @@ export interface Capabilities {
   forwarding?: boolean
   /** Administrators can set simultaneous ring groups (`RingGroup`). */
   groups?: boolean
+  /**
+   * A call to someone with no device online waits a while for one of theirs to come online, while the Gateway wakes
+   * their browsers (Web Push): the provider tells it whom to wake (`call.wake`), and the Gateway tells it who can be
+   * woken (`setWakeable`).
+   */
+  push?: boolean
   conference: { dialIn: boolean; dialOut: boolean }
 }
 
@@ -172,6 +178,16 @@ export interface ConferenceParticipant {
 
 export type TelephonyEvent =
   | { type: 'call.created' | 'call.ringing' | 'call.connected' | 'call.held' | 'call.resumed' | 'call.ended' | 'call.failed'; timestamp: string; payload: { call: Call } }
+  /**
+   * A call for this person, who has no device online: it waits `waitSec` seconds for one of theirs to come online
+   * (the Gateway wakes their browsers). `group`: the ring group number the caller dialled, when it is through one.
+   */
+  | { type: 'call.wake'; timestamp: string; payload: { call: Call; waitSec: number; group?: string } }
+  /**
+   * A call this person was woken for (`call.wake`) was answered by someone else, `by` (the extension of the
+   * colleague of the ring group who answered): it no longer waits for them, and it is no missed call of theirs.
+   */
+  | { type: 'call.taken'; timestamp: string; payload: { call: Call; by: string } }
   /** `extension`: the telephony identity the presence is about, so that a directory can show it next to a contact. */
   | { type: 'presence.changed'; timestamp: string; payload: { userId: UserId; extension?: string; presence: Presence } }
   | { type: 'endpoint.connected' | 'endpoint.disconnected'; timestamp: string; payload: { userId: UserId; endpoint: Endpoint } }

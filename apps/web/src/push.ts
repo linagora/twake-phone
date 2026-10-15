@@ -1,0 +1,241 @@
+// Notifications of calls while no window of the app is open (step 5, ADR 0015): this browser subscribes to its push
+// service with the Gateway's key, and the Gateway keeps the subscription for the person signed in. Asked for in
+// Réglages only, never on load; forgotten at sign-out (the next person on this browser does not get them).
+import type { PushState } from '@twake/telephony-client'
+
+/** What the app needs of the Gateway client. */
+export interface PushGateway {
+  getPushSubscriptions(): Promise<PushState>
+  addPushSubscription(subscription: { endpoint: string; keys: { p256dh: string; auth: string } }): Promise<PushState>
+  removePushSubscription(endpoint: string): Promise<void>
+}
+
+/** What the browser offers (a seam for the tests). */
+export interface PushBrowser {
+  supported: boolean
+  permission(): NotificationPermission
+  requestPermission(): Promise<NotificationPermission>
+  registration(): Promise<ServiceWorkerRegistration>
+  storage?: Pick<Storage, 'getItem' | 'setItem' | 'removeItem'>
+}
+
+export const SW_URL = '/sw.js'
+/** How long the service worker may take to be ready before the app says it cannot subscribe. */
+const READY_MS = 10_000
+const MARK = 'twakephone.push'
+
+const withTimeout = <T>(promise: Promise<T>, ms: number) =>
+  new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('the service worker did not start')), ms)
+    promise.then(
+      v => (clearTimeout(timer), resolve(v)),
+      e => (clearTimeout(timer), reject(e))
+    )
+  })
+
+export const browserPush = (): PushBrowser => {
+  const supported = typeof window !== 'undefined' && 'serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window
+  let storage: Storage | undefined
+  try {
+    storage = window.localStorage
+  } catch {
+    storage = undefined
+  }
+  return {
+    supported,
+    permission: () => (supported ? Notification.permission : 'denied'),
+    requestPermission: () => Notification.requestPermission(),
+    registration: () => withTimeout(navigator.serviceWorker.register(SW_URL).then(() => navigator.serviceWorker.ready), READY_MS),
+    ...(storage ? { storage } : {})
+  }
+}
+
+/** The service worker, registered at each start (it shows the notifications; it asks nothing). */
+export const registerServiceWorker = () => {
+  if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) return
+  navigator.serviceWorker.register(SW_URL).catch(() => undefined)
+}
+
+const b64url = (buffer: ArrayBuffer | null) => {
+  if (!buffer) return ''
+  let s = ''
+  for (const b of new Uint8Array(buffer)) s += String.fromCharCode(b)
+  return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+}
+const bytes = (b64: string) => {
+  const s = atob(b64.replace(/-/g, '+').replace(/_/g, '/'))
+  return Uint8Array.from(s, c => c.charCodeAt(0))
+}
+const json = (sub: PushSubscription) => {
+  const j = sub.toJSON() as { endpoint?: string; keys?: { p256dh?: string; auth?: string } }
+  return { endpoint: j.endpoint ?? sub.endpoint, keys: { p256dh: j.keys?.p256dh ?? '', auth: j.keys?.auth ?? '' } }
+}
+
+/** Who subscribed this browser, and which subscription (remembered here: the Gateway keeps whose it is, this says who asked). */
+const ownerOf = (b: PushBrowser): { userId: string; endpoint: string } | null => {
+  try {
+    const v = JSON.parse(b.storage?.getItem(MARK) ?? 'null') as { userId?: unknown; endpoint?: unknown } | null
+    return v && typeof v.userId === 'string' && typeof v.endpoint === 'string' ? { userId: v.userId, endpoint: v.endpoint } : null
+  } catch {
+    return null
+  }
+}
+const marked = (b: PushBrowser, userId: string, endpoint?: string) => {
+  const owner = ownerOf(b)
+  return !!owner && owner.userId === userId && (endpoint === undefined || owner.endpoint === endpoint)
+}
+const mark = (b: PushBrowser, userId: string, endpoint: string | null) => {
+  try {
+    if (endpoint) b.storage?.setItem(MARK, JSON.stringify({ userId, endpoint }))
+    else b.storage?.removeItem(MARK)
+  } catch {
+    // Storage blocked: the subscription holds at the Gateway; this browser just forgets who asked.
+  }
+}
+/** The Gateway's key a subscription was made with (base64url), or null when the browser does not say. */
+const keyOf = (sub: PushSubscription) => b64url(sub.options?.applicationServerKey ?? null) || null
+
+export type PushStatus = 'unsupported' | 'unavailable' | 'denied' | 'off' | 'on'
+
+/**
+ * Where notifications stand for this person on this browser. A subscription made with a key the Gateway no longer
+ * has is off: its pushes would be refused; so is one the Gateway no longer keeps (it has none for this person: it
+ * removed them once they held no extension), until it is handed over again.
+ */
+export const pushStatus = async (gateway: PushGateway, b: PushBrowser, userId: string): Promise<PushStatus> => {
+  if (!b.supported) return 'unsupported'
+  const state = await gateway.getPushSubscriptions()
+  if (!state.available) return 'unavailable'
+  if (b.permission() === 'denied') return 'denied'
+  if (b.permission() !== 'granted' || !marked(b, userId) || !state.subscriptions) return 'off'
+  const sub = await (await b.registration()).pushManager.getSubscription()
+  if (!sub || !marked(b, userId, sub.endpoint)) return 'off'
+  const key = keyOf(sub)
+  return key && state.publicKey && key !== state.publicKey ? 'off' : 'on'
+}
+
+/**
+ * Asks the browser's permission (the person clicked), subscribes with the Gateway's key (a subscription made with
+ * another key is replaced) and hands it to the Gateway. 'denied' when the person or the browser refused.
+ */
+export const enablePush = async (gateway: PushGateway, b: PushBrowser, userId: string): Promise<PushStatus> => {
+  if (!b.supported) return 'unsupported'
+  const permission = b.permission() === 'granted' ? 'granted' : await b.requestPermission()
+  if (permission !== 'granted') return 'denied'
+  const state = await gateway.getPushSubscriptions()
+  if (!state.available || !state.publicKey) return 'unavailable'
+  const registration = await b.registration()
+  let sub = await registration.pushManager.getSubscription()
+  if (sub && b64url(sub.options?.applicationServerKey ?? null) !== state.publicKey) {
+    await sub.unsubscribe().catch(() => undefined)
+    sub = null
+  }
+  sub ??= await registration.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: bytes(state.publicKey) })
+  try {
+    await gateway.addPushSubscription(json(sub))
+  } catch (err) {
+    // This browser's subscription is another organisation's at the Gateway (someone of it signed in here, and their
+    // sign-out never reached it): a new one, for this person.
+    if ((err as { status?: number }).status !== 409) throw err
+    await sub.unsubscribe().catch(() => undefined)
+    sub = await registration.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: bytes(state.publicKey) })
+    await gateway.addPushSubscription(json(sub))
+  }
+  mark(b, userId, sub.endpoint)
+  return 'on'
+}
+
+/**
+ * Forgets this browser's subscription, at the Gateway and at its push service. The Gateway refusing (too many changes,
+ * out of reach): nothing changes here either, the subscription is still on (the caller says so).
+ */
+export const disablePush = async (gateway: PushGateway, b: PushBrowser, userId: string): Promise<PushStatus> => {
+  if (!b.supported) return 'unsupported'
+  const sub = await (await b.registration()).pushManager.getSubscription()
+  if (sub) {
+    await gateway.removePushSubscription(sub.endpoint)
+    await sub.unsubscribe().catch(() => undefined)
+  }
+  mark(b, userId, null)
+  return 'off'
+}
+
+/**
+ * At each start of a signed-in app. The subscription this person made on this browser is handed to the Gateway again
+ * (one it removed, a push service that renewed it), and made anew when the Gateway's key changed (its pushes would
+ * be refused). A subscription someone else made here (their sign-out never reached it: an expired session, a Gateway
+ * out of reach then) stops at once at its push service: this person never gets their calls. Taken over then removed
+ * at the Gateway first, so that their calls no longer wait for a browser that will not wake (another organisation's
+ * stays theirs: the Gateway drops it at its next push, gone).
+ */
+export const resyncPush = async (gateway: PushGateway, b: PushBrowser, userId: string) => {
+  if (!b.supported || b.permission() !== 'granted') return
+  const registration = await b.registration()
+  const sub = await registration.pushManager.getSubscription()
+  if (!marked(b, userId)) {
+    if (sub) {
+      const taken = await gateway.addPushSubscription(json(sub)).then(
+        () => true,
+        () => false
+      )
+      if (taken) await gateway.removePushSubscription(sub.endpoint).catch(() => undefined)
+      await sub.unsubscribe().catch(() => undefined)
+      mark(b, userId, null)
+    }
+    return
+  }
+  if (!sub) return mark(b, userId, null)
+  const state = await gateway.getPushSubscriptions()
+  if (!state.available || !state.publicKey) return
+  const key = keyOf(sub)
+  if (key && key !== state.publicKey) {
+    await gateway.removePushSubscription(sub.endpoint).catch(() => undefined)
+    await sub.unsubscribe().catch(() => undefined)
+    const renewed = await registration.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: bytes(state.publicKey) })
+    await gateway.addPushSubscription(json(renewed))
+    mark(b, userId, renewed.endpoint)
+    return
+  }
+  if (!marked(b, userId, sub.endpoint)) mark(b, userId, sub.endpoint)
+  await gateway.addPushSubscription(json(sub))
+}
+
+/** At sign-out: this browser stops receiving the person's calls (bounded: a sign-out never waits long for it). */
+export const forgetPushAtSignOut = async (gateway: PushGateway, b: PushBrowser, userId: string, ms = 2_000) => {
+  if (!b.supported || !marked(b, userId)) return
+  await withTimeout(disablePush(gateway, b, userId), ms).catch(() => undefined)
+}
+
+/** The call a notification opened the app on (`/?call=<id>`), if any. */
+export const calledFor = (search: string) => {
+  const id = new URLSearchParams(search).get('call')
+  return id && id.length <= 256 ? id : null
+}
+
+/**
+ * Whether this window rings a call itself, for the service worker that asks before showing its notification:
+ * 'registered' on screen with its softphone registered (the page rings, no notification), 'connecting' on screen with
+ * its softphone on its way back (a WebSocket that dropped: the call may ring here, or not in time, a quiet
+ * notification shows meanwhile), null otherwise.
+ */
+export const ringsHere = (phone: string, visibility: DocumentVisibilityState | string): 'registered' | 'connecting' | null => {
+  if (visibility !== 'visible') return null
+  if (phone === 'registered') return 'registered'
+  return ['connecting', 'unregistered'].includes(phone) ? 'connecting' : null
+}
+
+/** Answers the service worker's question (sw.js, `twakephone.ring`) as `here()` says; returns how to stop. */
+export const answerRingQueries = (container: Pick<ServiceWorkerContainer, 'addEventListener' | 'removeEventListener'>, here: () => 'registered' | 'connecting' | null) => {
+  const onMessage = (e: MessageEvent) => {
+    if ((e.data as { type?: unknown } | null)?.type !== 'twakephone.ring' || !e.ports?.[0]) return
+    const state = here()
+    if (state) e.ports[0].postMessage({ type: 'twakephone.here', registered: state === 'registered' })
+  }
+  container.addEventListener('message', onMessage as EventListener)
+  return () => container.removeEventListener('message', onMessage as EventListener)
+}
+
+/** Tells the service worker which calls this window's softphone rings (JsSIP's ids): their quiet notifications go. */
+export const tellRinging = (worker: Pick<ServiceWorker, 'postMessage'> | null | undefined, callIds: string[]) => {
+  if (worker && callIds.length) worker.postMessage({ type: 'twakephone.ringing', callIds })
+}

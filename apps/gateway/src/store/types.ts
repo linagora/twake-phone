@@ -86,6 +86,37 @@ export interface UserPresenceRecord {
   message?: string
 }
 
+/**
+ * What saving a push subscription did (Store.savePushSubscription). `moved` without `previousUserId`: taken from
+ * someone the store cannot name (another request saved the same browser at the same moment); whoever needs to know
+ * whose it was recomputes the whole tenant.
+ */
+export interface PushSaveResult {
+  outcome: 'added' | 'unchanged' | 'updated' | 'moved' | 'refused'
+  previousUserId?: string
+}
+
+/**
+ * A browser's subscription to notifications (Web Push, ADR 0015): where its push service takes messages for it
+ * (`endpoint`, unique: one per browser profile and application key) and the keys a message is encrypted with. Whose it
+ * is: the person signed in when it was given. A browser given to someone else of the tenant moves to them.
+ */
+export interface PushSubscriptionRecord {
+  tenantId: string
+  userId: string
+  endpoint: string
+  /** The browser's public key (P-256, base64url) and authentication secret (base64url), RFC 8291. */
+  p256dh: string
+  auth: string
+  createdAt: string
+}
+
+/** The Gateway's VAPID keys (RFC 8292): the public one in clear, the private one encrypted with SECRETS_KEY. */
+export interface VapidKeysRecord {
+  publicKey: string
+  privateKeyEnc: string
+}
+
 export interface Store {
   listProviders(): Promise<ProviderRecord[]>
   upsertProvider(record: ProviderRecord): Promise<void>
@@ -124,6 +155,25 @@ export interface Store {
   getConference(meetingId: string): Promise<ConferenceRecord | null>
   setConferencePin(meetingId: string, pin: string | null): Promise<void>
   deleteConference(meetingId: string): Promise<void>
+
+  /** A person's subscriptions, oldest first. */
+  listPushSubscriptions(tenantId: string, userId: string): Promise<PushSubscriptionRecord[]>
+  /** The people of a tenant with at least one subscription, by user id. */
+  listPushUsers(tenantId: string): Promise<string[]>
+  /**
+   * Adds or replaces the subscription of `endpoint` within its tenant: 'added' (new), 'unchanged' (this person's
+   * already, same keys: nothing written), 'updated' (theirs, new keys), 'moved' (a browser given to them by someone
+   * else of the tenant, `previousUserId`). One another tenant has stays theirs: 'refused', nothing written.
+   */
+  savePushSubscription(record: PushSubscriptionRecord): Promise<PushSaveResult>
+  /** Removes `endpoint` if it is this person's. Whether it was. */
+  deletePushSubscription(tenantId: string, userId: string, endpoint: string): Promise<boolean>
+  /** Removes `endpoint` (its push service says it is gone), whoever had it; who that was. */
+  deletePushEndpoint(endpoint: string): Promise<{ tenantId: string; userId: string } | null>
+
+  getVapidKeys(): Promise<VapidKeysRecord | null>
+  /** Keeps `keys` unless some are kept already (another instance was first): those kept, either way. */
+  initVapidKeys(keys: VapidKeysRecord): Promise<VapidKeysRecord>
 
   close(): Promise<void>
 }

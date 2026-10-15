@@ -216,7 +216,7 @@ describe('OpensipsEvents', () => {
     cleanups.push(sips.close)
     let resyncs = 0
     let renewed = 0
-    const events = new OpensipsEvents({ miUrl: sips.url, events: ['E_UL_CONTACT_INSERT'], onEvent: () => undefined, onResync: () => void resyncs++, onRenewed: () => void renewed++, logger: quiet })
+    const events = new OpensipsEvents({ miUrl: sips.url, events: ['E_UL_CONTACT_INSERT'], expireSec: 90, onEvent: () => undefined, onResync: () => void resyncs++, onRenewed: () => void renewed++, logger: quiet })
     cleanups.push(() => events.stop())
     await events.start()
     expect(resyncs).toBe(1)
@@ -232,6 +232,49 @@ describe('OpensipsEvents', () => {
     expect([resyncs, renewed]).toEqual([2, 2])
     expect(sips.subscriptions.map(s => s.event)).toEqual(['E_UL_CONTACT_INSERT'])
     expect(events.connected).toBe(true)
+  })
+
+  it('tells it hears OpenSIPS only once the probe it raised after subscribing comes back from an accepted address', async () => {
+    const sips = await fakeOpensips()
+    cleanups.push(sips.close)
+    const other = dgram.createSocket('udp4')
+    await new Promise<void>(r => other.bind(0, '127.0.0.2', r))
+    cleanups.push(() => new Promise<void>(r => other.close(() => r())))
+    const got: string[] = []
+    const warnings: string[] = []
+    // How long the events are heard, each time they are (push_targets lives that long).
+    const lives: number[] = []
+    const events = new OpensipsEvents({ miUrl: sips.url, events: ['E_ACC_CDR', 'E_PROBE'], probeEvent: 'E_PROBE', expireSec: 90, onEvent: m => got.push(m), onHeard: sec => void lives.push(sec), logger: { ...quiet, warn: m => warnings.push(m), error: () => undefined } })
+    cleanups.push(() => events.stop())
+    await events.start()
+    await until('the probe back', () => lives.length === 1)
+    expect(lives).toEqual([90])
+    expect(sips.requests.filter(r => r.method === 'raise_event').map(r => r.params[0])).toEqual(['E_PROBE'])
+    // Another process's probe (its own nonce), or none: not this one's, and no event for the tracker either.
+    sips.push('E_PROBE', { probe: 'not-ours' })
+    sips.push('E_ACC_CDR', {})
+    await until('the event after it', () => got.length === 1)
+    expect([got, lives]).toEqual([['E_ACC_CDR'], [90]])
+    // An OpenSIPS whose script does not declare the probe: heard as long as the events are not all refused, said once.
+    sips.state.unknownEvents.add('E_PROBE')
+    await events['renew']()
+    await events['renew']()
+    expect(lives).toEqual([90, 90, 90])
+    expect(warnings.filter(w => /E_PROBE refused/.test(w))).toHaveLength(1)
+    sips.state.unknownEvents.delete('E_PROBE')
+    // The events come from an address that is not accepted: the probe does not come back, the Gateway is deaf.
+    sips.state.eventsVia = other
+    await events['renew']()
+    await until('the probe ignored', () => events['foreign'] > 0)
+    await events['renew']()
+    expect(events.connected).toBe(false)
+    await until('the second probe ignored', () => events['foreign'] > 0 && sips.requests.filter(r => r.method === 'raise_event').length === 5)
+    expect(lives).toEqual([90, 90, 90])
+    // From the MI host again: heard.
+    sips.state.eventsVia = undefined
+    await events['renew']()
+    await until('the probe back again', () => lives.length === 4)
+    expect(got).toEqual(['E_ACC_CDR'])
   })
 
   it('unsubscribes when it stops (expire 0), best effort, but not from a fixed address the next instance may hold', async () => {

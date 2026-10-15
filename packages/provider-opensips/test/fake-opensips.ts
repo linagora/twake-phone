@@ -6,8 +6,21 @@ export const fakeOpensips = async () => {
   const socket = dgram.createSocket('udp4')
   const subscriptions: { event: string; socket: string; expire: number }[] = []
   const requests: { id: string; method: string; params: unknown[] }[] = []
-  /** `down`: received but never answered (requests still counts them). `upSince`, `upTime`: what MI `uptime` says. */
-  const state = { down: false, received: 0, upSince: 'Wed Oct 14 18:00:00 2026', upTime: '600 [sec]', dump: { Domains: [{ name: 'location', hash_size: 512, AORs: [] as unknown[] }] }, dialogs: { Dialogs: [] as unknown[] } }
+  /**
+   * `down`: received but never answered (requests still counts them). `upSince`, `upTime`: what MI `uptime` says.
+   * `unknownEvents`: events its script does not declare (MI `raise_event` refuses them). `eventsVia`: the socket the
+   * events raised through the MI are sent from (another address than the MI's), this one's when absent.
+   */
+  const state = {
+    down: false,
+    received: 0,
+    upSince: 'Wed Oct 14 18:00:00 2026',
+    upTime: '600 [sec]',
+    dump: { Domains: [{ name: 'location', hash_size: 512, AORs: [] as unknown[] }] },
+    dialogs: { Dialogs: [] as unknown[] },
+    unknownEvents: new Set<string>(),
+    eventsVia: undefined as dgram.Socket | undefined
+  }
   socket.on('message', (raw, rinfo) => {
     state.received++
     if (state.down) return
@@ -21,6 +34,19 @@ export const fakeOpensips = async () => {
       if (expire === 0) {
         for (let i = subscriptions.length - 1; i >= 0; i--) if (subscriptions[i]!.event === event && subscriptions[i]!.socket === to) subscriptions.splice(i, 1)
       } else subscriptions.push({ event, socket: to, expire })
+      return reply({ result: 'OK' })
+    }
+    if (req.method === 'raise_event') {
+      // As OpenSIPS: 404 for an event its script does not know, 480 when nobody subscribed, else to each subscriber.
+      const [event, params] = req.params as [string, string | undefined]
+      if (state.unknownEvents.has(event)) return reply({ error: { code: 404, message: 'Event not registered' } })
+      const to = subscriptions.filter(s => s.event === event)
+      if (!to.length) return reply({ error: { code: 480, message: 'Temporarily Unavailable' } })
+      const body = JSON.stringify({ jsonrpc: '2.0', method: event, params: params ? JSON.parse(params) : {} })
+      for (const s of to) {
+        const { host, port } = parseUdpUrl(s.socket, 'subscriber')
+        ;(state.eventsVia ?? socket).send(body, port, host)
+      }
       return reply({ result: 'OK' })
     }
     if (req.method === 'uptime') return reply({ result: { Now: 'Wed Oct 14 18:10:00 2026', 'Up since': state.upSince, 'Up time': state.upTime } })

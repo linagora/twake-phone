@@ -1,15 +1,20 @@
-// End to end of steps 3 and 4 (calls, transfers, what the Gateway hears from OpenSIPS, forwards and "do not
-// disturb"): people call and transfer each other from their browsers through OpenSIPS and rtpengine; the Gateway
+// End to end of steps 3 to 5 (calls, transfers, what the Gateway hears from OpenSIPS, forwards and "do not
+// disturb", ring groups, calls to someone without a window of the app): people call and transfer each other from
+// their browsers through OpenSIPS and rtpengine; the Gateway
 // subscribes to OpenSIPS's events and shows the presence of the others in the directory and the calls in the
 // history; the forwards and the "do not disturb" set in the app are applied by OpenSIPS (`call_rules`). The SIP stack is the only thing
 // outside this process (docker/docker-compose.sip.yml, or OpenSIPS and rtpengine started by hand); the identity
 // provider, the directory, the Gateway (with the OpenSIPS provider) and the app run here, and three browser
-// contexts with a simulated microphone play Alice (101), Jean (102) and Bob (103).
+// contexts with a simulated microphone play Alice (101), Jean (102) and Bob (103). Step 5: a push service of this
+// process (apps/gateway/test/push-service.mjs) stands for the browsers' own; it checks and decrypts what the Gateway
+// sends, and the test hands it to the service worker as Chromium's push service would (DevTools; Firefox offers no
+// such way, its run checks the push and opens the app on the call as the notification does).
 //
 //   BROWSER              chromium (default), firefox or msedge (Edge installed on the machine, as Playwright finds it)
 //   PLAYWRIGHT_CHROMIUM  a Chromium binary to use instead of Playwright's (PLAYWRIGHT_FIREFOX likewise)
 //   SIP_WSS_URL          WSS socket of OpenSIPS (default wss://127.0.0.1:8089)
 //   SIP_DOMAIN           SIP domain and digest realm (default: the host of SIP_WSS_URL)
+//   SIP_UDP, SIP_WS      UDP and WS sockets of OpenSIPS for the user agents of this process (default 127.0.0.1:5060, ws://127.0.0.1:8088)
 //   OPENSIPS_DB_URL      the database auth_db reads (default postgres://twake:twake@127.0.0.1:54320/twake)
 //   OPENSIPS_MI_URL      the MI socket of OpenSIPS, where the Gateway subscribes to its events (default udp:127.0.0.1:8880)
 //   RTPENGINE_DTMF_LOG   where rtpengine reports the tones it sees (default 127.0.0.1:22223); "off" skips the check
@@ -21,13 +26,16 @@ import { fileURLToPath } from 'node:url'
 import pg from 'pg'
 import { chromium, firefox } from 'playwright-core'
 import { buildApp } from '../../gateway/dist/app.js'
+import { WebPush } from '../../gateway/dist/push.js'
 import { JwtAuthenticator } from '../../gateway/dist/auth.js'
 import { DirectorySync } from '../../gateway/dist/directory-sync.js'
 import { DEFAULT_ATTRIBUTES, LdapDirectory } from '../../gateway/dist/ldap-directory.js'
 import { storedOpensipsFactory } from '../../gateway/dist/providers.js'
 import { ProviderRegistry } from '../../gateway/dist/registry.js'
+import { SubscriberProvisioner } from '../../../packages/provider-opensips/dist/subscriber.js'
 import { MemoryStore } from '../../gateway/dist/store/memory.js'
 import { BASE_DN, PEOPLE, READER_DN, READER_PASSWORD, startLdapMock } from '../../gateway/test/ldap-mock.mjs'
+import { startPushService } from '../../gateway/test/push-service.mjs'
 import { startOidcMock } from './oidc-mock.mjs'
 import { serveApp } from '../server/serve.mjs'
 import { sipUa } from './sip-ua.mjs'
@@ -40,6 +48,7 @@ const OPENSIPS_DB_URL = process.env.OPENSIPS_DB_URL ?? 'postgres://twake:twake@1
 const OPENSIPS_MI_URL = process.env.OPENSIPS_MI_URL ?? 'udp:127.0.0.1:8880'
 // OpenSIPS's UDP socket, for the user agents of this process (sip-ua.mjs): on this host.
 const SIP_UDP = process.env.SIP_UDP ?? '127.0.0.1:5060'
+const SIP_WS = process.env.SIP_WS ?? 'ws://127.0.0.1:8088'
 const DTMF_LOG = process.env.RTPENGINE_DTMF_LOG ?? '127.0.0.1:22223'
 const TENANT = 'e2e'
 const BROWSER = process.env.BROWSER ?? 'chromium'
@@ -57,9 +66,9 @@ const freePort = () =>
   })
 
 const step = (name, fn) => fn().then(() => console.log(`ok   ${name}`), err => { console.log(`FAIL ${name}`); throw err })
-/** Scalars by value, arrays by content (in order). */
+/** Scalars by value, arrays and objects by content (in order). */
 const expectEqual = (actual, expected, what) => {
-  const same = Array.isArray(expected) ? Array.isArray(actual) && JSON.stringify(actual) === JSON.stringify(expected) : actual === expected
+  const same = typeof expected === 'object' && expected !== null ? typeof actual === 'object' && actual !== null && Array.isArray(actual) === Array.isArray(expected) && JSON.stringify(actual) === JSON.stringify(expected) : actual === expected
   if (!same) throw new Error(`${what}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`)
 }
 const sleep = ms => new Promise(r => setTimeout(r, ms))
@@ -108,6 +117,20 @@ const startRelay = (targetHost, targetPort, port) =>
           pair.upstream.removeAllListeners('error')
           pair.client.unpipe(pair.upstream)
           pair.upstream.destroy()
+        },
+        /**
+         * Holds what the browsers send (the SIP server waits, nothing is lost) until the function it returns is called:
+         * a page closed meanwhile never gets its last words through, as a laptop put to sleep.
+         */
+        hold: () => {
+          const held = pairs.filter(p => !p.client.destroyed && !p.upstream.destroyed)
+          for (const p of held) {
+            p.client.unpipe(p.upstream)
+            p.client.pause()
+          }
+          return () => {
+            for (const p of held) if (!p.client.destroyed && !p.upstream.destroyed) p.client.pipe(p.upstream)
+          }
         },
         cut: () => {
           const n = sockets.size
@@ -170,7 +193,11 @@ const ldap = await startLdapMock({ people })
 const contacts = new LdapDirectory({ url: ldap.url, tenantId: TENANT, bindDn: READER_DN, bindPassword: READER_PASSWORD, baseDn: BASE_DN, userFilter: '(objectClass=inetOrgPerson)', attributes: { ...DEFAULT_ATTRIBUTES, extension: 'ipPhone' } })
 // The synchronisation of the directory into the mappings, as main.ts builds it: run from Administration only here.
 const directorySync = new DirectorySync({ store, directory: contacts, tenantId: TENANT, reserved: async () => (await registry.forTenant(TENANT).listGroups()).map(g => g.number) })
-const gateway = await buildApp(registry, { auth, store, contacts, directorySync, admin: { adminRole: 'twakephone-admin', adminUsers: new Set() } })
+// Web Push (step 5): the Gateway's VAPID keys made at its start (kept in the store, encrypted), its pushes sent to the
+// push service of this process only.
+const pushService = await startPushService()
+const push = new WebPush({ store, key, subject: 'mailto:e2e@example.test', allowEndpoint: url => url.origin === pushService.origin, agent: pushService.agent })
+const gateway = await buildApp(registry, { auth, store, contacts, directorySync, push, admin: { adminRole: 'twakephone-admin', adminUsers: new Set() } })
 registry.startAll()
 await gateway.listen({ host: '127.0.0.1', port: GATEWAY_PORT })
 const web = await serveApp({
@@ -190,9 +217,11 @@ const since = { acc: await lastId('acc'), missed_calls: await lastId('missed_cal
 await until('the call_rules table', async () => (await db.query("SELECT to_regclass('call_rules') AS t")).rows[0].t)
 await db.query("DELETE FROM call_rules WHERE extension IN ('101', '102', '103', '104', '105')")
 // Nor the ring groups of an interrupted run.
-await db.query("DELETE FROM call_groups WHERE number IN ('200', '105', '106', '210')")
+await db.query("DELETE FROM call_groups WHERE number IN ('200', '105', '106', '210', '220')")
 // Nor the account an older Gateway would have left (106), which this run writes by hand.
 await db.query("DELETE FROM subscriber WHERE username = '106'")
+// Nor anyone left to wake by an interrupted run (step 5): the Gateway writes the rows of this run's subscriptions.
+await db.query("DELETE FROM push_targets WHERE extension IN ('101', '102', '103', '104', '105') OR tenant_id = 'e2e-ua'")
 
 // A microphone that produces a tone, no permission prompt, sound allowed without a gesture, OpenSIPS's self-signed
 // certificate accepted (Firefox: through the context's ignoreHTTPSErrors). Firefox ignores ICE candidates on the
@@ -214,7 +243,9 @@ const browser =
         }
       })
     : await chromium.launch({
-        ...(BROWSER === 'msedge' ? { channel: 'msedge' } : process.env.PLAYWRIGHT_CHROMIUM ? { executablePath: process.env.PLAYWRIGHT_CHROMIUM } : {}),
+        // Chromium itself in its new headless mode, not Playwright's default headless shell: the shell reports every
+        // notification permission as denied and shows no notification (step 5).
+        ...(BROWSER === 'msedge' ? { channel: 'msedge' } : process.env.PLAYWRIGHT_CHROMIUM ? { executablePath: process.env.PLAYWRIGHT_CHROMIUM } : { channel: 'chromium' }),
         args: ['--use-fake-device-for-media-stream', '--use-fake-ui-for-media-stream', '--ignore-certificate-errors', '--autoplay-policy=no-user-gesture-required']
       })
 console.log(`browser: ${BROWSER} ${browser.version()}`)
@@ -388,6 +419,7 @@ const synchronise = async who => {
 }
 
 let failed = false
+let gatewayClosed = false
 let alice
 let jean
 let jean2
@@ -1185,6 +1217,298 @@ try {
       for (const extension of [...members, '134']) await store.deleteMapping(TENANT, `ua-${extension}`)
     }
   })
+  // Step 5 in SIP only (user agents of this process): the windows that come back, the dead ones, and the races a
+  // browser cannot set up on purpose. 141 and 143 have windows over a WebSocket, as a browser's; 142 calls over UDP;
+  // ring group 220 is 143 and 144. Their browsers can be woken: rows of push_targets, as a Gateway of another tenant
+  // writes them, alive (that Gateway listens). Nothing pushes to them: only this test opens their windows.
+  const wakeable = { members: ['141', '143', '144'], credentials: {} }
+  /** A window of `user`, over a WebSocket (a browser's) or over UDP. */
+  const windowOf = (user, { ws = false } = {}) => sipUa({ ...(ws ? { ws: SIP_WS } : { proxy: SIP_UDP }), domain: SIP_DOMAIN, user, password: wakeable.credentials[user] })
+  /** A window over a WebSocket, registered, whose connection is gone: OpenSIPS keeps a contact it cannot reach. */
+  const deadWindow = async user => {
+    const ua = await windowOf(user, { ws: true })
+    expectEqual(await ua.register(), 200, `registration of a window of ${user} over a WebSocket`)
+    await ua.drop()
+    // A moment for OpenSIPS to see its side of the connection close.
+    await sleep(300)
+    return ua
+  }
+  /** For `ms`, the call has no final answer (OpenSIPS holds it), and the caller was told 180. */
+  const held = async (dialled, ms = 1_500) => {
+    const early = await Promise.race([dialled.ended, sleep(ms).then(() => null)])
+    if (early) throw new Error(`the call ended (${early.answer} after ${early.afterMs} ms), held expected`)
+    if (!dialled.provisional().includes(180)) throw new Error(`no 180 while the call is held: ${dialled.provisional()}`)
+  }
+  /** The final answer of `dialled`, which must come within `ms` of `since`. */
+  const endsWithin = async (dialled, ms, since = Date.now()) => {
+    const { answer } = await dialled.ended
+    const after = Date.now() - since
+    if (after > ms) throw new Error(`${answer} after ${after} ms, within ${ms} ms expected`)
+    return answer
+  }
+  /**
+   * A transaction that holds push_targets (ACCESS EXCLUSIVE): OpenSIPS's read of it waits, for less than its
+   * statement_timeout (1 s), and once more after a timeout. `waited()` resolves once a read waits on it (pg_locks).
+   */
+  const lockPushTargets = async () => {
+    const locker = new pg.Client({ connectionString: OPENSIPS_DB_URL })
+    await locker.connect()
+    await locker.query('BEGIN')
+    await locker.query('LOCK TABLE push_targets IN ACCESS EXCLUSIVE MODE')
+    return {
+      waited: () => until('a read of push_targets waiting on the lock', async () => ((await db.query("SELECT 1 FROM pg_locks WHERE relation = 'push_targets'::regclass AND NOT granted")).rows.length ? true : null), { timeout: 5_000, every: 20 }),
+      release: () => locker.query('COMMIT'),
+      end: async () => {
+        await locker.query('ROLLBACK').catch(() => undefined)
+        await locker.end()
+      }
+    }
+  }
+  const uas = []
+  const closeAll = async () => {
+    for (const ua of uas.splice(0)) await ua.close().catch(() => undefined)
+  }
+  let caller
+  let admin
+  try {
+    await step('the windows of 141, 143 and 144 (user agents of this process) get their accounts, and their browsers can be woken: rows of push_targets that a Gateway keeps alive', async () => {
+      for (const extension of [...wakeable.members, '142']) {
+        const userId = `ua-${extension}`
+        await store.upsertMapping({ tenantId: TENANT, userId, extension, displayName: `Fenêtre ${extension}` })
+        wakeable.credentials[extension] = (await registry.forTenant(TENANT).getSession({ id: userId, tenantId: TENANT, displayName: `Fenêtre ${extension}`, extension }, { id: 'ua', type: 'browser', label: 'UA' })).credential
+      }
+      await db.query("INSERT INTO push_targets (extension, tenant_id, holder, alive_until) SELECT e, 'e2e-ua', 'ua-' || e, now() + interval '1 hour' FROM unnest($1::text[]) AS e", [wakeable.members])
+      caller = await windowOf('142')
+      admin = await asPerson(alice)
+    })
+    await step('two windows of 141 whose WebSockets died (laptops put to sleep): the call waits; the caller gives up after 1.5 s and is told at once (487, not at the end of the wait); a missed call for 141 in missed_calls', async () => {
+      try {
+        uas.push(await deadWindow('141'), await deadWindow('141'))
+        const missedFrom = await lastId('missed_calls')
+        const dialled = await caller.dial('141')
+        await held(dialled)
+        const cancelled = Date.now()
+        await dialled.cancel()
+        expectEqual(await endsWithin(dialled, 1_000, cancelled), '487 Request Terminated', 'the answer once the caller gave up')
+        await until('the missed call in missed_calls', async () => ((await missedSince(missedFrom)).length ? true : null), { timeout: 5_000 })
+        expectEqual(await missedSince(missedFrom), ['142>141 487'], 'missed_calls rows of the held call given up')
+      } finally {
+        await closeAll()
+      }
+    })
+    await step('the window of 141 comes back on a new connection with the same Contact (the same registration: E_UL_CONTACT_UPDATE): it rings in the call that waits, and declines it', async () => {
+      try {
+        const ua = await deadWindow('141')
+        uas.push(ua)
+        ua.answer('603 Decline')
+        const dialled = await caller.dial('141')
+        await held(dialled)
+        const back = Date.now()
+        expectEqual(await ua.reconnect(), 200, 'the registration again, on the new connection')
+        expectEqual(await endsWithin(dialled, 3_000, back), '603 Decline', 'the answer of the window back')
+        expectEqual(ua.invites.length, 1, 'INVITEs to the window back')
+      } finally {
+        await closeAll()
+      }
+    })
+    await step('a woken window of 141 (over UDP: it keeps its Call-ID) renews its registration twice while it rings: it rings once, not once per renewal', async () => {
+      try {
+        const dialled = await caller.dial('141')
+        await held(dialled, 500)
+        const ua = await windowOf('141')
+        uas.push(ua)
+        ua.answer('603 Decline', 2_000)
+        expectEqual(await ua.register(), 200, 'the registration of the woken window')
+        await until('the woken window rung', async () => ua.invites.length === 1 || null)
+        for (let i = 0; i < 2; i++) expectEqual(await ua.register(), 200, `renewal ${i + 1} while it rings`)
+        expectEqual(await endsWithin(dialled, 5_000), '603 Decline', 'the answer of the woken window')
+        expectEqual(ua.invites.length, 1, 'INVITEs to the woken window')
+      } finally {
+        await closeAll()
+      }
+    })
+    await step('a window of 141 registers while OpenSIPS still reads whether 141 can be woken (push_targets locked until that read waits): it rings at once, not at the end of the wait, and once though it renews its registration', async () => {
+      const lock = await lockPushTargets()
+      try {
+        const dialled = await caller.dial('141')
+        // OpenSIPS found no window and waits on the table.
+        await lock.waited()
+        const ua = await windowOf('141')
+        uas.push(ua)
+        ua.answer('603 Decline', 2_000)
+        expectEqual(await ua.register(), 200, 'the registration of 141 while the read waits')
+        const registered = Date.now()
+        await lock.release()
+        await until('the window registered meanwhile rung', async () => ua.invites.length === 1 || null, { timeout: 3_000 })
+        expectEqual(await ua.register(), 200, 'its renewal while it rings')
+        expectEqual(await endsWithin(dialled, 5_000, registered), '603 Decline', 'the answer of the window registered meanwhile')
+        expectEqual(ua.invites.length, 1, 'INVITEs to that window')
+      } finally {
+        await lock.end()
+        await closeAll()
+      }
+    })
+    await step('a window of 141 registers over a WebSocket while push_targets is read, and its connection dies before the call is held: the caller gives up and is told at once (487, not at the end of the wait)', async () => {
+      const lock = await lockPushTargets()
+      try {
+        const dialled = await caller.dial('141')
+        await lock.waited()
+        const ua = await windowOf('141', { ws: true })
+        uas.push(ua)
+        expectEqual(await ua.register(), 200, 'the registration of 141 while the read waits')
+        await ua.drop()
+        // A moment for OpenSIPS to see its side of the connection close.
+        await sleep(300)
+        await lock.release()
+        await held(dialled)
+        const cancelled = Date.now()
+        await dialled.cancel()
+        expectEqual(await endsWithin(dialled, 1_000, cancelled), '487 Request Terminated', 'the answer once the caller gave up')
+      } finally {
+        await lock.end()
+        await closeAll()
+      }
+    })
+    await step('a call with Replaces (an attended transfer) to the window of 141 on a dead WebSocket: unreachable at once (477), nobody woken', async () => {
+      try {
+        uas.push(await deadWindow('141'))
+        const dialled = await caller.dial('141', { extra: ['Replaces: gone@127.0.0.1;to-tag=a;from-tag=b'] })
+        expectEqual(await endsWithin(dialled, 3_000), '477 Send failed', 'the answer to the INVITE with Replaces')
+      } finally {
+        await closeAll()
+      }
+    })
+    await step('no Gateway listens for 141 any more (its row of push_targets no longer alive): the call to its dead window is not held, unreachable at once (477)', async () => {
+      try {
+        uas.push(await deadWindow('141'))
+        await db.query("UPDATE push_targets SET alive_until = now() WHERE extension = '141'")
+        const dialled = await caller.dial('141')
+        expectEqual(await endsWithin(dialled, 3_000), '477 Send failed', 'the answer when nobody can wake 141')
+      } finally {
+        await db.query("UPDATE push_targets SET alive_until = now() + interval '1 hour' WHERE extension = '141'")
+        await closeAll()
+      }
+    })
+    await step('ring group 220 (143 and 144), none of whose windows is open: 143 opens two that decline, the call still waits for 144 (the first window of each member counts), whose window rings once though it renews its registration, and declines: 603', async () => {
+      expectEqual((await admin('POST', '/admin/groups', { number: '220', name: 'Réveils', members: ['143', '144'] })).statusCode, 201, 'creating group 220')
+      try {
+        const dialled = await caller.dial('220')
+        await held(dialled, 500)
+        for (let i = 0; i < 2; i++) {
+          const ua = await windowOf('143')
+          uas.push(ua)
+          ua.answer('603 Decline')
+          expectEqual(await ua.register(), 200, `registration of window ${i + 1} of 143`)
+        }
+        await until('both windows of 143 rung', async () => uas.every(w => w.invites.length === 1))
+        // Both declined (300 ms after their 180): the call waits on.
+        await held(dialled, 1_500)
+        const late = await windowOf('144')
+        uas.push(late)
+        late.answer('603 Decline', 2_000)
+        expectEqual(await late.register(), 200, 'registration of the window of 144')
+        await until('the window of 144 rung', async () => late.invites.length === 1 || null)
+        expectEqual(await late.register(), 200, 'its renewal while it rings')
+        expectEqual(await endsWithin(dialled, 5_000), '603 Decline', 'the answer of 220')
+        expectEqual(uas.map(w => `${w.user} ${w.invites.length}`), ['143 1', '143 1', '144 1'], 'INVITEs per window')
+      } finally {
+        await closeAll()
+      }
+    })
+    await step('ring group 220 whose only window (of 143) died: its members are woken, not 477; 143 comes back on a new connection and 144 opens a window: both ring and decline, 603', async () => {
+      try {
+        const dead = await deadWindow('143')
+        uas.push(dead)
+        dead.answer('603 Decline')
+        const dialled = await caller.dial('220')
+        await held(dialled)
+        expectEqual(await dead.reconnect(), 200, 'the registration of 143 again, on the new connection')
+        await until('the window of 143 back rung', async () => dead.invites.length === 1)
+        const other = await windowOf('144')
+        uas.push(other)
+        other.answer('603 Decline')
+        expectEqual(await other.register(), 200, 'registration of the window of 144')
+        expectEqual(await endsWithin(dialled, 3_000), '603 Decline', 'the answer of 220')
+        expectEqual(uas.map(w => `${w.user} ${w.invites.length}`), ['143 1', '144 1'], 'INVITEs per window')
+      } finally {
+        await closeAll()
+      }
+    })
+    await step('push_targets as the first version of step 5 wrote it (no alive_until): ring group 225 (143 and 144) still rings the window of 143, nobody woken; the start of the provider adds the column back', async () => {
+      expectEqual((await admin('POST', '/admin/groups', { number: '225', name: 'Ancien schéma', members: ['143', '144'] })).statusCode, 201, 'creating group 225')
+      try {
+        await db.query('ALTER TABLE push_targets DROP COLUMN alive_until')
+        const ua = await windowOf('143')
+        uas.push(ua)
+        ua.answer('603 Decline')
+        expectEqual(await ua.register(), 200, 'registration of the window of 143')
+        const dialled = await caller.dial('225')
+        expectEqual(await endsWithin(dialled, 3_000), '603 Decline', 'the answer of 225')
+        expectEqual(ua.invites.length, 1, 'INVITEs to the window of 143')
+      } finally {
+        await closeAll()
+        await admin('DELETE', '/admin/groups/225')
+        await new SubscriberProvisioner({ pool: db, realm: SIP_DOMAIN }).ensureSchema()
+        await db.query("UPDATE push_targets SET alive_until = now() + interval '1 hour' WHERE tenant_id = 'e2e-ua'")
+      }
+      expectEqual((await db.query("SELECT count(*)::int AS n FROM push_targets WHERE tenant_id = 'e2e-ua' AND alive_until > now()")).rows[0].n, 3, 'rows of 141, 143 and 144 alive again')
+    })
+    await step('ring group 230 of 12 members, full: 6 windows ring, 5 members are woken (the branch that waits for them takes the last place); 157 opens two windows: the second rings nobody, it would take the place of 161; 158 to 161 each ring: 603', async () => {
+      const members = Array.from({ length: 12 }, (_, i) => String(151 + i))
+      for (const extension of members) {
+        const userId = `ua-${extension}`
+        await store.upsertMapping({ tenantId: TENANT, userId, extension, displayName: `Fenêtre ${extension}` })
+        wakeable.credentials[extension] = (await registry.forTenant(TENANT).getSession({ id: userId, tenantId: TENANT, displayName: `Fenêtre ${extension}`, extension }, { id: 'ua', type: 'browser', label: 'UA' })).credential
+      }
+      // 151 to 156 have a window; 157 to 161 a browser to wake; 162 neither.
+      const woken = members.slice(6, 11)
+      await db.query("INSERT INTO push_targets (extension, tenant_id, holder, alive_until) SELECT e, 'e2e-ua', 'ua-' || e, now() + interval '1 hour' FROM unnest($1::text[]) AS e", [woken])
+      expectEqual((await admin('POST', '/admin/groups', { number: '230', name: 'Complet', members })).statusCode, 201, 'creating group 230')
+      try {
+        for (const user of members.slice(0, 6)) {
+          const ua = await windowOf(user)
+          uas.push(ua)
+          ua.answer('603 Decline')
+          expectEqual(await ua.register(), 200, `registration of the window of ${user}`)
+        }
+        const dialled = await caller.dial('230')
+        await until('the six windows rung', async () => uas.every(w => w.invites.length === 1) || null)
+        await held(dialled, 500)
+        const first = await windowOf('157')
+        uas.push(first)
+        first.answer('603 Decline', 5_000)
+        expectEqual(await first.register(), 200, 'registration of the first window of 157')
+        await until('the first window of 157 rung', async () => first.invites.length === 1 || null)
+        const second = await windowOf('157')
+        uas.push(second)
+        second.answer('603 Decline')
+        expectEqual(await second.register(), 200, 'registration of the second window of 157')
+        for (const user of woken.slice(1)) {
+          const ua = await windowOf(user)
+          uas.push(ua)
+          ua.answer('603 Decline')
+          expectEqual(await ua.register(), 200, `registration of the window of ${user}`)
+          await until(`the window of ${user} rung`, async () => ua.invites.length === 1 || null, { timeout: 3_000 })
+        }
+        expectEqual(await endsWithin(dialled, 8_000), '603 Decline', 'the answer of 230')
+        expectEqual(uas.map(w => `${w.user} ${w.invites.length}`), [...members.slice(0, 6).map(m => `${m} 1`), '157 1', '157 0', ...woken.slice(1).map(m => `${m} 1`)], 'INVITEs per window')
+      } finally {
+        await closeAll()
+        await admin('DELETE', '/admin/groups/230')
+        for (const extension of members) await store.deleteMapping(TENANT, `ua-${extension}`)
+        // Their accounts go now: the synchronisation of the step of the names removes only so many at once (a mapping
+        // emptied by mistake must not take every account), and expects those of 131 to 134 and 141 to 144.
+        await db.query('DELETE FROM subscriber WHERE username = ANY($1::text[])', [members])
+      }
+    })
+  } finally {
+    await closeAll()
+    await caller?.close()
+    await admin?.('DELETE', '/admin/groups/220')
+    await db.query("DELETE FROM push_targets WHERE tenant_id = 'e2e-ua'")
+    // Nobody holds them any more: the next synchronisation removes their accounts (step of the names).
+    for (const extension of [...wakeable.members, '142']) await store.deleteMapping(TENANT, `ua-${extension}`)
+  }
   await step('OpenSIPS shows the name the directory gives: Bob, renamed in the directory, calls Alice as Robert Durand once Alice synchronised it from Administration (POST /admin/directory/sync); the accounts of the extensions nobody holds now go, not the one the Gateway did not write (106)', async () => {
     const bobEntry = people.find(p => p.uid === 'bdurand')
     const nameOf103 = async () => (await db.query("SELECT display_name FROM display_names WHERE extension = '103'")).rows[0]?.display_name
@@ -1192,9 +1516,9 @@ try {
     try {
       await synchronise(alice)
       await until('the new name in display_names', async () => (await nameOf103()) === 'Robert Durand')
-      // Nobody holds 131 to 134 any more: the accounts the Gateway wrote for them go. 106, written by hand (no
-      // holder), stays: the Gateway removes only what it wrote.
-      await until('the accounts of 131 to 134 to go', async () => (await db.query("SELECT 1 FROM subscriber WHERE username IN ('131', '132', '133', '134')")).rows.length === 0)
+      // Nobody holds 131 to 134 and 141 to 144 any more: the accounts the Gateway wrote for them go. 106, written by
+      // hand (no holder), stays: the Gateway removes only what it wrote.
+      await until('the accounts of 131 to 134 and 141 to 144 to go', async () => (await db.query("SELECT 1 FROM subscriber WHERE username IN ('131', '132', '133', '134', '141', '142', '143', '144')")).rows.length === 0)
       expectEqual((await db.query("SELECT holder FROM subscriber WHERE username = '106'")).rows, [{ holder: null }], 'the account of 106')
       await dial(bob.page, '101')
       const ringing = alice.page.getByTestId('incoming-call')
@@ -1259,6 +1583,314 @@ try {
     expectEqual(`${ended.endStatus} ${ended.endReason}`, '404 unavailable', 'how the call to 200 ended')
     await signOut(desk)
   })
+  // Step 5: Jean is told of his calls by his browser while no window of TwakePhone is open (Web Push).
+  /** A browser with no page of the app: another page keeps it open (a browser closed altogether gets nothing). */
+  const leaveApp = async who => {
+    who.blank ??= await who.context.newPage()
+    // Closed, the page tries to unregister (pagehide, best effort): what it sends then is held at the relay until the
+    // page is gone, as when a laptop is put to sleep. What it leaves is always a registration on a closed WebSocket:
+    // OpenSIPS cannot reach it, and holds a call to it for the browser to wake (or answers 477 once nobody can).
+    const release = relay.hold()
+    try {
+      await who.page.close({ runBeforeUnload: true })
+      // A moment for the relay to close the SIP server's side of that connection.
+      await sleep(1_000)
+    } finally {
+      release()
+    }
+  }
+  /** The service worker of the app in `who`'s browser (Chromium and Edge: Playwright has no handle on Firefox's). */
+  const workerOf = who => who.context.serviceWorkers().find(w => w.url() === `${appOrigin}/sw.js`)
+  /**
+   * The notifications the service worker of `who`'s browser shows, once it showed `shown` of them since it was watched
+   * (deliverPush) and none is being shown. Never listed while one is: Chromium and Edge then forget the one being
+   * shown (getNotifications drops what is not on screen yet), which is what made this step fail on Edge.
+   */
+  const notificationsOf = async (who, shown = 1) =>
+    until(`${shown} notification(s) shown`, async () => {
+      const listed = await workerOf(who)?.evaluate(async shown => {
+        const e2e = self.__e2e
+        if (!e2e || e2e.pending || e2e.shown < shown) return null
+        return (await self.registration.getNotifications()).map(n => ({ title: n.title, body: n.body, tag: n.tag, url: n.data?.url, requireInteraction: n.requireInteraction, silent: n.silent }))
+      }, shown)
+      return listed ?? null
+    }).catch(async err => {
+      throw new Error(`${err.message}; worker: ${await workerOf(who)?.evaluate(() => JSON.stringify(self.__e2e ?? null)).catch(e => e.message)}`)
+    })
+  /**
+   * Hands `text` (a decrypted push) to the service worker of `who`'s browser, as its push service would (DevTools).
+   * The worker is watched first: what it shows, and whether a notification is being shown (notificationsOf); counted
+   * from this push on, or from the one before it too (`fresh` false).
+   */
+  const deliverPush = async (who, text, { fresh = true } = {}) => {
+    const cdp = await who.context.newCDPSession(who.blank)
+    const ids = new Map()
+    cdp.on('ServiceWorker.workerRegistrationUpdated', e => {
+      for (const r of e.registrations) ids.set(r.scopeURL, r.registrationId)
+    })
+    await cdp.send('ServiceWorker.enable')
+    const registrationId = await until('the service worker of the app', async () => ids.get(`${appOrigin}/`))
+    await workerOf(who).evaluate(fresh => {
+      if (self.__e2e) {
+        if (fresh) self.__e2e.shown = 0
+        return
+      }
+      const e2e = (self.__e2e = { pending: 0, shown: 0, log: [] })
+      const show = self.registration.showNotification.bind(self.registration)
+      self.registration.showNotification = (title, options) => {
+        e2e.pending++
+        e2e.log.push(`show ${title}`)
+        return show(title, options).finally(() => (e2e.pending--, e2e.shown++))
+      }
+    }, fresh)
+    await cdp.send('ServiceWorker.deliverPushMessage', { origin: appOrigin, registrationId, data: text })
+    await cdp.detach().catch(() => undefined)
+  }
+  /**
+   * Clicks the notification `tag` of `who`'s browser through its service worker: the browser's own notification, given
+   * to the worker's notificationclick listeners as a click would. No user activation comes with it, so what the
+   * worker opens (clients.openWindow) is noted, not opened: the caller opens it. Returns that, whether the
+   * notification is gone, and what the windows of the app were told.
+   */
+  const clickNotification = async (who, tag) =>
+    workerOf(who).evaluate(async tag => {
+      const [notification] = await self.registration.getNotifications({ tag })
+      if (!notification) throw new Error(`no notification ${tag}`)
+      const opened = []
+      const openWindow = self.clients.openWindow
+      self.clients.openWindow = async url => (opened.push(url), null)
+      try {
+        const event = new NotificationEvent('notificationclick', { notification })
+        const waits = []
+        Object.defineProperty(event, 'waitUntil', { value: p => void waits.push(p) })
+        self.dispatchEvent(event)
+        await Promise.all(waits)
+      } finally {
+        self.clients.openWindow = openWindow
+      }
+      return { opened, left: (await self.registration.getNotifications({ tag })).length }
+    }, tag)
+  /** A new page of the app in `who`'s browser, at `path`. */
+  const appPage = async (who, path) => {
+    const page = await who.context.newPage()
+    await page.route(/fonts\.g(static|oogleapis)\.com/, route => route.fulfill({ status: 200, contentType: 'text/css', body: '' }))
+    page.on('pageerror', err => console.log(`[${who.name}] page error:`, err.message))
+    await page.goto(`${appOrigin}${path}`)
+    return page
+  }
+  /** Opens the app at `path` in `who`'s browser, as a click on the notification does: it signs in by itself. */
+  const openFromNotification = async (who, login, path) => signedInFromNotification(who, login, await appPage(who, path))
+  /** `page` goes to the identity provider by itself (a notification was clicked): `who` signs in there, back on it. */
+  const signedInFromNotification = async (who, login, page) => {
+    // The identity provider may ask again (its sessions last ten minutes here), and asks for consent.
+    await until(`${who.name} signed in from the notification`, async () => {
+      try {
+        if (page.url() === `${appOrigin}/` && (await page.getByTestId('who').getByText(who.name).isVisible())) return true
+        if (await page.locator('input[name=login]').isVisible()) {
+          await page.locator('input[name=login]').fill(login)
+          await page.locator('input[name=password]').fill('whatever')
+          await page.getByRole('button', { name: 'Sign-in' }).click()
+        } else if (await page.getByRole('button', { name: 'Continue' }).isVisible()) {
+          await page.getByRole('button', { name: 'Continue' }).click()
+        }
+      } catch {
+        // The page navigated meanwhile: looked at again.
+      }
+      return false
+    }, { timeout: 20_000, every: 200 })
+    who.page = page
+    return page
+  }
+  const PUSH_TO_WORKER = BROWSER !== 'firefox'
+  let jeanBrowser
+  let jeanApi
+  /** The next push of `kind` for Jean's browser, once it came. */
+  const pushFor = async (kind = 'call') => {
+    const message = await pushService.next(jeanBrowser.id, m => m.error || m.data?.type === kind, 10_000)
+    if (message.error) throw new Error(`the push service refused the push: ${message.error}`)
+    return message
+  }
+  await step('Jean turns on call notifications in Réglages: only then does the browser ask him, the Gateway keeps his browser and OpenSIPS knows 102 can be woken', async () => {
+    jeanBrowser = pushService.subscribe()
+    // Playwright's browsers have no push service: the subscription is the test service's, the rest is the browser's.
+    await jean.context.grantPermissions(['notifications'], { origin: appOrigin })
+    await jean.context.addInitScript(sub => {
+      if (!('PushManager' in window)) return
+      const KEY = 'twakephone.e2e.push'
+      const of = key => ({
+        endpoint: sub.endpoint,
+        expirationTime: null,
+        options: { userVisibleOnly: true, applicationServerKey: Uint8Array.from(atob(key), c => c.charCodeAt(0)).buffer },
+        toJSON: () => ({ endpoint: sub.endpoint, expirationTime: null, keys: sub.keys }),
+        unsubscribe: async () => (localStorage.removeItem(KEY), true)
+      })
+      PushManager.prototype.subscribe = async function (o) {
+        const key = btoa(String.fromCharCode(...new Uint8Array(o.applicationServerKey)))
+        localStorage.setItem(KEY, key)
+        return of(key)
+      }
+      PushManager.prototype.getSubscription = async function () {
+        const key = localStorage.getItem(KEY)
+        return key ? of(key) : null
+      }
+    }, jeanBrowser)
+    await jean.page.reload()
+    await phoneState(jean.page).getByText('En ligne').waitFor({ timeout: 20_000 })
+    await setForwarding(jean, {})
+    await jean.page.getByRole('heading', { level: 2, name: "Notifications d'appel" }).waitFor()
+    await jean.page.getByText('Désactivées sur ce navigateur.', { exact: true }).waitFor()
+    await jean.page.getByRole('button', { name: 'Activer les notifications' }).click()
+    await jean.page.getByText('Activées sur ce navigateur.', { exact: true }).waitFor()
+    expectEqual((await store.listPushSubscriptions(TENANT, 'jdupont')).map(s => s.endpoint), [jeanBrowser.endpoint], "Jean's subscriptions at the Gateway")
+    await until('102 in push_targets', async () => (await db.query("SELECT holder FROM push_targets WHERE extension = '102'")).rows[0]?.holder === 'jdupont')
+    // Alive as long as the Gateway hears OpenSIPS (its subscription to the events, renewed every minute, lives 2).
+    expectEqual((await db.query("SELECT alive_until > now() + interval '30 seconds' AS alive FROM push_targets WHERE extension = '102'")).rows[0]?.alive, true, 'the row of 102 kept alive by the Gateway')
+    if (PUSH_TO_WORKER) await until('the service worker of the app', async () => jean.context.serviceWorkers().some(w => w.url() === `${appOrigin}/sw.js`))
+    // For what the screens cannot do once Jean has no window: his forwards (his access token, as his app kept it).
+    jeanApi = await asPerson(jean)
+  })
+  let woken
+  await step('Jean closes TwakePhone, his browser stays open; Alice calls 102: she hears it ringing, and in less than 3 s the push service has a message for Jean\'s browser, encrypted for it (aes128gcm) and signed by the Gateway (VAPID), with Alice\'s directory name', async () => {
+    await leaveApp(jean)
+    const dialled = Date.now()
+    await dial(alice.page, '102')
+    woken = await pushFor('call')
+    const after = woken.receivedAt - dialled
+    if (after > 3_000) throw new Error(`the push came ${after} ms after the call, under 3 s expected (FR-B10)`)
+    expectEqual(woken.vapid.publicKey, await push.publicKey(), 'the VAPID key of the push')
+    expectEqual(`${woken.headers.urgency} ${woken.headers['content-encoding']}`, 'high aes128gcm', 'urgency and encoding of the push')
+    expectEqual(`${woken.data.number} ${woken.data.name}`, '101 Alice Martin', 'who the push says is calling')
+    await alice.page.getByText('Appel de 102…').waitFor()
+  })
+  await step(`the notification ${PUSH_TO_WORKER ? 'the service worker shows says Alice calls (one, kept until Jean acts); clicked (notificationclick in the worker), it goes and opens' : 'opens'} TwakePhone on the call: Jean signs in by himself, his softphone registers and rings in the same call, he answers and they hear each other`, async () => {
+    let path = `/?call=${encodeURIComponent(woken.data.callId)}`
+    if (PUSH_TO_WORKER) {
+      await deliverPush(jean, woken.text)
+      const [shown, ...more] = await notificationsOf(jean)
+      expectEqual(more, [], 'other notifications')
+      expectEqual(`${shown.title} | ${shown.body} | ${shown.tag} | ${shown.requireInteraction}`, `Appel de Alice Martin (101) | Cliquez pour répondre dans TwakePhone. | call-${woken.data.callId} | true`, 'the notification')
+      // Clicked: no window of the app is open, the worker opens one on the call, and the notification goes.
+      const click = await clickNotification(jean, shown.tag)
+      expectEqual(click, { opened: [`${appOrigin}/?call=${encodeURIComponent(woken.data.callId)}`], left: 0 }, 'what the click on the notification did')
+      path = new URL(click.opened[0]).pathname + new URL(click.opened[0]).search
+    }
+    const page = await openFromNotification(jean, 'jdupont', path)
+    await phoneState(page).getByText('En ligne').waitFor({ timeout: 20_000 })
+    await page.getByTestId('incoming-call').getByText('Appel entrant de Alice Martin (101)').waitFor({ timeout: 20_000 })
+    await page.getByTestId('incoming-call').getByRole('button', { name: 'Répondre' }).click()
+    await page.getByText('En communication avec Alice Martin (101)').waitFor()
+    await alice.page.getByText('En communication avec Jean Dupont (102)').waitFor()
+    await bothHearEachOther(alice, jean)
+    await alice.page.getByRole('button', { name: 'Raccrocher' }).click()
+    await page.getByText('Appel avec Alice Martin (101) terminé.').waitFor()
+    // Nothing of the notification is left in the address.
+    expectEqual(page.url(), `${appOrigin}/`, 'the address of the app opened from the notification')
+  })
+  // Chromium and Edge only: Firefox's service worker gets no push here, and Playwright has no handle on it.
+  if (PUSH_TO_WORKER) {
+    await step('a window of TwakePhone that rings the call itself (on screen, signed in, registered): the worker shows no notification for it, the page rings', async () => {
+      // A push of a call while that window is there (its WebSocket was dead a moment): it asks the window first. Then
+      // a missed call, which shows whatever the windows say: pushes are handled one after the other, so once it shows
+      // the call's push is done with.
+      const here = `e2e-here-${randomBytes(4).toString('hex')}`
+      await deliverPush(jean, JSON.stringify({ type: 'call', callId: here, number: '101', name: 'Alice Martin', until: Date.now() + 30_000 }))
+      await deliverPush(jean, JSON.stringify({ type: 'missed', callId: `${here}-missed`, number: '101', name: 'Alice Martin' }), { fresh: false })
+      const listed = await notificationsOf(jean, 1)
+      expectEqual(listed.map(n => `${n.title} | ${n.tag}`), [`Appel manqué de Alice Martin (101) | call-${here}-missed`], 'the notifications shown')
+      await workerOf(jean).evaluate(async () => {
+        for (const n of await self.registration.getNotifications()) n.close()
+      })
+    })
+    await step('Jean leaves a window of TwakePhone signed out, on screen (a new tab); Alice calls: that window cannot ring, the notification shows; clicked, the worker tells that window (no other opens), which signs Jean in on the call: it rings there, he declines', async () => {
+      await leaveApp(jean)
+      const waiting = await appPage(jean, '/')
+      await waiting.getByRole('button', { name: 'Se connecter' }).waitFor()
+      await dial(alice.page, '102')
+      const { text, data } = await pushFor('call')
+      await deliverPush(jean, text)
+      const [shown, ...more] = await notificationsOf(jean)
+      expectEqual(more, [], 'other notifications')
+      expectEqual(`${shown.tag} ${shown.requireInteraction}`, `call-${data.callId} true`, 'the notification of the call')
+      expectEqual(await clickNotification(jean, shown.tag), { opened: [], left: 0 }, 'what the click on the notification did')
+      const page = await signedInFromNotification(jean, 'jdupont', waiting)
+      jean.page = page
+      expectEqual(jean.context.pages().filter(p => p.url().startsWith(appOrigin) && p !== jean.blank).length, 1, 'windows of the app in Jean\'s browser')
+      await phoneState(page).getByText('En ligne').waitFor({ timeout: 20_000 })
+      await page.getByTestId('incoming-call').getByText('Appel entrant de Alice Martin (101)').waitFor({ timeout: 20_000 })
+      await page.getByTestId('incoming-call').getByRole('button', { name: 'Refuser' }).click()
+      await alice.page.getByText("102 a refusé l'appel.").waitFor()
+    })
+  }
+  await step(`nobody opens the notification, Jean forwards on no answer after 5 s: Bob rings after those 5 s, not later; a missed call for Jean, whose notification ${PUSH_TO_WORKER ? 'replaces that of the call (the same one, it no longer waits for him)' : 'says so'}`, async () => {
+    await setForwarding(jean, { noAnswer: '103', delay: '5' })
+    await leaveApp(jean)
+    const started = new Date().toISOString()
+    const missedFrom = await lastId('missed_calls')
+    const dialled = Date.now()
+    await dial(alice.page, '102')
+    const pushed = await pushFor('call')
+    const { data } = pushed
+    const ringing = bob.page.getByTestId('incoming-call')
+    await ringing.getByText('Appel entrant de Alice Martin (101)').waitFor({ timeout: 20_000 })
+    const after = Date.now() - dialled
+    if (after > 12_000) throw new Error(`Bob rang ${after} ms after the call, about 5 s expected`)
+    await ringing.getByRole('button', { name: 'Répondre' }).click()
+    await alice.page.getByText('En communication avec Bob Durand (103)').waitFor()
+    await alice.page.getByRole('button', { name: 'Raccrocher' }).click()
+    await bob.page.getByText('Appel avec Alice Martin (101) terminé.').waitFor()
+    const missed = await pushFor('missed')
+    expectEqual(`${missed.data.callId} ${missed.data.name}`, `${data.callId} Alice Martin`, 'the push of the missed call')
+    if (PUSH_TO_WORKER) {
+      await deliverPush(jean, pushed.text)
+      await deliverPush(jean, missed.text, { fresh: false })
+      const listed = await notificationsOf(jean, 2)
+      expectEqual(listed.map(n => `${n.title} | ${n.body} | ${n.tag} | ${n.requireInteraction}`), [`Appel manqué de Alice Martin (101) | TwakePhone | call-${data.callId} | false`], 'the notifications once the call was missed')
+    }
+    const jeanCall = await newestCall('jdupont', started)
+    expectEqual(`${jeanCall.direction} ${jeanCall.remoteNumber} ${jeanCall.state}`, 'inbound 101 missed', "Jean's newest call")
+    expectEqual(await missedSince(missedFrom), [], 'missed_calls rows of the forwarded call')
+    expectEqual((await jeanApi('PUT', '/me/forwarding', {})).statusCode, 200, 'PUT /me/forwarding (none)')
+  })
+  await step('nobody opens it and Jean has no forward: after the wait Alice is told 102 did not answer, a missed call for Jean (408 in missed_calls), whose notification says so', async () => {
+    const started = new Date().toISOString()
+    const missedFrom = await lastId('missed_calls')
+    const before = await lastEnded(alice.page)
+    await dial(alice.page, '102')
+    await pushFor('call')
+    const ended = await until('the end of the call nobody took', async () => {
+      const e = await lastEnded(alice.page)
+      return e && e.id !== before?.id ? e : null
+    }, { timeout: 60_000 })
+    expectEqual(`${ended.endStatus} ${ended.endReason}`, '408 no-answer', 'how the call to Jean ended')
+    await alice.page.getByText("102 n'a pas répondu.").waitFor()
+    await pushFor('missed')
+    const jeanCall = await newestCall('jdupont', started)
+    expectEqual(`${jeanCall.direction} ${jeanCall.remoteNumber} ${jeanCall.state}`, 'inbound 101 missed', "Jean's newest call")
+    await until('the missed call in missed_calls', async () => ((await missedSince(missedFrom)).length ? true : null))
+    expectEqual(await missedSince(missedFrom), ['101>102 408'], 'missed_calls rows of the call nobody woke for')
+  })
+  await step('the push service says Jean\'s browser dropped its subscription (410): the Gateway forgets it; Alice gives up while the call waits, it ends at once; OpenSIPS no longer holds his calls, a call to 102 is unreachable at once', async () => {
+    pushService.gone(jeanBrowser.id)
+    const missedFrom = await lastId('missed_calls')
+    await dial(alice.page, '102')
+    await until('the subscription removed', async () => (await store.listPushSubscriptions(TENANT, 'jdupont')).length === 0)
+    await until('102 out of push_targets', async () => (await db.query("SELECT 1 FROM push_targets WHERE extension = '102'")).rows.length === 0)
+    // Alice gives up while the call waits: it ends at once (487), not at the end of the wait, a missed call for Jean.
+    // The windows Jean closed are registered on dead connections (leaveApp): the path of route[past_dead_branches].
+    await alice.page.getByRole('button', { name: 'Raccrocher' }).click()
+    await until('the call given up in missed_calls', async () => ((await missedSince(missedFrom)).length ? true : null), { timeout: 5_000 })
+    expectEqual(await missedSince(missedFrom), ['101>102 487'], 'missed_calls rows of the call given up while it waited')
+    const dialled = Date.now()
+    const ended = await dialUntilEnded(alice.page, '102')
+    // 477: the registrations his closed windows left (leaveApp) cannot be reached, and nobody can be woken.
+    expectEqual(`${ended.endStatus} ${ended.endReason}`, '477 unavailable', 'how the call to 102 ended once nobody can be woken')
+    if (Date.now() - dialled > 5_000) throw new Error('the call to 102 waited: nobody can be woken any more')
+  })
+  await step('Jean opens TwakePhone again for what follows', async () => {
+    await jean.context.close()
+    jean = await open('jdupont', 'Jean Dupont')
+    await phoneState(jean.page).getByText('En ligne').waitFor({ timeout: 20_000 })
+  })
   await step('a registration left on a dead connection (the first one, Alice) with a no-answer forward: Bob rings at once, not after the delay', async () => {
     await setForwarding(alice, { noAnswer: '103', delay: '20' })
     relay.cutUpstream(0)
@@ -1312,6 +1944,19 @@ try {
     await presenceIs(jean.page, 'Martin', '101', 'Hors ligne')
     await presenceIs(jean.page, 'Durand', '103', 'Disponible')
   })
+  await step('the Gateway stops: the rows of push_targets it kept alive are over at once (no call waits for a browser nobody will wake), not a row another Gateway keeps alive', async () => {
+    await registry.forTenant(TENANT).setWakeableOne({ extension: '102', userId: 'jdupont' }, true)
+    await db.query("INSERT INTO push_targets (extension, tenant_id, holder, alive_until) VALUES ('149', $1, 'another-gateway', now() + interval '1 hour')", [TENANT])
+    try {
+      const alive = async () => (await db.query("SELECT extension FROM push_targets WHERE tenant_id = $1 AND alive_until > now() ORDER BY extension", [TENANT])).rows.map(r => r.extension)
+      expectEqual(await alive(), ['102', '149'], 'rows alive while the Gateway runs')
+      gatewayClosed = true
+      await gateway.close()
+      expectEqual(await alive(), ['149'], 'rows alive once the Gateway stopped')
+    } finally {
+      await db.query("DELETE FROM push_targets WHERE extension = '149'")
+    }
+  })
 } catch (err) {
   failed = true
   console.error(err)
@@ -1325,10 +1970,11 @@ try {
 } finally {
   await browser.close()
   await web.stop()
-  await gateway.close()
+  if (!gatewayClosed) await gateway.close()
   await oidc.stop()
   await ldap.stop()
   await relay.stop()
+  await pushService.stop()
   await dtmf?.stop()
   await db.end()
 }

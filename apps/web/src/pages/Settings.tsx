@@ -8,6 +8,7 @@ import { LANGS, type Lang } from '../i18n/index.js'
 import { useT } from '../i18n/useT.js'
 import { usePhone } from '../softphone.js'
 import { ForwardingSettings, PresenceSettings } from './CallRulesSettings.js'
+import { NotificationSettings } from './NotificationSettings.js'
 
 type Device = { id: string; label: string }
 type Devices = { inputs: Device[]; outputs: Device[]; labelled: boolean }
@@ -159,6 +160,7 @@ export const Settings = ({ config }: { config: AppConfig }) => {
         <>
           <PresenceSettings />
           <ForwardingSettings />
+          <NotificationSettings userId={me.id} />
         </>
       ) : null}
       <section className="card" aria-labelledby="language">

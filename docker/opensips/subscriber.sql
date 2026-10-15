@@ -98,6 +98,18 @@ CREATE TABLE IF NOT EXISTS display_names (
     display_name VARCHAR(64) DEFAULT '' NOT NULL,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL
 );
+
+-- Our own table of step 5 (ADR 0015), written by the Gateway (PushTargets of provider-opensips), read by
+-- opensips.cfg.tpl when a call finds no window of the extension it reaches: the extensions whose holder has a
+-- browser subscribed to notifications, which the call then waits for while the Gateway wakes it, as long as a
+-- Gateway hears whom to wake (`alive_until`, renewed with its subscription to the events, over when it stops).
+CREATE TABLE IF NOT EXISTS push_targets (
+    extension VARCHAR(64) PRIMARY KEY NOT NULL,
+    tenant_id TEXT DEFAULT '' NOT NULL,
+    holder TEXT DEFAULT '' NOT NULL,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL,
+    alive_until TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL
+);
 -- Tables created beforehand (by OpenSIPS's own scripts, or by an earlier version of this file) lack columns: added
 -- here, once, by the owner (the Gateway only adds a missing one, see SubscriberProvisioner.ensureSchema), or every
 -- CDR insert, or every write of the rules, would fail. An older call_rules row gets an empty tenant: the Gateway's
@@ -114,3 +126,4 @@ ALTER TABLE call_rules ADD COLUMN IF NOT EXISTS holder TEXT DEFAULT '' NOT NULL;
 ALTER TABLE call_rules ADD COLUMN IF NOT EXISTS forward_always_holder TEXT;
 ALTER TABLE call_rules ADD COLUMN IF NOT EXISTS forward_busy_holder TEXT;
 ALTER TABLE call_rules ADD COLUMN IF NOT EXISTS forward_noanswer_holder TEXT;
+ALTER TABLE push_targets ADD COLUMN IF NOT EXISTS alive_until TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL;

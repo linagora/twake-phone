@@ -249,5 +249,16 @@
   "admin.groupMembersInvalid": "A group has 1 to 12 members.",
   "admin.groupMemberNotExtension": "Only extensions of your organisation can be members of a group.",
   "admin.groupSyncRunning": "A synchronisation of the directory is running: try again in a moment.",
-  "call.endedAnsweredElsewhere": "Call from {who} answered on another phone."
+  "call.endedAnsweredElsewhere": "Call from {who} answered on another phone.",
+  "settings.notifications": "Call notifications",
+  "settings.notificationsHint": "When no TwakePhone window is open, this browser shows you your calls: click the notification to answer. The browser must stay running.",
+  "settings.notificationsOn": "On for this browser.",
+  "settings.notificationsOff": "Off for this browser.",
+  "settings.notificationsEnable": "Turn on notifications",
+  "settings.notificationsDisable": "Turn off notifications",
+  "settings.notificationsDenied": "The browser blocks notifications from this site: allow them in its settings, then try again.",
+  "settings.notificationsUnsupported": "This browser cannot receive call notifications.",
+  "settings.notificationsUnavailable": "Call notifications are not offered on this platform.",
+  "settings.notificationsError": "Notifications could not be set.",
+  "auth.openingCall": "Signing in to take the call…"
 }

@@ -1,10 +1,11 @@
-import { useEffect, useRef } from 'react'
-import { NavLink, Outlet, useLocation } from 'react-router-dom'
+import { useEffect, useMemo, useRef } from 'react'
+import { NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom'
 import { useAuth } from '../auth/AuthProvider.js'
 import { displayNameFor } from '../auth/oidc.js'
 import { useGateway } from '../gateway.js'
 import type { Key } from '../i18n/index.js'
 import { useT } from '../i18n/useT.js'
+import { answerRingQueries, browserPush, calledFor, forgetPushAtSignOut, resyncPush, ringsHere, tellRinging } from '../push.js'
 import { usePhone } from '../softphone.js'
 import { CallPanel } from './CallPanel.js'
 
@@ -19,12 +20,46 @@ const LINKS: [string, Key][] = [
 export const Layout = () => {
   const { t } = useT()
   const { state, signOut } = useAuth()
-  const { me } = useGateway()
+  const { me, client } = useGateway()
   const phone = usePhone()
+  const push = useMemo(() => browserPush(), [])
+  const navigate = useNavigate()
   const name = displayNameFor(me, state.status === 'signed-in' ? state.user : null)
   // The administration link shows only to administrators; the Gateway refuses the others anyway.
   const links = LINKS.filter(([to]) => to !== '/admin' || me?.features?.admin)
-  const { pathname } = useLocation()
+  const { pathname, search } = useLocation()
+  // Opened by the notification of a call: signed in, the softphone registers and the call rings here. The address
+  // keeps no trace of it (a reload is no reason to do anything about that call).
+  useEffect(() => {
+    if (calledFor(search) !== null) navigate(pathname, { replace: true })
+  }, [search, pathname, navigate])
+  // The subscription to notifications this person made on this browser, handed to the Gateway again at each start.
+  useEffect(() => {
+    if (me?.extension) resyncPush(client, push, me.id).catch(() => undefined)
+  }, [client, push, me?.id, me?.extension])
+  // The service worker asks the windows on screen before it shows the notification of a call: this one rings it
+  // (registered), or may (its softphone on its way back: a quiet notification meanwhile).
+  const phoneState = useRef(phone.state)
+  phoneState.current = phone.state
+  useEffect(() => {
+    if (typeof navigator === 'undefined' || !navigator.serviceWorker) return
+    return answerRingQueries(navigator.serviceWorker, () => ringsHere(phoneState.current, document.visibilityState))
+  }, [])
+  // The calls this window rings: the quiet notification the service worker showed for one of them goes.
+  const ringing = phone.calls
+    .filter(c => c.direction === 'inbound' && c.state === 'ringing')
+    .map(c => c.id)
+    .join('\n')
+  useEffect(() => {
+    if (!ringing || typeof navigator === 'undefined' || !navigator.serviceWorker) return
+    navigator.serviceWorker.ready.then(r => tellRinging(r.active, ringing.split('\n'))).catch(() => undefined)
+  }, [ringing])
+  const signOutHere = async () => {
+    await phone.shutdown()
+    // The next person on this browser does not get this one's calls.
+    if (me) await forgetPushAtSignOut(client, push, me.id)
+    await signOut()
+  }
   const main = useRef<HTMLElement>(null)
   const firstRender = useRef(true)
   // A route change in a SPA is a page change for assistive tech: the title says where we are, the focus follows (RGAA 8.5, 12.7).
@@ -62,7 +97,7 @@ export const Layout = () => {
               </button>
             </span>
           ) : null}
-          <button type="button" className="btn" onClick={() => void phone.shutdown().then(signOut)}>
+          <button type="button" className="btn" onClick={() => void signOutHere()}>
             {t('auth.signout')}
           </button>
         </div>

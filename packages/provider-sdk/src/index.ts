@@ -40,6 +40,14 @@ export interface TelephonyProvider {
    * next one. `displayName` is the holder's name in the directory: what the SIP server shows the people they call.
    */
   syncExtensions?(holders: { extension: string; userId: string; displayName?: string }[]): Promise<void>
+  /**
+   * Who of the tenant can be woken for a call (capability `push`): the people with a browser subscribed to
+   * notifications, with the extension they hold. Replaces the tenant's list; a call to one of them while nothing of
+   * theirs is online waits for a device to come online, and the provider tells the Gateway to wake them (`call.wake`).
+   */
+  setWakeable?(holders: { extension: string; userId: string }[]): Promise<void>
+  /** One person's line of `setWakeable`: whether they can be woken now (`on`), the others untouched. */
+  setWakeableOne?(holder: { extension: string; userId: string }, on: boolean): Promise<void>
   /** Where the calls of the user's extension go (capability `forwarding`). */
   getForwarding?(user: User): Promise<ForwardingRules>
   /** Replaces those rules; targets are extensions the Gateway checked. */

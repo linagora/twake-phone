@@ -3,6 +3,7 @@ import pg from 'pg'
 import type { SecretProvisioner } from '@twake/telephony-provider-sdk'
 import { CALL_GROUPS_SCHEMA, CallGroups, DISPLAY_NAMES_SCHEMA, type CallGroupsOptions } from './call-groups.js'
 import { CALL_RULES_SCHEMA, CallRules, type CallRulesOptions } from './call-rules.js'
+import { PUSH_TARGETS_SCHEMA, PushTargets, type PushTargetsOptions } from './push-targets.js'
 
 // Everything about OpenSIPS's `subscriber` table (module auth_db) lives here: the Gateway only sees a SecretProvisioner.
 
@@ -28,7 +29,8 @@ export const digestHashes = (username: string, realm: string, secret: string) =>
  * CDRs, with the caller, the extension the call reached and the one dialled as extra columns), plus the rows of the
  * `version` table it checks at startup, and our own tables, read by the script through sqlops (no version row,
  * OpenSIPS does not check them): `call_rules` (forwards and "do not disturb"), `call_groups` (simultaneous ring
- * groups) and `display_names` (the directory name of each extension). `subscriber` has one column OpenSIPS does not
+ * groups), `display_names` (the directory name of each extension) and `push_targets` (the extensions whose holder has
+ * a browser to wake for a call, step 5). `subscriber` has one column OpenSIPS does not
  * read, `holder`: who the Gateway wrote the account for (NULL for a row it did not write). Tables created beforehand (by OpenSIPS's own scripts,
  * or by an earlier version of this schema) lack columns (EXTRA_COLUMNS): `ensureSchema()` adds those that are
  * missing, or every CDR insert, or every write of the rules, would fail.
@@ -90,14 +92,15 @@ CREATE TABLE IF NOT EXISTS missed_calls (
 CREATE INDEX IF NOT EXISTS missed_calls_callid_idx ON missed_calls (callid);
 INSERT INTO version (table_name, table_version) VALUES ('acc', ${ACC_TABLE_VERSION}), ('missed_calls', ${MISSED_CALLS_TABLE_VERSION})
   ON CONFLICT (table_name) DO NOTHING;
-${CALL_RULES_SCHEMA}${CALL_GROUPS_SCHEMA}${DISPLAY_NAMES_SCHEMA}`
+${CALL_RULES_SCHEMA}${CALL_GROUPS_SCHEMA}${DISPLAY_NAMES_SCHEMA}${PUSH_TARGETS_SCHEMA}`
 
 const ACC_EXTRA = "VARCHAR(64) DEFAULT '' NOT NULL"
 /**
  * The columns an existing table may lack: those of `acc` and `missed_calls` that OpenSIPS's own scripts do not create
  * (the acc extras of opensips.cfg.tpl), those `call_rules` gained after its first version (the holders; an older
- * row gets an empty tenant, and the first reconcile drops it), and the holder of a `subscriber` row (an older row has
- * none: it is never removed, until the session of its holder writes it again).
+ * row gets an empty tenant, and the first reconcile drops it), the holder of a `subscriber` row (an older row has
+ * none: it is never removed, until the session of its holder writes it again), and the life of a `push_targets` row
+ * (step 5 first wrote it without: an older row is not alive until the Gateway keeps it so).
  */
 export const EXTRA_COLUMNS = [
   ['subscriber', 'holder', 'TEXT'],
@@ -111,7 +114,8 @@ export const EXTRA_COLUMNS = [
   ['call_rules', 'holder', "TEXT DEFAULT '' NOT NULL"],
   ['call_rules', 'forward_always_holder', 'TEXT'],
   ['call_rules', 'forward_busy_holder', 'TEXT'],
-  ['call_rules', 'forward_noanswer_holder', 'TEXT']
+  ['call_rules', 'forward_noanswer_holder', 'TEXT'],
+  ['push_targets', 'alive_until', 'TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL']
 ] as const
 
 const addColumn = ([table, column, definition]: (typeof EXTRA_COLUMNS)[number]) => `ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS ${column} ${definition};`
@@ -213,7 +217,7 @@ export class SubscriberProvisioner implements SecretProvisioner {
       const added = await this.addColumns(missing).then(
         () => true,
         err => {
-          this.log.warn(`OpenSIPS tables: could not add ${missing.map(([t, c]) => `${t}.${c}`).join(', ')} (${err instanceof Error ? err.message : String(err)}); CDRs, call rules or the removal of accounts no longer held will not be written until they exist`)
+          this.log.warn(`OpenSIPS tables: could not add ${missing.map(([t, c]) => `${t}.${c}`).join(', ')} (${err instanceof Error ? err.message : String(err)}); CDRs, call rules, the removal of accounts no longer held or the wake of a browser will not be written until they exist`)
           return false
         }
       )
@@ -320,6 +324,11 @@ export class SubscriberProvisioner implements SecretProvisioner {
   /** The `call_groups` and `display_names` of the same database, on the same connections (see CallGroupsOptions). */
   callGroups(opts: Omit<CallGroupsOptions, 'pool'> = {}) {
     return new CallGroups({ pool: this.pool, ...opts })
+  }
+
+  /** The `push_targets` of the same database, on the same connections (see PushTargetsOptions). */
+  pushTargets(opts: Omit<PushTargetsOptions, 'pool'> = {}) {
+    return new PushTargets({ pool: this.pool, ...opts })
   }
 
   async close() {

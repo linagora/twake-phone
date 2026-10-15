@@ -6,6 +6,7 @@ import { StoreDirectory, parseUserMap } from './directory.js'
 import { DirectorySync, parseInterval } from './directory-sync.js'
 import { ldapDirectoryFromEnv } from './ldap-directory.js'
 import { storedOpensipsFactory, type StoredOpensipsConfig } from './providers.js'
+import { WebPush, parsePushServices, parseVapidSubject } from './push.js'
 import { ProviderRegistry } from './registry.js'
 import { PgStore } from './store/pg.js'
 
@@ -86,6 +87,28 @@ const conference = env.LIVEKIT_API_KEY && env.LIVEKIT_API_SECRET && env.LIVEKIT_
     })()
   : undefined
 
+// Web Push (step 5, ADR 0015): VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY (both or neither; `npx web-push
+// generate-vapid-keys`), else a pair made at the first start and kept in the database, encrypted with SECRETS_KEY.
+// VAPID_SUBJECT tells the push services whom to reach (mailto: or https:); the first https origin of CORS_ORIGINS (the
+// app) by default. PUSH_SERVICES: the push services allowed (the browsers' own by default); PUSH_PROXY: a proxy to them.
+const vapidGiven = env.VAPID_PUBLIC_KEY || env.VAPID_PRIVATE_KEY
+if (vapidGiven && !(env.VAPID_PUBLIC_KEY && env.VAPID_PRIVATE_KEY)) throw new Error('VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY go together')
+if (env.VAPID_PUBLIC_KEY && Buffer.from(env.VAPID_PUBLIC_KEY, 'base64url').length !== 65) throw new Error('VAPID_PUBLIC_KEY must be a P-256 public key in base64url (65 bytes)')
+if (env.VAPID_PRIVATE_KEY && Buffer.from(env.VAPID_PRIVATE_KEY, 'base64url').length !== 32) throw new Error('VAPID_PRIVATE_KEY must be a P-256 private key in base64url (32 bytes)')
+const vapidSubject = env.VAPID_SUBJECT ?? env.CORS_ORIGINS?.split(',').map(o => o.trim()).find(o => o.startsWith('https://'))
+const push =
+  vapidSubject && (vapidGiven || key)
+    ? new WebPush({
+        store,
+        ...(key ? { key } : {}),
+        ...(vapidGiven ? { vapid: { publicKey: env.VAPID_PUBLIC_KEY!, privateKey: env.VAPID_PRIVATE_KEY! } } : {}),
+        subject: parseVapidSubject(vapidSubject),
+        services: parsePushServices(env.PUSH_SERVICES),
+        ...(env.PUSH_PROXY ? { proxy: env.PUSH_PROXY } : {})
+      })
+    : undefined
+if (!push) console.warn('WARNING: no notifications of calls without a window (Web Push): set VAPID_SUBJECT (or an https origin in CORS_ORIGINS), and SECRETS_KEY or the VAPID keys')
+
 const contacts = ldapDirectoryFromEnv(env, message => console.warn(`WARNING: ${message}`))
 // The accounts of the directory become user ↔ extension mappings, on a schedule (LDAP_SYNC_INTERVAL, "0" to disable)
 // and on demand from the administration screen. Only when the schema says which attribute holds the extension.
@@ -105,6 +128,7 @@ const app = await buildApp(registry, {
   ...(directorySync ? { directorySync } : {}),
   ...(hstsMaxAge !== undefined ? { security: { hstsMaxAge, hstsIncludeSubDomains: env.HSTS_INCLUDE_SUBDOMAINS === '1' } } : {}),
   auth: authenticatorFromEnv(env),
+  ...(push ? { push } : {}),
   ...(conference ? { conference } : {})
 })
 directorySync?.useLogger(app.log)

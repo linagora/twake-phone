@@ -107,6 +107,8 @@ export const storedOpensipsFactory = ({ store, key, env = process.env, provision
         callRules: provisioner.callRules({ ready: ensureSchema, tenantId, holderOf: async extension => (await store.getMappingByExtension(tenantId, extension))?.userId }),
         // The ring groups and the directory names OpenSIPS reads, in the same database too (ADR 0014).
         callGroups: provisioner.callGroups({ ready: ensureSchema, tenantId }),
+        // Who can be woken for a call (their browser subscribed to notifications), in the same database (ADR 0015).
+        pushTargets: provisioner.pushTargets({ ready: ensureSchema, tenantId }),
         // The SIP accounts follow the mappings: one written for a user who no longer holds the extension goes (ADR 0014).
         accounts: {
           async reconcile(holders) {

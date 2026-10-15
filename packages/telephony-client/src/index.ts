@@ -92,6 +92,14 @@ export const parseMeetingId = (input: string): string | null => {
   return /^[A-Za-z0-9][A-Za-z0-9_-]{2,63}$/.test(candidate) ? candidate : null
 }
 
+/** What GET /me/push-subscriptions says. */
+export interface PushState {
+  available: boolean
+  /** The Gateway's VAPID public key (base64url), when available. */
+  publicKey?: string
+  subscriptions: number
+}
+
 export class TelephonyClient {
   constructor(private readonly options: TelephonyClientOptions) {}
 
@@ -222,6 +230,24 @@ export class TelephonyClient {
   /** A status; an absence or a "do not disturb" may end by itself (`until`, ISO 8601) and carry a message for callers. */
   setPresence(status: PresenceStatus, options: { until?: string; message?: string } = {}) {
     return this.request<MyPresence>('/me/presence', { method: 'PUT', body: JSON.stringify({ status, ...options }) })
+  }
+
+  /**
+   * Notifications of calls while no window of the app is open (Web Push): whether this platform offers them, the key
+   * a browser subscribes with, and how many browsers of the person are subscribed.
+   */
+  getPushSubscriptions() {
+    return this.request<PushState>('/me/push-subscriptions')
+  }
+
+  /** Keeps this browser's subscription (`PushSubscription.toJSON()`) for the person (501: not on this platform). */
+  addPushSubscription(subscription: { endpoint: string; keys: { p256dh: string; auth: string } }) {
+    return this.request<PushState>('/me/push-subscriptions', { method: 'POST', body: JSON.stringify({ endpoint: subscription.endpoint, keys: subscription.keys }) })
+  }
+
+  /** Forgets this browser's subscription (whether it was kept or not). */
+  async removePushSubscription(endpoint: string) {
+    await this.request<void>('/me/push-subscriptions', { method: 'DELETE', body: JSON.stringify({ endpoint }) })
   }
 
   /** Where one's calls go instead of ringing (501: not on this platform; 404: no extension). */

@@ -235,6 +235,13 @@ describe('Softphone', () => {
     const cancelled = await phone.call('104')
     ua().lastCall!.emit('failed', { originator: 'local', cause: 'Canceled' })
     expect(cancelled.endReason).toBe('cancelled')
+    // A 408 is a no answer (JsSIP counts it as unavailable); a 477, nobody there.
+    const late = await phone.call('102')
+    ua().lastCall!.emit('failed', { originator: 'remote', cause: 'Unavailable', message: { status_code: 408, reason_phrase: 'Request Timeout', getHeader: () => undefined } })
+    expect([late.endReason, late.endStatus]).toEqual(['no-answer', 408])
+    const dead = await phone.call('102')
+    ua().lastCall!.emit('failed', { originator: 'system', cause: 'SIP Failure Code', message: { status_code: 477, reason_phrase: 'Send failed', getHeader: () => undefined } })
+    expect([dead.endReason, dead.endStatus]).toEqual(['unavailable', 477])
   })
 
   it('tells a call refused by a "do not disturb" from a plain 480, with the message the person called left', async () => {
@@ -875,6 +882,28 @@ describe('Softphone', () => {
       expect(getSession).toHaveBeenCalledTimes(2)
       expect(uas[0]!.stop).toHaveBeenCalled()
       expect(uas[1]!.start).toHaveBeenCalled()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('registers the same Contact and instance after a restart: the new registration replaces the one left on a dead connection', async () => {
+    vi.useFakeTimers()
+    try {
+      const { ua, uas, configs } = await setup()
+      ua().emit('registered', {})
+      // A REGISTER lost with its connection (the WebSocket cut while it was sent): a restart.
+      ua().emit('registrationFailed', { cause: 'Connection Error' })
+      await vi.advanceTimersByTimeAsync(1_000)
+      expect(uas).toHaveLength(2)
+      const [first, second] = configs as { contact_uri?: string; instance_id?: string }[]
+      expect(first!.contact_uri).toMatch(/^sip:[a-z0-9]{8,}@[a-z0-9]{8,}\.invalid;transport=ws$/)
+      expect(first!.instance_id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
+      expect(second!.contact_uri).toBe(first!.contact_uri)
+      expect(second!.instance_id).toBe(first!.instance_id)
+      // Another softphone (another window): its own.
+      const other = await setup()
+      expect((other.configs[0] as { contact_uri?: string }).contact_uri).not.toBe(first!.contact_uri)
     } finally {
       vi.useRealTimers()
     }
