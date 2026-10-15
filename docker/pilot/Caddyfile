@@ -1,5 +1,10 @@
 # The only public entry of the pilot stack, on one domain: HTTPS (port 443, port 80 for the redirect and the ACME
 # challenge) in front of the services that listen on the loopback. WebSocket upgrades (Gateway events, SIP) pass as is.
+{
+	# The configuration is this file: no admin API on the host's loopback for a local process to rewrite.
+	admin off
+}
+
 {$DOMAIN} {
 	# An email: a Let's Encrypt certificate under that contact (DNS of DOMAIN must point here, ports 80 and 443 open).
 	# "internal": a certificate from Caddy's own CA, for a test where the browsers are told to trust it.
@@ -13,7 +18,13 @@
 	handle /sip {
 		reverse_proxy 127.0.0.1:{$OPENSIPS_WS_PORT:8088}
 	}
-	# The demo identity provider (Keycloak, `demo` profile). Without that profile nothing listens there (502).
+	# The demo identity provider (Keycloak, `demo` profile). Without that profile nothing listens there (502). Its
+	# administration (and the master realm) and the account console, where a tester could change a password, stay
+	# off the Internet: an SSH tunnel to 127.0.0.1:8180 reaches them (README).
+	@keycloakPrivate path /auth/admin /auth/admin/* /auth/realms/master /auth/realms/master/* /auth/realms/twakephone/account /auth/realms/twakephone/account/*
+	handle @keycloakPrivate {
+		respond 404
+	}
 	handle /auth/* {
 		reverse_proxy 127.0.0.1:{$KEYCLOAK_PORT:8180}
 	}

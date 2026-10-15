@@ -7,8 +7,13 @@
   "resetPasswordAllowed": false,
   "loginWithEmailAllowed": true,
   "internationalizationEnabled": true,
-  "supportedLocales": ["fr", "en"],
+  "supportedLocales": [
+    "fr",
+    "en"
+  ],
   "defaultLocale": "fr",
+  "ssoSessionIdleTimeout": 28800,
+  "ssoSessionMaxLifespan": 604800,
   "clients": [
     {
       "clientId": "twakephone-web",
@@ -19,8 +24,12 @@
       "implicitFlowEnabled": false,
       "directAccessGrantsEnabled": false,
       "consentRequired": false,
-      "redirectUris": ["https://${DOMAIN}/callback"],
-      "webOrigins": ["https://${DOMAIN}"],
+      "redirectUris": [
+        "https://${DOMAIN}/callback"
+      ],
+      "webOrigins": [
+        "https://${DOMAIN}"
+      ],
       "attributes": {
         "pkce.code.challenge.method": "S256",
         "post.logout.redirect.uris": "https://${DOMAIN}/"
@@ -47,7 +56,13 @@
       "emailVerified": true,
       "firstName": "Alice",
       "lastName": "Martin",
-      "credentials": [{ "type": "password", "value": "${DEMO_PASSWORD}", "temporary": false }]
+      "credentials": [
+        {
+          "type": "password",
+          "value": "${ALICE_PASSWORD}",
+          "temporary": false
+        }
+      ]
     },
     {
       "username": "bob",
@@ -56,7 +71,13 @@
       "emailVerified": true,
       "firstName": "Bob",
       "lastName": "Durand",
-      "credentials": [{ "type": "password", "value": "${DEMO_PASSWORD}", "temporary": false }]
+      "credentials": [
+        {
+          "type": "password",
+          "value": "${BOB_PASSWORD}",
+          "temporary": false
+        }
+      ]
     },
     {
       "username": "carole",
@@ -65,7 +86,13 @@
       "emailVerified": true,
       "firstName": "Carole",
       "lastName": "Bernard",
-      "credentials": [{ "type": "password", "value": "${DEMO_PASSWORD}", "temporary": false }]
+      "credentials": [
+        {
+          "type": "password",
+          "value": "${CAROLE_PASSWORD}",
+          "temporary": false
+        }
+      ]
     }
   ]
 }

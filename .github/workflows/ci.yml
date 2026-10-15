@@ -145,11 +145,21 @@ jobs:
       - name: .env du kit (init.sh, profil demo)
         run: |
           echo "127.0.0.1 twakephone.test" | sudo tee -a /etc/hosts
-          docker/pilot/init.sh twakephone.test internal --demo --public-ip 127.0.0.1
-          sed -i 's/^RTPENGINE_INTERFACE=.*/RTPENGINE_INTERFACE=127.0.0.1/' docker/pilot/.env
+          docker/pilot/init.sh twakephone.test internal --demo --media-ip 127.0.0.1
+          sudo ss -Hlntu | awk '{print $1, $5}' | sort -u > "$RUNNER_TEMP/listen-before"
       - name: Kit pilote (construction des images et démarrage)
         working-directory: docker/pilot
         run: docker compose up --build --wait --wait-timeout 600
+      # ADR 0012 : hors de la boucle, le kit n'ouvre que 80 et 443 (Caddy) et la plage RTP de rtpengine.
+      - name: Le kit n'écoute hors de la boucle que sur 80, 443 et la plage RTP
+        run: |
+          sudo ss -Hlntu | awk '{print $1, $5}' | sort -u > "$RUNNER_TEMP/listen-after"
+          comm -13 "$RUNNER_TEMP/listen-before" "$RUNNER_TEMP/listen-after" | tee "$RUNNER_TEMP/listen-new"
+          exposed=$(awk '{ addr = $2; port = addr; sub(/.*:/, "", port); sub(/:[^:]*$/, "", addr)
+                           if (addr ~ /^(127\.|\[::1\]$)/) next
+                           if (port == 80 || port == 443 || ($1 == "udp" && port >= 30000 && port <= 30100)) next
+                           print }' "$RUNNER_TEMP/listen-new")
+          if [ -n "$exposed" ]; then echo "Exposed beyond the loopback:"; echo "$exposed"; exit 1; fi
       - run: yarn install --frozen-lockfile
       - name: Cache de Chromium (clé = version de playwright-core)
         id: browser-cache
@@ -165,7 +175,19 @@ jobs:
         run: npx playwright-core install-deps chromium
       - name: e2e du kit pilote (connexion Keycloak, annuaire LDAP, appel entre deux navigateurs, Récents)
         run: |
-          DEMO_PASSWORD=$(sed -n 's/^DEMO_PASSWORD=//p' docker/pilot/.env) node apps/web/test/pilot.e2e.mjs
+          export ALICE_PASSWORD=$(sed -n 's/^ALICE_PASSWORD=//p' docker/pilot/.env) BOB_PASSWORD=$(sed -n 's/^BOB_PASSWORD=//p' docker/pilot/.env)
+          node apps/web/test/pilot.e2e.mjs
+        env:
+          PILOT_URL: https://twakephone.test
+          PILOT_RESOLVE: 127.0.0.1
+          PILOT_INSECURE: '1'
+      # Un second démarrage sur les mêmes volumes (royaume déjà importé, base et annuaire déjà là), comme après un
+      # redémarrage de la machine.
+      - name: Arrêt et second démarrage du kit, e2e rejoué
+        run: |
+          (cd docker/pilot && docker compose down && docker compose up --wait --wait-timeout 600)
+          export ALICE_PASSWORD=$(sed -n 's/^ALICE_PASSWORD=//p' docker/pilot/.env) BOB_PASSWORD=$(sed -n 's/^BOB_PASSWORD=//p' docker/pilot/.env)
+          node apps/web/test/pilot.e2e.mjs
         env:
           PILOT_URL: https://twakephone.test
           PILOT_RESOLVE: 127.0.0.1

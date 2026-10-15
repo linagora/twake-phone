@@ -2,18 +2,24 @@
 # Caddy (HTTPS on one domain), the app, the Gateway, OpenSIPS + rtpengine, PostgreSQL; with `--profile demo`, a
 # Keycloak and an OpenLDAP with three test people. Read docker/pilot/README.md first; `./init.sh` writes the .env.
 #
-#   ./init.sh phone.example.org you@example.org --demo
-#   docker compose up -d --build --wait            (without the demo profile: your own SSO and LDAP, see .env)
-#   docker compose --profile demo up -d --build --wait
+#   ./init.sh phone.example.org you@example.org --demo      (without --demo: your own SSO and LDAP, see .env)
+#   docker compose up -d --build --wait --wait-timeout 600   (.env says COMPOSE_PROFILES=demo with --demo)
 #
 # Public ports: 80/tcp and 443/tcp (Caddy), and the RTP range 30000-30100/udp (rtpengine). Everything else listens on
 # the loopback: host networking for the services that talk to each other and to the browsers' media, loopback port
 # mappings for the demo ones.
 name: twakephone
 
+x-logging: &logging
+  logging:
+    options:
+      max-size: 10m
+      max-file: "3"
+
 x-host: &host
   network_mode: host
   restart: unless-stopped
+  <<: *logging
 
 services:
   caddy:
@@ -26,11 +32,10 @@ services:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data
       - caddy-config:/config
+    # Started with the others, not after them: a service that never gets healthy must not leave 443 silent.
     depends_on:
-      web:
-        condition: service_healthy
-      gateway:
-        condition: service_healthy
+      - web
+      - gateway
 
   postgres:
     <<: *host
@@ -39,6 +44,8 @@ services:
       POSTGRES_USER: twake
       POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}"
       POSTGRES_DB: twake
+      # The image trusts the loopback by default: on the host network that is every process of the machine.
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256 --auth-local=scram-sha-256
     command: ["postgres", "-p", "54320", "-c", "listen_addresses=127.0.0.1"]
     volumes:
       - ../opensips/subscriber.sql:/docker-entrypoint-initdb.d/01-subscriber.sql:ro
@@ -84,10 +91,13 @@ services:
       RTPENGINE_SOCK: udp:127.0.0.1:22222
       OPENSIPS_LOG_LEVEL: ${OPENSIPS_LOG_LEVEL:-2}
     healthcheck:
-      test: ["CMD-SHELL", "test -p /tmp/opensips_fifo"]
-      interval: 2s
-      timeout: 3s
-      retries: 30
+      # One MI request over UDP (mi_datagram, loopback): healthy once OpenSIPS answers, not once its fifo exists.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/udp/127.0.0.1/8880 && printf '{\"jsonrpc\":\"2.0\",\"method\":\"version\",\"id\":\"health\"}' >&3 && read -r -t 2 -n 1 _ <&3"]
+      start_period: 60s
+      start_interval: 2s
+      interval: 30s
+      timeout: 5s
+      retries: 3
 
   gateway:
     <<: *host
@@ -173,6 +183,7 @@ services:
     image: quay.io/keycloak/keycloak:26.4
     command: ["start-dev", "--import-realm"]
     restart: unless-stopped
+    <<: *logging
     ports:
       - "127.0.0.1:8180:8080"
     environment:
@@ -183,9 +194,11 @@ services:
       KC_HTTP_MANAGEMENT_RELATIVE_PATH: /
       KC_BOOTSTRAP_ADMIN_USERNAME: admin
       KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-}
-      # Read by the realm file (demo/twakephone-realm.json) when it is imported, at the first start.
+      # Read by the realm file (demo/twakephone-realm.json) when it is imported, at the first start only.
       DOMAIN: ${DOMAIN}
-      DEMO_PASSWORD:
+      ALICE_PASSWORD: ${ALICE_PASSWORD:-}
+      BOB_PASSWORD: ${BOB_PASSWORD:-}
+      CAROLE_PASSWORD: ${CAROLE_PASSWORD:-}
     volumes:
       - ./demo/twakephone-realm.json:/opt/keycloak/data/import/twakephone-realm.json:ro
       - keycloak-data:/opt/keycloak/data
@@ -201,6 +214,7 @@ services:
     image: osixia/openldap:1.5.0
     command: ["--copy-service"]
     restart: unless-stopped
+    <<: *logging
     ports:
       - "127.0.0.1:3890:389"
     environment:

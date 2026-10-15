@@ -5,7 +5,8 @@
 // that reaches it (the media ports included).
 //
 //   PILOT_URL            https://<DOMAIN> of the deployment (required)
-//   DEMO_PASSWORD        the demo accounts' password, from docker/pilot/.env (required)
+//   ALICE_PASSWORD       Alice's and Bob's passwords, from docker/pilot/.env (required)
+//   BOB_PASSWORD
 //   PILOT_RESOLVE        an IP the browser uses for DOMAIN instead of the DNS (a test without a public name)
 //   PILOT_INSECURE=1     accept the certificate (TLS=internal)
 //   BROWSER              chromium (default), firefox or msedge
@@ -17,7 +18,7 @@ const need = name => {
   return process.env[name]
 }
 const PILOT_URL = new URL(need('PILOT_URL')).origin
-const PASSWORD = need('DEMO_PASSWORD')
+const PASSWORDS = { alice: need('ALICE_PASSWORD'), bob: need('BOB_PASSWORD') }
 const RESOLVE = process.env.PILOT_RESOLVE
 const INSECURE = process.env.PILOT_INSECURE === '1'
 const BROWSER = process.env.BROWSER ?? 'chromium'
@@ -61,7 +62,7 @@ const open = async (login, name) => {
   await page.getByRole('button', { name: 'Se connecter' }).click()
   await page.waitForURL(`${PILOT_URL}/auth/**`)
   await page.locator('#username').fill(login)
-  await page.locator('#password').fill(PASSWORD)
+  await page.locator('#password').fill(PASSWORDS[login])
   await page.locator('#kc-login').click()
   await page.waitForURL(`${PILOT_URL}/`)
   await page.getByTestId('who').getByText(name).waitFor()
@@ -107,6 +108,12 @@ try {
     await presenceIs(bob.page, 'Alice', '101', 'Disponible')
     await bob.page.getByRole('link', { name: 'Récents' }).click()
     await until('the call in Bob\'s history', async () => (await bob.page.locator('main ul.list li').filter({ hasText: '101' }).count()) > 0)
+  })
+  await step('the identity provider\'s administration and account console are not served on the Internet', async () => {
+    for (const path of ['/auth/admin/', '/auth/realms/master/', '/auth/realms/twakephone/account']) {
+      const res = await alice.page.request.get(`${PILOT_URL}${path}`, { maxRedirects: 0 })
+      if (res.status() !== 404) throw new Error(`${path} answers ${res.status()}, expected 404`)
+    }
   })
   await step('Alice signs out', async () => {
     await alice.page.getByRole('button', { name: 'Se déconnecter' }).click()

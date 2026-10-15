@@ -12,7 +12,7 @@ Le premier test réel se fait à quelques personnes, sur une machine louée, san
 
 ## Conséquences
 
-Un certificat, un port TCP public, la même origine pour l'app, l'API et le SIP : pas de CORS, une CSP qui n'ajoute rien. OpenSIPS voit toutes les connexions SIP venir de 127.0.0.1 : la limitation de débit et l'anti-fraude de l'étape 6 devront se fonder sur l'identité SIP, pas sur l'adresse source (ou Caddy devra filtrer avant OpenSIPS). OpenSIPS résout le domaine au démarrage : le DNS doit exister avant. Pas de TURN : pas de son derrière un réseau qui bloque l'UDP. Ce n'est pas le déploiement de production (redondance, supervision, images publiées, multi-tenant : étapes 7 et V1).
+Un certificat, deux ports TCP publics (80 pour le défi ACME et la redirection, 443), la même origine pour l'app, l'API et le SIP : pas de CORS, une CSP qui n'ajoute rien. OpenSIPS voit toutes les connexions SIP venir de 127.0.0.1, et la passerelle toutes les requêtes (ses journaux aussi) : la limitation de débit et l'anti-fraude de l'étape 6 devront se fonder sur l'identité SIP, pas sur l'adresse source (ou Caddy devra filtrer avant OpenSIPS). OpenSIPS résout le domaine au démarrage : le DNS doit exister avant. Pas de TURN : pas de son derrière un réseau qui bloque l'UDP. Ce n'est pas le déploiement de production (redondance, supervision, images publiées, multi-tenant : étapes 7 et V1).
 
 ## Alternatives écartées
 
