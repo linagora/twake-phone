@@ -1,6 +1,6 @@
-import type { Call, Capabilities, ConferenceParticipant, Contact, DialInConfiguration, MediaSession, Presence, PresenceStatus, TelephonyEvent } from '@twake/telephony-types'
+import type { Call, Capabilities, ConferenceParticipant, Contact, DialInConfiguration, ForwardingRules, MediaSession, Presence, PresenceStatus, TelephonyEvent } from '@twake/telephony-types'
 
-export type { Contact, ContactNumber } from '@twake/telephony-types'
+export type { Contact, ContactNumber, ForwardingRules } from '@twake/telephony-types'
 
 import { backoffDelay } from './backoff.js'
 
@@ -38,6 +38,17 @@ export interface HistoryFilter {
   limit?: number
   before?: string
 }
+
+/** What a person chose as presence, as the Gateway keeps it: absent or "do not disturb" may end at a date, with a message. */
+export interface PresenceChoice {
+  status: PresenceStatus
+  since: string
+  until?: string
+  message?: string
+}
+
+/** One's own presence: what the others see, and what one chose (absent once it ended, or never chosen). */
+export type MyPresence = Presence & { choice?: PresenceChoice }
 
 export interface Conference {
   /** Identifier used by every conference call (the Meet room id, which is also its LiveKit room name). */
@@ -93,7 +104,16 @@ export class TelephonyClient {
         ...init.headers
       }
     })
-    if (!res.ok) throw Object.assign(new Error(`Gateway ${res.status} on ${path}`), { status: res.status })
+    if (!res.ok) {
+      // The Gateway says why it refused (a forward target that is not an extension…): `code` for the screen to put
+      // into words, `detail` as it said it.
+      const body = await Promise.resolve()
+        .then(() => res.json())
+        .then((b: { code?: unknown; message?: unknown }) => b, () => undefined)
+      const code = typeof body?.code === 'string' ? body.code : undefined
+      const detail = typeof body?.message === 'string' ? body.message : undefined
+      throw Object.assign(new Error(`Gateway ${res.status} on ${path}`), { status: res.status, ...(code ? { code } : {}), ...(detail ? { detail } : {}) })
+    }
     if (res.status === 204) {
       // Drain the empty body: a response left unread shows up as an aborted request in the browser.
       await res.text()
@@ -169,7 +189,7 @@ export class TelephonyClient {
   }
 
   getPresence() {
-    return this.request<Presence>('/me/presence')
+    return this.request<MyPresence>('/me/presence')
   }
 
   /** The presence of everyone in the organisation, by extension; `realtime` false: the platform does not tell it. */
@@ -177,8 +197,19 @@ export class TelephonyClient {
     return this.request<{ realtime: boolean; items: { extension: string; userId: string; presence: Presence }[] }>('/presence')
   }
 
-  setPresence(status: PresenceStatus) {
-    return this.request<Presence>('/me/presence', { method: 'PUT', body: JSON.stringify({ status }) })
+  /** A status; an absence or a "do not disturb" may end by itself (`until`, ISO 8601) and carry a message for callers. */
+  setPresence(status: PresenceStatus, options: { until?: string; message?: string } = {}) {
+    return this.request<MyPresence>('/me/presence', { method: 'PUT', body: JSON.stringify({ status, ...options }) })
+  }
+
+  /** Where one's calls go instead of ringing (501: not on this platform; 404: no extension). */
+  getForwarding() {
+    return this.request<ForwardingRules>('/me/forwarding')
+  }
+
+  /** Replaces those rules (400 with `code`: a target that is not an extension of the organisation, one's own, a bad delay). */
+  setForwarding(rules: ForwardingRules) {
+    return this.request<ForwardingRules>('/me/forwarding', { method: 'PUT', body: JSON.stringify(rules) })
   }
 
   originate(target: string, idempotencyKey: string) {

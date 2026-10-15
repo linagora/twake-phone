@@ -237,6 +237,21 @@ describe('Softphone', () => {
     expect(cancelled.endReason).toBe('cancelled')
   })
 
+  it('tells a call refused by a "do not disturb" from a plain 480, with the message the person called left', async () => {
+    const { phone, ua } = await setup()
+    const response = (reason_phrase: string, headers: Record<string, string> = {}) => ({ status_code: 480, reason_phrase, getHeader: (name: string) => headers[name] })
+    const dnd = await phone.call('102')
+    ua().lastCall!.emit('failed', { originator: 'remote', cause: 'Unavailable', message: response('Do Not Disturb', { 'Twake-Dnd-Message': ' En réunion jusqu’à 16 h ' }) })
+    expect([dnd.endReason, dnd.endStatus, dnd.endMessage]).toEqual(['dnd', 480, 'En réunion jusqu’à 16 h'])
+    const silent = await phone.call('102')
+    ua().lastCall!.emit('failed', { originator: 'remote', cause: 'Unavailable', message: response('Do Not Disturb') })
+    expect([silent.endReason, silent.endMessage]).toEqual(['dnd', undefined])
+    // Nobody there: the usual 480, whatever header it carries.
+    const away = await phone.call('103')
+    ua().lastCall!.emit('failed', { originator: 'remote', cause: 'Unavailable', message: response('Temporarily Unavailable', { 'Twake-Dnd-Message': 'x' }) })
+    expect([away.endReason, away.endMessage]).toEqual(['unavailable', undefined])
+  })
+
   it('refuses a target that is not a dialable string', async () => {
     const { phone } = await setup()
     await expect(phone.call('102; DROP')).rejects.toThrow(/Invalid target/)

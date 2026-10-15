@@ -7,6 +7,7 @@ import { useGateway } from '../gateway.js'
 import { LANGS, type Lang } from '../i18n/index.js'
 import { useT } from '../i18n/useT.js'
 import { usePhone } from '../softphone.js'
+import { ForwardingSettings, PresenceSettings } from './CallRulesSettings.js'
 
 type Device = { id: string; label: string }
 type Devices = { inputs: Device[]; outputs: Device[]; labelled: boolean }
@@ -154,6 +155,12 @@ export const Settings = ({ config }: { config: AppConfig }) => {
           </p>
         ) : null}
       </section>
+      {me ? (
+        <>
+          <PresenceSettings />
+          <ForwardingSettings />
+        </>
+      ) : null}
       <section className="card" aria-labelledby="language">
         <h2 id="language">{t('settings.language')}</h2>
         <div className="field">

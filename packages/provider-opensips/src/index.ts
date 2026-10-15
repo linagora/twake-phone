@@ -1,5 +1,6 @@
 import type { MediaProvider, ProviderFactory, RoutedEvent, TelephonyProvider } from '@twake/telephony-provider-sdk'
-import type { Call, Capabilities, Endpoint, MediaSession, OriginateRequest, Presence, ProviderStatus, User } from '@twake/telephony-types'
+import type { Call, Capabilities, Endpoint, ForwardingRules, MediaSession, OriginateRequest, Presence, ProviderStatus, User } from '@twake/telephony-types'
+import type { CallRules } from './call-rules.js'
 import { OpensipsEvents, parseDlgList, parseUlDump, type EventsLogger } from './events.js'
 import { AsyncQueue } from './queue.js'
 import { CallTracker } from './tracker.js'
@@ -7,6 +8,7 @@ import { CallTracker } from './tracker.js'
 export { SubscriberProvisioner, digestHashes, SUBSCRIBER_SCHEMA, SUBSCRIBER_SQL, EXTRA_COLUMNS, SUBSCRIBER_TABLE_VERSION, ACC_TABLE_VERSION, MISSED_CALLS_TABLE_VERSION, type SubscriberProvisionerOptions, type Queryable } from './subscriber.js'
 export { OpensipsEvents, parseDlgList, parseUlDump, parseUdpUrl, type EventsLogger, type OpensipsEventsOptions, type RegisteredContact } from './events.js'
 export { CallTracker, userOf, type ContactRegistration, type TelephonyPresence } from './tracker.js'
+export { CallRules, CALL_RULES_SCHEMA, DND_MESSAGE_MAX, NOANSWER_DELAY, type CallRulesOptions, type DndRule } from './call-rules.js'
 export { AsyncQueue } from './queue.js'
 
 /** The events the Gateway listens to: registrations and their refreshes (usrloc), our own call events (opensips.cfg.tpl), the CDRs and missed calls (acc). */
@@ -18,6 +20,8 @@ export const SUBSCRIBED_EVENTS = [
   'E_TWAKEPHONE_CALLING',
   'E_TWAKEPHONE_RINGING',
   'E_TWAKEPHONE_ANSWERED',
+  'E_TWAKEPHONE_FORWARDED',
+  'E_TWAKEPHONE_DND',
   'E_ACC_CDR',
   'E_ACC_MISSED_EVENT'
 ]
@@ -48,10 +52,19 @@ export interface OpensipsConfig {
    * no events: no presence of the others, no history.
    */
   events?: { miUrl: string; listen?: string; advertise?: string; from?: string[]; expireSec?: number; timeoutMs?: number }
+  /**
+   * The `call_rules` OpenSIPS reads at each call (ADR 0013): forwards, and the "do not disturb" of the people who
+   * chose one. Without it, no forwarding, and a "do not disturb" is only a presence.
+   */
+  callRules?: CallRules
   logger?: EventsLogger
 }
 
 const START_RETRY_MS = [1_000, 2_000, 5_000, 10_000, 30_000]
+/** setTimeout's longest delay (about 24 days): a later end is waited for in several steps. */
+const MAX_TIMER_MS = 2 ** 31 - 1
+
+const noExtension = () => Object.assign(new Error('No extension is assigned to this user'), { statusCode: 404 })
 
 const notYet = (what: string) => Object.assign(new Error(`${what} through the Gateway is not available yet; the softphone does it directly for now`), { statusCode: 501 })
 
@@ -70,6 +83,8 @@ export class OpensipsProvider implements TelephonyProvider, MediaProvider {
   private subscribed = false
   private closed = false
   private startTimer?: ReturnType<typeof setTimeout>
+  /** Tells the end of a chosen presence (a "do not disturb" until a date) when it comes. */
+  private expiryTimer?: ReturnType<typeof setTimeout>
 
   constructor(private readonly config: OpensipsConfig) {
     for (const [name, value] of Object.entries({ websocketUrl: config.websocketUrl, domain: config.domain })) {
@@ -148,6 +163,7 @@ export class OpensipsProvider implements TelephonyProvider, MediaProvider {
       // Presences are told as they change only while OpenSIPS's events come; the history is filled from them.
       presence: { read: true, write: true, realtime: !!this.events?.live, statuses: ['available', 'busy', 'away', 'dnd', 'offline'] },
       history: !!this.events,
+      forwarding: !!this.config.callRules,
       conference: { dialIn: false, dialOut: false }
     }
   }
@@ -155,12 +171,60 @@ export class OpensipsProvider implements TelephonyProvider, MediaProvider {
   /** The presence of a user with an extension comes from the SIP server (registered, in a call) and what they set. */
   async getPresence(user: User): Promise<Presence> {
     if (user.extension) return this.tracker.presenceOf(user.extension)
-    return this.unmapped.get(`${user.tenantId}:${user.id}`) ?? { status: 'available', source: 'system' }
+    const chosen = this.unmapped.get(`${user.tenantId}:${user.id}`)
+    return chosen && !(chosen.until && Date.parse(chosen.until) <= Date.now()) ? chosen : { status: 'available', source: 'system' }
   }
 
+  /**
+   * What the user chose. A "do not disturb" is written in `call_rules` first (OpenSIPS refuses or forwards their
+   * calls while it lasts, and lifts it at its end by itself); any other choice lifts it there.
+   */
   async setPresence(user: User, presence: Presence) {
-    if (user.extension) this.tracker.setUserPresence(user.extension, presence)
-    else this.unmapped.set(`${user.tenantId}:${user.id}`, presence)
+    if (!user.extension) {
+      this.unmapped.set(`${user.tenantId}:${user.id}`, presence)
+      return
+    }
+    await this.config.callRules?.setDnd(user.extension, presence.status === 'dnd' ? { ...(presence.until ? { until: presence.until } : {}), ...(presence.message ? { message: presence.message } : {}) } : null)
+    this.tracker.setUserPresence(user.extension, presence)
+    this.armExpiry()
+  }
+
+  /**
+   * The choices the Gateway kept, at its start: applied, and every other one forgotten, here and in `call_rules`
+   * (a "do not disturb" left there by someone who no longer holds the extension, or lifted while this was down).
+   */
+  async restorePresences(entries: { user: User; presence: Presence }[]) {
+    const mapped = entries.filter((e): e is { user: User & { extension: string }; presence: Presence } => !!e.user.extension)
+    for (const e of entries) if (!e.user.extension) this.unmapped.set(`${e.user.tenantId}:${e.user.id}`, e.presence)
+    const keep = new Set(mapped.map(e => e.user.extension))
+    for (const ext of this.tracker.userPresences().keys()) if (!keep.has(ext)) this.tracker.clearUserPresence(ext)
+    await this.config.callRules?.clearDndExcept(mapped.filter(e => e.presence.status === 'dnd').map(e => e.user.extension))
+    for (const { user, presence } of mapped) await this.setPresence(user, presence)
+    this.armExpiry()
+  }
+
+  /** One timer, for the earliest end of a chosen presence: the others are told it ended when it does. */
+  private armExpiry() {
+    clearTimeout(this.expiryTimer)
+    const end = this.tracker.nextUserPresenceEnd()
+    if (end === undefined || this.closed) return
+    this.expiryTimer = setTimeout(() => {
+      this.tracker.expire()
+      this.armExpiry()
+    }, Math.min(Math.max(end - Date.now(), 0) + 50, MAX_TIMER_MS))
+    this.expiryTimer.unref?.()
+  }
+
+  async getForwarding(user: User): Promise<ForwardingRules> {
+    if (!user.extension) throw noExtension()
+    if (!this.config.callRules) return {}
+    return this.config.callRules.getForwarding(user.extension)
+  }
+
+  async setForwarding(user: User, rules: ForwardingRules) {
+    if (!user.extension) throw noExtension()
+    if (!this.config.callRules) throw Object.assign(new Error('Forwarding is not available on this platform'), { statusCode: 501 })
+    await this.config.callRules.setForwarding(user.extension, rules)
   }
 
   /** The presence of every extension the SIP server told about. */
@@ -213,6 +277,7 @@ export class OpensipsProvider implements TelephonyProvider, MediaProvider {
   async close() {
     this.closed = true
     clearTimeout(this.startTimer)
+    clearTimeout(this.expiryTimer)
     await this.events?.stop()
     this.queue.close()
     await this.config.onClose?.()

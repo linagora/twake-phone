@@ -1,6 +1,7 @@
-// End to end of steps 3 and 4 (calls, transfers, what the Gateway hears from OpenSIPS): people call and transfer
-// each other from their browsers through OpenSIPS and rtpengine; the Gateway subscribes to OpenSIPS's events and
-// shows the presence of the others in the directory and the calls in the history. The SIP stack is the only thing
+// End to end of steps 3 and 4 (calls, transfers, what the Gateway hears from OpenSIPS, forwards and "do not
+// disturb"): people call and transfer each other from their browsers through OpenSIPS and rtpengine; the Gateway
+// subscribes to OpenSIPS's events and shows the presence of the others in the directory and the calls in the
+// history; the forwards and the "do not disturb" set in the app are applied by OpenSIPS (`call_rules`). The SIP stack is the only thing
 // outside this process (docker/docker-compose.sip.yml, or OpenSIPS and rtpengine started by hand); the identity
 // provider, the directory, the Gateway (with the OpenSIPS provider) and the app run here, and three browser
 // contexts with a simulated microphone play Alice (101), Jean (102) and Bob (103).
@@ -174,6 +175,8 @@ const db = new pg.Pool({ connectionString: OPENSIPS_DB_URL, max: 1 })
 // on the same database would still see each other's rows: one run at a time per database.
 const lastId = async table => (await db.query(`SELECT coalesce(max(id), 0) AS id FROM ${table}`)).rows[0].id
 const since = { acc: await lastId('acc'), missed_calls: await lastId('missed_calls') }
+// The forwards and "do not disturb" of this cast that an interrupted run may have left: every run starts without.
+await db.query("DELETE FROM call_rules WHERE extension IN ('101', '102', '103')").catch(() => undefined)
 
 // A microphone that produces a tone, no permission prompt, sound allowed without a gesture, OpenSIPS's self-signed
 // certificate accepted (Firefox: through the context's ignoreHTTPSErrors). Firefox ignores ICE candidates on the
@@ -296,6 +299,42 @@ const recents = async (page, atLeast) => {
 }
 const transferButton = page => page.getByRole('button', { name: 'Transférer', exact: true })
 const transferTarget = page => page.getByLabel('Transférer à (poste ou numéro)')
+/** Opens Réglages and sets the forwards of `who` (an empty field: none in that case), as a person does. */
+const setForwarding = async (who, { always = '', busy = '', noAnswer = '', delay = '20' } = {}) => {
+  await who.page.getByRole('link', { name: 'Réglages' }).click()
+  await who.page.getByRole('heading', { level: 2, name: "Renvois d'appel" }).waitFor()
+  await who.page.getByLabel('Renvoyer tous les appels vers le poste').fill(always)
+  await who.page.getByLabel("Si vous êtes en ligne ou refusez l'appel, renvoyer vers le poste").fill(busy)
+  await who.page.getByLabel('Si vous ne répondez pas, renvoyer vers le poste').fill(noAnswer)
+  await who.page.getByLabel('Délai avant le renvoi (secondes de sonnerie)').fill(delay)
+  await who.page.getByRole('button', { name: 'Enregistrer les renvois' }).click()
+  await who.page.getByRole('status').filter({ hasText: 'Renvois enregistrés.' }).waitFor()
+}
+/** Opens Réglages and sets the status of `who`; `inMinutes`: an end that many minutes from now (the browser's clock). */
+const setStatus = async (who, label, { inMinutes, message = '' } = {}) => {
+  await who.page.getByRole('link', { name: 'Réglages' }).click()
+  await who.page.getByRole('heading', { level: 2, name: 'Disponibilité' }).waitFor()
+  await who.page.getByLabel('Statut', { exact: true }).selectOption({ label })
+  if (label !== 'Disponible') {
+    const until = inMinutes
+      ? await who.page.evaluate(m => {
+          const d = new Date(Date.now() + m * 60_000)
+          const p = n => String(n).padStart(2, '0')
+          return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`
+        }, inMinutes)
+      : ''
+    await who.page.getByLabel("Jusqu'au (facultatif)").fill(until)
+    await who.page.getByLabel('Message pour vos correspondants (facultatif)').fill(message)
+  }
+  await who.page.getByRole('button', { name: 'Enregistrer le statut' }).click()
+  await who.page.getByRole('status').filter({ hasText: 'Statut enregistré.' }).waitFor()
+}
+/** The newest entry of a person's history once it is newer than `after` (the Gateway's store, as Récents reads it). */
+const newestCall = (userId, after) =>
+  until(`a call in the history of ${userId}`, async () => {
+    const [entry] = (await store.listHistory(TENANT, userId, { limit: 1 })).items
+    return entry && entry.startedAt > after ? entry : null
+  })
 /** Alice calls Jean, who answers. */
 const aliceCallsJean = async (alice, jean) => {
   await dial(alice.page, '102')
@@ -585,6 +624,135 @@ try {
     await bothHearEachOther(alice, bob)
     await bob.page.getByRole('button', { name: 'Raccrocher' }).click()
     await alice.page.getByText('Appel avec 103 terminé.').waitFor()
+  })
+  await step('Jean forwards all his calls to 103 in Réglages: Alice calls 102, Bob rings and answers, Jean is not disturbed', async () => {
+    await setForwarding(jean, { always: '103' })
+    const { rows } = await db.query('SELECT forward_always, forward_busy, forward_noanswer FROM call_rules WHERE extension = $1', ['102'])
+    expectEqual(JSON.stringify(rows), JSON.stringify([{ forward_always: '103', forward_busy: null, forward_noanswer: null }]), 'call_rules of 102')
+    const started = new Date().toISOString()
+    await dial(alice.page, '102')
+    const ringing = bob.page.getByTestId('incoming-call')
+    await ringing.getByText('Appel entrant de Alice Martin (101)').waitFor({ timeout: 20_000 })
+    expectEqual(await jean.page.getByTestId('incoming-call').count(), 0, 'incoming calls on Jean side')
+    await ringing.getByRole('button', { name: 'Répondre' }).click()
+    await alice.page.getByText('En communication avec 102').waitFor()
+    await bob.page.getByText('En communication avec Alice Martin (101)').waitFor()
+    await bothHearEachOther(alice, bob)
+    await bob.page.getByRole('button', { name: 'Raccrocher' }).click()
+    await alice.page.getByText('Appel avec 102 terminé.').waitFor()
+    // The history says what happened: Alice called 102, Bob took it; Jean has nothing new.
+    const aliceCall = await newestCall('amartin', started)
+    expectEqual(`${aliceCall.direction} ${aliceCall.remoteNumber} ${aliceCall.answered}`, 'outbound 102 true', "Alice's newest call")
+    const bobCall = await newestCall('bdurand', started)
+    expectEqual(`${bobCall.direction} ${bobCall.remoteNumber} ${bobCall.answered}`, 'inbound 101 true', "Bob's newest call")
+    expectEqual((await store.listHistory(TENANT, 'jdupont', { from: started })).items.length, 0, "Jean's calls since the forward")
+    await setForwarding(jean, {})
+    expectEqual((await db.query('SELECT 1 FROM call_rules WHERE extension = $1', ['102'])).rows.length, 0, 'call_rules rows of 102 once nothing is forwarded')
+  })
+  await step('Jean forwards on no answer after 3 s: his phone rings, then Bob\'s, who answers; a missed call for Jean', async () => {
+    await setForwarding(jean, { noAnswer: '103', delay: '3' })
+    const started = new Date().toISOString()
+    await dial(alice.page, '102')
+    await jean.page.getByTestId('incoming-call').getByText('Appel entrant de Alice Martin (101)').waitFor({ timeout: 20_000 })
+    const rang = Date.now()
+    const ringing = bob.page.getByTestId('incoming-call')
+    await ringing.getByText('Appel entrant de Alice Martin (101)').waitFor({ timeout: 20_000 })
+    const after = Date.now() - rang
+    if (after < 2_000 || after > 10_000) throw new Error(`Bob rang ${after} ms after Jean, 3 s expected`)
+    await jean.page.getByTestId('incoming-call').waitFor({ state: 'hidden' })
+    // Longer than the delay: the call to Bob is not cut by Jean's timer.
+    await sleep(4_000)
+    await ringing.getByRole('button', { name: 'Répondre' }).click()
+    await alice.page.getByText('En communication avec 102').waitFor()
+    await bothHearEachOther(alice, bob)
+    await alice.page.getByRole('button', { name: 'Raccrocher' }).click()
+    await bob.page.getByText('Appel avec Alice Martin (101) terminé.').waitFor()
+    const jeanCall = await newestCall('jdupont', started)
+    expectEqual(`${jeanCall.direction} ${jeanCall.remoteNumber} ${jeanCall.state}`, 'inbound 101 missed', "Jean's newest call")
+    expectEqual((await recents(jean.page, 1))[0], '101: Manqué', "Jean's newest recent call")
+    const bobCall = await newestCall('bdurand', started)
+    expectEqual(`${bobCall.direction} ${bobCall.remoteNumber} ${bobCall.answered}`, 'inbound 101 true', "Bob's newest call")
+  })
+  await step('Jean forwards when busy: in a call with Alice, a call from her second window goes to Bob', async () => {
+    await setForwarding(jean, { busy: '103' })
+    const alice2 = await open('amartin', 'Alice Martin')
+    await phoneState(alice2.page).getByText('En ligne').waitFor({ timeout: 20_000 })
+    await dial(jean.page, '101')
+    await alice.page.getByTestId('incoming-call').getByRole('button', { name: 'Répondre' }).click()
+    await jean.page.getByText('En communication avec 101').waitFor()
+    await alice2.page.getByText('Appel de Jean Dupont (102) pris sur un autre poste ou abandonné.').waitFor()
+    // Jean's softphone answers 486 (already in a call): his busy forward takes the call to Bob.
+    await dial(alice2.page, '102')
+    const ringing = bob.page.getByTestId('incoming-call')
+    await ringing.getByText('Appel entrant de Alice Martin (101)').waitFor({ timeout: 20_000 })
+    expectEqual(await jean.page.getByTestId('incoming-call').count(), 0, 'incoming calls on Jean side')
+    await ringing.getByRole('button', { name: 'Répondre' }).click()
+    await alice2.page.getByText('En communication avec 102').waitFor()
+    await bothHearEachOther(alice2, bob)
+    await bob.page.getByRole('button', { name: 'Raccrocher' }).click()
+    await alice2.page.getByText('Appel avec 102 terminé.').waitFor()
+    await jean.page.getByRole('button', { name: 'Raccrocher' }).click()
+    await alice.page.getByText('Appel avec Jean Dupont (102) terminé.').waitFor()
+    await signOut(alice2)
+  })
+  await step('Jean does not want to be disturbed until later, with a message: Alice\'s call goes to his no-answer forward, Bob', async () => {
+    await setForwarding(jean, { noAnswer: '103', delay: '20' })
+    await setStatus(jean, 'Ne pas déranger', { inMinutes: 60, message: "En réunion jusqu'à 16 h" })
+    await jean.page.getByTestId('my-presence').getByText(/Ne pas déranger jusqu'au/).waitFor()
+    const { rows } = await db.query("SELECT dnd, dnd_message, dnd_until > now() + interval '50 minutes' AS later FROM call_rules WHERE extension = $1", ['102'])
+    expectEqual(JSON.stringify(rows), JSON.stringify([{ dnd: true, dnd_message: "En réunion jusqu'à 16 h", later: true }]), 'call_rules of 102')
+    await presenceIs(alice.page, 'Dupont', '102', 'Ne pas déranger', PRESENCE_MS)
+    await dial(alice.page, '102')
+    const ringing = bob.page.getByTestId('incoming-call')
+    await ringing.getByText('Appel entrant de Alice Martin (101)').waitFor({ timeout: 20_000 })
+    expectEqual(await jean.page.getByTestId('incoming-call').count(), 0, 'incoming calls on Jean side')
+    await ringing.getByRole('button', { name: 'Refuser' }).click()
+    await alice.page.getByText("102 a refusé l'appel.").waitFor()
+  })
+  await step('without a forward, his "do not disturb" refuses the call and Alice reads his message; a missed call for Jean', async () => {
+    await setForwarding(jean, {})
+    const started = new Date().toISOString()
+    const ended = await dialUntilEnded(alice.page, '102')
+    expectEqual(`${ended.endStatus} ${ended.endReason} ${ended.endMessage}`, "480 dnd En réunion jusqu'à 16 h", 'how the call to 102 ended')
+    await alice.page.getByText("102 ne souhaite pas être dérangé : « En réunion jusqu'à 16 h »").waitFor()
+    expectEqual(await jean.page.getByTestId('incoming-call').count(), 0, 'incoming calls on Jean side')
+    const jeanCall = await newestCall('jdupont', started)
+    expectEqual(`${jeanCall.direction} ${jeanCall.remoteNumber} ${jeanCall.state}`, 'inbound 101 missed', "Jean's newest call")
+    const missed = await db.query("SELECT caller, callee FROM missed_calls WHERE sip_code = '480' AND id > $1", [since.missed_calls])
+    expectEqual(missed.rows.map(r => `${r.caller}>${r.callee}`), ['101>102'], 'refused call in missed_calls')
+  })
+  await step('the "do not disturb" ends by itself at its date: once it passed, a call to 102 rings Jean again', async () => {
+    // As if the hour had gone by: its end is now two seconds away, on the database's clock OpenSIPS reads.
+    await db.query("UPDATE call_rules SET dnd_until = now() + interval '2 seconds' WHERE extension = $1", ['102'])
+    await sleep(3_000)
+    await dial(alice.page, '102')
+    const ringing = jean.page.getByTestId('incoming-call')
+    await ringing.getByText('Appel entrant de Alice Martin (101)').waitFor({ timeout: 20_000 })
+    await ringing.getByRole('button', { name: 'Refuser' }).click()
+    await alice.page.getByText("102 a refusé l'appel.").waitFor()
+    await setStatus(jean, 'Disponible')
+    expectEqual((await db.query('SELECT 1 FROM call_rules WHERE extension = $1', ['102'])).rows.length, 0, 'call_rules rows of 102 once available')
+    await presenceIs(alice.page, 'Dupont', '102', 'Disponible', PRESENCE_MS)
+  })
+  await step('forwards never loop: a forward to oneself or outside is refused in words, and 102 → 103 → 102 stops at Bob, who rings', async () => {
+    await jean.page.getByRole('link', { name: 'Réglages' }).click()
+    for (const [target, words] of [['102', 'Un renvoi vers votre propre poste vous ferait sonner à nouveau'], ['0612345678', "Seul le poste d'un collègue peut recevoir vos appels"]]) {
+      await jean.page.getByLabel('Renvoyer tous les appels vers le poste').fill(target)
+      await jean.page.getByRole('button', { name: 'Enregistrer les renvois' }).click()
+      await jean.page.getByRole('alert').filter({ hasText: words }).waitFor()
+    }
+    expectEqual((await db.query('SELECT 1 FROM call_rules WHERE extension = $1', ['102'])).rows.length, 0, 'call_rules rows of 102 after the refusals')
+    await setForwarding(jean, { always: '103' })
+    await setForwarding(bob, { always: '102' })
+    await dial(alice.page, '102')
+    const ringing = bob.page.getByTestId('incoming-call')
+    await ringing.getByText('Appel entrant de Alice Martin (101)').waitFor({ timeout: 20_000 })
+    expectEqual(await jean.page.getByTestId('incoming-call').count(), 0, 'incoming calls on Jean side')
+    await ringing.getByRole('button', { name: 'Refuser' }).click()
+    await alice.page.getByText("102 a refusé l'appel.").waitFor()
+    await setForwarding(jean, {})
+    await setForwarding(bob, {})
+    expectEqual((await db.query('SELECT 1 FROM call_rules')).rows.length, 0, 'call_rules rows once nothing is forwarded')
   })
   await step('a registration left on a dead connection (the first one, Alice): the caller is told unreachable, not an error', async () => {
     relay.cutUpstream(0)

@@ -1,7 +1,8 @@
 import dgram from 'node:dgram'
 import { afterEach, describe, expect, it } from 'vitest'
 import type { RoutedEvent } from '@twake/telephony-provider-sdk'
-import { AsyncQueue, OpensipsProvider, SUBSCRIBED_EVENTS } from './index.js'
+import type { ForwardingRules } from '@twake/telephony-types'
+import { AsyncQueue, OpensipsProvider, SUBSCRIBED_EVENTS, type CallRules, type DndRule } from './index.js'
 import { fakeOpensips } from '../test/fake-opensips.js'
 
 const user = { id: 'alice', tenantId: 't', displayName: 'Alice', extension: '101' }
@@ -190,6 +191,97 @@ describe('OpensipsProvider', () => {
     await until('the subscription', () => p.getStatus() === 'CONNECTED', 5_000)
     expect(p.getStatusReason()).toBeUndefined()
     expect(sips.subscriptions[0]!.socket).toBe(`udp:127.0.0.1:${port}`)
+  })
+})
+
+describe('OpensipsProvider call rules', () => {
+  /** A `call_rules` table in memory, recording what the provider asks of it. */
+  const fakeRules = () => {
+    const calls: string[] = []
+    const forwards = new Map<string, ForwardingRules>()
+    const dnd = new Map<string, DndRule>()
+    const rules = {
+      getForwarding: async (ext: string) => forwards.get(ext) ?? {},
+      setForwarding: async (ext: string, r: ForwardingRules) => void (calls.push(`forward ${ext}`), forwards.set(ext, r)),
+      setDnd: async (ext: string, d: DndRule | null) => void (calls.push(`dnd ${ext} ${JSON.stringify(d)}`), d ? dnd.set(ext, d) : dnd.delete(ext)),
+      clearDndExcept: async (keep: string[]) => void (calls.push(`clear except ${keep.join(',')}`), [...dnd.keys()].filter(e => !keep.includes(e)).forEach(e => dnd.delete(e)))
+    }
+    return { calls, dnd, rules: rules as unknown as CallRules }
+  }
+  const make = (callRules?: CallRules) => new OpensipsProvider({ websocketUrl: 'wss://sip.example.test', domain: 'sip.example.test', sipSecretFor: async () => 's', callRules })
+  const cleanups: (() => Promise<void>)[] = []
+  afterEach(async () => {
+    for (const c of cleanups.splice(0)) await c()
+  })
+
+  it('forwards only with the call rules table, and only for a user with an extension', async () => {
+    expect((await make().getCapabilities()).forwarding).toBe(false)
+    await expect(make().setForwarding(user, { always: '103' })).rejects.toMatchObject({ statusCode: 501 })
+    expect(await make().getForwarding(user)).toEqual({})
+    const db = fakeRules()
+    const p = make(db.rules)
+    expect((await p.getCapabilities()).forwarding).toBe(true)
+    await p.setForwarding(user, { busy: '103', noAnswer: { target: '104', delaySec: 10 } })
+    expect(await p.getForwarding(user)).toEqual({ busy: '103', noAnswer: { target: '104', delaySec: 10 } })
+    expect(db.calls).toEqual(['forward 101'])
+    await expect(p.getForwarding({ ...user, extension: undefined })).rejects.toMatchObject({ statusCode: 404 })
+    await expect(p.setForwarding({ ...user, extension: undefined }, {})).rejects.toMatchObject({ statusCode: 404 })
+  })
+
+  it('writes a "do not disturb" in the table OpenSIPS reads, with its end and message, and lifts it for any other choice', async () => {
+    const db = fakeRules()
+    const p = make(db.rules)
+    cleanups.push(() => p.close())
+    await p.setPresence(user, { status: 'dnd', source: 'user', until: '2099-01-01T00:00:00.000Z', message: 'En réunion' })
+    await p.setPresence(user, { status: 'dnd', source: 'user' })
+    await p.setPresence(user, { status: 'away', source: 'user', message: 'Au déjeuner' })
+    await p.setPresence({ ...user, extension: undefined }, { status: 'dnd', source: 'user' })
+    expect(db.calls).toEqual(['dnd 101 {"until":"2099-01-01T00:00:00.000Z","message":"En réunion"}', 'dnd 101 {}', 'dnd 101 null'])
+  })
+
+  it('keeps the choice out of the tracker when the table refuses it', async () => {
+    const rules = { setDnd: async () => Promise.reject(Object.assign(new Error('the message must be one line'), { statusCode: 400 })) } as unknown as CallRules
+    const p = make(rules)
+    await expect(p.setPresence(user, { status: 'dnd', source: 'user', message: 'x' })).rejects.toMatchObject({ statusCode: 400 })
+    expect(p['tracker'].userPresences().size).toBe(0)
+  })
+
+  it('restores the choices the Gateway kept, and forgets every other one, here and in the table', async () => {
+    const db = fakeRules()
+    const p = make(db.rules)
+    cleanups.push(() => p.close())
+    // 103 chose "do not disturb" before the extension went to someone else; 104's was left in the table.
+    await p.setPresence({ ...user, extension: '103' }, { status: 'dnd', source: 'user' })
+    db.dnd.set('104', {})
+    db.calls.splice(0)
+    const bob = { ...user, id: 'bob', extension: '102' }
+    const carol = { ...user, id: 'carol', extension: undefined }
+    await p.restorePresences([
+      { user, presence: { status: 'dnd', source: 'user', message: 'En congé' } },
+      { user: bob, presence: { status: 'away', source: 'user' } },
+      { user: carol, presence: { status: 'dnd', source: 'user' } }
+    ])
+    expect(db.calls).toEqual(['clear except 101', 'dnd 101 {"message":"En congé"}', 'dnd 102 null'])
+    expect([...db.dnd.keys()]).toEqual(['101'])
+    expect([...p['tracker'].userPresences().keys()].sort()).toEqual(['101', '102'])
+    expect((await p.getPresence(carol)).status).toBe('dnd')
+  })
+
+  it('tells the end of a chosen presence when it comes, without anyone asking', async () => {
+    const p = make()
+    cleanups.push(() => p.close())
+    const tracker = p['tracker']
+    await p.setPresence(user, { status: 'dnd', source: 'user', until: new Date(Date.now() + 150).toISOString() })
+    await p.setPresence({ ...user, extension: '102' }, { status: 'away', source: 'user', until: new Date(Date.now() + 300).toISOString() })
+    expect(tracker['userPresence'].size).toBe(2)
+    await until('the first end', () => tracker['userPresence'].size === 1)
+    await until('the second end', () => tracker['userPresence'].size === 0)
+    expect(p['expiryTimer']).toBeDefined()
+    expect(tracker.nextUserPresenceEnd()).toBeUndefined()
+    // One without extension: its end holds too.
+    const noExtension = { ...user, extension: undefined }
+    await p.setPresence(noExtension, { status: 'away', source: 'user', until: new Date(Date.now() - 1).toISOString() })
+    expect((await p.getPresence(noExtension)).status).toBe('available')
   })
 })
 

@@ -126,4 +126,47 @@ if (process.env.TEST_DATABASE_URL) {
       await pool.query('DROP TABLE acc')
     })
   })
+
+  // The call rules OpenSIPS reads (ADR 0013): here, not in call-rules.spec.ts, so that no other file creates the
+  // schema at the same time (two concurrent CREATE TABLE IF NOT EXISTS can collide in PostgreSQL).
+  describe('CallRules on PostgreSQL', () => {
+    const pool = new pg.Pool({ connectionString: process.env.TEST_DATABASE_URL, max: 2 })
+    afterAll(() => pool.end())
+    /** The test of route[load_rules] (opensips.cfg.tpl): is the "do not disturb" of `extension` in force now? */
+    const active = async (extension: string) =>
+      (await pool.query("SELECT CASE WHEN dnd AND (dnd_until IS NULL OR dnd_until > now()) THEN 1 ELSE 0 END AS active FROM call_rules WHERE extension = $1", [extension])).rows[0]?.active ?? null
+
+    it('keeps one row per extension while it holds a rule, none after', async () => {
+      await pool.query('DROP TABLE IF EXISTS call_rules')
+      const provisioner = new SubscriberProvisioner({ pool, realm: 'sip.example.test' })
+      await provisioner.ensureSchema()
+      const rules = provisioner.callRules()
+      await rules.setForwarding('101', { always: '103' })
+      await rules.setForwarding('101', { busy: '104', noAnswer: { target: '105', delaySec: 8 } })
+      expect(await rules.getForwarding('101')).toEqual({ busy: '104', noAnswer: { target: '105', delaySec: 8 } })
+      await rules.setDnd('101', { message: 'En réunion' })
+      await rules.setForwarding('101', {})
+      // The "do not disturb" still holds the row; lifting it removes it.
+      expect((await pool.query('SELECT extension, dnd, dnd_message FROM call_rules')).rows).toEqual([{ extension: '101', dnd: true, dnd_message: 'En réunion' }])
+      await rules.setDnd('101', null)
+      expect((await pool.query('SELECT extension FROM call_rules')).rows).toEqual([])
+    })
+
+    it('holds a "do not disturb" until its date on the database clock, and lifts those no one holds', async () => {
+      const rules = new SubscriberProvisioner({ pool, realm: 'sip.example.test' }).callRules()
+      await rules.setDnd('101', { until: new Date(Date.now() + 3_600_000).toISOString() })
+      await rules.setDnd('102', { until: new Date(Date.now() - 1_000).toISOString() })
+      await rules.setDnd('103', {})
+      await rules.setForwarding('104', { always: '101' })
+      expect([await active('101'), await active('102'), await active('103'), await active('104')]).toEqual([1, 0, 1, 0])
+      await rules.clearDndExcept(['103'])
+      expect((await pool.query('SELECT extension, dnd FROM call_rules ORDER BY extension')).rows).toEqual([
+        { extension: '103', dnd: true },
+        { extension: '104', dnd: false }
+      ])
+      await rules.clearDndExcept([])
+      await rules.setForwarding('104', {})
+      expect((await pool.query('SELECT extension FROM call_rules')).rows).toEqual([])
+    })
+  })
 }

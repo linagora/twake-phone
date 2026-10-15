@@ -55,6 +55,20 @@ CREATE TABLE IF NOT EXISTS missed_calls (
 CREATE INDEX IF NOT EXISTS missed_calls_callid_idx ON missed_calls (callid);
 INSERT INTO version (table_name, table_version) VALUES ('acc', 7), ('missed_calls', 5)
   ON CONFLICT (table_name) DO NOTHING;
+
+-- Our own table (step 4b, ADR 0013): forwards and "do not disturb" per extension, written by the Gateway
+-- (CallRules of provider-opensips), read by opensips.cfg.tpl at each INVITE (sqlops). OpenSIPS does not check it.
+CREATE TABLE IF NOT EXISTS call_rules (
+    extension VARCHAR(64) PRIMARY KEY NOT NULL,
+    forward_always VARCHAR(64),
+    forward_busy VARCHAR(64),
+    forward_noanswer VARCHAR(64),
+    noanswer_delay INTEGER DEFAULT 20 NOT NULL,
+    dnd BOOLEAN DEFAULT false NOT NULL,
+    dnd_until TIMESTAMP WITH TIME ZONE,
+    dnd_message VARCHAR(140) DEFAULT '' NOT NULL,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL
+);
 -- Tables created beforehand by OpenSIPS's own scripts lack caller and callee: added here, once, by the owner (the
 -- Gateway only adds a missing one, see SubscriberProvisioner.ensureSchema), or every CDR insert would fail.
 ALTER TABLE acc ADD COLUMN IF NOT EXISTS caller VARCHAR(64) DEFAULT '' NOT NULL;

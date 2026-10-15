@@ -1,7 +1,7 @@
 import { readdir, readFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import pg from 'pg'
-import { clampLimit, type ConferenceRecord, type HistoryEntry, type HistoryPage, type HistoryQuery, type ProviderRecord, type Store, type UserMapping } from './types.js'
+import { clampLimit, type ConferenceRecord, type HistoryEntry, type HistoryPage, type HistoryQuery, type ProviderRecord, type Store, type UserMapping, type UserPresenceRecord } from './types.js'
 
 const MIGRATIONS = fileURLToPath(new URL('../../migrations/', import.meta.url))
 
@@ -148,6 +148,40 @@ export class PgStore implements Store {
 
   async removeFavorite(tenantId: string, userId: string, contactId: string) {
     await this.pool.query('DELETE FROM favorites WHERE tenant_id = $1 AND user_id = $2 AND contact_id = $3', [tenantId, userId, contactId])
+  }
+
+  private presence(r: Record<string, any>): UserPresenceRecord {
+    return {
+      tenantId: r.tenant_id,
+      userId: r.user_id,
+      status: r.status,
+      since: new Date(r.since).toISOString(),
+      ...(r.until ? { until: new Date(r.until).toISOString() } : {}),
+      ...(r.message ? { message: r.message } : {})
+    }
+  }
+
+  async getUserPresence(tenantId: string, userId: string) {
+    const { rows } = await this.pool.query('SELECT * FROM user_presence WHERE tenant_id = $1 AND user_id = $2 AND (until IS NULL OR until > now())', [tenantId, userId])
+    return rows[0] ? this.presence(rows[0]) : null
+  }
+
+  async setUserPresence(p: UserPresenceRecord) {
+    await this.pool.query(
+      `INSERT INTO user_presence (tenant_id, user_id, status, since, until, message) VALUES ($1, $2, $3, $4, $5, $6)
+       ON CONFLICT (tenant_id, user_id) DO UPDATE SET status = EXCLUDED.status, since = EXCLUDED.since, until = EXCLUDED.until, message = EXCLUDED.message`,
+      [p.tenantId, p.userId, p.status, p.since, p.until ?? null, p.message ?? null]
+    )
+  }
+
+  async deleteUserPresence(tenantId: string, userId: string) {
+    await this.pool.query('DELETE FROM user_presence WHERE tenant_id = $1 AND user_id = $2', [tenantId, userId])
+  }
+
+  async listUserPresences(tenantId: string) {
+    await this.pool.query('DELETE FROM user_presence WHERE until <= now()')
+    const { rows } = await this.pool.query('SELECT * FROM user_presence WHERE tenant_id = $1 AND (until IS NULL OR until > now()) ORDER BY user_id', [tenantId])
+    return rows.map(r => this.presence(r))
   }
 
   async getSipSecret(tenantId: string, userId: string) {

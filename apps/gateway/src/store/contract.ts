@@ -128,6 +128,26 @@ export const storeContract = (name: string, make: () => Promise<Store>) =>
       await s.close()
     })
 
+    it('keeps the presence each user chose, per tenant and user, and forgets one whose end has passed', async () => {
+      const s = await make()
+      const later = new Date(Date.now() + 3_600_000).toISOString()
+      const past = new Date(Date.now() - 1_000).toISOString()
+      await s.setUserPresence({ tenantId: 'A', userId: 'alice', status: 'dnd', since: '2026-10-15T09:00:00.000Z', until: later, message: 'En réunion' })
+      await s.setUserPresence({ tenantId: 'A', userId: 'bob', status: 'away', since: '2026-10-15T09:00:00.000Z' })
+      await s.setUserPresence({ tenantId: 'A', userId: 'carol', status: 'dnd', since: '2026-10-15T09:00:00.000Z', until: past })
+      await s.setUserPresence({ tenantId: 'B', userId: 'alice', status: 'away', since: '2026-10-15T09:00:00.000Z' })
+      expect(await s.getUserPresence('A', 'alice')).toEqual({ tenantId: 'A', userId: 'alice', status: 'dnd', since: '2026-10-15T09:00:00.000Z', until: later, message: 'En réunion' })
+      expect(await s.getUserPresence('A', 'carol')).toBeNull()
+      expect((await s.listUserPresences('A')).map(p => `${p.userId}:${p.status}`)).toEqual(['alice:dnd', 'bob:away'])
+      // A new choice replaces the old one entirely (no end, no message left behind).
+      await s.setUserPresence({ tenantId: 'A', userId: 'alice', status: 'away', since: '2026-10-15T10:00:00.000Z' })
+      expect(await s.getUserPresence('A', 'alice')).toEqual({ tenantId: 'A', userId: 'alice', status: 'away', since: '2026-10-15T10:00:00.000Z' })
+      await s.deleteUserPresence('A', 'alice')
+      expect(await s.getUserPresence('A', 'alice')).toBeNull()
+      expect((await s.getUserPresence('B', 'alice'))?.status).toBe('away')
+      await s.close()
+    })
+
     it('stores SIP secrets per tenant and user', async () => {
       const s = await make()
       await s.setSipSecret('A', 'alice', 'enc1')

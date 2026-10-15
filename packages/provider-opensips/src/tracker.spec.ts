@@ -353,4 +353,99 @@ describe('CallTracker', () => {
     expect(calls()).toEqual(['101:call.ended:outbound:102:ended'])
     expect(tracker2.activeCalls()).toEqual([])
   })
+
+  it('follows a forwarded call: the caller sees the number dialled, each callee left behind a missed (or declined) call', () => {
+    const { tracker, calls, presences, clear } = make()
+    for (const ext of ['101', '102', '103', '104']) tracker.handle('E_UL_CONTACT_INSERT', contact(ext, `sip:${ext}@x.invalid`))
+    clear()
+    // 102 forwards everything to 103: the call goes there at once, the caller dialled 102.
+    tracker.handle('E_TWAKEPHONE_CALLING', { ...call('f1', '101', '103'), dialled: '102' })
+    tracker.handle('E_TWAKEPHONE_RINGING', call('f1', '101', '103'))
+    expect(calls()).toEqual(['101:call.created:outbound:102:new', '101:call.ringing:outbound:102:ringing', '103:call.ringing:inbound:101:ringing'])
+    clear()
+    // 103 does not answer (408) and forwards to 104 on no answer: a missed call for 103, free again.
+    tracker.handle('E_TWAKEPHONE_FORWARDED', { callid: 'f1', caller: '101', callee: '104', from: '103', code: '408' })
+    expect(calls()).toEqual(['103:call.ended:inbound:101:missed'])
+    expect(presences()).toEqual(['103:available'])
+    clear()
+    tracker.handle('E_TWAKEPHONE_RINGING', call('f1', '101', '104'))
+    tracker.handle('E_TWAKEPHONE_ANSWERED', call('f1', '101', '104'))
+    tracker.handle('E_ACC_CDR', cdr('f1', '101', '104', 4, 1792000805))
+    expect(calls().filter(c => c.includes('ended'))).toEqual(['101:call.ended:outbound:102:ended', '104:call.ended:inbound:101:ended'])
+    expect(tracker.activeCalls()).toEqual([])
+    expect(['101', '103', '104'].map(e => tracker.telephonyPresence(e))).toEqual(['available', 'available', 'available'])
+    clear()
+    // Declined (603) then forwarded on busy: declined for the one who refused it.
+    tracker.handle('E_TWAKEPHONE_CALLING', call('f2', '101', '102'))
+    tracker.handle('E_TWAKEPHONE_RINGING', call('f2', '101', '102'))
+    tracker.handle('E_TWAKEPHONE_FORWARDED', { callid: 'f2', caller: '101', callee: '103', from: '102', code: '603' })
+    expect(calls().slice(-1)).toEqual(['102:call.ended:inbound:101:rejected'])
+    clear()
+    // Unreachable (it never rang): nothing for the one left; the same callee again changes nothing.
+    tracker.handle('E_TWAKEPHONE_CALLING', call('f3', '101', '105'))
+    tracker.handle('E_TWAKEPHONE_FORWARDED', { callid: 'f3', caller: '101', callee: '103', from: '105', code: '480' })
+    tracker.handle('E_TWAKEPHONE_FORWARDED', { callid: 'f3', caller: '101', callee: '103', from: '103', code: '480' })
+    expect(calls()).toEqual(['101:call.created:outbound:105:new'])
+    expect(tracker.activeCalls().find(c => c.id === 'f3')).toMatchObject({ remoteNumber: '105' })
+  })
+
+  it('makes a call refused by a "do not disturb" a missed one for the callee, whose phone never rang, and a refused one for the caller', () => {
+    const { tracker, calls, presences, clear } = make()
+    for (const ext of ['101', '102']) tracker.handle('E_UL_CONTACT_INSERT', contact(ext, `sip:${ext}@x.invalid`))
+    clear()
+    tracker.handle('E_TWAKEPHONE_CALLING', call('d1', '101', '102'))
+    tracker.handle('E_TWAKEPHONE_DND', call('d1', '101', '102'))
+    tracker.handle('E_ACC_MISSED_EVENT', missed('d1', '101', '102', '480', 1792002800))
+    expect(calls()).toEqual(['101:call.created:outbound:102:new', '101:call.ended:outbound:102:rejected', '102:call.ended:inbound:101:missed'])
+    // 102 was never busy with it.
+    expect(presences()).toEqual(['101:busy', '101:available'])
+    clear()
+    // A plain 480 (nobody registered answers) stays a failed call for the caller only.
+    tracker.handle('E_TWAKEPHONE_CALLING', call('d2', '101', '102'))
+    tracker.handle('E_ACC_MISSED_EVENT', missed('d2', '101', '102', '480', 1792002801))
+    expect(calls().slice(-1)).toEqual(['101:call.failed:outbound:102:failed'])
+    // Unknown calls are left alone.
+    clear()
+    tracker.handle('E_TWAKEPHONE_DND', { callid: 'nope' })
+    tracker.handle('E_TWAKEPHONE_FORWARDED', { callid: 'nope' })
+    expect(calls()).toEqual([])
+  })
+
+  it('ends what the user chose at its date: told when it comes, never in force after it', () => {
+    let t = Date.parse('2026-10-14T18:00:00.000Z')
+    const told: string[] = []
+    const tracker = new CallTracker((ext, e) => void (e.type === 'presence.changed' && told.push(`${ext}:${e.payload.presence.status}`)), () => new Date(t).toISOString())
+    tracker.handle('E_UL_CONTACT_INSERT', contact('101', 'sip:a@x.invalid'))
+    tracker.handle('E_UL_CONTACT_INSERT', contact('102', 'sip:b@x.invalid'))
+    tracker.setUserPresence('101', { status: 'dnd', source: 'user', until: new Date(t + 60_000).toISOString(), message: 'En réunion' })
+    tracker.setUserPresence('102', { status: 'away', source: 'user', until: new Date(t + 30_000).toISOString() })
+    tracker.setUserPresence('103', { status: 'dnd', source: 'user' })
+    // 103 is not registered: offline, whatever it chose, until it is.
+    expect(told).toEqual(['101:available', '102:available', '101:dnd', '102:away', '103:offline'])
+    expect(tracker.presenceOf('101')).toMatchObject({ status: 'dnd', message: 'En réunion' })
+    expect(tracker.nextUserPresenceEnd()).toBe(t + 30_000)
+    expect([...tracker.userPresences().keys()]).toEqual(['101', '102', '103'])
+    t += 30_000
+    // Past its end it no longer holds, even before anything tells it.
+    expect(tracker.presenceOf('102').status).toBe('available')
+    expect([...tracker.userPresences().keys()]).toEqual(['101', '103'])
+    tracker.expire()
+    expect(told.slice(5)).toEqual(['102:available'])
+    expect(tracker.nextUserPresenceEnd()).toBe(t + 30_000)
+    t += 30_000
+    tracker.sweep()
+    expect(told.slice(6)).toEqual(['101:available'])
+    expect(tracker.nextUserPresenceEnd()).toBeUndefined()
+    // A choice whose end already passed is not taken; one cleared is forgotten.
+    tracker.setUserPresence('102', { status: 'dnd', source: 'user', until: new Date(t - 1).toISOString() })
+    expect(tracker.presenceOf('102').status).toBe('available')
+    tracker.clearUserPresence('103')
+    tracker.clearUserPresence('103')
+    expect([...tracker.userPresences().keys()]).toEqual([])
+    expect(told.slice(7)).toEqual([])
+    // A new message for the same choice is told.
+    tracker.setUserPresence('101', { status: 'dnd', source: 'user', message: 'En réunion' })
+    tracker.setUserPresence('101', { status: 'dnd', source: 'user', message: 'En rendez-vous' })
+    expect(told.slice(7)).toEqual(['101:dnd', '101:dnd'])
+  })
 })

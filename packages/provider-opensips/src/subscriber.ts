@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto'
 import pg from 'pg'
 import type { SecretProvisioner } from '@twake/telephony-provider-sdk'
+import { CALL_RULES_SCHEMA, CallRules } from './call-rules.js'
 
 // Everything about OpenSIPS's `subscriber` table (module auth_db) lives here: the Gateway only sees a SecretProvisioner.
 
@@ -24,7 +25,8 @@ export const digestHashes = (username: string, realm: string, secret: string) =>
 /**
  * The schema OpenSIPS 3.6 ships for PostgreSQL (`subscriber` of auth_db; `acc` and `missed_calls` of acc, the
  * CDRs, with the caller and callee as dialled as extra columns), plus the rows of the `version` table it checks
- * at startup. Tables created beforehand by OpenSIPS's own scripts lack the extra columns (EXTRA_COLUMNS):
+ * at startup, and our own `call_rules` (forwards and "do not disturb", read by the script through sqlops: no
+ * version row, OpenSIPS does not check it). Tables created beforehand by OpenSIPS's own scripts lack the extra columns (EXTRA_COLUMNS):
  * `ensureSchema()` adds those that are missing, or every CDR insert would fail.
  */
 export const SUBSCRIBER_SCHEMA = `
@@ -81,7 +83,7 @@ CREATE TABLE IF NOT EXISTS missed_calls (
 CREATE INDEX IF NOT EXISTS missed_calls_callid_idx ON missed_calls (callid);
 INSERT INTO version (table_name, table_version) VALUES ('acc', ${ACC_TABLE_VERSION}), ('missed_calls', ${MISSED_CALLS_TABLE_VERSION})
   ON CONFLICT (table_name) DO NOTHING;
-`
+${CALL_RULES_SCHEMA}`
 
 /** The columns of `acc` and `missed_calls` that OpenSIPS's own scripts do not create (the acc extras of opensips.cfg.tpl). */
 export const EXTRA_COLUMNS = [
@@ -195,6 +197,11 @@ export class SubscriberProvisioner implements SecretProvisioner {
   /** Forgets an extension: its registrations die at their next refresh. */
   async removeSipSecret(extension: string) {
     await this.pool.query('DELETE FROM subscriber WHERE username = $1 AND domain = $2', [extension, this.domain])
+  }
+
+  /** The `call_rules` of the same database, on the same connections; `ready` runs before each query (the schema check). */
+  callRules(ready?: () => Promise<void>) {
+    return new CallRules({ pool: this.pool, ...(ready ? { ready } : {}) })
   }
 
   async close() {

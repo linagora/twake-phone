@@ -14,8 +14,15 @@ export type SipWebrtcSession = Extract<MediaSession, { type: 'sip-webrtc' }>
 
 export type SoftCallState = 'new' | 'ringing' | 'connected' | 'held' | 'ended'
 
-/** Why a call ended, as the SIP layer reports it: the UI tells the user, the history keeps it. */
-export type EndReason = 'hangup' | 'rejected' | 'busy' | 'no-answer' | 'unavailable' | 'cancelled' | 'failed' | 'transferred'
+/**
+ * Why a call ended, as the SIP layer reports it: the UI tells the user, the history keeps it. `dnd`: the person
+ * called does not want to be disturbed (and gave no forward); their message, when they left one, is `endMessage`.
+ */
+export type EndReason = 'hangup' | 'rejected' | 'busy' | 'no-answer' | 'unavailable' | 'cancelled' | 'failed' | 'transferred' | 'dnd'
+
+/** How the SIP server refuses a call to someone in "do not disturb": 480 with this reason phrase, their message in DND_MESSAGE_HEADER. */
+export const DND_REASON_PHRASE = 'Do Not Disturb'
+export const DND_MESSAGE_HEADER = 'Twake-Dnd-Message'
 
 export type DtmfTransport = 'RFC2833' | 'INFO'
 
@@ -73,6 +80,8 @@ export interface SoftCall {
   readonly endReason?: EndReason
   /** SIP status code the call ended with, when a response ended it (404 nobody registered, 480 a dead contact...). */
   readonly endStatus?: number
+  /** What the person called left for their callers (a "do not disturb" message), as the SIP server relayed it. */
+  readonly endMessage?: string
   /** The far end put us on hold (re-INVITE with sendonly or inactive). */
   readonly remoteHold: boolean
   readonly muted: boolean
@@ -207,6 +216,7 @@ class WebCall implements SoftCall {
   endedAt?: Date
   endReason?: EndReason
   endStatus?: number
+  endMessage?: string
   remoteHold = false
   muted = false
   renegotiating = false
@@ -290,6 +300,13 @@ class WebCall implements SoftCall {
       // 477 "Send failed": the SIP server could not deliver to the far end (a registration left on a dead
       // connection); for the person it is the same as nobody there.
       if (this.endStatus === 477 && this.endReason === 'failed') this.endReason = 'unavailable'
+      // 480 "Do Not Disturb": refused on their behalf by the SIP server, with the message they left, if any.
+      const response = e.message as { reason_phrase?: unknown; getHeader?: (name: string) => string | undefined } | undefined
+      if (this.endStatus === 480 && response?.reason_phrase === DND_REASON_PHRASE) {
+        this.endReason = 'dnd'
+        const message = response.getHeader?.(DND_MESSAGE_HEADER)?.trim()
+        if (message) this.endMessage = message
+      }
       this.reofferPending?.reject(new CallError('call-ended', 'Call ended'))
       this.reofferPending = undefined
       this.renegotiating = false

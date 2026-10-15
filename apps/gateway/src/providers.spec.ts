@@ -42,6 +42,16 @@ describe('storedOpensipsFactory', () => {
     expect(stored?.secretEnc).not.toContain((first as { credential: string }).credential)
   })
 
+  it('forwards through the call_rules of the same database, once the schema is there', async () => {
+    const { queries, provider } = setup()
+    expect((await provider.getCapabilities()).forwarding).toBe(true)
+    await provider.setForwarding!({ id: 'alice', tenantId: 't', displayName: 'Alice', extension: '101' }, { always: '102' })
+    const create = queries.findIndex(q => /CREATE TABLE IF NOT EXISTS call_rules/.test(q))
+    const insert = queries.findIndex(q => /INSERT INTO call_rules/.test(q))
+    expect(create).toBeGreaterThanOrEqual(0)
+    expect(insert).toBeGreaterThan(create)
+  })
+
   it('refuses an extension nobody is mapped to', async () => {
     const { provider } = setup()
     await expect(provider.getSession!({ id: 'x', tenantId: 't', displayName: 'X', extension: '999' }, browser)).rejects.toMatchObject({ statusCode: 404 })

@@ -53,13 +53,15 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     const main = cfg.slice(cfg.indexOf('\nroute {'), cfg.indexOf('\nroute[relay]'))
     const lines = main.split('\n').map(l => l.trim())
     const at = (line: string, from = 0) => lines.indexOf(line, from)
-    const lookup = at('if (!lookup("location")) {')
-    const offer = at('route(rtp_offer);', lookup)
+    // The lookup is route[reach]'s (with the no-answer forward of an extension nobody registered).
+    const reach = at('if (!route(reach)) {')
+    const offer = at('route(rtp_offer);', reach)
     const calling = at('route(calling);', offer)
-    expect([lookup, offer, calling].every(i => i > 0)).toBe(true)
+    expect([reach, offer, calling].every(i => i > 0)).toBe(true)
     expect(lines[calling + 1]).toBe('route(relay);')
+    expect(cfg.slice(cfg.indexOf('route[reach] {'), cfg.indexOf('route[forward_to] {'))).toContain('while (!lookup("location")) {')
     // The 404 of an extension nobody registered goes through a transaction (acc sees it): announced just before.
-    expect(lines.slice(lookup, lookup + 4)).toEqual(['if (!lookup("location")) {', expect.stringMatching(/^#/), 'route(calling);', 't_reply(404, "Not Found");'])
+    expect(lines.slice(reach, reach + 5)).toEqual(['if (!route(reach)) {', expect.stringMatching(/^#/), 'route(account_missed);', 'route(calling);', 't_reply(404, "Not Found");'])
     expect(cfg.match(/raise_event\("E_TWAKEPHONE_CALLING"/g)).toHaveLength(1)
     // No transaction before t_relay: tm then answers 477 itself to a contact it cannot send to (e2e "dead connection").
     expect(cfg.slice(cfg.indexOf('route[calling]'), cfg.indexOf('route[relay]'))).not.toContain('t_newtran')
@@ -67,9 +69,39 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
 
   it('clears every value of the event attribute lists before building them again', () => {
     const { cfg } = render()
-    const attrs = cfg.slice(cfg.indexOf('route[event_attrs]'), cfg.indexOf('failure_route'))
+    const start = cfg.indexOf('route[event_attrs]')
+    const attrs = cfg.slice(start, cfg.indexOf('failure_route[', start))
     expect(attrs).toContain('$(avp(ev_attr)[*]) = NULL;')
     expect(attrs).toContain('$(avp(ev_val)[*]) = NULL;')
     expect(attrs).not.toMatch(/^\s*\$avp\(ev_(attr|val)\) = NULL;/m)
+  })
+
+  it('reads the call rules of an extension whose name cannot break out of the query, with the database clock', () => {
+    const { cfg } = render({ OPENSIPS_DB_URL: 'postgres://opensips@db.example.test/opensips' })
+    expect(cfg).toContain('loadmodule "sqlops.so"')
+    expect(cfg).toContain('modparam("sqlops", "db_url", "postgres://opensips@db.example.test/opensips")')
+    const load = cfg.slice(cfg.indexOf('route[load_rules] {'), cfg.indexOf('route[rules_before] {'))
+    const check = load.indexOf('if (!($rU =~ "^[A-Za-z0-9._+-]{1,64}$"))')
+    expect(check).toBeGreaterThan(0)
+    expect(load.indexOf('sql_query_one(')).toBeGreaterThan(check)
+    expect(load).toContain("FROM call_rules WHERE extension = '$rU'")
+    expect(load).toContain('dnd_until > now()')
+    // One query, one place: every rule comes from route[load_rules].
+    expect(cfg.match(/sql_query/g)).toHaveLength(1)
+  })
+
+  it('caps the forwards of a call, and spares the INVITE of an attended transfer the rules of its callee', () => {
+    const { cfg } = render()
+    const section = (name: string, next: string) => cfg.slice(cfg.indexOf(`${name} {`), cfg.indexOf(`${next} {`))
+    const fwd = section('route[forward_to]', 'route[arm_failure]')
+    expect(fwd).toContain('if ($avp(fwd_hops) >= 3) {')
+    expect(fwd).toContain('if ($param(1) == $avp(caller) || $(avp(fwd_seen){s.index,$var(seen)}) != NULL) {')
+    expect(cfg).toContain('if (!is_present_hf("Replaces"))\n\t\troute(rules_before);')
+    const refuse = section('route[dnd_refuse]', 'route[forwarded]')
+    expect(refuse).toContain('t_reply(480, "Do Not Disturb");')
+    expect(refuse).toContain('append_to_reply("Twake-Dnd-Message: $avp(r_message)\\r\\n");')
+    // A failure forwards on the statuses the ADR names, and only then.
+    expect(cfg).toContain('t_check_status("486|600|603") && $avp(r_busy) != NULL')
+    expect(cfg).toContain('t_check_status("408|477|480|503") && $avp(r_noanswer) != NULL')
   })
 })

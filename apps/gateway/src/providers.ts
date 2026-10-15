@@ -136,6 +136,8 @@ export const storedOpensipsFactory = ({ store, key, env = process.env, provision
         return secrets.getOrCreate(tenantId, mapping.userId, extension)
       },
       onClose: () => provisioner.close(),
+      // The forwards and "do not disturb" OpenSIPS reads, in the same database as `subscriber` (ADR 0013).
+      callRules: provisioner.callRules(ensureSchema),
       ...(config.events ? { events: config.events } : {}),
       ...(logger ? { logger } : {})
     })
