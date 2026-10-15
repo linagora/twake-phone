@@ -230,6 +230,18 @@ try {
     const stored = await page.evaluate(() => Object.keys(sessionStorage).filter(k => k.startsWith('oidc.user')))
     if (stored.length) throw new Error(`session still stored: ${stored.join(', ')}`)
   })
+  await step('opened from the notification of a call while the identity provider cannot be reached: the page says why and offers to sign in, it does not wait for good', async () => {
+    const unreachable = new RegExp(`^${oidc.issuer.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/`)
+    await page.route(unreachable, route => route.abort('connectionrefused'))
+    try {
+      await page.goto(`${appOrigin}/?call=e2e-call`)
+      await page.getByRole('alert').getByText(/^Sign-in failed: /).waitFor()
+      await page.getByRole('button', { name: 'Sign in' }).waitFor()
+      expectEqual(await page.getByText('Signing in to take the call…').count(), 0, 'the "signing in" status left on the page')
+    } finally {
+      await page.unroute(unreachable)
+    }
+  })
   await step('the app and the Gateway answer with their security headers', async () => {
     const app = await page.request.get(`${appOrigin}/recents`)
     const csp = app.headers()['content-security-policy'] ?? ''

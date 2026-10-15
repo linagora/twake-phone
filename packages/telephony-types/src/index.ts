@@ -183,6 +183,11 @@ export type TelephonyEvent =
    * (the Gateway wakes their browsers). `group`: the ring group number the caller dialled, when it is through one.
    */
   | { type: 'call.wake'; timestamp: string; payload: { call: Call; waitSec: number; group?: string } }
+  /**
+   * A call this person was woken for (`call.wake`) was answered by someone else, `by` (the extension of the
+   * colleague of the ring group who answered): it no longer waits for them, and it is no missed call of theirs.
+   */
+  | { type: 'call.taken'; timestamp: string; payload: { call: Call; by: string } }
   /** `extension`: the telephony identity the presence is about, so that a directory can show it next to a contact. */
   | { type: 'presence.changed'; timestamp: string; payload: { userId: UserId; extension?: string; presence: Presence } }
   | { type: 'endpoint.connected' | 'endpoint.disconnected'; timestamp: string; payload: { userId: UserId; endpoint: Endpoint } }

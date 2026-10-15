@@ -1,7 +1,7 @@
 import { readdir, readFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import pg from 'pg'
-import { clampLimit, type ConferenceRecord, type HistoryEntry, type HistoryPage, type HistoryQuery, type ProviderRecord, type PushSubscriptionRecord, type Store, type UserMapping, type UserPresenceRecord, type VapidKeysRecord } from './types.js'
+import { clampLimit, type ConferenceRecord, type HistoryEntry, type HistoryPage, type HistoryQuery, type ProviderRecord, type PushSaveResult, type PushSubscriptionRecord, type Store, type UserMapping, type UserPresenceRecord, type VapidKeysRecord } from './types.js'
 
 const MIGRATIONS = fileURLToPath(new URL('../../migrations/', import.meta.url))
 
@@ -238,12 +238,27 @@ export class PgStore implements Store {
     return rows.map(r => r.user_id as string)
   }
 
-  async savePushSubscription(s: PushSubscriptionRecord) {
-    await this.pool.query(
-      `INSERT INTO push_subscriptions (endpoint, tenant_id, user_id, p256dh, auth, created_at) VALUES ($1, $2, $3, $4, $5, $6)
-       ON CONFLICT (endpoint) DO UPDATE SET tenant_id = EXCLUDED.tenant_id, user_id = EXCLUDED.user_id, p256dh = EXCLUDED.p256dh, auth = EXCLUDED.auth, created_at = EXCLUDED.created_at`,
+  async savePushSubscription(s: PushSubscriptionRecord): Promise<PushSaveResult> {
+    // One statement: the row as it was (the snapshot every part of it sees), and whether it was written. Another
+    // tenant's row, or this person's with the same keys, is left as it is.
+    const { rows } = await this.pool.query(
+      `WITH old AS (SELECT tenant_id, user_id FROM push_subscriptions WHERE endpoint = $1),
+       up AS (
+         INSERT INTO push_subscriptions (endpoint, tenant_id, user_id, p256dh, auth, created_at) VALUES ($1, $2, $3, $4, $5, $6)
+         ON CONFLICT (endpoint) DO UPDATE SET user_id = EXCLUDED.user_id, p256dh = EXCLUDED.p256dh, auth = EXCLUDED.auth, created_at = EXCLUDED.created_at
+         WHERE push_subscriptions.tenant_id = EXCLUDED.tenant_id
+           AND (push_subscriptions.user_id, push_subscriptions.p256dh, push_subscriptions.auth) IS DISTINCT FROM (EXCLUDED.user_id, EXCLUDED.p256dh, EXCLUDED.auth)
+         RETURNING 1
+       )
+       SELECT (SELECT tenant_id FROM old) AS old_tenant, (SELECT user_id FROM old) AS old_user, (SELECT count(*) FROM up)::int AS written`,
       [s.endpoint, s.tenantId, s.userId, s.p256dh, s.auth, s.createdAt]
     )
+    const { old_tenant: oldTenant, old_user: oldUser, written } = rows[0] as { old_tenant: string | null; old_user: string | null; written: number }
+    if (oldTenant !== null && oldTenant !== s.tenantId) return { outcome: 'refused' }
+    // Added meanwhile by a request of the same browser (its insert won): nothing more to do.
+    if (!written) return { outcome: 'unchanged' }
+    if (oldUser === null) return { outcome: 'added' }
+    return oldUser === s.userId ? { outcome: 'updated' } : { outcome: 'moved', previousUserId: oldUser }
   }
 
   async deletePushSubscription(tenantId: string, userId: string, endpoint: string) {

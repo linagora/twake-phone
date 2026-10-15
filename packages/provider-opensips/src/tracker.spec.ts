@@ -590,7 +590,7 @@ describe('CallTracker', () => {
     expect(calls().filter(c => c.startsWith('102:'))).toEqual([])
   })
 
-  it('wakes members of a ring group: a missed call for each woken one if nobody answers, nothing more once a colleague answers', () => {
+  it('wakes members of a ring group: a missed call for each woken one if nobody answers, told who took it once a colleague answers', () => {
     const { tracker, calls, events, clear } = make()
     for (const ext of ['101', '103']) tracker.handle('E_UL_CONTACT_INSERT', contact(ext, `sip:${ext}@x.invalid`))
     clear()
@@ -604,13 +604,20 @@ describe('CallTracker', () => {
     tracker.handle('E_ACC_MISSED_EVENT', { ...missed('wg1', '101', '200', '480', 1792002800), dialled: '200' })
     expect(calls()).toEqual(['101:call.failed:outbound:200:failed', '103:call.ended:inbound:101:missed', '102:call.ended:inbound:101:missed'])
     clear()
-    // 103 answers: 102, woken for it, hears nothing more (as a colleague whose phone rang).
+    // 103 answers: 102, woken for it, is told 103 took it (its notification says so), then nothing more: no missed call.
     tracker.handle('E_TWAKEPHONE_CALLING', g('wg2', '200'))
     tracker.handle('E_TWAKEPHONE_WAKE', { ...g('wg2', '102'), wait: '30' })
     tracker.handle('E_TWAKEPHONE_RINGING', g('wg2', '103'))
     tracker.handle('E_TWAKEPHONE_ANSWERED', g('wg2', '103'))
     tracker.handle('E_ACC_CDR', { ...cdr('wg2', '101', '103', 4, 1792000805), dialled: '200' })
-    expect(calls().filter(c => c.startsWith('102:'))).toEqual(['102:call.wake:inbound:101:ringing'])
+    expect(calls().filter(c => c.startsWith('102:'))).toEqual(['102:call.wake:inbound:101:ringing', '102:call.taken:inbound:101:ended'])
+    expect(events.find(e => e.event.type === 'call.taken')!.event.payload).toMatchObject({ by: '103', call: { id: 'wg2' } })
+    // The woken member who answers is not told it was taken.
+    clear()
+    tracker.handle('E_TWAKEPHONE_CALLING', g('wg3', '200'))
+    tracker.handle('E_TWAKEPHONE_WAKE', { ...g('wg3', '102'), wait: '30' })
+    tracker.handle('E_TWAKEPHONE_ANSWERED', g('wg3', '102'))
+    expect(calls().filter(c => c.includes('call.taken'))).toEqual([])
   })
 
   it('wakes for a call whose CALLING was lost, never for an answered or ended one, nor the caller', () => {

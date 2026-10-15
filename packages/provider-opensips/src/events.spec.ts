@@ -216,12 +216,15 @@ describe('OpensipsEvents', () => {
     cleanups.push(sips.close)
     let resyncs = 0
     let renewed = 0
-    const events = new OpensipsEvents({ miUrl: sips.url, events: ['E_UL_CONTACT_INSERT'], onEvent: () => undefined, onResync: () => void resyncs++, onRenewed: () => void renewed++, logger: quiet })
+    // How long each subscription lives, as it is made or renewed (push_targets lives that long).
+    const lives: number[] = []
+    const events = new OpensipsEvents({ miUrl: sips.url, events: ['E_UL_CONTACT_INSERT'], expireSec: 90, onEvent: () => undefined, onResync: () => void resyncs++, onRenewed: () => void renewed++, onSubscribed: sec => void lives.push(sec), logger: quiet })
     cleanups.push(() => events.stop())
     await events.start()
     expect(resyncs).toBe(1)
     await events['renew']()
     expect([resyncs, renewed]).toEqual([1, 1])
+    expect(lives).toEqual([90, 90])
     // Restarted between two renewals: no failure was seen, the subscription is gone, the start time changed.
     // "Up time" is measured on the wall clock: going back (NTP) is not a restart, only "Up since" says so.
     sips.state.upTime = '1 [sec]'

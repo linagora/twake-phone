@@ -1,6 +1,7 @@
-// TwakePhone's service worker (step 5, ADR 0015): it only shows the notification of a call the Gateway pushed while
-// no window of the app was open, and opens the app on it when clicked. No fetch handler, no cache: the app is served
-// as before. What a push carries is the caller's number and directory name, the group dialled, and the call's id.
+// TwakePhone's service worker (step 5, ADR 0015): it only shows the notifications of a call the Gateway pushed while
+// no window of the app could ring, replaces them once the call no longer waits, and opens the app on the call when
+// clicked. No fetch handler, no cache: the app is served as before. What a push carries is the caller's number and
+// directory name, the group dialled, the call's id and, for a call, until when it waits.
 const TEXT = {
   fr: {
     call: who => `Appel de ${who}`,
@@ -8,6 +9,9 @@ const TEXT = {
     answer: 'Cliquez pour répondre dans TwakePhone.',
     missed: who => `Appel manqué de ${who}`,
     missedBody: 'TwakePhone',
+    answered: 'Répondu.',
+    taken: by => `Pris par ${by}.`,
+    over: 'Appel terminé.',
     other: 'TwakePhone',
     otherBody: 'Ouvrez TwakePhone.'
   },
@@ -17,6 +21,9 @@ const TEXT = {
     answer: 'Click to answer in TwakePhone.',
     missed: who => `Missed call from ${who}`,
     missedBody: 'TwakePhone',
+    answered: 'Answered.',
+    taken: by => `Taken by ${by}.`,
+    over: 'Call over.',
     other: 'TwakePhone',
     otherBody: 'Open TwakePhone.'
   }
@@ -25,27 +32,95 @@ const text = () => TEXT[String(self.navigator?.language ?? '').toLowerCase().sta
 /** A short single line: whatever a push says, a notification shows no more. */
 const line = (value, max = 64) => (typeof value === 'string' ? value.replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, max) : '')
 const who = (name, number) => (line(name) ? `${line(name)} (${line(number, 32)})` : line(number, 32))
+/** How long a window of the app has to say it rings the call itself. */
+const ASK_MS = 1_000
 
-/** The notification of a pushed message: title and options, or null for a message that is not ours. */
-const notificationOf = data => {
+/**
+ * The notification of a pushed message, `now` being the time on this device: title and options, or null for a message
+ * that is not ours. A call shows until its end (`until`, the Gateway's clock) at most: one that arrives after it shows
+ * as over, never as a call to answer.
+ */
+const notificationOf = (data, now = Date.now()) => {
   const t = text()
   if (!data || typeof data !== 'object' || typeof data.callId !== 'string' || !line(data.number, 32)) return null
   const caller = who(data.name, data.number)
   const group = data.group && typeof data.group === 'object' && line(data.group.number, 32) ? who(data.group.name, data.group.number) : ''
-  // One notification per call (its tag): the missed call replaces its ringing.
-  const tag = `call-${line(data.callId, 128)}`
+  // One notification per call (its tag): what the call became replaces its ringing.
+  const callId = line(data.callId, 128)
+  const tag = `call-${callId}`
+  const title = group ? t.groupCall(caller, group) : t.call(caller)
+  // Over: shown quietly, gone once seen (no sound, no need to act).
+  const over = body => ({ title, options: { body, tag, silent: true, data: { url: '/recents' } } })
   if (data.type === 'call') {
-    return {
-      title: group ? t.groupCall(caller, group) : t.call(caller),
-      options: { body: t.answer, tag, renotify: true, requireInteraction: true, data: { url: `/?call=${encodeURIComponent(line(data.callId, 128))}` } }
-    }
+    const until = typeof data.until === 'number' && Number.isFinite(data.until) ? data.until : 0
+    if (until && until <= now) return over(t.over)
+    return { title, options: { body: t.answer, tag, renotify: true, requireInteraction: true, data: { url: `/?call=${encodeURIComponent(callId)}`, until } } }
   }
   if (data.type === 'missed') return { title: t.missed(caller), options: { body: group || t.missedBody, tag, data: { url: '/recents' } } }
+  if (data.type === 'ended') {
+    if (data.reason === 'answered') return over(t.answered)
+    const by = data.by && typeof data.by === 'object' && line(data.by.number, 32) ? who(data.by.name, data.by.number) : ''
+    if (data.reason === 'taken' && by) return over(t.taken(by))
+    return over(t.over)
+  }
   return null
+}
+
+/** The windows of the app this browser shows now. */
+const visibleWindows = async () =>
+  (await self.clients.matchAll({ type: 'window', includeUncontrolled: true })).filter(w => new URL(w.url).origin === self.location.origin && w.visibilityState === 'visible')
+
+/**
+ * Whether a window of the app on screen rings this call itself (signed in, its softphone on: it answers when asked).
+ * Then no notification: the page rings, once its softphone is registered again.
+ */
+const ringsInAWindow = async callId => {
+  const windows = await visibleWindows()
+  if (!windows.length || typeof MessageChannel === 'undefined') return false
+  return new Promise(resolve => {
+    const timer = setTimeout(() => resolve(false), ASK_MS)
+    for (const w of windows) {
+      const channel = new MessageChannel()
+      channel.port1.onmessage = e => {
+        if (e.data?.type !== 'twakephone.here') return
+        clearTimeout(timer)
+        resolve(true)
+      }
+      w.postMessage({ type: 'twakephone.ring', callId }, [channel.port2])
+    }
+  })
+}
+
+/** The notifications of calls whose wait is over (their end message never came: a Gateway restarted) go. */
+const dropExpired = async (now = Date.now()) => {
+  const all = (await self.registration.getNotifications?.()) ?? []
+  for (const n of all) if (typeof n.data?.until === 'number' && n.data.until && n.data.until <= now) n.close()
+}
+
+const onPush = async data => {
+  await dropExpired().catch(() => undefined)
+  // Every push shows something (the browsers require it while no window of the site is on screen): a message that
+  // is not a call says to open the app.
+  const shown = notificationOf(data) ?? { title: text().other, options: { body: text().otherBody, data: { url: '/' } } }
+  if (data?.type === 'call' && shown.options.requireInteraction && (await ringsInAWindow(line(data.callId, 128)).catch(() => false))) return
+  // The end of a call while a window is on screen: its notification goes, no other comes.
+  if (data?.type === 'ended' && (await visibleWindows().catch(() => [])).length) {
+    for (const n of (await self.registration.getNotifications?.({ tag: shown.options.tag })) ?? []) n.close()
+    return
+  }
+  await self.registration.showNotification(shown.title, shown.options)
 }
 
 self.addEventListener('install', () => self.skipWaiting())
 self.addEventListener('activate', event => event.waitUntil(self.clients.claim()))
+
+/**
+ * The pushes, one after the other. Chromium (and Edge) forget a notification whose display is still under way when
+ * its notifications are listed meanwhile (getNotifications drops what is not on screen yet): shown all the same, it
+ * could never be closed again. So nothing lists them while one is being shown: a push waits for the previous one.
+ */
+let inTurn = Promise.resolve()
+const oneAtATime = work => (inTurn = inTurn.then(work, work))
 
 self.addEventListener('push', event => {
   let data = null
@@ -54,29 +129,31 @@ self.addEventListener('push', event => {
   } catch {
     data = null
   }
-  // Every push shows something (the browsers require it): a message that is not a call says to open the app.
-  const shown = notificationOf(data) ?? { title: text().other, options: { body: text().otherBody, data: { url: '/' } } }
-  event.waitUntil(self.registration.showNotification(shown.title, shown.options))
+  event.waitUntil(oneAtATime(() => onPush(data)))
 })
 
 self.addEventListener('notificationclick', event => {
   event.notification.close()
-  const url = new URL(event.notification.data?.url ?? '/', self.location.origin)
+  const data = event.notification.data ?? {}
+  // A call whose wait is over is no call to answer any more: its history instead.
+  const expired = typeof data.until === 'number' && data.until && data.until <= Date.now()
+  const url = new URL(expired ? '/recents' : (data.url ?? '/'), self.location.origin)
   // Only a page of the app, whatever the notification says.
   const target = url.origin === self.location.origin ? url : new URL('/', self.location.origin)
   event.waitUntil(openApp(target))
 })
 
 /**
- * A window of the app already open is brought forward and told which call (it signs in if needed: its softphone
- * then registers and the call rings there); otherwise a new one opens on it.
+ * A window of the app already open is told which call (it signs in if needed: its softphone then registers and the
+ * call rings there), then brought forward; otherwise a new one opens on it.
  */
 const openApp = async target => {
   const windows = await self.clients.matchAll({ type: 'window', includeUncontrolled: true })
   const open = windows.find(w => new URL(w.url).origin === self.location.origin)
   if (open) {
-    await open.focus()
     open.postMessage({ type: 'twakephone.open', path: target.pathname + target.search })
+    // Told first: a browser may refuse the focus (it allows it for a click on the notification only).
+    await open.focus().catch(() => undefined)
     return
   }
   await self.clients.openWindow(target.href)

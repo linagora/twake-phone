@@ -5,7 +5,7 @@ import { displayNameFor } from '../auth/oidc.js'
 import { useGateway } from '../gateway.js'
 import type { Key } from '../i18n/index.js'
 import { useT } from '../i18n/useT.js'
-import { browserPush, calledFor, forgetPushAtSignOut, resyncPush } from '../push.js'
+import { answerRingQueries, browserPush, calledFor, forgetPushAtSignOut, resyncPush, ringsHere } from '../push.js'
 import { usePhone } from '../softphone.js'
 import { CallPanel } from './CallPanel.js'
 
@@ -37,6 +37,13 @@ export const Layout = () => {
   useEffect(() => {
     if (me?.extension) resyncPush(client, push, me.id).catch(() => undefined)
   }, [client, push, me?.id, me?.extension])
+  // The service worker asks the windows on screen before it shows the notification of a call: this one rings it.
+  const phoneState = useRef(phone.state)
+  phoneState.current = phone.state
+  useEffect(() => {
+    if (typeof navigator === 'undefined' || !navigator.serviceWorker) return
+    return answerRingQueries(navigator.serviceWorker, () => ringsHere(phoneState.current, document.visibilityState))
+  }, [])
   const signOutHere = async () => {
     await phone.shutdown()
     // The next person on this browser does not get this one's calls.

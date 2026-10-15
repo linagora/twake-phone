@@ -22,7 +22,7 @@ export interface PushBrowser {
 export const SW_URL = '/sw.js'
 /** How long the service worker may take to be ready before the app says it cannot subscribe. */
 const READY_MS = 10_000
-const MARK = 'twakephone.push.'
+const MARK = 'twakephone.push'
 
 const withTimeout = <T>(promise: Promise<T>, ms: number) =>
   new Promise<T>((resolve, reject) => {
@@ -71,27 +71,36 @@ const json = (sub: PushSubscription) => {
   return { endpoint: j.endpoint ?? sub.endpoint, keys: { p256dh: j.keys?.p256dh ?? '', auth: j.keys?.auth ?? '' } }
 }
 
-/** Whether `userId` subscribed this browser (remembered here: the Gateway keeps whose it is, this says who asked). */
-const marked = (b: PushBrowser, userId: string, endpoint?: string) => {
+/** Who subscribed this browser, and which subscription (remembered here: the Gateway keeps whose it is, this says who asked). */
+const ownerOf = (b: PushBrowser): { userId: string; endpoint: string } | null => {
   try {
-    const v = b.storage?.getItem(MARK + userId)
-    return !!v && (endpoint === undefined || v === endpoint)
+    const v = JSON.parse(b.storage?.getItem(MARK) ?? 'null') as { userId?: unknown; endpoint?: unknown } | null
+    return v && typeof v.userId === 'string' && typeof v.endpoint === 'string' ? { userId: v.userId, endpoint: v.endpoint } : null
   } catch {
-    return false
+    return null
   }
+}
+const marked = (b: PushBrowser, userId: string, endpoint?: string) => {
+  const owner = ownerOf(b)
+  return !!owner && owner.userId === userId && (endpoint === undefined || owner.endpoint === endpoint)
 }
 const mark = (b: PushBrowser, userId: string, endpoint: string | null) => {
   try {
-    if (endpoint) b.storage?.setItem(MARK + userId, endpoint)
-    else b.storage?.removeItem(MARK + userId)
+    if (endpoint) b.storage?.setItem(MARK, JSON.stringify({ userId, endpoint }))
+    else b.storage?.removeItem(MARK)
   } catch {
     // Storage blocked: the subscription holds at the Gateway; this browser just forgets who asked.
   }
 }
+/** The Gateway's key a subscription was made with (base64url), or null when the browser does not say. */
+const keyOf = (sub: PushSubscription) => b64url(sub.options?.applicationServerKey ?? null) || null
 
 export type PushStatus = 'unsupported' | 'unavailable' | 'denied' | 'off' | 'on'
 
-/** Where notifications stand for this person on this browser. */
+/**
+ * Where notifications stand for this person on this browser. A subscription made with a key the Gateway no longer
+ * has is off: its pushes would be refused.
+ */
 export const pushStatus = async (gateway: PushGateway, b: PushBrowser, userId: string): Promise<PushStatus> => {
   if (!b.supported) return 'unsupported'
   const state = await gateway.getPushSubscriptions()
@@ -99,7 +108,9 @@ export const pushStatus = async (gateway: PushGateway, b: PushBrowser, userId: s
   if (b.permission() === 'denied') return 'denied'
   if (b.permission() !== 'granted' || !marked(b, userId)) return 'off'
   const sub = await (await b.registration()).pushManager.getSubscription()
-  return sub && marked(b, userId, sub.endpoint) ? 'on' : 'off'
+  if (!sub || !marked(b, userId, sub.endpoint)) return 'off'
+  const key = keyOf(sub)
+  return key && state.publicKey && key !== state.publicKey ? 'off' : 'on'
 }
 
 /**
@@ -137,13 +148,35 @@ export const disablePush = async (gateway: PushGateway, b: PushBrowser, userId: 
 }
 
 /**
- * At each start of a signed-in app: the subscription this person made on this browser is handed to the Gateway
- * again (one it removed, a push service that renewed it). Someone else's is left alone.
+ * At each start of a signed-in app. The subscription this person made on this browser is handed to the Gateway again
+ * (one it removed, a push service that renewed it), and made anew when the Gateway's key changed (its pushes would
+ * be refused). A subscription someone else made here (their sign-out never reached it: an expired session, a Gateway
+ * out of reach then) stops at once at its push service: this person never gets their calls, and the Gateway drops it
+ * at its next push (gone).
  */
 export const resyncPush = async (gateway: PushGateway, b: PushBrowser, userId: string) => {
-  if (!b.supported || b.permission() !== 'granted' || !marked(b, userId)) return
-  const sub = await (await b.registration()).pushManager.getSubscription()
+  if (!b.supported || b.permission() !== 'granted') return
+  const registration = await b.registration()
+  const sub = await registration.pushManager.getSubscription()
+  if (!marked(b, userId)) {
+    if (sub) {
+      await sub.unsubscribe().catch(() => undefined)
+      mark(b, userId, null)
+    }
+    return
+  }
   if (!sub) return mark(b, userId, null)
+  const state = await gateway.getPushSubscriptions()
+  if (!state.available || !state.publicKey) return
+  const key = keyOf(sub)
+  if (key && key !== state.publicKey) {
+    await gateway.removePushSubscription(sub.endpoint).catch(() => undefined)
+    await sub.unsubscribe().catch(() => undefined)
+    const renewed = await registration.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: bytes(state.publicKey) })
+    await gateway.addPushSubscription(json(renewed))
+    mark(b, userId, renewed.endpoint)
+    return
+  }
   if (!marked(b, userId, sub.endpoint)) mark(b, userId, sub.endpoint)
   await gateway.addPushSubscription(json(sub))
 }
@@ -158,4 +191,21 @@ export const forgetPushAtSignOut = async (gateway: PushGateway, b: PushBrowser, 
 export const calledFor = (search: string) => {
   const id = new URLSearchParams(search).get('call')
   return id && id.length <= 256 ? id : null
+}
+
+/**
+ * Whether this window rings a call itself, for the service worker that asks before showing its notification: on
+ * screen, with its softphone registered or on its way back (a WebSocket that dropped). Then the page rings, not a
+ * notification.
+ */
+export const ringsHere = (phone: string, visibility: DocumentVisibilityState | string) => visibility === 'visible' && ['connecting', 'unregistered', 'registered'].includes(phone)
+
+/** Answers the service worker's question (sw.js, `twakephone.ring`) while `here()` says so; returns how to stop. */
+export const answerRingQueries = (container: Pick<ServiceWorkerContainer, 'addEventListener' | 'removeEventListener'>, here: () => boolean) => {
+  const onMessage = (e: MessageEvent) => {
+    if ((e.data as { type?: unknown } | null)?.type !== 'twakephone.ring' || !e.ports?.[0] || !here()) return
+    e.ports[0].postMessage({ type: 'twakephone.here' })
+  }
+  container.addEventListener('message', onMessage as EventListener)
+  return () => container.removeEventListener('message', onMessage as EventListener)
 }

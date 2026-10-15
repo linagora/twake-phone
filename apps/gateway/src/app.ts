@@ -13,7 +13,7 @@ import { StoreDirectory, parseUserMap, type UserDirectory } from './directory.js
 import type { DirectorySync } from './directory-sync.js'
 import { EventBus } from './events.js'
 import { historyEntryFor } from './history.js'
-import { MISSED_TTL_SEC, type PushMessage, type WebPush } from './push.js'
+import { ENDED_TTL_SEC, MISSED_TTL_SEC, type PushMessage, type WebPush } from './push.js'
 import type { ProviderRegistry } from './registry.js'
 import { securityHeadersFor, type SecurityOptions } from './security.js'
 import { MemoryStore } from './store/memory.js'
@@ -63,6 +63,8 @@ export interface BuildOptions {
   contacts?: ContactDirectory
   /** Searches allowed per user (tests inject a tighter one). Default: 30 per 10 seconds. */
   directorySearchLimiter?: RateLimiter
+  /** Push subscriptions given or removed per user (tests inject a tighter one). Default: 20 a minute. */
+  pushSubscriptionLimiter?: RateLimiter
   /** Copies the directory's accounts into the user ↔ extension mappings; administrators can run it from the app. */
   directorySync?: DirectorySync
   /** Who administers the platform. Default: from ADMIN_ROLE and ADMIN_USERS. */
@@ -320,15 +322,19 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
     if (!userId) return
     // A call held for someone without a window: their browsers are woken (not awaited: the stream goes on).
     if (event.type === 'call.wake') {
-      void wake(tenantId, userId, event.payload).catch(err => app.log.error({ err, tenantId }, 'push for a call not sent'))
+      wake(tenantId, userId, event.payload)
       return
     }
-    if ((event.type === 'call.ended' || event.type === 'call.failed') && woken.size) {
-      const k = wokenKey(tenantId, userId, event.payload.call.id)
-      const shown = woken.get(k)
-      woken.delete(k)
-      // Nobody answered: the notification of the call becomes that of a missed call.
-      if (shown && event.payload.call.state === 'missed') void sendPush(tenantId, userId, { type: 'missed', ...shown }, MISSED_TTL_SEC).catch(err => app.log.error({ err, tenantId }, 'push for a missed call not sent'))
+    // A colleague of the group answered the call this person was woken for: their notifications say so.
+    if (event.type === 'call.taken') {
+      wokenOver(tenantId, userId, event.payload.call.id, { reason: 'taken', by: event.payload.by })
+      return
+    }
+    // The call no longer waits for this person: answered (on one of their browsers), or over. Nobody answered: the
+    // notification of the call becomes that of a missed call.
+    if (woken.size && (event.type === 'call.connected' || event.type === 'call.ended' || event.type === 'call.failed')) {
+      const { call } = event.payload
+      wokenOver(tenantId, userId, call.id, event.type === 'call.connected' ? { reason: 'answered' } : call.state === 'missed' ? { reason: 'missed' } : { reason: 'over' })
     }
     if (event.type === 'presence.changed') {
       const mapped: TelephonyEvent = { ...event, payload: { ...event.payload, userId, extension } }
@@ -372,6 +378,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
   const restoreOnce = (tenantId: string, provider: TelephonyProvider) =>
     inTurn(tenantId, async () => {
       if (provider.syncExtensions) await provider.syncExtensions((await store.listMappings(tenantId)).map(m => ({ extension: m.extension, userId: m.userId, ...(m.displayName ? { displayName: m.displayName } : {}) })))
+      await purgeLeavers(tenantId)
       await wakeable(tenantId, provider)
       const entries = await Promise.all(
         (await store.listUserPresences(tenantId)).map(async r => ({ user: await dir.forUser(tenantId, r.userId), presence: presenceOfRecord(r) }))
@@ -411,41 +418,91 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
   // the Gateway can send pushes; written where the provider holds calls for them (always in the tenant's turn).
   const push = options.push
   push?.useLogger(app.log)
+  /** The people of the tenant who no longer hold an extension lose their browsers' subscriptions (they left). */
+  const purgeLeavers = async (tenantId: string) => {
+    if (!push) return
+    const holders = new Set((await store.listMappings(tenantId)).map(m => m.userId))
+    for (const userId of await store.listPushUsers(tenantId)) {
+      if (holders.has(userId)) continue
+      for (const s of await store.listPushSubscriptions(tenantId, userId)) await store.deletePushSubscription(tenantId, userId, s.endpoint)
+      app.log.info({ tenantId, userId }, 'push subscriptions of someone who holds no extension any more removed')
+    }
+  }
   const wakeable = async (tenantId: string, provider: TelephonyProvider) => {
     if (!provider.setWakeable) return
     const users = push && (await push.publicKey()) ? new Set(await store.listPushUsers(tenantId)) : new Set<string>()
     await provider.setWakeable(users.size ? (await store.listMappings(tenantId)).filter(m => users.has(m.userId)).map(m => ({ extension: m.extension, userId: m.userId })) : [])
   }
-  const rewake = (tenantId: string) => {
-    const provider = started.get(tenantId)
-    if (provider) void inTurn(tenantId, () => wakeable(tenantId, provider)).catch(err => app.log.error({ err, tenantId }, 'who can be woken not handed to the provider'))
+  /** One person's line of `wakeable`: whether they can be woken now, the others untouched. */
+  const wakeableOne = async (tenantId: string, provider: TelephonyProvider, userId: string) => {
+    if (!provider.setWakeableOne) return wakeable(tenantId, provider)
+    const mapping = await store.getMappingByUser(tenantId, userId)
+    if (!mapping) return
+    const on = !!push && !!(await push.publicKey()) && (await store.listPushSubscriptions(tenantId, userId)).length > 0
+    await provider.setWakeableOne({ extension: mapping.extension, userId }, on)
   }
-  /** What the notification of each call being woken for shows, by tenant, person and call: told again if missed. */
-  const woken = new Map<string, Omit<Extract<PushMessage, { type: 'call' }>, 'type' | 'until'>>()
-  const wokenKey = (tenantId: string, userId: string, callId: string) => `${tenantId}\u0000${userId}\u0000${callId}`
+  /** Browsers their push service says are gone: their people may no longer be wakeable. */
+  const forgetGone = (gone: { tenantId: string; userId: string }[]) => {
+    for (const { tenantId, userId } of gone) {
+      const provider = started.get(tenantId)
+      if (provider) void inTurn(tenantId, () => wakeableOne(tenantId, provider, userId)).catch(err => app.log.error({ err, tenantId }, 'who can be woken not handed to the provider'))
+    }
+  }
   const sendPush = async (tenantId: string, userId: string, message: PushMessage, ttlSec: number) => {
     if (!push) return
     const { gone } = await push.notify(tenantId, userId, message, ttlSec)
-    for (const t of new Set(gone.map(g => g.tenantId))) rewake(t)
+    forgetGone(gone)
   }
-  const wake = async (tenantId: string, userId: string, { call, waitSec, group }: Extract<TelephonyEvent, { type: 'call.wake' }>['payload']) => {
+  /**
+   * The calls each person is being woken for, by tenant, person and call: what their notification shows, whether it
+   * was sent, and the pushes about it in order (the end of a call never overtakes its ringing). Set as soon as the
+   * provider says so, before anything is read: an end that comes meanwhile is not missed.
+   */
+  type Shown = Omit<Extract<PushMessage, { type: 'call' }>, 'type' | 'until'>
+  const woken = new Map<string, { shown: Shown; sent: boolean; over: boolean; chain: Promise<void> }>()
+  const wokenKey = (tenantId: string, userId: string, callId: string) => `${tenantId}\u0000${userId}\u0000${callId}`
+  const nameOf = async (tenantId: string, extension: string) => (await within(store.getMappingByExtension(tenantId, extension), historyWriteMs, 'name').catch(() => null))?.displayName?.slice(0, 64)
+  const wake = (tenantId: string, userId: string, { call, waitSec, group }: Extract<TelephonyEvent, { type: 'call.wake' }>['payload']) => {
     if (!push) return
-    // The caller's name and the group's, as the directory gives them: what the notification shows, nothing more.
-    const [caller, groupName] = await Promise.all([
-      within(store.getMappingByExtension(tenantId, call.remoteNumber), historyWriteMs, 'caller name').catch(() => null),
-      group ? within((async () => (await started.get(tenantId)?.listGroups?.())?.find(g => g.number === group)?.name)(), historyWriteMs, 'group name').catch(() => undefined) : undefined
-    ])
-    const shown = {
-      callId: call.id,
-      number: call.remoteNumber,
-      ...(caller?.displayName ? { name: caller.displayName.slice(0, 64) } : {}),
-      ...(group ? { group: { number: group, ...(groupName ? { name: groupName } : {}) } } : {})
-    }
     const k = wokenKey(tenantId, userId, call.id)
-    woken.set(k, shown)
+    if (woken.has(k)) return
+    const entry = { shown: { callId: call.id, number: call.remoteNumber } as Shown, sent: false, over: false, chain: Promise.resolve() }
+    woken.set(k, entry)
     // Forgotten if its end never comes.
     setTimeout(() => woken.delete(k), (waitSec + 600) * 1000).unref()
-    await sendPush(tenantId, userId, { type: 'call', ...shown, until: Date.now() + waitSec * 1000 }, waitSec)
+    const until = Date.now() + waitSec * 1000
+    entry.chain = (async () => {
+      // The caller's name and the group's, as the directory gives them: what the notification shows, nothing more.
+      const [name, groupName] = await Promise.all([
+        nameOf(tenantId, call.remoteNumber),
+        group ? within((async () => (await started.get(tenantId)?.listGroups?.())?.find(g => g.number === group)?.name)(), historyWriteMs, 'group name').catch(() => undefined) : undefined
+      ])
+      entry.shown = { ...entry.shown, ...(name ? { name } : {}), ...(group ? { group: { number: group, ...(groupName ? { name: groupName } : {}) } } : {}) }
+      // Over already (the caller hung up while the names were read): no call to answer is shown.
+      if (entry.over) return
+      entry.sent = true
+      await sendPush(tenantId, userId, { type: 'call', ...entry.shown, until }, waitSec)
+    })().catch(err => app.log.error({ err, tenantId }, 'push for a call not sent'))
+  }
+  /**
+   * The call `callId` no longer waits for this person: their browsers' notification is replaced, after its ringing.
+   * Missed: a missed call (sent even if the ringing never was). Otherwise only where the ringing was shown: answered
+   * (by them, on one of their browsers), taken (by `by`, a colleague of the group), over.
+   */
+  const wokenOver = (tenantId: string, userId: string, callId: string, end: { reason: 'answered' | 'missed' | 'over' } | { reason: 'taken'; by: string }) => {
+    const k = wokenKey(tenantId, userId, callId)
+    const entry = woken.get(k)
+    if (!entry) return
+    woken.delete(k)
+    entry.over = true
+    entry.chain = entry.chain
+      .then(async () => {
+        if (end.reason === 'missed') return sendPush(tenantId, userId, { type: 'missed', ...entry.shown }, MISSED_TTL_SEC)
+        if (!entry.sent) return
+        const by = end.reason === 'taken' ? { number: end.by, ...(await nameOf(tenantId, end.by).then(name => (name ? { name } : {}))) } : undefined
+        return sendPush(tenantId, userId, { type: 'ended', ...entry.shown, reason: end.reason, ...(by ? { by } : {}) }, ENDED_TTL_SEC)
+      })
+      .catch(err => app.log.error({ err, tenantId }, 'push for the end of a call not sent'))
   }
   // A synchronisation that changed who holds which extension: the provider hears it at once.
   options.directorySync?.onChange(tenantId => {
@@ -553,6 +610,8 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
       // Notifications of calls while no window of the app is open (Web Push, ADR 0015): the key a browser subscribes
       // with, and its subscription, the person's own. Available when the Gateway has VAPID keys and the provider can
       // hold a call for someone without a window (capability `push`); a browser may always be forgotten.
+      // Subscriptions given or removed per person: 20 a minute (the app gives one at each start, a click another).
+      const pushChanges = options.pushSubscriptionLimiter ?? new RateLimiter(20, 60_000)
       const pushState = async (user: User, provider: TelephonyProvider) => {
         const publicKey = push && user.extension && (await provider.getCapabilities()).push ? await push.publicKey() : null
         return publicKey ? { available: true, publicKey, subscriptions: (await store.listPushSubscriptions(user.tenantId, user.id)).length } : { available: false, subscriptions: 0 }
@@ -565,21 +624,28 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         const { user, provider } = await who(req)
         withExtension(user)
         if (!push || !(await pushState(user, provider)).available) throw Object.assign(new Error('Notifications are not available on this platform'), { statusCode: 501 })
+        // The app gives it again at each start: cheap when known, bounded when someone loops on it.
+        if (!pushChanges.allow(ownerKey(user.tenantId, user.id))) return reply.code(429).send({ error: 'too many changes to notifications, slow down' })
         const sub = push.parseSubscription(req.body)
-        await inTurn(user.tenantId, async () => {
-          await stillHolds(user)
-          await push.subscribe(user.tenantId, user.id, sub)
-          await wakeable(user.tenantId, provider)
-        })
+        await stillHolds(user)
+        const saved = await push.subscribe(user.tenantId, user.id, sub)
+        // Another tenant's browser stays theirs (knowing its address is no reason to take its calls).
+        if (saved.outcome === 'refused') throw Object.assign(new Error('This browser subscription belongs to another organisation'), { statusCode: 409, code: 'PUSH_SUBSCRIPTION_TAKEN' })
+        // Only this person's line of who can be woken, and that of whoever this browser was given by.
+        if (saved.outcome !== 'unchanged') {
+          await inTurn(user.tenantId, async () => {
+            await wakeableOne(user.tenantId, provider, user.id)
+            if (saved.previousUserId) await wakeableOne(user.tenantId, provider, saved.previousUserId)
+          })
+        }
         return reply.code(201).send(await pushState(user, provider))
       })
       v1.delete('/me/push-subscriptions', async (req, reply) => {
         const { user, provider } = await who(req)
+        if (!pushChanges.allow(ownerKey(user.tenantId, user.id))) return reply.code(429).send({ error: 'too many changes to notifications, slow down' })
         const endpoint = (req.body as { endpoint?: unknown } | undefined)?.endpoint
         if (typeof endpoint !== 'string' || !endpoint || endpoint.length > 1024) throw bad('invalid endpoint')
-        await inTurn(user.tenantId, async () => {
-          if (await store.deletePushSubscription(user.tenantId, user.id, endpoint)) await wakeable(user.tenantId, provider)
-        })
+        if (await store.deletePushSubscription(user.tenantId, user.id, endpoint)) await inTurn(user.tenantId, () => wakeableOne(user.tenantId, provider, user.id))
         return reply.code(204).send()
       })
 

@@ -177,14 +177,24 @@ export const storeContract = (name: string, make: () => Promise<Store>) =>
     it('keeps push subscriptions per tenant and user, one per endpoint: a browser given to someone else moves to them', async () => {
       const s = await make()
       const sub = (tenantId: string, userId: string, endpoint: string, createdAt: string) => ({ tenantId, userId, endpoint, p256dh: 'BKey', auth: 'secret', createdAt })
-      await s.savePushSubscription(sub('A', 'jean', 'https://push.example.test/1', '2026-10-15T10:00:00.000Z'))
-      await s.savePushSubscription(sub('A', 'jean', 'https://push.example.test/2', '2026-10-15T09:00:00.000Z'))
-      await s.savePushSubscription(sub('B', 'jean', 'https://push.example.test/3', '2026-10-15T10:00:00.000Z'))
+      expect(await s.savePushSubscription(sub('A', 'jean', 'https://push.example.test/1', '2026-10-15T10:00:00.000Z'))).toEqual({ outcome: 'added' })
+      expect(await s.savePushSubscription(sub('A', 'jean', 'https://push.example.test/2', '2026-10-15T09:00:00.000Z'))).toEqual({ outcome: 'added' })
+      expect(await s.savePushSubscription(sub('B', 'jean', 'https://push.example.test/3', '2026-10-15T10:00:00.000Z'))).toEqual({ outcome: 'added' })
       expect((await s.listPushSubscriptions('A', 'jean')).map(r => r.endpoint)).toEqual(['https://push.example.test/2', 'https://push.example.test/1'])
       expect(await s.listPushSubscriptions('A', 'jean')).toContainEqual(sub('A', 'jean', 'https://push.example.test/1', '2026-10-15T10:00:00.000Z'))
       expect(await s.listPushUsers('A')).toEqual(['jean'])
-      // Another person signs in on Jean's browser: it is theirs now.
-      await s.savePushSubscription(sub('A', 'paul', 'https://push.example.test/1', '2026-10-15T11:00:00.000Z'))
+      // Known already: nothing written (its date stays).
+      expect(await s.savePushSubscription(sub('A', 'jean', 'https://push.example.test/1', '2026-10-15T12:00:00.000Z'))).toEqual({ outcome: 'unchanged' })
+      expect((await s.listPushSubscriptions('A', 'jean')).find(r => r.endpoint === 'https://push.example.test/1')?.createdAt).toBe('2026-10-15T10:00:00.000Z')
+      // New keys for the same browser.
+      expect(await s.savePushSubscription({ ...sub('A', 'jean', 'https://push.example.test/2', '2026-10-15T09:30:00.000Z'), auth: 'other' })).toEqual({ outcome: 'updated' })
+      expect((await s.listPushSubscriptions('A', 'jean')).find(r => r.endpoint === 'https://push.example.test/2')?.auth).toBe('other')
+      // Another tenant cannot take it: refused, nothing written.
+      expect(await s.savePushSubscription(sub('B', 'mallory', 'https://push.example.test/1', '2026-10-15T11:00:00.000Z'))).toEqual({ outcome: 'refused' })
+      expect((await s.listPushSubscriptions('A', 'jean')).map(r => r.endpoint)).toContain('https://push.example.test/1')
+      expect(await s.listPushUsers('B')).toEqual(['jean'])
+      // Another person of the tenant signs in on Jean's browser: it is theirs now.
+      expect(await s.savePushSubscription(sub('A', 'paul', 'https://push.example.test/1', '2026-10-15T11:00:00.000Z'))).toEqual({ outcome: 'moved', previousUserId: 'jean' })
       expect((await s.listPushSubscriptions('A', 'jean')).map(r => r.endpoint)).toEqual(['https://push.example.test/2'])
       expect(await s.listPushUsers('A')).toEqual(['jean', 'paul'])
       // Only one's own, inside one's tenant.

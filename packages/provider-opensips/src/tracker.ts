@@ -426,7 +426,11 @@ export class CallTracker {
     for (const other of group.ringing) if (other !== member) this.count(other, -1)
     const rang = group.ringing.has(member)
     group.ringing.clear()
-    // Those woken for it hear nothing more either: a colleague took the call.
+    // Those woken for it hear nothing more either, but that a colleague took the call (their browsers' notification
+    // says so instead of ringing on).
+    for (const other of call.woken ?? []) {
+      if (other !== member) this.emit(other, { type: 'call.taken', timestamp: this.now(), payload: { call: this.toCall(call, other, 'ended'), by: member } })
+    }
     call.woken?.clear()
     call.callee = member
     call.rang = rang

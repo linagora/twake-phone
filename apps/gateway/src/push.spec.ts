@@ -2,11 +2,12 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import type { ProviderFactory, RoutedEvent, TelephonyProvider } from '@twake/telephony-provider-sdk'
 import type { Call, TelephonyEvent } from '@twake/telephony-types'
 import { buildApp } from './app.js'
+import { RateLimiter } from './contacts.js'
 import { TicketStore } from './auth.js'
 import { decrypt } from './crypto.js'
 import { StoreDirectory } from './directory.js'
 import { EventBus } from './events.js'
-import { DEFAULT_PUSH_SERVICES, PUSH_SUBSCRIPTIONS_MAX, WebPush, hostAllowed, parsePushServices, parseVapidSubject } from './push.js'
+import { DEFAULT_PUSH_SERVICES, ENDED_TTL_SEC, PUSH_SUBSCRIPTIONS_MAX, WebPush, hostAllowed, parsePushServices, parseVapidSubject } from './push.js'
 import { ProviderRegistry } from './registry.js'
 import { MemoryStore } from './store/memory.js'
 import { startPushService } from '../test/push-service.mjs'
@@ -138,8 +139,10 @@ describe('WebPush', () => {
 describe('/me/push-subscriptions and the calls woken for', () => {
   const call = (id: string, remoteNumber: string, state: Call['state'] = 'ringing'): Call => ({ id, direction: 'inbound', state, localNumber: '102', remoteNumber, startedAt: new Date().toISOString() })
   /** A provider that can hold calls for someone without a window, and hands the Gateway the events it is given. */
-  const holding = (push = true) => {
+  const holding = (push = true, one = false) => {
     const wakeable: string[] = []
+    /** One person's line at a time (setWakeableOne), when the provider can. */
+    const ones: string[] = []
     const queue: RoutedEvent[] = []
     let wakeUp: (() => void) | undefined
     const provider = {
@@ -149,6 +152,7 @@ describe('/me/push-subscriptions and the calls woken for', () => {
       setPresence: async () => undefined,
       listGroups: async () => [{ number: '200', name: 'Accueil', members: ['101', '102'] }],
       setWakeable: async (holders: { extension: string; userId: string }[]) => void wakeable.push(holders.map(h => `${h.extension}=${h.userId}`).join(',')),
+      ...(one ? { setWakeableOne: async (h: { extension: string; userId: string }, on: boolean) => void ones.push(`${h.extension}=${h.userId} ${on}`) } : {}),
       subscribe: async function* () {
         for (;;) {
           while (queue.length) yield queue.shift()!
@@ -163,19 +167,29 @@ describe('/me/push-subscriptions and the calls woken for', () => {
       queue.push({ extension, event })
       wakeUp?.()
     }
-    return { factory, wakeable, emit }
+    return { factory, wakeable, ones, emit }
   }
-  const setup = async ({ push = true, withPush = true } = {}) => {
+  interface SetupOptions {
+    push?: boolean
+    withPush?: boolean
+    /** The provider writes one person's line at a time (setWakeableOne). */
+    one?: boolean
+    limiter?: RateLimiter
+    /** What the store holds before the Gateway starts. */
+    prepare?: (store: MemoryStore) => Promise<void>
+  }
+  const setup = async ({ push = true, withPush = true, one = false, limiter, prepare }: SetupOptions = {}) => {
     process.env.AUTH_MODE = 'dev'
     const store = new MemoryStore()
     await store.upsertMapping({ tenantId: 'A', userId: 'alice', extension: '101', displayName: 'Alice Martin' })
     await store.upsertMapping({ tenantId: 'A', userId: 'jean', extension: '102', displayName: 'Jean Dupont' })
     await store.upsertMapping({ tenantId: 'B', userId: 'carol', extension: '102' })
-    const rec = holding(push)
+    await prepare?.(store)
+    const rec = holding(push, one)
     const registry = new ProviderRegistry([{ tenantId: 'A', type: 'holding', config: {} }, { tenantId: 'B', type: 'holding', config: {} }], [rec.factory])
     const webPush = make(store)
     const bus = new EventBus()
-    const app = await buildApp(registry, { store, bus, directory: new StoreDirectory(store), tickets: new TicketStore(), ...(withPush ? { push: webPush } : {}) })
+    const app = await buildApp(registry, { store, bus, directory: new StoreDirectory(store), tickets: new TicketStore(), ...(withPush ? { push: webPush } : {}), ...(limiter ? { pushSubscriptionLimiter: limiter } : {}) })
     registry.startAll()
     const as = (user: string, tenant = 'A') => ({ 'x-dev-user': user, 'x-dev-tenant': tenant })
     return { app, as, store, rec, bus, webPush }
@@ -241,15 +255,92 @@ describe('/me/push-subscriptions and the calls woken for', () => {
     const missed = await service.next(browser.id)
     expect(missed.data).toEqual({ type: 'missed', callId: 'w1', number: '101', name: 'Alice Martin' })
     expect(Number(missed.headers.ttl)).toBeGreaterThan(3600)
-    // A call woken for and answered: nothing more.
+    // A call woken for and answered (on one of his browsers): the notification says so, briefly.
     rec.emit('102', { type: 'call.wake', timestamp: new Date().toISOString(), payload: { call: call('w2', '101'), waitSec: 20 } })
     await service.next(browser.id, m => m.data?.callId === 'w2')
+    rec.emit('102', { type: 'call.connected', timestamp: new Date().toISOString(), payload: { call: call('w2', '101', 'connected') } })
+    const answered = await service.next(browser.id, m => m.data?.callId === 'w2')
+    expect(answered.data).toEqual({ type: 'ended', callId: 'w2', number: '101', name: 'Alice Martin', reason: 'answered' })
+    expect(answered.headers.ttl).toBe(String(ENDED_TTL_SEC))
+    // Its end afterwards: nothing more.
     rec.emit('102', { type: 'call.ended', timestamp: new Date().toISOString(), payload: { call: call('w2', '101', 'ended') } })
     // A group's: its name with the caller's.
     rec.emit('102', { type: 'call.wake', timestamp: new Date().toISOString(), payload: { call: call('w3', '101'), waitSec: 30, group: '200' } })
     const group = await service.next(browser.id, m => m.data?.callId === 'w3')
     expect(group.data).toMatchObject({ group: { number: '200', name: 'Accueil' }, name: 'Alice Martin' })
-    expect(service.messages.filter(m => m.id === browser.id).map(m => `${m.data.type}:${m.data.callId}`)).toEqual(['call:w1', 'missed:w1', 'call:w2', 'call:w3'])
+    // A colleague of the group answered it: who, with the name the directory gives.
+    rec.emit('102', { type: 'call.taken', timestamp: new Date().toISOString(), payload: { call: call('w3', '101', 'ended'), by: '101' } })
+    const taken = await service.next(browser.id, m => m.data?.callId === 'w3')
+    expect(taken.data).toMatchObject({ type: 'ended', reason: 'taken', by: { number: '101', name: 'Alice Martin' } })
+    // The caller gave up some other way (the call failed, Jean did not miss it): over.
+    rec.emit('102', { type: 'call.wake', timestamp: new Date().toISOString(), payload: { call: call('w4', '101'), waitSec: 30 } })
+    await service.next(browser.id, m => m.data?.callId === 'w4')
+    rec.emit('102', { type: 'call.failed', timestamp: new Date().toISOString(), payload: { call: call('w4', '101', 'failed') } })
+    expect((await service.next(browser.id, m => m.data?.callId === 'w4')).data).toMatchObject({ type: 'ended', reason: 'over' })
+    expect(service.messages.filter(m => m.id === browser.id).map(m => `${m.data.type}:${m.data.callId}`)).toEqual(['call:w1', 'missed:w1', 'call:w2', 'ended:w2', 'call:w3', 'ended:w3', 'call:w4', 'ended:w4'])
+    await app.close()
+  })
+
+  it('knows a call is woken for before it reads the names: one that ends meanwhile shows no call to answer, only what it became', async () => {
+    const { app, as, store, rec } = await setup()
+    const browser = service.subscribe()
+    await app.inject({ method: 'POST', url: '/api/v1/me/push-subscriptions', headers: as('jean'), payload: browser })
+    // A slow directory for the caller's name: the call ends while it is read.
+    const byExtension = store.getMappingByExtension.bind(store)
+    store.getMappingByExtension = async (tenantId, extension) => {
+      if (extension === '101') await new Promise(r => setTimeout(r, 100))
+      return byExtension(tenantId, extension)
+    }
+    rec.emit('102', { type: 'call.wake', timestamp: new Date().toISOString(), payload: { call: call('s1', '101'), waitSec: 30 } })
+    rec.emit('102', { type: 'call.ended', timestamp: new Date().toISOString(), payload: { call: call('s1', '101', 'missed') } })
+    expect((await service.next(browser.id, m => m.data?.callId === 's1')).data).toEqual({ type: 'missed', callId: 's1', number: '101', name: 'Alice Martin' })
+    // Answered meanwhile: nothing at all.
+    rec.emit('102', { type: 'call.wake', timestamp: new Date().toISOString(), payload: { call: call('s2', '101'), waitSec: 30 } })
+    rec.emit('102', { type: 'call.connected', timestamp: new Date().toISOString(), payload: { call: call('s2', '101', 'connected') } })
+    // The same wake twice: one push.
+    rec.emit('102', { type: 'call.wake', timestamp: new Date().toISOString(), payload: { call: call('s3', '101'), waitSec: 30 } })
+    rec.emit('102', { type: 'call.wake', timestamp: new Date().toISOString(), payload: { call: call('s3', '101'), waitSec: 30 } })
+    await service.next(browser.id, m => m.data?.callId === 's3')
+    await new Promise(r => setTimeout(r, 300))
+    expect(service.messages.filter(m => m.id === browser.id).map(m => `${m.data.type}:${m.data.callId}`)).toEqual(['missed:s1', 'call:s3'])
+    await app.close()
+  })
+
+  it('writes only the line of the person whose browser changed, nothing when it is known already, and limits the changes', async () => {
+    const { app, as, store, rec } = await setup({ one: true, limiter: new RateLimiter(4, 60_000) })
+    await until('the first restore', () => rec.wakeable.length >= 1)
+    const browser = service.subscribe()
+    expect((await app.inject({ method: 'POST', url: '/api/v1/me/push-subscriptions', headers: as('jean'), payload: browser })).statusCode).toBe(201)
+    // Given again at the next start of the app: nothing written.
+    expect((await app.inject({ method: 'POST', url: '/api/v1/me/push-subscriptions', headers: as('jean'), payload: browser })).statusCode).toBe(201)
+    expect(rec.ones).toEqual(['102=jean true'])
+    // Alice signs in on Jean's browser: it is hers now, Jean's line goes.
+    expect((await app.inject({ method: 'POST', url: '/api/v1/me/push-subscriptions', headers: as('alice'), payload: browser })).statusCode).toBe(201)
+    expect(rec.ones).toEqual(['102=jean true', '101=alice true', '102=jean false'])
+    expect(await store.listPushUsers('A')).toEqual(['alice'])
+    // Another tenant's person cannot take it.
+    const taken = await app.inject({ method: 'POST', url: '/api/v1/me/push-subscriptions', headers: as('carol', 'B'), payload: browser })
+    expect([taken.statusCode, taken.json().code]).toEqual([409, 'PUSH_SUBSCRIPTION_TAKEN'])
+    expect(await store.listPushUsers('B')).toEqual([])
+    // Four changes a minute for each person here: Alice's fifth waits.
+    expect((await app.inject({ method: 'DELETE', url: '/api/v1/me/push-subscriptions', headers: as('alice'), payload: { endpoint: browser.endpoint } })).statusCode).toBe(204)
+    expect(rec.ones.at(-1)).toBe('101=alice false')
+    for (let i = 0; i < 2; i++) expect((await app.inject({ method: 'POST', url: '/api/v1/me/push-subscriptions', headers: as('alice'), payload: service.subscribe() })).statusCode).toBe(201)
+    expect((await app.inject({ method: 'POST', url: '/api/v1/me/push-subscriptions', headers: as('alice'), payload: service.subscribe() })).statusCode).toBe(429)
+    expect((await app.inject({ method: 'DELETE', url: '/api/v1/me/push-subscriptions', headers: as('alice'), payload: { endpoint: browser.endpoint } })).statusCode).toBe(429)
+    // Jean is not slowed down by her.
+    expect((await app.inject({ method: 'POST', url: '/api/v1/me/push-subscriptions', headers: as('jean'), payload: browser })).statusCode).toBe(201)
+    await app.close()
+  })
+
+  it('forgets the browsers of someone who no longer holds an extension (they left) as the tenant starts', async () => {
+    const { app, store } = await setup({
+      prepare: async store => {
+        for (const userId of ['jean', 'gone']) await store.savePushSubscription({ tenantId: 'A', userId, endpoint: `${service.origin}/push/${userId}`, p256dh: 'k', auth: 'a', createdAt: new Date().toISOString() })
+      }
+    })
+    await until('the leaver forgotten', async () => (await store.listPushUsers('A')).join() === 'jean')
+    expect(await store.listPushSubscriptions('A', 'gone')).toEqual([])
     await app.close()
   })
 

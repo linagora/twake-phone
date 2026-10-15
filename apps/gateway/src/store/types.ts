@@ -86,10 +86,16 @@ export interface UserPresenceRecord {
   message?: string
 }
 
+/** What saving a push subscription did (Store.savePushSubscription). */
+export interface PushSaveResult {
+  outcome: 'added' | 'unchanged' | 'updated' | 'moved' | 'refused'
+  previousUserId?: string
+}
+
 /**
  * A browser's subscription to notifications (Web Push, ADR 0015): where its push service takes messages for it
  * (`endpoint`, unique: one per browser profile and application key) and the keys a message is encrypted with. Whose it
- * is: the person signed in when it was given. A browser given to someone else moves to them.
+ * is: the person signed in when it was given. A browser given to someone else of the tenant moves to them.
  */
 export interface PushSubscriptionRecord {
   tenantId: string
@@ -150,8 +156,12 @@ export interface Store {
   listPushSubscriptions(tenantId: string, userId: string): Promise<PushSubscriptionRecord[]>
   /** The people of a tenant with at least one subscription, by user id. */
   listPushUsers(tenantId: string): Promise<string[]>
-  /** Adds or replaces the subscription of `endpoint`, whoever had it (a browser given to someone else moves to them). */
-  savePushSubscription(record: PushSubscriptionRecord): Promise<void>
+  /**
+   * Adds or replaces the subscription of `endpoint` within its tenant: 'added' (new), 'unchanged' (this person's
+   * already, same keys: nothing written), 'updated' (theirs, new keys), 'moved' (a browser given to them by someone
+   * else of the tenant, `previousUserId`). One another tenant has stays theirs: 'refused', nothing written.
+   */
+  savePushSubscription(record: PushSubscriptionRecord): Promise<PushSaveResult>
   /** Removes `endpoint` if it is this person's. Whether it was. */
   deletePushSubscription(tenantId: string, userId: string, endpoint: string): Promise<boolean>
   /** Removes `endpoint` (its push service says it is gone), whoever had it; who that was. */

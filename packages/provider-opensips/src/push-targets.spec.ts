@@ -38,18 +38,46 @@ describe('PushTargets', () => {
       { extension: '103', userId: '' }
     ])
     expect(ready).toBe(2)
+    // Not alive yet (no subscription to the events): written with no time left.
     expect(db.queries.map(q => q.values)).toEqual([
       ['A', ['102'], ['jean']],
-      ['A', ['102'], ['jean']]
+      ['A', ['102'], ['jean'], 0]
     ])
     expect(db.queries[0].text).toMatch(/^DELETE FROM push_targets p WHERE p.tenant_id = \$1 AND NOT EXISTS/)
-    // Another tenant's row on the same extension stays theirs.
-    expect(db.queries[1].text).toContain('ON CONFLICT (extension) DO UPDATE SET holder = EXCLUDED.holder, updated_at = now() WHERE push_targets.tenant_id = EXCLUDED.tenant_id')
+    // Another tenant's row on the same extension stays theirs; a row already right is not written again.
+    expect(db.queries[1].text).toContain('WHERE push_targets.tenant_id = EXCLUDED.tenant_id AND push_targets.holder IS DISTINCT FROM EXCLUDED.holder')
     // Nobody: the tenant's rows go, nothing is inserted.
     const none = recorder()
     await new PushTargets({ pool: none.pool }).set([])
     expect(none.queries).toHaveLength(1)
     expect(none.queries[0].values).toEqual(['default', [], []])
+  })
+})
+
+describe('PushTargets, one person and the lease', () => {
+  it("writes or removes one person's row only, alive for what is left of the lease", async () => {
+    let now = 1_000_000
+    const db = recorder()
+    const t = new PushTargets({ pool: db.pool, tenantId: 'A', now: () => now })
+    await t.keepAlive(120)
+    now += 30_500
+    await t.setOne({ extension: '102', userId: 'jean' }, true)
+    await t.setOne({ extension: '102', userId: 'jean' }, false)
+    await t.setOne({ extension: "1' OR '1'='1", userId: 'eve' }, true)
+    expect(db.queries.map(q => q.values)).toEqual([
+      ['A', 120],
+      ['A', '102', 'jean', 89],
+      ['A', '102', 'jean']
+    ])
+    expect(db.queries[0].text).toBe('UPDATE push_targets SET alive_until = now() + make_interval(secs => $2) WHERE tenant_id = $1')
+    expect(db.queries[2].text).toBe('DELETE FROM push_targets WHERE tenant_id = $1 AND extension = $2 AND holder = $3')
+    // Released (the Gateway stops): no call waits for the tenant's rows, and those written next are not alive.
+    await t.release()
+    await t.setOne({ extension: '103', userId: 'bob' }, true)
+    expect(db.queries.slice(3).map(q => [q.text.slice(0, 40), q.values])).toEqual([
+      ['UPDATE push_targets SET alive_until = no', ['A']],
+      ['INSERT INTO push_targets (extension, ten', ['A', '103', 'bob', 0]]
+    ])
   })
 })
 
@@ -87,6 +115,22 @@ if (process.env.TEST_DATABASE_URL) {
       expect((await pool.query("SELECT 1 FROM push_targets WHERE extension = '9102'")).rowCount).toBe(1)
       // Bob unsubscribed his last browser.
       await a.set([{ extension: '9102', userId: 'jean' }])
+      expect(await a.list()).toEqual([{ extension: '9102', userId: 'jean' }])
+      // Alive only while kept so, as OpenSIPS reads it (alive_until > now()); one person's row alone.
+      const alive = async () => (await pool.query("SELECT extension FROM push_targets WHERE extension LIKE '91%' AND alive_until > now() ORDER BY extension")).rows.map(r => r.extension)
+      expect(await alive()).toEqual([])
+      await a.keepAlive(60)
+      expect(await alive()).toEqual(['9102'])
+      await a.setOne({ extension: '9104', userId: 'paul' }, true)
+      await b.setOne({ extension: '9102', userId: 'mallory' }, true)
+      expect(await alive()).toEqual(['9102', '9104'])
+      expect(await a.list()).toEqual([
+        { extension: '9102', userId: 'jean' },
+        { extension: '9104', userId: 'paul' }
+      ])
+      await a.setOne({ extension: '9104', userId: 'paul' }, false)
+      await a.release()
+      expect(await alive()).toEqual([])
       expect(await a.list()).toEqual([{ extension: '9102', userId: 'jean' }])
       // 9102 now belongs to someone else in the directory: Jean's row goes.
       await a.reconcile([{ extension: '9102', userId: 'paul' }])

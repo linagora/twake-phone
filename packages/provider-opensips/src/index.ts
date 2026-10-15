@@ -136,6 +136,11 @@ export class OpensipsProvider implements TelephonyProvider, MediaProvider {
         onEvent: (method, params) => this.tracker.handle(method, params),
         onResync: () => this.resync(),
         onRenewed: () => this.tracker.sweep(),
+        // The rows of push_targets live as long as this subscription: OpenSIPS holds a call for someone to wake
+        // only while a Gateway hears it (a Gateway gone, its rows lapse with its subscription).
+        onSubscribed: expireSec => {
+          void this.config.pushTargets?.keepAlive(expireSec).catch((err: unknown) => log.warn(`push_targets not kept alive: ${err instanceof Error ? err.message : String(err)}`))
+        },
         // The subscription lapsed in OpenSIPS: the registrations it told no longer hold (everyone offline) until
         // the next resync, which also ends the calls it no longer has. A failed renewal alone changes nothing.
         onExpired: () => {
@@ -280,6 +285,12 @@ export class OpensipsProvider implements TelephonyProvider, MediaProvider {
     await this.config.pushTargets.set(this.events ? holders : [])
   }
 
+  /** One person's line of setWakeable: whether `holder` can be woken now; the others are not written. */
+  async setWakeableOne(holder: { extension: string; userId: string }, on: boolean) {
+    if (!this.config.pushTargets) return
+    await this.config.pushTargets.setOne(holder, on && !!this.events)
+  }
+
   async getForwarding(user: User): Promise<ForwardingRules> {
     if (!user.extension) throw noExtension()
     if (!this.config.callRules) return {}
@@ -361,6 +372,9 @@ export class OpensipsProvider implements TelephonyProvider, MediaProvider {
     clearTimeout(this.startTimer)
     clearTimeout(this.expiryTimer)
     await this.events?.stop()
+    // Nobody hears whom to wake any more: no call waits for this tenant's browsers (best effort, bounded by the
+    // database's own timeout).
+    await this.config.pushTargets?.release().catch(() => undefined)
     this.queue.close()
     await this.config.onClose?.()
   }

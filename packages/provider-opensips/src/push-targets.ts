@@ -7,14 +7,18 @@ import type { Queryable } from './subscriber.js'
 /**
  * One row per extension that can be woken. `holder` is the person it was written for and `tenant_id` whose
  * extension it is: OpenSIPS reads neither (one tenant per database), the Gateway drops a row as soon as its holder no
- * longer holds the extension, and only ever touches its own tenant's rows.
+ * longer holds the extension, and only ever touches its own tenant's rows. `alive_until`: until when a Gateway hears
+ * whom to wake, the life of its subscription to OpenSIPS's events, renewed with it (keepAlive), over when the Gateway
+ * stops (release). OpenSIPS holds a call only for a row still alive: a Gateway that stopped, or no longer hears
+ * OpenSIPS, holds nobody's calls for nothing.
  */
 export const PUSH_TARGETS_SCHEMA = `
 CREATE TABLE IF NOT EXISTS push_targets (
     extension VARCHAR(64) PRIMARY KEY NOT NULL,
     tenant_id TEXT DEFAULT '' NOT NULL,
     holder TEXT DEFAULT '' NOT NULL,
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL,
+    alive_until TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL
 );
 `
 
@@ -27,11 +31,15 @@ export interface PushTargetsOptions {
   ready?: () => Promise<void>
   /** The tenant whose extensions these are. */
   tenantId?: string
+  /** Test seam: this host's clock (ms). */
+  now?: () => number
 }
 
 /** Reads and writes the tenant's rows of `push_targets`. */
 export class PushTargets {
   private readonly tenantId: string
+  /** When the rows stop being alive (ms since the epoch, this host's clock); 0: not alive. */
+  private aliveUntil = 0
 
   constructor(private readonly opts: PushTargetsOptions) {
     this.tenantId = opts.tenantId ?? 'default'
@@ -43,6 +51,11 @@ export class PushTargets {
     return res?.rows ?? []
   }
 
+  /** Seconds a row written now stays alive: what is left of the lease (keepAlive). */
+  private leftSec() {
+    return Math.max(0, Math.floor((this.aliveUntil - (this.opts.now ?? Date.now)()) / 1000))
+  }
+
   /** The extensions of the tenant that can be woken, with their holder, by extension. */
   async list(): Promise<{ extension: string; userId: string }[]> {
     const rows = await this.query<{ extension: string; holder: string }>('SELECT extension, holder FROM push_targets WHERE tenant_id = $1 ORDER BY extension', [this.tenantId])
@@ -51,7 +64,8 @@ export class PushTargets {
 
   /**
    * Exactly these extensions of the tenant can be woken, each for its holder: the others go. An extension that is
-   * not a SIP user name is left out (it could not be called anyway). A row another tenant wrote stays theirs.
+   * not a SIP user name is left out (it could not be called anyway). A row another tenant wrote stays theirs; a row
+   * that is already as wanted is not written again.
    */
   async set(targets: { extension: string; userId: string }[]) {
     const wanted = new Map<string, string>()
@@ -61,10 +75,38 @@ export class PushTargets {
     await this.query('DELETE FROM push_targets p WHERE p.tenant_id = $1 AND NOT EXISTS (SELECT 1 FROM unnest($2::text[], $3::text[]) AS w(extension, holder) WHERE w.extension = p.extension AND w.holder = p.holder)', [this.tenantId, extensions, holders])
     if (!extensions.length) return
     await this.query(
-      `INSERT INTO push_targets (extension, tenant_id, holder) SELECT extension, $1, holder FROM unnest($2::text[], $3::text[]) AS w(extension, holder)
-       ON CONFLICT (extension) DO UPDATE SET holder = EXCLUDED.holder, updated_at = now() WHERE push_targets.tenant_id = EXCLUDED.tenant_id`,
-      [this.tenantId, extensions, holders]
+      `INSERT INTO push_targets (extension, tenant_id, holder, alive_until) SELECT extension, $1, holder, now() + make_interval(secs => $4) FROM unnest($2::text[], $3::text[]) AS w(extension, holder)
+       ON CONFLICT (extension) DO UPDATE SET holder = EXCLUDED.holder, updated_at = now(), alive_until = EXCLUDED.alive_until
+       WHERE push_targets.tenant_id = EXCLUDED.tenant_id AND push_targets.holder IS DISTINCT FROM EXCLUDED.holder`,
+      [this.tenantId, extensions, holders, this.leftSec()]
     )
+  }
+
+  /** One person's row only: `extension` can be woken for them (`on`), or no longer. The other rows are not touched. */
+  async setOne(target: { extension: string; userId: string }, on: boolean) {
+    if (!SIP_USER.test(target.extension) || !target.userId) return
+    if (!on) {
+      await this.query('DELETE FROM push_targets WHERE tenant_id = $1 AND extension = $2 AND holder = $3', [this.tenantId, target.extension, target.userId])
+      return
+    }
+    await this.query(
+      `INSERT INTO push_targets (extension, tenant_id, holder, alive_until) VALUES ($2, $1, $3, now() + make_interval(secs => $4))
+       ON CONFLICT (extension) DO UPDATE SET holder = EXCLUDED.holder, updated_at = now(), alive_until = EXCLUDED.alive_until
+       WHERE push_targets.tenant_id = EXCLUDED.tenant_id AND push_targets.holder IS DISTINCT FROM EXCLUDED.holder`,
+      [this.tenantId, target.extension, target.userId, this.leftSec()]
+    )
+  }
+
+  /** The Gateway hears whom to wake `sec` seconds more (its subscription to the events was renewed): the rows live that long. */
+  async keepAlive(sec: number) {
+    this.aliveUntil = (this.opts.now ?? Date.now)() + sec * 1000
+    await this.query('UPDATE push_targets SET alive_until = now() + make_interval(secs => $2) WHERE tenant_id = $1', [this.tenantId, sec])
+  }
+
+  /** The Gateway no longer hears whom to wake (it stops): no call waits for the tenant's rows any more. */
+  async release() {
+    this.aliveUntil = 0
+    await this.query('UPDATE push_targets SET alive_until = now() WHERE tenant_id = $1', [this.tenantId])
   }
 
   /** Given who holds each extension of the tenant now, removes the rows whose holder no longer holds it. */

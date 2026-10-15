@@ -15,12 +15,22 @@ export const PUSH_SUBSCRIPTIONS_MAX = 10
 const SEND_TIMEOUT_MS = 5_000
 /** How long a missed call waits at the push service for a browser that is off. */
 export const MISSED_TTL_SEC = 12 * 3600
+/**
+ * How long the end of a call (answered, taken, over) waits there: a browser off longer shows nothing of the call
+ * any more (its service worker drops a call past its `until`).
+ */
+export const ENDED_TTL_SEC = 10 * 60
 const ENDPOINT_MAX = 1024
 
-/** What a notification shows, and the call it is about. Nothing else travels: no secret, no address. */
+/**
+ * What a notification shows, and the call it is about. Nothing else travels: no secret, no address. `until`: when
+ * the call stops waiting (ms since the epoch, the Gateway's clock). `ended`: the call no longer waits for this person
+ * (answered on one of their browsers, taken by `by` of the group, or over).
+ */
 export type PushMessage =
   | { type: 'call'; callId: string; number: string; name?: string; group?: { number: string; name?: string }; until: number }
   | { type: 'missed'; callId: string; number: string; name?: string; group?: { number: string; name?: string } }
+  | { type: 'ended'; callId: string; number: string; name?: string; group?: { number: string; name?: string }; reason: 'answered' | 'taken' | 'over'; by?: { number: string; name?: string } }
 
 export interface PushLogger {
   warn: (obj: object, msg: string) => void
@@ -137,11 +147,18 @@ export class WebPush {
     return { endpoint: b.endpoint, p256dh, auth }
   }
 
-  /** Keeps a browser's subscription for this person (theirs from now on); beyond PUSH_SUBSCRIPTIONS_MAX, the oldest go. */
+  /**
+   * Keeps a browser's subscription for this person (theirs from now on, taken from a colleague of the tenant who had
+   * it: `previousUserId`); beyond PUSH_SUBSCRIPTIONS_MAX, the oldest go. Nothing written when it is known already
+   * ('unchanged'), and another tenant's stays theirs ('refused').
+   */
   async subscribe(tenantId: string, userId: string, sub: { endpoint: string; p256dh: string; auth: string }) {
-    await this.opts.store.savePushSubscription({ tenantId, userId, ...sub, createdAt: new Date().toISOString() })
-    const all = await this.opts.store.listPushSubscriptions(tenantId, userId)
-    for (const old of all.slice(0, Math.max(0, all.length - PUSH_SUBSCRIPTIONS_MAX))) await this.opts.store.deletePushSubscription(tenantId, userId, old.endpoint)
+    const saved = await this.opts.store.savePushSubscription({ tenantId, userId, ...sub, createdAt: new Date().toISOString() })
+    if (saved.outcome === 'added' || saved.outcome === 'moved') {
+      const all = await this.opts.store.listPushSubscriptions(tenantId, userId)
+      for (const old of all.slice(0, Math.max(0, all.length - PUSH_SUBSCRIPTIONS_MAX))) await this.opts.store.deletePushSubscription(tenantId, userId, old.endpoint)
+    }
+    return saved
   }
 
   /**

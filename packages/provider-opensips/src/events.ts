@@ -45,6 +45,8 @@ export interface OpensipsEventsOptions {
   onResync?(): Promise<void> | void
   /** A renewal went through without needing a resync: time for periodic housekeeping. */
   onRenewed?(): void
+  /** The subscription lives in OpenSIPS `expireSec` seconds from now (made or renewed): events come that long at least. */
+  onSubscribed?(expireSec: number): void
   /**
    * No renewal went through for the whole life of the last subscription: OpenSIPS has dropped it, and what it told
    * may no longer hold. A single failed renewal is not that: the subscription lives on and events keep coming.
@@ -359,6 +361,7 @@ export class OpensipsEvents {
       for (const event of this.options.events) await this.call('event_subscribe', [event, address, expire])
       const lapsed = !this.alive
       this.keepAlive(expire)
+      this.options.onSubscribed?.(expire)
       this.checkSources()
       if (!wasSubscribed || restarted || lapsed) {
         if (restarted) this.log.info('OpenSIPS restarted since the last renewal: reading its state again')

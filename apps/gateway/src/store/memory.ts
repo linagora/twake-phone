@@ -1,4 +1,4 @@
-import { clampLimit, isDeclined, isMissed, type HistoryEntry, type HistoryPage, type HistoryQuery, type ConferenceRecord, type ProviderRecord, type PushSubscriptionRecord, type Store, type UserMapping, type UserPresenceRecord, type VapidKeysRecord } from './types.js'
+import { clampLimit, isDeclined, isMissed, type HistoryEntry, type HistoryPage, type HistoryQuery, type ConferenceRecord, type ProviderRecord, type PushSaveResult, type PushSubscriptionRecord, type Store, type UserMapping, type UserPresenceRecord, type VapidKeysRecord } from './types.js'
 
 const key = (...parts: string[]) => parts.join('\u0000')
 
@@ -158,8 +158,13 @@ export class MemoryStore implements Store {
     return [...new Set([...this.pushSubscriptions.values()].filter(r => r.tenantId === tenantId).map(r => r.userId))].sort()
   }
 
-  async savePushSubscription(record: PushSubscriptionRecord) {
+  async savePushSubscription(record: PushSubscriptionRecord): Promise<PushSaveResult> {
+    const old = this.pushSubscriptions.get(record.endpoint)
+    if (old && old.tenantId !== record.tenantId) return { outcome: 'refused' }
+    if (old && old.userId === record.userId && old.p256dh === record.p256dh && old.auth === record.auth) return { outcome: 'unchanged' }
     this.pushSubscriptions.set(record.endpoint, { ...record })
+    if (!old) return { outcome: 'added' }
+    return old.userId === record.userId ? { outcome: 'updated' } : { outcome: 'moved', previousUserId: old.userId }
   }
 
   async deletePushSubscription(tenantId: string, userId: string, endpoint: string) {

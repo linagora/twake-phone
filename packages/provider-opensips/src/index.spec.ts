@@ -1,5 +1,5 @@
 import dgram from 'node:dgram'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { RoutedEvent } from '@twake/telephony-provider-sdk'
 import type { ForwardingRules } from '@twake/telephony-types'
 import { AsyncQueue, OpensipsProvider, SUBSCRIBED_EVENTS, type CallRules, type DndRule, type PushTargets } from './index.js'
@@ -295,21 +295,32 @@ describe('OpensipsProvider call rules', () => {
     const written: string[] = []
     const pushTargets = {
       set: async (t: { extension: string; userId: string }[]) => void written.push(`set ${t.map(h => `${h.extension}=${h.userId}`).join(',')}`),
-      reconcile: async (t: { extension: string; userId: string }[]) => void written.push(`reconcile ${t.map(h => `${h.extension}=${h.userId}`).join(',')}`)
+      reconcile: async (t: { extension: string; userId: string }[]) => void written.push(`reconcile ${t.map(h => `${h.extension}=${h.userId}`).join(',')}`),
+      setOne: async (t: { extension: string; userId: string }, on: boolean) => void written.push(`one ${t.extension}=${t.userId} ${on}`),
+      keepAlive: async (sec: number) => void written.push(`alive ${sec}`),
+      release: async () => void written.push('release')
     } as unknown as PushTargets
     const sips = await fakeOpensips()
     cleanups.push(sips.close)
     const p = new OpensipsProvider({ websocketUrl: 'wss://sip.example.test', domain: 'sip.example.test', sipSecretFor: async () => 's', events: { miUrl: sips.url }, pushTargets, logger: quiet })
-    cleanups.push(() => p.close())
     expect((await p.getCapabilities()).push).toBe(true)
     await p.setWakeable([{ extension: '102', userId: 'jean' }])
     await p.syncExtensions([{ extension: '102', userId: 'jean' }])
-    expect(written).toEqual(['set 102=jean', 'reconcile 102=jean'])
+    // One person's browser, alone: their row only.
+    await p.setWakeableOne({ extension: '103', userId: 'bob' }, true)
+    await p.setWakeableOne({ extension: '103', userId: 'bob' }, false)
+    expect(written.filter(w => !w.startsWith('alive'))).toEqual(['set 102=jean', 'reconcile 102=jean', 'one 103=bob true', 'one 103=bob false'])
+    // The rows live as long as the subscription to the events (each renewal), and no longer once it stops.
+    await vi.waitFor(() => expect(written).toContain('alive 120'))
+    await p.close()
+    expect(written.at(-1)).toBe('release')
     // Without the events, nobody would hear whom to wake: nobody can be (OpenSIPS would hold calls for nothing).
     const deaf = new OpensipsProvider({ websocketUrl: 'wss://sip.example.test', domain: 'sip.example.test', sipSecretFor: async () => 's', pushTargets })
     expect((await deaf.getCapabilities()).push).toBe(false)
     await deaf.setWakeable([{ extension: '102', userId: 'jean' }])
     expect(written.at(-1)).toBe('set ')
+    await deaf.setWakeableOne({ extension: '103', userId: 'bob' }, true)
+    expect(written.at(-1)).toBe('one 103=bob false')
     // Without the table, nothing to write.
     expect((await make().getCapabilities()).push).toBe(false)
     await make().setWakeable([{ extension: '102', userId: 'jean' }])

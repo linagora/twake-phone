@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { calledFor, disablePush, enablePush, forgetPushAtSignOut, pushStatus, resyncPush, type PushBrowser, type PushGateway } from './push.js'
+import { answerRingQueries, calledFor, disablePush, enablePush, forgetPushAtSignOut, pushStatus, resyncPush, ringsHere, type PushBrowser, type PushGateway } from './push.js'
 
 const KEY = Buffer.concat([Buffer.from([4]), Buffer.alloc(64, 9)]).toString('base64url')
 const OTHER_KEY = Buffer.concat([Buffer.from([4]), Buffer.alloc(64, 8)]).toString('base64url')
@@ -115,8 +115,57 @@ describe('notifications of calls (push.ts)', () => {
     await enablePush(g.gateway, b.browser, 'jean')
     await resyncPush(g.gateway, b.browser, 'jean')
     expect(g.log).toEqual(['add https://push.example.test/1 p/a', 'add https://push.example.test/1 p/a'])
+    expect(b.log).toEqual(['ask', 'subscribe true KEY'])
+  })
+
+  it('stops, at its push service, a subscription someone else left on this browser (their sign-out never reached it)', async () => {
+    const b = fakeBrowser()
+    const g = fakeGateway()
+    await enablePush(g.gateway, b.browser, 'jean')
+    // Paul signs in on the same browser: Jean's calls stop here, Paul gets none of them.
     await resyncPush(g.gateway, b.browser, 'paul')
-    expect(g.log).toHaveLength(2)
+    expect(b.log.at(-1)).toBe('unsubscribe https://push.example.test/1')
+    expect(g.log).toEqual(['add https://push.example.test/1 p/a'])
+    expect(await pushStatus(g.gateway, b.browser, 'paul')).toBe('off')
+    expect(await pushStatus(g.gateway, b.browser, 'jean')).toBe('off')
+    // A subscription nobody here is known to have made goes too.
+    const unknown = fakeBrowser({ permission: 'granted', existing: { key: KEY, endpoint: 'https://push.example.test/unknown' } })
+    await resyncPush(g.gateway, unknown.browser, 'paul')
+    expect(unknown.log).toEqual(['unsubscribe https://push.example.test/unknown'])
+  })
+
+  it('makes the subscription anew when the Gateway\'s key changed (its pushes would be refused), and says it is off until then', async () => {
+    const b = fakeBrowser()
+    const g = fakeGateway()
+    await enablePush(g.gateway, b.browser, 'jean')
+    // The Gateway now signs with another key (VAPID keys set afterwards, a database restored without them).
+    const changed = { ...g.gateway, getPushSubscriptions: async () => ({ available: true, publicKey: OTHER_KEY, subscriptions: 1 }) }
+    expect(await pushStatus(changed, b.browser, 'jean')).toBe('off')
+    await resyncPush(changed, b.browser, 'jean')
+    expect(b.log.slice(2)).toEqual(['unsubscribe https://push.example.test/1', `subscribe true ${OTHER_KEY}`])
+    expect(g.log.slice(1)).toEqual(['remove https://push.example.test/1', 'add https://push.example.test/2 p/a'])
+    expect(await pushStatus(changed, b.browser, 'jean')).toBe('on')
+  })
+
+  it('answers the service worker for a window on screen whose softphone rings the call, not otherwise', () => {
+    expect(ringsHere('registered', 'visible')).toBe(true)
+    expect(ringsHere('connecting', 'visible')).toBe(true)
+    expect(ringsHere('registered', 'hidden')).toBe(false)
+    expect(ringsHere('failed', 'visible')).toBe(false)
+    expect(ringsHere('off', 'visible')).toBe(false)
+    let listener: ((e: MessageEvent) => void) | undefined
+    const container = { addEventListener: (_: string, l: EventListener) => void (listener = l as never), removeEventListener: () => void (listener = undefined) }
+    let here = true
+    const stop = answerRingQueries(container as never, () => here)
+    const answers: unknown[] = []
+    const ask = (data: unknown) => listener?.({ data, ports: [{ postMessage: (m: unknown) => void answers.push(m) }] } as never)
+    ask({ type: 'twakephone.ring', callId: 'c1' })
+    ask({ type: 'other' })
+    here = false
+    ask({ type: 'twakephone.ring', callId: 'c2' })
+    expect(answers).toEqual([{ type: 'twakephone.here' }])
+    stop()
+    expect(listener).toBeUndefined()
   })
 
   it('reads the call a notification opened the app on', () => {
