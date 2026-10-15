@@ -63,6 +63,23 @@ describe('storedOpensipsFactory', () => {
     await expect(provider.getSession!({ id: 'x', tenantId: 't', displayName: 'X', extension: '999' }, browser)).rejects.toMatchObject({ statusCode: 404 })
   })
 
+  it('refuses a second tenant on the OpenSIPS database of another (call_rules is keyed by extension alone)', async () => {
+    const versions = { rows: [{ table_name: 'subscriber', table_version: 8 }, { table_name: 'acc', table_version: 7 }, { table_name: 'missed_calls', table_version: 5 }] }
+    const provisioner = new SubscriberProvisioner({ pool: { query: async (text: string) => (/SELECT table_name, table_version/.test(text) ? versions : { rows: [] }) }, realm: 'sip.test' })
+    const env = { A_DB: 'postgres://gw:one@db.example.test/opensips', B_DB: 'postgres://other:two@DB.example.test:5432/opensips', C_DB: 'postgres://gw:one@db.example.test/opensips_c' }
+    const factory = storedOpensipsFactory({ store: new MemoryStore(), key, env, provisionerFor: () => provisioner })
+    const config = (ref: string) => ({ websocketUrl: 'wss://sip.test/ws', domain: 'sip.test', subscriberDbUrlRef: ref })
+    const a = factory.create(config('env:A_DB'), { tenantId: 'a', site: 'default' })
+    // The same database under other credentials and spelling is still the same one.
+    expect(() => factory.create(config('env:B_DB'), { tenantId: 'b', site: 'default' })).toThrow(/already serves tenant a/)
+    // Its own database, or the same tenant again (a provider recreated), is fine.
+    factory.create(config('env:C_DB'), { tenantId: 'c', site: 'default' })
+    factory.create(config('env:A_DB'), { tenantId: 'a', site: 'default' })
+    // Once a's provider is closed, its database is free.
+    await a.close()
+    expect(() => factory.create(config('env:B_DB'), { tenantId: 'b', site: 'default' })).not.toThrow()
+  })
+
   it('refuses to start without the secrets key', () => {
     const factory = storedOpensipsFactory({ store: new MemoryStore(), env: { OPENSIPS_DB_URL: 'postgres://x' } })
     expect(() => factory.create({ websocketUrl: 'wss://sip.test/ws', domain: 'sip.test', subscriberDbUrlRef: 'env:OPENSIPS_DB_URL' })).toThrow(/SECRETS_KEY/)

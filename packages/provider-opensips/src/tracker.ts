@@ -225,10 +225,11 @@ export class CallTracker {
       case 'E_TWAKEPHONE_DND': {
         // Refused for `callee`, who does not want to be disturbed (and has nowhere to forward to): the missed call
         // event that follows ends it, as a missed call for them. `told` "0": the caller did not call them (a forward
-        // led there) and was not told why.
+        // led there) and was not told why. The refusal may be the dialled extension's after its forward rang
+        // someone else (`code`: how it ended there), who is left with a missed (or declined) call.
         const call = this.find(p, now)
         if (!call) return
-        this.moveTo(call, userOf(str(p.callee)), 0, now)
+        this.moveTo(call, userOf(str(p.callee)), Number(p.code) || 0, now)
         call.dnd = { told: str(p.told) !== '0' }
         break
       }

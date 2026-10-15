@@ -10,13 +10,14 @@ import type { Queryable } from './subscriber.js'
  * database's clock: OpenSIPS compares it with `now()` itself, so it ends at its date even if the Gateway is down.
  * The rules are a person's, not an extension's: `holder` is who held the extension when they were written, each
  * `*_holder` who held the target, and `tenant_id` whose extensions these are. OpenSIPS reads none of them: the
- * Gateway drops a row, or a forward, as soon as that holder changes (`CallRules.reconcile`).
+ * Gateway drops a row, or a forward, as soon as that holder changes (`CallRules.reconcile`). A row from before those
+ * columns (`tenant_id` empty: SubscriberProvisioner.ensureSchema adds them) is nobody's: the first reconcile drops it.
  */
 export const CALL_RULES_SCHEMA = `
 CREATE TABLE IF NOT EXISTS call_rules (
     extension VARCHAR(64) PRIMARY KEY NOT NULL,
-    tenant_id TEXT NOT NULL,
-    holder TEXT NOT NULL,
+    tenant_id TEXT DEFAULT '' NOT NULL,
+    holder TEXT DEFAULT '' NOT NULL,
     forward_always VARCHAR(64),
     forward_always_holder TEXT,
     forward_busy VARCHAR(64),
@@ -170,7 +171,8 @@ export class CallRules {
     const extensions = holders.map(h => h.extension)
     const users = holders.map(h => h.userId)
     const held = (column: string, holderColumn: string) => `EXISTS (SELECT 1 FROM unnest($2::text[], $3::text[]) AS m(extension, holder) WHERE m.extension = call_rules.${column} AND m.holder = call_rules.${holderColumn})`
-    await this.query(`DELETE FROM call_rules WHERE tenant_id = $1 AND NOT ${held('extension', 'holder')}`, [this.tenantId, extensions, users])
+    // A row of no tenant was written before the holders were (an older schema): nobody's rules any more.
+    await this.query(`DELETE FROM call_rules WHERE (tenant_id = $1 AND NOT ${held('extension', 'holder')}) OR tenant_id = ''`, [this.tenantId, extensions, users])
     for (const column of FORWARDS) {
       await this.query(
         `UPDATE call_rules SET ${column} = NULL, ${column}_holder = NULL, updated_at = now() WHERE tenant_id = $1 AND ${column} IS NOT NULL AND NOT ${held(column, `${column}_holder`)}`,
@@ -182,6 +184,6 @@ export class CallRules {
 
   /** A row that says nothing any more is removed: OpenSIPS finds no rule, as for an extension that never had one. */
   private async prune(extension: string) {
-    await this.query('DELETE FROM call_rules WHERE extension = $1 AND NOT dnd AND forward_always IS NULL AND forward_busy IS NULL AND forward_noanswer IS NULL', [extension])
+    await this.query('DELETE FROM call_rules WHERE extension = $1 AND tenant_id = $2 AND NOT dnd AND forward_always IS NULL AND forward_busy IS NULL AND forward_noanswer IS NULL', [extension, this.tenantId])
   }
 }

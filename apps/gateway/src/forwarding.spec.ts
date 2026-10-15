@@ -89,13 +89,13 @@ describe('/me/presence and /me/forwarding', () => {
     const factory: ProviderFactory<unknown> = { type: 'recording', create: () => provider as unknown as TelephonyProvider }
     return { factory, restored, presences, forwards, log, failNextRestores: (n: number) => void (failRestore = n), hold: (p: Promise<void> | undefined) => void (gate = p) }
   }
-  const setup = async (store = new MemoryStore(), rec = recording(), directorySync?: DirectorySync) => {
+  const setup = async (store = new MemoryStore(), rec = recording(), directorySync?: DirectorySync, turnMaxMs?: number) => {
     process.env.AUTH_MODE = 'dev'
     await store.upsertMapping({ tenantId: 'A', userId: 'alice', extension: '101' })
     await store.upsertMapping({ tenantId: 'A', userId: 'bob', extension: '102' })
     await store.upsertMapping({ tenantId: 'B', userId: 'carol', extension: '103' })
     const registry = new ProviderRegistry([{ tenantId: 'A', type: 'recording', config: {} }], [rec.factory])
-    const app = await buildApp(registry, { store, bus: new EventBus(), directory: new StoreDirectory(store), tickets: new TicketStore(), ...(directorySync ? { directorySync } : {}) })
+    const app = await buildApp(registry, { store, bus: new EventBus(), directory: new StoreDirectory(store), tickets: new TicketStore(), ...(directorySync ? { directorySync } : {}), ...(turnMaxMs ? { turnMaxMs } : {}) })
     registry.startAll()
     const as = (user: string, tenant = 'A') => ({ 'x-dev-user': user, 'x-dev-tenant': tenant })
     return { app, as, store, rec }
@@ -181,6 +181,62 @@ describe('/me/presence and /me/forwarding', () => {
     release()
     expect((await put).statusCode).toBe(200)
     expect(rec.log).toEqual(['holders 101=alice,102=bob', 'restore ', 'set 101 dnd'])
+    await app.close()
+  })
+
+  it('lets a change go once the one before it took too long (a provider whose database hangs)', async () => {
+    const rec = recording()
+    // The restore never ends.
+    rec.hold(new Promise<void>(() => undefined))
+    const { app, as } = await setup(new MemoryStore(), rec, undefined, 100)
+    await until('the restore to start', () => rec.log.length === 1)
+    const started = Date.now()
+    const res = await app.inject({ method: 'PUT', url: '/api/v1/me/presence', headers: as('alice'), payload: { status: 'away' } })
+    expect(res.statusCode).toBe(200)
+    expect(Date.now() - started).toBeLessThan(1_000)
+    expect(rec.presences.get('101')).toMatchObject({ status: 'away' })
+    await app.close()
+  })
+
+  it('refuses a change for an extension that changed holder while it waited, rather than give the new holder those rules', async () => {
+    const rec = recording()
+    let release!: () => void
+    rec.hold(new Promise<void>(resolve => (release = resolve)))
+    const { app, as, store } = await setup(new MemoryStore(), rec)
+    await until('the restore to start', () => rec.log.length === 1)
+    // Resolved as 101's holder, then the synchronisation gives Alice 105 before her turn comes.
+    const forward = app.inject({ method: 'PUT', url: '/api/v1/me/forwarding', headers: as('alice'), payload: { busy: '102' } })
+    const presence = app.inject({ method: 'PUT', url: '/api/v1/me/presence', headers: as('alice'), payload: { status: 'dnd' } })
+    await new Promise(r => setTimeout(r, 50))
+    await store.upsertMapping({ tenantId: 'A', userId: 'alice', extension: '105' })
+    release()
+    expect((await forward).statusCode).toBe(409)
+    expect((await presence).statusCode).toBe(409)
+    expect(rec.forwards.has('101')).toBe(false)
+    expect(rec.presences.has('101')).toBe(false)
+    // Asked again, it applies to her extension of now.
+    expect((await app.inject({ method: 'PUT', url: '/api/v1/me/forwarding', headers: as('alice'), payload: { busy: '102' } })).statusCode).toBe(200)
+    expect(rec.forwards.get('105')).toEqual({ busy: '102' })
+    await app.close()
+  })
+
+  it('keeps one restore per tenant: a change heard while one waits to be tried again joins it, with the mappings of then', async () => {
+    const store = new MemoryStore()
+    await store.setUserPresence({ tenantId: 'A', userId: 'bob', status: 'dnd', since: '2026-10-15T08:00:00.000Z' })
+    const people = [{ id: 'alice', displayName: 'alice', numbers: [{ type: 'extension' as const, number: '101' }] }]
+    const directory = { listAll: async () => people } as unknown as ContactDirectory
+    const sync = new DirectorySync({ store, directory, tenantId: 'A' })
+    const rec = recording()
+    rec.failNextRestores(1)
+    const { app } = await setup(store, rec, sync)
+    await until('the first attempt', () => rec.log.length === 1)
+    // While it waits a second to try again, Bob moves to 105, twice told.
+    people.push({ id: 'bob', displayName: 'bob', numbers: [{ type: 'extension' as const, number: '105' }] })
+    await sync.run()
+    await sync.run()
+    await until('the restore', () => rec.restored.length === 1, 4_000)
+    await new Promise(r => setTimeout(r, 300))
+    expect(rec.log).toEqual(['holders 101=alice,102=bob', 'holders 101=alice,105=bob', 'restore 105=dnd'])
     await app.close()
   })
 

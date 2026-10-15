@@ -34,6 +34,8 @@ const PRESENCE_MAX_MS = 366 * 86_400_000
 const NOANSWER_DELAY = { min: 5, max: 120, default: 20 }
 /** Waits between two attempts at handing a provider the presences kept in the store (its database may be late). */
 const RESTORE_RETRY_MS = [1_000, 5_000, 15_000, 30_000]
+/** Longest wait of a change for the one before it (a provider whose database hangs): the next one then goes. */
+const TURN_MAX_MS = 10_000
 /** One line of text: no control character (a message for callers ends up in a SIP header). */
 const CONTROL = /[\u0000-\u001f\u007f]/
 
@@ -53,6 +55,8 @@ export interface BuildOptions {
   store?: Store
   /** How long a history write may take before the event goes on without it. Default 5 s. */
   historyWriteTimeoutMs?: number
+  /** How long a change to a provider's presences or forwards waits for the one before it, at most. Default 10 s. */
+  turnMaxMs?: number
   directory?: UserDirectory
   /** The people one can look up and call. Absent when no directory is configured: the endpoints answer 501. */
   contacts?: ContactDirectory
@@ -194,6 +198,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
   const admin = options.admin ?? adminPolicyFromEnv(process.env)
   const tickets = options.tickets ?? new TicketStore()
   const historyWriteMs = options.historyWriteTimeoutMs ?? HISTORY_WRITE_MS
+  const turnMaxMs = options.turnMaxMs ?? TURN_MAX_MS
   let directory = options.directory
   if (!directory) {
     // Dev convenience: a bare in-memory gateway maps users from DEV_USER_MAP.
@@ -282,10 +287,17 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
     bus.publish(tenantId, userId, event)
   }
   // One change at a time per tenant to what its provider keeps for each person (presences, forwards): a restore
-  // hands the store's state whole, and a choice written while it runs would be undone by it. The others wait.
+  // hands the store's state whole, and a choice written while it runs would be undone by it. The others wait, for
+  // turnMaxMs at most: a provider whose database hangs (its queries have their own bound) holds nobody for good.
   const turns = new Map<string, Promise<unknown>>()
   const inTurn = <T>(tenantId: string, run: () => Promise<T>): Promise<T> => {
-    const next = (turns.get(tenantId) ?? Promise.resolve()).then(run)
+    const previous = turns.get(tenantId)
+    let waited: Promise<unknown> = Promise.resolve()
+    if (previous) {
+      let timer: ReturnType<typeof setTimeout> | undefined
+      waited = Promise.race([previous, new Promise(resolve => (timer = setTimeout(resolve, turnMaxMs)))]).finally(() => clearTimeout(timer))
+    }
+    const next = waited.then(run)
     const settled = next.catch(() => undefined)
     turns.set(tenantId, settled)
     void settled.then(() => {
@@ -296,23 +308,44 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
   // What each person chose (absent, "do not disturb" until a date) is the store's: handed to the provider when it
   // starts, and again once the mappings changed, so that a restart forgets nothing and nobody inherits someone
   // else's choice, or rules, with their extension (who holds which extension goes first: syncExtensions).
+  // One restore at a time per tenant, retried until it holds: a change heard while one runs (or waits to retry) asks
+  // it for one more round, with the mappings as they are then.
   let closing = false
-  const restorePresences = async (tenantId: string, provider: TelephonyProvider, attempt = 0): Promise<void> => {
+  const restoring = new Map<string, { again: boolean }>()
+  const restoreOnce = (tenantId: string, provider: TelephonyProvider) =>
+    inTurn(tenantId, async () => {
+      if (provider.syncExtensions) await provider.syncExtensions((await store.listMappings(tenantId)).map(m => ({ extension: m.extension, userId: m.userId })))
+      const entries = await Promise.all(
+        (await store.listUserPresences(tenantId)).map(async r => ({ user: await dir.forUser(tenantId, r.userId), presence: presenceOfRecord(r) }))
+      )
+      if (provider.restorePresences) await provider.restorePresences(entries)
+      else for (const e of entries) await provider.setPresence(e.user, e.presence)
+    })
+  const restorePresences = async (tenantId: string, provider: TelephonyProvider): Promise<void> => {
+    const running = restoring.get(tenantId)
+    if (running) {
+      running.again = true
+      return
+    }
+    const state = { again: true }
+    restoring.set(tenantId, state)
+    let attempt = 0
     try {
-      await inTurn(tenantId, async () => {
-        if (provider.syncExtensions) await provider.syncExtensions((await store.listMappings(tenantId)).map(m => ({ extension: m.extension, userId: m.userId })))
-        const entries = await Promise.all(
-          (await store.listUserPresences(tenantId)).map(async r => ({ user: await dir.forUser(tenantId, r.userId), presence: presenceOfRecord(r) }))
-        )
-        if (provider.restorePresences) await provider.restorePresences(entries)
-        else for (const e of entries) await provider.setPresence(e.user, e.presence)
-      })
-    } catch (err) {
-      if (closing) return
-      const delay = RESTORE_RETRY_MS[Math.min(attempt, RESTORE_RETRY_MS.length - 1)]!
-      app.log.error({ err, tenantId }, `chosen presences not handed to the provider, retrying in ${delay / 1000} s`)
-      await new Promise(resolve => setTimeout(resolve, delay).unref())
-      if (!closing) return restorePresences(tenantId, provider, attempt + 1)
+      while (state.again && !closing) {
+        state.again = false
+        try {
+          await restoreOnce(tenantId, provider)
+          attempt = 0
+        } catch (err) {
+          if (closing) return
+          state.again = true
+          const delay = RESTORE_RETRY_MS[Math.min(attempt++, RESTORE_RETRY_MS.length - 1)]!
+          app.log.error({ err, tenantId }, `chosen presences not handed to the provider, retrying in ${delay / 1000} s`)
+          await new Promise(resolve => setTimeout(resolve, delay).unref())
+        }
+      }
+    } finally {
+      restoring.delete(tenantId)
     }
   }
   const started = new Map<string, TelephonyProvider>()
@@ -363,6 +396,13 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         const user = await whoIs(req)
         return { user, provider: registry.forTenant(user.tenantId) }
       }
+      // In a turn, before a change for `user`: the extension resolved with the request is still theirs. A
+      // synchronisation that gave it to someone else in between ran its restore first: writing now would give the
+      // new holder the old one's rules.
+      const stillHolds = async (user: User) => {
+        const now = await dir.forUser(user.tenantId, user.id)
+        if (now.extension !== user.extension) throw Object.assign(new Error('The extension of this user changed, try again'), { statusCode: 409 })
+      }
 
       // features tells the app what this platform offers, so it never has to probe an endpoint to find out.
       v1.get('/me', async req => {
@@ -402,6 +442,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         const { user, provider } = await who(req)
         const { status, until, message } = parsePresence(req.body)
         await inTurn(user.tenantId, async () => {
+          await stillHolds(user)
           const since = new Date().toISOString()
           await provider.setPresence(user, { status, source: 'user', since, ...(until ? { until } : {}), ...(message ? { message } : {}) })
           if (status === 'available') await store.deleteUserPresence(user.tenantId, user.id)
@@ -428,7 +469,10 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         const { user, provider } = await who(req)
         const forwarding = forwardingOf(provider)
         const rules = await parseForwarding(req.body, withExtension(user), async target => !!(await store.getMappingByExtension(user.tenantId, target)))
-        await inTurn(user.tenantId, () => forwarding.set(user, rules))
+        await inTurn(user.tenantId, async () => {
+          await stillHolds(user)
+          await forwarding.set(user, rules)
+        })
         return forwarding.get(user)
       })
 

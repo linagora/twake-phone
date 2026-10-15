@@ -27,7 +27,12 @@ set -eu
 case "$RULES_QUERY_TIMEOUT_MS" in
   '' | *[!0-9]*) echo "RULES_QUERY_TIMEOUT_MS must be a number of milliseconds" >&2; exit 1 ;;
 esac
-case "$OPENSIPS_DB_URL" in
+# The parameters of the URL follow the host: a "?" in the password (OpenSIPS ends it at the "@") is not one.
+case "${OPENSIPS_DB_URL##*@}" in
+  *\?options=* | *\&options=*)
+    # Its own server options: kept as they are (a second options= would replace them), so they must bound the reads.
+    OPENSIPS_RULES_DB_URL="$OPENSIPS_DB_URL"
+    echo "OPENSIPS_DB_URL sets options: RULES_QUERY_TIMEOUT_MS is not applied, add -cstatement_timeout to them" >&2 ;;
   *\?*) OPENSIPS_RULES_DB_URL="${OPENSIPS_DB_URL}&options=-cstatement_timeout=${RULES_QUERY_TIMEOUT_MS}" ;;
   *) OPENSIPS_RULES_DB_URL="${OPENSIPS_DB_URL}?options=-cstatement_timeout=${RULES_QUERY_TIMEOUT_MS}" ;;
 esac

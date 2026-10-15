@@ -476,6 +476,37 @@ try {
     const missed = await db.query("SELECT caller, callee, sip_code FROM missed_calls WHERE sip_code = '487' AND id > $1", [since.missed_calls])
     expectEqual(missed.rows.map(r => `${r.caller}>${r.callee}`), ['101>102'], 'cancelled call in missed_calls')
   })
+  await step('Alice gives up while OpenSIPS still reads the rules of 102 (a slow database): 487, a missed call for Jean, nobody left in a call', async () => {
+    const missedFrom = await lastId('missed_calls')
+    // call_rules locked: OpenSIPS's read of Jean's rules waits (up to its statement_timeout, 1 s) while Alice hangs up.
+    const locker = new pg.Client({ connectionString: OPENSIPS_DB_URL })
+    await locker.connect()
+    try {
+      await locker.query('BEGIN')
+      await locker.query('LOCK TABLE call_rules IN ACCESS EXCLUSIVE MODE')
+      const before = await lastEnded(alice.page)
+      await dial(alice.page, '102')
+      // Hung up once OpenSIPS waits on the lock: the INVITE is there (a click before it leaves the browser sends nothing).
+      await until("OpenSIPS's read of the rules to wait on the lock", async () => {
+        const { rows } = await locker.query("SELECT count(*)::int AS n FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE '%FROM call_rules WHERE extension = ''102''%'")
+        return rows[0].n > 0
+      }, { timeout: 5_000, every: 20 })
+      await alice.page.getByRole('button', { name: 'Raccrocher' }).click()
+      await until('the cancelled call to end', async () => {
+        const e = await lastEnded(alice.page)
+        return e && e.id !== before?.id ? e : null
+      })
+    } finally {
+      await locker.query('ROLLBACK').catch(() => undefined)
+      await locker.end()
+    }
+    // Long enough for a call to be told after the read (the bug: a call told, then never ended, Alice busy for hours).
+    await sleep(2_000)
+    expectEqual(await jean.page.getByTestId('incoming-call').count(), 0, 'incoming calls on Jean side')
+    await until('the missed call in missed_calls', async () => ((await missedSince(missedFrom)).length ? true : null))
+    expectEqual(await missedSince(missedFrom), ['101>102 487'], 'missed_calls rows of the call given up during the read')
+    await presenceIs(jean.page, 'Martin', '101', 'Disponible', PRESENCE_MS)
+  })
   await step('Alice chooses a microphone and outputs in the settings: the next call uses them, the ringtone can be tested', async () => {
     await alice.page.getByRole('link', { name: 'Réglages' }).click()
     await alice.page.getByRole('heading', { level: 2, name: 'Audio' }).waitFor()
@@ -829,10 +860,10 @@ try {
     await ringing.getByText('Appel entrant de Alice Martin (101)').waitFor({ timeout: 20_000 })
     expectEqual(await jean.page.getByTestId('incoming-call').count(), 0, 'incoming calls on Jean side')
     await ringing.getByRole('button', { name: 'Refuser' }).click()
-    await alice.page.getByText("102 a refusé l'appel.").waitFor()
-    // Bob declined it: his refusal in missed_calls, not Jean's.
-    await until('the declined call in missed_calls', async () => ((await missedSince(missedFrom)).length ? true : null))
-    expectEqual(await missedSince(missedFrom), ['101>103 603'], 'missed_calls rows')
+    // Bob declined it, Jean did not: Alice hears Jean's "do not disturb", with his message; the missed call is Jean's.
+    await alice.page.getByText("102 ne souhaite pas être dérangé : « En réunion jusqu'à 16 h »").waitFor()
+    await until('the refused call in missed_calls', async () => ((await missedSince(missedFrom)).length ? true : null))
+    expectEqual(await missedSince(missedFrom), ['101>102 480'], 'missed_calls rows')
   })
   await step('without a forward, his "do not disturb" refuses the call and Alice reads his message; a missed call for Jean', async () => {
     await setForwarding(jean, {})
@@ -864,14 +895,16 @@ try {
   await step('the "do not disturb" ends by itself at its date: the Gateway says so, forgets it, and a call to 102 rings Jean again', async () => {
     // An end a few seconds away (the screen takes minutes): what Jean's app sends.
     const api = await asPerson(jean)
-    const end = new Date(Date.now() + 6_000).toISOString()
-    const res = await api('PUT', '/me/presence', { status: 'dnd', until: end, message: 'Bientôt libre' })
+    const endMs = Date.now() + 8_000
+    const res = await api('PUT', '/me/presence', { status: 'dnd', until: new Date(endMs).toISOString(), message: 'Bientôt libre' })
     expectEqual(res.statusCode, 200, 'PUT /me/presence')
-    await presenceIs(alice.page, 'Dupont', '102', 'Ne pas déranger', PRESENCE_MS)
+    // Called at once (OpenSIPS reads call_rules, written before the answer): a call before the end, however slow the
+    // directory is to show the presence.
     const ended = await dialUntilEnded(alice.page, '102')
     expectEqual(`${ended.endStatus} ${ended.endReason} ${ended.endMessage}`, '480 dnd Bientôt libre', 'how the call before the end ended')
+    if (Date.now() >= endMs) throw new Error('the call before the end of the "do not disturb" ended after it: too slow a machine for this step')
     // Past its end: the Gateway's own timer tells the directory, and its store no longer holds the choice.
-    await presenceIs(alice.page, 'Dupont', '102', 'Disponible', 6_000 + PRESENCE_MS + 2_000)
+    await presenceIs(alice.page, 'Dupont', '102', 'Disponible', endMs - Date.now() + PRESENCE_MS + 2_000)
     expectEqual(await store.getUserPresence(TENANT, 'jdupont'), null, "Jean's choice in the store once over")
     expectEqual((await api('GET', '/me/presence')).json().choice, undefined, 'the choice Jean reads once over')
     await dial(alice.page, '102')
@@ -902,13 +935,32 @@ try {
     await setForwarding(bob, {})
     expectEqual((await db.query('SELECT 1 FROM call_rules')).rows.length, 0, 'call_rules rows once nothing is forwarded')
   })
-  await step('a registration left on a dead connection (the first one, Alice): the caller is told unreachable, not an error', async () => {
+  await step('a registration left on a dead connection (the first one, Alice) with a no-answer forward: Bob rings at once, not after the delay', async () => {
+    await setForwarding(alice, { noAnswer: '103', delay: '20' })
     relay.cutUpstream(0)
     await sleep(500)
+    const missedFrom = await lastId('missed_calls')
+    const dialled = Date.now()
+    await dial(jean.page, '101')
+    const ringing = bob.page.getByTestId('incoming-call')
+    await ringing.getByText('Appel entrant de Jean Dupont (102)').waitFor({ timeout: 20_000 })
+    // Nobody can answer a dead window: a no answer at once, not 20 s of ringing nobody hears.
+    const after = Date.now() - dialled
+    if (after > 10_000) throw new Error(`Bob rang ${after} ms after the call, at once expected`)
+    await ringing.getByRole('button', { name: 'Refuser' }).click()
+    await jean.page.getByText("101 a refusé l'appel.").waitFor()
+    await until('the declined call in missed_calls', async () => ((await missedSince(missedFrom)).length ? true : null))
+    expectEqual(await missedSince(missedFrom), ['102>103 603'], 'missed_calls rows of the forwarded call')
+    await setForwarding(alice, {})
+  })
+  await step('the same dead connection without a forward: the caller is told unreachable, not an error; a missed call for Alice', async () => {
+    const missedFrom = await lastId('missed_calls')
     const ended = await dialUntilEnded(jean.page, '101')
     // 477 "Send failed": OpenSIPS could not reach the contact; the person reads the same as for nobody registered.
     expectEqual(`${ended.endStatus} ${ended.endReason}`, '477 unavailable', 'how the call to a dead contact ended')
     await jean.page.getByText('101 est injoignable.').waitFor()
+    await until('the missed call in missed_calls', async () => ((await missedSince(missedFrom)).length ? true : null))
+    expectEqual(await missedSince(missedFrom), ['102>101 477'], 'missed_calls rows of the call to a dead contact')
   })
   await step('the SIP connections drop: the header says offline, then the softphones come back on their own', async () => {
     const cut = relay.cut()

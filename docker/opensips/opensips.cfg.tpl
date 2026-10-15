@@ -19,6 +19,10 @@ udp_workers=2
 tcp_workers=4
 # A browser's WebSocket stays open as long as its registration (tcp_persistent_flag below).
 tcp_connection_lifetime=3605
+# Each SIP process opens a database connection per asynchronous read in flight (the call rules, below) and keeps it
+# for the next ones: at most 3 per process (6 processes, 18 connections to the database the Gateway uses too). Past
+# that, a read runs synchronously in the process, bounded by RULES_QUERY_TIMEOUT_MS like the others.
+db_max_async_connections=3
 
 auto_aliases=no
 # The SIP domain is "us" on our ports only: on a local stack it is also the browsers' address (127.0.0.1), and a
@@ -108,19 +112,21 @@ loadmodule "rtpengine.so"
 modparam("rtpengine", "rtpengine_sock", "${RTPENGINE_SOCK}")
 
 #### Call rules (step 4b, ADR 0013): forwards and "do not disturb" per extension, written by the Gateway in
-#### `call_rules` (same database as `subscriber`), read at each call. Raw queries, on a user part checked first,
-#### through their own connections: OPENSIPS_RULES_DB_URL is OPENSIPS_DB_URL with a short statement_timeout
-#### (entrypoint.sh), so that a slow database delays a call by that much at most, and never holds a process longer.
+#### `call_rules` (same database as `subscriber`), read at each call, asynchronously (the process serves other
+#### messages meanwhile). Raw queries, on a user part checked first, through their own connections:
+#### OPENSIPS_RULES_DB_URL is OPENSIPS_DB_URL with a short statement_timeout (entrypoint.sh), so that a slow database
+#### delays a call by that much per read at most. Nothing is read in failure_route (see route[ring]).
 loadmodule "sqlops.so"
 modparam("sqlops", "db_url", "${OPENSIPS_RULES_DB_URL}")
 
 #### Accounting: CDRs in the database (the reference history) and the same as events for the Gateway (E_ACC_EVENT at
-#### the answer, E_ACC_CDR at the end of the dialog, E_ACC_MISSED_EVENT for a call that did not go through). Caller
-#### and callee as extra fields: the default ones only carry tags and the Call-ID.
+#### the answer, E_ACC_CDR at the end of the dialog, E_ACC_MISSED_EVENT for a call that did not go through). Caller,
+#### callee (the extension the call reached) and dialled (what the caller dialled) as extra fields: the default ones
+#### only carry tags and the Call-ID.
 loadmodule "acc.so"
 modparam("acc", "db_url", "${OPENSIPS_DB_URL}")
-modparam("acc", "extra_fields", "db: caller; callee")
-modparam("acc", "extra_fields", "evi: caller; callee")
+modparam("acc", "extra_fields", "db: caller; callee; dialled")
+modparam("acc", "extra_fields", "evi: caller; callee; dialled")
 
 #### Routing ###########################################################################################################
 
@@ -272,13 +278,21 @@ route {
 	$avp(domain) = $rd;
 	$acc_extra(caller) = $fU;
 	# acc's `callee` is the extension the call reached (route[forward_to] moves it): the one that rang, answered or
-	# refused, as the Gateway counts it; what the caller dialled is in the events (`dialled`).
+	# refused, as the Gateway counts it; `dialled` is what the caller dialled, as in the events.
 	$acc_extra(callee) = $rU;
+	$acc_extra(dialled) = $rU;
 	# The missed call is accounted once nothing can forward the call any more (route[arm_failure]): acc reports the
 	# first failure only, and a forward on busy or no answer comes after that failure.
 	do_accounting("db|evi", "cdr");
 	$avp(fwd_hops) = 0;
 	$avp(fwd_seen) = "," + $rU + ",";
+
+	# The transaction now, whatever path the call takes: every refusal below is a t_reply (accounted by acc), and a
+	# relay that cannot send returns -6 to route[relay_call] instead of being answered by tm on its own.
+	if (!t_newtran()) {
+		sl_reply_error();
+		exit;
+	}
 
 	if (is_present_hf("Replaces")) {
 		# No rules for it: it must reach the very call it replaces.
@@ -304,24 +318,57 @@ route {
 	exit;
 }
 
-# The call rings the windows found by the lookup ($ru and the branches): media offer, then the relay. The extension it
-# rings is kept in the dialog: an INVITE with Replaces for this call is sent there (route[replaces_target]).
+# The call rings the windows found by the lookup ($ru and the branches). When the extension it rings has a busy or a
+# no-answer forward, the rules those forwards may lead to are read first, asynchronously (route[preload_query]): the
+# failure of this ringing (failure_route) or of its relay (route[relay_call]) then decides from them, without a
+# query. They are those of when the ringing starts: a change made while it rings applies to the next call.
 route[ring] {
+	if ($avp(fwd_hops) < 3 && ($avp(r_busy) != NULL || $avp(r_noanswer) != NULL) && route(preload_query)) {
+		async(sql_query("$var(preload_query)", "$avp(p_ext);$avp(p_always);$avp(p_busy);$avp(p_noanswer);$avp(p_delay);$avp(p_dnd);$avp(p_message);$avp(p_retry)"), ring_loaded);
+	} else {
+		route(ring_now);
+	}
+}
+
+route[ring_loaded] {
+	# 1: rows; -2: none; any other failure (timeout, database down): the forwards' targets go without rules.
+	$var(rules_rc) = $rc;
+	if (t_was_cancelled())
+		route(cancelled);
+	if ($var(rules_rc) < 0 && $var(rules_rc) != -2)
+		xlog("L_WARN", "call $ci: rules of the forwards of $avp(callee) not read ($var(rules_rc)), they go without them\n");
+	route(ring_now);
+	exit;
+}
+
+# Media offer (once per call: a forward after a failure sends the same offer on), then the relay. The extension it
+# rings is kept in the dialog with the one dialled: an INVITE with Replaces for this call is sent there
+# (route[replaces_target]).
+route[ring_now] {
 	$dlg_val(callee) = $avp(callee);
-	if (has_body_part("application/sdp"))
+	$dlg_val(dialled) = $avp(dialled);
+	if ($avp(rtp_on) == NULL && has_body_part("application/sdp"))
 		route(rtp_offer);
 	t_on_reply("rtp");
 	t_on_failure("call_failed");
 	route(arm_failure);
 	# The call starts: told to the Gateway only now, once nothing can refuse it without a transaction: from here on,
-	# acc tells how it ended, save the rare 500 of a relay that fails before any transaction (route[relay]), caught
-	# up like a lost event (ADR 0011).
+	# acc tells how it ended.
 	route(calling);
-	route(relay);
+	route(relay_call);
+}
+
+# The caller cancelled while the rules were read (the transaction exists, so tm accepts its CANCEL, but nothing rang
+# yet): no offer, no call told to the Gateway, a missed call for the extension dialled.
+route[cancelled] {
+	route(account_missed);
+	t_reply(487, "Request Terminated");
+	exit;
 }
 
 # The extension the call named in Replaces reached, from the dialog of that call ($var(replaces_to); empty when this
-# proxy does not know the call: the INVITE then goes to the extension it names, as dialled).
+# proxy does not know the call: the INVITE then goes to the extension it names, as dialled). Only when the INVITE
+# names the extension that call dialled: the extension it reached is not anyone's to ring by naming a Call-ID.
 route[replaces_target] {
 	$var(replaced) = $(hdr(Replaces){s.select,0,;});
 	if ($var(replaced) == NULL || $var(replaced) == "")
@@ -329,7 +376,10 @@ route[replaces_target] {
 	if (!load_dialog_ctx($var(replaced), "callid"))
 		return(-1);
 	$var(reached) = $dlg_val(callee);
+	$var(was_dialled) = $dlg_val(dialled);
 	unload_dialog_ctx();
+	if ($var(was_dialled) == NULL || $var(was_dialled) != $rU)
+		return(-1);
 	if ($var(reached) != NULL && $var(reached) =~ "^[A-Za-z0-9._+-]{1,64}$" && $var(reached) != $fU)
 		$var(replaces_to) = $var(reached);
 	return(1);
@@ -349,12 +399,14 @@ route[calling] {
 # the extension reached rings (or refuses, if it does not want to be disturbed). The Gateway refuses a forward to
 # oneself and checks every target is one of our extensions.
 #
-# The rules of the extension now called ($rU) come from `call_rules`, one query on its primary key: asynchronous in
-# the request route (route[rules_next]: the process serves other messages while PostgreSQL answers), synchronous in
-# failure_route (async is not available there). Both are bounded by the statement_timeout of OPENSIPS_RULES_DB_URL
-# (entrypoint.sh). None when the extension has no row, when the query fails or times out (the call goes on,
-# unforwarded) or for a user part that cannot be one of ours. The "do not disturb" holds while its end is ahead on
-# the database's clock: it lifts at its date by itself.
+# The rules of the extension now called ($rU) come from `call_rules`, one query on its primary key, asynchronous
+# (route[rules_next]: the process serves other messages while PostgreSQL answers). After a failure (failure_route,
+# route[relay_call]), from the rules read before the ringing (route[ring], route[rules_local]): no query there, where
+# async is not available and a synchronous one would hold tm's timer process. Every read is bounded by the
+# statement_timeout of OPENSIPS_RULES_DB_URL (entrypoint.sh). None when the extension has no row, when the query
+# fails or times out (the call goes on, unforwarded) or for a user part that cannot be one of ours. The "do not
+# disturb" holds while its end is ahead on the database's clock: it lifts at its date by itself. A caller may
+# cancel during any read: each resume checks it first (route[cancelled]).
 
 # The query for $rU: only the characters a `subscriber` user name has get there, nothing that could close its quote.
 route[rules_query] {
@@ -382,14 +434,19 @@ route[rules_next] {
 
 route[rules_loaded] {
 	# 1: a row; -2: none; any other failure (timeout, database down): no rules, the call goes on.
-	if ($rc < 0 && $rc != -2)
-		xlog("L_WARN", "call $ci: rules of $rU not read ($rc), the call goes on without them\n");
+	$var(rules_rc) = $rc;
+	if (t_was_cancelled())
+		route(cancelled);
+	if ($var(rules_rc) < 0 && $var(rules_rc) != -2)
+		xlog("L_WARN", "call $ci: rules of $rU not read ($var(rules_rc)), the call goes on without them\n");
 	route(rules_step);
 }
 
 # What the rules just read say, in the request route: another extension (its rules are read in turn), the windows
 # to ring, a refusal (route[dnd_refuse], which ends the script) or nobody to ring.
 route[rules_step] {
+	# Nothing rang yet: a refusal leaves nobody behind (E_TWAKEPHONE_DND's `code`).
+	$var(dnd_code) = 0;
 	# The dialled extension's own "do not disturb": its refusal is the one the caller hears if the chain it forwards
 	# to ends nowhere (route[unreachable]).
 	if ($avp(fwd_hops) == 0 && $avp(d_loaded) == NULL) {
@@ -439,21 +496,60 @@ route[rules_decide] {
 	return(-1);
 }
 
-# failure_route: the same, synchronously, until there are windows to ring (2) or nobody (-1).
-route[rules_sync] {
-	$var(sync_hops) = 0;
-	while ($var(sync_hops) < 4) {
-		$var(sync_hops) = $var(sync_hops) + 1;
-		if (route(rules_query)) {
-			sql_query_one("$var(rules_query)", "$avp(r_always);$avp(r_busy);$avp(r_noanswer);$avp(r_delay);$avp(r_dnd);$avp(r_message);$avp(r_retry)");
-			# -2: no row; any other failure (timeout, database down): no rules, the call goes on.
-			if ($rc < 0 && $rc != -2)
-				xlog("L_WARN", "call $ci: rules of $rU not read ($rc), the call goes on without them\n");
-		}
+# Before ringing $avp(callee): the rules of every extension its busy and no-answer forwards can lead to, three
+# forwards deep (each forward of those, in turn), in one query: one row per extension, in the $avp(p_*) lists, a
+# value for each column of each row (no NULL: the lists stay aligned). The callee's own rules are already read.
+route[preload_query] {
+	$(avp(p_ext)[*]) = NULL;
+	$(avp(p_always)[*]) = NULL;
+	$(avp(p_busy)[*]) = NULL;
+	$(avp(p_noanswer)[*]) = NULL;
+	$(avp(p_delay)[*]) = NULL;
+	$(avp(p_dnd)[*]) = NULL;
+	$(avp(p_message)[*]) = NULL;
+	$(avp(p_retry)[*]) = NULL;
+	if (!($avp(callee) =~ "^[A-Za-z0-9._+-]{1,64}$"))
+		return(-1);
+	$var(preload_query) = "WITH RECURSIVE reach(extension, depth) AS (SELECT f.target, 1 FROM call_rules c, unnest(ARRAY[c.forward_busy, c.forward_noanswer]) AS f(target) WHERE c.extension = '" + $avp(callee) + "' AND f.target IS NOT NULL UNION SELECT f.target, r.depth + 1 FROM reach r JOIN call_rules c ON c.extension = r.extension, unnest(ARRAY[c.forward_always, c.forward_busy, c.forward_noanswer]) AS f(target) WHERE f.target IS NOT NULL AND r.depth < 3) SELECT extension, coalesce(forward_always, ''), coalesce(forward_busy, ''), coalesce(forward_noanswer, ''), noanswer_delay, CASE WHEN dnd AND (dnd_until IS NULL OR dnd_until > now()) THEN 1 ELSE 0 END, regexp_replace(dnd_message, '[[:cntrl:]]', '', 'g'), coalesce(CASE WHEN dnd AND dnd_until > now() THEN ceil(extract(epoch FROM dnd_until - now()))::integer END, 0) FROM call_rules WHERE extension IN (SELECT extension FROM reach)";
+	return(1);
+}
+
+# After a failure: route[rules_decide] on the rules read before the ringing, until there are windows to ring (2) or
+# nobody (-1). An extension the preload did not return has no rules (no row, or the preload failed).
+route[rules_local] {
+	$var(local_hops) = 0;
+	while ($var(local_hops) < 4) {
+		$var(local_hops) = $var(local_hops) + 1;
+		if (route(rules_query))
+			route(rules_preloaded);
 		route(rules_decide);
 		$var(decided) = $rc;
 		if ($var(decided) != 1)
 			return($var(decided));
+	}
+	return(-1);
+}
+
+# The preloaded rules of $rU into $avp(r_*), as route[rules_next] reads them.
+route[rules_preloaded] {
+	$var(i) = 0;
+	while ($(avp(p_ext)[$var(i)]) != NULL) {
+		if ($(avp(p_ext)[$var(i)]) == $rU) {
+			if ($(avp(p_always)[$var(i)]) != "")
+				$avp(r_always) = $(avp(p_always)[$var(i)]);
+			if ($(avp(p_busy)[$var(i)]) != "")
+				$avp(r_busy) = $(avp(p_busy)[$var(i)]);
+			if ($(avp(p_noanswer)[$var(i)]) != "")
+				$avp(r_noanswer) = $(avp(p_noanswer)[$var(i)]);
+			$avp(r_delay) = $(avp(p_delay)[$var(i)]);
+			$avp(r_dnd) = $(avp(p_dnd)[$var(i)]);
+			if ($(avp(p_message)[$var(i)]) != "")
+				$avp(r_message) = $(avp(p_message)[$var(i)]);
+			if ($(avp(p_retry)[$var(i)]) > 0)
+				$avp(r_retry) = $(avp(p_retry)[$var(i)]);
+			return(1);
+		}
+		$var(i) = $var(i) + 1;
 	}
 	return(-1);
 }
@@ -501,7 +597,9 @@ route[forward_to] {
 }
 
 # Before ringing: when a forward can still follow a failure, the ringing lasts the no-answer delay (if that forward
-# is set) and the missed call waits for failure_route; otherwise the missed call is accounted now.
+# is set) and the missed call waits for failure_route; so it does when the call was forwarded from a "do not
+# disturb" (a failure here is answered with it, a missed call for the extension dialled). Otherwise the missed call
+# is accounted now.
 route[arm_failure] {
 	if ($avp(fwd_hops) < 3 && ($avp(r_busy) != NULL || $avp(r_noanswer) != NULL)) {
 		if ($avp(r_noanswer) != NULL)
@@ -510,7 +608,8 @@ route[arm_failure] {
 			$T_fr_inv_timeout = NULL;
 	} else {
 		$T_fr_inv_timeout = NULL;
-		route(account_missed);
+		if ($avp(d_dnd) != 1)
+			route(account_missed);
 	}
 }
 
@@ -584,6 +683,9 @@ route[dnd_reply] {
 		$avp(ev_val) = "1";
 	else
 		$avp(ev_val) = "0";
+	# The status of the extension that rang before (declined, busy, no answer), 0 when none did.
+	$avp(ev_attr) = "code";
+	$avp(ev_val) = $var(dnd_code);
 	raise_event("E_TWAKEPHONE_DND", $avp(ev_attr), $avp(ev_val));
 	if ($var(dnd_told) == 1)
 		t_reply(480, "Do Not Disturb");
@@ -602,11 +704,9 @@ route[forwarded] {
 	raise_event("E_TWAKEPHONE_FORWARDED", $avp(ev_attr), $avp(ev_val));
 }
 
+# In-dialog requests. A contact that cannot be reached: 477 "Send failed" (tm answers it itself when it creates the
+# transaction here, the script otherwise); the 500 is for a relay that fails otherwise before any reply.
 route[relay] {
-	# A registered contact that cannot be reached (window gone without unregistering): 477 "Send failed", that the
-	# softphone renders as "unreachable" (proven by the e2e). tm answers it itself when it creates the transaction
-	# here; once the rules were read (async created it), it is answered from the script. The 500 is for a relay that
-	# fails otherwise before any reply.
 	if (!t_relay()) {
 		if ($rc == -6)
 			t_reply(477, "Send failed");
@@ -615,7 +715,59 @@ route[relay] {
 	}
 }
 
+# The initial INVITE to the windows of $avp(callee), from the request route or failure_route (the transaction exists:
+# tm leaves the reply of a failed relay to us). None of them can be reached (windows gone without unregistering, their
+# WebSocket dead): nobody can answer, a no answer at once, so the no-answer forward is taken; failing that, the dialled
+# extension's "do not disturb" if the call was forwarded from it, else 477 "Send failed", that the softphone renders
+# as "unreachable" (proven by the e2e). The 500 is for a relay that fails otherwise. Either way, a missed call.
+route[relay_call] {
+	# $rc is t_relay's within the if only.
+	$var(relay_rc) = 1;
+	if (!t_relay())
+		$var(relay_rc) = $rc;
+	if ($var(relay_rc) > 0)
+		return(1);
+	xlog("L_NOTICE", "call $ci: relay to $avp(callee) failed ($var(relay_rc))\n");
+	if ($var(relay_rc) == -6)
+		$var(dnd_code) = 477;
+	else
+		$var(dnd_code) = 500;
+	if ($var(relay_rc) == -6 && $avp(r_noanswer) != NULL) {
+		$var(relay_from) = $avp(callee);
+		if (route(forward_to, $avp(r_noanswer))) {
+			$(avp(ringing)[*]) = NULL;
+			$(avp(ring_at)[*]) = NULL;
+			route(rules_local);
+			if ($rc == 2) {
+				$dlg_val(callee) = $avp(callee);
+				route(forwarded, $var(relay_from), "477");
+				t_on_reply("rtp");
+				t_on_failure("call_failed");
+				route(arm_failure);
+				route(relay_call);
+				exit;
+			}
+			$(avp(callee)[*]) = NULL;
+			$avp(callee) = $var(relay_from);
+			$acc_extra(callee) = $var(relay_from);
+		}
+	}
+	if ($avp(d_dnd) == 1 && $avp(callee) != $avp(dialled))
+		route(dnd_refuse_dialled);
+	if ($avp(rtp_on) != NULL)
+		rtpengine_delete();
+	route(account_missed);
+	if ($var(relay_rc) == -6)
+		t_reply(477, "Send failed");
+	else
+		t_reply(500, "Internal Error");
+	exit;
+}
+
 onreply_route[rtp] {
+	# Only this script tells a "do not disturb" (route[dnd_reply]): an UA's own Twake-Dnd headers do not pass, or the
+	# caller would show them as the dialled extension's.
+	remove_hf_glob("Twake-Dnd*");
 	# The callee's Contact: same ".invalid" host, same fix (see above).
 	fix_nated_contact();
 	if (has_body_part("application/sdp"))
@@ -660,6 +812,7 @@ failure_route[call_failed] {
 		route(account_missed);
 		exit;
 	}
+	$var(dnd_code) = $T_reply_code;
 	# The callee's busy forward when a window of theirs is already in a call (486) or they declined (603, 600); the
 	# no-answer one when the ringing lasted its delay (408, our timer) or their window could not be reached. With
 	# several windows, one in a call answers 486 at once while another rings: once the delay is over tm prefers that
@@ -681,7 +834,7 @@ failure_route[call_failed] {
 	if ($var(next) != "" && route(forward_to, $var(next))) {
 		$(avp(ringing)[*]) = NULL;
 		$(avp(ring_at)[*]) = NULL;
-		route(rules_sync);
+		route(rules_local);
 		if ($rc == 2) {
 			# The same offer (rtpengine's, from the request route) goes to the new callee: its answer completes it.
 			$dlg_val(callee) = $avp(callee);
@@ -689,18 +842,19 @@ failure_route[call_failed] {
 			t_on_reply("rtp");
 			t_on_failure("call_failed");
 			route(arm_failure);
-			route(relay);
+			route(relay_call);
 			exit;
 		}
-		# Nobody to ring where the forward led: the dialled extension's "do not disturb" if it has one, else the
-		# failure of the extension that rang (the reply tm picked), for it.
-		if ($avp(d_dnd) == 1)
-			route(dnd_refuse_dialled);
 		$(avp(callee)[*]) = NULL;
 		$avp(callee) = $var(from);
 		$acc_extra(callee) = $var(from);
 	}
-	# Over: the caller gets the best failure, the media session is freed, the missed call accounted.
+	# Nothing follows. The call came here by a forward from an extension that does not want to be disturbed: its
+	# refusal, with its message (whoever it was forwarded to did not answer, or refused: not the dialled one).
+	if ($avp(d_dnd) == 1)
+		route(dnd_refuse_dialled);
+	# Else the caller gets the best failure (the one tm picked, for the extension that rang), the media session is
+	# freed, the missed call accounted.
 	rtpengine_delete();
 	route(account_missed);
 }

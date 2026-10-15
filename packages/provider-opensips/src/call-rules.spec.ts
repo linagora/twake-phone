@@ -41,7 +41,8 @@ describe('CallRules', () => {
     // Another holder's "do not disturb" is not kept with the extension.
     expect(db.queries[0]!.text).toContain('dnd = call_rules.dnd AND call_rules.holder = EXCLUDED.holder')
     expect(db.queries[0]!.values).toEqual(['102', 'A', 'bob', '103', 'carol', null, null, '104', 'dave', 5])
-    expect(db.queries[1]!.text).toMatch(/^DELETE FROM call_rules WHERE extension = \$1 AND NOT dnd/)
+    // Its own row only: another tenant's 102 is not its to remove.
+    expect(db.queries[1]).toMatchObject({ text: expect.stringMatching(/^DELETE FROM call_rules WHERE extension = \$1 AND tenant_id = \$2 AND NOT dnd/), values: ['102', 'A'] })
     await rules.setForwarding('102', { busy: '199' }, 'bob')
     // Nobody holds 199: an empty holder, which no mapping matches.
     expect(db.queries[2]!.values).toEqual(['102', 'A', 'bob', null, null, '199', '', null, null, 20])
@@ -93,8 +94,9 @@ describe('CallRules', () => {
     const db = recorder()
     await new CallRules({ pool: db.pool, tenantId: 'A' }).reconcile([{ extension: '101', userId: 'alice' }, { extension: '102', userId: 'bob' }])
     expect(db.queries).toHaveLength(5)
-    for (const q of db.queries) expect(q.text).toContain('WHERE tenant_id = $1')
-    expect(db.queries[0]).toMatchObject({ text: expect.stringMatching(/^DELETE FROM call_rules WHERE tenant_id = \$1 AND NOT EXISTS .*m\.extension = call_rules\.extension AND m\.holder = call_rules\.holder/), values: ['A', ['101', '102'], ['alice', 'bob']] })
+    for (const q of db.queries) expect(q.text).toContain('tenant_id = $1')
+    // With the rows of no tenant: written before the holders were (an older schema), nobody's any more.
+    expect(db.queries[0]).toMatchObject({ text: expect.stringMatching(/^DELETE FROM call_rules WHERE \(tenant_id = \$1 AND NOT EXISTS .*m\.extension = call_rules\.extension AND m\.holder = call_rules\.holder\)\) OR tenant_id = ''$/), values: ['A', ['101', '102'], ['alice', 'bob']] })
     expect(db.queries.slice(1, 4).map(q => q.text.match(/^UPDATE call_rules SET (\w+) = NULL, (\w+) = NULL/)?.slice(1))).toEqual([
       ['forward_always', 'forward_always_holder'],
       ['forward_busy', 'forward_busy_holder'],

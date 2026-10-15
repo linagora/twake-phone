@@ -134,6 +134,13 @@ describe('CallTracker', () => {
     expect(events).toEqual([])
   })
 
+  it('keeps the number dialled for a forwarded call whose CALLING was lost: the CDR carries it (acc extra `dialled`)', () => {
+    const { tracker, calls } = make()
+    // 101 dialled 102, whose rules took the call to 103, who answered.
+    tracker.handle('E_ACC_CDR', { ...cdr('lostf', '101', '103', 12, 1792002800), dialled: '102' })
+    expect(calls()).toEqual(['101:call.ended:outbound:102:ended', '103:call.ended:inbound:101:ended'])
+  })
+
   it('records the end of a call whose start it never saw once the dialogs read say it is in progress (a Gateway started mid-call)', () => {
     const { tracker, calls, events, clear } = make()
     tracker.seedDialogs([{ callid: 'old', state: 4, caller: '103', callee: '101', startedAt: '2026-10-14T18:33:20.000Z' }])
@@ -413,6 +420,23 @@ describe('CallTracker', () => {
     tracker.handle('E_TWAKEPHONE_DND', { callid: 'd3', caller: '101', callee: '103', dialled: '102', told: '0' })
     tracker.handle('E_ACC_MISSED_EVENT', missed('d3', '101', '103', '480', 1792002802))
     expect(calls()).toEqual(['101:call.created:outbound:102:new', '101:call.failed:outbound:102:failed', '103:call.ended:inbound:101:missed'])
+    // 102 does not want to be disturbed and forwards to 104, who declines: the caller hears 102's refusal (and its
+    // message), 104 keeps the call they declined, 102 the missed one.
+    clear()
+    tracker.handle('E_UL_CONTACT_INSERT', contact('104', 'sip:104@x.invalid'))
+    clear()
+    tracker.handle('E_TWAKEPHONE_CALLING', { callid: 'd4', caller: '101', callee: '104', dialled: '102' })
+    tracker.handle('E_TWAKEPHONE_RINGING', { callid: 'd4', caller: '101', callee: '104', dialled: '102' })
+    tracker.handle('E_TWAKEPHONE_DND', { callid: 'd4', caller: '101', callee: '102', dialled: '102', told: '1', code: '603' })
+    tracker.handle('E_ACC_MISSED_EVENT', missed('d4', '101', '102', '480', 1792002803))
+    expect(calls()).toEqual([
+      '101:call.created:outbound:102:new',
+      '101:call.ringing:outbound:102:ringing',
+      '104:call.ringing:inbound:101:ringing',
+      '104:call.ended:inbound:101:rejected',
+      '101:call.ended:outbound:102:rejected',
+      '102:call.ended:inbound:101:missed'
+    ])
     // Unknown calls are left alone.
     clear()
     tracker.handle('E_TWAKEPHONE_DND', { callid: 'nope' })

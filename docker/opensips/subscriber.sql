@@ -19,8 +19,8 @@ CREATE INDEX IF NOT EXISTS subscriber_username_idx ON subscriber (username);
 INSERT INTO version (table_name, table_version) VALUES ('subscriber', 8)
   ON CONFLICT (table_name) DO NOTHING;
 
--- OpenSIPS acc schema (acc, missed_calls: the CDRs, the reference of the call history), plus the caller and callee
--- as dialled (acc extra fields), which the default columns do not carry.
+-- OpenSIPS acc schema (acc, missed_calls: the CDRs, the reference of the call history), plus the caller, the
+-- extension the call reached (callee) and the one dialled (acc extra fields), which the default columns do not carry.
 CREATE TABLE IF NOT EXISTS acc (
     id SERIAL PRIMARY KEY NOT NULL,
     method VARCHAR(16) DEFAULT '' NOT NULL,
@@ -35,7 +35,8 @@ CREATE TABLE IF NOT EXISTS acc (
     setuptime INTEGER DEFAULT 0 NOT NULL,
     created TIMESTAMP WITHOUT TIME ZONE DEFAULT NULL,
     caller VARCHAR(64) DEFAULT '' NOT NULL,
-    callee VARCHAR(64) DEFAULT '' NOT NULL
+    callee VARCHAR(64) DEFAULT '' NOT NULL,
+    dialled VARCHAR(64) DEFAULT '' NOT NULL
 );
 CREATE INDEX IF NOT EXISTS acc_callid_idx ON acc (callid);
 CREATE TABLE IF NOT EXISTS missed_calls (
@@ -50,7 +51,8 @@ CREATE TABLE IF NOT EXISTS missed_calls (
     setuptime INTEGER DEFAULT 0 NOT NULL,
     created TIMESTAMP WITHOUT TIME ZONE DEFAULT NULL,
     caller VARCHAR(64) DEFAULT '' NOT NULL,
-    callee VARCHAR(64) DEFAULT '' NOT NULL
+    callee VARCHAR(64) DEFAULT '' NOT NULL,
+    dialled VARCHAR(64) DEFAULT '' NOT NULL
 );
 CREATE INDEX IF NOT EXISTS missed_calls_callid_idx ON missed_calls (callid);
 INSERT INTO version (table_name, table_version) VALUES ('acc', 7), ('missed_calls', 5)
@@ -62,8 +64,8 @@ INSERT INTO version (table_name, table_version) VALUES ('acc', 7), ('missed_call
 -- it drops the rules of an extension, or a forward, whose holder changed.
 CREATE TABLE IF NOT EXISTS call_rules (
     extension VARCHAR(64) PRIMARY KEY NOT NULL,
-    tenant_id TEXT NOT NULL,
-    holder TEXT NOT NULL,
+    tenant_id TEXT DEFAULT '' NOT NULL,
+    holder TEXT DEFAULT '' NOT NULL,
     forward_always VARCHAR(64),
     forward_always_holder TEXT,
     forward_busy VARCHAR(64),
@@ -76,9 +78,18 @@ CREATE TABLE IF NOT EXISTS call_rules (
     dnd_message VARCHAR(140) DEFAULT '' NOT NULL,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL
 );
--- Tables created beforehand by OpenSIPS's own scripts lack caller and callee: added here, once, by the owner (the
--- Gateway only adds a missing one, see SubscriberProvisioner.ensureSchema), or every CDR insert would fail.
+-- Tables created beforehand (by OpenSIPS's own scripts, or by an earlier version of this file) lack columns: added
+-- here, once, by the owner (the Gateway only adds a missing one, see SubscriberProvisioner.ensureSchema), or every
+-- CDR insert, or every write of the rules, would fail. An older call_rules row gets an empty tenant: the Gateway's
+-- first reconcile drops it.
 ALTER TABLE acc ADD COLUMN IF NOT EXISTS caller VARCHAR(64) DEFAULT '' NOT NULL;
 ALTER TABLE acc ADD COLUMN IF NOT EXISTS callee VARCHAR(64) DEFAULT '' NOT NULL;
+ALTER TABLE acc ADD COLUMN IF NOT EXISTS dialled VARCHAR(64) DEFAULT '' NOT NULL;
 ALTER TABLE missed_calls ADD COLUMN IF NOT EXISTS caller VARCHAR(64) DEFAULT '' NOT NULL;
 ALTER TABLE missed_calls ADD COLUMN IF NOT EXISTS callee VARCHAR(64) DEFAULT '' NOT NULL;
+ALTER TABLE missed_calls ADD COLUMN IF NOT EXISTS dialled VARCHAR(64) DEFAULT '' NOT NULL;
+ALTER TABLE call_rules ADD COLUMN IF NOT EXISTS tenant_id TEXT DEFAULT '' NOT NULL;
+ALTER TABLE call_rules ADD COLUMN IF NOT EXISTS holder TEXT DEFAULT '' NOT NULL;
+ALTER TABLE call_rules ADD COLUMN IF NOT EXISTS forward_always_holder TEXT;
+ALTER TABLE call_rules ADD COLUMN IF NOT EXISTS forward_busy_holder TEXT;
+ALTER TABLE call_rules ADD COLUMN IF NOT EXISTS forward_noanswer_holder TEXT;

@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs'
 import pg from 'pg'
 import { afterAll, describe, expect, it } from 'vitest'
-import { SUBSCRIBER_SCHEMA, SUBSCRIBER_SQL, SUBSCRIBER_TABLE_VERSION, SubscriberProvisioner, digestHashes } from './subscriber.js'
+import { EXTRA_COLUMNS, SUBSCRIBER_SCHEMA, SUBSCRIBER_SQL, SUBSCRIBER_TABLE_VERSION, SubscriberProvisioner, digestHashes } from './subscriber.js'
 
 describe('SUBSCRIBER_SCHEMA', () => {
   it('is the SQL the Compose stack loads into PostgreSQL at first start (docker/opensips/subscriber.sql)', () => {
@@ -10,14 +10,17 @@ describe('SUBSCRIBER_SCHEMA', () => {
     expect(statements(file)).toBe(statements(SUBSCRIBER_SQL))
   })
 
-  it('adds the caller and callee columns in the file (run once, by the owner), not at each start of the Gateway', () => {
+  it('adds the columns an older table lacks in the file (run once, by the owner), not at each start of the Gateway', () => {
     for (const table of ['acc', 'missed_calls']) {
-      for (const column of ['caller', 'callee']) {
+      for (const column of ['caller', 'callee', 'dialled']) {
         const alter = `ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS ${column} VARCHAR(64) DEFAULT '' NOT NULL;`
         expect(SUBSCRIBER_SQL).toContain(alter)
         expect(SUBSCRIBER_SCHEMA).not.toContain(alter)
       }
     }
+    // call_rules as its first version created it: the tenant and the holders, with a default for the rows it has.
+    for (const alter of ["ALTER TABLE call_rules ADD COLUMN IF NOT EXISTS tenant_id TEXT DEFAULT '' NOT NULL;", "ALTER TABLE call_rules ADD COLUMN IF NOT EXISTS holder TEXT DEFAULT '' NOT NULL;", 'ALTER TABLE call_rules ADD COLUMN IF NOT EXISTS forward_busy_holder TEXT;'])
+      expect(SUBSCRIBER_SQL).toContain(alter)
   })
 })
 
@@ -65,14 +68,14 @@ describe('SubscriberProvisioner', () => {
     return { queries, pool: { query, connect: async () => ({ query, release: () => void released++ }) }, released: () => released }
   }
 
-  it('alters the acc tables only for a column they lack, waiting 2 s at most for the lock, in one transaction', async () => {
-    const all: [string, string][] = [['acc', 'caller'], ['acc', 'callee'], ['missed_calls', 'caller'], ['missed_calls', 'callee']]
+  it('alters a table only for a column it lacks, waiting 2 s at most for the lock, in one transaction', async () => {
+    const all = EXTRA_COLUMNS.map(([table, column]): [string, string] => [table, column])
     const complete = database(all)
     await new SubscriberProvisioner({ pool: complete.pool, realm: 'r' }).ensureSchema()
     expect(complete.queries.filter(q => /ALTER|BEGIN|lock_timeout/.test(q))).toEqual([])
-    const lacking = database(all.slice(0, 3))
+    const lacking = database(all.filter(([table, column]) => !(table === 'missed_calls' && column === 'dialled')))
     await new SubscriberProvisioner({ pool: lacking.pool, realm: 'r' }).ensureSchema()
-    expect(lacking.queries.slice(2, 6)).toEqual(['BEGIN', "SET LOCAL lock_timeout = '2s'", "ALTER TABLE missed_calls ADD COLUMN IF NOT EXISTS callee VARCHAR(64) DEFAULT '' NOT NULL;", 'COMMIT'])
+    expect(lacking.queries.slice(2, 6)).toEqual(['BEGIN', "SET LOCAL lock_timeout = '2s'", "ALTER TABLE missed_calls ADD COLUMN IF NOT EXISTS dialled VARCHAR(64) DEFAULT '' NOT NULL;", 'COMMIT'])
     expect(lacking.released()).toBe(1)
   })
 
@@ -83,7 +86,7 @@ describe('SubscriberProvisioner', () => {
     await p.ensureSchema()
     expect(db.queries).toContain('ROLLBACK')
     expect(db.released()).toBe(1)
-    expect(warnings).toEqual([expect.stringMatching(/could not add acc\.caller, acc\.callee, missed_calls\.caller, missed_calls\.callee \(must be owner of table acc\)/)])
+    expect(warnings).toEqual([expect.stringMatching(/could not add acc\.caller, acc\.callee, acc\.dialled, missed_calls\.caller, .*, call_rules\.forward_noanswer_holder \(must be owner of table acc\)/)])
   })
 
   it('needs a realm and a database', () => {
@@ -117,13 +120,30 @@ if (process.env.TEST_DATABASE_URL) {
       expect((await pool.query('SELECT username FROM subscriber')).rows).toEqual([{ username: '102' }])
     })
 
-    it('adds caller and callee to an acc table OpenSIPS created without them', async () => {
+    it('adds caller, callee and dialled to an acc table OpenSIPS created without them', async () => {
       await pool.query('DROP TABLE IF EXISTS acc; CREATE TABLE acc (id SERIAL PRIMARY KEY NOT NULL, callid VARCHAR(64) DEFAULT \'\' NOT NULL, time TIMESTAMP WITHOUT TIME ZONE NOT NULL)')
       await new SubscriberProvisioner({ pool, realm: 'sip.example.test' }).ensureSchema()
-      const { rows } = await pool.query("SELECT column_name FROM information_schema.columns WHERE table_name = 'acc' AND column_name IN ('caller', 'callee') ORDER BY column_name")
-      expect(rows.map(r => r.column_name)).toEqual(['callee', 'caller'])
+      const { rows } = await pool.query("SELECT column_name FROM information_schema.columns WHERE table_name = 'acc' AND column_name IN ('caller', 'callee', 'dialled') ORDER BY column_name")
+      expect(rows.map(r => r.column_name)).toEqual(['callee', 'caller', 'dialled'])
       // Recreated whole by the next ensureSchema.
       await pool.query('DROP TABLE acc')
+    })
+
+    it('bounds each query it runs on a pool of its own: a locked table fails the write instead of holding it', async () => {
+      const p = new SubscriberProvisioner({ databaseUrl: process.env.TEST_DATABASE_URL, realm: 'sip.example.test', queryTimeoutMs: 300 })
+      await p.ensureSchema()
+      const locker = await pool.connect()
+      try {
+        await locker.query('BEGIN')
+        await locker.query('LOCK TABLE call_rules IN ACCESS EXCLUSIVE MODE')
+        const started = Date.now()
+        await expect(p.callRules({ tenantId: 'T' }).setDnd('101', {}, 'alice')).rejects.toThrow(/statement timeout|Query read timeout/)
+        expect(Date.now() - started).toBeLessThan(2_000)
+      } finally {
+        await locker.query('ROLLBACK')
+        locker.release()
+        await p.close()
+      }
     })
   })
 
@@ -168,6 +188,28 @@ if (process.env.TEST_DATABASE_URL) {
       await rules.clearDndExcept([])
       await rules.setForwarding('104', {}, 'dave')
       expect((await pool.query('SELECT extension FROM call_rules')).rows).toEqual([])
+    })
+
+    it("upgrades a call_rules table of its first version: its rows are nobody's, and the first reconcile drops them", async () => {
+      // The table as the first version of step 4b created it (no tenant, no holders), with a forward OpenSIPS applies.
+      await pool.query(`DROP TABLE IF EXISTS call_rules; CREATE TABLE call_rules (
+        extension VARCHAR(64) PRIMARY KEY NOT NULL, forward_always VARCHAR(64), forward_busy VARCHAR(64), forward_noanswer VARCHAR(64),
+        noanswer_delay INTEGER DEFAULT 20 NOT NULL, dnd BOOLEAN DEFAULT false NOT NULL, dnd_until TIMESTAMP WITH TIME ZONE,
+        dnd_message VARCHAR(140) DEFAULT '' NOT NULL, updated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL)`)
+      await pool.query("INSERT INTO call_rules (extension, forward_always) VALUES ('102', '103')")
+      const p = new SubscriberProvisioner({ pool, realm: 'sip.example.test' })
+      await p.ensureSchema()
+      expect((await pool.query('SELECT extension, tenant_id, holder, forward_always, forward_always_holder FROM call_rules')).rows).toEqual([
+        { extension: '102', tenant_id: '', holder: '', forward_always: '103', forward_always_holder: null }
+      ])
+      const rules = p.callRules({ tenantId: 'A', holderOf: async () => 'carol' })
+      expect(await rules.getForwarding('102')).toEqual({})
+      await rules.reconcile([{ extension: '102', userId: 'jean' }])
+      expect((await pool.query('SELECT extension FROM call_rules')).rows).toEqual([])
+      await rules.setForwarding('102', { busy: '103' }, 'jean')
+      expect(await rules.getForwarding('102')).toEqual({ busy: '103' })
+      await pool.query('DROP TABLE call_rules')
+      await p.ensureSchema()
     })
 
     it('makes the rules follow the person: a new holder inherits nothing, a forward to an extension that changed holder goes', async () => {
