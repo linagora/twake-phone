@@ -81,7 +81,11 @@ export class MemoryStore implements Store {
 
   async deleteHistory(tenantId: string, userId: string) {
     let n = 0
-    for (const [k, e] of this.history) if (e.tenantId === tenantId && e.userId === userId) (this.history.delete(k), n++)
+    for (const [k, e] of this.history) {
+      if (e.tenantId !== tenantId || e.userId !== userId) continue
+      this.history.delete(k)
+      n++
+    }
     return n
   }
 
@@ -143,7 +147,9 @@ export class MemoryStore implements Store {
 
   async setConferencePin(meetingId: string, pin: string | null) {
     const c = this.conferences.get(meetingId)
-    if (c) pin === null ? delete c.pin : (c.pin = pin)
+    if (!c) return
+    if (pin === null) delete c.pin
+    else c.pin = pin
   }
 
   async deleteConference(meetingId: string) {

@@ -137,7 +137,7 @@ describe('WebPush', () => {
 })
 
 describe('/me/push-subscriptions and the calls woken for', () => {
-  const call = (id: string, remoteNumber: string, state: Call['state'] = 'ringing'): Call => ({ id, direction: 'inbound', state, localNumber: '102', remoteNumber, startedAt: new Date().toISOString() })
+  const call = (id: string, remoteNumber: string, state: Call['state'] = 'ringing'): Call => ({ id, direction: 'inbound', state, remoteNumber, startedAt: new Date().toISOString() })
   /** A provider that can hold calls for someone without a window, and hands the Gateway the events it is given. */
   const holding = (push = true, one = false) => {
     const wakeable: string[] = []
@@ -261,7 +261,7 @@ describe('/me/push-subscriptions and the calls woken for', () => {
     rec.emit('102', { type: 'call.wake', timestamp: new Date().toISOString(), payload: { call: call('w1', '101'), waitSec: 30 } })
     const wake = await service.next(browser.id)
     expect(wake.data).toEqual({ type: 'call', callId: 'w1', number: '101', name: 'Alice Martin', until: expect.any(Number) })
-    expect(wake.data.until).toBeGreaterThanOrEqual(sent + 30_000)
+    expect(wake.data?.until).toBeGreaterThanOrEqual(sent + 30_000)
     expect(wake.headers.ttl).toBe('30')
     // The wake is the push's alone: not an event of the app.
     expect(published).toEqual([])
@@ -292,7 +292,7 @@ describe('/me/push-subscriptions and the calls woken for', () => {
     await service.next(browser.id, m => m.data?.callId === 'w4')
     rec.emit('102', { type: 'call.failed', timestamp: new Date().toISOString(), payload: { call: call('w4', '101', 'failed') } })
     expect((await service.next(browser.id, m => m.data?.callId === 'w4')).data).toMatchObject({ type: 'ended', reason: 'over' })
-    expect(service.messages.filter(m => m.id === browser.id).map(m => `${m.data.type}:${m.data.callId}`)).toEqual(['call:w1', 'missed:w1', 'call:w2', 'ended:w2', 'call:w3', 'ended:w3', 'call:w4', 'ended:w4'])
+    expect(service.messages.filter(m => m.id === browser.id).map(m => `${m.data?.type}:${m.data?.callId}`)).toEqual(['call:w1', 'missed:w1', 'call:w2', 'ended:w2', 'call:w3', 'ended:w3', 'call:w4', 'ended:w4'])
     await app.close()
   })
 
@@ -317,7 +317,7 @@ describe('/me/push-subscriptions and the calls woken for', () => {
     rec.emit('102', { type: 'call.wake', timestamp: new Date().toISOString(), payload: { call: call('s3', '101'), waitSec: 30 } })
     await service.next(browser.id, m => m.data?.callId === 's3')
     await new Promise(r => setTimeout(r, 300))
-    expect(service.messages.filter(m => m.id === browser.id).map(m => `${m.data.type}:${m.data.callId}`)).toEqual(['missed:s1', 'call:s3'])
+    expect(service.messages.filter(m => m.id === browser.id).map(m => `${m.data?.type}:${m.data?.callId}`)).toEqual(['missed:s1', 'call:s3'])
     await app.close()
   })
 

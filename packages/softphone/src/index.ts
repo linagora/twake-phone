@@ -170,6 +170,7 @@ export interface SoftphoneOptions {
 
 /** The part of JsSIP's UA the softphone uses (and tests fake). */
 export interface UserAgentLike {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- each event has its own payload, as in JsSIP's own typing
   on(event: string, listener: (...args: any[]) => void): unknown
   start(): void
   stop(): void
@@ -178,8 +179,12 @@ export interface UserAgentLike {
   call(target: string, options?: Record<string, unknown>): RTCSession
 }
 
+/** What `accept` of JsSIP's REFER and Replaces events takes (typed `Function` in its declarations). */
+type AcceptReferred = (initCallback: (session: RTCSession) => void, options?: object) => void
+
 /** What JsSIP's `refer()` returns (typed `void` in its declarations): the subscription to the far end's reports. */
 interface ReferSubscriberLike {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- each event has its own payload, as in JsSIP's own typing
   on(event: string, listener: (...args: any[]) => void): unknown
 }
 
@@ -370,7 +375,7 @@ class WebCall implements SoftCall {
   }
 
   private get pc(): RTCPeerConnection | undefined {
-    return (this.session.connection as unknown as RTCPeerConnection | undefined) ?? undefined
+    return this.session.connection ?? undefined
   }
 
   private attachRemoteAudio(pc: RTCPeerConnection) {
@@ -620,7 +625,7 @@ class WebCall implements SoftCall {
     let packetsReceived = 0
     let packetsSent = 0
     const report = await this.pc?.getStats()
-    report?.forEach(r => {
+    report?.forEach((r: { type?: string; kind?: string; packetsReceived?: number; packetsSent?: number }) => {
       if (r.type === 'inbound-rtp' && r.kind === 'audio') packetsReceived += r.packetsReceived ?? 0
       if (r.type === 'outbound-rtp' && r.kind === 'audio') packetsSent += r.packetsSent ?? 0
     })
@@ -836,7 +841,7 @@ export class Softphone {
       session_timers: false,
       user_agent: 'TwakePhone'
     }
-    const ua = this.options.createUserAgent?.(config) ?? (new UA(config) as unknown as UserAgentLike)
+    const ua = this.options.createUserAgent?.(config) ?? new UA(config)
     this.ua = ua
     // A replaced user agent still emits (its own disconnect, late replies): only the current one speaks.
     const live = () => this.ua === ua
@@ -870,7 +875,7 @@ export class Softphone {
         this.options.onCallChange?.(call)
         void call.setOutput(this.devices.outputId ?? '')
         // After its newRTCSession, JsSIP still sends the 180: the answer comes right after it.
-        setTimeout(() => call.answer().catch(() => undefined), 0)
+        setTimeout(() => void call.answer().catch(() => undefined), 0)
         return
       }
       if (direction === 'inbound' && this.activeCalls().length) {
@@ -934,19 +939,21 @@ export class Softphone {
       return
     }
     const attempt = this.restartAttempt++
-    this.restartTimer = setTimeout(async () => {
+    this.restartTimer = setTimeout(() => {
       this.restartTimer = undefined
       if (this.stopped) return
       if (this.activeCalls().length) {
         this.restartWhenIdle = true
         return
       }
-      try {
-        this.ua?.stop()
-        await this.boot()
-      } catch {
-        this.scheduleRestart()
-      }
+      void (async () => {
+        try {
+          this.ua?.stop()
+          await this.boot()
+        } catch {
+          this.scheduleRestart()
+        }
+      })()
     }, restartDelay(attempt))
   }
 
@@ -1034,13 +1041,14 @@ export class Softphone {
       const referredBy = request.getHeader?.('Referred-By')
       // JsSIP has already said 202: the new call is placed once our microphone is open.
       void this.acquireMicrophone().then(
-        microphone => e.accept((s: RTCSession) => this.calls.get(s.id)?.adopt(microphone), { ...mediaOptions(iceServers, microphone), ...(referredBy ? { extraHeaders: [`Referred-By: ${referredBy}`] } : {}) }),
-        () => e.accept(() => undefined, { ...mediaOptions(iceServers), ...(referredBy ? { extraHeaders: [`Referred-By: ${referredBy}`] } : {}) })
+        microphone => (e.accept as AcceptReferred)((s: RTCSession) => this.calls.get(s.id)?.adopt(microphone), { ...mediaOptions(iceServers, microphone), ...(referredBy ? { extraHeaders: [`Referred-By: ${referredBy}`] } : {}) }),
+        () => (e.accept as AcceptReferred)(() => undefined, { ...mediaOptions(iceServers), ...(referredBy ? { extraHeaders: [`Referred-By: ${referredBy}`] } : {}) })
       )
     })
     // The far end of an attended transfer replaces the person who consulted us (INVITE with Replaces).
     session.on('replaces', (e: ReferEvent) => {
-      e.accept((s: RTCSession) => {
+      const accept = e.accept as AcceptReferred
+      accept((s: RTCSession) => {
         this.replacing = { session: s, replaces: call }
       })
     })

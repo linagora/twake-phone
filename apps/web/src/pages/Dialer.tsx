@@ -26,6 +26,7 @@ export const Dialer = () => {
 
   useEffect(() => {
     let cancelled = false
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- an older message goes as the capabilities are asked again
     setStatus(null)
     client
       .getCapabilities()

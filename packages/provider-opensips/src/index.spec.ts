@@ -417,7 +417,7 @@ describe('AsyncQueue', () => {
 
   it('a provider queue drops the presences before the call events when the Gateway does not keep up', () => {
     const p = new OpensipsProvider({ websocketUrl: 'wss://sip.example.test', domain: 'sip.example.test', sipSecretFor: async () => 's', logger: quiet })
-    const q = p['queue'] as AsyncQueue<RoutedEvent>
+    const q = p['queue']
     expect(q['droppable']({ extension: '101', event: { type: 'presence.changed', timestamp: '', payload: { userId: '', presence: { status: 'busy', source: 'telephony' } } } })).toBe(true)
     expect(q['droppable']({ extension: '101', event: { type: 'call.ended', timestamp: '', payload: { call: { id: 'c', direction: 'inbound', state: 'ended', remoteNumber: '102', startedAt: '' } } } })).toBe(false)
   })

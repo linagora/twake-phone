@@ -141,7 +141,7 @@ describe('conference endpoints with Meet', () => {
       }
     }
     const lkCalls: string[] = []
-    const fetch: Fetch = async (url, init) => {
+    const fetch: Fetch = async url => {
       lkCalls.push(new URL(url).pathname.replace('/twirp/', ''))
       return { ok: true, status: 200, text: async () => JSON.stringify(new URL(url).pathname.endsWith('ListParticipants') ? { participants: [] } : {}) }
     }

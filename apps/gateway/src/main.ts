@@ -66,9 +66,9 @@ const registry = new ProviderRegistry(await store.listProviders(), [storedOpensi
 const conference = env.LIVEKIT_API_KEY && env.LIVEKIT_API_SECRET && env.LIVEKIT_URL
   ? (() => {
       const bridge = new LiveKitConferenceBridge({
-        url: env.LIVEKIT_URL!,
-        apiKey: env.LIVEKIT_API_KEY!,
-        apiSecret: env.LIVEKIT_API_SECRET!,
+        url: env.LIVEKIT_URL,
+        apiKey: env.LIVEKIT_API_KEY,
+        apiSecret: env.LIVEKIT_API_SECRET,
         dialInNumbers: (env.MEET_DIALIN_NUMBERS ?? '8000').split(',').map(e164 => ({ country: env.MEET_DIALIN_COUNTRY ?? 'FR', e164: e164.trim() })),
         outboundAddress: need('MEET_OUTBOUND_ADDRESS'),
         ...(env.MEET_NUMBER_PRIVACY ? { numberPrivacy: env.MEET_NUMBER_PRIVACY as 'show' | 'mask' | 'hide' } : {})
@@ -83,7 +83,7 @@ const conference = env.LIVEKIT_API_KEY && env.LIVEKIT_API_SECRET && env.LIVEKIT_
         })
       }
       prepare()
-      return { bridge: () => bridge, ...(meet ? { meet } : {}), webhookKey: env.LIVEKIT_API_KEY!, webhookSecret: env.LIVEKIT_API_SECRET! }
+      return { bridge: () => bridge, ...(meet ? { meet } : {}), webhookKey: env.LIVEKIT_API_KEY, webhookSecret: env.LIVEKIT_API_SECRET }
     })()
   : undefined
 

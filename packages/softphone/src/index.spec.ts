@@ -298,7 +298,7 @@ describe('Softphone', () => {
   })
 
   it('hands an incoming call to the app ringing, answers it with audio and attaches the remote track', async () => {
-    const { phone, ua, incoming, changes } = await setup()
+    const { ua, incoming, changes } = await setup()
     const s = new FakeSession('incoming')
     ua().emit('newRTCSession', { originator: 'remote', session: s })
     expect(incoming).toHaveLength(1)
@@ -726,25 +726,25 @@ describe('Softphone', () => {
       await phone.setDevices({ microphoneId: 'mic-bt', outputId: 'speaker' })
       expect(media.getUserMedia).toHaveBeenLastCalledWith({ audio: { deviceId: { exact: 'mic-bt' } } })
       expect(pc.sender.replaceTrack).toHaveBeenCalled()
-      expect(pc.sender.track!.getSettings().deviceId).toBe('mic-bt')
+      expect(pc.sender.track.getSettings().deviceId).toBe('mic-bt')
       expect(first.stop).toHaveBeenCalled()
       expect(audios[audios.length - 1]!.sinkId).toBe('speaker')
       // Muted calls stay muted on the new microphone.
       phone.activeCalls()[0]!.setMuted(true)
-      const current = pc.sender.track!
+      const current = pc.sender.track
       current.unplug()
       await new Promise(r => setTimeout(r, 0))
       expect(media.getUserMedia).toHaveBeenCalledTimes(3)
       expect(pc.sender.track).not.toBe(current)
-      expect(pc.sender.track!.enabled).toBe(false)
+      expect(pc.sender.track.enabled).toBe(false)
       expect(current.stop).toHaveBeenCalled()
       expect(phone.audioDevices).toEqual({ microphoneId: 'mic-bt', outputId: 'speaker' })
       // A chosen microphone the browser no longer has: the default one instead of a failed call.
       await phone.setDevices({ microphoneId: 'mic-gone' })
       expect(media.getUserMedia).toHaveBeenLastCalledWith({ audio: true })
-      expect(pc.sender.track!.getSettings().deviceId).toBe('mic-default')
+      expect(pc.sender.track.getSettings().deviceId).toBe('mic-default')
       // The call over, the microphone the softphone opened is let go (JsSIP only stops what it opened itself).
-      const final = pc.sender.track!
+      const final = pc.sender.track
       s.emit('ended', { originator: 'remote', cause: 'Terminated' })
       expect(final.stop).toHaveBeenCalled()
       expect(media.tracks.every(t => t.stop.mock.calls.length > 0)).toBe(true)
@@ -759,7 +759,7 @@ describe('Softphone', () => {
   it('answers with the chosen microphone and stops it with the call', async () => {
     const media = withMediaDevices()
     try {
-      const { phone, ua, incoming } = await setup({ devices: { microphoneId: 'mic-bt' } })
+      const { ua, incoming } = await setup({ devices: { microphoneId: 'mic-bt' } })
       const s = new FakeSession('incoming')
       ua().emit('newRTCSession', { originator: 'remote', session: s })
       await incoming[0]!.answer()
@@ -786,7 +786,7 @@ describe('Softphone', () => {
       await Promise.all([phone.setDevices({ microphoneId: 'mic-usb' }), phone.setDevices({ microphoneId: 'mic-bt' }), phone.setDevices({ microphoneId: 'mic-x' })])
       const live = media.tracks.filter(t => !t.stop.mock.calls.length)
       expect(live).toEqual([pc.sender.track])
-      expect(pc.sender.track!.getSettings().deviceId).toBe('mic-x')
+      expect(pc.sender.track.getSettings().deviceId).toBe('mic-x')
     } finally {
       media.restore()
     }
@@ -808,12 +808,12 @@ describe('Softphone', () => {
       expect(media.getUserMedia).toHaveBeenCalledTimes(1)
       // The chosen headset was away when the call started (default microphone); it comes back: the call takes it.
       await phone.setDevices({ microphoneId: 'mic-usb' })
-      expect(pc.sender.track!.getSettings().deviceId).toBe('mic-usb')
+      expect(pc.sender.track.getSettings().deviceId).toBe('mic-usb')
       pc.sender.track = fakeTrack('mic-default')
       media.plug()
       await new Promise(r => setTimeout(r, 0))
       expect(media.getUserMedia).toHaveBeenLastCalledWith({ audio: { deviceId: { exact: 'mic-usb' } } })
-      expect(pc.sender.track!.getSettings().deviceId).toBe('mic-usb')
+      expect(pc.sender.track.getSettings().deviceId).toBe('mic-usb')
       await phone.stop()
       expect(media.listeners).toHaveLength(0)
     } finally {

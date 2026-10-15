@@ -17,7 +17,7 @@ describe('storedOpensipsFactory', () => {
       pool: {
         query: async (text, params) => {
           queries.push(text)
-          values.push((params as unknown[] | undefined) ?? [])
+          values.push(params ?? [])
           // The version check of ensureSchema() reads the row OpenSIPS's schema holds.
           if (/SELECT table_name, table_version/.test(text)) return { rows: [{ table_name: 'subscriber', table_version: 8 }, { table_name: 'acc', table_version: 7 }, { table_name: 'missed_calls', table_version: 5 }] }
           // The reconciliation of the accounts (SubscriberProvisioner.reconcileAccounts, run on PostgreSQL in its spec).

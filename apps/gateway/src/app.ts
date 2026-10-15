@@ -40,6 +40,7 @@ const PUSH_PURGE_GRACE_MS = 3_600_000
 /** Longest wait of a change for the one before it (a provider whose database hangs): the next one then goes. */
 const TURN_MAX_MS = 10_000
 /** One line of text: no control character (a message for callers ends up in a SIP header). */
+// eslint-disable-next-line no-control-regex -- control characters are exactly what is refused here
 const CONTROL = /[\u0000-\u001f\u007f]/
 
 /** `promise`, or a rejection once `ms` passed without it settling (it still runs, its result is ignored). */
@@ -956,7 +957,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
             }
           } else {
             if (!MEETING_ID.test(req.body?.slug ?? '')) throw bad('invalid room')
-            room = await meetRoomFor(email, { slug: req.body!.slug! })
+            room = await meetRoomFor(email, { slug: req.body.slug! })
             if (!room) throw Object.assign(new Error('Room not found, or not accessible to you'), { statusCode: 404 })
           }
           meetingId = room.id
@@ -1016,7 +1017,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         const body = req.body as { room?: { name?: string } }
         const record = body.room?.name ? await store.getConference(body.room.name) : null
         const bridge = record && cfg.bridge(record.tenantId)
-        const event = record && bridge ? bridge.fromWebhook(body as Parameters<LiveKitConferenceBridge['fromWebhook']>[0]) : undefined
+        const event = record && bridge ? bridge.fromWebhook(body) : undefined
         if (record && event) bus.publish(record.tenantId, record.ownerUserId, event)
         return reply.code(204).send()
       })

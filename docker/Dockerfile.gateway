@@ -4,7 +4,9 @@ WORKDIR /app
 COPY package.json yarn.lock tsconfig.base.json ./
 COPY packages ./packages
 COPY apps/gateway ./apps/gateway
-RUN yarn install --frozen-lockfile && yarn build
+# Built with every dependency, then only the runtime ones are kept (no TypeScript, ESLint or test tools in the image).
+RUN yarn install --frozen-lockfile && yarn build \
+    && yarn install --frozen-lockfile --production --ignore-scripts && yarn cache clean
 ENV NODE_ENV=production PORT=8080
 EXPOSE 8080
 USER node

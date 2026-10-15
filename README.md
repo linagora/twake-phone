@@ -159,7 +159,7 @@ Le code du POC (app Phone Cozy, PBX de dev MiniPBX, `sip-media`, stack de dev) a
 
 Pour essayer TwakePhone à plusieurs, sur une machine joignable depuis Internet : le kit pilote, [docker/pilot/README.md](docker/pilot/README.md) (une machine Linux avec Docker, un nom de domaine, trois commandes). Ce qui suit est pour développer.
 
-Prérequis : Node 22 ou plus récent (24 dans `.nvmrc`), Yarn 1, Docker.
+Prérequis : Node 22.13 et plus, ou 24 et plus (24 dans `.nvmrc`), Yarn 1, Docker.
 
 ```bash
 yarn install && yarn build && yarn test        # paquets, passerelle et app web, aucun service externe

@@ -166,7 +166,7 @@ describe('DirectorySync', () => {
     expect(report.error).toMatch(/could not be listed/)
     expect(JSON.stringify(report)).not.toMatch(/10\.0\.0\.5/)
     expect(await store.getMappingByUser('acme', 'alice')).not.toBeNull()
-    const noList = new DirectorySync({ store, directory: { search: directory.search, getMany: directory.getMany }, tenantId: 'acme' })
+    const noList = new DirectorySync({ store, directory: { search: directory.search.bind(directory), getMany: directory.getMany.bind(directory) }, tenantId: 'acme' })
     expect((await noList.run()).error).toMatch(/could not be listed/)
   })
 

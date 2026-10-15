@@ -31,7 +31,7 @@ export const Layout = () => {
   // Opened by the notification of a call: signed in, the softphone registers and the call rings here. The address
   // keeps no trace of it (a reload is no reason to do anything about that call).
   useEffect(() => {
-    if (calledFor(search) !== null) navigate(pathname, { replace: true })
+    if (calledFor(search) !== null) void navigate(pathname, { replace: true })
   }, [search, pathname, navigate])
   // The subscription to notifications this person made on this browser, handed to the Gateway again at each start.
   useEffect(() => {
@@ -40,6 +40,7 @@ export const Layout = () => {
   // The service worker asks the windows on screen before it shows the notification of a call: this one rings it
   // (registered), or may (its softphone on its way back: a quiet notification meanwhile).
   const phoneState = useRef(phone.state)
+  // eslint-disable-next-line react-hooks/refs -- the latest value, read by an effect without restarting it
   phoneState.current = phone.state
   useEffect(() => {
     if (typeof navigator === 'undefined' || !navigator.serviceWorker) return

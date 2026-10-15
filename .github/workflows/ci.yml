@@ -35,9 +35,17 @@ jobs:
           node-version: 22
           cache: yarn
       - run: yarn install --frozen-lockfile
-      - run: yarn build
+      - id: build
+        run: yarn build
       - run: yarn typecheck
+      # ESLint sur tout le monorepo (eslint.config.mjs), après le build (l'app web et les specs lisent les dist/*.d.ts
+      # des paquets) et même si le typecheck a échoué : les deux verdicts en un seul passage.
+      - name: Lint (ESLint)
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: yarn lint
+      # Les tests tournent et rendent leur verdict même si le typecheck ou le lint ont échoué.
       - name: Tests unitaires et contrat de stockage (mémoire et PostgreSQL)
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: yarn test
         env:
           TEST_DATABASE_URL: postgres://twake:twake@localhost:5432/twake_test

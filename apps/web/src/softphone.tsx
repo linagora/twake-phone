@@ -40,7 +40,7 @@ const readDevices = (): AudioDevices => {
     const parsed: unknown = raw ? JSON.parse(raw) : null
     if (!parsed || typeof parsed !== 'object') return {}
     const d = parsed as Record<string, unknown>
-    const pick = (k: string) => (typeof d[k] === 'string' && d[k] ? { [k]: d[k] as string } : {})
+    const pick = (k: string) => (typeof d[k] === 'string' && d[k] ? { [k]: d[k] } : {})
     return { ...pick('microphoneId'), ...pick('outputId'), ...pick('ringerId') }
   } catch {
     return {}
@@ -79,11 +79,13 @@ export const SoftphoneProvider = ({ children }: { children: ReactNode }) => {
   const [soundBlocked, setSoundBlocked] = useState(false)
   const phone = useRef<Softphone | null>(null)
   const devicesRef = useRef(devices)
+  // eslint-disable-next-line react-hooks/refs -- the latest value, read by an effect without restarting it
   devicesRef.current = devices
   const extension = me?.extension
   // The name goes in the From header at registration; a change (directory synchronisation) applies at the next
   // start, never by restarting the softphone in the middle of a call.
   const nameRef = useRef(displayName)
+  // eslint-disable-next-line react-hooks/refs -- the latest value, read by an effect without restarting it
   nameRef.current = displayName
 
   useEffect(() => {

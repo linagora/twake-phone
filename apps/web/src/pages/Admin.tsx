@@ -81,6 +81,7 @@ export const Admin = () => {
   }, [running, load])
   useEffect(() => {
     if (!started || running) return
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- the run this screen started has ended: its outcome shows once
     setStarted(false)
     setOutcome({ ok: true })
     // The administrator may be among the synchronised accounts: their own extension in the header follows.

@@ -51,6 +51,7 @@ const invalid = (message: string) => Object.assign(new Error(message), { statusC
  * would end or escape the quoting), spaces folded, at most NAME_MAX characters. Empty when nothing is left.
  */
 export const sipDisplayName = (name: string | undefined): string =>
+  // eslint-disable-next-line no-control-regex -- control characters are exactly what is folded here
   [...(name ?? '').replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029"\\]/g, ' ').replace(/\s+/g, ' ').trim()]
     .slice(0, NAME_MAX)
     .join('')

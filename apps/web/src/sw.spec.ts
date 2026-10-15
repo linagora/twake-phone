@@ -72,13 +72,15 @@ const load = (language = 'fr-FR', windows: FakeWindow[] = []) => {
       openWindow: async (url: string) => void opened.push(url)
     }
   }
-  new Function('self', readFileSync(new URL('../public/sw.js', import.meta.url), 'utf8'))(self)
+  // The service worker's script as the browser runs it, with the fake `self` above.
+  // eslint-disable-next-line @typescript-eslint/no-implied-eval -- evaluating that file is the point of this test
+  ;(new Function('self', readFileSync(new URL('../public/sw.js', import.meta.url), 'utf8')) as (self: unknown) => void)(self)
   const fire = async (type: string, event: Record<string, unknown>) => {
     let waited: Promise<unknown> | undefined
     handlers.get(type)!({ ...event, waitUntil: (p: Promise<unknown>) => void (waited = p) })
     await waited
   }
-  const push = (data: unknown) => fire('push', { data: data === undefined ? null : { json: () => (typeof data === 'string' ? JSON.parse(data) : data) } })
+  const push = (data: unknown) => fire('push', { data: data === undefined ? null : { json: () => (typeof data === 'string' ? (JSON.parse(data) as unknown) : data) } })
   /** A page of the app says its softphone rings these calls (their SIP Call-ID and From tag, as JsSIP names them). */
   const ringing = (callIds: unknown) => fire('message', { data: { type: 'twakephone.ringing', callIds } })
   const click = (url: string, extra: Record<string, unknown> = {}) => {
@@ -140,7 +142,7 @@ describe('the service worker (public/sw.js)', () => {
     const sw = load()
     await sw.push({ type: 'ended', callId: 'c1', number: '101', reason: 'over' })
     await sw.push({ type: 'call', callId: 'c1', number: '101', until: IN_A_MINUTE() })
-    expect(sw.notifications.map(n => `${n.tag} ${n.data?.over}`)).toEqual(['call-c1 true'])
+    expect(sw.notifications.map(n => `${n.tag} ${String(n.data?.over)}`)).toEqual(['call-c1 true'])
     expect(sw.shown.map(s => s.options.body)).toEqual(['Appel terminé.'])
     // The end shown while a window was on screen (nothing on screen then): the late call shows as over, quietly.
     const seen = load('fr-FR', [{ url: 'https://phone.example.test/', visibilityState: 'visible' }])

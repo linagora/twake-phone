@@ -1,4 +1,4 @@
-import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react'
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import type { Contact } from '@twake/telephony-client'
 import { useGateway } from './gateway.js'
 
@@ -17,15 +17,21 @@ const FavoritesContext = createContext<Favorites | null>(null)
 /**
  * The signed-in user's favourites, loaded once and updated optimistically: the Gateway keeps them. One change per
  * contact at a time, state updates by function (never from a stale closure), and the list is reloaded after a failure.
+ * Nothing is asked before the Gateway said who the user is (whether the platform has a directory), and only the
+ * answer to the latest load counts.
  */
 export const FavoritesProvider = ({ children }: { children: ReactNode }) => {
   const { client, me } = useGateway()
+  const known = me !== null
   const enabled = me?.features?.directory !== false
   const [items, setItems] = useState<Contact[] | null>(null)
   const [error, setError] = useState(false)
   const [inFlight, setInFlight] = useState<Set<string>>(() => new Set())
+  const latest = useRef(0)
 
   const reload = useCallback(() => {
+    const load = ++latest.current
+    if (!known) return Promise.resolve()
     if (!enabled) {
       setItems([])
       return Promise.resolve()
@@ -33,16 +39,19 @@ export const FavoritesProvider = ({ children }: { children: ReactNode }) => {
     return client
       .getFavorites()
       .then(page => {
+        if (load !== latest.current) return
         setItems(page.items)
         setError(false)
       })
       .catch(() => {
+        if (load !== latest.current) return
         setItems(current => current ?? [])
         setError(true)
       })
-  }, [client, enabled])
+  }, [client, known, enabled])
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- a platform without a directory has no favourites: an empty list at once
     void reload()
   }, [reload])
 
