@@ -6,7 +6,7 @@ interface Window {
     state: string
     calls: { id: string; direction: string; state: string; remoteNumber: string; remoteHold: boolean; muted: boolean; renegotiating: boolean; transferring: boolean; replacedCallId?: string; consultationOf?: string }[]
     /** The last call that ended, kept a few seconds: why and, when the far end said so, the SIP status. */
-    lastEnded: { id: string; remoteNumber: string; endReason?: string; endStatus?: number } | null
+    lastEnded: { id: string; remoteNumber: string; endReason?: string; endStatus?: number; endMessage?: string } | null
     tones: Record<string, string>
     devices: { microphoneId?: string; outputId?: string; ringerId?: string }
     soundBlocked: boolean

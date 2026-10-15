@@ -11,10 +11,12 @@ describe('storedOpensipsFactory', () => {
   const setup = () => {
     const store = new MemoryStore()
     const queries: string[] = []
+    const values: unknown[][] = []
     const provisioner = new SubscriberProvisioner({
       pool: {
-        query: async text => {
+        query: async (text, params) => {
           queries.push(text)
+          values.push((params as unknown[] | undefined) ?? [])
           // The version check of ensureSchema() reads the row OpenSIPS's schema holds.
           return /SELECT table_name, table_version/.test(text) ? { rows: [{ table_name: 'subscriber', table_version: 8 }, { table_name: 'acc', table_version: 7 }, { table_name: 'missed_calls', table_version: 5 }] } : { rows: [] }
         }
@@ -23,7 +25,7 @@ describe('storedOpensipsFactory', () => {
     })
     const factory = storedOpensipsFactory({ store, key, env: { OPENSIPS_DB_URL: 'postgres://x' }, provisionerFor: () => provisioner })
     const provider = factory.create({ websocketUrl: 'wss://sip.test/ws', domain: 'sip.test', subscriberDbUrlRef: 'env:OPENSIPS_DB_URL' }, { tenantId: 't', site: 'default' })
-    return { store, queries, provider }
+    return { store, queries, values, provider }
   }
 
   it('creates the schema once, provisions the secret at every session and hands the same one out again', async () => {
@@ -42,9 +44,40 @@ describe('storedOpensipsFactory', () => {
     expect(stored?.secretEnc).not.toContain((first as { credential: string }).credential)
   })
 
+  it('forwards through the call_rules of the same database, once the schema is there, with the tenant and who holds each extension', async () => {
+    const { store, queries, values, provider } = setup()
+    await store.upsertMapping({ tenantId: 't', userId: 'alice', extension: '101' })
+    await store.upsertMapping({ tenantId: 't', userId: 'bob', extension: '102' })
+    expect((await provider.getCapabilities()).forwarding).toBe(true)
+    await provider.setForwarding!({ id: 'alice', tenantId: 't', displayName: 'Alice', extension: '101' }, { always: '102', busy: '103' })
+    const create = queries.findIndex(q => /CREATE TABLE IF NOT EXISTS call_rules/.test(q))
+    const insert = queries.findIndex(q => /INSERT INTO call_rules/.test(q))
+    expect(create).toBeGreaterThanOrEqual(0)
+    expect(insert).toBeGreaterThan(create)
+    // 103 is nobody's: its holder is empty, the next reconcile drops that forward.
+    expect(values[insert]).toEqual(['101', 't', 'alice', '102', 'bob', '103', '', null, null, 20])
+  })
+
   it('refuses an extension nobody is mapped to', async () => {
     const { provider } = setup()
     await expect(provider.getSession!({ id: 'x', tenantId: 't', displayName: 'X', extension: '999' }, browser)).rejects.toMatchObject({ statusCode: 404 })
+  })
+
+  it('refuses a second tenant on the OpenSIPS database of another (call_rules is keyed by extension alone)', async () => {
+    const versions = { rows: [{ table_name: 'subscriber', table_version: 8 }, { table_name: 'acc', table_version: 7 }, { table_name: 'missed_calls', table_version: 5 }] }
+    const provisioner = new SubscriberProvisioner({ pool: { query: async (text: string) => (/SELECT table_name, table_version/.test(text) ? versions : { rows: [] }) }, realm: 'sip.test' })
+    const env = { A_DB: 'postgres://gw:one@db.example.test/opensips', B_DB: 'postgres://other:two@DB.example.test:5432/opensips', C_DB: 'postgres://gw:one@db.example.test/opensips_c' }
+    const factory = storedOpensipsFactory({ store: new MemoryStore(), key, env, provisionerFor: () => provisioner })
+    const config = (ref: string) => ({ websocketUrl: 'wss://sip.test/ws', domain: 'sip.test', subscriberDbUrlRef: ref })
+    const a = factory.create(config('env:A_DB'), { tenantId: 'a', site: 'default' })
+    // The same database under other credentials and spelling is still the same one.
+    expect(() => factory.create(config('env:B_DB'), { tenantId: 'b', site: 'default' })).toThrow(/already serves tenant a/)
+    // Its own database, or the same tenant again (a provider recreated), is fine.
+    factory.create(config('env:C_DB'), { tenantId: 'c', site: 'default' })
+    factory.create(config('env:A_DB'), { tenantId: 'a', site: 'default' })
+    // Once a's provider is closed, its database is free.
+    await a.close()
+    expect(() => factory.create(config('env:B_DB'), { tenantId: 'b', site: 'default' })).not.toThrow()
   })
 
   it('refuses to start without the secrets key', () => {

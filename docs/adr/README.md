@@ -16,5 +16,6 @@ Une décision, un fichier, numéroté dans l'ordre où elle a été prise. Un AD
 | [0010](0010-transfert-refer-replaces.md) | Transferts par REFER et Replaces de bout en bout entre softphones, OpenSIPS reste un proxy | acceptée |
 | [0011](0011-evenements-opensips.md) | La passerelle écoute OpenSIPS par `event_datagram` et MI ; le CDR du module `acc` fait foi | acceptée |
 | [0012](0012-pilote-un-domaine.md) | Pilote sur une machine, un seul domaine derrière Caddy, SIP sur WebSocket par le port 443 | acceptée |
+| [0013](0013-renvois-et-ne-pas-deranger.md) | Renvois et « ne pas déranger » dans `call_rules`, lue par OpenSIPS à chaque appel ; la présence choisie rangée par personne | acceptée |
 
 Gabarit : date, état et « remplacé par », contexte, décision, conséquences, alternatives écartées. Dix lignes suffisent. Une décision cite le fil ou le compte rendu où elle a été prise, pas une personne.

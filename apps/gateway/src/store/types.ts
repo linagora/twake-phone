@@ -1,4 +1,4 @@
-import type { CallDirection, CallState } from '@twake/telephony-types'
+import type { CallDirection, CallState, PresenceStatus } from '@twake/telephony-types'
 
 export interface ProviderRecord {
   tenantId: string
@@ -73,6 +73,19 @@ export interface ConferenceRecord {
   createdAt: string
 }
 
+/** What a person chose as presence (absent, do not disturb…), kept per user: it survives a restart and stays theirs. */
+export interface UserPresenceRecord {
+  tenantId: string
+  userId: string
+  status: PresenceStatus
+  /** When they chose it (ISO 8601). */
+  since: string
+  /** When it ends by itself (ISO 8601); absent: until they change it. */
+  until?: string
+  /** For their callers (a "do not disturb" refuses calls with it). */
+  message?: string
+}
+
 export interface Store {
   listProviders(): Promise<ProviderRecord[]>
   upsertProvider(record: ProviderRecord): Promise<void>
@@ -95,6 +108,13 @@ export interface Store {
   /** Idempotent. */
   addFavorite(tenantId: string, userId: string, contactId: string): Promise<void>
   removeFavorite(tenantId: string, userId: string, contactId: string): Promise<void>
+
+  /** What the user chose, unless its end has passed. */
+  getUserPresence(tenantId: string, userId: string): Promise<UserPresenceRecord | null>
+  setUserPresence(record: UserPresenceRecord): Promise<void>
+  deleteUserPresence(tenantId: string, userId: string): Promise<void>
+  /** Every choice of a tenant still in force (those past their end are dropped), by user id. */
+  listUserPresences(tenantId: string): Promise<UserPresenceRecord[]>
 
   getSipSecret(tenantId: string, userId: string): Promise<{ secretEnc: string; rotatedAt: string } | null>
   setSipSecret(tenantId: string, userId: string, secretEnc: string): Promise<void>

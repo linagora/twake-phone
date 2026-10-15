@@ -212,6 +212,10 @@ try {
     await page.getByRole('heading', { level: 2, name: 'Audio' }).waitFor()
     await page.getByLabel('Microphone').waitFor()
     if (!(await page.getByRole('button', { name: 'Tester la sonnerie' }).isDisabled())) throw new Error('the ringtone test must wait for a phone')
+    // No telephony platform here: no availability nor forwarding to set, and no error about them either.
+    await page.waitForLoadState('networkidle')
+    for (const name of ['Disponibilité', "Renvois d'appel"]) expectEqual(await page.getByRole('heading', { level: 2, name }).count(), 0, `no "${name}" section`)
+    expectEqual(await page.getByRole('alert').count(), 0, 'no error shown')
     await page.getByLabel("Langue de l'interface").selectOption('en')
     await page.getByRole('heading', { level: 1, name: 'Settings' }).waitFor()
     expectEqual(await page.title(), 'Settings – TwakePhone', 'document title')

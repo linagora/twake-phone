@@ -4,6 +4,7 @@ import type {
   ConferenceParticipant,
   DialInConfiguration,
   Endpoint,
+  ForwardingRules,
   MediaSession,
   Meeting,
   OriginateRequest,
@@ -27,6 +28,21 @@ export interface TelephonyProvider {
   getCapabilities(): Promise<Capabilities>
   getPresence(user: User): Promise<Presence>
   setPresence(user: User, presence: Presence): Promise<void>
+  /**
+   * The presences the Gateway kept for the users of the tenant (what each person chose), handed back when the
+   * provider starts: the provider applies them, and forgets any it applied for someone not in the list.
+   */
+  restorePresences?(entries: { user: User; presence: Presence }[]): Promise<void>
+  /**
+   * Who holds each extension of the tenant now, handed when the provider starts and after any change of the
+   * mappings: what a provider keeps per extension for its holder (forwards, "do not disturb") does not pass to the
+   * next one.
+   */
+  syncExtensions?(holders: { extension: string; userId: string }[]): Promise<void>
+  /** Where the calls of the user's extension go (capability `forwarding`). */
+  getForwarding?(user: User): Promise<ForwardingRules>
+  /** Replaces those rules; targets are extensions the Gateway checked. */
+  setForwarding?(user: User, rules: ForwardingRules): Promise<void>
   originate(request: OriginateRequest): Promise<Call>
   /** Releases connections and stops event streams. */
   close(): Promise<void>

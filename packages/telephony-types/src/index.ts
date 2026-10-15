@@ -42,6 +42,24 @@ export interface Presence {
   status: PresenceStatus
   source: PresenceSource
   since?: string
+  /** A status the person chose ends by itself at this instant (ISO 8601): a "do not disturb" until a meeting ends. */
+  until?: string
+  /** What the person wants callers to read while it lasts (a "do not disturb" refuses calls with it). */
+  message?: string
+}
+
+/**
+ * Where a person's calls go instead of ringing them, per extension. Targets are extensions of the organisation (a
+ * number outside comes with the trunk). `noAnswer` also applies when nothing of theirs can be reached. Each one
+ * absent: not forwarded in that case.
+ */
+export interface ForwardingRules {
+  /** Every call, at once, without ringing. */
+  always?: string
+  /** When the person is already in a call or declines it. */
+  busy?: string
+  /** When nobody answers within `delaySec` seconds of ringing (at once when the person cannot be reached). */
+  noAnswer?: { target: string; delaySec: number }
 }
 
 export type CallState =
@@ -92,6 +110,8 @@ export interface Capabilities {
     statuses: PresenceStatus[]
   }
   history: boolean
+  /** The person can set where their calls go (`ForwardingRules`) and a "do not disturb" that refuses or forwards them. */
+  forwarding?: boolean
   conference: { dialIn: boolean; dialOut: boolean }
 }
 

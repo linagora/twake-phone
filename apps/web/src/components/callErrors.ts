@@ -12,7 +12,8 @@ const TRANSFER_REASON_KEY: Record<EndReason, Key> = {
   cancelled: 'call.errorTransferCancelled',
   failed: 'call.errorTransferFailed',
   hangup: 'call.errorTransferFailed',
-  transferred: 'call.errorTransferFailed'
+  transferred: 'call.errorTransferFailed',
+  dnd: 'call.errorTransferDnd'
 }
 
 const CODE_KEY: Partial<Record<CallError['code'], Key>> = {

@@ -5,7 +5,7 @@ import swagger from '@fastify/swagger'
 import swaggerUi from '@fastify/swagger-ui'
 import { splitParticipantId, verifyWebhook, type LiveKitConferenceBridge, type MeetApi, type MeetRoom } from '@twake/conference-livekit'
 import type { MediaProvider, TelephonyProvider } from '@twake/telephony-provider-sdk'
-import type { CallDirection, Endpoint, Presence, PresenceStatus, TelephonyEvent, User } from '@twake/telephony-types'
+import type { CallDirection, Endpoint, ForwardingRules, Presence, PresenceStatus, TelephonyEvent, User } from '@twake/telephony-types'
 import { adminPolicyFromEnv, isAdmin, type AdminPolicy } from './admin.js'
 import { authenticatorFromEnv, TicketStore, type Authenticator, type Identity } from './auth.js'
 import { MAX_CONTACT_ID, MAX_FAVORITES, MAX_QUERY, MAX_SEARCH, RateLimiter, type ContactDirectory } from './contacts.js'
@@ -16,7 +16,7 @@ import { historyEntryFor } from './history.js'
 import type { ProviderRegistry } from './registry.js'
 import { securityHeadersFor, type SecurityOptions } from './security.js'
 import { MemoryStore } from './store/memory.js'
-import { isMissed, type HistoryEntry, type HistoryQuery, type Store } from './store/types.js'
+import { isMissed, type HistoryEntry, type HistoryQuery, type Store, type UserPresenceRecord } from './store/types.js'
 
 const STATUSES: PresenceStatus[] = ['available', 'busy', 'away', 'dnd', 'offline']
 const DIRECTIONS: CallDirection[] = ['inbound', 'outbound']
@@ -24,6 +24,20 @@ const HISTORY_STATUS = ['missed', 'declined', 'answered', 'failed']
 /** How long recording a call in the history may take before the pump moves on (a database that hangs). */
 const HISTORY_WRITE_MS = 5_000
 const BROWSER_ENDPOINT: Endpoint = { id: 'browser', type: 'browser', label: 'Twake Phone' }
+/** The statuses a person may give an end and a message to: the others last until they change them. */
+const TIMED_STATUSES: PresenceStatus[] = ['away', 'dnd']
+/** Longest message for callers: it travels in a SIP header. */
+const PRESENCE_MESSAGE_MAX = 140
+/** Furthest end of a chosen presence: a year (beyond, a forward is the tool). */
+const PRESENCE_MAX_MS = 366 * 86_400_000
+/** Seconds of ringing before a call goes to the no-answer target (about: the forward may come a second or two later). */
+const NOANSWER_DELAY = { min: 5, max: 120, default: 20 }
+/** Waits between two attempts at handing a provider the presences kept in the store (its database may be late). */
+const RESTORE_RETRY_MS = [1_000, 5_000, 15_000, 30_000]
+/** Longest wait of a change for the one before it (a provider whose database hangs): the next one then goes. */
+const TURN_MAX_MS = 10_000
+/** One line of text: no control character (a message for callers ends up in a SIP header). */
+const CONTROL = /[\u0000-\u001f\u007f]/
 
 /** `promise`, or a rejection once `ms` passed without it settling (it still runs, its result is ignored). */
 const within = <T>(promise: Promise<T>, ms: number, what: string): Promise<T> => {
@@ -41,6 +55,8 @@ export interface BuildOptions {
   store?: Store
   /** How long a history write may take before the event goes on without it. Default 5 s. */
   historyWriteTimeoutMs?: number
+  /** How long a change to a provider's presences or forwards waits for the one before it, at most. Default 10 s. */
+  turnMaxMs?: number
   directory?: UserDirectory
   /** The people one can look up and call. Absent when no directory is configured: the endpoints answer 501. */
   contacts?: ContactDirectory
@@ -66,6 +82,8 @@ export interface BuildOptions {
 const MEETING_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{2,63}$/
 
 const bad = (message: string) => Object.assign(new Error(message), { statusCode: 400 })
+/** A 400 whose `code` the app turns into the person's words (the message stays for the logs and other clients). */
+const refused = (code: string, message: string) => Object.assign(new Error(message), { statusCode: 400, code })
 
 /** Validates the query string of the history endpoint: nothing unchecked reaches the store. */
 export const parseHistoryQuery = (q: Record<string, string | undefined>): HistoryQuery => {
@@ -97,6 +115,69 @@ export const parseHistoryQuery = (q: Record<string, string | undefined>): Histor
   return out
 }
 
+/** A chosen presence as the person's own screens show it (no tenant, no user id). */
+const publicChoice = (r: UserPresenceRecord) => ({ status: r.status, since: r.since, ...(r.until ? { until: r.until } : {}), ...(r.message ? { message: r.message } : {}) })
+const presenceOfRecord = (r: UserPresenceRecord): Presence => ({ ...publicChoice(r), source: 'user' })
+
+/** Validates a presence the person sets: a status, and for absent or "do not disturb" an end in the future and a message. */
+export const parsePresence = (body: unknown, now = Date.now()): { status: PresenceStatus; until?: string; message?: string } => {
+  const b = (body ?? {}) as { status?: unknown; until?: unknown; message?: unknown }
+  if (!STATUSES.includes(b.status as PresenceStatus)) throw bad('invalid status')
+  const status = b.status as PresenceStatus
+  const out: { status: PresenceStatus; until?: string; message?: string } = { status }
+  const timed = TIMED_STATUSES.includes(status)
+  if (b.until !== undefined && b.until !== null && b.until !== '') {
+    if (!timed) throw bad('only an absence or a "do not disturb" can have an end')
+    const at = typeof b.until === 'string' ? Date.parse(b.until) : NaN
+    if (Number.isNaN(at)) throw refused('PRESENCE_UNTIL', 'invalid until')
+    if (at <= now) throw refused('PRESENCE_UNTIL', 'until must be in the future')
+    if (at > now + PRESENCE_MAX_MS) throw refused('PRESENCE_UNTIL', 'until must be within a year')
+    out.until = new Date(at).toISOString()
+  }
+  if (b.message !== undefined && b.message !== null && b.message !== '') {
+    if (!timed) throw bad('only an absence or a "do not disturb" can have a message')
+    if (typeof b.message !== 'string') throw bad('invalid message')
+    const message = b.message.trim()
+    if (message.length > PRESENCE_MESSAGE_MAX || CONTROL.test(message)) throw refused('PRESENCE_MESSAGE', `the message must be one line of at most ${PRESENCE_MESSAGE_MAX} characters`)
+    if (message) out.message = message
+  }
+  return out
+}
+
+/**
+ * Validates forwarding rules: each target an extension of the organisation (the store maps it to someone), never the
+ * person's own; external numbers are refused until the trunk exists. An empty or null field: no forward in that case.
+ */
+export const parseForwarding = async (body: unknown, user: User, isExtension: (target: string) => Promise<boolean>): Promise<ForwardingRules> => {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) throw bad('invalid forwarding rules')
+  const b = body as { always?: unknown; busy?: unknown; noAnswer?: unknown }
+  const target = async (value: unknown, what: string): Promise<string | undefined> => {
+    if (value === undefined || value === null || value === '') return undefined
+    if (typeof value !== 'string') throw bad(`invalid ${what} target`)
+    const t = value.replace(/\s/g, '')
+    if (!t) return undefined
+    if (t === user.extension) throw refused('FORWARD_SELF', `${what}: a forward to your own extension would ring you again`)
+    if (!/^[A-Za-z0-9._+-]{1,64}$/.test(t) || !(await isExtension(t))) {
+      throw refused('FORWARD_NOT_EXTENSION', `${what}: only an extension of your organisation can receive your calls for now (forwarding to an outside number comes with the phone line)`)
+    }
+    return t
+  }
+  const out: ForwardingRules = {}
+  const always = await target(b.always, 'always')
+  if (always) out.always = always
+  const busy = await target(b.busy, 'busy')
+  if (busy) out.busy = busy
+  if (b.noAnswer !== undefined && b.noAnswer !== null) {
+    if (typeof b.noAnswer !== 'object' || Array.isArray(b.noAnswer)) throw bad('invalid noAnswer')
+    const n = b.noAnswer as { target?: unknown; delaySec?: unknown }
+    const t = await target(n.target, 'noAnswer')
+    const delaySec = n.delaySec === undefined || n.delaySec === null || n.delaySec === '' ? NOANSWER_DELAY.default : Number(n.delaySec)
+    if (!Number.isInteger(delaySec) || delaySec < NOANSWER_DELAY.min || delaySec > NOANSWER_DELAY.max) throw refused('FORWARD_DELAY', `noAnswer: the delay must be ${NOANSWER_DELAY.min} to ${NOANSWER_DELAY.max} seconds`)
+    if (t) out.noAnswer = { target: t, delaySec }
+  }
+  return out
+}
+
 const publicEntry = (e: HistoryEntry) => ({
   id: e.callId,
   direction: e.direction,
@@ -117,6 +198,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
   const admin = options.admin ?? adminPolicyFromEnv(process.env)
   const tickets = options.tickets ?? new TicketStore()
   const historyWriteMs = options.historyWriteTimeoutMs ?? HISTORY_WRITE_MS
+  const turnMaxMs = options.turnMaxMs ?? TURN_MAX_MS
   let directory = options.directory
   if (!directory) {
     // Dev convenience: a bare in-memory gateway maps users from DEV_USER_MAP.
@@ -170,6 +252,8 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
   // Origins of the Twake apps allowed to call the Gateway from a browser.
   await app.register(cors, {
     origin: process.env.CORS_ORIGINS?.split(',') ?? false,
+    // The plugin's default is GET, HEAD and POST: the browser's preflight would refuse every PUT and DELETE.
+    methods: ['GET', 'HEAD', 'POST', 'PUT', 'DELETE'],
     allowedHeaders: ['authorization', 'content-type', 'idempotency-key', 'x-cozy-instance']
   })
   await app.register(swagger, { openapi: { info: { title: 'Twake Telephony Gateway', version: '0.1.0' } } })
@@ -202,7 +286,77 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
     if (entry) await within(store.addHistory(entry), historyWriteMs, 'history write').catch(err => app.log.error({ err, callId: entry.callId }, 'could not record call history'))
     bus.publish(tenantId, userId, event)
   }
+  // One change at a time per tenant to what its provider keeps for each person (presences, forwards): a restore
+  // hands the store's state whole, and a choice written while it runs would be undone by it. The others wait, for
+  // turnMaxMs at most: a provider whose database hangs (its queries have their own bound) holds nobody for good.
+  const turns = new Map<string, Promise<unknown>>()
+  const inTurn = <T>(tenantId: string, run: () => Promise<T>): Promise<T> => {
+    const previous = turns.get(tenantId)
+    let waited: Promise<unknown> = Promise.resolve()
+    if (previous) {
+      let timer: ReturnType<typeof setTimeout> | undefined
+      waited = Promise.race([previous, new Promise(resolve => (timer = setTimeout(resolve, turnMaxMs)))]).finally(() => clearTimeout(timer))
+    }
+    const next = waited.then(run)
+    const settled = next.catch(() => undefined)
+    turns.set(tenantId, settled)
+    void settled.then(() => {
+      if (turns.get(tenantId) === settled) turns.delete(tenantId)
+    })
+    return next
+  }
+  // What each person chose (absent, "do not disturb" until a date) is the store's: handed to the provider when it
+  // starts, and again once the mappings changed, so that a restart forgets nothing and nobody inherits someone
+  // else's choice, or rules, with their extension (who holds which extension goes first: syncExtensions).
+  // One restore at a time per tenant, retried until it holds: a change heard while one runs (or waits to retry) asks
+  // it for one more round, with the mappings as they are then.
+  let closing = false
+  const restoring = new Map<string, { again: boolean }>()
+  const restoreOnce = (tenantId: string, provider: TelephonyProvider) =>
+    inTurn(tenantId, async () => {
+      if (provider.syncExtensions) await provider.syncExtensions((await store.listMappings(tenantId)).map(m => ({ extension: m.extension, userId: m.userId })))
+      const entries = await Promise.all(
+        (await store.listUserPresences(tenantId)).map(async r => ({ user: await dir.forUser(tenantId, r.userId), presence: presenceOfRecord(r) }))
+      )
+      if (provider.restorePresences) await provider.restorePresences(entries)
+      else for (const e of entries) await provider.setPresence(e.user, e.presence)
+    })
+  const restorePresences = async (tenantId: string, provider: TelephonyProvider): Promise<void> => {
+    const running = restoring.get(tenantId)
+    if (running) {
+      running.again = true
+      return
+    }
+    const state = { again: true }
+    restoring.set(tenantId, state)
+    let attempt = 0
+    try {
+      while (state.again && !closing) {
+        state.again = false
+        try {
+          await restoreOnce(tenantId, provider)
+          attempt = 0
+        } catch (err) {
+          if (closing) return
+          state.again = true
+          const delay = RESTORE_RETRY_MS[Math.min(attempt++, RESTORE_RETRY_MS.length - 1)]!
+          app.log.error({ err, tenantId }, `chosen presences not handed to the provider, retrying in ${delay / 1000} s`)
+          await new Promise(resolve => setTimeout(resolve, delay).unref())
+        }
+      }
+    } finally {
+      restoring.delete(tenantId)
+    }
+  }
+  const started = new Map<string, TelephonyProvider>()
+  // A synchronisation that changed who holds which extension: the provider hears it at once.
+  options.directorySync?.onChange(tenantId => {
+    const provider = started.get(tenantId)
+    if (provider) void restorePresences(tenantId, provider)
+  })
   registry.onCreate = (tenantId, provider) => {
+    started.set(tenantId, provider)
+    void restorePresences(tenantId, provider)
     void (async () => {
       for await (const { extension, event } of provider.subscribe()) {
         try {
@@ -214,6 +368,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
     })().catch(err => app.log.error({ err }, 'provider event stream failed'))
   }
   app.addHook('onClose', async () => {
+    closing = true
     await registry.closeAll()
     await store.close()
   })
@@ -241,6 +396,13 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         const user = await whoIs(req)
         return { user, provider: registry.forTenant(user.tenantId) }
       }
+      // In a turn, before a change for `user`: the extension resolved with the request is still theirs. A
+      // synchronisation that gave it to someone else in between ran its restore first: writing now would give the
+      // new holder the old one's rules.
+      const stillHolds = async (user: User) => {
+        const now = await dir.forUser(user.tenantId, user.id)
+        if (now.extension !== user.extension) throw Object.assign(new Error('The extension of this user changed, try again'), { statusCode: 409 })
+      }
 
       // features tells the app what this platform offers, so it never has to probe an endpoint to find out.
       v1.get('/me', async req => {
@@ -264,19 +426,54 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         return { ...caps, conference: { dialIn: enabled, dialOut: enabled } }
       })
 
+      // What the others see, and what the person chose (`choice`: kept in the store, with its end and message).
+      const presenceOf = async (user: User, provider: TelephonyProvider) => {
+        const [presence, choice] = await Promise.all([provider.getPresence(user), store.getUserPresence(user.tenantId, user.id)])
+        return { ...presence, ...(choice ? { choice: publicChoice(choice) } : {}) }
+      }
       v1.get('/me/presence', async req => {
         const { user, provider } = await who(req)
-        return provider.getPresence(user)
+        return presenceOf(user, provider)
       })
 
-      v1.put<{ Body: { status: PresenceStatus } }>('/me/presence', async (req, reply) => {
+      // A status, with an end and a message for an absence or a "do not disturb" (`until`, `message`). The provider
+      // applies it first (a "do not disturb" refuses or forwards calls while it lasts): stored only once it holds.
+      v1.put('/me/presence', async req => {
         const { user, provider } = await who(req)
-        const { status } = req.body
-        if (!STATUSES.includes(status)) return reply.code(400).send({ error: 'invalid status' })
-        const presence = { status, source: 'user' as const, since: new Date().toISOString() }
-        await provider.setPresence(user, presence)
+        const { status, until, message } = parsePresence(req.body)
+        await inTurn(user.tenantId, async () => {
+          await stillHolds(user)
+          const since = new Date().toISOString()
+          await provider.setPresence(user, { status, source: 'user', since, ...(until ? { until } : {}), ...(message ? { message } : {}) })
+          if (status === 'available') await store.deleteUserPresence(user.tenantId, user.id)
+          else await store.setUserPresence({ tenantId: user.tenantId, userId: user.id, status, since, ...(until ? { until } : {}), ...(message ? { message } : {}) })
+        })
         // What the others see may differ (in a call, not registered): the provider's events say so.
-        return provider.getPresence(user)
+        return presenceOf(user, provider)
+      })
+
+      // Where the person's calls go instead of ringing them (capability `forwarding`). Replaced as a whole.
+      const forwardingOf = (provider: TelephonyProvider) => {
+        if (!provider.getForwarding || !provider.setForwarding) throw Object.assign(new Error('Forwarding is not available on this platform'), { statusCode: 501 })
+        return { get: provider.getForwarding.bind(provider), set: provider.setForwarding.bind(provider) }
+      }
+      const withExtension = (user: User) => {
+        if (!user.extension) throw Object.assign(new Error('No extension is assigned to this user'), { statusCode: 404 })
+        return user
+      }
+      v1.get('/me/forwarding', async req => {
+        const { user, provider } = await who(req)
+        return forwardingOf(provider).get(withExtension(user))
+      })
+      v1.put('/me/forwarding', async req => {
+        const { user, provider } = await who(req)
+        const forwarding = forwardingOf(provider)
+        const rules = await parseForwarding(req.body, withExtension(user), async target => !!(await store.getMappingByExtension(user.tenantId, target)))
+        await inTurn(user.tenantId, async () => {
+          await stillHolds(user)
+          await forwarding.set(user, rules)
+        })
+        return forwarding.get(user)
       })
 
       // The presence of everyone in the caller's tenant, by extension, as the provider's events built it. Only when

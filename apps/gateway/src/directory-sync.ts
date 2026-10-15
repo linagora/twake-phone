@@ -52,12 +52,18 @@ export class DirectorySync {
   private last: SyncReport | undefined
   private timer: NodeJS.Timeout | undefined
   private intervalMs: number | undefined
+  private readonly listeners: ((tenantId: string) => void)[] = []
 
   constructor(private readonly opts: DirectorySyncOptions) {}
 
   /** The Gateway's logger, once it exists. */
   useLogger(log: NonNullable<DirectorySyncOptions['log']>) {
     this.opts.log = log
+  }
+
+  /** Called after a run that created, changed or removed a mapping (who holds which extension changed). */
+  onChange(listener: (tenantId: string) => void) {
+    this.listeners.push(listener)
   }
 
   status(): SyncStatus {
@@ -196,6 +202,15 @@ export class DirectorySync {
       }
     }
     this.opts.log?.info({ ...report }, 'directory synchronisation done')
+    if (report.created || report.updated || report.removed || released.size) {
+      for (const listener of this.listeners) {
+        try {
+          listener(tenantId)
+        } catch (err) {
+          this.opts.log?.error({ err }, 'directory synchronisation: a listener failed')
+        }
+      }
+    }
     return finish()
   }
 }

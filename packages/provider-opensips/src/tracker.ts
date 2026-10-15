@@ -7,10 +7,19 @@ import type { Call, CallState, Presence, PresenceStatus, TelephonyEvent } from '
 interface TrackedCall {
   id: string
   caller: string
+  /** The extension the call is going to now: the one dialled, or where its rules forwarded it. */
   callee: string
+  /** What the caller dialled: what their history shows, wherever the call went. */
+  dialled: string
   startedAt: string
   /** The callee's phone rang: it knows about the call (and is busy with it), so a call that does not go through is a missed one for it. */
   rang: boolean
+  /**
+   * Refused on the callee's behalf by their "do not disturb": theirs all the same, a missed call for them. `told`:
+   * the caller was told (they called that extension); otherwise (a colleague the call was forwarded to) the caller
+   * only sees a call that did not go through.
+   */
+  dnd?: { told: boolean }
   connectedAt?: string
 }
 
@@ -69,6 +78,7 @@ export class CallTracker {
   private readonly busy = new Map<string, number>()
   /** Call-IDs that ended, oldest first, bounded. */
   private readonly ended = new Set<string>()
+  /** What each extension's person chose (dnd, away…), with its end when it has one. */
   private readonly userPresence = new Map<string, Presence>()
   /** The presence last told for each extension, so that only changes are told; offline ones are forgotten once told. */
   private readonly told = new Map<string, Presence>()
@@ -120,7 +130,7 @@ export class CallTracker {
    * progress (states 1 to 4: unconfirmed, ringing, answered, confirmed), and one we track that went further
    * meanwhile is told so. A call that started while the answer was on its way is left alone.
    */
-  seedDialogs(dialogs: { callid: string; state: number; caller: string; callee: string; startedAt?: string }[], known = this.knownCalls()) {
+  seedDialogs(dialogs: { callid: string; state: number; caller: string; callee: string; dialled?: string; startedAt?: string }[], known = this.knownCalls()) {
     const live = dialogs.filter(d => d.state >= 1 && d.state <= 4)
     const alive = new Set(live.map(d => d.callid))
     for (const id of known) {
@@ -132,7 +142,7 @@ export class CallTracker {
       let call = this.calls.get(d.callid)
       if (!call) {
         if (!d.caller || !d.callee) continue
-        call = this.start(d.callid, d.caller, d.callee, d.startedAt ?? this.now())
+        call = this.start(d.callid, d.caller, d.callee, d.startedAt ?? this.now(), d.dialled)
         if (d.state === 1) this.tell(call, call.caller, 'call.created', 'new')
       }
       if (d.state >= 3 && !call.connectedAt) {
@@ -157,10 +167,11 @@ export class CallTracker {
     this.tellPresences()
   }
 
-  /** Housekeeping, run on a timer: registrations past their expiry, calls whose end never came. */
+  /** Housekeeping, run on a timer: registrations past their expiry, calls whose end never came, choices past their end. */
   sweep() {
     const now = this.now()
     const nowMs = Date.parse(now)
+    this.expireUserPresences(nowMs)
     for (const [ext, set] of [...this.contacts]) {
       for (const [uri, expiresAt] of [...set]) if (expiresAt !== undefined && expiresAt + EXPIRY_GRACE_MS < nowMs) set.delete(uri)
       if (set.size === 0) this.contacts.delete(ext)
@@ -195,11 +206,31 @@ export class CallTracker {
         break
       case 'E_TWAKEPHONE_CALLING': {
         // The only event a call is born from: its callee hears of it once its phone rings.
+        // `callee` is where the call goes once the rules of the one dialled (an immediate forward) applied.
         const id = str(p.callid)
         const caller = userOf(str(p.caller))
         const callee = userOf(str(p.callee))
         if (!id || !caller || !callee || this.calls.has(id) || this.ended.has(id)) return
-        this.tell(this.start(id, caller, callee, now), caller, 'call.created', 'new')
+        this.tell(this.start(id, caller, callee, now, userOf(str(p.dialled)) || undefined), caller, 'call.created', 'new')
+        break
+      }
+      case 'E_TWAKEPHONE_FORWARDED': {
+        // The callee was busy, declined or did not answer, and its rules sent the call on (`callee`, the new one;
+        // `code`, the status that made it go): for the one it leaves, a call its phone rang for is missed (or
+        // declined); the new one hears of it when its phone rings.
+        const call = this.find(p, now)
+        if (call) this.moveTo(call, userOf(str(p.callee)), Number(p.code) || 0, now)
+        break
+      }
+      case 'E_TWAKEPHONE_DND': {
+        // Refused for `callee`, who does not want to be disturbed (and has nowhere to forward to): the missed call
+        // event that follows ends it, as a missed call for them. `told` "0": the caller did not call them (a forward
+        // led there) and was not told why. The refusal may be the dialled extension's after its forward rang
+        // someone else (`code`: how it ended there), who is left with a missed (or declined) call.
+        const call = this.find(p, now)
+        if (!call) return
+        this.moveTo(call, userOf(str(p.callee)), Number(p.code) || 0, now)
+        call.dnd = { told: str(p.told) !== '0' }
         break
       }
       case 'E_TWAKEPHONE_RINGING': {
@@ -241,7 +272,9 @@ export class CallTracker {
         if (!call) return
         const code = Number(p.sip_code) || 0
         const at = epochMs(p.time)
-        this.end(call, at !== undefined ? iso(at) : now, failedState(code), DECLINED.has(code) ? 'rejected' : 'missed')
+        // Refused by a "do not disturb": the callee's phone stayed silent, but the call is theirs, missed.
+        if (call.dnd) this.rings(call)
+        this.end(call, at !== undefined ? iso(at) : now, call.dnd?.told ? 'rejected' : failedState(code), DECLINED.has(code) ? 'rejected' : 'missed')
         break
       }
       default:
@@ -251,8 +284,8 @@ export class CallTracker {
   }
 
   /** The effective presence of an extension: a call beats everything, then not being registered, then what the user set. */
-  presenceOf(extension: string): Presence {
-    const user = this.userPresence.get(extension)
+  presenceOf(extension: string, nowMs = Date.parse(this.now())): Presence {
+    const user = this.userPresenceOf(extension, nowMs)
     const telephony = this.telephonyPresence(extension)
     if (telephony !== 'available') return { status: telephony, source: 'telephony' }
     return user ?? { status: 'available', source: 'telephony' }
@@ -263,10 +296,46 @@ export class CallTracker {
     return this.contacts.has(extension) ? 'available' : 'offline'
   }
 
-  /** What the user chose (dnd, away…), kept while the SIP server has nothing stronger to say. */
+  /** What the user chose (dnd, away…), kept while the SIP server has nothing stronger to say, until its end if it has one. */
   setUserPresence(extension: string, presence: Presence) {
     this.userPresence.set(extension, presence)
     this.tellPresences()
+  }
+
+  /** Forgets what the user of an extension chose (the extension is no longer theirs, or nobody holds it). */
+  clearUserPresence(extension: string) {
+    if (!this.userPresence.delete(extension)) return
+    this.tellPresences()
+  }
+
+  /** The extensions whose user chose something, still in force. */
+  userPresences(): Map<string, Presence> {
+    const nowMs = Date.parse(this.now())
+    return new Map([...this.userPresence].filter(([, p]) => !this.expired(p, nowMs)))
+  }
+
+  /** The earliest end of a choice still in force (ms since the epoch), for a timer that tells it when it comes. */
+  nextUserPresenceEnd(): number | undefined {
+    const ends = [...this.userPresence.values()].map(p => (p.until ? Date.parse(p.until) : NaN)).filter(Number.isFinite)
+    return ends.length ? Math.min(...ends) : undefined
+  }
+
+  /** The choices whose end has come are dropped, and the presences that change with them told. */
+  expire() {
+    this.tellPresences()
+  }
+
+  private userPresenceOf(extension: string, nowMs: number): Presence | undefined {
+    const p = this.userPresence.get(extension)
+    return p && !this.expired(p, nowMs) ? p : undefined
+  }
+
+  private expired(p: Presence, nowMs: number) {
+    return p.until !== undefined && Date.parse(p.until) <= nowMs
+  }
+
+  private expireUserPresences(nowMs: number) {
+    for (const [ext, p] of [...this.userPresence]) if (this.expired(p, nowMs)) this.userPresence.delete(ext)
   }
 
   /** Every extension whose presence was told and is not plain offline (registered, in a call, or set by its user). */
@@ -290,11 +359,22 @@ export class CallTracker {
     if (call) return call
     const caller = userOf(str(p.caller))
     const callee = userOf(str(p.callee))
-    return caller && callee ? this.start(id, caller, callee, startedAt) : undefined
+    return caller && callee ? this.start(id, caller, callee, startedAt, userOf(str(p.dialled)) || undefined) : undefined
   }
 
-  private start(id: string, caller: string, callee: string, startedAt: string): TrackedCall {
-    const call: TrackedCall = { id, caller, callee, startedAt, rang: false }
+  /** The call goes to `to` now: the callee it leaves is told it ended (missed, or declined) if its phone rang for it. */
+  private moveTo(call: TrackedCall, to: string, code: number, now: string) {
+    if (!to || call.callee === to) return
+    if (call.rang) {
+      this.count(call.callee, -1)
+      if (call.callee !== call.caller) this.emit(call.callee, { type: 'call.ended', timestamp: this.now(), payload: { call: this.toCall(call, call.callee, DECLINED.has(code) ? 'rejected' : 'missed', now) } })
+    }
+    call.callee = to
+    call.rang = false
+  }
+
+  private start(id: string, caller: string, callee: string, startedAt: string, dialled = callee): TrackedCall {
+    const call: TrackedCall = { id, caller, callee, dialled, startedAt, rang: false }
     this.calls.set(id, call)
     this.count(caller, 1)
     return call
@@ -319,7 +399,7 @@ export class CallTracker {
       id: c.id,
       direction: outbound ? 'outbound' : 'inbound',
       state,
-      remoteNumber: outbound ? c.callee : c.caller,
+      remoteNumber: outbound ? c.dialled : c.caller,
       startedAt: c.startedAt,
       ...(c.connectedAt ? { connectedAt: c.connectedAt } : {}),
       ...(endedAt ? { endedAt } : {})
@@ -354,13 +434,17 @@ export class CallTracker {
 
   /** Tells the presence of every extension whose effective presence changed since it was last told. */
   private tellPresences() {
-    const extensions = new Set<string>([...this.contacts.keys(), ...this.told.keys(), ...this.userPresence.keys(), ...this.busy.keys()])
     const timestamp = this.now()
+    const nowMs = Date.parse(timestamp)
+    this.expireUserPresences(nowMs)
+    const extensions = new Set<string>([...this.contacts.keys(), ...this.told.keys(), ...this.userPresence.keys(), ...this.busy.keys()])
     for (const ext of extensions) {
-      const presence = this.presenceOf(ext)
+      const presence = this.presenceOf(ext, nowMs)
       const before = this.told.get(ext)
       const offline = presence.status === 'offline' && !this.userPresence.has(ext)
-      if (before ? before.status === presence.status && before.source === presence.source : offline) continue
+      // A new end or message for the same choice is a change too: whoever shows it must show the new one.
+      const same = (a: Presence, b: Presence) => a.status === b.status && a.source === b.source && a.until === b.until && a.message === b.message
+      if (before ? same(before, presence) : offline) continue
       const since = presence.since ?? timestamp
       // Back to plain offline: told once, then forgotten (an extension dialled once costs nothing afterwards).
       if (offline) this.told.delete(ext)
