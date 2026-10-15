@@ -267,19 +267,16 @@ route {
 	t_on_reply("rtp");
 	t_on_failure("call_failed");
 	# The call starts: told to the Gateway only now, once nothing can refuse it without a transaction (rtp_offer
-	# answers 503 statelessly, which acc never sees): from here on, acc always tells how it ended.
+	# answers 503 statelessly, which acc never sees): from here on, acc tells how it ended, save the rare 500 of a
+	# relay that fails before any transaction (route[relay]), caught up like a lost event (ADR 0011).
 	route(calling);
 	route(relay);
 }
 
-# Ringing, answer and end follow: our own events, then acc's CDR or missed call. The transaction comes first
-# (t_relay and t_reply use it): from then on every final reply, the 500 below included, goes through it and acc
-# tells how the call ended; a request it cannot be created for is refused before anything is announced.
+# Ringing, answer and end follow: our own events, then acc's CDR or missed call. No t_newtran() here: with a
+# transaction created before t_relay, tm no longer answers 477 itself to a contact it cannot send to (the e2e saw
+# the 500 below instead), and the softphone would say "error" for "unreachable".
 route[calling] {
-	if (!t_newtran()) {
-		sl_reply_error();
-		exit;
-	}
 	route(event_attrs);
 	raise_event("E_TWAKEPHONE_CALLING", $avp(ev_attr), $avp(ev_val));
 }
@@ -287,7 +284,7 @@ route[calling] {
 route[relay] {
 	# A registered contact that cannot be reached (window gone without unregistering) makes tm answer
 	# 477 "Send failed" itself: the softphone renders it as "unreachable" (proven by the e2e). The 500 below is
-	# for a relay that fails before any reply, sent through the transaction route[calling] created.
+	# for a relay that fails before any reply.
 	if (!t_relay())
 		send_reply(500, "Internal Error");
 }

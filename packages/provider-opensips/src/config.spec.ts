@@ -61,8 +61,8 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     // The 404 of an extension nobody registered goes through a transaction (acc sees it): announced just before.
     expect(lines.slice(lookup, lookup + 4)).toEqual(['if (!lookup("location")) {', expect.stringMatching(/^#/), 'route(calling);', 't_reply(404, "Not Found");'])
     expect(cfg.match(/raise_event\("E_TWAKEPHONE_CALLING"/g)).toHaveLength(1)
-    // The transaction exists before the call is announced: acc sees every final reply, the 500 of a failed relay too.
-    expect(cfg.slice(cfg.indexOf('route[calling]'))).toMatch(/^route\[calling\] \{\s+if \(!t_newtran\(\)\) \{\s+sl_reply_error\(\);\s+exit;\s+\}\s+route\(event_attrs\);\s+raise_event\("E_TWAKEPHONE_CALLING"/)
+    // No transaction before t_relay: tm then answers 477 itself to a contact it cannot send to (e2e "dead connection").
+    expect(cfg.slice(cfg.indexOf('route[calling]'), cfg.indexOf('route[relay]'))).not.toContain('t_newtran')
   })
 
   it('clears every value of the event attribute lists before building them again', () => {
