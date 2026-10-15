@@ -10,6 +10,7 @@ import type {
   OriginateRequest,
   Presence,
   ProviderStatus,
+  RingGroup,
   TelephonyEvent,
   User
 } from '@twake/telephony-types'
@@ -36,13 +37,23 @@ export interface TelephonyProvider {
   /**
    * Who holds each extension of the tenant now, handed when the provider starts and after any change of the
    * mappings: what a provider keeps per extension for its holder (forwards, "do not disturb") does not pass to the
-   * next one.
+   * next one. `displayName` is the holder's name in the directory: what the SIP server shows the people they call.
    */
-  syncExtensions?(holders: { extension: string; userId: string }[]): Promise<void>
+  syncExtensions?(holders: { extension: string; userId: string; displayName?: string }[]): Promise<void>
   /** Where the calls of the user's extension go (capability `forwarding`). */
   getForwarding?(user: User): Promise<ForwardingRules>
   /** Replaces those rules; targets are extensions the Gateway checked. */
   setForwarding?(user: User, rules: ForwardingRules): Promise<void>
+  /** The simultaneous ring groups of the tenant (capability `groups`), by number. */
+  listGroups?(): Promise<RingGroup[]>
+  /**
+   * Creates a group (`create`: 409 with code GROUP_EXISTS when the tenant has one of that number, GROUP_NUMBER_TAKEN
+   * when the PBX has that number already) or replaces one (`replace`: 404 when the tenant has none). The Gateway
+   * checked its number is no extension and its members are, or were already members.
+   */
+  setGroup?(group: RingGroup, mode: 'create' | 'replace'): Promise<void>
+  /** Removes a group; false when the tenant has none with that number. */
+  deleteGroup?(number: string): Promise<boolean>
   originate(request: OriginateRequest): Promise<Call>
   /** Releases connections and stops event streams. */
   close(): Promise<void>
@@ -69,7 +80,8 @@ export interface ConferenceBridgeProvider {
 
 /** Pushes a user's SIP secret where the SIP server checks it. The Gateway generates and keeps the secret. */
 export interface SecretProvisioner {
-  setSipSecret(extension: string, secret: string): Promise<void>
+  /** `holder`: the user the extension's account is for (the Gateway's user id), when the SIP server keeps it. */
+  setSipSecret(extension: string, secret: string, holder?: string): Promise<void>
 }
 
 /** Provider modules export a factory; config comes from the tenant settings, secrets from env/Vault. */

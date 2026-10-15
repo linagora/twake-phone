@@ -1,23 +1,7 @@
-import { AsteriskProvider, miniPbxProvisioner, type AsteriskConfig } from '@twake/provider-asterisk'
 import { OpensipsProvider, SubscriberProvisioner, type EventsLogger, type SubscriberProvisionerOptions } from '@twake/provider-opensips'
 import type { ProviderContext, ProviderFactory } from '@twake/telephony-provider-sdk'
 import { SipSecrets } from './sip-secrets.js'
 import type { Store } from './store/types.js'
-
-/** What is stored in provider_configs for an Asterisk provider. Secrets are references, never values. */
-export interface StoredAsteriskConfig {
-  ari: { url: string; user: string; passwordRef: string; app?: string }
-  websocketUrl: string
-  iceServers?: { urls: string[] }[]
-  trunkEndpoint?: string
-  /** Dialplan context that rings every window of an extension (see provider-asterisk). */
-  originateContext?: string
-  /** Route external numbers through a PBX dialplan context (applies the PBX's own outbound rules). */
-  externalDial?: { context: string; e164Prefix?: string; nationalPrefix?: string }
-  /** Per-user SIP secrets pushed to the PBX. Without it, `staticSipSecretRef` is used (dev only). */
-  provisioning?: { url: string; tokenRef: string }
-  staticSipSecretRef?: string
-}
 
 /** "env:NAME" -> value of the environment variable. A vault scheme would plug in here. */
 export const resolveRef = (ref: string, env: NodeJS.ProcessEnv = process.env): string => {
@@ -27,45 +11,6 @@ export const resolveRef = (ref: string, env: NodeJS.ProcessEnv = process.env): s
   if (value === undefined) throw new Error(`Secret reference ${ref} is not set`)
   return value
 }
-
-export interface FactoryDeps {
-  store: Store
-  /** Absent when provisioning is not configured. */
-  secretsFor?: (provisioningUrl: string, token: string) => SipSecrets
-  env?: NodeJS.ProcessEnv
-}
-
-/** Builds Asterisk providers from their stored configuration. */
-export const storedAsteriskFactory = ({ store, secretsFor, env = process.env }: FactoryDeps): ProviderFactory<StoredAsteriskConfig> => ({
-  type: 'asterisk',
-  create(config, context?: ProviderContext) {
-    const tenantId = context?.tenantId ?? 'default'
-    const secrets = config.provisioning && secretsFor ? secretsFor(config.provisioning.url, resolveRef(config.provisioning.tokenRef, env)) : undefined
-    const staticSecret = config.staticSipSecretRef ? resolveRef(config.staticSipSecretRef, env) : undefined
-
-    const sipSecretFor: AsteriskConfig['sipSecretFor'] = async extension => {
-      if (secrets) {
-        const mapping = await store.getMappingByExtension(tenantId, extension)
-        if (!mapping) throw Object.assign(new Error('Extension is not mapped to a user'), { statusCode: 404 })
-        return secrets.getOrCreate(tenantId, mapping.userId, extension)
-      }
-      if (!staticSecret) throw Object.assign(new Error('No SIP secret source configured'), { statusCode: 500 })
-      return staticSecret
-    }
-
-    return new AsteriskProvider({
-      ari: { url: config.ari.url, user: config.ari.user, password: resolveRef(config.ari.passwordRef, env), ...(config.ari.app ? { app: config.ari.app } : {}) },
-      websocketUrl: config.websocketUrl,
-      ...(config.iceServers ? { iceServers: config.iceServers } : {}),
-      ...(config.trunkEndpoint ? { trunkEndpoint: config.trunkEndpoint } : {}),
-      ...(config.originateContext ? { originateContext: config.originateContext } : {}),
-      ...(config.externalDial ? { externalDial: config.externalDial } : {}),
-      sipSecretFor
-    })
-  }
-})
-
-export { miniPbxProvisioner }
 
 /** What is stored in provider_configs for an OpenSIPS provider. The database holding `subscriber` is a reference. */
 export interface StoredOpensipsConfig {
@@ -139,9 +84,9 @@ export const storedOpensipsFactory = ({ store, key, env = process.env, provision
         store,
         key,
         provisioner: {
-          async setSipSecret(extension, secret) {
+          async setSipSecret(extension, secret, holder) {
             await ensureSchema()
-            await provisioner.setSipSecret(extension, secret)
+            await provisioner.setSipSecret(extension, secret, holder)
           }
         }
       })
@@ -160,6 +105,15 @@ export const storedOpensipsFactory = ({ store, key, env = process.env, provision
         },
         // The forwards and "do not disturb" OpenSIPS reads, in the same database as `subscriber` (ADR 0013).
         callRules: provisioner.callRules({ ready: ensureSchema, tenantId, holderOf: async extension => (await store.getMappingByExtension(tenantId, extension))?.userId }),
+        // The ring groups and the directory names OpenSIPS reads, in the same database too (ADR 0014).
+        callGroups: provisioner.callGroups({ ready: ensureSchema, tenantId }),
+        // The SIP accounts follow the mappings: one written for a user who no longer holds the extension goes (ADR 0014).
+        accounts: {
+          async reconcile(holders) {
+            await ensureSchema()
+            return provisioner.reconcileAccounts(holders)
+          }
+        },
         ...(config.events ? { events: config.events } : {}),
         ...(logger ? { logger } : {})
       })

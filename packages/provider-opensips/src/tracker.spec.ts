@@ -481,4 +481,62 @@ describe('CallTracker', () => {
     tracker.setUserPresence('101', { status: 'dnd', source: 'user', message: 'En rendez-vous' })
     expect(told.slice(7)).toEqual(['101:dnd', '101:dnd'])
   })
+
+  it('rings the members of a ring group one by one as their phones ring; the one who answers takes the call, the others hear no more of it', () => {
+    const { tracker, calls, presences, clear } = make()
+    for (const ext of ['101', '102', '103', '104']) tracker.handle('E_UL_CONTACT_INSERT', contact(ext, `sip:${ext}@x.invalid`))
+    clear()
+    const g = (callee: string) => ({ ...call('g1', '101', callee), dialled: '200', group: '200' })
+    tracker.handle('E_TWAKEPHONE_CALLING', g('200'))
+    expect(calls()).toEqual(['101:call.created:outbound:200:new'])
+    tracker.handle('E_TWAKEPHONE_RINGING', g('102'))
+    tracker.handle('E_TWAKEPHONE_RINGING', g('103'))
+    // Told once each: a second window of 103 ringing says nothing more.
+    tracker.handle('E_TWAKEPHONE_RINGING', g('103'))
+    expect(calls().slice(1)).toEqual(['102:call.ringing:inbound:101:ringing', '101:call.ringing:outbound:200:ringing', '103:call.ringing:inbound:101:ringing'])
+    expect(presences()).toEqual(['101:busy', '102:busy', '103:busy'])
+    clear()
+    // A forward or a "do not disturb" is not a group's: nothing moves.
+    tracker.handle('E_TWAKEPHONE_FORWARDED', { ...g('104'), from: '102', code: '486' })
+    tracker.handle('E_TWAKEPHONE_DND', { ...g('104'), told: '1', code: '0' })
+    expect(calls()).toEqual([])
+    tracker.handle('E_TWAKEPHONE_ANSWERED', g('103'))
+    // 102 stops ringing without a call of its own to show: a colleague answered.
+    expect(calls()).toEqual(['101:call.connected:outbound:200:connected', '103:call.connected:inbound:101:connected'])
+    expect(presences()).toEqual(['102:available'])
+    clear()
+    // acc names the member who answered; the caller keeps the number dialled.
+    tracker.handle('E_ACC_CDR', { ...cdr('g1', '101', '103', 4, 1792000805), dialled: '200' })
+    expect(calls()).toEqual(['101:call.ended:outbound:200:ended', '103:call.ended:inbound:101:ended'])
+    expect(presences()).toEqual(['101:available', '103:available'])
+  })
+
+  it('makes a ring group nobody answered a missed call for every member whose phone rang, and for nobody else', () => {
+    const { tracker, calls, presences, clear } = make()
+    for (const ext of ['101', '102', '103']) tracker.handle('E_UL_CONTACT_INSERT', contact(ext, `sip:${ext}@x.invalid`))
+    clear()
+    const g = (id: string, callee: string) => ({ ...call(id, '101', callee), dialled: '200', group: '200' })
+    tracker.handle('E_TWAKEPHONE_CALLING', g('g2', '200'))
+    tracker.handle('E_TWAKEPHONE_RINGING', g('g2', '102'))
+    tracker.handle('E_TWAKEPHONE_RINGING', g('g2', '103'))
+    clear()
+    // Cancelled by the caller (acc's missed call names the group).
+    tracker.handle('E_ACC_MISSED_EVENT', { ...missed('g2', '101', '200', '487', 1792002800), dialled: '200' })
+    expect(calls()).toEqual(['101:call.ended:outbound:200:ended', '102:call.ended:inbound:101:missed', '103:call.ended:inbound:101:missed'])
+    expect(presences()).toEqual(['101:available', '102:available', '103:available'])
+    clear()
+    // Nobody to ring (all in "do not disturb", or none registered): the caller's call failed, nobody else hears of it.
+    tracker.handle('E_TWAKEPHONE_CALLING', g('g3', '200'))
+    tracker.handle('E_ACC_MISSED_EVENT', { ...missed('g3', '101', '200', '480', 1792002801), dialled: '200' })
+    expect(calls()).toEqual(['101:call.created:outbound:200:new', '101:call.failed:outbound:200:failed'])
+  })
+
+  it('creates a ring group call whose CALLING was lost from its first ringing, with the group as callee until a member answers', () => {
+    const { tracker, calls, clear } = make()
+    for (const ext of ['101', '102']) tracker.handle('E_UL_CONTACT_INSERT', contact(ext, `sip:${ext}@x.invalid`))
+    clear()
+    tracker.handle('E_TWAKEPHONE_RINGING', { ...call('g4', '101', '102'), dialled: '200', group: '200' })
+    expect(calls()).toEqual(['102:call.ringing:inbound:101:ringing', '101:call.ringing:outbound:200:ringing'])
+    expect(tracker.activeCalls()).toMatchObject([{ id: 'g4', remoteNumber: '200' }])
+  })
 })

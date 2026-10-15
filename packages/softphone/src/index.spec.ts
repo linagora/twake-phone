@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events'
 import { describe, expect, it, vi } from 'vitest'
-import { Softphone, type RingerLike, type SoftCall, type UserAgentLike } from './index.js'
+import { answeredElsewhere, assertedIdentity, Softphone, type RingerLike, type SoftCall, type UserAgentLike } from './index.js'
 
 /** The ringtone as the test sees it: whether it rings, where it goes, and whether the browser "blocks" it. */
 class FakeRinger implements RingerLike {
@@ -254,6 +254,35 @@ describe('Softphone', () => {
     const away = await phone.call('103')
     ua().lastCall!.emit('failed', { originator: 'remote', cause: 'Unavailable', message: response('Do Not Disturb', { 'Twake-Dnd-Message': 'x' }) })
     expect([away.endReason, away.endMessage]).toEqual(['unavailable', undefined])
+  })
+
+  it('shows who answered a call it placed, as the SIP server asserts it (a member of a ring group), and transfers the call as placed', async () => {
+    const { phone, ua } = await setup()
+    const call = await phone.call('200')
+    const s = ua().lastCall!
+    const response = (headers: Record<string, string>) => ({ status_code: 200, getHeader: (name: string) => headers[name] })
+    s.emit('accepted', { originator: 'remote', response: response({ 'P-Asserted-Identity': '"Jean Dupont" <sip:102@sip.test>' }) })
+    expect([call.remoteNumber, call.remoteName]).toEqual(['102', 'Jean Dupont'])
+    expect((call as unknown as { remoteUri: string }).remoteUri).toBe(s.remote_identity.uri.toString())
+    s.emit('ended', { originator: 'remote', cause: 'Terminated' })
+    // Nothing asserted, or nothing readable: what the call was placed to stays.
+    const plain = await phone.call('103')
+    const placed = [plain.remoteNumber, plain.remoteName]
+    ua().lastCall!.emit('accepted', { originator: 'remote', response: response({ 'P-Asserted-Identity': '<tel:+33612345678>' }) })
+    expect([plain.remoteNumber, plain.remoteName]).toEqual(placed)
+  })
+
+  it('tells a ringing call another phone took (CANCEL with Reason cause 200) from one the caller gave up', async () => {
+    const { ua, incoming } = await setup()
+    const cancel = (reason?: string) => ({ method: 'CANCEL', getHeader: (name: string) => (name === 'Reason' ? reason : undefined) })
+    const taken = new FakeSession('incoming')
+    ua().emit('newRTCSession', { originator: 'remote', session: taken })
+    taken.emit('failed', { originator: 'remote', cause: 'Canceled', message: cancel('SIP ;cause=200 ;text="Call completed elsewhere"') })
+    expect(incoming[0]!.endReason).toBe('answered-elsewhere')
+    const given = new FakeSession('incoming')
+    ua().emit('newRTCSession', { originator: 'remote', session: given })
+    given.emit('failed', { originator: 'remote', cause: 'Canceled', message: cancel('SIP;cause=487;text="ORIGINATOR_CANCEL"') })
+    expect(incoming[1]!.endReason).toBe('cancelled')
   })
 
   it('refuses a target that is not a dialable string', async () => {
@@ -877,5 +906,25 @@ describe('Softphone', () => {
     expect(ua().registered).toBe(false)
     expect(ua().stop).toHaveBeenCalled()
     await expect(phone.call('103')).rejects.toMatchObject({ code: 'not-started' })
+  })
+})
+
+describe('assertedIdentity and answeredElsewhere', () => {
+  it('reads the number and the quoted name of a SIP identity, and nothing else', () => {
+    expect(assertedIdentity('"Jean Dupont" <sip:102@sip.test>')).toEqual({ number: '102', name: 'Jean Dupont' })
+    expect(assertedIdentity('<sip:102@sip.test;transport=ws>;party=called')).toEqual({ number: '102', name: '' })
+    expect(assertedIdentity('Jean <sip:102@sip.test>')).toBeUndefined()
+    expect(assertedIdentity('"A \\"B" <sip:102@sip.test>')).toBeUndefined()
+    expect(assertedIdentity('<sip:10 2@sip.test>')).toBeUndefined()
+    expect(assertedIdentity(undefined)).toBeUndefined()
+  })
+
+  it('reads the cause of a Reason header as RFC 3326 writes it, spaces or not', () => {
+    expect(answeredElsewhere('SIP ;cause=200 ;text="Call completed elsewhere"')).toBe(true)
+    expect(answeredElsewhere('SIP;cause=200')).toBe(true)
+    expect(answeredElsewhere('SIP;text="x";cause=200')).toBe(true)
+    expect(answeredElsewhere('SIP;cause=2000')).toBe(false)
+    expect(answeredElsewhere('Q.850;cause=200')).toBe(false)
+    expect(answeredElsewhere(undefined)).toBe(false)
   })
 })

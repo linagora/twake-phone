@@ -11,12 +11,12 @@ export const storeContract = (name: string, make: () => Promise<Store>) =>
   describe(`${name} store contract`, () => {
     it('keeps provider configs and upserts per tenant and site', async () => {
       const s = await make()
-      await s.upsertProvider({ tenantId: 'A', type: 'asterisk', config: { ari: { url: 'x' } } })
-      await s.upsertProvider({ tenantId: 'A', type: 'asterisk', config: { ari: { url: 'y' } } })
-      await s.upsertProvider({ tenantId: 'B', type: 'asterisk', config: { ari: { url: 'z' } } })
+      await s.upsertProvider({ tenantId: 'A', type: 'opensips', config: { mi: { host: 'x' } } })
+      await s.upsertProvider({ tenantId: 'A', type: 'opensips', config: { mi: { host: 'y' } } })
+      await s.upsertProvider({ tenantId: 'B', type: 'opensips', config: { mi: { host: 'z' } } })
       const all = await s.listProviders()
       expect(all).toHaveLength(2)
-      expect(all.find(p => p.tenantId === 'A')?.config).toEqual({ ari: { url: 'y' } })
+      expect(all.find(p => p.tenantId === 'A')?.config).toEqual({ mi: { host: 'y' } })
       await s.close()
     })
 

@@ -17,8 +17,10 @@ export type SoftCallState = 'new' | 'ringing' | 'connected' | 'held' | 'ended'
 /**
  * Why a call ended, as the SIP layer reports it: the UI tells the user, the history keeps it. `dnd`: the person
  * called does not want to be disturbed (and gave no forward); their message, when they left one, is `endMessage`.
+ * `answered-elsewhere`: a call ringing here was taken by another phone (a colleague of a ring group, or another
+ * device of ours): the CANCEL said so (`Reason: SIP;cause=200`).
  */
-export type EndReason = 'hangup' | 'rejected' | 'busy' | 'no-answer' | 'unavailable' | 'cancelled' | 'failed' | 'transferred' | 'dnd'
+export type EndReason = 'hangup' | 'rejected' | 'busy' | 'no-answer' | 'unavailable' | 'cancelled' | 'failed' | 'transferred' | 'dnd' | 'answered-elsewhere'
 
 /**
  * How the SIP server refuses a call to someone in "do not disturb": 480 with DND_HEADER set to 1 (a reason phrase may
@@ -28,6 +30,20 @@ export const DND_HEADER = 'Twake-Dnd'
 export const DND_MESSAGE_HEADER = 'Twake-Dnd-Message'
 
 export type DtmfTransport = 'RFC2833' | 'INFO'
+
+/**
+ * Who answered, as the SIP server asserts it in the 2xx of our INVITE (`P-Asserted-Identity`, ADR 0014): the member
+ * of a ring group who took the call, and their directory name. The server removes any the far end sent, and only
+ * the user part and the quoted name are read; anything that is not plainly that is ignored.
+ */
+export const assertedIdentity = (header: string | undefined): { number: string; name: string } | undefined => {
+  const m = /^\s*(?:"([^"\\]*)"\s*)?<sips?:([+0-9A-Za-z*#._-]{1,64})@[^<>\s]*>\s*(?:;.*)?$/.exec(header ?? '')
+  if (!m) return undefined
+  return { number: m[2]!, name: (m[1] ?? '').trim() }
+}
+
+/** A CANCEL whose `Reason` says another phone answered (RFC 3326, cause 200: "Call completed elsewhere"). */
+export const answeredElsewhere = (reason: string | undefined) => /^\s*SIP\s*;(?:.*;)?\s*cause\s*=\s*200\s*(?:;|$)/i.test(reason ?? '')
 
 /** The person's choice of devices (`deviceId`s of `enumerateDevices`); unset or empty: the browser's default. */
 export interface AudioDevices {
@@ -73,8 +89,12 @@ export class CallError extends Error {
 export interface SoftCall {
   readonly id: string
   readonly direction: 'inbound' | 'outbound'
+  /** The far end's number; for a call we placed, the one who answered once they did (a member of a ring group). */
   readonly remoteNumber: string
-  /** Display name the far end gave, if any. Never trusted for anything but display. */
+  /**
+   * The far end's name: the directory's, as the SIP server put it in the From (an incoming call) or asserted it in
+   * the answer (a call we placed); else what the far end gave, if anything. Never trusted for anything but display.
+   */
   readonly remoteName: string
   readonly state: SoftCallState
   readonly startedAt: Date
@@ -224,8 +244,8 @@ class WebCall implements SoftCall {
   muted = false
   renegotiating = false
   transferring = false
-  readonly remoteNumber: string
-  readonly remoteName: string
+  remoteNumber: string
+  remoteName: string
   private reofferPending?: { reject: (e: Error) => void }
   /** The transfer waiting for the far end's report, to settle if the call ends first. */
   private referPending?: (err: CallError) => void
@@ -257,7 +277,14 @@ class WebCall implements SoftCall {
     if (pc) this.attachRemoteAudio(pc)
     else session.on('peerconnection', (e: { peerconnection: RTCPeerConnection }) => this.attachRemoteAudio(e.peerconnection))
     session.on('progress', () => this.set('ringing'))
-    session.on('accepted', () => {
+    session.on('accepted', (e: { response?: { getHeader?: (name: string) => string | undefined } }) => {
+      // Our call answered: who took it (a ring group rings several people), as the SIP server asserts it. The
+      // address a transfer names stays the session's (remoteUri): that is the dialog the SIP server knows.
+      const asserted = direction === 'outbound' ? assertedIdentity(e?.response?.getHeader?.('P-Asserted-Identity')) : undefined
+      if (asserted) {
+        this.remoteNumber = asserted.number
+        this.remoteName = asserted.name
+      }
       this.connectedAt ??= new Date()
       this.watchMicrophone()
       this.set('connected')
@@ -303,6 +330,9 @@ class WebCall implements SoftCall {
       // 477 "Send failed": the SIP server could not deliver to the far end (a registration left on a dead
       // connection); for the person it is the same as nobody there.
       if (this.endStatus === 477 && this.endReason === 'failed') this.endReason = 'unavailable'
+      // A call ringing here, cancelled because another phone took it (the SIP server's CANCEL says so).
+      const request = e.message as { method?: string; getHeader?: (name: string) => string | undefined } | undefined
+      if (direction === 'inbound' && this.endReason === 'cancelled' && request?.method === 'CANCEL' && answeredElsewhere(request.getHeader?.('Reason'))) this.endReason = 'answered-elsewhere'
       // 480 with `Twake-Dnd: 1`: refused on their behalf by the SIP server, with the message they left, if any.
       const response = e.message as { getHeader?: (name: string) => string | undefined } | undefined
       if (this.endStatus === 480 && response?.getHeader?.(DND_HEADER)?.trim() === '1') {

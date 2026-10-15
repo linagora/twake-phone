@@ -44,8 +44,12 @@ describe('SubscriberProvisioner', () => {
     expect(queries).toHaveLength(2)
     expect(queries[0]!.text).toMatch(/INSERT INTO subscriber/)
     expect(queries[0]!.text).toMatch(/ON CONFLICT \(username, domain\)/)
-    expect(queries[0]!.values).toEqual(['101', '', '4c72c8368eb8ec309fc6be33755cdccd', expect.any(String), expect.any(String)])
+    // No holder given: NULL, an account the reconciliation never removes.
+    expect(queries[0]!.values).toEqual(['101', '', '4c72c8368eb8ec309fc6be33755cdccd', expect.any(String), expect.any(String), null])
     expect(JSON.stringify(queries)).not.toContain('s3cret')
+    await p.setSipSecret('102', 'x', 'bob')
+    expect(queries[2]!.text).toMatch(/holder = EXCLUDED\.holder/)
+    expect(queries[2]!.values!.at(-1)).toBe('bob')
   })
 
   it('refuses an extension that is not a SIP user name', async () => {
@@ -86,7 +90,13 @@ describe('SubscriberProvisioner', () => {
     await p.ensureSchema()
     expect(db.queries).toContain('ROLLBACK')
     expect(db.released()).toBe(1)
-    expect(warnings).toEqual([expect.stringMatching(/could not add acc\.caller, acc\.callee, acc\.dialled, missed_calls\.caller, .*, call_rules\.forward_noanswer_holder \(must be owner of table acc\)/)])
+    expect(warnings).toEqual([expect.stringMatching(/could not add subscriber\.holder, acc\.caller, acc\.callee, acc\.dialled, missed_calls\.caller, .*, call_rules\.forward_noanswer_holder \(must be owner of table acc\)/)])
+    // Without the holder column: the accounts are written without it, and none is removed.
+    db.queries.length = 0
+    await p.setSipSecret('101', 'x', 'alice')
+    expect(db.queries).toEqual(['INSERT INTO subscriber (username, domain, password, ha1, ha1_sha256, ha1_sha512t256) VALUES ($1, $2, \'\', $3, $4, $5)'])
+    expect(await p.reconcileAccounts([{ extension: '101', userId: 'alice' }])).toEqual([])
+    expect(db.queries).toHaveLength(1)
   })
 
   it('needs a realm and a database', () => {
@@ -109,7 +119,7 @@ if (process.env.TEST_DATABASE_URL) {
       await p.setSipSecret('101', 'first')
       await p.setSipSecret('101', 'second')
       await p.setSipSecret('102', 'other')
-      const { rows } = await pool.query('SELECT username, domain, password, ha1 FROM subscriber ORDER BY username')
+      const { rows } = await pool.query("SELECT username, domain, password, ha1 FROM subscriber WHERE domain = '' ORDER BY username")
       expect(rows).toEqual([
         { username: '101', domain: '', password: '', ha1: digestHashes('101', 'sip.example.test', 'second').ha1 },
         { username: '102', domain: '', password: '', ha1: digestHashes('102', 'sip.example.test', 'other').ha1 }
@@ -117,13 +127,48 @@ if (process.env.TEST_DATABASE_URL) {
       const version = await pool.query("SELECT table_version FROM version WHERE table_name = 'subscriber'")
       expect(version.rows[0]).toEqual({ table_version: SUBSCRIBER_TABLE_VERSION })
       await p.removeSipSecret('101')
-      expect((await pool.query('SELECT username FROM subscriber')).rows).toEqual([{ username: '102' }])
+      expect((await pool.query("SELECT username FROM subscriber WHERE domain = ''")).rows).toEqual([{ username: '102' }])
+    })
+
+    it('removes only the accounts it wrote whose holder no longer holds the extension, within a bound, never on an empty mapping', async () => {
+      // A subscriber table from before the holder column, with an account written by hand; in a schema of its own:
+      // the other specs use the same database at the same time.
+      await pool.query('DROP SCHEMA IF EXISTS spec_holder CASCADE; CREATE SCHEMA spec_holder')
+      const own = new pg.Pool({ connectionString: process.env.TEST_DATABASE_URL, max: 1, options: '-c search_path=spec_holder' })
+      await own.query("CREATE TABLE subscriber (id SERIAL PRIMARY KEY NOT NULL, username VARCHAR(64) DEFAULT '' NOT NULL, domain VARCHAR(64) DEFAULT '' NOT NULL, password VARCHAR(25) DEFAULT '' NOT NULL, ha1 VARCHAR(64) DEFAULT '' NOT NULL, ha1_sha256 VARCHAR(64) DEFAULT '' NOT NULL, ha1_sha512t256 VARCHAR(64) DEFAULT '' NOT NULL, CONSTRAINT subscriber_account_idx UNIQUE (username, domain))")
+      await own.query("INSERT INTO subscriber (username, domain) VALUES ('9000', 'spec-holder')")
+      const warnings: string[] = []
+      const p = new SubscriberProvisioner({ pool: own, realm: 'sip.example.test', domain: 'spec-holder', logger: { warn: m => warnings.push(m) }, accountsRemoved: { min: 2, ratio: 0.25 } })
+      await p.ensureSchema()
+      const accounts = async () => (await own.query('SELECT username, holder FROM subscriber ORDER BY username')).rows
+      for (const [extension, holder] of [['101', 'alice'], ['102', 'bob'], ['103', 'carol'], ['104', 'dan']]) await p.setSipSecret(extension!, 'pw', holder)
+      // Nothing is removed on an empty mapping: a directory that answered nothing is not everybody leaving.
+      expect(await p.reconcileAccounts([])).toEqual([])
+      expect(warnings.pop()).toMatch(/mapping is empty, no account removed/)
+      expect(await accounts()).toHaveLength(5)
+      // 102 nobody holds, 103 is erin's now: carol's account goes; 9000 (written by hand) stays.
+      expect(await p.reconcileAccounts([{ extension: '101', userId: 'alice' }, { extension: '103', userId: 'erin' }, { extension: '104', userId: 'dan' }])).toEqual(['102', '103'])
+      expect(warnings.pop()).toBe('OpenSIPS accounts: 2 removed, no longer held (102, 103)')
+      expect(await accounts()).toEqual([
+        { username: '101', holder: 'alice' },
+        { username: '104', holder: 'dan' },
+        { username: '9000', holder: null }
+      ])
+      // Erin's session writes 103 for her: the next reconciliation keeps it.
+      await p.setSipSecret('103', 'pw', 'erin')
+      expect(await p.reconcileAccounts([{ extension: '101', userId: 'alice' }, { extension: '103', userId: 'erin' }, { extension: '104', userId: 'dan' }])).toEqual([])
+      // A mapping that answered short (three accounts no longer held, more than max(2, a quarter of 3)): none removed.
+      expect(await p.reconcileAccounts([{ extension: '999', userId: 'zoe' }])).toEqual([])
+      expect(warnings.pop()).toBe('OpenSIPS accounts: 3 accounts no longer held, more than 2 at once: none removed (a directory that answered short?)')
+      expect(await accounts()).toHaveLength(4)
+      await own.end()
+      await pool.query('DROP SCHEMA spec_holder CASCADE')
     })
 
     it('adds caller, callee and dialled to an acc table OpenSIPS created without them', async () => {
       await pool.query('DROP TABLE IF EXISTS acc; CREATE TABLE acc (id SERIAL PRIMARY KEY NOT NULL, callid VARCHAR(64) DEFAULT \'\' NOT NULL, time TIMESTAMP WITHOUT TIME ZONE NOT NULL)')
       await new SubscriberProvisioner({ pool, realm: 'sip.example.test' }).ensureSchema()
-      const { rows } = await pool.query("SELECT column_name FROM information_schema.columns WHERE table_name = 'acc' AND column_name IN ('caller', 'callee', 'dialled') ORDER BY column_name")
+      const { rows } = await pool.query("SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'acc' AND column_name IN ('caller', 'callee', 'dialled') ORDER BY column_name")
       expect(rows.map(r => r.column_name)).toEqual(['callee', 'caller', 'dialled'])
       // Recreated whole by the next ensureSchema.
       await pool.query('DROP TABLE acc')

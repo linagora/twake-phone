@@ -39,14 +39,14 @@ export class SipSecrets {
     const secret = decrypt(stored.secretEnc, this.opts.key)
     // Provisioned again each time (an idempotent upsert): a user moved to another extension, or a PBX whose
     // account table was recreated, gets the hashes back without a new secret.
-    await this.opts.provisioner.setSipSecret(extension, secret)
+    await this.opts.provisioner.setSipSecret(extension, secret, userId)
     return secret
   }
 
   private async create(tenantId: string, userId: string, extension: string) {
     const secret = generateSecret()
     // Provision first: a secret stored but unknown to the PBX would lock the user out.
-    await this.opts.provisioner.setSipSecret(extension, secret)
+    await this.opts.provisioner.setSipSecret(extension, secret, userId)
     await this.opts.store.setSipSecret(tenantId, userId, encrypt(secret, this.opts.key))
     return secret
   }

@@ -1,8 +1,5 @@
-import { asteriskProviderFactory } from '@twake/provider-asterisk'
 import type { ProviderFactory, TelephonyProvider } from '@twake/telephony-provider-sdk'
 import type { ProviderRecord } from './store/types.js'
-
-const defaultFactories: ProviderFactory<any>[] = [asteriskProviderFactory]
 
 /** Resolves the provider of a tenant (one per tenant and site; sites are not routed yet). */
 export class ProviderRegistry {
@@ -13,9 +10,15 @@ export class ProviderRegistry {
 
   constructor(
     private readonly records: ProviderRecord[],
-    factories: ProviderFactory<any>[] = defaultFactories
+    factories: ProviderFactory<any>[] = []
   ) {
     for (const f of factories) this.factories.set(f.type, f)
+  }
+
+  /** Whether the tenant has a provider this Gateway can build. */
+  serves(tenantId: string): boolean {
+    const record = this.records.find(r => r.tenantId === tenantId)
+    return !!record && this.factories.has(record.type)
   }
 
   forTenant(tenantId: string): TelephonyProvider {
@@ -32,9 +35,18 @@ export class ProviderRegistry {
     return provider
   }
 
-  /** Instantiates every configured provider (so event streams run before the first request). */
-  startAll() {
-    for (const r of this.records) this.forTenant(r.tenantId)
+  /**
+   * Instantiates every configured provider (so event streams run before the first request). A record of a type
+   * no factory builds (an `asterisk` one, from before step 4c) is reported and skipped: its tenant has no provider.
+   */
+  startAll(warn: (message: string) => void = console.warn) {
+    for (const r of this.records) {
+      if (!this.factories.has(r.type)) {
+        warn(`Tenant ${r.tenantId}: no provider of type "${r.type}" in this Gateway; remove or replace its provider_configs row`)
+        continue
+      }
+      this.forTenant(r.tenantId)
+    }
   }
 
   async closeAll() {

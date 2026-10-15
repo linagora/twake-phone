@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto'
 import pg from 'pg'
 import type { SecretProvisioner } from '@twake/telephony-provider-sdk'
+import { CALL_GROUPS_SCHEMA, CallGroups, DISPLAY_NAMES_SCHEMA, type CallGroupsOptions } from './call-groups.js'
 import { CALL_RULES_SCHEMA, CallRules, type CallRulesOptions } from './call-rules.js'
 
 // Everything about OpenSIPS's `subscriber` table (module auth_db) lives here: the Gateway only sees a SecretProvisioner.
@@ -25,8 +26,10 @@ export const digestHashes = (username: string, realm: string, secret: string) =>
 /**
  * The schema OpenSIPS 3.6 ships for PostgreSQL (`subscriber` of auth_db; `acc` and `missed_calls` of acc, the
  * CDRs, with the caller, the extension the call reached and the one dialled as extra columns), plus the rows of the
- * `version` table it checks at startup, and our own `call_rules` (forwards and "do not disturb", read by the script
- * through sqlops: no version row, OpenSIPS does not check it). Tables created beforehand (by OpenSIPS's own scripts,
+ * `version` table it checks at startup, and our own tables, read by the script through sqlops (no version row,
+ * OpenSIPS does not check them): `call_rules` (forwards and "do not disturb"), `call_groups` (simultaneous ring
+ * groups) and `display_names` (the directory name of each extension). `subscriber` has one column OpenSIPS does not
+ * read, `holder`: who the Gateway wrote the account for (NULL for a row it did not write). Tables created beforehand (by OpenSIPS's own scripts,
  * or by an earlier version of this schema) lack columns (EXTRA_COLUMNS): `ensureSchema()` adds those that are
  * missing, or every CDR insert, or every write of the rules, would fail.
  */
@@ -44,6 +47,7 @@ CREATE TABLE IF NOT EXISTS subscriber (
     ha1 VARCHAR(64) DEFAULT '' NOT NULL,
     ha1_sha256 VARCHAR(64) DEFAULT '' NOT NULL,
     ha1_sha512t256 VARCHAR(64) DEFAULT '' NOT NULL,
+    holder TEXT,
     CONSTRAINT subscriber_account_idx UNIQUE (username, domain)
 );
 CREATE INDEX IF NOT EXISTS subscriber_username_idx ON subscriber (username);
@@ -86,15 +90,17 @@ CREATE TABLE IF NOT EXISTS missed_calls (
 CREATE INDEX IF NOT EXISTS missed_calls_callid_idx ON missed_calls (callid);
 INSERT INTO version (table_name, table_version) VALUES ('acc', ${ACC_TABLE_VERSION}), ('missed_calls', ${MISSED_CALLS_TABLE_VERSION})
   ON CONFLICT (table_name) DO NOTHING;
-${CALL_RULES_SCHEMA}`
+${CALL_RULES_SCHEMA}${CALL_GROUPS_SCHEMA}${DISPLAY_NAMES_SCHEMA}`
 
 const ACC_EXTRA = "VARCHAR(64) DEFAULT '' NOT NULL"
 /**
  * The columns an existing table may lack: those of `acc` and `missed_calls` that OpenSIPS's own scripts do not create
- * (the acc extras of opensips.cfg.tpl), and those `call_rules` gained after its first version (the holders; an older
- * row gets an empty tenant, and the first reconcile drops it).
+ * (the acc extras of opensips.cfg.tpl), those `call_rules` gained after its first version (the holders; an older
+ * row gets an empty tenant, and the first reconcile drops it), and the holder of a `subscriber` row (an older row has
+ * none: it is never removed, until the session of its holder writes it again).
  */
 export const EXTRA_COLUMNS = [
+  ['subscriber', 'holder', 'TEXT'],
   ['acc', 'caller', ACC_EXTRA],
   ['acc', 'callee', ACC_EXTRA],
   ['acc', 'dialled', ACC_EXTRA],
@@ -124,6 +130,14 @@ const ALTER_LOCK_TIMEOUT = '2s'
  */
 export const DEFAULT_QUERY_TIMEOUT_MS = 5_000
 
+/**
+ * The bound of a reconciliation of the accounts: it removes at most max(ACCOUNTS_REMOVED_MIN, a quarter of the
+ * accounts the Gateway wrote) at once. More is taken for a directory that answered short (a filter, a page lost),
+ * not for people who left: nothing is removed, and it is logged.
+ */
+export const ACCOUNTS_REMOVED_MIN = 10
+export const ACCOUNTS_REMOVED_RATIO = 0.25
+
 /** What the provisioner needs to run queries: a pg Pool, or anything with the same `query` (and `connect`). */
 export interface Queryable {
   query(text: string, values?: unknown[]): Promise<unknown>
@@ -143,6 +157,8 @@ export interface SubscriberProvisionerOptions {
   logger?: { warn(message: string): void }
   /** Bound of each query and of each connection of the pool it opens (not of a `pool` given). */
   queryTimeoutMs?: number
+  /** The bound of a reconciliation of the accounts (ACCOUNTS_REMOVED_MIN and ACCOUNTS_REMOVED_RATIO by default). */
+  accountsRemoved?: { min: number; ratio: number }
 }
 
 /**
@@ -155,6 +171,9 @@ export class SubscriberProvisioner implements SecretProvisioner {
   private readonly realm: string
   private readonly domain: string
   private readonly log: { warn(message: string): void }
+  private readonly removedBound: { min: number; ratio: number }
+  /** Whether `subscriber` has its `holder` column (one that could not be added: accounts written without, none removed). */
+  private holderColumn = true
 
   constructor(opts: SubscriberProvisionerOptions) {
     if (!opts.realm) throw new Error('SubscriberProvisioner needs the SIP realm')
@@ -174,6 +193,7 @@ export class SubscriberProvisioner implements SecretProvisioner {
     this.realm = opts.realm
     this.domain = opts.domain ?? ''
     this.log = opts.logger ?? console
+    this.removedBound = opts.accountsRemoved ?? { min: ACCOUNTS_REMOVED_MIN, ratio: ACCOUNTS_REMOVED_RATIO }
   }
 
   /**
@@ -188,10 +208,16 @@ export class SubscriberProvisioner implements SecretProvisioner {
       [[...new Set(EXTRA_COLUMNS.map(c => c[0]))], [...new Set(EXTRA_COLUMNS.map(c => c[1]))]]
     )) as { rows: { table_name: string; column_name: string }[] }
     const missing = EXTRA_COLUMNS.filter(([table, column]) => !present.some(r => r.table_name === table && r.column_name === column))
+    this.holderColumn = !missing.some(([table, column]) => table === 'subscriber' && column === 'holder')
     if (missing.length) {
-      await this.addColumns(missing).catch(err =>
-        this.log.warn(`OpenSIPS tables: could not add ${missing.map(([t, c]) => `${t}.${c}`).join(', ')} (${err instanceof Error ? err.message : String(err)}); CDRs or call rules will not be written until they exist`)
+      const added = await this.addColumns(missing).then(
+        () => true,
+        err => {
+          this.log.warn(`OpenSIPS tables: could not add ${missing.map(([t, c]) => `${t}.${c}`).join(', ')} (${err instanceof Error ? err.message : String(err)}); CDRs, call rules or the removal of accounts no longer held will not be written until they exist`)
+          return false
+        }
       )
+      if (added) this.holderColumn = true
     }
     const { rows } = (await this.pool.query("SELECT table_name, table_version FROM version WHERE table_name IN ('subscriber', 'acc', 'missed_calls')")) as { rows: { table_name: string; table_version: number }[] }
     for (const [table, expected] of [['subscriber', SUBSCRIBER_TABLE_VERSION], ['acc', ACC_TABLE_VERSION], ['missed_calls', MISSED_CALLS_TABLE_VERSION]] as const) {
@@ -217,13 +243,25 @@ export class SubscriberProvisioner implements SecretProvisioner {
     }
   }
 
-  async setSipSecret(extension: string, secret: string) {
+  /**
+   * Writes the account of an extension, for its holder (the Gateway's user id): the reconciliation removes it once
+   * that user no longer holds the extension.
+   */
+  async setSipSecret(extension: string, secret: string, holder?: string) {
     if (!/^[A-Za-z0-9._+-]{1,64}$/.test(extension)) throw Object.assign(new Error('Extension is not a valid SIP user'), { statusCode: 400 })
     const { ha1, ha1Sha256, ha1Sha512t256 } = digestHashes(extension, this.realm, secret)
+    if (!this.holderColumn) {
+      await this.pool.query(
+        `INSERT INTO subscriber (username, domain, password, ha1, ha1_sha256, ha1_sha512t256) VALUES ($1, $2, '', $3, $4, $5)
+         ON CONFLICT (username, domain) DO UPDATE SET ha1 = EXCLUDED.ha1, ha1_sha256 = EXCLUDED.ha1_sha256, ha1_sha512t256 = EXCLUDED.ha1_sha512t256`,
+        [extension, this.domain, ha1, ha1Sha256, ha1Sha512t256]
+      )
+      return
+    }
     await this.pool.query(
-      `INSERT INTO subscriber (username, domain, password, ha1, ha1_sha256, ha1_sha512t256) VALUES ($1, $2, '', $3, $4, $5)
-       ON CONFLICT (username, domain) DO UPDATE SET ha1 = EXCLUDED.ha1, ha1_sha256 = EXCLUDED.ha1_sha256, ha1_sha512t256 = EXCLUDED.ha1_sha512t256`,
-      [extension, this.domain, ha1, ha1Sha256, ha1Sha512t256]
+      `INSERT INTO subscriber (username, domain, password, ha1, ha1_sha256, ha1_sha512t256, holder) VALUES ($1, $2, '', $3, $4, $5, $6)
+       ON CONFLICT (username, domain) DO UPDATE SET ha1 = EXCLUDED.ha1, ha1_sha256 = EXCLUDED.ha1_sha256, ha1_sha512t256 = EXCLUDED.ha1_sha512t256, holder = EXCLUDED.holder`,
+      [extension, this.domain, ha1, ha1Sha256, ha1Sha512t256, holder ?? null]
     )
   }
 
@@ -233,11 +271,55 @@ export class SubscriberProvisioner implements SecretProvisioner {
   }
 
   /**
+   * Removes the accounts the Gateway wrote (a holder) whose holder no longer holds the extension: nobody holds it,
+   * or someone else (their session writes it again, for them). A row it did not write (no holder: by hand, or from
+   * before the column) is never touched. An empty mapping removes nothing (a directory that answered nothing is not
+   * everybody leaving), nor does one that would remove more than the bound (see ACCOUNTS_REMOVED_MIN): both logged.
+   * One statement: an account written meanwhile for its holder stays. Returns the extensions removed.
+   */
+  async reconcileAccounts(holders: { extension: string; userId: string }[]): Promise<string[]> {
+    if (!this.holderColumn) return []
+    if (holders.length === 0) {
+      this.log.warn('OpenSIPS accounts: the mapping is empty, no account removed')
+      return []
+    }
+    const { rows } = (await this.pool.query(
+      `WITH stale AS (
+         SELECT s.id FROM subscriber s
+         WHERE s.domain = $3 AND s.holder IS NOT NULL
+           AND NOT EXISTS (SELECT 1 FROM unnest($1::text[], $2::text[]) AS m(extension, holder) WHERE m.extension = s.username AND m.holder = s.holder)
+       ), bound AS (
+         SELECT greatest($4::int, floor(count(*) * $5::float8)::int) AS n FROM subscriber WHERE domain = $3 AND holder IS NOT NULL
+       ), gone AS (
+         DELETE FROM subscriber s
+         WHERE s.id IN (SELECT id FROM stale) AND (SELECT count(*) FROM stale) <= (SELECT n FROM bound)
+           AND s.domain = $3 AND s.holder IS NOT NULL
+           AND NOT EXISTS (SELECT 1 FROM unnest($1::text[], $2::text[]) AS m(extension, holder) WHERE m.extension = s.username AND m.holder = s.holder)
+         RETURNING s.username
+       )
+       SELECT (SELECT count(*) FROM stale)::int AS stale, (SELECT n FROM bound) AS bound, coalesce((SELECT array_agg(username ORDER BY username) FROM gone), '{}') AS removed`,
+      [holders.map(h => h.extension), holders.map(h => h.userId), this.domain, this.removedBound.min, this.removedBound.ratio]
+    )) as { rows: { stale: number; bound: number; removed: string[] }[] }
+    const { stale, bound, removed } = rows[0]!
+    if (stale > bound) {
+      this.log.warn(`OpenSIPS accounts: ${stale} accounts no longer held, more than ${bound} at once: none removed (a directory that answered short?)`)
+      return []
+    }
+    if (removed.length) this.log.warn(`OpenSIPS accounts: ${removed.length} removed, no longer held (${removed.join(', ')})`)
+    return removed
+  }
+
+  /**
    * The `call_rules` of the same database, on the same connections: `ready` runs before each query (the schema
    * check), `tenantId` and `holderOf` say whose extensions these are (see CallRulesOptions).
    */
   callRules(opts: Omit<CallRulesOptions, 'pool'> = {}) {
     return new CallRules({ pool: this.pool, ...opts })
+  }
+
+  /** The `call_groups` and `display_names` of the same database, on the same connections (see CallGroupsOptions). */
+  callGroups(opts: Omit<CallGroupsOptions, 'pool'> = {}) {
+    return new CallGroups({ pool: this.pool, ...opts })
   }
 
   async close() {

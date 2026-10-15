@@ -1,6 +1,6 @@
-import type { Call, Capabilities, ConferenceParticipant, Contact, DialInConfiguration, ForwardingRules, MediaSession, Presence, PresenceStatus, TelephonyEvent } from '@twake/telephony-types'
+import type { Call, Capabilities, ConferenceParticipant, Contact, DialInConfiguration, ForwardingRules, MediaSession, Presence, PresenceStatus, RingGroup, TelephonyEvent } from '@twake/telephony-types'
 
-export type { Contact, ContactNumber, ForwardingRules } from '@twake/telephony-types'
+export type { Contact, ContactNumber, ForwardingRules, RingGroup } from '@twake/telephony-types'
 
 import { backoffDelay } from './backoff.js'
 
@@ -70,7 +70,8 @@ export interface SyncReport {
   updated: number
   unchanged: number
   removed: number
-  conflicts: { userId: string; extension: string; heldBy: string }[]
+  /** `group`: the person's extension is a ring group's number (`heldBy` is then empty). */
+  conflicts: { userId: string; extension: string; heldBy: string; group?: true }[]
   error?: string
 }
 
@@ -134,6 +135,27 @@ export class TelephonyClient {
   /** Starts copying the directory's accounts into the user ↔ extension mappings (409: already running); follow it with getDirectoryAdmin. */
   syncDirectory() {
     return this.request<DirectoryAdmin['sync']>('/admin/directory/sync', { method: 'POST' })
+  }
+
+  /** The ring groups of the organisation, for administrators (403 otherwise; 501: the PBX has none). */
+  listGroups() {
+    return this.request<{ items: RingGroup[] }>('/admin/groups')
+  }
+
+  /** Creates a group; refusals carry a `code` (GROUP_EXISTS when the organisation has one of that number, GROUP_NUMBER_TAKEN…). */
+  createGroup(group: RingGroup) {
+    const { number, name, members } = group
+    return this.request<RingGroup>('/admin/groups', { method: 'POST', body: JSON.stringify({ number, name, members }) })
+  }
+
+  /** Replaces the name and members of an existing group (404: there is none of that number). */
+  setGroup(group: RingGroup) {
+    const { number, name, members } = group
+    return this.request<RingGroup>(`/admin/groups/${encodeURIComponent(number)}`, { method: 'PUT', body: JSON.stringify({ name, members }) })
+  }
+
+  async deleteGroup(number: string) {
+    await this.request<void>(`/admin/groups/${encodeURIComponent(number)}`, { method: 'DELETE' })
   }
 
   getMediaSession() {

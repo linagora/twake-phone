@@ -1,14 +1,12 @@
 import { LiveKitConferenceBridge, MeetApi } from '@twake/conference-livekit'
-import { miniPbxProvisioner } from '@twake/provider-asterisk'
 import { buildApp } from './app.js'
 import { authenticatorFromEnv } from './auth.js'
 import { parseKey } from './crypto.js'
 import { StoreDirectory, parseUserMap } from './directory.js'
 import { DirectorySync, parseInterval } from './directory-sync.js'
 import { ldapDirectoryFromEnv } from './ldap-directory.js'
-import { storedAsteriskFactory, storedOpensipsFactory, type StoredAsteriskConfig, type StoredOpensipsConfig } from './providers.js'
+import { storedOpensipsFactory, type StoredOpensipsConfig } from './providers.js'
 import { ProviderRegistry } from './registry.js'
-import { SipSecrets } from './sip-secrets.js'
 import { PgStore } from './store/pg.js'
 
 const env = process.env
@@ -28,17 +26,6 @@ await store.migrate()
 
 // Bootstrap of a single-tenant dev stack from the environment. It never overwrites configuration already in the database.
 const tenant = env.DEFAULT_TENANT ?? 'default'
-if (env.BOOTSTRAP_PROVIDER_URL && !(await store.listProviders()).some(p => p.tenantId === tenant)) {
-  const config: StoredAsteriskConfig = {
-    ari: { url: env.BOOTSTRAP_PROVIDER_URL, user: env.ARI_USER ?? 'twake', passwordRef: 'env:ARI_PASSWORD', ...(env.ARI_APP ? { app: env.ARI_APP } : {}) },
-    websocketUrl: need('PBX_WSS_URL'),
-    ...(env.ASTERISK_TRUNK_ENDPOINT ? { trunkEndpoint: env.ASTERISK_TRUNK_ENDPOINT } : {}),
-    ...(env.ASTERISK_EXTERNAL_CONTEXT ? { externalDial: { context: env.ASTERISK_EXTERNAL_CONTEXT, ...(env.ASTERISK_EXTERNAL_E164_PREFIX ? { e164Prefix: env.ASTERISK_EXTERNAL_E164_PREFIX } : {}), ...(env.ASTERISK_EXTERNAL_NATIONAL_PREFIX ? { nationalPrefix: env.ASTERISK_EXTERNAL_NATIONAL_PREFIX } : {}) } } : {}),
-    ...(env.ASTERISK_ORIGINATE_CONTEXT ? { originateContext: env.ASTERISK_ORIGINATE_CONTEXT } : {}),
-    ...(env.PBX_PROVISION_URL ? { provisioning: { url: env.PBX_PROVISION_URL, tokenRef: 'env:TWAKE_PROVISION_TOKEN' } } : { staticSipSecretRef: 'env:DEV_SIP_SECRET' })
-  }
-  await store.upsertProvider({ tenantId: tenant, type: 'asterisk', config })
-}
 // OpenSIPS (step 3): the SIP server the browsers register to. OPENSIPS_WS_URL is public; the accounts live in the
 // `subscriber` table of OPENSIPS_DB_URL (the Gateway's own database when unset); SIP_DOMAIN defaults to the WS host.
 // Step 4: OPENSIPS_MI_URL (`udp:host:port` of mi_datagram) is where the Gateway subscribes to the events, delivered
@@ -47,7 +34,6 @@ if (env.BOOTSTRAP_PROVIDER_URL && !(await store.listProviders()).some(p => p.ten
 // accepted from the MI host and OPENSIPS_EVENTS_FROM (comma-separated IPv4 addresses or names): event_datagram
 // sends from the address its kernel picks for the route, not always the MI one. These variables only seed the
 // tenant's provider when the database has none; a stored one is not read again (see the README).
-if (env.OPENSIPS_WS_URL && env.BOOTSTRAP_PROVIDER_URL) console.warn(`Both BOOTSTRAP_PROVIDER_URL and OPENSIPS_WS_URL are set: tenant ${tenant} keeps the provider already in the database, Asterisk when neither was`)
 const eventsFrom = (env.OPENSIPS_EVENTS_FROM ?? '').split(',').map(s => s.trim()).filter(Boolean)
 if (env.OPENSIPS_WS_URL && !(await store.listProviders()).some(p => p.tenantId === tenant)) {
   const config: StoredOpensipsConfig = {
@@ -72,12 +58,8 @@ if (env.OPENSIPS_WS_URL && !(await store.listProviders()).some(p => p.tenantId =
 for (const m of parseUserMap(env.DEV_USER_MAP)) if (!(await store.getMappingByUser(tenant, m.userId))) await store.upsertMapping({ tenantId: tenant, ...m })
 
 const key = env.SECRETS_KEY ? parseKey(env.SECRETS_KEY) : undefined
-const secretsFor = key ? (url: string, token: string) => new SipSecrets({ store, key, provisioner: miniPbxProvisioner({ url, token }) }) : undefined
 
-const registry = new ProviderRegistry(await store.listProviders(), [
-  storedAsteriskFactory({ store, ...(secretsFor ? { secretsFor } : {}) }),
-  storedOpensipsFactory({ store, ...(key ? { key } : {}) })
-])
+const registry = new ProviderRegistry(await store.listProviders(), [storedOpensipsFactory({ store, ...(key ? { key } : {}) })])
 
 // Meet phone access: one LiveKit for the deployment, enabled when its API credentials are given.
 const conference = env.LIVEKIT_API_KEY && env.LIVEKIT_API_SECRET && env.LIVEKIT_URL
@@ -107,7 +89,13 @@ const conference = env.LIVEKIT_API_KEY && env.LIVEKIT_API_SECRET && env.LIVEKIT_
 const contacts = ldapDirectoryFromEnv(env, message => console.warn(`WARNING: ${message}`))
 // The accounts of the directory become user ↔ extension mappings, on a schedule (LDAP_SYNC_INTERVAL, "0" to disable)
 // and on demand from the administration screen. Only when the schema says which attribute holds the extension.
-const directorySync = contacts && env.LDAP_ATTR_EXTENSION ? new DirectorySync({ store, directory: contacts, tenantId: env.LDAP_TENANT ?? tenant }) : undefined
+// A group's number is never given to someone: the synchronisation reads the tenant's groups first (ADR 0014).
+const groupNumbers = async (tenantId: string) => {
+  if (!registry.serves(tenantId)) return []
+  const provider = registry.forTenant(tenantId)
+  return provider.listGroups ? (await provider.listGroups()).map(g => g.number) : []
+}
+const directorySync = contacts && env.LDAP_ATTR_EXTENSION ? new DirectorySync({ store, directory: contacts, tenantId: env.LDAP_TENANT ?? tenant, reserved: groupNumbers }) : undefined
 const hstsMaxAge = env.HSTS_MAX_AGE ? Number(env.HSTS_MAX_AGE) : undefined
 if (hstsMaxAge !== undefined && !(Number.isInteger(hstsMaxAge) && hstsMaxAge >= 0)) throw new Error('HSTS_MAX_AGE must be a number of seconds')
 const app = await buildApp(registry, {

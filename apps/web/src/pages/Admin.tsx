@@ -3,6 +3,7 @@ import type { DirectoryAdmin, SyncReport } from '@twake/telephony-client'
 import { useGateway } from '../gateway.js'
 import type { Key } from '../i18n/index.js'
 import { useT } from '../i18n/useT.js'
+import { RingGroups } from './RingGroups.js'
 
 type T = (key: Key, params?: Record<string, string | number>) => string
 
@@ -41,7 +42,7 @@ const Report = ({ report }: { report: SyncReport }) => {
       {report.conflicts.length ? (
         <ul className="list">
           {report.conflicts.map(c => (
-            <li key={`${c.userId}:${c.extension}`}>{t('admin.conflict', c)}</li>
+            <li key={`${c.userId}:${c.extension}`}>{t(c.group ? 'admin.conflictGroup' : 'admin.conflict', { userId: c.userId, extension: c.extension, heldBy: c.heldBy })}</li>
           ))}
         </ul>
       ) : null}
@@ -49,7 +50,7 @@ const Report = ({ report }: { report: SyncReport }) => {
   )
 }
 
-/** The directory source and its synchronisation into the extensions. Administrators only; the Gateway decides who. */
+/** The directory source and its synchronisation into the extensions, and the ring groups. Administrators only; the Gateway decides who. */
 export const Admin = () => {
   const { t, lang } = useT()
   const { client, me, meError, refreshMe } = useGateway()
@@ -197,6 +198,7 @@ export const Admin = () => {
           )}
         </section>
       ) : null}
+      <RingGroups />
     </>
   )
 }
