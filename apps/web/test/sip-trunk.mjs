@@ -2,7 +2,8 @@
 // RFCs say, over UDP on this host. It is the registrar of the trunk (digest, 401) and challenges each call it is sent
 // (407, or 401 with `challenge: 'www'`); it answers the OPTIONS of OpenSIPS's dispatcher; it answers the calls OpenSIPS
 // sends it (100, 180, then 200 with G.711 A-law), or as the test asks for the next ones (`state.next`: refused at once,
-// after ringing, never answered, challenged for ever); it places calls to the trunk's direct numbers (with an offer,
+// after ringing, never answered, challenged for ever), a 100 Trying first as a real one sends at once, before its
+// challenge or its refusal too; it places calls to the trunk's direct numbers (with an offer,
 // or none: a late offer), sends re-INVITEs without SDP in either kind of call, and records every request it gets in a
 // dialog (REFER, re-INVITE, BYE...). Media both ways: an A-law tone over RTP out, the RTP received counted (sound,
 // and RFC 4733 events). `dead` plays a server that answers nothing at all. Behind a NAT (`nat`): what OpenSIPS
@@ -322,6 +323,8 @@ export const startOperator = async ({ opensips, user, password, realm = 'operato
           changed()
           break
         }
+        // As a real operator: 100 Trying at once, whatever comes next (a challenge, a refusal, the ringing).
+        await reply(msg, '100 Trying')
         const authHeader = challenge === 'www' ? one(msg, 'authorization') : one(msg, 'proxy-authorization')
         if (behaviour?.rejectAuth || !authorized(authHeader, 'INVITE')) {
           if (behaviour?.rejectAuth && authHeader) state.next.shift()
@@ -332,7 +335,7 @@ export const startOperator = async ({ opensips, user, password, realm = 'operato
         }
         if (behaviour) state.next.shift()
         const tag = token()
-        const call = { invite: msg, tag, sessionId: Date.now(), media: await media(), far: remoteMedia(msg.body), events: msg.body ? eventsOf(msg.body) : 101, state: 'ringing', reinvites: [], requests: [] }
+        const call = { invite: msg, tag, sessionId: Date.now(), media: await media(), far: remoteMedia(msg.body), events: msg.body ? eventsOf(msg.body) : 101, state: 'ringing', reinvites: [], requests: [], acks: [] }
         // As the UAS of this dialog: our tag in the To, the route set as received, the far end at its Contact.
         Object.assign(call, { callId, local: `${one(msg, 'to')};tag=${tag}`, remote: one(msg, 'from'), route: routeSet(msg), remoteTarget: /<([^>]+)>/.exec(one(msg, 'contact'))?.[1] })
         dialogs.set(callId, call)
@@ -345,7 +348,6 @@ export const startOperator = async ({ opensips, user, password, realm = 'operato
           changed()
           break
         }
-        await reply(msg, '100 Trying')
         await reply(msg, '180 Ringing', { toTag: tag })
         if (behaviour?.ringOnly) break
         setTimeout(async () => {
@@ -368,11 +370,13 @@ export const startOperator = async ({ opensips, user, password, realm = 'operato
       case 'ACK': {
         // The answer to an offer we made in a 2xx (a call OpenSIPS sent us without SDP).
         const call = dialogs.get(callId)
+        call?.acks.push(msg)
         const far = remoteMedia(msg.body)
         if (call && far) {
           call.far = far
           call.media.start(far)
         }
+        changed()
         break
       }
       case 'CANCEL': {

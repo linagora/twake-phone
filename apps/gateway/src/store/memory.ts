@@ -208,6 +208,10 @@ export class MemoryStore implements Store {
     else this.trunks.push(copy)
   }
 
+  async upsertTrunks(records: TrunkRecord[]) {
+    for (const r of records) await this.upsertTrunk(r)
+  }
+
   async deleteTrunk(tenantId: string, id: string) {
     const before = this.trunks.length
     this.trunks = this.trunks.filter(t => !(t.tenantId === tenantId && t.id === id))

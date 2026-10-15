@@ -303,11 +303,26 @@ export class PgStore implements Store {
   }
 
   async upsertTrunk(t: TrunkRecord) {
-    await this.pool.query(
-      `INSERT INTO trunk_configs (tenant_id, id, config, password_enc) VALUES ($1, $2, $3, $4)
-       ON CONFLICT (tenant_id, id) DO UPDATE SET config = EXCLUDED.config, password_enc = EXCLUDED.password_enc`,
-      [t.tenantId, t.id, JSON.stringify(t.config), t.passwordEnc ?? null]
-    )
+    await this.upsertTrunks([t])
+  }
+
+  async upsertTrunks(records: TrunkRecord[]) {
+    const client = await this.pool.connect()
+    try {
+      await client.query('BEGIN')
+      for (const t of records)
+        await client.query(
+          `INSERT INTO trunk_configs (tenant_id, id, config, password_enc) VALUES ($1, $2, $3, $4)
+           ON CONFLICT (tenant_id, id) DO UPDATE SET config = EXCLUDED.config, password_enc = EXCLUDED.password_enc`,
+          [t.tenantId, t.id, JSON.stringify(t.config), t.passwordEnc ?? null]
+        )
+      await client.query('COMMIT')
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => undefined)
+      throw err
+    } finally {
+      client.release()
+    }
   }
 
   async deleteTrunk(tenantId: string, id: string) {

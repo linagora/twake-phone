@@ -54,8 +54,6 @@ export const fakeOpensips = async () => {
     if (req.method === 'dlg_list') return reply({ result: state.dialogs })
     // The trunks (step 6): OpenSIPS reads its tables again.
     if (['ds_reload', 'reg_reload', 'dp_reload'].includes(req.method)) return reply({ result: 'OK' })
-    // A dialog ended by the MI (dlg_end_dlg, by its Call-ID).
-    if (req.method === 'dlg_end_dlg') return reply({ result: 'OK' })
     if (req.method === 'ul_rm') {
       // Removes the AOR from the location table, as OpenSIPS does (OK even when it is not there).
       const [, aor] = req.params as [string, string]

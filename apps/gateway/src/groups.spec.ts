@@ -32,6 +32,12 @@ describe('parseGroup', () => {
     await expect(parseGroup('200', null, ours)).rejects.toMatchObject({ statusCode: 400 })
   })
 
+  it('never takes an emergency number or another short number of the French plan: dialled, it goes to the operator', async () => {
+    for (const number of ['15', '17', '18', '112', '114', '115', '119', '191', '196', '197', '116000', '116117', '116006', '118218'])
+      await expect(parseGroup(number, { name: 'Urgences', members: ['101'] }, ours), number).rejects.toMatchObject({ statusCode: 400, code: 'GROUP_NUMBER_RESERVED' })
+    for (const number of ['16', '113', '1120', '116', '150']) await expect(parseGroup(number, { name: 'G', members: ['101'] }, ours), number).resolves.toMatchObject({ number })
+  })
+
   it('takes 12 members, what one call of the SIP server rings, and refuses 13 before looking any up', async () => {
     const twelve = Array.from({ length: 12 }, (_, i) => String(300 + i))
     expect((await parseGroup('200', { name: 'G', members: twelve }, anyButGroup)).members).toEqual(twelve)
@@ -109,6 +115,10 @@ describe('ring group routes', () => {
     expect([res.statusCode, res.json().code]).toEqual([409, 'GROUP_NUMBER_TAKEN'])
     res = await app.inject({ method: 'POST', url: '/api/v1/admin/groups', headers: admin, payload: { number: '201', name: 'X', members: ['103'] } })
     expect([res.statusCode, res.json().code]).toEqual([400, 'GROUP_MEMBER_NOT_EXTENSION'])
+    // 115 (the social emergency number) is nobody's: the group is not made, the provider never sees it.
+    res = await app.inject({ method: 'POST', url: '/api/v1/admin/groups', headers: admin, payload: { number: '115', name: 'Accueil social', members: ['101'] } })
+    expect([res.statusCode, res.json().code]).toEqual([400, 'GROUP_NUMBER_RESERVED'])
+    expect(groups.has('115')).toBe(false)
     expect((await app.inject({ method: 'DELETE', url: '/api/v1/admin/groups/200', headers: admin })).statusCode).toBe(204)
     expect((await app.inject({ method: 'DELETE', url: '/api/v1/admin/groups/200', headers: admin })).statusCode).toBe(404)
     expect(groups.size).toBe(0)

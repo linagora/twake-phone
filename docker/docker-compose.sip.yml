@@ -69,8 +69,12 @@ services:
       # registration's binding, the Via and the Record-Route. The CI sets a TEST-NET one (192.0.2.10:5070) that the
       # simulated operator maps back to the socket. Empty: the socket's own address.
       TRUNK_ADVERTISE: ${TRUNK_ADVERTISE:-}
-      # A call with the operator ends by itself after this long (seconds, 60 to 86400), a BYE to both sides.
+      # A call with the operator ends by itself after this long (seconds, 60 to 86400), a BYE to both sides; an
+      # emergency call excepted.
       TRUNK_MAX_CALL_SEC: ${TRUNK_MAX_CALL_SEC:-14400}
+      # Every this long (seconds, 5 to 300), the phone in a call with the operator is sent an OPTIONS in the call: one
+      # that does not answer it any more (its page closed, put to sleep, its network gone) has the call ended.
+      CALL_PING_SEC: ${CALL_PING_SEC:-30}
     network_mode: host
     healthcheck:
       test: ["CMD-SHELL", "test -p /tmp/opensips_fifo"]

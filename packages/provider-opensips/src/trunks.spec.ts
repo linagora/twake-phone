@@ -3,8 +3,8 @@ import { createHash } from 'node:crypto'
 import pg from 'pg'
 import type { DidRange, Trunk } from '@twake/telephony-types'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { SUBSCRIBER_SCHEMA, SUBSCRIBER_SQL } from './subscriber.js'
-import { DEFAULT_TRUNK_SOCKET, TRUNK_SCHEMA, TRUNK_SQL, TrunkTables, codecFlags, projectTrunks, trunkSecret } from './trunks.js'
+import { SUBSCRIBER_SCHEMA, SUBSCRIBER_SQL, type Queryable } from './subscriber.js'
+import { DEFAULT_TRUNK_SOCKET, SOURCES_SET, TRUNK_SCHEMA, TRUNK_SQL, TrunkTables, codecFlags, projectTrunks, trunkSecret } from './trunks.js'
 
 // Fictional numbers only (ARCEP's ranges for fiction); the operator's names are reserved for documentation (RFC 2606).
 const OPERATOR: Trunk & { password: string } = {
@@ -38,14 +38,25 @@ describe('projectTrunks', () => {
   it("writes the operator's servers in order, probed, its other addresses only recognised, and the registration", () => {
     const p = projectTrunks([OPERATOR], DIDS, 'udp:192.0.2.1:5070')
     const ha1 = `0x${createHash('md5').update('0033199000100:operator.example:not-a-real-password').digest('hex')}`
-    expect(p.trunks).toEqual([['operator', 1, 0, 'sip.operator.example', 'international-00', 0, '0033199000100', ha1, 'operator.example', 'codec-strip-all codec-except-PCMA codec-except-PCMU codec-except-telephone-event', '+33199000100', 'sip:0033199000100@sip.operator.example', ',fixed,mobile,freephone,standard-rate,']])
+    expect(p.trunks).toEqual([['operator', 1, 0, 'sip.operator.example', 'international-00', 0, '0033199000100', ha1, 'operator.example', 'codec-strip-all codec-except-PCMA codec-except-PCMU codec-except-telephone-event', '+33199000100', 'sip:0033199000100@sip.operator.example', ',fixed,mobile,freephone,standard-rate,', '']])
     // The dispatcher tries the highest priority first (algorithm 8): the first server gets the calls, the second one
-    // takes over; the other addresses, inactive, last.
+    // takes over. The other addresses: in a set of their own that no call is sent to (ds_select_dst is only ever given
+    // a trunk's own set), never probed: with every server down, a call fails at once rather than going to one of them.
     expect(p.dispatcher).toEqual([
       [1, 'sip:sbc1.operator.example:5060', 'udp:192.0.2.1:5070', 0, 1, '1', 2, '', 'operator'],
       [1, 'sip:sbc2.operator.example', 'udp:192.0.2.1:5070', 0, 1, '1', 1, '', 'operator'],
-      [1, 'sip:192.0.2.10', 'udp:192.0.2.1:5070', 1, 0, '1', 0, '', 'operator']
+      [1 + SOURCES_SET, 'sip:192.0.2.10', 'udp:192.0.2.1:5070', 0, 0, '1', 0, '', 'operator']
     ])
+    const sets = (trunks: Trunk[]) => projectTrunks(trunks, [], DEFAULT_TRUNK_SOCKET).dispatcher.map(r => [r[0], r[1]])
+    expect(sets([OPERATOR, { ...OPERATOR, id: 'backup', proxies: ['192.0.2.20'], sources: ['192.0.2.21', '192.0.2.22'] }])).toEqual([
+      [1, 'sip:sbc1.operator.example:5060'],
+      [1, 'sip:sbc2.operator.example'],
+      [1001, 'sip:192.0.2.10'],
+      [2, 'sip:192.0.2.20'],
+      [1002, 'sip:192.0.2.21'],
+      [1002, 'sip:192.0.2.22']
+    ])
+    expect(() => projectTrunks(Array.from({ length: SOURCES_SET }, (_, i) => ({ ...OPERATOR, id: `t${i}` })), [], DEFAULT_TRUNK_SOCKET)).toThrow(/At most 999 trunks/)
     // Registered from the trunk socket, with no other address declared (ARCHITECTURE §13), through the first server.
     expect(p.registrant).toEqual([['sip:sip.operator.example', 'sip:sbc1.operator.example:5060', 'sip:0033199000100@sip.operator.example', '0033199000100', ha1, 'sip:0033199000100@192.0.2.1:5070', 600, 'udp:192.0.2.1:5070']])
     expect(p.dids).toEqual([
@@ -66,8 +77,20 @@ describe('projectTrunks', () => {
     const row = (t: Partial<Trunk>) => projectTrunks([{ ...OPERATOR, ...t }], [], DEFAULT_TRUNK_SOCKET).trunks[0]![12]
     expect(row({})).toBe(',fixed,mobile,freephone,standard-rate,')
     expect(row({ allowed: ['fixed', 'mobile', 'overseas'] })).toBe(',fixed,mobile,overseas,')
-    expect(row({ allowed: ['international'] })).toBe(',international,')
+    expect(row({ allowed: ['international'], countries: ['44'] })).toBe(',international,')
     for (const allowed of [['premium'], ['emergency'], ['fixed', 'Mobile']]) expect(() => row({ allowed: allowed as Trunk['allowed'] }), allowed.join()).toThrow(/allowed/)
+  })
+
+  it('calls abroad only the countries a trunk lists, never a whole world, France, its overseas or a code of no country', () => {
+    const row = (t: Partial<Trunk>) => projectTrunks([{ ...OPERATOR, ...t }], [], DEFAULT_TRUNK_SOCKET).trunks[0]![13]
+    expect(row({})).toBe('')
+    expect(row({ allowed: ['fixed', 'international'], countries: ['44', '32', '1'] })).toBe(',44,32,1,')
+    // `international` without countries would be every country: refused, as countries without it.
+    expect(() => row({ allowed: ['international'] })).toThrow(/countries/)
+    expect(() => row({ allowed: ['international'], countries: [] })).toThrow(/countries/)
+    expect(() => row({ countries: ['44'] })).toThrow(/countries/)
+    for (const c of ['33', '262', '590', '689', '870', '881', '882', '883', '979', '800', '808', '991', '0', '044', '+44', '1234', '', '4 4', "4'"])
+      expect(() => row({ allowed: ['international'], countries: [c] }), c).toThrow(/countries/)
   })
 
   it('binds the registration to the address OpenSIPS announces on the trunk socket, when it announces one', () => {
@@ -161,6 +184,65 @@ if (process.env.TEST_DATABASE_URL) {
       expect(dp.rows[0].n).toBeGreaterThan(10)
     })
 
+    it('writes trunks with sources and countries once, and nothing when they hold already', async () => {
+      const tables = new TrunkTables({ pool, ready, tenantId: 'spec-A', socket: 'udp:192.0.2.1:5070' })
+      const trunks = [
+        { ...OPERATOR, allowed: ['fixed' as const, 'international' as const], countries: ['44', '32'] },
+        { ...OPERATOR, id: 'backup', auth: 'ip' as const, proxies: ['192.0.2.20', '192.0.2.23'], sources: ['192.0.2.22', '192.0.2.21'] }
+      ]
+      expect(await tables.set(trunks, DIDS)).toEqual({ dispatcher: true, registrant: true })
+      expect(await tables.set(trunks, DIDS)).toEqual({ dispatcher: false, registrant: false })
+      expect((await pool.query('SELECT setid, destination, state, probe_mode FROM dispatcher ORDER BY setid, priority DESC, id')).rows).toEqual([
+        { setid: 1, destination: 'sip:sbc1.operator.example:5060', state: 0, probe_mode: 1 },
+        { setid: 1, destination: 'sip:sbc2.operator.example', state: 0, probe_mode: 1 },
+        { setid: 2, destination: 'sip:192.0.2.20', state: 0, probe_mode: 1 },
+        { setid: 2, destination: 'sip:192.0.2.23', state: 0, probe_mode: 1 },
+        { setid: 1001, destination: 'sip:192.0.2.10', state: 0, probe_mode: 0 },
+        { setid: 1002, destination: 'sip:192.0.2.22', state: 0, probe_mode: 0 },
+        { setid: 1002, destination: 'sip:192.0.2.21', state: 0, probe_mode: 0 }
+      ])
+      expect((await pool.query('SELECT id, countries FROM trunks ORDER BY position')).rows).toEqual([
+        { id: 'operator', countries: ',44,32,' },
+        { id: 'backup', countries: '' }
+      ])
+      // Removing a trunk takes its sources too.
+      expect(await tables.set([trunks[0]!], DIDS)).toEqual({ dispatcher: true, registrant: false })
+      expect((await pool.query('SELECT setid FROM dispatcher ORDER BY setid')).rows.map(r => r.setid)).toEqual([1, 1, 1001])
+      await tables.set([], [])
+      expect((await pool.query('SELECT count(*)::int AS n FROM dispatcher')).rows[0].n).toBe(0)
+    })
+
+    it('never lets two tenants write their first trunks at once: one of them is told another has them (409), never a 500', async () => {
+      // Each waits a moment once it has read whose trunks the database holds, as a slow writer would.
+      const slow = new pg.Pool({ connectionString: process.env.TEST_DATABASE_URL, max: 4, options: '-c search_path=spec_trunks' })
+      const delayed: Queryable = {
+        query: (text, values) => slow.query(text, values),
+        connect: async () => {
+          const c = await slow.connect()
+          return {
+            query: async (text: string, values?: unknown[]) => {
+              const r = await c.query(text, values)
+              if (text.includes('SELECT tenant_id FROM trunks WHERE tenant_id <> $1')) await new Promise(resolve => setTimeout(resolve, 300))
+              return r
+            },
+            release: () => c.release()
+          }
+        }
+      }
+      try {
+        const a = new TrunkTables({ pool: delayed, ready, tenantId: 'spec-A' })
+        const b = new TrunkTables({ pool: delayed, ready, tenantId: 'spec-B' })
+        const results = await Promise.allSettled([a.set([OPERATOR], []), b.set([{ ...OPERATOR, id: 'other' }], [])])
+        expect(results.filter(r => r.status === 'fulfilled')).toHaveLength(1)
+        const refused = results.find(r => r.status === 'rejected')
+        expect(refused?.status === 'rejected' && refused.reason).toMatchObject({ statusCode: 409, code: 'TRUNK_OTHER_TENANT' })
+        expect((await pool.query('SELECT DISTINCT tenant_id FROM trunks')).rows).toHaveLength(1)
+      } finally {
+        for (const t of ['spec-A', 'spec-B']) await new TrunkTables({ pool, ready, tenantId: t }).set([], [])
+        await slow.end()
+      }
+    })
+
     it('answers the queries of opensips.cfg.tpl: the direct number called, the trunk and number of a caller', async () => {
       const tables = new TrunkTables({ pool, ready, tenantId: 'spec-A' })
       await tables.set([OPERATOR, { ...OPERATOR, id: 'backup', auth: 'ip', defaultNumber: '+33199000200' }], DIDS)
@@ -187,6 +269,10 @@ if (process.env.TEST_DATABASE_URL) {
       expect(await outbound('102', '+331990001131')).toMatchObject({ internal: null })
       expect(await outbound('102', '112')).toMatchObject({ internal: null, presented: '+33199000100' })
       expect(await outbound('102', '')).toMatchObject({ internal: null })
+      // The countries of the trunk, for its international numbers.
+      await tables.set([{ ...OPERATOR, allowed: ['international'], countries: ['44'] }], DIDS)
+      expect(await outbound('101', '+442079460123')).toMatchObject({ allowed: ',international,', countries: ',44,' })
+      await tables.set([], [])
     })
 
     it("keeps each tenant to its own rows, and refuses trunks to a second tenant of the same database", async () => {

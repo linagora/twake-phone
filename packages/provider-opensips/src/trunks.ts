@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { TRUNK_OUTBOUND_CLASSES, TRUNK_OUTBOUND_DEFAULT, type DidRange, type Trunk } from '@twake/telephony-types'
+import { TRUNK_COUNTRY_EXCLUDED, TRUNK_OUTBOUND_CLASSES, TRUNK_OUTBOUND_DEFAULT, type DidRange, type Trunk } from '@twake/telephony-types'
 import { DIALPLAN_SQL } from './numbering.js'
 import type { Queryable } from './subscriber.js'
 
@@ -18,7 +18,9 @@ export const REGISTRANT_TABLE_VERSION = 3
 /**
  * OpenSIPS's own tables as its scripts create them, our two, and the numbering plan. `trunks`: one row per trunk,
  * with what the script needs for an outbound call (where, as whom, how numbers are written, which codecs, the number
- * presented by default, the kinds of numbers it may call as `,fixed,mobile,`) and `setid`, its set of `dispatcher`.
+ * presented by default, the kinds of numbers it may call as `,fixed,mobile,`, the country codes of the international
+ * ones as `,32,44,`) and `setid`, its set of `dispatcher` (its servers; the other addresses its calls may come from are
+ * in set `setid + SOURCES_SET`, which no call is ever sent to).
  * `dids`: the direct numbers, a range of E.164 numbers
  * of the same length, to an extension or group (`target`) or to the extension that ends with their last
  * `suffix_digits` digits. `tenant_id` is whose they are: OpenSIPS does not read it, and one tenant only may have trunks
@@ -86,6 +88,7 @@ CREATE TABLE IF NOT EXISTS trunks (
     reg_aor VARCHAR(255) DEFAULT '' NOT NULL
 );
 ALTER TABLE trunks ADD COLUMN IF NOT EXISTS allowed VARCHAR(128) DEFAULT ',${TRUNK_OUTBOUND_DEFAULT.join(',')},' NOT NULL;
+ALTER TABLE trunks ADD COLUMN IF NOT EXISTS countries VARCHAR(1024) DEFAULT '' NOT NULL;
 CREATE TABLE IF NOT EXISTS dids (
     id VARCHAR(64) PRIMARY KEY NOT NULL,
     tenant_id TEXT DEFAULT '' NOT NULL,
@@ -112,6 +115,13 @@ CREATE TABLE IF NOT EXISTS version (
 ${TRUNK_SCHEMA.trim()}
 `
 
+/**
+ * The set of `dispatcher` that holds the other addresses a trunk's calls may come from (`sources`): its own set plus
+ * this. ds_is_in_list() (the trunk socket's check) reads every set; ds_select_dst() is only ever asked for a trunk's own
+ * set: no call goes to a source, whatever state the dispatcher gives it.
+ */
+export const SOURCES_SET = 1000
+
 /** The UDP socket of OpenSIPS for the trunks (`udp:IP:PORT`): where it registers and sends from, never 5060 by default. */
 export const DEFAULT_TRUNK_SOCKET = 'udp:127.0.0.1:5070'
 
@@ -120,6 +130,7 @@ const SOCKET = /^udp:([0-9]{1,3}(?:\.[0-9]{1,3}){3}):(\d{1,5})$/
 const HOST_PORT = /^([A-Za-z0-9.-]+)(:\d{1,5})?$/
 const IP = /^[0-9]{1,3}(\.[0-9]{1,3}){3}$/
 const E164 = /^\+[1-9][0-9]{6,14}$/
+const COUNTRY = /^[1-9][0-9]{0,2}$/
 /** What may go into a SIP URI's user part or a quoted SQL literal here, and nothing else. */
 const SIP_USER = /^[A-Za-z0-9._+-]{1,64}$/
 
@@ -156,6 +167,8 @@ export const projectTrunks = (trunks: (Trunk & { password?: string })[], dids: D
   if (advertise !== undefined && !HOST_PORT.test(advertise)) throw new Error(`Trunk advertised address ${advertise} is not host[:port]`)
   const bindingHost = advertise ? (advertise.includes(':') ? advertise : `${advertise}:${s[2]}`) : `${s[1]}:${s[2]}`
   const out: Projection = { trunks: [], dids: [], dispatcher: [], registrant: [] }
+  // A trunk's set never reaches the sets of the sources.
+  if (trunks.length >= SOURCES_SET) throw invalid(`At most ${SOURCES_SET - 1} trunks`)
   trunks.forEach((t, position) => {
     if (!/^[a-z0-9][a-z0-9-]{0,31}$/.test(t.id)) throw invalid(`Trunk id ${t.id} is not valid`)
     if (!HOST_PORT.test(t.domain) || t.domain.includes(':')) throw invalid(`Trunk ${t.id}: domain is not a host name`)
@@ -173,12 +186,16 @@ export const projectTrunks = (trunks: (Trunk & { password?: string })[], dids: D
     const aor = register ? `sip:${username}@${t.domain}` : ''
     const allowed = t.allowed ?? TRUNK_OUTBOUND_DEFAULT
     if (!allowed.every(c => (TRUNK_OUTBOUND_CLASSES as readonly string[]).includes(c))) throw invalid(`Trunk ${t.id}: allowed is some of ${TRUNK_OUTBOUND_CLASSES.join(', ')}`)
-    out.trunks.push([t.id, setid, position, t.domain, t.numberFormat, t.assertIdentity ? 1 : 0, username, secret, t.realm ?? '', codecFlags(t.codecs), t.defaultNumber, aor, `,${allowed.join(',')},`])
+    const countries = t.countries ?? []
+    if (!countries.every(c => COUNTRY.test(c) && !TRUNK_COUNTRY_EXCLUDED.test(c))) throw invalid(`Trunk ${t.id}: countries are country codes of one to three digits, neither France nor its overseas ones, nor a code of no country`)
+    if (allowed.includes('international') !== countries.length > 0) throw invalid(`Trunk ${t.id}: international numbers are called to the countries listed only (countries), and countries go with international`)
+    out.trunks.push([t.id, setid, position, t.domain, t.numberFormat, t.assertIdentity ? 1 : 0, username, secret, t.realm ?? '', codecFlags(t.codecs), t.defaultNumber, aor, `,${allowed.join(',')},`, countries.length ? `,${countries.join(',')},` : ''])
     // The operator's servers, in order, each probed with OPTIONS (probe_mode 1): it keeps the NAT open towards each
     // (ARCHITECTURE §13). The dispatcher tries the highest priority first (algorithm 8): the first server has the
-    // highest. Its other addresses: inactive (never chosen), only recognised, at priority 0.
+    // highest. Its other addresses: in a set of their own that no call is sent to (SOURCES_SET), never probed, only
+    // recognised by the trunk socket.
     servers.forEach((p, i) => out.dispatcher.push([setid, `sip:${p}`, socket, 0, 1, '1', servers.length - i, '', t.id]))
-    for (const ip of t.sources ?? []) out.dispatcher.push([setid, `sip:${ip}`, socket, 1, 0, '1', 0, '', t.id])
+    for (const ip of t.sources ?? []) out.dispatcher.push([setid + SOURCES_SET, `sip:${ip}`, socket, 0, 0, '1', 0, '', t.id])
     if (register) {
       const registrar = `sip:${t.registrar ?? t.domain}`
       const proxy = t.proxies?.length ? `sip:${t.proxies[0]}` : null
@@ -207,6 +224,9 @@ export interface TrunkTablesOptions {
   advertise?: string
 }
 
+/** The rows of `dispatcher` of the tenant's trunks: their servers and their sources. */
+const OF_TENANT = `setid IN (SELECT setid FROM trunks WHERE tenant_id = $1 UNION ALL SELECT setid + ${SOURCES_SET} FROM trunks WHERE tenant_id = $1)`
+
 const sameRows = (a: unknown[][], b: unknown[][]) => JSON.stringify(a) === JSON.stringify(b)
 
 /** Writes the tenant's projection; says which of OpenSIPS's tables changed (the provider reloads only those). */
@@ -227,9 +247,9 @@ export class TrunkTables {
   private async current(q: Queryable): Promise<Projection> {
     const rows = async (text: string) => (((await q.query(text, [this.tenantId])) as { rows?: Record<string, unknown>[] } | undefined)?.rows ?? []).map(r => Object.values(r))
     return {
-      trunks: await rows('SELECT id, setid, position, domain, number_format, assert_identity, auth_username, auth_password, auth_realm, codec_flags, default_number, reg_aor, allowed FROM trunks WHERE tenant_id = $1 ORDER BY position'),
+      trunks: await rows('SELECT id, setid, position, domain, number_format, assert_identity, auth_username, auth_password, auth_realm, codec_flags, default_number, reg_aor, allowed, countries FROM trunks WHERE tenant_id = $1 ORDER BY position'),
       dids: await rows('SELECT id, trunk_id, first_number, last_number, target, suffix_digits FROM dids WHERE tenant_id = $1 ORDER BY first_number, id'),
-      dispatcher: await rows('SELECT setid, destination, socket, state, probe_mode, weight, priority, attrs, description FROM dispatcher WHERE setid IN (SELECT setid FROM trunks WHERE tenant_id = $1) ORDER BY setid, state, priority DESC, id'),
+      dispatcher: await rows(`SELECT setid, destination, socket, state, probe_mode, weight, priority, attrs, description FROM dispatcher WHERE ${OF_TENANT} ORDER BY setid, priority DESC, id`),
       registrant: await rows("SELECT registrar, proxy, aor, username, password, binding_uri, expiry, forced_socket FROM registrant WHERE aor IN (SELECT reg_aor FROM trunks WHERE tenant_id = $1 AND reg_aor <> '') ORDER BY id")
     }
   }
@@ -242,11 +262,16 @@ export class TrunkTables {
   async set(trunks: (Trunk & { password?: string })[], dids: DidRange[]): Promise<{ dispatcher: boolean; registrant: boolean }> {
     const wanted = projectTrunks(trunks, dids, this.socket, this.advertise)
     wanted.dids.sort((a, b) => String(a[2]).localeCompare(String(b[2])) || String(a[0]).localeCompare(String(b[0])))
+    // As current() reads them: by set (the servers of each trunk, then the sources), the highest priority first.
+    wanted.dispatcher.sort((a, b) => Number(a[0]) - Number(b[0]) || Number(b[6]) - Number(a[6]))
     await this.opts.ready?.()
     const client = this.opts.pool.connect ? await this.opts.pool.connect() : undefined
     const q = client ?? this.opts.pool
     try {
       await q.query('BEGIN')
+      // Whose trunks the database holds is read under a lock that two writers cannot hold at once (each taking it
+      // waits for the other to commit): two tenants writing their first trunks at the same time never both pass.
+      await q.query('LOCK TABLE trunks IN SHARE ROW EXCLUSIVE MODE')
       if (wanted.trunks.length) {
         const other = (await q.query('SELECT tenant_id FROM trunks WHERE tenant_id <> $1 LIMIT 1', [this.tenantId])) as { rows?: unknown[] } | undefined
         if (other?.rows?.length)
@@ -262,12 +287,12 @@ export class TrunkTables {
         return changed
       }
       await q.query("DELETE FROM registrant WHERE aor IN (SELECT reg_aor FROM trunks WHERE tenant_id = $1 AND reg_aor <> '')", [this.tenantId])
-      await q.query('DELETE FROM dispatcher WHERE setid IN (SELECT setid FROM trunks WHERE tenant_id = $1)', [this.tenantId])
+      await q.query(`DELETE FROM dispatcher WHERE ${OF_TENANT}`, [this.tenantId])
       await q.query('DELETE FROM dids WHERE tenant_id = $1', [this.tenantId])
       await q.query('DELETE FROM trunks WHERE tenant_id = $1', [this.tenantId])
       for (const r of wanted.trunks)
         await q.query(
-          'INSERT INTO trunks (tenant_id, id, setid, position, domain, number_format, assert_identity, auth_username, auth_password, auth_realm, codec_flags, default_number, reg_aor, allowed) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)',
+          'INSERT INTO trunks (tenant_id, id, setid, position, domain, number_format, assert_identity, auth_username, auth_password, auth_realm, codec_flags, default_number, reg_aor, allowed, countries) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)',
           [this.tenantId, ...r]
         )
       for (const r of wanted.dids) await q.query('INSERT INTO dids (tenant_id, id, trunk_id, first_number, last_number, target, suffix_digits) VALUES ($1, $2, $3, $4, $5, $6, $7)', [this.tenantId, ...r])

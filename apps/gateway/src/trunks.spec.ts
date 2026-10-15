@@ -74,6 +74,36 @@ describe('parseTrunk', () => {
     expect(() => parseTrunk(null)).toThrow(/JSON object/)
   })
 
+  it('calls abroad only the countries listed with international, never every country nor a code of no country', () => {
+    expect(parseTrunk({ ...trunk, allowed: ['fixed', 'international'], countries: ['44', '32', '1'] }).config).toMatchObject({ allowed: ['fixed', 'international'], countries: ['44', '32', '1'] })
+    const bad: [Record<string, unknown>, RegExp][] = [
+      // `international` alone would be the whole world.
+      [{ allowed: ['international'] }, /^countries: .* required with international/],
+      [{ allowed: ['international'], countries: [] }, /^countries/],
+      [{ allowed: ['fixed'], countries: ['44'] }, /^countries: only with international/],
+      [{ countries: ['44'] }, /^countries: only with international/],
+      // France and its overseas have classes of their own; satellites, international networks and premium rate,
+      // international freephone and shared cost: never.
+      ...['33', '262', '508', '590', '594', '596', '687', '689', '681', '870', '878', '881', '882', '883', '888', '979', '800', '808', '991'].map(c => [{ allowed: ['international'], countries: [c] }, /^countries/] as [Record<string, unknown>, RegExp]),
+      [{ allowed: ['international'], countries: ['+44'] }, /^countries/],
+      [{ allowed: ['international'], countries: ['044'] }, /^countries/],
+      [{ allowed: ['international'], countries: ['4444'] }, /^countries/],
+      [{ allowed: ['international'], countries: ['*'] }, /^countries/],
+      [{ allowed: ['international'], countries: ['44', '44'] }, /^countries/],
+      // A code that starts another would call it too.
+      [{ allowed: ['international'], countries: ['4', '44'] }, /^countries: .*none the start of another/],
+      [{ allowed: ['international'], countries: Array.from({ length: 65 }, (_, i) => String(200 + i)) }, /^countries/]
+    ]
+    for (const [change, error] of bad) {
+      expect(() => parseTrunk({ ...trunk, ...change }), JSON.stringify(change)).toThrow(error)
+      try {
+        parseTrunk({ ...trunk, ...change })
+      } catch (err) {
+        expect(err).toMatchObject({ statusCode: 400, code: 'TRUNK_INVALID' })
+      }
+    }
+  })
+
   it('keeps the current password unless a new one is given, and removes it on null', () => {
     const key = randomBytes(32)
     const first = trunkRecord('A', 'operator', parseTrunk(trunk), undefined, key)
@@ -109,7 +139,7 @@ describe('parseDid', () => {
   const trunks = [{ id: 'operator' }]
   it('takes one number or a range, and an extension, a group, or the last digits of the number called', () => {
     expect(parseDid('reception', { trunkId: 'operator', first: '+33199000101', target: '101' }, trunks, [])).toEqual({ id: 'reception', trunkId: 'operator', first: '+33199000101', last: '+33199000101', target: '101' })
-    expect(parseDid('sales', { trunkId: 'operator', first: '+33199000110', last: '+33199000119', suffixDigits: 3 }, trunks, [])).toEqual({ id: 'sales', trunkId: 'operator', first: '+33199000110', last: '+33199000119', suffixDigits: 3 })
+    expect(parseDid('sales', { trunkId: 'operator', first: '+33199000130', last: '+33199000139', suffixDigits: 3 }, trunks, [])).toEqual({ id: 'sales', trunkId: 'operator', first: '+33199000130', last: '+33199000139', suffixDigits: 3 })
   })
 
   it('refuses a number of no trunk, no E.164, a backward or oversized range, both or neither target', () => {
@@ -128,12 +158,35 @@ describe('parseDid', () => {
     for (const [id, body, error] of bad) expect(() => parseDid(id, body, trunks, []), JSON.stringify(body)).toThrow(error)
   })
 
+  it('never makes a direct number ring an emergency number or another short number of the French plan', () => {
+    const reserved = (body: Record<string, unknown>) => {
+      try {
+        parseDid('x', { trunkId: 'operator', ...body }, trunks, [])
+      } catch (err) {
+        return err as Error & { statusCode?: number; code?: string }
+      }
+      return undefined
+    }
+    for (const target of ['15', '17', '18', '112', '114', '115', '119', '191', '196', '197', '116000', '116006', '118218'])
+      expect(reserved({ first: '+33199000101', target }), target).toMatchObject({ statusCode: 400, code: 'DID_RESERVED' })
+    // The last digits of the numbers called make the extension: a range whose suffixes cross one is refused, naming them.
+    const range = reserved({ first: '+33199000100', last: '+33199000199', suffixDigits: 3 })
+    expect(range).toMatchObject({ statusCode: 400, code: 'DID_RESERVED' })
+    expect(range?.message).toContain('112, 114, 115, 119, 191, 196, 197')
+    expect(reserved({ first: '+33199000010', last: '+33199000019', suffixDigits: 2 })?.message).toContain('15, 17, 18')
+    expect(reserved({ first: '+33199116000', last: '+33199116009', suffixDigits: 6 })?.code).toBe('DID_RESERVED')
+    // Their neighbours are extensions like any other.
+    expect(reserved({ first: '+33199000100', last: '+33199000109', suffixDigits: 3 })).toBeUndefined()
+    expect(reserved({ first: '+33199000120', last: '+33199000189', suffixDigits: 3 })).toBeUndefined()
+    expect(reserved({ first: '+33199000101', target: '1120' })).toBeUndefined()
+  })
+
   it('gives no number to two ranges (409), a range being free to change itself', () => {
-    const others: DidRange[] = [{ id: 'sales', trunkId: 'operator', first: '+33199000110', last: '+33199000119', suffixDigits: 3 }]
-    expect(() => parseDid('x', { trunkId: 'operator', first: '+33199000119', target: '101' }, trunks, others)).toThrow(expect.objectContaining({ statusCode: 409, code: 'DID_OVERLAP' }))
-    expect(() => parseDid('x', { trunkId: 'operator', first: '+33199000100', last: '+33199000110', target: '101' }, trunks, others)).toThrow(/sales/)
+    const others: DidRange[] = [{ id: 'sales', trunkId: 'operator', first: '+33199000130', last: '+33199000139', suffixDigits: 3 }]
+    expect(() => parseDid('x', { trunkId: 'operator', first: '+33199000139', target: '101' }, trunks, others)).toThrow(expect.objectContaining({ statusCode: 409, code: 'DID_OVERLAP' }))
+    expect(() => parseDid('x', { trunkId: 'operator', first: '+33199000100', last: '+33199000130', target: '101' }, trunks, others)).toThrow(/sales/)
     expect(parseDid('x', { trunkId: 'operator', first: '+33199000120', target: '101' }, trunks, others).first).toBe('+33199000120')
-    expect(parseDid('sales', { trunkId: 'operator', first: '+33199000110', last: '+33199000115', suffixDigits: 3 }, trunks, others).last).toBe('+33199000115')
+    expect(parseDid('sales', { trunkId: 'operator', first: '+33199000130', last: '+33199000135', suffixDigits: 3 }, trunks, others).last).toBe('+33199000135')
   })
 })
 
@@ -147,18 +200,21 @@ describe('trunkFromEnv', () => {
       TRUNK_PASSWORD: 'not-a-real-one',
       TRUNK_DEFAULT_NUMBER: '+33199000100',
       TRUNK_SOURCES: '192.0.2.40',
-      TRUNK_DIDS: '+33199000101=101, +33199000110..+33199000119=last:3'
+      TRUNK_DIDS: '+33199000101=101, +33199000130..+33199000139=last:3'
     })
     expect(seed).toEqual({
       id: 'operator',
       parsed: { config: { auth: 'register', domain: 'operator.example', proxies: ['192.0.2.20', '192.0.2.21:5070'], sources: ['192.0.2.40'], username: '0033199000100', codecs: ['PCMA', 'PCMU'], numberFormat: 'e164', defaultNumber: '+33199000100' }, password: 'not-a-real-one' },
       dids: [
         { id: 'operator-1', trunkId: 'operator', first: '+33199000101', last: '+33199000101', target: '101' },
-        { id: 'operator-2', trunkId: 'operator', first: '+33199000110', last: '+33199000119', suffixDigits: 3 }
+        { id: 'operator-2', trunkId: 'operator', first: '+33199000130', last: '+33199000139', suffixDigits: 3 }
       ]
     })
     expect(trunkFromEnv({ TRUNK_DOMAIN: 'operator.example', TRUNK_AUTH: 'ip', TRUNK_DEFAULT_NUMBER: '+33199000100', TRUNK_ALLOWED: 'fixed, mobile,overseas' })?.parsed.config.allowed).toEqual(['fixed', 'mobile', 'overseas'])
     expect(() => trunkFromEnv({ TRUNK_DOMAIN: 'operator.example', TRUNK_AUTH: 'ip', TRUNK_DEFAULT_NUMBER: '+33199000100', TRUNK_ALLOWED: 'premium' })).toThrow(/^TRUNK_\*: allowed/)
+    expect(trunkFromEnv({ TRUNK_DOMAIN: 'operator.example', TRUNK_AUTH: 'ip', TRUNK_DEFAULT_NUMBER: '+33199000100', TRUNK_ALLOWED: 'fixed,international', TRUNK_COUNTRIES: '44, 32' })?.parsed.config).toMatchObject({ allowed: ['fixed', 'international'], countries: ['44', '32'] })
+    expect(() => trunkFromEnv({ TRUNK_DOMAIN: 'operator.example', TRUNK_AUTH: 'ip', TRUNK_DEFAULT_NUMBER: '+33199000100', TRUNK_ALLOWED: 'international' })).toThrow(/^TRUNK_\*: countries/)
+    expect(() => trunkFromEnv({ TRUNK_DOMAIN: 'operator.example', TRUNK_AUTH: 'ip', TRUNK_DEFAULT_NUMBER: '+33199000100', TRUNK_DIDS: '+33199000100..+33199000199=last:3' })).toThrow(/^TRUNK_DIDS .*112, 114/)
     expect(() => trunkFromEnv({ TRUNK_DOMAIN: 'operator.example', TRUNK_DEFAULT_NUMBER: '+33199000100' })).toThrow(/^TRUNK_\*: a trunk that registers needs/)
     expect(() => trunkFromEnv({ TRUNK_DOMAIN: 'operator.example', TRUNK_AUTH: 'ip', TRUNK_DEFAULT_NUMBER: '+33199000100', TRUNK_DIDS: '+33199000101' })).toThrow(/^TRUNK_DIDS: "\+33199000101" is not/)
     expect(() => trunkFromEnv({ TRUNK_DOMAIN: 'operator.example', TRUNK_AUTH: 'ip', TRUNK_DEFAULT_NUMBER: '+33199000100', TRUNK_DIDS: '+33199000101=101,+33199000101=102' })).toThrow(/^TRUNK_DIDS \+33199000101=102: .*operator-1/)
@@ -223,8 +279,8 @@ describe('trunk routes', () => {
     expect(handed.at(-1)!.trunks[0]).toMatchObject({ registerExpires: 900, password: 'not-a-real-one' })
 
     expect((await app.inject({ method: 'PUT', url: '/api/v1/admin/dids/reception', headers: admin, payload: { trunkId: 'operator', first: '+33199000101', target: '101' } })).statusCode).toBe(201)
-    expect((await app.inject({ method: 'PUT', url: '/api/v1/admin/dids/sales', headers: admin, payload: { trunkId: 'operator', first: '+33199000110', last: '+33199000119', suffixDigits: 3 } })).statusCode).toBe(201)
-    const clash = await app.inject({ method: 'PUT', url: '/api/v1/admin/dids/other', headers: admin, payload: { trunkId: 'operator', first: '+33199000115', target: '102' } })
+    expect((await app.inject({ method: 'PUT', url: '/api/v1/admin/dids/sales', headers: admin, payload: { trunkId: 'operator', first: '+33199000130', last: '+33199000139', suffixDigits: 3 } })).statusCode).toBe(201)
+    const clash = await app.inject({ method: 'PUT', url: '/api/v1/admin/dids/other', headers: admin, payload: { trunkId: 'operator', first: '+33199000135', target: '102' } })
     expect(clash.statusCode).toBe(409)
     expect(clash.json()).toMatchObject({ code: 'DID_OVERLAP' })
     expect(handed.at(-1)!.dids.map(d => d.id)).toEqual(['reception', 'sales'])
@@ -307,6 +363,46 @@ describe('trunk routes', () => {
     expect((await app.inject({ method: 'DELETE', url: '/api/v1/admin/trunks/backup', headers: admin })).statusCode).toBe(204)
     // The last one goes.
     expect((await app.inject({ method: 'DELETE', url: '/api/v1/admin/trunks/main', headers: admin })).statusCode).toBe(204)
+  })
+
+  it('keeps the default trunk marked when a change does not say, and never unmarks it without another one marked', async () => {
+    const { app, admin, handed, store } = await setup()
+    const ip = { auth: 'ip', domain: 'operator.example', codecs: ['PCMA'], defaultNumber: '+33199000100' }
+    await app.inject({ method: 'PUT', url: '/api/v1/admin/trunks/main', headers: admin, payload: ip })
+    await app.inject({ method: 'PUT', url: '/api/v1/admin/trunks/backup', headers: admin, payload: { ...ip, defaultNumber: '+33199000200', default: true } })
+    expect(handed.at(-1)!.trunks.map(t => t.id)).toEqual(['backup', 'main'])
+    // Another field of the default trunk changed, `default` not given: still the default.
+    expect((await app.inject({ method: 'PUT', url: '/api/v1/admin/trunks/backup', headers: admin, payload: { ...ip, defaultNumber: '+33199000201' } })).statusCode).toBe(200)
+    expect(handed.at(-1)!.trunks.map(t => t.id)).toEqual(['backup', 'main'])
+    expect((await store.listTrunks('A')).find(t => t.id === 'backup')?.config.default).toBe(true)
+    // `default: false` on the default trunk: which one would be? Another one is marked instead.
+    const unmark = await app.inject({ method: 'PUT', url: '/api/v1/admin/trunks/backup', headers: admin, payload: { ...ip, defaultNumber: '+33199000201', default: false } })
+    expect(unmark.statusCode).toBe(409)
+    expect(unmark.json()).toMatchObject({ code: 'TRUNK_DEFAULT' })
+    expect(handed.at(-1)!.trunks.map(t => t.id)).toEqual(['backup', 'main'])
+    // On another trunk, `default: false` changes nothing.
+    expect((await app.inject({ method: 'PUT', url: '/api/v1/admin/trunks/main', headers: admin, payload: { ...ip, default: false } })).statusCode).toBe(200)
+    expect(handed.at(-1)!.trunks.map(t => t.id)).toEqual(['backup', 'main'])
+  })
+
+  it('moves the default mark in one write: a store that fails keeps the mark where it was', async () => {
+    const { app, admin, handed, store } = await setup()
+    const ip = { auth: 'ip', domain: 'operator.example', codecs: ['PCMA'], defaultNumber: '+33199000100' }
+    await app.inject({ method: 'PUT', url: '/api/v1/admin/trunks/main', headers: admin, payload: { ...ip, default: true } })
+    await app.inject({ method: 'PUT', url: '/api/v1/admin/trunks/backup', headers: admin, payload: { ...ip, defaultNumber: '+33199000200' } })
+    // The store writes several trunks at once, all or none (PostgreSQL: one transaction).
+    const upsertTrunks = store.upsertTrunks.bind(store)
+    let writes = 0
+    store.upsertTrunks = async records => {
+      writes++
+      expect(records.map(r => `${r.id}:${r.config.default ?? false}`).sort()).toEqual(['backup:true', 'main:false'])
+      throw new Error('database down')
+    }
+    expect((await app.inject({ method: 'PUT', url: '/api/v1/admin/trunks/backup', headers: admin, payload: { ...ip, defaultNumber: '+33199000200', default: true } })).statusCode).toBe(500)
+    expect(writes).toBe(1)
+    store.upsertTrunks = upsertTrunks
+    expect((await store.listTrunks('A')).map(t => `${t.id}:${t.config.default ?? false}`)).toEqual(['main:true', 'backup:false'])
+    expect(handed.at(-1)!.trunks.map(t => t.id)).toEqual(['main', 'backup'])
   })
 
   it('fails a change OpenSIPS did not apply (502), keeps the store and the provider on the previous set, the same when the store fails', async () => {

@@ -223,8 +223,14 @@ export const storeContract = (name: string, make: () => Promise<Store>) =>
       expect(a[1]!.passwordEnc).toBeUndefined()
       expect((await s.listTrunks('B'))[0]!.config.domain).toBe('other.example')
       expect(await s.listTrunks('C')).toEqual([])
+      // Several at once (the default mark moved from one to the other), each in its place.
+      await s.upsertTrunks([
+        { tenantId: 'A', id: 'backup', config: { ...config, auth: 'ip', sources: ['192.0.2.30'], default: true } },
+        { tenantId: 'A', id: 'main', config: { ...config, registerExpires: 900 }, passwordEnc: 'enc2' }
+      ])
+      expect((await s.listTrunks('A')).map(t => `${t.id}:${t.config.default ?? false}`)).toEqual(['main:false', 'backup:true'])
 
-      await s.upsertDid({ tenantId: 'A', id: 'sales', trunkId: 'main', first: '+33199000110', last: '+33199000119', suffixDigits: 3 })
+      await s.upsertDid({ tenantId: 'A', id: 'sales', trunkId: 'main', first: '+33199000130', last: '+33199000139', suffixDigits: 3 })
       await s.upsertDid({ tenantId: 'A', id: 'reception', trunkId: 'main', first: '+33199000101', last: '+33199000101', target: '101' })
       await s.upsertDid({ tenantId: 'A', id: 'support', trunkId: 'backup', first: '+33199000200', last: '+33199000200', target: '600' })
       await s.upsertDid({ tenantId: 'B', id: 'reception', trunkId: 'main', first: '+33199000101', last: '+33199000101', target: '200' })
@@ -233,7 +239,7 @@ export const storeContract = (name: string, make: () => Promise<Store>) =>
       await expect(s.upsertDid({ tenantId: 'A', id: 'x', trunkId: 'nope', first: '+33199000300', last: '+33199000300', target: '1' })).rejects.toThrow()
       expect(await s.listDids('A')).toEqual([
         { tenantId: 'A', id: 'reception', trunkId: 'main', first: '+33199000101', last: '+33199000101', target: '101' },
-        { tenantId: 'A', id: 'sales', trunkId: 'main', first: '+33199000110', last: '+33199000119', suffixDigits: 3 },
+        { tenantId: 'A', id: 'sales', trunkId: 'main', first: '+33199000130', last: '+33199000139', suffixDigits: 3 },
         { tenantId: 'A', id: 'support', trunkId: 'backup', first: '+33199000200', last: '+33199000200', target: '600' }
       ])
       await s.upsertDid({ tenantId: 'A', id: 'reception', trunkId: 'main', first: '+33199000101', last: '+33199000101', target: '102' })

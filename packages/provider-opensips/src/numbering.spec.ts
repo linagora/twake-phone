@@ -1,3 +1,4 @@
+import { RESERVED_NUMBER } from '@twake/telephony-types'
 import { describe, expect, it } from 'vitest'
 import { DIALPLAN_RULES, DIALPLAN_SQL, DP_CLASSIFY, DP_INBOUND, DP_NORMALISE, OUTBOUND_ALLOWABLE, OUTBOUND_ALLOWED, classify, translate } from './numbering.js'
 
@@ -25,7 +26,22 @@ describe('the numbering plan (dialplan, dpid 1 then 2)', () => {
   it('takes every French emergency number for one, before anything else', () => {
     for (const n of ['15', '17', '18', '112', '114', '115', '119', '191', '196', '197', '116000', '116117']) expect(classify(n), n).toEqual({ number: n, class: 'emergency' })
     // Neighbours of theirs are extensions or groups, as before.
-    for (const n of ['16', '101', '102', '113', '116', '1120', '116118', '3949']) expect(classify(n), n).toBeNull()
+    for (const n of ['16', '101', '102', '113', '116', '1120', '1161', '11600', '1160000', '3949']) expect(classify(n), n).toBeNull()
+  })
+
+  it('calls the European harmonised numbers (116xxx) as dialled, free, and never the directory enquiries (118xxx)', () => {
+    // 116006 (victims), 116111 (children): no longer a 404 nobody explains, a free number the trunk calls.
+    for (const n of ['116006', '116111', '116123', '116999']) expect(classify(n), n).toEqual({ number: n, class: 'freephone' })
+    for (const n of ['118000', '118218', '118712']) expect(classify(n), n).toEqual({ number: n, class: 'premium' })
+  })
+
+  it('reserves for the public network every short number it routes or refuses, and none other (RESERVED_NUMBER)', () => {
+    // No extension or group may take one (the Gateway refuses it): dialled, it never rings anyone inside.
+    const short = [...Array(1000).keys()].flatMap(i => [String(i), String(i).padStart(2, '0'), String(i).padStart(3, '0'), `116${String(i).padStart(3, '0')}`, `118${String(i).padStart(3, '0')}`, `117${String(i).padStart(3, '0')}`, `1${i}`])
+    for (const n of new Set(short)) {
+      const c = classify(n)
+      expect(RESERVED_NUMBER.test(n), n).toBe(c !== null && c.class !== 'invalid')
+    }
   })
 
   it('classes other countries as international, the French overseas territories apart', () => {
@@ -35,6 +51,12 @@ describe('the numbering plan (dialplan, dpid 1 then 2)', () => {
     expect(classify('00590590000000')?.class).toBe('overseas')
   })
 
+  it('never takes the codes of no country for international: satellites, international networks, premium and shared cost', () => {
+    for (const n of ['+870000000000', '+881600000000', '+882340000000', '+883130000000', '+979000000000', '+80012345678', '+80812345678', '+878100000000', '+888000000000', '+991000000000', '00881600000000'])
+      expect(classify(n)?.class, n).toBe('premium')
+    for (const n of ['+87100000000', '+88000000000', '+886200000000', '+97100000000', '+3220000000', '+12025550100']) expect(classify(n)?.class, n).toBe('international')
+  })
+
   it('classes the overseas numbers of the French plan as overseas however they are written, not as fixed or mobile', () => {
     // Réunion and Mayotte, Guadeloupe (with Saint-Martin and Saint-Barthélemy), Guiana, Martinique: fixed and mobile.
     for (const prefix of ['0262', '0263', '0269', '0590', '0594', '0596', '0639', '0690', '0691', '0692', '0693', '0694', '0696', '0697']) {
@@ -42,6 +64,9 @@ describe('the numbering plan (dialplan, dpid 1 then 2)', () => {
       const e164 = `+33${national.slice(1)}`
       for (const input of [national, e164, `0033${national.slice(1)}`]) expect(classify(input), input).toEqual({ number: e164, class: 'overseas' })
     }
+    // Their non-geographic numbers (0976x: ARCEP decision 06-0509, annex 3), not the metropolitan 09 ones.
+    for (const n of ['0976000000', '0976900000', '+33976000000']) expect(classify(n)?.class, n).toBe('overseas')
+    for (const n of ['0970000000', '0975000000', '0977000000', '0950000000']) expect(classify(n)?.class, n).toBe('fixed')
     // ARCEP's fictional mobile numbers are in the block of Mayotte.
     expect(classify('06 39 98 00 01'.replace(/ /g, ''))).toEqual({ number: '+33639980001', class: 'overseas' })
     // Their metropolitan neighbours stay fixed or mobile.

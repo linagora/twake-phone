@@ -63,9 +63,11 @@ describe('call ownership', () => {
   })
 })
 
-describe('calls with the public network whose browser is gone', () => {
-  /** A provider that reports answered calls for alice (101) and records which it is asked to end. */
-  const setup = async (graceMs: number) => {
+describe('calls with the public network whose windows are all closed', () => {
+  // Their end is the SIP server's: the dialog's OPTIONS to the phone go unanswered (its page closed, put to sleep, its
+  // network gone) and OpenSIPS ends the call (ADR 0016). The app's connection to the Gateway says nothing of the call:
+  // a reload, a second window, a SIP phone (Linphone) without any, a Gateway restarted, an emergency call least of all.
+  const setup = async () => {
     const ended: string[] = []
     const answered = (id: string, remoteNumber: string): { extension: string; event: TelephonyEvent } => ({ extension: '101', event: { type: 'call.connected', timestamp: new Date().toISOString(), payload: { call: { ...call(id, 'connected'), remoteNumber } } } })
     const factory: ProviderFactory<unknown> = {
@@ -76,20 +78,19 @@ describe('calls with the public network whose browser is gone', () => {
           getCapabilities: async () => ({}) as never,
           subscribe: async function* () {
             yield answered('outside', '+33639980001')
-            yield answered('inside', '102')
+            yield answered('emergency', '112')
           },
-          // The provider ends a call with the public network only.
-          endCall: async (id: string) => {
-            ended.push(id)
-            if (id === 'inside') throw Object.assign(new Error('internal'), { statusCode: 409 })
-          },
+          // What a provider of the previous version offered the Gateway to end such a call: never called.
+          endCall: async (id: string) => void ended.push(id),
+          hangup: async (id: string) => void ended.push(id),
           close: async () => {}
         }) as unknown as TelephonyProvider
     }
     const store = new MemoryStore()
     await store.upsertMapping({ tenantId: 'dev', userId: 'alice', extension: '101' })
     const registry = new ProviderRegistry([{ tenantId: 'dev', type: 'fake', config: {} }], [factory])
-    const app = await buildApp(registry, { store, orphanCallGraceMs: graceMs })
+    // The option of the previous version, a grace period after the last window closed: no longer read.
+    const app = await buildApp(registry, { store, orphanCallGraceMs: 50 } as never)
     registry.startAll()
     await app.listen({ port: 0 })
     const port = (app.server.address() as { port: number }).port
@@ -104,27 +105,17 @@ describe('calls with the public network whose browser is gone', () => {
     return { app, ended, open, close }
   }
 
-  it('asks the provider to end them once no window of the person is left for the grace period', async () => {
-    const { app, ended, open, close } = await setup(100)
+  it('never ends them itself, however long no window of the person is open', async () => {
+    const { app, ended, open, close } = await setup()
     const first = await open()
     const second = await open()
     await close(first)
-    await new Promise(r => setTimeout(r, 250))
-    // Another window is open: the calls are still the person's.
-    expect(ended).toEqual([])
     await close(second)
-    await new Promise(r => setTimeout(r, 250))
-    expect(ended.sort()).toEqual(['inside', 'outside'])
-    await app.close()
-  })
-
-  it('leaves them to a person whose window comes back within the grace period', async () => {
-    const { app, ended, open, close } = await setup(300)
-    await close(await open())
-    const again = await open()
-    await new Promise(r => setTimeout(r, 450))
+    await new Promise(r => setTimeout(r, 300))
     expect(ended).toEqual([])
-    await close(again)
+    // Closed, the app's windows have not ended the calls either.
+    await close(await open())
     await app.close()
+    expect(ended).toEqual([])
   })
 })

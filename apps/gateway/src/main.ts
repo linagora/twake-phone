@@ -2,7 +2,7 @@ import { LiveKitConferenceBridge, MeetApi } from '@twake/conference-livekit'
 import { buildApp } from './app.js'
 import { authenticatorFromEnv } from './auth.js'
 import { parseKey } from './crypto.js'
-import { StoreDirectory, parseUserMap } from './directory.js'
+import { StoreDirectory, reservedInUse, seedUserMap } from './directory.js'
 import { DirectorySync, parseInterval } from './directory-sync.js'
 import { ldapDirectoryFromEnv } from './ldap-directory.js'
 import { storedOpensipsFactory, type StoredOpensipsConfig } from './providers.js'
@@ -57,7 +57,7 @@ if (env.OPENSIPS_WS_URL && !(await store.listProviders()).some(p => p.tenantId =
   await store.upsertProvider({ tenantId: tenant, type: 'opensips', config })
 }
 // DEV_USER_MAP seeds a mapping once; it never overwrites what an administrator or the directory wrote since.
-for (const m of parseUserMap(env.DEV_USER_MAP)) if (!(await store.getMappingByUser(tenant, m.userId))) await store.upsertMapping({ tenantId: tenant, ...m })
+await seedUserMap(store, tenant, env.DEV_USER_MAP, message => console.warn(`WARNING: USER_EXTENSIONS (DEV_USER_MAP): ${message}`))
 
 const key = env.SECRETS_KEY ? parseKey(env.SECRETS_KEY) : undefined
 
@@ -149,4 +149,8 @@ const syncEvery = parseInterval(env.LDAP_SYNC_INTERVAL, 3_600_000)
 if (directorySync && syncEvery > 0) directorySync.start(syncEvery)
 app.addHook('onClose', async () => directorySync?.stop())
 registry.startAll()
+// Extensions and groups kept from before step 6a that are emergency numbers (or other short numbers of the French
+// plan): a call to them goes to the operator, never to whoever has them. Said at each start until changed.
+for (const what of await reservedInUse(store, tenant, await groupNumbers(tenant).catch(() => [])))
+  console.warn(`WARNING: ${what} is an emergency number or another short number of the French plan: dialled, it goes to the operator, never there; give it another number`)
 await app.listen({ host: env.HOST ?? '0.0.0.0', port: Number(env.PORT ?? 8080) })

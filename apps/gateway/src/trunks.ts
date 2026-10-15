@@ -1,4 +1,4 @@
-import { TRUNK_CODECS, TRUNK_OUTBOUND_CLASSES, type DidRange, type Trunk, type TrunkAuth, type TrunkCodec, type TrunkNumberFormat, type TrunkOutboundClass } from '@twake/telephony-types'
+import { RESERVED_NUMBER, TRUNK_CODECS, TRUNK_COUNTRY_EXCLUDED, TRUNK_OUTBOUND_CLASSES, type DidRange, type Trunk, type TrunkAuth, type TrunkCodec, type TrunkNumberFormat, type TrunkOutboundClass } from '@twake/telephony-types'
 import { decrypt, encrypt } from './crypto.js'
 import type { DidRecord, TrunkRecord } from './store/types.js'
 
@@ -25,6 +25,9 @@ export const MAX_DIDS = 500
 export const MAX_RANGE = 10_000
 const MAX_PROXIES = 4
 const MAX_SOURCES = 16
+const MAX_COUNTRIES = 64
+/** An E.164 country code, without the +. */
+const COUNTRY = /^[1-9][0-9]{0,2}$/
 
 /** A 400 whose `code` the app turns into the administrator's words; the message names the field. */
 const invalid = (message: string) => Object.assign(new Error(message), { statusCode: 400, code: 'TRUNK_INVALID' })
@@ -87,6 +90,11 @@ export const parseTrunk = (body: unknown, current?: Pick<TrunkRecord, 'passwordE
     if (!Array.isArray(a) || !a.length || !a.every(c => TRUNK_OUTBOUND_CLASSES.includes(c as TrunkOutboundClass)) || new Set(a).size !== a.length) throw invalid(`allowed: some of ${TRUNK_OUTBOUND_CLASSES.join(', ')}, each once`)
     allowed = a as TrunkOutboundClass[]
   }
+  // International numbers to the countries listed only, never to a whole world: `countries` goes with `international`.
+  const countries = list(b, 'countries', MAX_COUNTRIES, v => COUNTRY.test(v) && !TRUNK_COUNTRY_EXCLUDED.test(v), 'country codes (32, 44, 1...), not France nor its overseas ones (their own classes), nor a code of no country (satellites, international premium rate: never called)')
+  if (countries?.some(c => countries.some(o => o !== c && o.startsWith(c)))) throw invalid('countries: country codes, none the start of another')
+  if (allowed?.includes('international') && !countries) throw invalid('countries: the country codes international numbers may have are required with international')
+  if (countries && !allowed?.includes('international')) throw invalid('countries: only with international in allowed')
   if (b.default !== undefined && typeof b.default !== 'boolean') throw invalid('default: true or false')
   const defaultNumber = text(b, 'defaultNumber', v => E164.test(v), 'an E.164 number (+ then 7 to 15 digits)')
   if (!defaultNumber) throw invalid('defaultNumber: the number presented by those without a direct number is required')
@@ -113,11 +121,24 @@ export const parseTrunk = (body: unknown, current?: Pick<TrunkRecord, 'passwordE
       numberFormat,
       ...(b.assertIdentity ? { assertIdentity: true } : {}),
       ...(allowed ? { allowed } : {}),
+      ...(countries ? { countries } : {}),
       ...(b.default ? { default: true } : {}),
       defaultNumber
     },
     password
   }
+}
+
+/** The reserved numbers (RESERVED_NUMBER) that the last `digits` digits of the numbers first to last make. */
+const reservedSuffixes = (first: string, last: string, digits: number): string[] => {
+  const found = new Set<string>()
+  const from = BigInt(first.slice(1))
+  const to = BigInt(last.slice(1))
+  for (let n = from; n <= to; n++) {
+    const suffix = n.toString().slice(-digits)
+    if (RESERVED_NUMBER.test(suffix)) found.add(suffix)
+  }
+  return [...found]
 }
 
 /** Whether two ranges share a number. */
@@ -144,6 +165,13 @@ export const parseDid = (id: string, body: unknown, trunks: readonly Pick<TrunkR
     suffixDigits = b.suffixDigits as number
   }
   if (!target === !suffixDigits) throw invalid('target (an extension or a group) or suffixDigits (the extension is the last digits of the number called), one of them')
+  // A short number of the French plan (an emergency number...) rings nobody inside: never the target of a number.
+  if (target && RESERVED_NUMBER.test(target)) throw Object.assign(new Error(`target: ${target} is a number the platform sends to the operator (an emergency number, or another short number of the French plan): no extension nor group has it`), { statusCode: 400, code: 'DID_RESERVED' })
+  if (suffixDigits) {
+    const reserved = reservedSuffixes(first, last, suffixDigits)
+    if (reserved.length)
+      throw Object.assign(new Error(`suffixDigits: the last ${suffixDigits} digits of these numbers make ${reserved.join(', ')}, which the platform sends to the operator (emergency numbers, or other short numbers of the French plan): take a range without them, or give these numbers a target`), { statusCode: 400, code: 'DID_RESERVED' })
+  }
   const clash = others.find(o => o.id !== id && overlap(o, { first, last }))
   if (clash) throw Object.assign(new Error(`${clash.first}${clash.last !== clash.first ? ` to ${clash.last}` : ''} (${clash.id}) has some of these numbers already`), { statusCode: 409, code: 'DID_OVERLAP' })
   return { id, trunkId: b.trunkId, first, last, ...(target ? { target } : {}), ...(suffixDigits ? { suffixDigits } : {}) }
@@ -185,7 +213,8 @@ export const providerTrunks = (records: readonly TrunkRecord[], key: Buffer | un
  * at least; TRUNK_AUTH (register by default), TRUNK_ID (operator), TRUNK_NAME, TRUNK_PROXIES and TRUNK_SOURCES
  * (comma-separated), TRUNK_USERNAME, TRUNK_PASSWORD, TRUNK_REALM, TRUNK_REGISTRAR, TRUNK_EXPIRES, TRUNK_CODECS
  * (PCMA,PCMU by default), TRUNK_NUMBER_FORMAT, TRUNK_ASSERT_IDENTITY=1, TRUNK_ALLOWED (comma-separated classes:
- * fixed, mobile, freephone, standard-rate by default; overseas, international on demand); TRUNK_DIDS, comma-separated
+ * fixed, mobile, freephone, standard-rate by default; overseas, international on demand), TRUNK_COUNTRIES (with
+ * international: the country codes it calls, comma-separated); TRUNK_DIDS, comma-separated
  * `FIRST[..LAST]=TARGET` where TARGET is an extension or a group, or `last:N` for the extension made of the last N
  * digits of the number called. Undefined without TRUNK_DOMAIN; throws on anything invalid (named).
  */
@@ -214,6 +243,7 @@ export const trunkFromEnv = (env: NodeJS.ProcessEnv): { id: string; parsed: Retu
       ...(env.TRUNK_NUMBER_FORMAT ? { numberFormat: env.TRUNK_NUMBER_FORMAT } : {}),
       ...(env.TRUNK_ASSERT_IDENTITY === '1' ? { assertIdentity: true } : {}),
       ...(env.TRUNK_ALLOWED ? { allowed: csv(env.TRUNK_ALLOWED) } : {}),
+      ...(env.TRUNK_COUNTRIES ? { countries: csv(env.TRUNK_COUNTRIES) } : {}),
       defaultNumber: env.TRUNK_DEFAULT_NUMBER
     })
   } catch (err) {

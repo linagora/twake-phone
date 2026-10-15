@@ -70,8 +70,8 @@ export interface SyncReport {
   updated: number
   unchanged: number
   removed: number
-  /** `group`: the person's extension is a ring group's number (`heldBy` is then empty). */
-  conflicts: { userId: string; extension: string; heldBy: string; group?: true }[]
+  /** `group`: the person's extension is a ring group's number; `reserved`: an emergency number or another short number of the French plan (`heldBy` is then empty). */
+  conflicts: { userId: string; extension: string; heldBy: string; group?: true; reserved?: true }[]
   error?: string
 }
 

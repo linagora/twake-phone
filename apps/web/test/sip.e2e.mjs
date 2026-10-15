@@ -213,7 +213,7 @@ const directorySync = new DirectorySync({ store, directory: contacts, tenantId: 
 const pushService = await startPushService()
 const push = new WebPush({ store, key, subject: 'mailto:e2e@example.test', allowEndpoint: url => url.origin === pushService.origin, agent: pushService.agent })
 // A call with the public network whose person has no window left is ended after 3 s here (30 s by default).
-const gateway = await buildApp(registry, { auth, store, contacts, directorySync, push, secretsKey: key, orphanCallGraceMs: 3_000, admin: { adminRole: 'twakephone-admin', adminUsers: new Set() } })
+const gateway = await buildApp(registry, { auth, store, contacts, directorySync, push, secretsKey: key, admin: { adminRole: 'twakephone-admin', adminUsers: new Set() } })
 registry.startAll()
 await gateway.listen({ host: '127.0.0.1', port: GATEWAY_PORT })
 const web = await serveApp({
@@ -1924,7 +1924,7 @@ try {
   await step('before any trunk, 112 is refused: no operator is connected, Alice is told to call 112 from another phone (403, emergency)', async () => {
     const ended = await dialUntilEnded(alice.page, '112')
     expectEqual(`${ended.endStatus} ${ended.endReason} ${ended.endRefusal}`, '403 refused emergency', 'how the call to 112 ended without a trunk')
-    await alice.page.getByText("Aucun opérateur n'est relié à Twake Phone : appelez 112 depuis un autre téléphone").waitFor()
+    await alice.page.getByText("L'appel vers 112 n'a pas pu passer par Twake Phone : appelez 112 depuis un autre téléphone").waitFor()
   })
   const trunkBody = {
     name: 'Opérateur (simulé)',
@@ -1942,8 +1942,11 @@ try {
     const trunk = await api('PUT', '/admin/trunks/operator', trunkBody)
     expectEqual(trunk.statusCode, 201, 'PUT /admin/trunks/operator')
     expectEqual(trunk.json().hasPassword, true, 'hasPassword')
-    // The staff's direct numbers: +33 1 99 00 01 xx rings extension 1xx.
-    const dids = await api('PUT', '/admin/dids/staff', { trunkId: 'operator', first: '+33199000100', last: '+33199000199', suffixDigits: 3 })
+    // The staff's direct numbers: +33 1 99 00 01 0x rings extension 10x. A range whose last digits make an emergency
+    // number (+33 1 99 00 01 12 would ring 112) is refused, naming them.
+    const reserved = await api('PUT', '/admin/dids/staff', { trunkId: 'operator', first: '+33199000100', last: '+33199000199', suffixDigits: 3 })
+    expectEqual(`${reserved.statusCode} ${reserved.json().code}`, '400 DID_RESERVED', 'PUT /admin/dids/staff over 112')
+    const dids = await api('PUT', '/admin/dids/staff', { trunkId: 'operator', first: '+33199000100', last: '+33199000109', suffixDigits: 3 })
     expectEqual(dids.statusCode, 201, 'PUT /admin/dids/staff')
     const listed = await api('GET', '/admin/trunks')
     if (listed.body.includes(TRUNK_PASSWORD)) throw new Error('GET /admin/trunks shows the password')
@@ -2056,7 +2059,7 @@ try {
     await until('the call from +33 6 39 98 00 02 first in the Récents of Jean', async () => ((await recents(jean.page, 1))[0].startsWith('+33 6 39 98 00 02: Entrant') ? true : null))
     await jean.page.getByRole('link', { name: 'Clavier' }).click()
   })
-  await step('the operator calls Jean without SDP (a late offer) and with Privacy: id: Jean sees "Numéro masqué" and answers; the offer of his browser reaches the operator as plain RTP, the answer goes back in the ACK, both hear each other. Jean then closes TwakePhone without hanging up: the Gateway has the call ended (BYE to the operator)', async () => {
+  await step('the operator calls Jean without SDP (a late offer) and with Privacy: id: Jean sees "Numéro masqué" and answers; the offer of his browser reaches the operator as plain RTP, the answer goes back in the ACK, both hear each other. Jean then closes TwakePhone without hanging up: his browser no longer answers the OPTIONS OpenSIPS sends in the call (CALL_PING_SEC), which ends it (BYE to the operator)', async () => {
     const placed = await operator.call('+33199000102', { from: '+33639980002', ruri: TRUNK_LOGIN, lateOffer: true, headers: ['Privacy: id'] })
     const ringing = jean.page.getByTestId('incoming-call')
     await ringing.getByText('Numéro masqué').waitFor({ timeout: 20_000 })
@@ -2084,12 +2087,13 @@ try {
     expectEqual((await placed.final).status, 487, 'final answer to the cancelled call')
     await ringing.waitFor({ state: 'hidden' })
   })
-  await step('Alice dials 112: it reaches the operator as dialled (sip:112@operator.example), from her direct number; then she dials Bob\'s direct number 01 99 00 01 03: it rings Bob inside, never through the operator', async () => {
+  await step('Alice dials 112: it reaches the operator as dialled (sip:112@operator.example), from her direct number; the operator refuses it (486): Alice is told to call 112 from another phone (503, emergency); then she dials Bob\'s direct number 01 99 00 01 03: it rings Bob inside, never through the operator', async () => {
     operator.state.next.push({ reply: '486 Busy Here' })
     const ended = await dialUntilEnded(alice.page, '112')
     const call = await operator.invited(invite => invite.uri === 'sip:112@operator.example')
     if (!(call.invite.headers.get('from')?.[0] ?? '').includes('<sip:+33199000101@operator.example>')) throw new Error(`From sent to the operator: ${call.invite.headers.get('from')}`)
-    expectEqual(ended.endStatus, 486, 'how the call to 112 ended (the operator busy)')
+    expectEqual(`${ended.endStatus} ${ended.endReason} ${ended.endRefusal}`, '503 refused emergency', 'how the call to 112 ended (the operator busy)')
+    await alice.page.getByText("L'appel vers 112 n'a pas pu passer par Twake Phone : appelez 112 depuis un autre téléphone").waitFor()
     const attempts = operator.state.attempts.length + operator2.state.attempts.length
     await dial(alice.page, '01 99 00 01 03')
     const ringing = bob.page.getByTestId('incoming-call')
@@ -2159,7 +2163,7 @@ try {
       operator.state.dead = false
     }
   })
-  await step('a request to the trunk socket from an address that is not the operator is refused (403), in a dialog or not; a call to a number that is no direct number is not found (404)', async () => {
+  await step('a request to the trunk socket from an address that is not the operator is refused (403), out of a dialog or in one that is none of its calls; a call to a number that is no direct number is not found (404)', async () => {
     const intruder = await startOperator({ opensips: SIP_TRUNK, user: 'x', password: 'y', bind: '127.0.0.2' })
     try {
       expectEqual((await intruder.raw('INVITE', '+33199000101')).status, 403, 'INVITE from 127.0.0.2')

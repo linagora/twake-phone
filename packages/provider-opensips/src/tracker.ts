@@ -1,5 +1,4 @@
 import type { Call, CallState, Presence, PresenceStatus, TelephonyEvent } from '@twake/telephony-types'
-import { classify } from './numbering.js'
 
 // Turns what OpenSIPS tells (registrations from usrloc, our own E_TWAKEPHONE_* events, the CDRs and missed calls of
 // acc) into the vendor-neutral call and presence events of the Gateway. Pure state machine: no I/O, unit-tested
@@ -390,21 +389,6 @@ export class CallTracker {
   /** Every extension whose presence was told and is not plain offline (registered, in a call, or set by its user). */
   presences(): Map<string, Presence> {
     return new Map(this.told)
-  }
-
-  /**
-   * Whether the call is one with the public network (through the trunk): its caller or the number it reached is an
-   * external party, or an emergency number. Undefined for a call not (or no longer) known.
-   */
-  isWithOperator(callId: string): boolean | undefined {
-    const c = this.calls.get(callId)
-    if (!c) return undefined
-    return isExternalParty(c.caller) || isExternalParty(c.callee) || classify(c.callee)?.class === 'emergency'
-  }
-
-  /** Whether the call is answered (and not over). */
-  isConnected(callId: string): boolean {
-    return !!this.calls.get(callId)?.connectedAt
   }
 
   /** The calls in progress, for a look at the state. */

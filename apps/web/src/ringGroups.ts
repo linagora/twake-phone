@@ -7,6 +7,7 @@ export const parseMembers = (text: string): string[] => [...new Set(text.split(/
 const CODE_KEY: Record<string, Key> = {
   GROUP_NUMBER: 'admin.groupNumberInvalid',
   GROUP_NUMBER_TAKEN: 'admin.groupNumberTaken',
+  GROUP_NUMBER_RESERVED: 'admin.groupNumberReserved',
   GROUP_EXISTS: 'admin.groupExists',
   GROUP_NAME: 'admin.groupNameInvalid',
   GROUP_MEMBERS: 'admin.groupMembersInvalid',

@@ -196,6 +196,8 @@ export interface Store {
   listTrunks(tenantId: string): Promise<TrunkRecord[]>
   /** Adds or replaces a trunk; a replaced one keeps its place. */
   upsertTrunk(record: TrunkRecord): Promise<void>
+  /** Adds or replaces these trunks together: all of them, or none when one cannot be kept. */
+  upsertTrunks(records: TrunkRecord[]): Promise<void>
   /** Removes a trunk and its direct numbers. Whether it was there. */
   deleteTrunk(tenantId: string, id: string): Promise<boolean>
   /** The direct numbers of a tenant, by first number. */

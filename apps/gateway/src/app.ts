@@ -5,11 +5,11 @@ import swagger from '@fastify/swagger'
 import swaggerUi from '@fastify/swagger-ui'
 import { splitParticipantId, verifyWebhook, type LiveKitConferenceBridge, type MeetApi, type MeetRoom } from '@twake/conference-livekit'
 import type { MediaProvider, TelephonyProvider } from '@twake/telephony-provider-sdk'
-import type { CallDirection, DidRange, Endpoint, ForwardingRules, Presence, PresenceStatus, RingGroup, TelephonyEvent, User } from '@twake/telephony-types'
+import { isReservedNumber, type CallDirection, type DidRange, type Endpoint, type ForwardingRules, type Presence, type PresenceStatus, type RingGroup, type TelephonyEvent, type User } from '@twake/telephony-types'
 import { adminPolicyFromEnv, isAdmin, type AdminPolicy } from './admin.js'
 import { authenticatorFromEnv, TicketStore, type Authenticator, type Identity } from './auth.js'
 import { MAX_CONTACT_ID, MAX_FAVORITES, MAX_QUERY, MAX_SEARCH, RateLimiter, type ContactDirectory } from './contacts.js'
-import { StoreDirectory, parseUserMap, type UserDirectory } from './directory.js'
+import { StoreDirectory, seedUserMap, type UserDirectory } from './directory.js'
 import type { DirectorySync } from './directory-sync.js'
 import { EventBus } from './events.js'
 import { historyEntryFor } from './history.js'
@@ -40,8 +40,6 @@ const RESTORE_RETRY_MS = [1_000, 5_000, 15_000, 30_000]
 const PUSH_PURGE_GRACE_MS = 3_600_000
 /** Longest wait of a change for the one before it (a provider whose database hangs): the next one then goes. */
 const TURN_MAX_MS = 10_000
-/** How long a person may be without any event socket before their answered calls with the public network are ended. */
-const ORPHAN_CALL_GRACE_MS = 30_000
 /** One line of text: no control character (a message for callers ends up in a SIP header). */
 // eslint-disable-next-line no-control-regex -- control characters are exactly what is refused here
 const CONTROL = /[\u0000-\u001f\u007f]/
@@ -93,12 +91,6 @@ export interface BuildOptions {
    * a password only.
    */
   secretsKey?: Buffer
-  /**
-   * How long a person may have no event socket open (no window of the app) before the Gateway asks the provider to
-   * end their answered calls with the public network (ADR 0016): a browser gone without hanging up must not leave the
-   * operator's leg open and charged. Default 30 s (a window reloading, an event socket coming back, keeps its call).
-   */
-  orphanCallGraceMs?: number
   /** Phone access to Meet rooms. Absent when no LiveKit is configured: the endpoints answer 501. */
   conference?: {
     bridge: (tenantId: string) => LiveKitConferenceBridge | undefined
@@ -226,6 +218,8 @@ const NUMBER = /^[A-Za-z0-9._+-]{1,64}$/
  */
 export const parseGroup = async (number: string, body: unknown, isExtension: (extension: string) => Promise<boolean>, keep: readonly string[] = []): Promise<RingGroup> => {
   if (!NUMBER.test(number)) throw refused('GROUP_NUMBER', 'invalid group number')
+  // Dialled, an emergency number (or another short number of the French plan) goes to the operator, never to a group.
+  if (isReservedNumber(number)) throw refused('GROUP_NUMBER_RESERVED', `${number} is an emergency number or another short number of the French plan: calls to it go to the operator`)
   if (await isExtension(number)) throw Object.assign(new Error(`${number} is an extension: a group needs a number of its own`), { statusCode: 409, code: 'GROUP_NUMBER_TAKEN' })
   if (!body || typeof body !== 'object' || Array.isArray(body)) throw bad('invalid group')
   const b = body as { name?: unknown; members?: unknown }
@@ -272,7 +266,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
   if (!directory) {
     // Dev convenience: a bare in-memory gateway maps users from DEV_USER_MAP.
     const tenant = process.env.DEFAULT_TENANT ?? 'dev'
-    for (const m of parseUserMap(process.env.DEV_USER_MAP)) if (!(await store.getMappingByUser(tenant, m.userId))) await store.upsertMapping({ tenantId: tenant, ...m })
+    await seedUserMap(store, tenant, process.env.DEV_USER_MAP, message => console.warn(`WARNING: DEV_USER_MAP: ${message}`))
     directory = new StoreDirectory(store)
   }
   const dir = directory
@@ -288,53 +282,6 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
     callOwners.set(call.id, owners)
     // Forget finished calls after a grace period (late actions such as a double click still resolve).
     if (event.type === 'call.ended' || event.type === 'call.failed') setTimeout(() => callOwners.delete(call.id), 5 * 60_000).unref()
-    // The person's answered calls, for the ones to end once no window of theirs is left (orphans, below).
-    const key = ownerKey(tenantId, userId)
-    if (event.type === 'call.connected' || event.type === 'call.held' || event.type === 'call.resumed') {
-      const calls = answeredCalls.get(key) ?? new Set<string>()
-      answeredCalls.set(key, calls.add(call.id))
-    } else if (event.type === 'call.ended' || event.type === 'call.failed') {
-      answeredCalls.get(key)?.delete(call.id)
-      if (!answeredCalls.get(key)?.size) answeredCalls.delete(key)
-    }
-  }
-  // A call with the public network whose browser is gone without hanging up (closed, crashed, put to sleep) would keep
-  // the operator's leg open and charged (ADR 0016). The browser is the app: once a person has had no event socket for
-  // orphanCallGraceMs, the provider is asked to end their answered calls (it ends only those with the public network:
-  // a colleague's browser ends an internal call itself).
-  const answeredCalls = new Map<string, Set<string>>()
-  const eventSockets = new Map<string, number>()
-  const orphanTimers = new Map<string, ReturnType<typeof setTimeout>>()
-  const orphanGraceMs = options.orphanCallGraceMs ?? ORPHAN_CALL_GRACE_MS
-  const socketOpened = (tenantId: string, userId: string) => {
-    const key = ownerKey(tenantId, userId)
-    eventSockets.set(key, (eventSockets.get(key) ?? 0) + 1)
-    clearTimeout(orphanTimers.get(key))
-    orphanTimers.delete(key)
-  }
-  const socketClosed = (tenantId: string, userId: string) => {
-    const key = ownerKey(tenantId, userId)
-    const left = (eventSockets.get(key) ?? 1) - 1
-    if (left > 0) return void eventSockets.set(key, left)
-    eventSockets.delete(key)
-    if (!answeredCalls.get(key)?.size) return
-    clearTimeout(orphanTimers.get(key))
-    const timer = setTimeout(() => {
-      orphanTimers.delete(key)
-      if (eventSockets.has(key)) return
-      const provider = registry.forTenant(tenantId)
-      if (!provider.endCall) return
-      for (const callId of answeredCalls.get(key) ?? []) {
-        provider.endCall(callId).then(
-          () => app.log.info({ tenantId, userId, callId }, 'call with the public network ended: no window of its person is left'),
-          (err: { statusCode?: number }) => {
-            if (err?.statusCode !== 404 && err?.statusCode !== 409) app.log.warn({ err, tenantId, callId }, 'orphan call not ended')
-          }
-        )
-      }
-    }, orphanGraceMs)
-    timer.unref()
-    orphanTimers.set(key, timer)
   }
 
   const app = Fastify({
@@ -993,7 +940,15 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
           const records = await store.listTrunks(user.tenantId)
           const current = records.find(t => t.id === id)
           if (!current && records.length >= MAX_TRUNKS) throw Object.assign(new Error(`At most ${MAX_TRUNKS} trunks`), { statusCode: 409 })
-          const record = trunkRecord(user.tenantId, id, parseTrunk(req.body, current), current, options.secretsKey)
+          const parsed = parseTrunk(req.body, current)
+          // The default trunk stays so unless another one is made the default: a change that does not say `default`
+          // keeps the mark; `default: false` on the default trunk is refused, it would hand the number of everyone
+          // without a direct number (and their emergency calls) to another trunk without a word.
+          const given = (req.body as Record<string, unknown>).default
+          if (given === undefined && current?.config.default) parsed.config = { ...parsed.config, default: true }
+          if (given === false && current && defaultTrunk(records)?.id === id)
+            throw Object.assign(new Error('This is the default trunk: make another one the default instead'), { statusCode: 409, code: 'TRUNK_DEFAULT' })
+          const record = trunkRecord(user.tenantId, id, parsed, current, options.secretsKey)
           // One default trunk: the one marked now, the others no longer.
           const unmark = (t: TrunkRecord): TrunkRecord => {
             const { default: _was, ...config } = t.config
@@ -1002,10 +957,8 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
           const unmarked = record.config.default ? records.filter(t => t.id !== id && t.config.default).map(unmark) : []
           const updated = (t: TrunkRecord) => (t.id === id ? record : (unmarked.find(u => u.id === t.id) ?? t))
           const next = current ? records.map(updated) : [...records.map(updated), record]
-          await changeTrunks(user.tenantId, apply, next, (await store.listDids(user.tenantId)).map(publicDid), async () => {
-            for (const t of unmarked) await store.upsertTrunk(t)
-            await store.upsertTrunk(record)
-          })
+          // The marks moved together, or not at all.
+          await changeTrunks(user.tenantId, apply, next, (await store.listDids(user.tenantId)).map(publicDid), () => store.upsertTrunks([...unmarked, record]))
           return { record, created: !current }
         })
         return reply.code(created ? 201 : 200).send(publicTrunk(record))
@@ -1220,11 +1173,9 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         const send = (event: TelephonyEvent) => socket.send(JSON.stringify(event))
         const unsubscribe = bus.subscribe(user.tenantId, user.id, send)
         const unsubscribeTenant = bus.subscribeTenant(user.tenantId, send)
-        socketOpened(user.tenantId, user.id)
         socket.on('close', () => {
           unsubscribe()
           unsubscribeTenant()
-          socketClosed(user.tenantId, user.id)
         })
         // The session is accepted: the client may read the state now (and reset its backoff), every change from
         // here on reaches it. Not an event; a socket closed before it is a failed attempt.

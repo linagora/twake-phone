@@ -15,7 +15,7 @@ export { CallRules, CALL_RULES_SCHEMA, DND_MESSAGE_MAX, NOANSWER_DELAY, type Cal
 export { CallGroups, CALL_GROUPS_SCHEMA, DISPLAY_NAMES_SCHEMA, GROUP_MEMBERS_MAX, NAME_MAX, sipDisplayName, type CallGroupsOptions } from './call-groups.js'
 export { PushTargets, PUSH_TARGETS_SCHEMA, type PushTargetsOptions } from './push-targets.js'
 export { AsyncQueue } from './queue.js'
-export { TrunkTables, TRUNK_SCHEMA, TRUNK_SQL, DEFAULT_TRUNK_SOCKET, DISPATCHER_TABLE_VERSION, DIALPLAN_TABLE_VERSION, REGISTRANT_TABLE_VERSION, codecFlags, projectTrunks, trunkSecret, type TrunkTablesOptions } from './trunks.js'
+export { TrunkTables, TRUNK_SCHEMA, TRUNK_SQL, DEFAULT_TRUNK_SOCKET, SOURCES_SET, DISPATCHER_TABLE_VERSION, DIALPLAN_TABLE_VERSION, REGISTRANT_TABLE_VERSION, codecFlags, projectTrunks, trunkSecret, type TrunkTablesOptions } from './trunks.js'
 export { DIALPLAN_RULES, DIALPLAN_SQL, DP_CLASSIFY, DP_INBOUND, DP_NORMALISE, OUTBOUND_ALLOWABLE, OUTBOUND_ALLOWED, classify, translate, type DialplanRule, type NumberClass } from './numbering.js'
 
 /**
@@ -346,20 +346,6 @@ export class OpensipsProvider implements TelephonyProvider, MediaProvider {
       log.warn(`OpenSIPS: trunks written, ${failed.join(', ')} failed: not applied until it reloads them or restarts`)
       throw Object.assign(new Error(`OpenSIPS did not reload the trunks: ${failed.join(', ')}`), { statusCode: 502, code: 'TRUNK_RELOAD_FAILED' })
     }
-  }
-
-  /**
-   * Ends a call with the public network on OpenSIPS's side (a BYE to each party it can reach, the operator's leg
-   * first of all): for a call whose browser went without hanging up (the Gateway, ADR 0016). 404 for a call it does
-   * not know, 409 for an internal one (both parties are browsers, which end their calls themselves) or one not
-   * answered.
-   */
-  async endCall(callId: string) {
-    if (!this.events) throw Object.assign(new Error('Ending a call needs the MI of OpenSIPS'), { statusCode: 501 })
-    const withOperator = this.tracker.isWithOperator(callId)
-    if (withOperator === undefined) throw Object.assign(new Error('No such call'), { statusCode: 404 })
-    if (!withOperator || !this.tracker.isConnected(callId)) throw Object.assign(new Error('Only an answered call with the public network is ended here'), { statusCode: 409 })
-    await this.events.call('dlg_end_dlg', [callId])
   }
 
   async getForwarding(user: User): Promise<ForwardingRules> {

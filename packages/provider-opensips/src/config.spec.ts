@@ -156,11 +156,14 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(preload).toContain('FROM (SELECT DISTINCT extension FROM reach) AS x LEFT JOIN call_rules r ON r.extension = x.extension')
     // Each query is asynchronous (the rules, the first of them with the caller's name, the names of a Replaces, the
     // members of a group, the preload, whether the callee can be woken), none is run where async is not available.
-    // The trunk of a call to the public network, the direct number of a call from it: step 6). The two synchronous
+    // The trunk of a call to the public network, the direct number of a call from it: step 6). Two synchronous
     // queries ask the catalog whether the tables of step 4c, or that of step 5, exist, only after a read failed, from
-    // the routes that resume a read.
-    expect(cfg.match(/sql_query/g)).toHaveLength(10)
+    // the routes that resume a read; the third reads the default trunk every 15 s, in a timer of its own, never in a
+    // call (an emergency call's fallback when the trunk of the call cannot be read).
+    expect(cfg.match(/sql_query/g)).toHaveLength(11)
     expect(cfg.match(/async\(sql_query/g)).toHaveLength(8)
+    const timer = cfg.slice(cfg.indexOf('\ntimer_route[default_trunk, 15] {'), cfg.indexOf('\nroute[emergency_failed] {'))
+    expect(timer.match(/sql_query_one\(/g)).toHaveLength(1)
     expect(section('route[tables_4c_missing]', 'route[table_5_missing]').match(/sql_query_one\(/g)).toHaveLength(1)
     expect(section('route[table_5_missing]', 'route[wake_next]').match(/sql_query_one\(/g)).toHaveLength(1)
     expect(cfg.match(/route\(tables_4c_missing\)/g)).toHaveLength(1)
@@ -615,8 +618,13 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     const check = loaded.indexOf('if ($avp(num_class) != "emergency") {\n\t\t$var(mark) = "," + $avp(num_class) + ",";')
     expect([internal, check].every(i => i > 0)).toBe(true)
     expect(internal).toBeLessThan(check)
-    expect(loaded).toContain('if ($avp(t_allowed) == NULL || $(avp(t_allowed){s.index,$var(mark)}) == NULL) {')
-    expect(loaded).toContain('$var(to_user) = $avp(callee);\n\tif ($avp(num_class) != "emergency") {\n\t\troute(trunk_number, $avp(callee));')
+    expect(loaded).toContain('if ($avp(t_allowed) == NULL || $(avp(t_allowed){s.index,$var(mark)}) == NULL)\n\t\t\t$var(allowed) = 0;')
+    // An international number only to a country code the trunk lists (",44,"), read on its first one to three digits.
+    expect(loaded).toContain('if ($avp(num_class) == "international" && $var(allowed) == 1) {\n\t\t\t$var(allowed) = 0;')
+    expect(loaded).toContain('$var(cc) = "," + $(avp(callee){s.substr,1,$var(i)}) + ",";')
+    expect(loaded).toContain('$avp(t_countries) != NULL && $(avp(t_countries){s.index,$var(cc)}) != NULL')
+    // A number in E.164 as the operator writes them; a short one (112, 116006...) as dialled.
+    expect(loaded).toContain('$var(to_user) = $avp(callee);\n\tif ($avp(callee) =~ "^\\+") {\n\t\troute(trunk_number, $avp(callee));')
     // No trunk at all: an emergency number is told to be called from another phone, anything else has no trunk.
     const noTrunk = loaded.slice(loaded.indexOf('if ($var(trunk_rc) == -2) {'), loaded.indexOf('if ($var(trunk_rc) < 0) {'))
     expect(noTrunk).toContain('append_to_reply("Twake-Call-Refused: emergency\\r\\n");\n\t\t\tt_reply(403, "Emergency Calls Not Routed");')
@@ -641,10 +649,35 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(failed.indexOf('$ru = $avp(t_ruri);')).toBeGreaterThan(0)
     expect(failed.indexOf('$ru = $avp(t_ruri);')).toBeLessThan(failed.indexOf('if (t_check_status("401|407")) {'))
     expect(section('route[trunk_out_loaded]', 'route[trunk_number]')).toContain('$avp(t_ruri) = $ru;')
-    expect(failed.replace(/#.*$/gm, '').trimEnd().endsWith('rtpengine_delete();\n\troute(account_missed);\n}')).toBe(true)
-    // Any reply of the operator under 200 (100 Trying, 180...) holds the call to that server.
-    expect(section('onreply_route[rtp]', 'route[event_attrs]')).toContain('if ($rs < 200 && $dlg_val(trunk) == "callee")\n\t\t$avp(t_rang) = 1;')
+    // A redirection is never followed, and its Contact never reaches the phone: 480.
+    expect(failed.replace(/#.*$/gm, '').trimEnd().endsWith('if (t_check_status("3[0-9][0-9]")) {\n\t\txlog("L_NOTICE", "call $ci: the operator redirected the call ($T_reply_code), not followed\\n");\n\t\tt_reply(480, "Temporarily Unavailable");\n\t}\n}')).toBe(true)
+    // A provisional reply past 100 Trying (180, 183...) holds the call to that server; 100 only says the INVITE arrived.
+    expect(section('onreply_route[rtp]', 'route[event_attrs]')).toContain('if ($rs > 100 && $rs < 200 && $dlg_val(trunk) == "callee")\n\t\t$avp(t_rang) = 1;')
     expect(section('route[trunk_out_loaded]', 'route[trunk_number]')).toContain('$(avp(t_rang)[*]) = NULL;')
+  })
+
+  it('never lets an emergency call depend on the database, cuts it at TRUNK_MAX_CALL_SEC, or fail without saying to call from another phone', () => {
+    const { cfg } = render({ TRUNK_MAX_CALL_SEC: '7200' })
+    const section = (name: string, next: string) => cfg.slice(cfg.indexOf(`\n${name} {`), cfg.indexOf(`\n${next} {`))
+    // The default trunk, read every 15 s into shared variables; none: 0.
+    expect(cfg).toContain('modparam("cfgutils", "shvset", "dt_setid=i:0")')
+    const timer = section('timer_route[default_trunk, 15]', 'route[emergency_failed]')
+    expect(timer).toContain('FROM trunks ORDER BY position LIMIT 1')
+    expect(timer).toContain('$shv(dt_setid) = $var(d_setid);')
+    expect(timer).toContain('} else if ($rc == -2) {\n\t\t# No trunk any more.\n\t\t$shv(dt_setid) = 0;')
+    // Taken for an emergency call when the trunk could not be read, or none of its servers is up.
+    const fallback = section('route[default_trunk]', 'timer_route[default_trunk, 15]')
+    expect(fallback).toContain('if ($shv(dt_setid) == 0 || ($avp(t_setid) != NULL && $avp(t_setid) == $shv(dt_setid)))\n\t\treturn(-1);')
+    const loaded = section('route[trunk_out_loaded]', 'route[trunk_headers]')
+    expect(loaded).toContain('if ($avp(num_class) == "emergency" && route(default_trunk)) {')
+    expect(loaded).toContain('if (!route(default_trunk) || !ds_select_dst($avp(t_setid), 8, "f")) {\n\t\t\troute(emergency_failed, "no server up");')
+    // Never cut at TRUNK_MAX_CALL_SEC.
+    expect(loaded).toContain('if ($avp(num_class) == "emergency")\n\t\t$DLG_timeout = 604800;\n\telse\n\t\t$DLG_timeout = 7200;')
+    // Every failure of it, the operator's refusal included: "call from another phone".
+    expect(section('route[emergency_failed]', 'route[trunk_out_loaded]')).toContain('append_to_reply("Twake-Call-Refused: emergency\\r\\n");\n\tt_reply(503, "Emergency Call Failed");')
+    const failed = section('failure_route[trunk_failed]', 'route[trunk_in]')
+    expect(failed).toContain('if ($avp(num_class) == "emergency") {\n\t\t$var(failed) = "" + $T_reply_code;\n\t\troute(emergency_failed, $var(failed));\n\t\texit;\n\t}')
+    expect(failed.indexOf('route(emergency_failed, $var(failed));')).toBeLessThan(failed.indexOf('if (t_check_status("3[0-9][0-9]")) {'))
   })
 
   it('never lets a call with the operator be transferred by it, from either side', () => {
@@ -662,12 +695,42 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(replaced).toBeLessThan(main.indexOf('record_route();'))
   })
 
-  it('hears the operator only on the trunk socket, in a dialog as out of one', () => {
+  it('hears the operator only on the trunk socket: out of a dialog from its addresses, in one of its calls from any', () => {
     const { cfg } = render()
     const main = cfg.slice(cfg.indexOf('\nroute {'), cfg.indexOf('\nroute[outbound_policy] {'))
     const known = main.indexOf('if ($socket_in(ip) == "127.0.0.1" && $socket_in(port) == 5070 && !ds_is_in_list("$si", 0)) {')
     expect(known).toBeGreaterThan(0)
     expect(known).toBeLessThan(main.indexOf('if (has_totag()) {'))
+    // Out of a dialog from an address the trunk does not declare: 403. In one: a stranger, judged below.
+    expect(main.slice(known)).toMatch(/^[^]*?if \(!has_totag\(\)\) \{[^]*?send_reply\(403, "Forbidden"\);\n\t\t\texit;\n\t\t\}\n\t\t\$var\(stranger\) = 1;/)
+    const inDialog = main.slice(main.indexOf('if (has_totag()) {'), main.indexOf('if (is_method("CANCEL")) {'))
+    // Not let through by the shortcut of an ACK to a transaction: through the Record-Route and the dialog like the rest.
+    expect(inDialog).toContain('if (is_method("ACK") && $var(stranger) == 0 && t_check_trans()) {')
+    const judged = inDialog.indexOf('if ($var(stranger) == 1) {\n\t\t\tif ($dlg_val(trunk) == NULL || route(to_trunk)) {')
+    // After loose_route and match_dialog (our Record-Route, a dialog of ours), before anything is relayed: only the
+    // operator's side of a call with it, never a request to it nor one in a call between two accounts.
+    expect(judged).toBeGreaterThan(inDialog.indexOf('if (!match_dialog()) {'))
+    expect(judged).toBeLessThan(inDialog.indexOf('route(relay);'))
+  })
+
+  it('sends the operator only the headers a call needs, whatever the phone added', () => {
+    const { cfg } = render()
+    const section = (name: string, next: string) => cfg.slice(cfg.indexOf(`\n${name} {`), cfg.indexOf(`\n${next} {`))
+    const headers = section('route[trunk_headers]', 'route[trunk_number]')
+    const allowed = /if \(!\(\$var\(name\) =~ "([^"]+)"\)\)\n\t\t\tremove_hf\("\$var\(name\)"\);/.exec(headers)?.[1]
+    expect(allowed).toBeDefined()
+    // Every header, by its name in lower case, all of them in turn.
+    expect(headers).toContain('while ($(hdr_name[$var(h)]) != NULL) {\n\t\t$var(name) = $(hdr_name[$var(h)]{s.tolower});')
+    const kept = (name: string) => new RegExp(allowed ?? 'never').test(name.toLowerCase())
+    for (const name of ['Via', 'v', 'Max-Forwards', 'From', 'To', 'Call-ID', 'i', 'CSeq', 'Contact', 'm', 'Route', 'Content-Type', 'Content-Length', 'l', 'Allow', 'Supported', 'Require', 'Session-Expires', 'Min-SE', 'RAck', 'RSeq'])
+      expect(kept(name), name).toBe(true)
+    for (const name of ['Diversion', 'History-Info', 'P-Charge-Info', 'P-Called-Party-ID', 'P-Preferred-Service', 'P-Preferred-Identity', 'P-Asserted-Identity', 'Remote-Party-ID', 'Privacy', 'Referred-By', 'Reply-To', 'Alert-Info', 'Call-Info', 'Organization', 'Subject', 's', 'User-Agent', 'X-Account', 'Twake-Anything', 'Via-Fake', 'ToX'])
+      expect(kept(name), name).toBe(false)
+    // On the initial INVITE before the From, To and P-Asserted-Identity of ours; on every request of a call to the operator.
+    const loaded = section('route[trunk_out_loaded]', 'route[trunk_headers]')
+    expect(loaded.indexOf('route(trunk_headers);')).toBeLessThan(loaded.indexOf('uac_replace_from('))
+    expect(loaded.indexOf('route(trunk_headers);')).toBeLessThan(loaded.indexOf('append_hf("P-Asserted-Identity'))
+    expect(cfg).toContain('\t\tif (route(to_trunk))\n\t\t\troute(trunk_headers);\n\t\troute(relay);')
   })
 
   it('makes rtpengine take an offer made in a 2xx (an INVITE without SDP) and its answer in the ACK', () => {
@@ -678,6 +741,8 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(inDialog).toContain('} else if (is_method("INVITE")) {\n\t\t\troute(late_offer);\n\t\t\tt_on_reply("rtp");\n\t\t}')
     expect(inDialog).toContain('if (is_method("ACK") && $dlg_val(late_answer) == "1" && has_body_part("application/sdp")) {')
     expect(section('route[trunk_in]', 'route[inbound_number]')).toContain('if (!has_body_part("application/sdp")) {\n\t\t$(avp(late_offer)[*]) = NULL;\n\t\t$avp(late_offer) = "trunk";')
+    // A SIP phone's call to the operator without SDP: the operator's offer in its 2xx through rtpengine, never as sent.
+    expect(section('route[trunk_out_loaded]', 'route[trunk_headers]')).toContain('if (has_body_part("application/sdp")) {\n\t\troute(rtp_offer);\n\t} else {\n\t\t$(avp(late_offer)[*]) = NULL;\n\t\t$avp(late_offer) = "browser";\n\t}')
     const reply = section('onreply_route[rtp]', 'route[event_attrs]')
     expect(reply).toContain('if ($avp(late_offer) != NULL) {\n\t\t\tif ($rs >= 200 && $rs < 300)\n\t\t\t\troute(rtp_late_offer);\n\t\t} else {\n\t\t\troute(rtp_answer);')
     expect(section('route[rtp_late_offer]', 'route')).toContain('$dlg_val(late_answer) = "1";')
@@ -685,10 +750,27 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
 
   it('bounds every call with the operator, and ends it with a BYE to both sides at TRUNK_MAX_CALL_SEC', () => {
     const { cfg } = render({ TRUNK_MAX_CALL_SEC: '7200' })
-    expect(cfg).toContain('\tif ($var(pstn) == 1)\n\t\tcreate_dialog("B");\n\telse\n\t\tcreate_dialog();')
+    expect(cfg).toContain('\tif ($var(pstn) == 1)\n\t\tcreate_dialog("BP");\n\telse\n\t\tcreate_dialog();')
     expect(cfg.match(/\$DLG_timeout = 7200;/g)).toHaveLength(2)
-    expect(cfg).toContain('\tcreate_dialog("B");\n\t$DLG_timeout = 7200;\n\t$dlg_val(trunk) = "caller";')
+    expect(cfg).toContain('\tcreate_dialog("Bp");\n\t$DLG_timeout = 7200;\n\t$dlg_val(trunk) = "caller";')
     expect(render().cfg).toContain('$DLG_timeout = 14400;')
+  })
+
+  it('ends a call with the operator when its phone stops answering the OPTIONS of the dialog, every CALL_PING_SEC', () => {
+    // The phone's side only: the caller's (P) of a call out, the callee's (p) of a call in; never the operator's.
+    const { cfg } = render({ CALL_PING_SEC: '12' })
+    expect(cfg).toContain('modparam("dialog", "options_ping_interval", 12)')
+    expect(cfg.replace(/#.*$/gm, '').match(/create_dialog\("[^"]*"\)/g)).toEqual(['create_dialog("BP")', 'create_dialog("Bp")'])
+    expect(render().cfg).toContain('modparam("dialog", "options_ping_interval", 30)')
+    expect(render({ CALL_PING_SEC: '5' }).status).toBe(0)
+    expect(render({ CALL_PING_SEC: '300' }).status).toBe(0)
+    for (const v of ['4', '301', 'abc', '10s', '-5']) {
+      const { status, stderr } = render({ CALL_PING_SEC: v })
+      expect(status, v).toBe(1)
+      expect(stderr).toMatch(/CALL_PING_SEC/)
+    }
+    // Nothing else ends a call: no MI command of the Gateway's does (dlg_end_dlg is never sent, ADR 0016).
+    expect(cfg).not.toContain('dlg_end_dlg')
   })
 
   it('tells the operator nothing of the inside: the number as it writes them in the To, no version, no "do not disturb" nor refusal of ours', () => {
@@ -702,13 +784,19 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(section('onreply_route[rtp]', 'route[event_attrs]')).toContain('remove_hf("Twake-Call-Refused");')
   })
 
-  it('reads the caller of the operator in the national forms only operators send, and hides it under Privacy: id', () => {
+  it('reads the caller of the operator in the national forms only operators send, and hides it under Privacy: id or user', () => {
     const { cfg } = render()
     const section = (name: string, next: string) => cfg.slice(cfg.indexOf(`\n${name} {`), cfg.indexOf(`\n${next} {`))
     expect(section('route[inbound_number]', 'route[trunk_in_loaded]')).toContain('if (!dp_translate(1, "$var(in)", $var(n), $var(n_class)) && !dp_translate(3, "$var(in)", $var(n), $var(n_class)))')
     const trunkIn = section('route[trunk_in]', 'route[inbound_number]')
     for (const what of ['$rU', '$tU', '$fU']) expect(trunkIn).toContain(`route(inbound_number, ${what})`)
-    expect(trunkIn).toContain('if (is_present_hf("Privacy") && $hdr(Privacy) =~ "(^|[;, ])id([;, ]|$)")\n\t\t$var(from_number) = "anonymous";')
+    // Every Privacy header (all their values, joined), any case: `id` or `user` hides the caller, nothing else does.
+    expect(trunkIn).toContain('if (is_present_hf("Privacy")) {\n\t\t$var(privacy) = $(hdr(Privacy)[*]{s.tolower});')
+    const privacy = /\$var\(privacy\) =~ "([^"]+)"\)\n\t\t\t\$var\(from_number\) = "anonymous";/.exec(trunkIn)?.[1]
+    expect(privacy).toBeDefined()
+    const hides = (value: string) => new RegExp(privacy ?? 'never').test(value.toLowerCase())
+    for (const value of ['id', 'user', 'none, user', 'header;id', 'ID', 'header, critical, user']) expect(hides(value), value).toBe(true)
+    for (const value of ['none', 'header', 'session', 'critical', 'identity', 'userinfo']) expect(hides(value), value).toBe(false)
     // The browser sees the caller as read, never the operator's From.
     expect(section('route[caller_name]', 'route[tables_4c]')).toContain('if ($avp(caller_uri) != NULL) {\n\t\tuac_replace_from("", "$avp(caller_uri)");')
   })

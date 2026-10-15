@@ -92,12 +92,29 @@ export const TRUNK_CODECS = ['PCMA', 'PCMU', 'G722', 'opus'] as const
 export type TrunkCodec = (typeof TRUNK_CODECS)[number]
 /**
  * The kinds of numbers a trunk may be allowed to call. The emergency numbers are always called, premium numbers never
- * (step 6b brings rights per profile and caps).
+ * (step 6b brings rights per profile and caps); `international` only to the countries the trunk lists (`countries`).
  */
 export const TRUNK_OUTBOUND_CLASSES = ['fixed', 'mobile', 'freephone', 'standard-rate', 'overseas', 'international'] as const
 export type TrunkOutboundClass = (typeof TRUNK_OUTBOUND_CLASSES)[number]
 /** What a trunk calls when its administrator does not say: metropolitan fixed, mobile, free and standard-rate numbers. */
 export const TRUNK_OUTBOUND_DEFAULT: readonly TrunkOutboundClass[] = ['fixed', 'mobile', 'freephone', 'standard-rate']
+
+/**
+ * The short numbers of the French plan the SIP server routes to the operator or refuses itself, before any
+ * extension or group (ADR 0016): the emergency numbers (15, 17, 18, 112, 114, 115, 119, 191, 196, 197, 116000,
+ * 116117), the European harmonised numbers (116xxx) and the directory enquiries (118xxx). No extension, ring group or
+ * target of a direct number may be one: dialled, it never rings anyone inside.
+ */
+export const RESERVED_NUMBER = /^(1[578]|11[2459]|19[167]|116[0-9]{3}|118[0-9]{3})$/
+/** Whether `number` is a short number of the French plan that no extension or group may have (RESERVED_NUMBER). */
+export const isReservedNumber = (number: string) => RESERVED_NUMBER.test(number)
+
+/**
+ * E.164 country codes no trunk may list in `countries`: France and its overseas departments and territories (their
+ * own classes, `overseas`), and the codes of no country, charged as premium (satellites, international networks and
+ * premium rate: never called).
+ */
+export const TRUNK_COUNTRY_EXCLUDED = /^(33|262|508|59[046]|68[179]|80[08]|87[08]|88[1238]|979|991)$/
 
 /**
  * A SIP trunk: where calls to and from the public network go (step 6, ADR 0016). The password is write-only: it is
@@ -135,6 +152,11 @@ export interface Trunk {
   defaultNumber: string
   /** The kinds of numbers it calls (TRUNK_OUTBOUND_DEFAULT when absent). */
   allowed?: TrunkOutboundClass[]
+  /**
+   * The countries its international numbers may be in, as E.164 country codes without the + ("32", "44", "1"):
+   * required with `international` in `allowed`, which calls these only, never a whole world.
+   */
+  countries?: string[]
   /**
    * The trunk of those who have no direct number (and of the emergency numbers they call): one per tenant. Absent on
    * every trunk: the first one written.
