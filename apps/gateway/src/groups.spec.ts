@@ -81,7 +81,7 @@ describe('ring group routes', () => {
     const factory: ProviderFactory<unknown> = { type: 'recording', create: () => provider as unknown as TelephonyProvider }
     const registry = new ProviderRegistry([{ tenantId: 'A', type: 'recording', config: {} }], [factory])
     const directory = people ? new MemoryContactDirectory(people) : undefined
-    const directorySync = directory ? new DirectorySync({ store, directory, tenantId: 'A', reserved: async () => [...groups.keys()] }) : undefined
+    const directorySync = directory ? new DirectorySync({ store, directory, tenantId: 'A', reserved: async () => [...groups.keys()], exclusiveWaitMs: 1_000 }) : undefined
     const app = await buildApp(registry, {
       store,
       bus: new EventBus(),
@@ -169,6 +169,26 @@ describe('ring group routes', () => {
     await app.inject({ method: 'POST', url: '/api/v1/admin/groups', headers: admin, payload: { number: '201', name: 'Support', members: ['101'] } })
     directory!.listAll = async () => [...people, { id: 'erin', displayName: 'Erin', numbers: [{ type: 'extension', number: '201' }] }]
     expect((await directorySync!.run()).conflicts).toEqual([{ userId: 'erin', extension: '201', heldBy: '', group: true }])
+    await app.close()
+  })
+
+  it('answers 503 SYNC_RUNNING, and writes nothing, when a synchronisation does not end in time', async () => {
+    const people: Contact[] = [{ id: 'alice', displayName: 'Alice Martin', numbers: [{ type: 'extension', number: '101' }] }]
+    const { app, as, groups, directory, directorySync, writes } = await setup(true, people)
+    const admin = as('root', 'twakephone-admin')
+    let release!: () => void
+    directory!.listAll = () => new Promise(resolve => (release = () => resolve(people)))
+    const run = directorySync!.run()
+    const created = await app.inject({ method: 'POST', url: '/api/v1/admin/groups', headers: admin, payload: { number: '200', name: 'Accueil', members: ['101'] } })
+    expect([created.statusCode, created.json().code]).toEqual([503, 'SYNC_RUNNING'])
+    const changed = await app.inject({ method: 'PUT', url: '/api/v1/admin/groups/200', headers: admin, payload: { name: 'Accueil', members: ['101'] } })
+    expect([changed.statusCode, changed.json().code]).toEqual([503, 'SYNC_RUNNING'])
+    release()
+    await run
+    await new Promise(r => setTimeout(r, 20))
+    // Their turn came after they gave up: nothing written.
+    expect(writes).toEqual([])
+    expect(groups.size).toBe(0)
     await app.close()
   })
 

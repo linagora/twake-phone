@@ -30,6 +30,7 @@ import { MemoryStore } from '../../gateway/dist/store/memory.js'
 import { BASE_DN, PEOPLE, READER_DN, READER_PASSWORD, startLdapMock } from '../../gateway/test/ldap-mock.mjs'
 import { startOidcMock } from './oidc-mock.mjs'
 import { serveApp } from '../server/serve.mjs'
+import { sipUa } from './sip-ua.mjs'
 
 const AUDIENCE = 'twakephone-gateway'
 const RESOURCE = 'https://gateway.twakephone.test'
@@ -37,6 +38,8 @@ const SIP_WSS_URL = process.env.SIP_WSS_URL ?? 'wss://127.0.0.1:8089'
 const SIP_DOMAIN = process.env.SIP_DOMAIN ?? new URL(SIP_WSS_URL).hostname
 const OPENSIPS_DB_URL = process.env.OPENSIPS_DB_URL ?? 'postgres://twake:twake@127.0.0.1:54320/twake'
 const OPENSIPS_MI_URL = process.env.OPENSIPS_MI_URL ?? 'udp:127.0.0.1:8880'
+// OpenSIPS's UDP socket, for the user agents of this process (sip-ua.mjs): on this host.
+const SIP_UDP = process.env.SIP_UDP ?? '127.0.0.1:5060'
 const DTMF_LOG = process.env.RTPENGINE_DTMF_LOG ?? '127.0.0.1:22223'
 const TENANT = 'e2e'
 const BROWSER = process.env.BROWSER ?? 'chromium'
@@ -187,7 +190,9 @@ const since = { acc: await lastId('acc'), missed_calls: await lastId('missed_cal
 await until('the call_rules table', async () => (await db.query("SELECT to_regclass('call_rules') AS t")).rows[0].t)
 await db.query("DELETE FROM call_rules WHERE extension IN ('101', '102', '103', '104', '105')")
 // Nor the ring groups of an interrupted run.
-await db.query("DELETE FROM call_groups WHERE number IN ('200', '105', '106')")
+await db.query("DELETE FROM call_groups WHERE number IN ('200', '105', '106', '210')")
+// Nor the account an older Gateway would have left (106), which this run writes by hand.
+await db.query("DELETE FROM subscriber WHERE username = '106'")
 
 // A microphone that produces a tone, no permission prompt, sound allowed without a gesture, OpenSIPS's self-signed
 // certificate accepted (Firefox: through the context's ignoreHTTPSErrors). Firefox ignores ICE candidates on the
@@ -1138,15 +1143,59 @@ try {
     await bob.page.evaluate(() => window.e2eObserver?.disconnect())
     await setStatus(bob, 'Disponible')
   })
-  await step('OpenSIPS shows the name the directory gives: Bob, renamed in the directory, calls Alice as Robert Durand once Alice synchronised it from Administration (POST /admin/directory/sync); the account an older Gateway left (106) goes', async () => {
+  await step('ring group 210 of three extensions with five windows each (user agents of this process): twelve windows ring, four of each member; all decline: 603; one member busy on all its windows: 480', async () => {
+    // Three extensions and a caller nobody signs in to in a browser: their accounts written for them as their sessions do.
+    const members = ['131', '132', '133']
+    const credentials = {}
+    for (const extension of [...members, '134']) {
+      const userId = `ua-${extension}`
+      await store.upsertMapping({ tenantId: TENANT, userId, extension, displayName: `Fenêtre ${extension}` })
+      credentials[extension] = (await registry.forTenant(TENANT).getSession({ id: userId, tenantId: TENANT, displayName: `Fenêtre ${extension}`, extension }, { id: 'ua', type: 'browser', label: 'UA' })).credential
+    }
+    const holders = (await db.query("SELECT username, holder FROM subscriber WHERE username IN ('131', '132', '133', '134') ORDER BY username")).rows
+    expectEqual(holders.map(r => `${r.username} ${r.holder}`), ['131 ua-131', '132 ua-132', '133 ua-133', '134 ua-134'], 'the holders of the accounts')
+    const api = await asPerson(alice)
+    expectEqual((await api('POST', '/admin/groups', { number: '210', name: 'Fenêtres', members })).statusCode, 201, 'creating group 210')
+    const windows = []
+    const caller = await sipUa({ proxy: SIP_UDP, domain: SIP_DOMAIN, user: '134', password: credentials['134'] })
+    try {
+      for (const user of members) {
+        for (let i = 0; i < 5; i++) {
+          const ua = await sipUa({ proxy: SIP_UDP, domain: SIP_DOMAIN, user, password: credentials[user] })
+          windows.push(ua)
+          expectEqual(await ua.register(), 200, `registration of window ${i + 1} of ${user}`)
+        }
+      }
+      // How many INVITEs each window got since `before`, by member.
+      const rung = before => members.map(m => `${m}: ${windows.filter(w => w.user === m && w.invites.length > (before.get(w) ?? 0)).length}`)
+      const counts = () => new Map(windows.map(w => [w, w.invites.length]))
+      for (const w of windows) w.answer('603 Decline')
+      let before = counts()
+      expectEqual(await caller.call('210'), '603 Decline', 'the answer to 210 when every window declines')
+      expectEqual(rung(before), ['131: 4', '132: 4', '133: 4'], 'windows rung per member (12 at most, in turn)')
+      // 132 is busy on every window: not every window declined, the group cannot be reached (480).
+      for (const w of windows) w.answer(w.user === '132' ? '486 Busy Here' : '603 Decline')
+      before = counts()
+      expectEqual(await caller.call('210'), '480 Temporarily Unavailable', 'the answer to 210 when one member is busy and the others decline')
+      expectEqual(rung(before), ['131: 4', '132: 4', '133: 4'], 'windows rung per member, the second time')
+    } finally {
+      for (const ua of [...windows, caller]) await ua.close()
+      await api('DELETE', '/admin/groups/210')
+      // Nobody holds them any more: the next synchronisation removes their accounts (step of the names).
+      for (const extension of [...members, '134']) await store.deleteMapping(TENANT, `ua-${extension}`)
+    }
+  })
+  await step('OpenSIPS shows the name the directory gives: Bob, renamed in the directory, calls Alice as Robert Durand once Alice synchronised it from Administration (POST /admin/directory/sync); the accounts of the extensions nobody holds now go, not the one the Gateway did not write (106)', async () => {
     const bobEntry = people.find(p => p.uid === 'bdurand')
     const nameOf103 = async () => (await db.query("SELECT display_name FROM display_names WHERE extension = '103'")).rows[0]?.display_name
     bobEntry.cn = 'Robert Durand'
     try {
       await synchronise(alice)
       await until('the new name in display_names', async () => (await nameOf103()) === 'Robert Durand')
-      // Nobody holds 106: its account goes with the synchronisation (the provider keeps those of the mappings only).
-      await until('the account of 106 to go', async () => (await db.query("SELECT 1 FROM subscriber WHERE username = '106'")).rows.length === 0)
+      // Nobody holds 131 to 134 any more: the accounts the Gateway wrote for them go. 106, written by hand (no
+      // holder), stays: the Gateway removes only what it wrote.
+      await until('the accounts of 131 to 134 to go', async () => (await db.query("SELECT 1 FROM subscriber WHERE username IN ('131', '132', '133', '134')")).rows.length === 0)
+      expectEqual((await db.query("SELECT holder FROM subscriber WHERE username = '106'")).rows, [{ holder: null }], 'the account of 106')
       await dial(bob.page, '101')
       const ringing = alice.page.getByTestId('incoming-call')
       await ringing.getByText('Appel entrant de Robert Durand (103)').waitFor({ timeout: 20_000 })
@@ -1157,20 +1206,31 @@ try {
       await bob.page.getByText('Appel avec Alice Martin (101) terminé.').waitFor()
     } finally {
       bobEntry.cn = 'Bob Durand'
+      await db.query("DELETE FROM subscriber WHERE username = '106'")
       await synchronise(alice)
       await until('the name back in display_names', async () => (await nameOf103()) === 'Bob Durand')
     }
   })
-  await step('Paul Leroy (105) signs in, then out: his account stays; he leaves the directory: the synchronisation removes his mapping and his account, 105 becomes a group of its own and the desk rings it', async () => {
-    const paul = await open('pleroy', 'Paul Leroy')
+  await step('Paul Leroy (105) signs in, then out: his account stays; signed in again, he leaves the directory: the synchronisation removes his mapping, his account and his registration at once (a call to 105 finds nobody, 404); 105 becomes a group of its own and the desk rings it', async () => {
+    let paul = await open('pleroy', 'Paul Leroy')
     await phoneState(paul.page).getByText('En ligne').waitFor({ timeout: 20_000 })
     await signOut(paul)
-    // Signing out unregisters; the account is his as long as he holds 105.
-    expectEqual((await db.query("SELECT 1 FROM subscriber WHERE username = '105'")).rows.length, 1, 'subscriber rows of 105 after Paul signed out')
-    people.splice(people.findIndex(p => p.uid === 'pleroy'), 1)
-    const report = await synchronise(alice)
-    expectEqual(report.removed, 1, 'mappings the synchronisation removed')
-    await until('the account of 105 to go', async () => (await db.query("SELECT 1 FROM subscriber WHERE username = '105'")).rows.length === 0)
+    // Signing out unregisters; the account is his (written for him) as long as he holds 105.
+    expectEqual((await db.query("SELECT holder FROM subscriber WHERE username = '105'")).rows, [{ holder: 'pleroy' }], 'the account of 105 after Paul signed out')
+    paul = await open('pleroy', 'Paul Leroy')
+    await phoneState(paul.page).getByText('En ligne').waitFor({ timeout: 20_000 })
+    try {
+      people.splice(people.findIndex(p => p.uid === 'pleroy'), 1)
+      const report = await synchronise(alice)
+      expectEqual(report.removed, 1, 'mappings the synchronisation removed')
+      await until('the account of 105 to go', async () => (await db.query("SELECT 1 FROM subscriber WHERE username = '105'")).rows.length === 0)
+      // His window is still open and registered a moment ago: OpenSIPS forgot it with the account (MI ul_rm).
+      const ended = await dialUntilEnded(desk.page, '105')
+      expectEqual(`${ended.endStatus} ${ended.endReason}`, '404 unavailable', 'how the call to 105 ended')
+      expectEqual(await paul.page.getByTestId('incoming-call').count(), 0, 'incoming calls on Paul side')
+    } finally {
+      await paul.context.close()
+    }
     await alice.page.getByRole('link', { name: 'Administration' }).click()
     await alice.page.getByLabel('Numéro du groupe').fill('105')
     await alice.page.getByLabel('Nom affiché').fill('Support')

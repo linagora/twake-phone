@@ -248,5 +248,6 @@
   "admin.groupNameInvalid": "The name must be one line of 1 to 64 characters.",
   "admin.groupMembersInvalid": "A group has 1 to 12 members.",
   "admin.groupMemberNotExtension": "Only extensions of your organisation can be members of a group.",
+  "admin.groupSyncRunning": "A synchronisation of the directory is running: try again in a moment.",
   "call.endedAnsweredElsewhere": "Call from {who} answered on another phone."
 }

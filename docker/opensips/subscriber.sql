@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS subscriber (
     ha1 VARCHAR(64) DEFAULT '' NOT NULL,
     ha1_sha256 VARCHAR(64) DEFAULT '' NOT NULL,
     ha1_sha512t256 VARCHAR(64) DEFAULT '' NOT NULL,
+    holder TEXT,
     CONSTRAINT subscriber_account_idx UNIQUE (username, domain)
 );
 CREATE INDEX IF NOT EXISTS subscriber_username_idx ON subscriber (username);
@@ -100,7 +101,8 @@ CREATE TABLE IF NOT EXISTS display_names (
 -- Tables created beforehand (by OpenSIPS's own scripts, or by an earlier version of this file) lack columns: added
 -- here, once, by the owner (the Gateway only adds a missing one, see SubscriberProvisioner.ensureSchema), or every
 -- CDR insert, or every write of the rules, would fail. An older call_rules row gets an empty tenant: the Gateway's
--- first reconcile drops it.
+-- first reconcile drops it. An older subscriber row has no holder: the Gateway never removes it.
+ALTER TABLE subscriber ADD COLUMN IF NOT EXISTS holder TEXT;
 ALTER TABLE acc ADD COLUMN IF NOT EXISTS caller VARCHAR(64) DEFAULT '' NOT NULL;
 ALTER TABLE acc ADD COLUMN IF NOT EXISTS callee VARCHAR(64) DEFAULT '' NOT NULL;
 ALTER TABLE acc ADD COLUMN IF NOT EXISTS dialled VARCHAR(64) DEFAULT '' NOT NULL;

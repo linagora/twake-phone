@@ -248,5 +248,6 @@
   "admin.groupNameInvalid": "Le nom doit tenir sur une ligne, de 1 à 64 caractères.",
   "admin.groupMembersInvalid": "Un groupe a de 1 à 12 membres.",
   "admin.groupMemberNotExtension": "Seuls les postes de votre organisation peuvent être membres d'un groupe.",
+  "admin.groupSyncRunning": "Une synchronisation de l'annuaire est en cours : réessayez dans un instant.",
   "call.endedAnsweredElsewhere": "Appel de {who} pris sur un autre poste."
 }

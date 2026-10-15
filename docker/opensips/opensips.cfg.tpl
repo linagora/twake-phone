@@ -132,9 +132,11 @@ modparam("uac", "restore_mode", "none")
 #### delays a call by that much per read at most. Nothing is read in failure_route (see route[ring]).
 loadmodule "sqlops.so"
 modparam("sqlops", "db_url", "${OPENSIPS_RULES_DB_URL}")
-# The tables of step 4c (`call_groups`, `display_names`) may be missing (a database the Gateway has not upgraded yet):
-# the rules must not depend on them. A query naming them that fails at once (not a timeout) turns them off for every
-# process, 30 s ($shv(no4c_until)), and the rules are read again without them (route[q4c_retry]).
+# A read that fails is made again once (route[read_failed]): the database may have dropped the connection (a restart,
+# a failover, an idle timeout), which the next query makes again. The tables of step 4c (`call_groups`,
+# `display_names`) may be missing (a database the Gateway has not upgraded yet): the rules must not depend on them.
+# When a read naming them fails, the database is asked whether they exist (to_regclass); only when it says they do
+# not are they left out, for every process, 30 s ($shv(no4c_until)), and the read is made again without them.
 loadmodule "cfgutils.so"
 modparam("cfgutils", "shvset", "no4c_until=i:0")
 
@@ -353,7 +355,6 @@ route {
 # query. They are those of when the ringing starts: a change made while it rings applies to the next call.
 route[ring] {
 	if ($avp(fwd_hops) < 3 && ($avp(r_busy) != NULL || $avp(r_noanswer) != NULL) && route(preload_query)) {
-		route(q_start);
 		async(sql_query("$var(preload_query)", "$avp(p_ext);$avp(p_always);$avp(p_busy);$avp(p_noanswer);$avp(p_delay);$avp(p_dnd);$avp(p_message);$avp(p_retry);$avp(p_name)"), ring_loaded);
 	} else {
 		route(ring_now);
@@ -365,12 +366,13 @@ route[ring_loaded] {
 	$var(rules_rc) = $rc;
 	if (t_was_cancelled())
 		route(cancelled);
-	if ($var(rules_rc) < 0 && $var(rules_rc) != -2 && route(q4c_retry)) {
+	if ($var(rules_rc) < 0 && $var(rules_rc) != -2 && route(read_failed)) {
 		route(ring);
 		exit;
 	}
+	$(avp(q_again)[*]) = NULL;
 	if ($var(rules_rc) < 0 && $var(rules_rc) != -2)
-		xlog("L_WARN", "call $ci: rules of the forwards of $avp(callee) not read ($var(rules_rc)), they go without them\n");
+		xlog("L_WARN", "call $ci: rules of the forwards of $avp(callee) not read ($var(rules_rc), twice), they go without them\n");
 	route(ring_now);
 	exit;
 }
@@ -433,7 +435,6 @@ route[names_next] {
 	route(name_sql);
 	$var(names_query) = "SELECT (SELECT " + $var(name_sql) + " FROM display_names n WHERE n.extension = '" + $var(names_callee) + "'), (SELECT " + $var(name_sql) + " FROM display_names n WHERE n.extension = '" + $var(names_caller) + "')";
 	$avp(q4c) = 1;
-	route(q_start);
 	async(sql_query_one("$var(names_query)", "$avp(r_name);$avp(n_caller)"), names_loaded);
 }
 
@@ -441,10 +442,15 @@ route[names_loaded] {
 	$var(names_rc) = $rc;
 	if (t_was_cancelled())
 		route(cancelled);
+	if ($var(names_rc) < 0 && $var(names_rc) != -2 && route(read_failed)) {
+		route(names_next);
+		exit;
+	}
+	$(avp(q_again)[*]) = NULL;
 	if ($var(names_rc) == 1)
 		$avp(names_read) = 1;
-	else if (!route(q4c_retry))
-		xlog("L_WARN", "call $ci: names not read ($var(names_rc)), the caller's phone's own is shown\n");
+	else
+		xlog("L_WARN", "call $ci: names not read ($var(names_rc)), the From stays as the caller's phone sent it\n");
 	route(caller_name);
 	route(ring);
 	exit;
@@ -468,34 +474,40 @@ route[caller_name] {
 	return(1);
 }
 
-# Whether the queries may name the tables of step 4c: not for 30 s after one that named them failed at once.
+# Whether the queries may name the tables of step 4c: not for 30 s after the database said one is missing.
 route[tables_4c] {
 	if ($shv(no4c_until) > $Ts)
 		return(-1);
 	return(1);
 }
 
-# When a query starts: route[q4c_retry] tells a failure at once (an error) from a timeout.
-route[q_start] {
-	$(avp(q_s)[*]) = NULL;
-	$(avp(q_us)[*]) = NULL;
-	$avp(q_s) = $Ts;
-	$avp(q_us) = $Tsm;
+# A read that failed: 1 to make it again (once per read), -1 to go on without it. When it named the tables of step 4c
+# ($avp(q4c)) and the database says one is missing, they are left out for 30 s and the read goes again without them;
+# otherwise (they exist, or the database cannot say) the same read goes again: a dropped connection is made anew.
+route[read_failed] {
+	if ($avp(q_again) == 1) {
+		$(avp(q_again)[*]) = NULL;
+		return(-1);
+	}
+	$avp(q_again) = 1;
+	if ($avp(q4c) == 1 && route(tables_4c_missing)) {
+		$shv(no4c_until) = $Ts + 30;
+		xlog("L_WARN", "call $ci: the database has no call_groups or display_names (the Gateway of step 4c creates them): ring groups and directory names left out for 30 s\n");
+	} else {
+		xlog("L_NOTICE", "call $ci: a read failed, made again once\n");
+	}
+	return(1);
 }
 
-# A query that named the tables of step 4c ($avp(q4c)) failed: if it failed at once (250 ms: no timeout is that short,
-# RULES_QUERY_TIMEOUT_MS), they are taken as missing, turned off for 30 s for everyone, and 1 says to read again
-# without them. -1 otherwise (a timeout, a query that did not name them): the call goes on as it is.
-route[q4c_retry] {
-	if ($avp(q4c) != 1)
+# Whether the database says a table of step 4c is missing: a synchronous catalog query, only after a failed read
+# (bounded by the statement_timeout as the others). -1 when it says they exist, or cannot say.
+route[tables_4c_missing] {
+	$var(missing) = 0;
+	if (!sql_query_one("SELECT CASE WHEN to_regclass('call_groups') IS NULL OR to_regclass('display_names') IS NULL THEN 1 ELSE 0 END", "$var(missing)"))
 		return(-1);
-	$(avp(q4c)[*]) = NULL;
-	$var(q_ms) = ($Ts - $avp(q_s)) * 1000 + ($Tsm - $avp(q_us)) / 1000;
-	if ($var(q_ms) >= 250)
-		return(-1);
-	$shv(no4c_until) = $Ts + 30;
-	xlog("L_WARN", "call $ci: a query naming call_groups or display_names failed at once: are they missing (start the Gateway of step 4c)? Without names and ring groups for 30 s\n");
-	return(1);
+	if ($var(missing) == 1)
+		return(1);
+	return(-1);
 }
 
 #### Ring groups (step 4c, ADR 0014) ###################################################################################
@@ -512,6 +524,7 @@ route[q4c_retry] {
 
 # The members of the group $rU, in their order, with their names: asynchronous, as the rules.
 route[group_next] {
+	$(avp(q4c)[*]) = NULL;
 	$(avp(g_ext)[*]) = NULL;
 	$(avp(g_name)[*]) = NULL;
 	$var(group_caller) = "";
@@ -527,8 +540,13 @@ route[group_loaded] {
 	$var(group_rc) = $rc;
 	if (t_was_cancelled())
 		route(cancelled);
+	if ($var(group_rc) < 0 && $var(group_rc) != -2 && route(read_failed)) {
+		route(group_next);
+		exit;
+	}
+	$(avp(q_again)[*]) = NULL;
 	if ($var(group_rc) < 0 && $var(group_rc) != -2)
-		xlog("L_WARN", "call $ci: members of group $rU not read ($var(group_rc))\n");
+		xlog("L_WARN", "call $ci: members of group $rU not read ($var(group_rc), twice)\n");
 	route(group_ring);
 	exit;
 }
@@ -749,26 +767,29 @@ route[rules_next] {
 		if ($avp(q4c) == 1)
 			$var(first_cols) = ", (SELECT " + $var(name_sql) + " FROM display_names n WHERE n.extension = '" + $var(first_caller) + "'), CASE WHEN EXISTS (SELECT 1 FROM call_groups g WHERE g.number = '" + $rU + "') AND NOT EXISTS (SELECT 1 FROM subscriber s WHERE s.username = '" + $rU + "') THEN 1 ELSE 0 END";
 		$var(rules_query) = "SELECT " + $var(rules_cols) + $var(first_cols) + $var(rules_from);
-		route(q_start);
 		async(sql_query_one("$var(rules_query)", "$avp(r_always);$avp(r_busy);$avp(r_noanswer);$avp(r_delay);$avp(r_dnd);$avp(r_message);$avp(r_retry);$avp(r_name);$avp(n_caller);$avp(r_group)"), rules_loaded);
 		exit;
 	}
-	route(q_start);
 	async(sql_query_one("$var(rules_query)", "$avp(r_always);$avp(r_busy);$avp(r_noanswer);$avp(r_delay);$avp(r_dnd);$avp(r_message);$avp(r_retry);$avp(r_name)"), rules_loaded);
 }
 
 route[rules_loaded] {
-	# 1: a row; any failure (timeout, database down): no rules, the call goes on (and no names: the phone's own From).
-	# A failure at once of a query naming the tables of step 4c: read again without them (route[q4c_retry]).
+	# 1: a row; a failure is read again once (route[read_failed]); twice (timeout, database down): no rules, the call
+	# goes on (and no names: the phone's own From). The number dialled may then be a ring group nobody can tell:
+	# nobody registered there is told as unreachable (480), not as a number that does not exist (route[unreachable]).
 	$var(rules_rc) = $rc;
 	if (t_was_cancelled())
 		route(cancelled);
-	if ($var(rules_rc) < 0 && $var(rules_rc) != -2 && route(q4c_retry)) {
+	if ($var(rules_rc) < 0 && $var(rules_rc) != -2 && route(read_failed)) {
 		route(rules_next);
 		exit;
 	}
-	if ($var(rules_rc) < 0 && $var(rules_rc) != -2)
-		xlog("L_WARN", "call $ci: rules of $rU not read ($var(rules_rc)), the call goes on without them\n");
+	$(avp(q_again)[*]) = NULL;
+	if ($var(rules_rc) < 0 && $var(rules_rc) != -2) {
+		xlog("L_WARN", "call $ci: rules of $rU not read ($var(rules_rc), twice), the call goes on without them\n");
+		if ($avp(d_loaded) == NULL && $avp(fwd_hops) == 0)
+			$avp(dialled_unread) = 1;
+	}
 	if ($var(rules_rc) == 1 && $avp(q4c) == 1 && $avp(d_loaded) == NULL)
 		$avp(names_read) = 1;
 	# The first read done: the caller's name goes into the From, whatever comes next.
@@ -906,13 +927,14 @@ route[rules_preloaded] {
 
 # Nobody to ring at the end of the request route. The dialled extension does not want to be disturbed (its
 # forward led nowhere): its refusal, with its message. Else 404 for an extension nobody registered, and 480 for a
-# call forwarded to one (the extension dialled exists: it cannot be reached now).
+# call forwarded to one (the extension dialled exists: it cannot be reached now), or for a number whose rules could
+# not be read (it may be a ring group: never told it does not exist because the database failed).
 route[unreachable] {
 	if ($avp(d_dnd) == 1)
 		route(dnd_refuse_dialled);
 	route(account_missed);
 	route(calling);
-	if ($avp(fwd_hops) == 0)
+	if ($avp(fwd_hops) == 0 && $avp(dialled_unread) != 1)
 		t_reply(404, "Not Found");
 	else
 		t_reply(480, "Temporarily Unavailable");

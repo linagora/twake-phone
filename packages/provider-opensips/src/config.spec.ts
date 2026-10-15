@@ -65,7 +65,7 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     // Nobody to ring: the refusal goes through a transaction (acc sees it), announced just before.
     const unreachable = lines(section('route[unreachable]', 'route[forward_to]'))
     const missed = unreachable.indexOf('route(account_missed);')
-    expect(unreachable.slice(missed, missed + 4)).toEqual(['route(account_missed);', 'route(calling);', 'if ($avp(fwd_hops) == 0)', 't_reply(404, "Not Found");'])
+    expect(unreachable.slice(missed, missed + 4)).toEqual(['route(account_missed);', 'route(calling);', 'if ($avp(fwd_hops) == 0 && $avp(dialled_unread) != 1)', 't_reply(404, "Not Found");'])
     expect(cfg.match(/raise_event\("E_TWAKEPHONE_CALLING"/g)).toHaveLength(1)
     // The transaction of every call exists before its rules are read and before its relay: a relay that cannot send
     // returns to the script (route[relay_call]) instead of tm answering on its own, unaccounted.
@@ -130,9 +130,14 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     // One row per extension reached, with or without rules, and no NULL (sql_query would add "<null>"): the lists stay aligned.
     expect(preload).toContain('FROM (SELECT DISTINCT extension FROM reach) AS x LEFT JOIN call_rules r ON r.extension = x.extension')
     // Each query is asynchronous (the rules, the first of them with the caller's name, the names of a Replaces, the
-    // members of a group, the preload), none is run where async is not available.
-    expect(cfg.match(/sql_query/g)).toHaveLength(5)
+    // members of a group, the preload), none is run where async is not available. The one synchronous query asks the
+    // catalog whether the tables of step 4c exist, only after a read failed, from the routes that resume a read.
+    expect(cfg.match(/sql_query/g)).toHaveLength(6)
     expect(cfg.match(/async\(sql_query/g)).toHaveLength(5)
+    expect(section('route[tables_4c_missing]', 'route[group_next]').match(/sql_query_one\(/g)).toHaveLength(1)
+    expect(cfg.match(/route\(tables_4c_missing\)/g)).toHaveLength(1)
+    const callers = [...cfg.matchAll(/route\(read_failed\)/g)].map(m => cfg.lastIndexOf('\nroute[', m.index))
+    expect(new Set(callers.map(i => cfg.slice(i + 1, cfg.indexOf(']', i)) + ']'))).toEqual(new Set(['route[rules_loaded]', 'route[ring_loaded]', 'route[names_loaded]', 'route[group_loaded]']))
     expect(cfg.slice(cfg.indexOf('failure_route['))).not.toMatch(/sql_query|async\(/)
     expect(cfg.slice(cfg.indexOf('failure_route['))).toContain('route(rules_local);')
     expect(section('route[rules_local]', 'route[rules_preloaded]')).toContain('route(rules_preloaded);')
@@ -366,12 +371,30 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(next.indexOf('$var(first_cols) = ", NULL, 0";')).toBeLessThan(next.indexOf('if ($avp(q4c) == 1)'))
     expect(section('route[preload_query]', 'route[rules_local]').indexOf('$var(name_col) = "\'\'";')).toBeLessThan(section('route[preload_query]', 'route[rules_local]').indexOf('if (route(tables_4c)) {'))
     expect(section('route[names_next]', 'route[names_loaded]')).toContain('if (!route(tables_4c)) {')
-    // A query that named them and failed at once: they are off for 30 s, the same read again without them.
-    const retry = section('route[q4c_retry]', 'route[group_next]')
-    expect(retry).toContain('if ($var(q_ms) >= 250)\n\t\treturn(-1);')
-    expect(retry).toContain('$shv(no4c_until) = $Ts + 30;')
-    expect(section('route[rules_loaded]', 'route[rules_step]')).toContain('if ($var(rules_rc) < 0 && $var(rules_rc) != -2 && route(q4c_retry)) {\n\t\troute(rules_next);\n\t\texit;\n\t}')
-    expect(section('route[ring_loaded]', 'route[ring_now]')).toContain('route(q4c_retry)')
-    for (const r of ['route[rules_next]', 'route[names_next]', 'route[ring]']) expect(section(r, r === 'route[ring]' ? 'route[ring_loaded]' : r === 'route[names_next]' ? 'route[names_loaded]' : 'route[rules_loaded]'), r).toContain('route(q_start);')
+    // A failed read is made again once (a dropped connection is made anew by the next query); the tables are left
+    // out only when the database says one is missing (to_regclass), never on a guess from the time a query took.
+    const failed = section('route[read_failed]', 'route[tables_4c_missing]')
+    expect(failed).toContain('if ($avp(q_again) == 1) {')
+    expect(failed).toContain('if ($avp(q4c) == 1 && route(tables_4c_missing)) {\n\t\t$shv(no4c_until) = $Ts + 30;')
+    expect(failed).toContain('return(1);')
+    const probe = section('route[tables_4c_missing]', 'route[group_next]')
+    expect(probe).toContain("to_regclass('call_groups') IS NULL OR to_regclass('display_names') IS NULL")
+    expect(cfg).not.toMatch(/\$Tsm|q_start|q4c_retry|q_ms/)
+    expect(section('route[rules_loaded]', 'route[rules_step]')).toContain('if ($var(rules_rc) < 0 && $var(rules_rc) != -2 && route(read_failed)) {\n\t\troute(rules_next);\n\t\texit;\n\t}')
+    expect(section('route[ring_loaded]', 'route[ring_now]')).toContain('if ($var(rules_rc) < 0 && $var(rules_rc) != -2 && route(read_failed)) {\n\t\troute(ring);\n\t\texit;\n\t}')
+    expect(section('route[names_loaded]', 'route[caller_name]')).toContain('if ($var(names_rc) < 0 && $var(names_rc) != -2 && route(read_failed)) {\n\t\troute(names_next);\n\t\texit;\n\t}')
+    expect(section('route[group_loaded]', 'route[group_ring]')).toContain('if ($var(group_rc) < 0 && $var(group_rc) != -2 && route(read_failed)) {\n\t\troute(group_next);\n\t\texit;\n\t}')
+    // The members' query always needs call_groups: its failure is never taken for missing tables.
+    expect(section('route[group_next]', 'route[group_loaded]')).toContain('$(avp(q4c)[*]) = NULL;')
+  })
+
+  it('never answers 404 for a number whose rules could not be read: it may be a ring group', () => {
+    const { cfg } = render()
+    const section = (name: string, next: string) => cfg.slice(cfg.indexOf(`${name} {`), cfg.indexOf(`${next} {`))
+    const lines = (text: string) => text.split('\n').map(l => l.trim())
+    expect(section('route[rules_loaded]', 'route[rules_step]')).toContain('if ($avp(d_loaded) == NULL && $avp(fwd_hops) == 0)\n\t\t\t$avp(dialled_unread) = 1;')
+    const unreachable = lines(section('route[unreachable]', 'route[forward_to]'))
+    const reply = unreachable.indexOf('t_reply(404, "Not Found");')
+    expect(unreachable.slice(reply - 1, reply + 3)).toEqual(['if ($avp(fwd_hops) == 0 && $avp(dialled_unread) != 1)', 't_reply(404, "Not Found");', 'else', 't_reply(480, "Temporarily Unavailable");'])
   })
 })

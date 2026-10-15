@@ -10,7 +10,8 @@ const CODE_KEY: Record<string, Key> = {
   GROUP_EXISTS: 'admin.groupExists',
   GROUP_NAME: 'admin.groupNameInvalid',
   GROUP_MEMBERS: 'admin.groupMembersInvalid',
-  GROUP_MEMBER_NOT_EXTENSION: 'admin.groupMemberNotExtension'
+  GROUP_MEMBER_NOT_EXTENSION: 'admin.groupMemberNotExtension',
+  SYNC_RUNNING: 'admin.groupSyncRunning'
 }
 
 export const groupRefusalKey = (err: unknown): Key | undefined => {

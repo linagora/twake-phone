@@ -267,6 +267,30 @@ describe('OpensipsProvider call rules', () => {
     await make().syncExtensions([])
   })
 
+  it('removes the accounts no longer held, and their windows from OpenSIPS at once (MI ul_rm)', async () => {
+    const sips = await fakeOpensips()
+    cleanups.push(sips.close)
+    sips.state.dump.Domains[0]!.AORs.push({ AOR: '102', Contacts: [{ Contact: 'sip:b@y.invalid', Expires: 3000 }] }, { AOR: '103', Contacts: [{ Contact: 'sip:c@y.invalid', Expires: 3000 }] })
+    const given: { extension: string; userId: string }[][] = []
+    const accounts = { reconcile: async (holders: { extension: string; userId: string }[]) => (given.push(holders), ['102']) }
+    const warnings: string[] = []
+    const p = new OpensipsProvider({ websocketUrl: 'wss://sip.example.test', domain: 'sip.example.test', sipSecretFor: async () => 's', events: { miUrl: sips.url, timeoutMs: 300 }, accounts, logger: { info: () => undefined, warn: m => void warnings.push(m) } })
+    cleanups.push(() => p.close())
+    await until('the subscription', () => p.getStatus() === 'CONNECTED')
+    await p.syncExtensions([{ extension: '101', userId: 'alice', displayName: 'Alice' }, { extension: '103', userId: 'carol' }])
+    expect(given).toEqual([[{ extension: '101', userId: 'alice' }, { extension: '103', userId: 'carol' }]])
+    expect(sips.requests.filter(r => r.method === 'ul_rm').map(r => r.params)).toEqual([['location', '102']])
+    expect(sips.state.dump.Domains[0]!.AORs.map(a => (a as { AOR: string }).AOR)).toEqual(['103'])
+    // OpenSIPS not answering: the account is gone all the same, said so; the windows go when their registration ends.
+    sips.state.down = true
+    await p.syncExtensions([{ extension: '101', userId: 'alice' }])
+    expect(warnings).toEqual([expect.stringMatching(/^OpenSIPS: the windows of 102 not removed \(.*\); they go when their registration ends$/)])
+    // Without the MI, nothing more than the accounts.
+    const bare = new OpensipsProvider({ websocketUrl: 'wss://sip.example.test', domain: 'sip.example.test', sipSecretFor: async () => 's', accounts })
+    await bare.syncExtensions([])
+    expect(given).toHaveLength(3)
+  })
+
   it('keeps the choice out of the tracker when the table refuses it', async () => {
     const rules = { setDnd: async () => Promise.reject(Object.assign(new Error('the message must be one line'), { statusCode: 400 })) } as unknown as CallRules
     const p = make(rules)

@@ -19,7 +19,9 @@ describe('storedOpensipsFactory', () => {
           queries.push(text)
           values.push((params as unknown[] | undefined) ?? [])
           // The version check of ensureSchema() reads the row OpenSIPS's schema holds.
-          return /SELECT table_name, table_version/.test(text) ? { rows: [{ table_name: 'subscriber', table_version: 8 }, { table_name: 'acc', table_version: 7 }, { table_name: 'missed_calls', table_version: 5 }] } : { rows: [], rowCount: 1 }
+          if (/SELECT table_name, table_version/.test(text)) return { rows: [{ table_name: 'subscriber', table_version: 8 }, { table_name: 'acc', table_version: 7 }, { table_name: 'missed_calls', table_version: 5 }] }
+          // The reconciliation of the accounts (SubscriberProvisioner.reconcileAccounts, run on PostgreSQL in its spec).
+          return /WITH stale AS/.test(text) ? { rows: [{ stale: 0, bound: 10, removed: [] }] } : { rows: [], rowCount: 1 }
         }
       },
       realm: 'sip.test'
@@ -75,15 +77,23 @@ describe('storedOpensipsFactory', () => {
     expect(values[names]).toEqual(['t', ['101'], ['Alice Martin']])
   })
 
-  it('removes the SIP account of an extension nobody holds any more, or whose holder changed', async () => {
-    const { queries, values, provider } = setup()
-    const deletes = () => queries.flatMap((q, i) => (/DELETE FROM subscriber/.test(q) ? [values[i]] : []))
-    await provider.syncExtensions!([{ extension: '101', userId: 'alice' }, { extension: '102', userId: 'bob' }])
-    // Everything but the extensions held goes (domain '' as the provisioner writes it).
-    expect(deletes()).toEqual([[['101', '102'], '']])
-    await provider.syncExtensions!([{ extension: '101', userId: 'carol' }])
-    // 102 is nobody's: gone with the others; 101 changed holder: alice's hashes go, carol's session provisions hers.
-    expect(deletes().slice(1)).toEqual([[['101'], ''], ['101', '']])
+  it('writes each SIP account for its holder, and reconciles the accounts with who holds each extension', async () => {
+    const { store, queries, values, provider } = setup()
+    await store.upsertMapping({ tenantId: 't', userId: 'alice', extension: '101' })
+    await provider.getSession!({ id: 'alice', tenantId: 't', displayName: 'Alice', extension: '101' }, browser)
+    // The account says whom it was written for: the reconciliation removes it once alice no longer holds 101.
+    const insert = queries.findIndex(q => /INSERT INTO subscriber/.test(q))
+    expect(queries[insert]).toMatch(/holder = EXCLUDED\.holder/)
+    expect(values[insert]![0]).toBe('101')
+    expect(values[insert]!.at(-1)).toBe('alice')
+    const reconciles = () => queries.flatMap((q, i) => (/WITH stale AS/.test(q) ? [values[i]] : []))
+    await provider.syncExtensions!([{ extension: '101', userId: 'carol' }, { extension: '102', userId: 'bob' }])
+    // The extensions and their holders, the domain the provisioner writes, the bound of the removals.
+    expect(reconciles()).toEqual([[['101', '102'], ['carol', 'bob'], '', 10, 0.25]])
+    // An empty mapping removes nothing: no query.
+    await provider.syncExtensions!([])
+    expect(reconciles()).toHaveLength(1)
+    expect(queries.some(q => /DELETE FROM subscriber/.test(q) && !/WITH stale AS/.test(q))).toBe(false)
   })
 
   it('refuses an extension nobody is mapped to', async () => {

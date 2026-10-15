@@ -207,6 +207,25 @@ describe('DirectorySync', () => {
     await expect(sync.run()).resolves.toMatchObject({ unchanged: 1 })
   })
 
+  it('waits a bounded time for a synchronisation that does not end: 503 SYNC_RUNNING, and the task never runs', async () => {
+    const { directory, sync } = setup([person('alice', 'Alice', '101')])
+    let release!: () => void
+    directory.listAll = () => new Promise(resolve => (release = () => resolve([person('alice', 'Alice', '101')])))
+    const run = sync.run()
+    let ran = false
+    const started = Date.now()
+    await expect(sync.exclusive(async () => (ran = true), 50)).rejects.toMatchObject({ statusCode: 503, code: 'SYNC_RUNNING' })
+    expect(Date.now() - started).toBeLessThan(1_000)
+    release()
+    await run
+    // Its turn came after it gave up: skipped, and it holds nothing back.
+    await new Promise(r => setTimeout(r, 10))
+    expect(ran).toBe(false)
+    await expect(sync.exclusive(async () => 7, 50)).resolves.toBe(7)
+    directory.listAll = async () => [person('alice', 'Alice', '101')]
+    await expect(sync.run()).resolves.toMatchObject({ unchanged: 1 })
+  })
+
   it('schedules runs and stops cleanly', async () => {
     const { sync } = setup([person('alice', 'Alice', '101')])
     sync.start(60_000, 5)

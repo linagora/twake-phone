@@ -84,9 +84,9 @@ export const storedOpensipsFactory = ({ store, key, env = process.env, provision
         store,
         key,
         provisioner: {
-          async setSipSecret(extension, secret) {
+          async setSipSecret(extension, secret, holder) {
             await ensureSchema()
-            await provisioner.setSipSecret(extension, secret)
+            await provisioner.setSipSecret(extension, secret, holder)
           }
         }
       })
@@ -107,15 +107,11 @@ export const storedOpensipsFactory = ({ store, key, env = process.env, provision
         callRules: provisioner.callRules({ ready: ensureSchema, tenantId, holderOf: async extension => (await store.getMappingByExtension(tenantId, extension))?.userId }),
         // The ring groups and the directory names OpenSIPS reads, in the same database too (ADR 0014).
         callGroups: provisioner.callGroups({ ready: ensureSchema, tenantId }),
-        // The SIP accounts follow the mappings: an extension nobody holds is no account OpenSIPS routes to (ADR 0014).
+        // The SIP accounts follow the mappings: one written for a user who no longer holds the extension goes (ADR 0014).
         accounts: {
-          async keepOnly(extensions) {
+          async reconcile(holders) {
             await ensureSchema()
-            await provisioner.keepOnly(extensions)
-          },
-          async remove(extension) {
-            await ensureSchema()
-            await provisioner.removeSipSecret(extension)
+            return provisioner.reconcileAccounts(holders)
           }
         },
         ...(config.events ? { events: config.events } : {}),

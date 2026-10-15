@@ -1,5 +1,5 @@
 import pg from 'pg'
-import { afterAll, describe, expect, it } from 'vitest'
+import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { CALL_GROUPS_SCHEMA, CallGroups, DISPLAY_NAMES_SCHEMA, GROUP_MEMBERS_MAX, sipDisplayName } from './call-groups.js'
 import { SUBSCRIBER_SCHEMA, SUBSCRIBER_SQL, SubscriberProvisioner } from './subscriber.js'
 
@@ -100,12 +100,17 @@ describe('CallGroups', () => {
 // Against a real PostgreSQL (TEST_DATABASE_URL): the SQL itself, as OpenSIPS will read what it writes.
 if (process.env.TEST_DATABASE_URL) {
   describe('CallGroups on PostgreSQL', () => {
-    const pool = new pg.Pool({ connectionString: process.env.TEST_DATABASE_URL, max: 2 })
+    // A schema of its own: subscriber.spec.ts drops and creates the same tables at the same time (in parallel).
+    const pool = new pg.Pool({ connectionString: process.env.TEST_DATABASE_URL, max: 2, options: '-c search_path=spec_call_groups' })
     afterAll(async () => {
-      await pool.query("DELETE FROM call_groups WHERE tenant_id LIKE 'spec-%'; DELETE FROM display_names WHERE tenant_id LIKE 'spec-%'")
+      await pool.query('DROP SCHEMA IF EXISTS spec_call_groups CASCADE')
       await pool.end()
     })
-    const ready = () => new SubscriberProvisioner({ pool, realm: 'sip.example.test' }).ensureSchema()
+    const ready = async () => {
+      await pool.query('CREATE SCHEMA IF NOT EXISTS spec_call_groups')
+      await new SubscriberProvisioner({ pool, realm: 'sip.example.test' }).ensureSchema()
+    }
+    beforeAll(ready)
 
     it('keeps each tenant to its own groups, and keeps the members in their order', async () => {
       const a = new CallGroups({ pool, ready, tenantId: 'spec-A' })
@@ -129,12 +134,12 @@ if (process.env.TEST_DATABASE_URL) {
       const a = new CallGroups({ pool, ready, tenantId: 'spec-A' })
       const accounts = new SubscriberProvisioner({ pool, realm: 'sip.example.test' })
       await ready()
-      await accounts.setSipSecret('9299', 'secret')
+      await accounts.setSipSecret('9299', 'secret', 'zed')
       try {
         await expect(a.set({ number: '9299', name: 'Accueil', members: ['9101'] }, 'create')).rejects.toMatchObject({ statusCode: 409, code: 'GROUP_NUMBER_TAKEN' })
         expect(await a.list()).toEqual([])
         // Once the account is gone (its holder left), the number is free.
-        await accounts.keepOnly(['9101'])
+        expect(await accounts.reconcileAccounts([{ extension: '9101', userId: 'ann' }])).toEqual(['9299'])
         expect((await pool.query("SELECT 1 FROM subscriber WHERE username = '9299'")).rowCount).toBe(0)
         await a.set({ number: '9299', name: 'Accueil', members: ['9101'] }, 'create')
         expect(await a.list()).toEqual([{ number: '9299', name: 'Accueil', members: ['9101'] }])

@@ -43,7 +43,14 @@ export interface DirectorySyncOptions {
    * read them stops the run before any change.
    */
   reserved?: (tenantId: string) => Promise<Iterable<string>>
+  /** How long `exclusive` waits for a run in progress (EXCLUSIVE_WAIT_MS by default). */
+  exclusiveWaitMs?: number
 }
+
+/** How long a change of the groups waits for a synchronisation that runs (DirectorySync.exclusive). */
+export const EXCLUSIVE_WAIT_MS = 10_000
+
+const syncRunning = () => Object.assign(new Error('A synchronisation of the directory is running; try again in a moment'), { statusCode: 503, code: 'SYNC_RUNNING' })
 
 /** The first extension of a contact: what the PBX rings. */
 export const extensionOf = (c: Contact): string | undefined => c.numbers.find(n => n.type === 'extension')?.number.replace(/\s/g, '') || undefined
@@ -114,9 +121,26 @@ export class DirectorySync {
   /**
    * Runs `fn` while no synchronisation runs, and holds the next one back until it ends: what checks that a number
    * is no extension and writes a group with it (ADR 0014), so that a run cannot give that number away in between.
+   * Waits `waitMs` at most for its turn (a run of a large directory, or one that hangs): then 503 `SYNC_RUNNING`,
+   * and `fn` never runs.
    */
-  exclusive<T>(fn: () => Promise<T>): Promise<T> {
-    return this.serial(fn)
+  exclusive<T>(fn: () => Promise<T>, waitMs = this.opts.exclusiveWaitMs ?? EXCLUSIVE_WAIT_MS): Promise<T> {
+    if (this.pending === 0) return this.serial(fn)
+    let gaveUp = false
+    let timer: NodeJS.Timeout | undefined
+    const task = this.serial(() => {
+      clearTimeout(timer)
+      return gaveUp ? Promise.reject(syncRunning()) : fn()
+    })
+    return new Promise<T>((resolve, reject) => {
+      timer = setTimeout(() => {
+        gaveUp = true
+        reject(syncRunning())
+      }, waitMs)
+      task.then(resolve, (err: unknown) => {
+        if (!gaveUp) reject(err)
+      })
+    })
   }
 
   /** Starts `fn` at once when nothing runs, else after what runs and waits. */

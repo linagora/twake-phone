@@ -26,6 +26,13 @@ export const fakeOpensips = async () => {
     if (req.method === 'uptime') return reply({ result: { Now: 'Wed Oct 14 18:10:00 2026', 'Up since': state.upSince, 'Up time': state.upTime } })
     if (req.method === 'ul_dump') return reply({ result: state.dump })
     if (req.method === 'dlg_list') return reply({ result: state.dialogs })
+    if (req.method === 'ul_rm') {
+      // Removes the AOR from the location table, as OpenSIPS does (OK even when it is not there).
+      const [, aor] = req.params as [string, string]
+      const domain = state.dump.Domains[0]!
+      domain.AORs = domain.AORs.filter(a => (a as { AOR: string }).AOR !== aor)
+      return reply({ result: 'OK' })
+    }
     return reply({ error: { code: -32601, message: 'Method not found' } })
   })
   await new Promise<void>(r => socket.bind(0, '127.0.0.1', r))

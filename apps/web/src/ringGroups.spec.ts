@@ -12,6 +12,8 @@ describe('ring groups (Administration)', () => {
     expect(groupRefusalKey(Object.assign(new Error('x'), { code: 'GROUP_MEMBER_NOT_EXTENSION' }))).toBe('admin.groupMemberNotExtension')
     // "New group" on a number the organisation has: said so, never replaced.
     expect(groupRefusalKey(Object.assign(new Error('x'), { code: 'GROUP_EXISTS' }))).toBe('admin.groupExists')
+    // A directory synchronisation that does not end in time: try again.
+    expect(groupRefusalKey(Object.assign(new Error('x'), { code: 'SYNC_RUNNING' }))).toBe('admin.groupSyncRunning')
     expect(groupRefusalKey(Object.assign(new Error('x'), { code: 'FST_ERR_SOMETHING' }))).toBeUndefined()
     expect(groupRefusalKey(new Error('x'))).toBeUndefined()
   })
