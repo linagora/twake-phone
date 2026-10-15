@@ -226,7 +226,9 @@ const browser =
         }
       })
     : await chromium.launch({
-        ...(BROWSER === 'msedge' ? { channel: 'msedge' } : process.env.PLAYWRIGHT_CHROMIUM ? { executablePath: process.env.PLAYWRIGHT_CHROMIUM } : {}),
+        // Chromium itself in its new headless mode, not Playwright's default headless shell: the shell reports every
+        // notification permission as denied and shows no notification (step 5).
+        ...(BROWSER === 'msedge' ? { channel: 'msedge' } : process.env.PLAYWRIGHT_CHROMIUM ? { executablePath: process.env.PLAYWRIGHT_CHROMIUM } : { channel: 'chromium' }),
         args: ['--use-fake-device-for-media-stream', '--use-fake-ui-for-media-stream', '--ignore-certificate-errors', '--autoplay-policy=no-user-gesture-required']
       })
 console.log(`browser: ${BROWSER} ${browser.version()}`)
@@ -1286,17 +1288,25 @@ try {
     const [sw] = who.context.serviceWorkers()
     return sw ? sw.evaluate(() => self.registration.getNotifications().then(ns => ns.map(n => ({ title: n.title, body: n.body, url: n.data?.url })))) : []
   }
-  /** Hands `text` (a decrypted push) to the service worker of `who`'s browser, as its push service would (DevTools). */
+  /**
+   * Hands `text` (a decrypted push) to the service worker of `who`'s browser, as its push service would (DevTools).
+   * Resolves with what DevTools reports of the worker (its states and errors), for a failure to say what happened.
+   */
   const deliverPush = async (who, text) => {
     const cdp = await who.context.newCDPSession(who.blank)
     const ids = new Map()
+    const seen = []
     cdp.on('ServiceWorker.workerRegistrationUpdated', e => {
       for (const r of e.registrations) ids.set(r.scopeURL, r.registrationId)
     })
+    cdp.on('ServiceWorker.workerVersionUpdated', e => {
+      for (const v of e.versions) seen.push(`${v.status} ${v.runningStatus}`)
+    })
+    cdp.on('ServiceWorker.workerErrorReported', e => seen.push(`error: ${e.errorMessage.errorMessage}`))
     await cdp.send('ServiceWorker.enable')
     const registrationId = await until('the service worker of the app', async () => ids.get(`${appOrigin}/`))
     await cdp.send('ServiceWorker.deliverPushMessage', { origin: appOrigin, registrationId, data: text })
-    await cdp.detach()
+    return { seen, detach: () => cdp.detach().catch(() => undefined) }
   }
   /** Opens the app at `path` in `who`'s browser, as a click on the notification does: it signs in by itself. */
   const openFromNotification = async (who, login, path) => {
@@ -1385,11 +1395,15 @@ try {
   await step(`the notification ${PUSH_TO_WORKER ? 'the service worker shows says Alice calls; clicked, it opens' : 'opens'} TwakePhone on the call: Jean signs in by himself, his softphone registers and rings in the same call, he answers and they hear each other`, async () => {
     let path = `/?call=${encodeURIComponent(woken.data.callId)}`
     if (PUSH_TO_WORKER) {
-      await deliverPush(jean, woken.text)
+      const delivered = await deliverPush(jean, woken.text)
       const [shown] = await until('the notification', async () => {
         const all = await notificationsOf(jean)
         return all.length ? all : null
+      }).catch(err => {
+        const workers = jean.context.serviceWorkers().map(w => w.url())
+        throw new Error(`${err.message}; workers: ${JSON.stringify(workers)}; DevTools: ${delivered.seen.join(', ')}`)
       })
+      await delivered.detach()
       expectEqual(`${shown.title} | ${shown.body}`, 'Appel de Alice Martin (101) | Cliquez pour répondre dans TwakePhone.', 'the notification')
       path = shown.url
     }
