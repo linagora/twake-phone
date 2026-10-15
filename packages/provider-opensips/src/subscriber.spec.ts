@@ -90,7 +90,7 @@ describe('SubscriberProvisioner', () => {
     await p.ensureSchema()
     expect(db.queries).toContain('ROLLBACK')
     expect(db.released()).toBe(1)
-    expect(warnings).toEqual([expect.stringMatching(/could not add subscriber\.holder, acc\.caller, acc\.callee, acc\.dialled, missed_calls\.caller, .*, call_rules\.forward_noanswer_holder \(must be owner of table acc\)/)])
+    expect(warnings).toEqual([expect.stringMatching(/could not add subscriber\.holder, acc\.caller, acc\.callee, acc\.dialled, missed_calls\.caller, .*, call_rules\.forward_noanswer_holder, push_targets\.alive_until \(must be owner of table acc\)/)])
     // Without the holder column: the accounts are written without it, and none is removed.
     db.queries.length = 0
     await p.setSipSecret('101', 'x', 'alice')

@@ -28,6 +28,8 @@ const parse = raw => {
 const one = (msg, name) => msg.headers.get(name)?.[0] ?? ''
 const callIdOf = msg => one(msg, 'call-id')
 const cseqOf = msg => one(msg, 'cseq')
+/** The branch of the top Via: one per transaction of the proxy, the same for a retransmission and its CANCEL. */
+const branchOf = msg => /;branch=([^;,\s]+)/i.exec(one(msg, 'via'))?.[1] ?? ''
 
 /** The Authorization (or Proxy-Authorization) value answering an MD5 challenge. */
 const digest = (challenges, { user, password, method, uri }) => {
@@ -57,7 +59,10 @@ const digest = (challenges, { user, password, method, uri }) => {
 export const sipUa = async ({ proxy, ws, domain, user, password }) => {
   const responses = []
   const waiters = new Set()
-  /** The INVITEs this window received (one per call, retransmissions left out). */
+  /**
+   * The INVITEs this window received: one per branch the proxy sent (retransmissions left out), so that the same call
+   * sent twice to this window counts twice.
+   */
   const invites = []
   let behaviour
   const toTag = token()
@@ -70,13 +75,13 @@ export const sipUa = async ({ proxy, ws, domain, user, password }) => {
       return
     }
     if (msg.method === 'INVITE') {
-      if (invites.some(i => callIdOf(i) === callIdOf(msg) && cseqOf(i) === cseqOf(msg))) return
+      if (invites.some(i => branchOf(i) === branchOf(msg))) return
       invites.push(msg)
       void reply(msg, '180 Ringing')
       if (behaviour) setTimeout(() => void reply(msg, behaviour.final), behaviour.delayMs)
     } else if (msg.method === 'CANCEL') {
       void reply(msg, '200 OK', { tag: false })
-      const invite = invites.find(i => callIdOf(i) === callIdOf(msg))
+      const invite = invites.find(i => branchOf(i) === branchOf(msg))
       if (invite) void reply(invite, '487 Request Terminated')
     } else if (msg.method === 'BYE' || msg.method === 'OPTIONS') {
       void reply(msg, '200 OK')
@@ -215,10 +220,13 @@ export const sipUa = async ({ proxy, ws, domain, user, password }) => {
       else throw new Error(`${user}: the call to ${target} was answered (${answer.first}): this UA keeps no dialog`)
       return { answer: `${answer.status} ${answer.reason}`, afterMs: Date.now() - started }
     })
+    const finalAnswer = ended.then(e => e.answer)
+    // A call without an answer fails the step that waits on `ended` or `final`, not the process with the other one.
+    finalAnswer.catch(() => undefined)
     return {
       callId,
       /** The final answer ("487 Request Terminated"). */
-      final: ended.then(e => e.answer),
+      final: finalAnswer,
       /** The final answer and how long after the (authenticated) INVITE it came. */
       ended,
       provisional: () => responses.filter(r => callIdOf(r) === callId && r.status < 200).map(r => r.status),
@@ -230,7 +238,7 @@ export const sipUa = async ({ proxy, ws, domain, user, password }) => {
   return {
     user,
     invites,
-    /** Registers this window: resolves with OpenSIPS's final status (200). */
+    /** Registers this window, or renews its registration (the same Call-ID): resolves with OpenSIPS's final status (200). */
     register: () => registerFor(300),
     answer(finalReply, delayMs = 300) {
       behaviour = { final: finalReply, delayMs }

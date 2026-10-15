@@ -177,8 +177,10 @@ describe('/me/push-subscriptions and the calls woken for', () => {
     limiter?: RateLimiter
     /** What the store holds before the Gateway starts. */
     prepare?: (store: MemoryStore) => Promise<void>
+    /** How long someone without an extension keeps their browsers (BuildOptions.pushPurgeGraceMs). */
+    purgeGraceMs?: number
   }
-  const setup = async ({ push = true, withPush = true, one = false, limiter, prepare }: SetupOptions = {}) => {
+  const setup = async ({ push = true, withPush = true, one = false, limiter, prepare, purgeGraceMs }: SetupOptions = {}) => {
     process.env.AUTH_MODE = 'dev'
     const store = new MemoryStore()
     await store.upsertMapping({ tenantId: 'A', userId: 'alice', extension: '101', displayName: 'Alice Martin' })
@@ -189,10 +191,23 @@ describe('/me/push-subscriptions and the calls woken for', () => {
     const registry = new ProviderRegistry([{ tenantId: 'A', type: 'holding', config: {} }, { tenantId: 'B', type: 'holding', config: {} }], [rec.factory])
     const webPush = make(store)
     const bus = new EventBus()
-    const app = await buildApp(registry, { store, bus, directory: new StoreDirectory(store), tickets: new TicketStore(), ...(withPush ? { push: webPush } : {}), ...(limiter ? { pushSubscriptionLimiter: limiter } : {}) })
+    // A synchronisation of the directory that changed who holds which extension, told when the test says so.
+    const changed: ((tenantId: string) => void)[] = []
+    const directorySync = { onChange: (cb: (tenantId: string) => void) => void changed.push(cb) } as unknown as NonNullable<Parameters<typeof buildApp>[1]>['directorySync']
+    const app = await buildApp(registry, {
+      store,
+      bus,
+      directory: new StoreDirectory(store),
+      tickets: new TicketStore(),
+      directorySync,
+      ...(withPush ? { push: webPush } : {}),
+      ...(limiter ? { pushSubscriptionLimiter: limiter } : {}),
+      ...(purgeGraceMs !== undefined ? { pushPurgeGraceMs: purgeGraceMs } : {})
+    })
     registry.startAll()
     const as = (user: string, tenant = 'A') => ({ 'x-dev-user': user, 'x-dev-tenant': tenant })
-    return { app, as, store, rec, bus, webPush }
+    const directoryChanged = (tenantId = 'A') => changed.forEach(cb => cb(tenantId))
+    return { app, as, store, rec, bus, webPush, directoryChanged }
   }
 
   it('gives the key to subscribe with, keeps the browser for the person, and tells the provider who can be woken', async () => {
@@ -306,17 +321,18 @@ describe('/me/push-subscriptions and the calls woken for', () => {
     await app.close()
   })
 
-  it('writes only the line of the person whose browser changed, nothing when it is known already, and limits the changes', async () => {
+  it('writes only the line of the person whose browser changed, again when it is known already (a line lost meanwhile comes back), and limits the changes', async () => {
     const { app, as, store, rec } = await setup({ one: true, limiter: new RateLimiter(4, 60_000) })
     await until('the first restore', () => rec.wakeable.length >= 1)
     const browser = service.subscribe()
     expect((await app.inject({ method: 'POST', url: '/api/v1/me/push-subscriptions', headers: as('jean'), payload: browser })).statusCode).toBe(201)
-    // Given again at the next start of the app: nothing written.
+    // Given again at the next start of the app: the subscription is not written again, the line is (the provider
+    // writes nothing when it is right).
     expect((await app.inject({ method: 'POST', url: '/api/v1/me/push-subscriptions', headers: as('jean'), payload: browser })).statusCode).toBe(201)
-    expect(rec.ones).toEqual(['102=jean true'])
+    expect(rec.ones).toEqual(['102=jean true', '102=jean true'])
     // Alice signs in on Jean's browser: it is hers now, Jean's line goes.
     expect((await app.inject({ method: 'POST', url: '/api/v1/me/push-subscriptions', headers: as('alice'), payload: browser })).statusCode).toBe(201)
-    expect(rec.ones).toEqual(['102=jean true', '101=alice true', '102=jean false'])
+    expect(rec.ones).toEqual(['102=jean true', '102=jean true', '101=alice true', '102=jean false'])
     expect(await store.listPushUsers('A')).toEqual(['alice'])
     // Another tenant's person cannot take it.
     const taken = await app.inject({ method: 'POST', url: '/api/v1/me/push-subscriptions', headers: as('carol', 'B'), payload: browser })
@@ -333,14 +349,40 @@ describe('/me/push-subscriptions and the calls woken for', () => {
     await app.close()
   })
 
-  it('forgets the browsers of someone who no longer holds an extension (they left) as the tenant starts', async () => {
-    const { app, store } = await setup({
+  it('forgets the browsers of someone who no longer holds an extension (they left), not before a reconciliation after the grace period', async () => {
+    const { app, store, rec, directoryChanged } = await setup({
+      purgeGraceMs: 50,
       prepare: async store => {
-        for (const userId of ['jean', 'gone']) await store.savePushSubscription({ tenantId: 'A', userId, endpoint: `${service.origin}/push/${userId}`, p256dh: 'k', auth: 'a', createdAt: new Date().toISOString() })
+        for (const userId of ['jean', 'gone', 'back']) await store.savePushSubscription({ tenantId: 'A', userId, endpoint: `${service.origin}/push/${userId}`, p256dh: 'k', auth: 'a', createdAt: new Date().toISOString() })
       }
     })
-    await until('the leaver forgotten', async () => (await store.listPushUsers('A')).join() === 'jean')
+    // As the tenant starts: noted, kept (a mapping missing a moment: an extension given again in two synchronisations).
+    await until('the first restore', () => rec.wakeable.length >= 1)
+    expect(await store.listPushUsers('A')).toEqual(['back', 'gone', 'jean'])
+    // A reconciliation within the grace period: still kept; 'back' holds an extension again.
+    await store.upsertMapping({ tenantId: 'A', userId: 'back', extension: '105' })
+    directoryChanged()
+    await until('the second restore', () => rec.wakeable.length >= 2)
+    expect(await store.listPushUsers('A')).toEqual(['back', 'gone', 'jean'])
+    // After it: the leaver's browsers go; 'back' left again, but only just (noted anew).
+    await new Promise(r => setTimeout(r, 60))
+    await store.deleteMapping('A', 'back')
+    directoryChanged()
+    await until('the leaver forgotten', async () => (await store.listPushUsers('A')).join() === 'back,jean')
     expect(await store.listPushSubscriptions('A', 'gone')).toEqual([])
+    await app.close()
+  })
+
+  it('recomputes the whole tenant when a browser was taken from someone the store cannot name (two people saving it at once)', async () => {
+    const { app, as, store, rec } = await setup({ one: true })
+    await until('the first restore', () => rec.wakeable.length >= 1)
+    const save = store.savePushSubscription.bind(store)
+    store.savePushSubscription = async record => ({ ...(await save(record)), outcome: 'moved' })
+    const before = rec.wakeable.length
+    expect((await app.inject({ method: 'POST', url: '/api/v1/me/push-subscriptions', headers: as('jean'), payload: service.subscribe() })).statusCode).toBe(201)
+    expect(rec.wakeable.length).toBe(before + 1)
+    expect(rec.wakeable.at(-1)).toBe('102=jean')
+    expect(rec.ones).toEqual([])
     await app.close()
   })
 

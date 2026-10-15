@@ -397,6 +397,7 @@ route[ring_now] {
 		route(rtp_offer);
 	t_on_reply("rtp");
 	t_on_failure("call_failed");
+	t_on_branch("tried");
 	route(arm_failure);
 	# The call starts: told to the Gateway only now, once nothing can refuse it without a transaction: from here on,
 	# acc tells how it ended.
@@ -631,6 +632,8 @@ route[hold] {
 		route(unreachable);
 	}
 	$avp(held) = 1;
+	# The first window that rings ends the wait (branch_route[tried]).
+	$avp(held_one) = 1;
 	$(avp(wake_filter)[*]) = NULL;
 	$avp(wake_filter) = "aor=" + $avp(callee);
 	# A window that registers (INSERT), or one that comes back with the Contact it had (UPDATE: a tab whose WebSocket
@@ -658,6 +661,9 @@ route[hold] {
 # destinations tried then: those of windows on dead WebSockets): relayed, and the call no longer waits for another
 # (t_wait_no_more_branches: the phony branch, just before them, stays in their set). 1 when one was sent. A window
 # known already is not tried again: a second relay after the failed ones would start a set without the phony branch.
+# A relay that fails after adding its branch (a WebSocket that died meanwhile) leaves it beside the phony branch: the
+# set starts again past it, with a phony branch of its own (route[past_dead_branches]), so that a CANCEL still ends the
+# call at once.
 route[registered_meanwhile] {
 	$var(aor) = "sip:" + $avp(callee) + "@" + $avp(domain);
 	if (!lookup("location", "to-branches-only", "$var(aor)"))
@@ -694,6 +700,14 @@ route[registered_meanwhile] {
 		xlog("L_NOTICE", "call $ci: the window of $avp(callee) that registered meanwhile cannot be reached ($rc), the call waits\n");
 		$ru = $var(aor);
 		resetdsturi();
+		# The last branch is a phony one when the relay added none (its URI is empty): it is still alone in the set.
+		if ($(tm.branch.uri[-1]) != "") {
+			route(past_dead_branches);
+			if (!t_wait_for_new_branches()) {
+				xlog("L_ERR", "call $ci: cannot hold the call for a window of $avp(callee)\n");
+				route(unreachable);
+			}
+		}
 		return(-1);
 	}
 	t_wait_no_more_branches();
@@ -718,11 +732,13 @@ route[past_dead_branches] {
 
 # A window of a held callee registered (event_routing's notification route: no context of the call but its
 # transaction): it rings in that transaction, built from the request the transaction keeps (Record-Route, the media
-# offer, the caller's name), with the call's reply and failure routes. "l": the call no longer waits for the phony
-# branch, it ends as this ringing does (another window registering meanwhile rings too). A call already over: nothing.
+# offer, the caller's name), with the call's reply and failure routes; the call then no longer waits for the phony
+# branch, it ends as this ringing does (another window registering meanwhile rings too: branch_route[tried]). A call
+# already over (-2), or a window that rings in it already (-3, a renewal of its registration: branch_route[tried]
+# drops that branch, and tm logs "failure to add branches"): nothing.
 route[woken] {
-	if (!t_inject_branches("event", "l"))
-		xlog("L_NOTICE", "a window of $avp(aor) registered, its held call is over ($rc)\n");
+	if (!t_inject_branches("event"))
+		xlog("L_NOTICE", "a window of $avp(aor) registered, not rung in its held call ($rc: over, or ringing already)\n");
 }
 
 # A ring group whose members without a window can be woken ($avp(gw_ext), the first $avp(g_woken) of them in their
@@ -756,6 +772,10 @@ route[group_hold] {
 	$(avp(g_wake_list)[*]) = NULL;
 	$(avp(g_joined)[*]) = NULL;
 	$(avp(g_njoined)[*]) = NULL;
+	# Those of them a window of rings already, and how many still have none: branch_route[tried] keeps one place
+	# for each of these.
+	$(avp(g_injected)[*]) = NULL;
+	$(avp(g_awaited)[*]) = NULL;
 	$var(list) = ",";
 	$var(j) = $var(n) - 1;
 	$var(left) = $avp(g_woken);
@@ -782,6 +802,8 @@ route[group_hold] {
 	}
 	$avp(g_wake_list) = $var(list);
 	$avp(g_njoined) = 0;
+	$avp(g_injected) = ",";
+	$avp(g_awaited) = $avp(g_woken);
 	$var(windows) = $avp(g_windows) + $avp(g_woken);
 	$(avp(g_windows)[*]) = NULL;
 	$avp(g_windows) = $var(windows);
@@ -846,11 +868,59 @@ route[group_dead] {
 }
 
 # A window of a member of a held ring group registered: it rings in the group's transaction, tagged with the member
-# (onreply_route[rtp] finds the member's name in the group's list).
+# (onreply_route[rtp] finds the member's name in the group's list). Not when it rings there already, nor when it is a
+# second window of its member that would take the place of a member still awaited (branch_route[tried]).
 route[group_woken] {
 	$(msg.branch.attr(gext)[0]) = $avp(aor);
 	if (!t_inject_branches("event"))
-		xlog("L_NOTICE", "a window of $avp(aor) registered, the group call it was woken for is over ($rc)\n");
+		xlog("L_NOTICE", "a window of $avp(aor) registered, not rung in the group call it was woken for ($rc: over, ringing already, or no place)\n");
+}
+
+# Every branch of a call, as tm creates it (t_on_branch in route[ring_now]: the relays, and the windows that register
+# while it waits). A destination tried already in this call is not tried again: a window that renews its
+# registration while it rings (E_UL_CONTACT_UPDATE, the same Contact on the same connection) would ring once per
+# renewal. The same Contact on another connection (a WebSocket that died and came back) is another destination: the
+# first one could not be reached. A woken member of a ring group keeps one place out of the 12 of the transaction
+# until a window of theirs rings: a second window of a member is rung only while there are places left for the
+# members still awaited. A branch that rings ends the wait of a held callee (route[hold]). drop(): tm adds no
+# branch, and logs "failure to add branches".
+branch_route[tried] {
+	$var(key) = " " + $ru;
+	if ($du != NULL)
+		$var(key) = $var(key) + "|" + $du;
+	$var(key) = $var(key) + " ";
+	if ($avp(tried) != NULL && $(avp(tried){s.index,$var(key)}) != NULL) {
+		xlog("L_NOTICE", "call $ci: $ru rings already in this call, not again\n");
+		drop();
+	}
+	if ($avp(g_wake_list) != NULL && $tm.branch.attr(gext) != NULL && $tm.branch.attr(gname) == NULL) {
+		$var(member) = $tm.branch.attr(gext);
+		$var(mark) = "," + $var(member) + ",";
+		if ($(avp(g_wake_list){s.index,$var(mark)}) != NULL) {
+			if ($(avp(g_injected){s.index,$var(mark)}) == NULL) {
+				$var(injected) = $avp(g_injected) + $var(member) + ",";
+				$(avp(g_injected)[*]) = NULL;
+				$avp(g_injected) = $var(injected);
+				$var(awaited) = $avp(g_awaited) - 1;
+				$(avp(g_awaited)[*]) = NULL;
+				$avp(g_awaited) = $var(awaited);
+			} else {
+				# The places left once this branch is added (12 branches, 0 to 11).
+				$var(left) = 11 - $T_branch_idx;
+				if ($var(left) < $avp(g_awaited)) {
+					xlog("L_NOTICE", "call $ci: group $avp(group): another window of $var(member), no place left beside the $avp(g_awaited) members awaited\n");
+					drop();
+				}
+			}
+		}
+	}
+	$var(tried) = $var(key);
+	if ($avp(tried) != NULL)
+		$var(tried) = $avp(tried) + $var(key);
+	$(avp(tried)[*]) = NULL;
+	$avp(tried) = $var(tried);
+	if ($avp(held_one) == 1)
+		t_wait_no_more_branches();
 }
 
 #### Ring groups (step 4c, ADR 0014) ###################################################################################
@@ -874,11 +944,13 @@ route[group_next] {
 	if ($avp(caller) =~ "^[A-Za-z0-9._+-]{1,64}$")
 		$var(group_caller) = $avp(caller);
 	route(name_sql);
-	# Step 5: whether each member has a browser to wake (`push_targets`), while that table may be named.
+	# Step 5: whether each member has a browser to wake (`push_targets`), while that table may be named, and not
+	# after a read naming it failed ($avp(g_nowake), route[group_loaded]: a `push_targets` the Gateway has not
+	# upgraded yet fails the query, the group still rings its members' windows).
 	$(avp(g_wake)[*]) = NULL;
 	$(avp(q5)[*]) = NULL;
 	$var(wake_col) = "0";
-	if ($shv(no5_until) <= $Ts) {
+	if ($shv(no5_until) <= $Ts && $avp(g_nowake) == NULL) {
 		$avp(q5) = 1;
 		$var(wake_col) = "CASE WHEN EXISTS (SELECT 1 FROM push_targets p WHERE p.extension = x.ext AND p.alive_until > now()) THEN 1 ELSE 0 END";
 	}
@@ -896,6 +968,9 @@ route[group_loaded] {
 	if (t_was_cancelled())
 		route(cancelled);
 	if ($var(group_rc) < 0 && $var(group_rc) != -2 && route(read_failed)) {
+		# Made again without whether the members can be woken: the failure may be that column's.
+		if ($avp(q5) == 1)
+			$avp(g_nowake) = 1;
 		route(group_next);
 		exit;
 	}
@@ -1747,6 +1822,14 @@ route[event_attrs] {
 	$avp(ev_val) = $avp(caller);
 	$avp(ev_attr) = "callid";
 	$avp(ev_val) = $ci;
+}
+
+# The event the Gateway raises itself through the MI (`raise_event`) after each subscription to the events, and gets
+# back: it then knows it hears OpenSIPS, and only then keeps the rows of `push_targets` alive (a Gateway whose events
+# come from an address it does not accept wakes nobody: no call waits for it). Never called: a route that names an
+# event is enough for OpenSIPS to know it.
+route[probe_event] {
+	raise_event("E_TWAKEPHONE_PROBE");
 }
 
 failure_route[call_failed] {

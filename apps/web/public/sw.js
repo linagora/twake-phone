@@ -49,14 +49,15 @@ const notificationOf = (data, now = Date.now()) => {
   const callId = line(data.callId, 128)
   const tag = `call-${callId}`
   const title = group ? t.groupCall(caller, group) : t.call(caller)
-  // Over: shown quietly, gone once seen (no sound, no need to act).
-  const over = body => ({ title, options: { body, tag, silent: true, data: { url: '/recents' } } })
+  // Over: shown quietly, gone once seen (no sound, no need to act). Marked so (`over`): a push of the call itself
+  // that comes after it never puts the call to answer back (onPush).
+  const over = body => ({ title, options: { body, tag, silent: true, data: { url: '/recents', over: true } } })
   if (data.type === 'call') {
     const until = typeof data.until === 'number' && Number.isFinite(data.until) ? data.until : 0
     if (until && until <= now) return over(t.over)
     return { title, options: { body: t.answer, tag, renotify: true, requireInteraction: true, data: { url: `/?call=${encodeURIComponent(callId)}`, until } } }
   }
-  if (data.type === 'missed') return { title: t.missed(caller), options: { body: group || t.missedBody, tag, data: { url: '/recents' } } }
+  if (data.type === 'missed') return { title: t.missed(caller), options: { body: group || t.missedBody, tag, data: { url: '/recents', over: true } } }
   if (data.type === 'ended') {
     if (data.reason === 'answered') return over(t.answered)
     const by = data.by && typeof data.by === 'object' && line(data.by.number, 32) ? who(data.by.name, data.by.number) : ''
@@ -71,24 +72,46 @@ const visibleWindows = async () =>
   (await self.clients.matchAll({ type: 'window', includeUncontrolled: true })).filter(w => new URL(w.url).origin === self.location.origin && w.visibilityState === 'visible')
 
 /**
- * Whether a window of the app on screen rings this call itself (signed in, its softphone on: it answers when asked).
- * Then no notification: the page rings, once its softphone is registered again.
+ * Whether a window of the app on screen rings this call itself: 'rings' when one is signed in with its softphone
+ * registered (then no notification: the page rings), 'soon' when the only ones signed in are not registered yet (a
+ * WebSocket on its way back: the call may ring there, or not in time), 'no' otherwise.
  */
 const ringsInAWindow = async callId => {
   const windows = await visibleWindows()
-  if (!windows.length || typeof MessageChannel === 'undefined') return false
+  if (!windows.length || typeof MessageChannel === 'undefined') return 'no'
   return new Promise(resolve => {
-    const timer = setTimeout(() => resolve(false), ASK_MS)
+    let soon = false
+    let left = windows.length
+    const timer = setTimeout(() => resolve(soon ? 'soon' : 'no'), ASK_MS)
     for (const w of windows) {
       const channel = new MessageChannel()
       channel.port1.onmessage = e => {
         if (e.data?.type !== 'twakephone.here') return
-        clearTimeout(timer)
-        resolve(true)
+        if (e.data.registered === true) {
+          clearTimeout(timer)
+          return resolve('rings')
+        }
+        soon = true
+        if (--left === 0) {
+          clearTimeout(timer)
+          resolve('soon')
+        }
       }
       w.postMessage({ type: 'twakephone.ring', callId }, [channel.port2])
     }
   })
+}
+
+/**
+ * The calls whose end (or miss) was shown since this worker started: a push of the call that comes after it (push
+ * services keep no order) shows the end again, never the call to answer. The notification's own mark (`over`) says
+ * so too while it is on screen, across a restart of the worker.
+ */
+const overCalls = new Set()
+const OVER_KEPT = 200
+const remember = callId => {
+  overCalls.add(callId)
+  if (overCalls.size > OVER_KEPT) overCalls.delete(overCalls.values().next().value)
 }
 
 /** The notifications of calls whose wait is over (their end message never came: a Gateway restarted) go. */
@@ -101,14 +124,38 @@ const onPush = async data => {
   await dropExpired().catch(() => undefined)
   // Every push shows something (the browsers require it while no window of the site is on screen): a message that
   // is not a call says to open the app.
-  const shown = notificationOf(data) ?? { title: text().other, options: { body: text().otherBody, data: { url: '/' } } }
-  if (data?.type === 'call' && shown.options.requireInteraction && (await ringsInAWindow(line(data.callId, 128)).catch(() => false))) return
+  let shown = notificationOf(data) ?? { title: text().other, options: { body: text().otherBody, data: { url: '/' } } }
+  const callId = typeof data?.callId === 'string' ? line(data.callId, 128) : ''
+  if (data?.type === 'call' && shown.options.requireInteraction) {
+    // Its end came first: it stays (or shows again, quietly) as over.
+    const tagged = (await self.registration.getNotifications?.({ tag: shown.options.tag })) ?? []
+    if (tagged.some(n => n.data?.over)) return
+    if (overCalls.has(callId)) shown = notificationOf({ ...data, type: 'ended', reason: 'over' })
+  }
+  if (data?.type === 'call' && shown.options.requireInteraction) {
+    const here = await ringsInAWindow(callId).catch(() => 'no')
+    if (here === 'rings') return
+    // A window on screen on its way back: the call shown quietly, closed once it rings there (`twakephone.ringing`).
+    if (here === 'soon') {
+      const { renotify, requireInteraction, ...options } = shown.options
+      shown = { title: shown.title, options: { ...options, silent: true, data: { ...options.data, quiet: true, callId } } }
+    }
+  }
+  if (data?.type === 'ended' || data?.type === 'missed') remember(callId)
   // The end of a call while a window is on screen: its notification goes, no other comes.
   if (data?.type === 'ended' && (await visibleWindows().catch(() => [])).length) {
     for (const n of (await self.registration.getNotifications?.({ tag: shown.options.tag })) ?? []) n.close()
     return
   }
   await self.registration.showNotification(shown.title, shown.options)
+}
+
+/** A page of the app rings these calls itself (JsSIP's ids: the Call-ID, then the From tag): their quiet notifications go. */
+const ringingHere = async callIds => {
+  for (const n of (await self.registration.getNotifications?.()) ?? []) {
+    const callId = n.data?.quiet ? n.data.callId : undefined
+    if (typeof callId === 'string' && callId && callIds.some(id => id.startsWith(callId))) n.close()
+  }
 }
 
 self.addEventListener('install', () => self.skipWaiting())
@@ -130,6 +177,11 @@ self.addEventListener('push', event => {
     data = null
   }
   event.waitUntil(oneAtATime(() => onPush(data)))
+})
+
+self.addEventListener('message', event => {
+  const callIds = event.data?.type === 'twakephone.ringing' && Array.isArray(event.data.callIds) ? event.data.callIds.filter(id => typeof id === 'string').slice(0, 16) : []
+  if (callIds.length) event.waitUntil(oneAtATime(() => ringingHere(callIds)))
 })
 
 self.addEventListener('notificationclick', event => {

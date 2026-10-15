@@ -8,9 +8,9 @@ import type { Queryable } from './subscriber.js'
  * One row per extension that can be woken. `holder` is the person it was written for and `tenant_id` whose
  * extension it is: OpenSIPS reads neither (one tenant per database), the Gateway drops a row as soon as its holder no
  * longer holds the extension, and only ever touches its own tenant's rows. `alive_until`: until when a Gateway hears
- * whom to wake, the life of its subscription to OpenSIPS's events, renewed with it (keepAlive), over when the Gateway
- * stops (release). OpenSIPS holds a call only for a row still alive: a Gateway that stopped, or no longer hears
- * OpenSIPS, holds nobody's calls for nothing.
+ * whom to wake, the life of its subscription to OpenSIPS's events, extended each time it is renewed and the Gateway
+ * heard OpenSIPS since (keepAlive), over when the Gateway stops (release). OpenSIPS holds a call only for a row still
+ * alive: a Gateway that stopped, or no longer hears OpenSIPS, holds nobody's calls for nothing.
  */
 export const PUSH_TARGETS_SCHEMA = `
 CREATE TABLE IF NOT EXISTS push_targets (
@@ -31,15 +31,16 @@ export interface PushTargetsOptions {
   ready?: () => Promise<void>
   /** The tenant whose extensions these are. */
   tenantId?: string
-  /** Test seam: this host's clock (ms). */
-  now?: () => number
 }
 
 /** Reads and writes the tenant's rows of `push_targets`. */
 export class PushTargets {
   private readonly tenantId: string
-  /** When the rows stop being alive (ms since the epoch, this host's clock); 0: not alive. */
-  private aliveUntil = 0
+  /**
+   * When the rows stop being alive, as the database wrote it (its clock, the one OpenSIPS reads it against); null:
+   * not alive. The rows this Gateway wrote last carry exactly this value (release).
+   */
+  private until: string | null = null
 
   constructor(private readonly opts: PushTargetsOptions) {
     this.tenantId = opts.tenantId ?? 'default'
@@ -49,11 +50,6 @@ export class PushTargets {
     await this.opts.ready?.()
     const res = (await this.opts.pool.query(text, values)) as { rows?: T[] } | undefined
     return res?.rows ?? []
-  }
-
-  /** Seconds a row written now stays alive: what is left of the lease (keepAlive). */
-  private leftSec() {
-    return Math.max(0, Math.floor((this.aliveUntil - (this.opts.now ?? Date.now)()) / 1000))
   }
 
   /** The extensions of the tenant that can be woken, with their holder, by extension. */
@@ -75,10 +71,10 @@ export class PushTargets {
     await this.query('DELETE FROM push_targets p WHERE p.tenant_id = $1 AND NOT EXISTS (SELECT 1 FROM unnest($2::text[], $3::text[]) AS w(extension, holder) WHERE w.extension = p.extension AND w.holder = p.holder)', [this.tenantId, extensions, holders])
     if (!extensions.length) return
     await this.query(
-      `INSERT INTO push_targets (extension, tenant_id, holder, alive_until) SELECT extension, $1, holder, now() + make_interval(secs => $4) FROM unnest($2::text[], $3::text[]) AS w(extension, holder)
+      `INSERT INTO push_targets (extension, tenant_id, holder, alive_until) SELECT extension, $1, holder, coalesce($4::timestamptz, now()) FROM unnest($2::text[], $3::text[]) AS w(extension, holder)
        ON CONFLICT (extension) DO UPDATE SET holder = EXCLUDED.holder, updated_at = now(), alive_until = EXCLUDED.alive_until
        WHERE push_targets.tenant_id = EXCLUDED.tenant_id AND push_targets.holder IS DISTINCT FROM EXCLUDED.holder`,
-      [this.tenantId, extensions, holders, this.leftSec()]
+      [this.tenantId, extensions, holders, this.until]
     )
   }
 
@@ -90,23 +86,37 @@ export class PushTargets {
       return
     }
     await this.query(
-      `INSERT INTO push_targets (extension, tenant_id, holder, alive_until) VALUES ($2, $1, $3, now() + make_interval(secs => $4))
+      `INSERT INTO push_targets (extension, tenant_id, holder, alive_until) VALUES ($2, $1, $3, coalesce($4::timestamptz, now()))
        ON CONFLICT (extension) DO UPDATE SET holder = EXCLUDED.holder, updated_at = now(), alive_until = EXCLUDED.alive_until
        WHERE push_targets.tenant_id = EXCLUDED.tenant_id AND push_targets.holder IS DISTINCT FROM EXCLUDED.holder`,
-      [this.tenantId, target.extension, target.userId, this.leftSec()]
+      [this.tenantId, target.extension, target.userId, this.until]
     )
   }
 
-  /** The Gateway hears whom to wake `sec` seconds more (its subscription to the events was renewed): the rows live that long. */
+  /**
+   * The Gateway hears whom to wake `sec` seconds more (its subscription to the events was renewed, and OpenSIPS heard
+   * since): the rows live that long. Never shorter than another Gateway of the tenant made them (one starting while
+   * this one stops).
+   */
   async keepAlive(sec: number) {
-    this.aliveUntil = (this.opts.now ?? Date.now)() + sec * 1000
-    await this.query('UPDATE push_targets SET alive_until = now() + make_interval(secs => $2) WHERE tenant_id = $1', [this.tenantId, sec])
+    const [row] = await this.query<{ until: string }>(
+      `WITH t AS (SELECT now() + make_interval(secs => $2) AS until),
+       u AS (UPDATE push_targets p SET alive_until = t.until FROM t WHERE p.tenant_id = $1 AND p.alive_until < t.until)
+       SELECT until::text AS until FROM t`,
+      [this.tenantId, sec]
+    )
+    this.until = row?.until ?? null
   }
 
-  /** The Gateway no longer hears whom to wake (it stops): no call waits for the tenant's rows any more. */
+  /**
+   * The Gateway no longer hears whom to wake (it stops): no call waits for the rows it kept alive any more. Only those
+   * whose life is still the one it gave them: a row another Gateway of the tenant kept alive since stays so.
+   */
   async release() {
-    this.aliveUntil = 0
-    await this.query('UPDATE push_targets SET alive_until = now() WHERE tenant_id = $1', [this.tenantId])
+    const until = this.until
+    this.until = null
+    if (!until) return
+    await this.query('UPDATE push_targets SET alive_until = now() WHERE tenant_id = $1 AND alive_until = $2::timestamptz AND alive_until > now()', [this.tenantId, until])
   }
 
   /** Given who holds each extension of the tenant now, removes the rows whose holder no longer holds it. */

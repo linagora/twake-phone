@@ -410,7 +410,8 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(section('route[rules_loaded]', 'route[rules_step]')).toContain('if ($var(rules_rc) < 0 && $var(rules_rc) != -2 && route(read_failed)) {\n\t\troute(rules_next);\n\t\texit;\n\t}')
     expect(section('route[ring_loaded]', 'route[ring_now]')).toContain('if ($var(rules_rc) < 0 && $var(rules_rc) != -2 && route(read_failed)) {\n\t\troute(ring);\n\t\texit;\n\t}')
     expect(section('route[names_loaded]', 'route[caller_name]')).toContain('if ($var(names_rc) < 0 && $var(names_rc) != -2 && route(read_failed)) {\n\t\troute(names_next);\n\t\texit;\n\t}')
-    expect(section('route[group_loaded]', 'route[group_ring]')).toContain('if ($var(group_rc) < 0 && $var(group_rc) != -2 && route(read_failed)) {\n\t\troute(group_next);\n\t\texit;\n\t}')
+    expect(section('route[group_loaded]', 'route[group_ring]')).toContain('if ($var(group_rc) < 0 && $var(group_rc) != -2 && route(read_failed)) {')
+    expect(section('route[group_loaded]', 'route[group_ring]')).toContain('\t\troute(group_next);\n\t\texit;\n\t}')
     // The members' query always needs call_groups: its failure is never taken for missing tables.
     expect(section('route[group_next]', 'route[group_loaded]')).toContain('$(avp(q4c)[*]) = NULL;')
   })
@@ -443,7 +444,10 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     const failed = section('route[read_failed]', 'route[tables_4c_missing]')
     expect(failed).toContain('if ($avp(q5) == 1 && route(table_5_missing)) {\n\t\t$shv(no5_until) = $Ts + 30;')
     expect(section('route[table_5_missing]', 'route[wake_next]')).toContain("to_regclass('push_targets') IS NULL")
-    expect(section('route[group_next]', 'route[group_loaded]')).toContain('if ($shv(no5_until) <= $Ts) {\n\t\t$avp(q5) = 1;')
+    expect(section('route[group_next]', 'route[group_loaded]')).toContain('if ($shv(no5_until) <= $Ts && $avp(g_nowake) == NULL) {\n\t\t$avp(q5) = 1;')
+    // The members' query failed while it named push_targets (a table of the first version of step 5, without
+    // alive_until): made again without it, the group still rings its members' windows.
+    expect(section('route[group_loaded]', 'route[group_ring]')).toContain('if ($avp(q5) == 1)\n\t\t\t$avp(g_nowake) = 1;\n\t\troute(group_next);')
     // Nobody to wake: on as before; windows that could not be reached end as a failed relay, never in a loop.
     const notWoken = section('route[not_woken]', 'route[hold]')
     expect(notWoken.indexOf('route(relay_failed);')).toBeLessThan(notWoken.indexOf('route(rules_step);'))
@@ -464,6 +468,9 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(meanwhile).toContain('lookup("location", "to-branches-only", "$var(aor)")')
     expect(meanwhile).toContain('remove_msg_branch($var(i));')
     expect(meanwhile.indexOf('if (!t_relay()) {')).toBeLessThan(meanwhile.indexOf('t_wait_no_more_branches();'))
+    // Its relay failed after adding a branch (a WebSocket that died meanwhile): a set of its own with a phony branch,
+    // so that a CANCEL still ends the call at once; none added, the phony branch is still alone in its set.
+    expect(meanwhile).toContain('if ($(tm.branch.uri[-1]) != "") {\n\t\t\troute(past_dead_branches);\n\t\t\tif (!t_wait_for_new_branches()) {')
     expect(hold.indexOf('raise_event("E_TWAKEPHONE_WAKE"')).toBeLessThan(hold.indexOf('t_reply(180, "Ringing");'))
     // Windows that could not be reached: their failed branches left behind first, so that a CANCEL ends the wait at
     // once (a relay that adds no branch, to a transport OpenSIPS does not listen on), the destination reset after.
@@ -474,7 +481,10 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(past.indexOf('while ($msg.branch.last_idx > 0)\n\t\tremove_msg_branch(0);')).toBeLessThan(past.indexOf('$du = '))
     expect(past.indexOf('$socket_out = NULL;')).toBeLessThan(past.indexOf('$du = '))
     expect(cfg).not.toMatch(/listen\s*=\s*sctp/)
-    expect(section('route[woken]', 'route[group_hold]')).toContain('t_inject_branches("event", "l")')
+    // Injected as any branch; the branch route ends the wait for a branch it lets go (not for a renewal it drops).
+    expect(section('route[woken]', 'route[group_hold]')).toContain('if (!t_inject_branches("event"))')
+    expect(cfg).not.toContain('t_inject_branches("event", "l")')
+    expect(hold.indexOf('$avp(held_one) = 1;')).toBeGreaterThan(hold.indexOf('t_wait_for_new_branches()'))
     // A group: the woken members' windows are tagged with the member, and the wait counts one branch per member.
     const groupHold = section('route[group_hold]', 'route[group_woken]')
     // Counted per member: the wait has no limit of branches, it stops once each woken member had a window answer.
@@ -503,6 +513,31 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(section('route[relay_failed]', 'onreply_route')).toContain('$var(relay_request) = 0;')
     // A woken callee or member is an event attribute of its own; nothing the UA sent goes in it.
     expect(cfg.match(/raise_event\("E_TWAKEPHONE_WAKE"/g)).toHaveLength(2)
+  })
+
+  it('tries each destination once per call, keeps their place to the woken members of a ring group, and declares the probe of the Gateway', () => {
+    const { cfg } = render()
+    const section = (name: string, next: string) => cfg.slice(cfg.indexOf(`${name} {`), cfg.indexOf(`${next} {`))
+    // Every branch of a call, the relays' and those a registration injects, goes through the branch route.
+    const ringNow = section('route[ring_now]', 'route[cancelled]')
+    expect(ringNow.indexOf('t_on_branch("tried");')).toBeLessThan(ringNow.indexOf('route(hold);'))
+    expect(cfg.match(/t_on_branch\(/g)).toHaveLength(1)
+    const tried = cfg.slice(cfg.indexOf('branch_route[tried] {'), cfg.indexOf('#### Ring groups'))
+    // A Contact on the connection it rang on already: dropped (a renewal); on another connection: another destination.
+    expect(tried).toContain('$var(key) = " " + $ru;\n\tif ($du != NULL)\n\t\t$var(key) = $var(key) + "|" + $du;')
+    expect(tried).toContain('if ($avp(tried) != NULL && $(avp(tried){s.index,$var(key)}) != NULL) {')
+    expect(tried.indexOf('drop();')).toBeLessThan(tried.indexOf('$avp(tried) = $var(tried);'))
+    // A woken member's first window takes the place kept for them; another one only while places remain for the others.
+    expect(tried).toContain('$tm.branch.attr(gext) != NULL && $tm.branch.attr(gname) == NULL')
+    expect(tried).toContain('$var(left) = 11 - $T_branch_idx;\n\t\t\t\tif ($var(left) < $avp(g_awaited)) {')
+    const groupHold = section('route[group_hold]', 'route[group_woken]')
+    expect(groupHold).toContain('$avp(g_injected) = ",";\n\t$avp(g_awaited) = $avp(g_woken);')
+    // The wait of a held callee ends with the first branch that goes, as t_inject_branches' "l" did.
+    expect(tried.trimEnd().endsWith('if ($avp(held_one) == 1)\n\t\tt_wait_no_more_branches();\n}')).toBe(true)
+    // The event the Gateway raises itself through the MI to know it hears OpenSIPS: declared, raised nowhere else.
+    expect(section('route[probe_event]', 'failure_route[call_failed]')).toContain('raise_event("E_TWAKEPHONE_PROBE");')
+    expect(cfg.match(/E_TWAKEPHONE_PROBE/g)).toHaveLength(1)
+    expect(cfg).not.toMatch(/route\(probe_event\)/)
   })
 
   it('refuses a PUSH_WAIT_SEC that is no number of seconds from 5 to 120', () => {

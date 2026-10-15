@@ -15,6 +15,12 @@ export { CallGroups, CALL_GROUPS_SCHEMA, DISPLAY_NAMES_SCHEMA, GROUP_MEMBERS_MAX
 export { PushTargets, PUSH_TARGETS_SCHEMA, type PushTargetsOptions } from './push-targets.js'
 export { AsyncQueue } from './queue.js'
 
+/**
+ * The event the Gateway raises itself through the MI after each subscription to tell it hears OpenSIPS
+ * (opensips.cfg.tpl declares it, and never raises it).
+ */
+export const PROBE_EVENT = 'E_TWAKEPHONE_PROBE'
+
 /** The events the Gateway listens to: registrations and their refreshes (usrloc), our own call events (opensips.cfg.tpl), the CDRs and missed calls (acc). */
 export const SUBSCRIBED_EVENTS = [
   'E_UL_CONTACT_INSERT',
@@ -27,6 +33,7 @@ export const SUBSCRIBED_EVENTS = [
   'E_TWAKEPHONE_FORWARDED',
   'E_TWAKEPHONE_DND',
   'E_TWAKEPHONE_WAKE',
+  PROBE_EVENT,
   'E_ACC_CDR',
   'E_ACC_MISSED_EVENT'
 ]
@@ -136,9 +143,11 @@ export class OpensipsProvider implements TelephonyProvider, MediaProvider {
         onEvent: (method, params) => this.tracker.handle(method, params),
         onResync: () => this.resync(),
         onRenewed: () => this.tracker.sweep(),
-        // The rows of push_targets live as long as this subscription: OpenSIPS holds a call for someone to wake
-        // only while a Gateway hears it (a Gateway gone, its rows lapse with its subscription).
-        onSubscribed: expireSec => {
+        // The rows of push_targets live as long as this subscription, once the Gateway heard OpenSIPS since it was
+        // made or renewed: OpenSIPS holds a call for someone to wake only while a Gateway hears it (a Gateway gone, or
+        // deaf, its rows lapse with its subscription).
+        probeEvent: PROBE_EVENT,
+        onHeard: expireSec => {
           void this.config.pushTargets?.keepAlive(expireSec).catch((err: unknown) => log.warn(`push_targets not kept alive: ${err instanceof Error ? err.message : String(err)}`))
         },
         // The subscription lapsed in OpenSIPS: the registrations it told no longer hold (everyone offline) until

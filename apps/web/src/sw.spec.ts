@@ -6,8 +6,11 @@ type Handler = (event: Record<string, unknown>) => void
 interface FakeWindow {
   url: string
   visibilityState?: 'visible' | 'hidden'
-  /** Answers the worker's question as a window that rings the call itself. */
-  rings?: boolean
+  /**
+   * Answers the worker's question as a window of the app signed in: its softphone registered (it rings the call
+   * itself), or on its way (connecting: it may not ring in time).
+   */
+  answers?: 'registered' | 'connecting'
   /** Refuses to be brought forward (a browser allows it for a click on the notification only). */
   refusesFocus?: boolean
   focused?: boolean
@@ -63,7 +66,7 @@ const load = (language = 'fr-FR', windows: FakeWindow[] = []) => {
           },
           postMessage: (m: { type?: string }, ports?: MessagePort[]) => {
             ;(w.messages ??= []).push(m)
-            if (m.type === 'twakephone.ring' && w.rings) ports?.[0]?.postMessage({ type: 'twakephone.here' })
+            if (m.type === 'twakephone.ring' && w.answers) ports?.[0]?.postMessage({ type: 'twakephone.here', registered: w.answers === 'registered' })
           }
         })),
       openWindow: async (url: string) => void opened.push(url)
@@ -76,11 +79,13 @@ const load = (language = 'fr-FR', windows: FakeWindow[] = []) => {
     await waited
   }
   const push = (data: unknown) => fire('push', { data: data === undefined ? null : { json: () => (typeof data === 'string' ? JSON.parse(data) : data) } })
+  /** A page of the app says its softphone rings these calls (their SIP Call-ID and From tag, as JsSIP names them). */
+  const ringing = (callIds: unknown) => fire('message', { data: { type: 'twakephone.ringing', callIds } })
   const click = (url: string, extra: Record<string, unknown> = {}) => {
     let wasClosed = false
     return fire('notificationclick', { notification: { data: { url, ...extra }, close: () => void (wasClosed = true) } }).then(() => wasClosed)
   }
-  return { shown, closed, opened, notifications, push, click, windows, showing }
+  return { shown, closed, opened, notifications, push, ringing, click, windows, showing }
 }
 const IN_A_MINUTE = () => Date.now() + 60_000
 
@@ -99,7 +104,7 @@ describe('the service worker (public/sw.js)', () => {
   it('turns the notification of a call nobody answered into that of a missed call', async () => {
     const sw = load()
     await sw.push({ type: 'missed', callId: 'c1', number: '101', name: 'Alice Martin' })
-    expect(sw.shown).toEqual([{ title: 'Appel manqué de Alice Martin (101)', options: { body: 'TwakePhone', tag: 'call-c1', data: { url: '/recents' } } }])
+    expect(sw.shown).toEqual([{ title: 'Appel manqué de Alice Martin (101)', options: { body: 'TwakePhone', tag: 'call-c1', data: { url: '/recents', over: true } } }])
   })
 
   it('replaces the call, quietly and for good, once it no longer waits: answered, taken by a colleague, over', async () => {
@@ -107,7 +112,7 @@ describe('the service worker (public/sw.js)', () => {
     await sw.push({ type: 'call', callId: 'c1', number: '101', name: 'Alice Martin', until: IN_A_MINUTE() })
     await sw.push({ type: 'ended', callId: 'c1', number: '101', name: 'Alice Martin', reason: 'answered' })
     expect(sw.notifications.map(n => n.title)).toEqual(['Appel de Alice Martin (101)'])
-    expect(sw.shown[1]).toEqual({ title: 'Appel de Alice Martin (101)', options: { body: 'Répondu.', tag: 'call-c1', silent: true, data: { url: '/recents' } } })
+    expect(sw.shown[1]).toEqual({ title: 'Appel de Alice Martin (101)', options: { body: 'Répondu.', tag: 'call-c1', silent: true, data: { url: '/recents', over: true } } })
     await sw.push({ type: 'ended', callId: 'c2', number: '104', group: { number: '200', name: 'Accueil' }, reason: 'taken', by: { number: '103', name: 'Bob Durand' } })
     expect(sw.shown[2]!.options.body).toBe('Pris par Bob Durand (103).')
     expect(sw.shown[2]!.options.requireInteraction).toBeUndefined()
@@ -131,8 +136,43 @@ describe('the service worker (public/sw.js)', () => {
     expect(stale.opened).toEqual(['https://phone.example.test/recents'])
   })
 
+  it('never puts back the call to answer once its end was shown: a push of the call that comes late (push services keep no order)', async () => {
+    const sw = load()
+    await sw.push({ type: 'ended', callId: 'c1', number: '101', reason: 'over' })
+    await sw.push({ type: 'call', callId: 'c1', number: '101', until: IN_A_MINUTE() })
+    expect(sw.notifications.map(n => `${n.tag} ${n.data?.over}`)).toEqual(['call-c1 true'])
+    expect(sw.shown.map(s => s.options.body)).toEqual(['Appel terminé.'])
+    // The end shown while a window was on screen (nothing on screen then): the late call shows as over, quietly.
+    const seen = load('fr-FR', [{ url: 'https://phone.example.test/', visibilityState: 'visible' }])
+    await seen.push({ type: 'ended', callId: 'c2', number: '101', reason: 'answered' })
+    await seen.push({ type: 'call', callId: 'c2', number: '101', until: IN_A_MINUTE() })
+    expect(seen.shown.map(s => [s.options.body, s.options.silent])).toEqual([['Appel terminé.', true]])
+    // A missed call likewise; another call of the same caller is another call.
+    await sw.push({ type: 'missed', callId: 'c3', number: '102' })
+    await sw.push({ type: 'call', callId: 'c3', number: '102', until: IN_A_MINUTE() })
+    await sw.push({ type: 'call', callId: 'c4', number: '102', until: IN_A_MINUTE() })
+    expect(sw.notifications.map(n => n.title)).toEqual(['Appel de 101', 'Appel manqué de 102', 'Appel de 102'])
+  })
+
+  it('shows a quiet notification while the window on screen is not registered yet, closed once that window rings the call', async () => {
+    const sw = load('fr-FR', [{ url: 'https://phone.example.test/', visibilityState: 'visible', answers: 'connecting' }])
+    const until = IN_A_MINUTE()
+    await sw.push({ type: 'call', callId: 'c1', number: '101', until })
+    expect(sw.shown).toEqual([{ title: 'Appel de 101', options: { body: 'Cliquez pour répondre dans TwakePhone.', tag: 'call-c1', silent: true, data: { url: '/?call=c1', until, quiet: true, callId: 'c1' } } }])
+    // Another call rings in that window: nothing closed; this one rings there (its id is the Call-ID then the From tag).
+    await sw.ringing(['other-tag'])
+    expect(sw.notifications).toHaveLength(1)
+    await sw.ringing([42, 'c1abcdef'])
+    expect(sw.notifications).toHaveLength(0)
+    // A notification of the full kind stays: the window that rings is not the one on screen.
+    const full = load()
+    await full.push({ type: 'call', callId: 'c1', number: '101', until: IN_A_MINUTE() })
+    await full.ringing(['c1abcdef'])
+    expect(full.notifications).toHaveLength(1)
+  })
+
   it('shows no call while a window of the app on screen rings it itself; a window that does not (signed out) gets the notification', async () => {
-    const ringing = load('fr-FR', [{ url: 'https://phone.example.test/', visibilityState: 'visible', rings: true }])
+    const ringing = load('fr-FR', [{ url: 'https://phone.example.test/', visibilityState: 'visible', answers: 'registered' }])
     await ringing.push({ type: 'call', callId: 'c1', number: '101', until: IN_A_MINUTE() })
     expect(ringing.shown).toEqual([])
     expect(ringing.windows[0]!.messages).toEqual([{ type: 'twakephone.ring', callId: 'c1' }])
@@ -143,7 +183,7 @@ describe('the service worker (public/sw.js)', () => {
     await signedOut.push({ type: 'call', callId: 'c1', number: '101', until: IN_A_MINUTE() })
     expect(signedOut.shown.map(s => s.options.body)).toEqual(['Cliquez pour répondre dans TwakePhone.'])
     // A window in the background is not asked.
-    const hidden = load('fr-FR', [{ url: 'https://phone.example.test/', rings: true }])
+    const hidden = load('fr-FR', [{ url: 'https://phone.example.test/', answers: 'registered' }])
     await hidden.push({ type: 'call', callId: 'c1', number: '101', until: IN_A_MINUTE() })
     expect(hidden.shown).toHaveLength(1)
     expect(hidden.windows[0]!.messages).toBeUndefined()

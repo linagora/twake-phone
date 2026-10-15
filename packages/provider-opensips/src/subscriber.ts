@@ -98,8 +98,9 @@ const ACC_EXTRA = "VARCHAR(64) DEFAULT '' NOT NULL"
 /**
  * The columns an existing table may lack: those of `acc` and `missed_calls` that OpenSIPS's own scripts do not create
  * (the acc extras of opensips.cfg.tpl), those `call_rules` gained after its first version (the holders; an older
- * row gets an empty tenant, and the first reconcile drops it), and the holder of a `subscriber` row (an older row has
- * none: it is never removed, until the session of its holder writes it again).
+ * row gets an empty tenant, and the first reconcile drops it), the holder of a `subscriber` row (an older row has
+ * none: it is never removed, until the session of its holder writes it again), and the life of a `push_targets` row
+ * (step 5 first wrote it without: an older row is not alive until the Gateway keeps it so).
  */
 export const EXTRA_COLUMNS = [
   ['subscriber', 'holder', 'TEXT'],
@@ -113,7 +114,8 @@ export const EXTRA_COLUMNS = [
   ['call_rules', 'holder', "TEXT DEFAULT '' NOT NULL"],
   ['call_rules', 'forward_always_holder', 'TEXT'],
   ['call_rules', 'forward_busy_holder', 'TEXT'],
-  ['call_rules', 'forward_noanswer_holder', 'TEXT']
+  ['call_rules', 'forward_noanswer_holder', 'TEXT'],
+  ['push_targets', 'alive_until', 'TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL']
 ] as const
 
 const addColumn = ([table, column, definition]: (typeof EXTRA_COLUMNS)[number]) => `ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS ${column} ${definition};`
@@ -215,7 +217,7 @@ export class SubscriberProvisioner implements SecretProvisioner {
       const added = await this.addColumns(missing).then(
         () => true,
         err => {
-          this.log.warn(`OpenSIPS tables: could not add ${missing.map(([t, c]) => `${t}.${c}`).join(', ')} (${err instanceof Error ? err.message : String(err)}); CDRs, call rules or the removal of accounts no longer held will not be written until they exist`)
+          this.log.warn(`OpenSIPS tables: could not add ${missing.map(([t, c]) => `${t}.${c}`).join(', ')} (${err instanceof Error ? err.message : String(err)}); CDRs, call rules, the removal of accounts no longer held or the wake of a browser will not be written until they exist`)
           return false
         }
       )

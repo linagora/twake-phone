@@ -45,8 +45,18 @@ export interface OpensipsEventsOptions {
   onResync?(): Promise<void> | void
   /** A renewal went through without needing a resync: time for periodic housekeeping. */
   onRenewed?(): void
-  /** The subscription lives in OpenSIPS `expireSec` seconds from now (made or renewed): events come that long at least. */
-  onSubscribed?(expireSec: number): void
+  /**
+   * An event of OpenSIPS's script this process raises itself through the MI (`raise_event`) after each subscription
+   * made or renewed, and subscribes to: when it comes back from an accepted address, the events are heard (onHeard).
+   */
+  probeEvent?: string
+  /**
+   * The events of OpenSIPS reach this process `expireSec` seconds more at least: its subscription lives that long, and
+   * the probe event it raised after making or renewing it came back from an accepted address. Without `probeEvent`,
+   * or from an OpenSIPS whose script does not know it: the subscription went through and the last period was not
+   * deaf (only datagrams from addresses not accepted).
+   */
+  onHeard?(expireSec: number): void
   /**
    * No renewal went through for the whole life of the last subscription: OpenSIPS has dropped it, and what it told
    * may no longer hold. A single failed renewal is not that: the subscription lives on and events keep coming.
@@ -111,6 +121,10 @@ export class OpensipsEvents {
   private foreignFrom = ''
   /** Only ignored datagrams arrived during the last renewal period: OpenSIPS sends from an address not accepted. */
   private deaf = false
+  /** The probe event raised after the last subscription, until it comes back: its nonce, when, and the life it tells. */
+  private probing?: { nonce: string; sentAt: number; expire: number }
+  /** The probe event was refused by OpenSIPS (logged once until it is known again). */
+  private probeRefused = false
   /** When OpenSIPS started, as its MI `uptime` says: a change means it restarted. */
   private upSince?: string
   private timer?: ReturnType<typeof setTimeout>
@@ -296,6 +310,15 @@ export class OpensipsEvents {
     if (typeof msg.method === 'string') {
       this.heard++
       const params = msg.params && typeof msg.params === 'object' && !Array.isArray(msg.params) ? (msg.params as Record<string, unknown>) : {}
+      if (msg.method === this.options.probeEvent) {
+        // Ours (another process subscribed to the same OpenSIPS raises its own): heard, for what is left of its life.
+        const probe = this.probing
+        if (probe && params.probe === probe.nonce) {
+          this.probing = undefined
+          this.options.onHeard?.(Math.max(0, probe.expire - Math.floor((Date.now() - probe.sentAt) / 1000)))
+        }
+        return
+      }
       try {
         this.options.onEvent(msg.method, params)
       } catch (err) {
@@ -361,8 +384,8 @@ export class OpensipsEvents {
       for (const event of this.options.events) await this.call('event_subscribe', [event, address, expire])
       const lapsed = !this.alive
       this.keepAlive(expire)
-      this.options.onSubscribed?.(expire)
       this.checkSources()
+      await this.probe(expire)
       if (!wasSubscribed || restarted || lapsed) {
         if (restarted) this.log.info('OpenSIPS restarted since the last renewal: reading its state again')
         try {
@@ -391,6 +414,32 @@ export class OpensipsEvents {
       this.updateStatus()
       this.schedule(delay)
     }
+  }
+
+  /**
+   * Asks OpenSIPS to send the probe event to its subscribers, this process among them: onHeard once it comes back.
+   * Not back (an address not accepted, a datagram lost): not heard, the next renewal asks again.
+   */
+  private async probe(expire: number) {
+    if (!this.options.onHeard) return
+    this.probing = undefined
+    const event = this.options.probeEvent
+    if (event) {
+      const probe = { nonce: randomBytes(12).toString('hex'), sentAt: Date.now(), expire }
+      this.probing = probe
+      try {
+        await this.call('raise_event', [event, JSON.stringify({ probe: probe.nonce })])
+        this.probeRefused = false
+        return
+      } catch (err) {
+        if (this.probing === probe) this.probing = undefined
+        // No reply: as a probe that does not come back. An error reply: this OpenSIPS's script does not know the event.
+        if ((err as MiError).code === undefined) return
+        if (!this.probeRefused) this.log.warn(`OpenSIPS events: ${event} refused (${err instanceof Error ? err.message : String(err)}); whether the events are heard is told by the addresses they come from only`)
+        this.probeRefused = true
+      }
+    }
+    if (!this.deaf) this.options.onHeard(expire)
   }
 
   /** The subscription now lives `expire` seconds in OpenSIPS: past that without a renewal, it is gone. */

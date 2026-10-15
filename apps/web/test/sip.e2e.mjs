@@ -32,6 +32,7 @@ import { DirectorySync } from '../../gateway/dist/directory-sync.js'
 import { DEFAULT_ATTRIBUTES, LdapDirectory } from '../../gateway/dist/ldap-directory.js'
 import { storedOpensipsFactory } from '../../gateway/dist/providers.js'
 import { ProviderRegistry } from '../../gateway/dist/registry.js'
+import { SubscriberProvisioner } from '../../../packages/provider-opensips/dist/subscriber.js'
 import { MemoryStore } from '../../gateway/dist/store/memory.js'
 import { BASE_DN, PEOPLE, READER_DN, READER_PASSWORD, startLdapMock } from '../../gateway/test/ldap-mock.mjs'
 import { startPushService } from '../../gateway/test/push-service.mjs'
@@ -418,6 +419,7 @@ const synchronise = async who => {
 }
 
 let failed = false
+let gatewayClosed = false
 let alice
 let jean
 let jean2
@@ -1244,12 +1246,30 @@ try {
     if (after > ms) throw new Error(`${answer} after ${after} ms, within ${ms} ms expected`)
     return answer
   }
+  /**
+   * A transaction that holds push_targets (ACCESS EXCLUSIVE): OpenSIPS's read of it waits, for less than its
+   * statement_timeout (1 s), and once more after a timeout. `waited()` resolves once a read waits on it (pg_locks).
+   */
+  const lockPushTargets = async () => {
+    const locker = new pg.Client({ connectionString: OPENSIPS_DB_URL })
+    await locker.connect()
+    await locker.query('BEGIN')
+    await locker.query('LOCK TABLE push_targets IN ACCESS EXCLUSIVE MODE')
+    return {
+      waited: () => until('a read of push_targets waiting on the lock', async () => ((await db.query("SELECT 1 FROM pg_locks WHERE relation = 'push_targets'::regclass AND NOT granted")).rows.length ? true : null), { timeout: 5_000, every: 20 }),
+      release: () => locker.query('COMMIT'),
+      end: async () => {
+        await locker.query('ROLLBACK').catch(() => undefined)
+        await locker.end()
+      }
+    }
+  }
   const uas = []
   const closeAll = async () => {
     for (const ua of uas.splice(0)) await ua.close().catch(() => undefined)
   }
   let caller
-  let api220
+  let admin
   try {
     await step('the windows of 141, 143 and 144 (user agents of this process) get their accounts, and their browsers can be woken: rows of push_targets that a Gateway keeps alive', async () => {
       for (const extension of [...wakeable.members, '142']) {
@@ -1259,6 +1279,7 @@ try {
       }
       await db.query("INSERT INTO push_targets (extension, tenant_id, holder, alive_until) SELECT e, 'e2e-ua', 'ua-' || e, now() + interval '1 hour' FROM unnest($1::text[]) AS e", [wakeable.members])
       caller = await windowOf('142')
+      admin = await asPerson(alice)
     })
     await step('two windows of 141 whose WebSockets died (laptops put to sleep): the call waits; the caller gives up after 1.5 s and is told at once (487, not at the end of the wait); a missed call for 141 in missed_calls', async () => {
       try {
@@ -1290,26 +1311,61 @@ try {
         await closeAll()
       }
     })
-    await step('a window of 141 registers while OpenSIPS still reads whether 141 can be woken (push_targets locked a moment): it rings at once, not at the end of the wait', async () => {
-      const locker = new pg.Client({ connectionString: OPENSIPS_DB_URL })
-      await locker.connect()
+    await step('a woken window of 141 (over UDP: it keeps its Call-ID) renews its registration twice while it rings: it rings once, not once per renewal', async () => {
       try {
-        await locker.query('BEGIN')
-        await locker.query('LOCK TABLE push_targets IN ACCESS EXCLUSIVE MODE')
         const dialled = await caller.dial('141')
-        // OpenSIPS found no window and waits on the table (for less than its statement_timeout, 1 s).
-        await sleep(200)
+        await held(dialled, 500)
         const ua = await windowOf('141')
         uas.push(ua)
-        ua.answer('603 Decline')
+        ua.answer('603 Decline', 2_000)
+        expectEqual(await ua.register(), 200, 'the registration of the woken window')
+        await until('the woken window rung', async () => ua.invites.length === 1 || null)
+        for (let i = 0; i < 2; i++) expectEqual(await ua.register(), 200, `renewal ${i + 1} while it rings`)
+        expectEqual(await endsWithin(dialled, 5_000), '603 Decline', 'the answer of the woken window')
+        expectEqual(ua.invites.length, 1, 'INVITEs to the woken window')
+      } finally {
+        await closeAll()
+      }
+    })
+    await step('a window of 141 registers while OpenSIPS still reads whether 141 can be woken (push_targets locked until that read waits): it rings at once, not at the end of the wait, and once though it renews its registration', async () => {
+      const lock = await lockPushTargets()
+      try {
+        const dialled = await caller.dial('141')
+        // OpenSIPS found no window and waits on the table.
+        await lock.waited()
+        const ua = await windowOf('141')
+        uas.push(ua)
+        ua.answer('603 Decline', 2_000)
         expectEqual(await ua.register(), 200, 'the registration of 141 while the read waits')
         const registered = Date.now()
-        await locker.query('COMMIT')
-        expectEqual(await endsWithin(dialled, 3_000, registered), '603 Decline', 'the answer of the window registered meanwhile')
+        await lock.release()
+        await until('the window registered meanwhile rung', async () => ua.invites.length === 1 || null, { timeout: 3_000 })
+        expectEqual(await ua.register(), 200, 'its renewal while it rings')
+        expectEqual(await endsWithin(dialled, 5_000, registered), '603 Decline', 'the answer of the window registered meanwhile')
         expectEqual(ua.invites.length, 1, 'INVITEs to that window')
       } finally {
-        await locker.query('ROLLBACK').catch(() => undefined)
-        await locker.end()
+        await lock.end()
+        await closeAll()
+      }
+    })
+    await step('a window of 141 registers over a WebSocket while push_targets is read, and its connection dies before the call is held: the caller gives up and is told at once (487, not at the end of the wait)', async () => {
+      const lock = await lockPushTargets()
+      try {
+        const dialled = await caller.dial('141')
+        await lock.waited()
+        const ua = await windowOf('141', { ws: true })
+        uas.push(ua)
+        expectEqual(await ua.register(), 200, 'the registration of 141 while the read waits')
+        await ua.drop()
+        // A moment for OpenSIPS to see its side of the connection close.
+        await sleep(300)
+        await lock.release()
+        await held(dialled)
+        const cancelled = Date.now()
+        await dialled.cancel()
+        expectEqual(await endsWithin(dialled, 1_000, cancelled), '487 Request Terminated', 'the answer once the caller gave up')
+      } finally {
+        await lock.end()
         await closeAll()
       }
     })
@@ -1333,9 +1389,8 @@ try {
         await closeAll()
       }
     })
-    await step('ring group 220 (143 and 144), none of whose windows is open: 143 opens two that decline, the call still waits for 144 (the first window of each member counts), whose window rings and declines: 603', async () => {
-      api220 = await asPerson(alice)
-      expectEqual((await api220('POST', '/admin/groups', { number: '220', name: 'Réveils', members: ['143', '144'] })).statusCode, 201, 'creating group 220')
+    await step('ring group 220 (143 and 144), none of whose windows is open: 143 opens two that decline, the call still waits for 144 (the first window of each member counts), whose window rings once though it renews its registration, and declines: 603', async () => {
+      expectEqual((await admin('POST', '/admin/groups', { number: '220', name: 'Réveils', members: ['143', '144'] })).statusCode, 201, 'creating group 220')
       try {
         const dialled = await caller.dial('220')
         await held(dialled, 500)
@@ -1350,9 +1405,11 @@ try {
         await held(dialled, 1_500)
         const late = await windowOf('144')
         uas.push(late)
-        late.answer('603 Decline')
+        late.answer('603 Decline', 2_000)
         expectEqual(await late.register(), 200, 'registration of the window of 144')
-        expectEqual(await endsWithin(dialled, 3_000), '603 Decline', 'the answer of 220')
+        await until('the window of 144 rung', async () => late.invites.length === 1 || null)
+        expectEqual(await late.register(), 200, 'its renewal while it rings')
+        expectEqual(await endsWithin(dialled, 5_000), '603 Decline', 'the answer of 220')
         expectEqual(uas.map(w => `${w.user} ${w.invites.length}`), ['143 1', '143 1', '144 1'], 'INVITEs per window')
       } finally {
         await closeAll()
@@ -1377,10 +1434,77 @@ try {
         await closeAll()
       }
     })
+    await step('push_targets as the first version of step 5 wrote it (no alive_until): ring group 225 (143 and 144) still rings the window of 143, nobody woken; the start of the provider adds the column back', async () => {
+      expectEqual((await admin('POST', '/admin/groups', { number: '225', name: 'Ancien schéma', members: ['143', '144'] })).statusCode, 201, 'creating group 225')
+      try {
+        await db.query('ALTER TABLE push_targets DROP COLUMN alive_until')
+        const ua = await windowOf('143')
+        uas.push(ua)
+        ua.answer('603 Decline')
+        expectEqual(await ua.register(), 200, 'registration of the window of 143')
+        const dialled = await caller.dial('225')
+        expectEqual(await endsWithin(dialled, 3_000), '603 Decline', 'the answer of 225')
+        expectEqual(ua.invites.length, 1, 'INVITEs to the window of 143')
+      } finally {
+        await closeAll()
+        await admin('DELETE', '/admin/groups/225')
+        await new SubscriberProvisioner({ pool: db, realm: SIP_DOMAIN }).ensureSchema()
+        await db.query("UPDATE push_targets SET alive_until = now() + interval '1 hour' WHERE tenant_id = 'e2e-ua'")
+      }
+      expectEqual((await db.query("SELECT count(*)::int AS n FROM push_targets WHERE tenant_id = 'e2e-ua' AND alive_until > now()")).rows[0].n, 3, 'rows of 141, 143 and 144 alive again')
+    })
+    await step('ring group 230 of 12 members, full: 6 windows ring, 5 members are woken (the branch that waits for them takes the last place); 157 opens two windows: the second rings nobody, it would take the place of 161; 158 to 161 each ring: 603', async () => {
+      const members = Array.from({ length: 12 }, (_, i) => String(151 + i))
+      for (const extension of members) {
+        const userId = `ua-${extension}`
+        await store.upsertMapping({ tenantId: TENANT, userId, extension, displayName: `Fenêtre ${extension}` })
+        wakeable.credentials[extension] = (await registry.forTenant(TENANT).getSession({ id: userId, tenantId: TENANT, displayName: `Fenêtre ${extension}`, extension }, { id: 'ua', type: 'browser', label: 'UA' })).credential
+      }
+      // 151 to 156 have a window; 157 to 161 a browser to wake; 162 neither.
+      const woken = members.slice(6, 11)
+      await db.query("INSERT INTO push_targets (extension, tenant_id, holder, alive_until) SELECT e, 'e2e-ua', 'ua-' || e, now() + interval '1 hour' FROM unnest($1::text[]) AS e", [woken])
+      expectEqual((await admin('POST', '/admin/groups', { number: '230', name: 'Complet', members })).statusCode, 201, 'creating group 230')
+      try {
+        for (const user of members.slice(0, 6)) {
+          const ua = await windowOf(user)
+          uas.push(ua)
+          ua.answer('603 Decline')
+          expectEqual(await ua.register(), 200, `registration of the window of ${user}`)
+        }
+        const dialled = await caller.dial('230')
+        await until('the six windows rung', async () => uas.every(w => w.invites.length === 1) || null)
+        await held(dialled, 500)
+        const first = await windowOf('157')
+        uas.push(first)
+        first.answer('603 Decline', 5_000)
+        expectEqual(await first.register(), 200, 'registration of the first window of 157')
+        await until('the first window of 157 rung', async () => first.invites.length === 1 || null)
+        const second = await windowOf('157')
+        uas.push(second)
+        second.answer('603 Decline')
+        expectEqual(await second.register(), 200, 'registration of the second window of 157')
+        for (const user of woken.slice(1)) {
+          const ua = await windowOf(user)
+          uas.push(ua)
+          ua.answer('603 Decline')
+          expectEqual(await ua.register(), 200, `registration of the window of ${user}`)
+          await until(`the window of ${user} rung`, async () => ua.invites.length === 1 || null, { timeout: 3_000 })
+        }
+        expectEqual(await endsWithin(dialled, 8_000), '603 Decline', 'the answer of 230')
+        expectEqual(uas.map(w => `${w.user} ${w.invites.length}`), [...members.slice(0, 6).map(m => `${m} 1`), '157 1', '157 0', ...woken.slice(1).map(m => `${m} 1`)], 'INVITEs per window')
+      } finally {
+        await closeAll()
+        await admin('DELETE', '/admin/groups/230')
+        for (const extension of members) await store.deleteMapping(TENANT, `ua-${extension}`)
+        // Their accounts go now: the synchronisation of the step of the names removes only so many at once (a mapping
+        // emptied by mistake must not take every account), and expects those of 131 to 134 and 141 to 144.
+        await db.query('DELETE FROM subscriber WHERE username = ANY($1::text[])', [members])
+      }
+    })
   } finally {
     await closeAll()
     await caller?.close()
-    await api220?.('DELETE', '/admin/groups/220')
+    await admin?.('DELETE', '/admin/groups/220')
     await db.query("DELETE FROM push_targets WHERE tenant_id = 'e2e-ua'")
     // Nobody holds them any more: the next synchronisation removes their accounts (step of the names).
     for (const extension of [...wakeable.members, '142']) await store.deleteMapping(TENANT, `ua-${extension}`)
@@ -1619,6 +1743,8 @@ try {
     await jean.page.getByText('Activées sur ce navigateur.', { exact: true }).waitFor()
     expectEqual((await store.listPushSubscriptions(TENANT, 'jdupont')).map(s => s.endpoint), [jeanBrowser.endpoint], "Jean's subscriptions at the Gateway")
     await until('102 in push_targets', async () => (await db.query("SELECT holder FROM push_targets WHERE extension = '102'")).rows[0]?.holder === 'jdupont')
+    // Alive as long as the Gateway hears OpenSIPS (its subscription to the events, renewed every minute, lives 2).
+    expectEqual((await db.query("SELECT alive_until > now() + interval '30 seconds' AS alive FROM push_targets WHERE extension = '102'")).rows[0]?.alive, true, 'the row of 102 kept alive by the Gateway')
     if (PUSH_TO_WORKER) await until('the service worker of the app', async () => jean.context.serviceWorkers().some(w => w.url() === `${appOrigin}/sw.js`))
     // For what the screens cannot do once Jean has no window: his forwards (his access token, as his app kept it).
     jeanApi = await asPerson(jean)
@@ -1818,6 +1944,19 @@ try {
     await presenceIs(jean.page, 'Martin', '101', 'Hors ligne')
     await presenceIs(jean.page, 'Durand', '103', 'Disponible')
   })
+  await step('the Gateway stops: the rows of push_targets it kept alive are over at once (no call waits for a browser nobody will wake), not a row another Gateway keeps alive', async () => {
+    await registry.forTenant(TENANT).setWakeableOne({ extension: '102', userId: 'jdupont' }, true)
+    await db.query("INSERT INTO push_targets (extension, tenant_id, holder, alive_until) VALUES ('149', $1, 'another-gateway', now() + interval '1 hour')", [TENANT])
+    try {
+      const alive = async () => (await db.query("SELECT extension FROM push_targets WHERE tenant_id = $1 AND alive_until > now() ORDER BY extension", [TENANT])).rows.map(r => r.extension)
+      expectEqual(await alive(), ['102', '149'], 'rows alive while the Gateway runs')
+      gatewayClosed = true
+      await gateway.close()
+      expectEqual(await alive(), ['149'], 'rows alive once the Gateway stopped')
+    } finally {
+      await db.query("DELETE FROM push_targets WHERE extension = '149'")
+    }
+  })
 } catch (err) {
   failed = true
   console.error(err)
@@ -1831,7 +1970,7 @@ try {
 } finally {
   await browser.close()
   await web.stop()
-  await gateway.close()
+  if (!gatewayClosed) await gateway.close()
   await oidc.stop()
   await ldap.stop()
   await relay.stop()

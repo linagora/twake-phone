@@ -248,16 +248,19 @@ export class PgStore implements Store {
          ON CONFLICT (endpoint) DO UPDATE SET user_id = EXCLUDED.user_id, p256dh = EXCLUDED.p256dh, auth = EXCLUDED.auth, created_at = EXCLUDED.created_at
          WHERE push_subscriptions.tenant_id = EXCLUDED.tenant_id
            AND (push_subscriptions.user_id, push_subscriptions.p256dh, push_subscriptions.auth) IS DISTINCT FROM (EXCLUDED.user_id, EXCLUDED.p256dh, EXCLUDED.auth)
-         RETURNING 1
+         RETURNING (xmax = 0) AS inserted
        )
-       SELECT (SELECT tenant_id FROM old) AS old_tenant, (SELECT user_id FROM old) AS old_user, (SELECT count(*) FROM up)::int AS written`,
+       SELECT (SELECT tenant_id FROM old) AS old_tenant, (SELECT user_id FROM old) AS old_user, (SELECT count(*) FROM up)::int AS written,
+         (SELECT bool_and(inserted) FROM up) AS inserted`,
       [s.endpoint, s.tenantId, s.userId, s.p256dh, s.auth, s.createdAt]
     )
-    const { old_tenant: oldTenant, old_user: oldUser, written } = rows[0] as { old_tenant: string | null; old_user: string | null; written: number }
+    const { old_tenant: oldTenant, old_user: oldUser, written, inserted } = rows[0] as { old_tenant: string | null; old_user: string | null; written: number; inserted: boolean | null }
     if (oldTenant !== null && oldTenant !== s.tenantId) return { outcome: 'refused' }
     // Added meanwhile by a request of the same browser (its insert won): nothing more to do.
     if (!written) return { outcome: 'unchanged' }
-    if (oldUser === null) return { outcome: 'added' }
+    // Not in the snapshot yet updated: another request inserted it meanwhile (its insert won, this one waited on
+    // it), for someone else or with other keys; whom is not known here (the snapshot predates it).
+    if (oldUser === null) return inserted ? { outcome: 'added' } : { outcome: 'moved' }
     return oldUser === s.userId ? { outcome: 'updated' } : { outcome: 'moved', previousUserId: oldUser }
   }
 

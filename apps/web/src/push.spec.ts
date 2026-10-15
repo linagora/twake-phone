@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { answerRingQueries, calledFor, disablePush, enablePush, forgetPushAtSignOut, pushStatus, resyncPush, ringsHere, type PushBrowser, type PushGateway } from './push.js'
+import { answerRingQueries, calledFor, disablePush, enablePush, forgetPushAtSignOut, pushStatus, resyncPush, ringsHere, tellRinging, type PushBrowser, type PushGateway } from './push.js'
 
 const KEY = Buffer.concat([Buffer.from([4]), Buffer.alloc(64, 9)]).toString('base64url')
 const OTHER_KEY = Buffer.concat([Buffer.from([4]), Buffer.alloc(64, 8)]).toString('base64url')
@@ -45,17 +45,33 @@ const fakeBrowser = ({ permission = 'default' as NotificationPermission, answer 
   }
   return { browser, log, store }
 }
+/**
+ * A Gateway keeping this person's subscriptions. `refuse`: the status it answers to the next requests that match (an
+ * endpoint another organisation has: 409; too many changes: 429).
+ */
 const fakeGateway = (available = true) => {
   const log: string[] = []
+  const kept = new Set<string>()
+  const refuse: { method: 'add' | 'remove'; endpoint?: string; status: number }[] = []
+  const refused = (method: 'add' | 'remove', endpoint: string) => {
+    const r = refuse.find(r => r.method === method && (!r.endpoint || r.endpoint === endpoint))
+    if (r) throw Object.assign(new Error(`Gateway ${r.status}`), { status: r.status })
+  }
   const gateway: PushGateway = {
-    getPushSubscriptions: async () => (available ? { available, publicKey: KEY, subscriptions: 0 } : { available, subscriptions: 0 }),
+    getPushSubscriptions: async () => (available ? { available, publicKey: KEY, subscriptions: kept.size } : { available, subscriptions: 0 }),
     addPushSubscription: async s => {
       log.push(`add ${s.endpoint} ${s.keys.p256dh}/${s.keys.auth}`)
-      return { available, subscriptions: 1 }
+      refused('add', s.endpoint)
+      kept.add(s.endpoint)
+      return { available, subscriptions: kept.size }
     },
-    removePushSubscription: async e => void log.push(`remove ${e}`)
+    removePushSubscription: async e => {
+      log.push(`remove ${e}`)
+      refused('remove', e)
+      kept.delete(e)
+    }
   }
-  return { gateway, log }
+  return { gateway, log, kept, refuse }
 }
 
 describe('notifications of calls (push.ts)', () => {
@@ -122,16 +138,61 @@ describe('notifications of calls (push.ts)', () => {
     const b = fakeBrowser()
     const g = fakeGateway()
     await enablePush(g.gateway, b.browser, 'jean')
-    // Paul signs in on the same browser: Jean's calls stop here, Paul gets none of them.
+    // Paul signs in on the same browser: Jean's calls stop here, Paul gets none of them. Taken over then removed at
+    // the Gateway (Jean's calls no longer wait for this browser), then stopped at its push service.
     await resyncPush(g.gateway, b.browser, 'paul')
     expect(b.log.at(-1)).toBe('unsubscribe https://push.example.test/1')
-    expect(g.log).toEqual(['add https://push.example.test/1 p/a'])
+    expect(g.log).toEqual(['add https://push.example.test/1 p/a', 'add https://push.example.test/1 p/a', 'remove https://push.example.test/1'])
     expect(await pushStatus(g.gateway, b.browser, 'paul')).toBe('off')
     expect(await pushStatus(g.gateway, b.browser, 'jean')).toBe('off')
     // A subscription nobody here is known to have made goes too.
     const unknown = fakeBrowser({ permission: 'granted', existing: { key: KEY, endpoint: 'https://push.example.test/unknown' } })
     await resyncPush(g.gateway, unknown.browser, 'paul')
     expect(unknown.log).toEqual(['unsubscribe https://push.example.test/unknown'])
+    // Another organisation's (409): only stopped here, never removed for them.
+    const foreign = fakeBrowser({ permission: 'granted', existing: { key: KEY, endpoint: 'https://push.example.test/foreign' } })
+    g.refuse.push({ method: 'add', endpoint: 'https://push.example.test/foreign', status: 409 })
+    await resyncPush(g.gateway, foreign.browser, 'paul')
+    expect(g.log.slice(-1)).toEqual(['add https://push.example.test/foreign p/a'])
+    expect(foreign.log).toEqual(['unsubscribe https://push.example.test/foreign'])
+  })
+
+  it('says off once the Gateway keeps no subscription of this person any more (it removed them), on again once handed over', async () => {
+    const b = fakeBrowser()
+    const g = fakeGateway()
+    await enablePush(g.gateway, b.browser, 'jean')
+    g.kept.clear()
+    expect(await pushStatus(g.gateway, b.browser, 'jean')).toBe('off')
+    await resyncPush(g.gateway, b.browser, 'jean')
+    expect(await pushStatus(g.gateway, b.browser, 'jean')).toBe('on')
+  })
+
+  it('stays on when the Gateway refuses to forget it (too many changes): nothing changes on this browser either', async () => {
+    const b = fakeBrowser()
+    const g = fakeGateway()
+    await enablePush(g.gateway, b.browser, 'jean')
+    g.refuse.push({ method: 'remove', status: 429 })
+    await expect(disablePush(g.gateway, b.browser, 'jean')).rejects.toThrow(/429/)
+    expect(await pushStatus(g.gateway, b.browser, 'jean')).toBe('on')
+    expect(b.log.filter(l => l.startsWith('unsubscribe'))).toEqual([])
+    g.refuse.splice(0)
+    expect(await disablePush(g.gateway, b.browser, 'jean')).toBe('off')
+    expect(await pushStatus(g.gateway, b.browser, 'jean')).toBe('off')
+  })
+
+  it('subscribes anew when the Gateway says this browser\'s subscription is another organisation\'s (409)', async () => {
+    const b = fakeBrowser({ permission: 'granted', existing: { key: KEY, endpoint: 'https://push.example.test/theirs' } })
+    const g = fakeGateway()
+    g.refuse.push({ method: 'add', endpoint: 'https://push.example.test/theirs', status: 409 })
+    expect(await enablePush(g.gateway, b.browser, 'jean')).toBe('on')
+    expect(b.log).toEqual(['unsubscribe https://push.example.test/theirs', 'subscribe true KEY'])
+    expect([...g.kept]).toEqual(['https://push.example.test/1'])
+    expect(await pushStatus(g.gateway, b.browser, 'jean')).toBe('on')
+    // Any other refusal is said as it is.
+    const other = fakeBrowser({ permission: 'granted' })
+    const busy = fakeGateway()
+    busy.refuse.push({ method: 'add', status: 429 })
+    await expect(enablePush(busy.gateway, other.browser, 'jean')).rejects.toThrow(/429/)
   })
 
   it('makes the subscription anew when the Gateway\'s key changed (its pushes would be refused), and says it is off until then', async () => {
@@ -147,25 +208,37 @@ describe('notifications of calls (push.ts)', () => {
     expect(await pushStatus(changed, b.browser, 'jean')).toBe('on')
   })
 
-  it('answers the service worker for a window on screen whose softphone rings the call, not otherwise', () => {
-    expect(ringsHere('registered', 'visible')).toBe(true)
-    expect(ringsHere('connecting', 'visible')).toBe(true)
-    expect(ringsHere('registered', 'hidden')).toBe(false)
-    expect(ringsHere('failed', 'visible')).toBe(false)
-    expect(ringsHere('off', 'visible')).toBe(false)
+  it('answers the service worker for a window on screen: whether its softphone is registered (it rings the call) or on its way', () => {
+    expect(ringsHere('registered', 'visible')).toBe('registered')
+    expect(ringsHere('connecting', 'visible')).toBe('connecting')
+    expect(ringsHere('unregistered', 'visible')).toBe('connecting')
+    expect(ringsHere('registered', 'hidden')).toBeNull()
+    expect(ringsHere('failed', 'visible')).toBeNull()
+    expect(ringsHere('off', 'visible')).toBeNull()
     let listener: ((e: MessageEvent) => void) | undefined
     const container = { addEventListener: (_: string, l: EventListener) => void (listener = l as never), removeEventListener: () => void (listener = undefined) }
-    let here = true
+    let here: 'registered' | 'connecting' | null = 'registered'
     const stop = answerRingQueries(container as never, () => here)
     const answers: unknown[] = []
     const ask = (data: unknown) => listener?.({ data, ports: [{ postMessage: (m: unknown) => void answers.push(m) }] } as never)
     ask({ type: 'twakephone.ring', callId: 'c1' })
     ask({ type: 'other' })
-    here = false
+    here = 'connecting'
     ask({ type: 'twakephone.ring', callId: 'c2' })
-    expect(answers).toEqual([{ type: 'twakephone.here' }])
+    here = null
+    ask({ type: 'twakephone.ring', callId: 'c3' })
+    expect(answers).toEqual([
+      { type: 'twakephone.here', registered: true },
+      { type: 'twakephone.here', registered: false }
+    ])
     stop()
     expect(listener).toBeUndefined()
+    // The calls the softphone rings, told to the worker (nothing when none, or no worker).
+    const told: unknown[] = []
+    tellRinging({ postMessage: (m: unknown) => void told.push(m) } as never, ['c1tag'])
+    tellRinging({ postMessage: (m: unknown) => void told.push(m) } as never, [])
+    tellRinging(null, ['c1tag'])
+    expect(told).toEqual([{ type: 'twakephone.ringing', callIds: ['c1tag'] }])
   })
 
   it('reads the call a notification opened the app on', () => {

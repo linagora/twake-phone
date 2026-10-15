@@ -35,6 +35,8 @@ const PRESENCE_MAX_MS = 366 * 86_400_000
 const NOANSWER_DELAY = { min: 5, max: 120, default: 20 }
 /** Waits between two attempts at handing a provider the presences kept in the store (its database may be late). */
 const RESTORE_RETRY_MS = [1_000, 5_000, 15_000, 30_000]
+/** How long someone found without an extension keeps their browsers' subscriptions (BuildOptions.pushPurgeGraceMs). */
+const PUSH_PURGE_GRACE_MS = 3_600_000
 /** Longest wait of a change for the one before it (a provider whose database hangs): the next one then goes. */
 const TURN_MAX_MS = 10_000
 /** One line of text: no control character (a message for callers ends up in a SIP header). */
@@ -65,6 +67,11 @@ export interface BuildOptions {
   directorySearchLimiter?: RateLimiter
   /** Push subscriptions given or removed per user (tests inject a tighter one). Default: 20 a minute. */
   pushSubscriptionLimiter?: RateLimiter
+  /**
+   * How long someone found without an extension keeps their browsers' subscriptions: removed at the first
+   * reconciliation after that (a mapping missing a moment loses nothing). Default: an hour.
+   */
+  pushPurgeGraceMs?: number
   /** Copies the directory's accounts into the user ↔ extension mappings; administrators can run it from the app. */
   directorySync?: DirectorySync
   /** Who administers the platform. Default: from ADMIN_ROLE and ADMIN_USERS. */
@@ -418,13 +425,35 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
   // the Gateway can send pushes; written where the provider holds calls for them (always in the tenant's turn).
   const push = options.push
   push?.useLogger(app.log)
-  /** The people of the tenant who no longer hold an extension lose their browsers' subscriptions (they left). */
+  /**
+   * The people of the tenant who no longer hold an extension lose their browsers' subscriptions (they left), at the
+   * first reconciliation once they have been without one for the grace period (since this Gateway first found them
+   * so): an extension missing a moment (taken back then given again, moved in two synchronisations) loses nothing.
+   */
+  const purgeGraceMs = options.pushPurgeGraceMs ?? PUSH_PURGE_GRACE_MS
+  /** Since when each person with a subscription was found holding no extension (by ownerKey). */
+  const withoutExtension = new Map<string, number>()
   const purgeLeavers = async (tenantId: string) => {
     if (!push) return
     const holders = new Set((await store.listMappings(tenantId)).map(m => m.userId))
-    for (const userId of await store.listPushUsers(tenantId)) {
-      if (holders.has(userId)) continue
+    const now = Date.now()
+    const users = await store.listPushUsers(tenantId)
+    for (const key of withoutExtension.keys()) if (key.startsWith(`${tenantId}\u0000`) && !users.some(u => ownerKey(tenantId, u) === key)) withoutExtension.delete(key)
+    for (const userId of users) {
+      const key = ownerKey(tenantId, userId)
+      if (holders.has(userId)) {
+        withoutExtension.delete(key)
+        continue
+      }
+      const since = withoutExtension.get(key)
+      if (since === undefined) {
+        withoutExtension.set(key, now)
+        app.log.info({ tenantId, userId }, 'someone with push subscriptions holds no extension: removed at a reconciliation after the grace period if still so')
+        continue
+      }
+      if (now - since < purgeGraceMs) continue
       for (const s of await store.listPushSubscriptions(tenantId, userId)) await store.deletePushSubscription(tenantId, userId, s.endpoint)
+      withoutExtension.delete(key)
       app.log.info({ tenantId, userId }, 'push subscriptions of someone who holds no extension any more removed')
     }
   }
@@ -631,13 +660,15 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         const saved = await push.subscribe(user.tenantId, user.id, sub)
         // Another tenant's browser stays theirs (knowing its address is no reason to take its calls).
         if (saved.outcome === 'refused') throw Object.assign(new Error('This browser subscription belongs to another organisation'), { statusCode: 409, code: 'PUSH_SUBSCRIPTION_TAKEN' })
-        // Only this person's line of who can be woken, and that of whoever this browser was given by.
-        if (saved.outcome !== 'unchanged') {
-          await inTurn(user.tenantId, async () => {
-            await wakeableOne(user.tenantId, provider, user.id)
-            if (saved.previousUserId) await wakeableOne(user.tenantId, provider, saved.previousUserId)
-          })
-        }
+        // Only this person's line of who can be woken, and that of whoever this browser was given by; written again
+        // when the browser is known already (cheap: nothing changes when the line is right), so that a line lost
+        // meanwhile (a database of the provider restored) comes back at the next start of the app. Taken from someone
+        // the store cannot name (another request saved it at the same moment): the whole tenant.
+        await inTurn(user.tenantId, async () => {
+          if (saved.outcome === 'moved' && !saved.previousUserId) return wakeable(user.tenantId, provider)
+          await wakeableOne(user.tenantId, provider, user.id)
+          if (saved.previousUserId) await wakeableOne(user.tenantId, provider, saved.previousUserId)
+        })
         return reply.code(201).send(await pushState(user, provider))
       })
       v1.delete('/me/push-subscriptions', async (req, reply) => {

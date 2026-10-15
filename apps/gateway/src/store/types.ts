@@ -86,7 +86,11 @@ export interface UserPresenceRecord {
   message?: string
 }
 
-/** What saving a push subscription did (Store.savePushSubscription). */
+/**
+ * What saving a push subscription did (Store.savePushSubscription). `moved` without `previousUserId`: taken from
+ * someone the store cannot name (another request saved the same browser at the same moment); whoever needs to know
+ * whose it was recomputes the whole tenant.
+ */
 export interface PushSaveResult {
   outcome: 'added' | 'unchanged' | 'updated' | 'moved' | 'refused'
   previousUserId?: string
