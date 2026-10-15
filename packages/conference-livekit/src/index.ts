@@ -1,6 +1,6 @@
 import type { ConferenceBridgeProvider } from '@twake/telephony-provider-sdk'
 import type { ConferenceParticipant, DialInConfiguration, Meeting } from '@twake/telephony-types'
-import { LiveKitApi, LiveKitError, type Fetch } from './livekit-api.js'
+import { LiveKitApi, type Fetch } from './livekit-api.js'
 
 export { LiveKitApi, LiveKitError, signToken, verifyWebhook } from './livekit-api.js'
 export type { Fetch } from './livekit-api.js'

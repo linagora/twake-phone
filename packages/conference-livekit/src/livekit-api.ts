@@ -53,7 +53,7 @@ export class LiveKitApi {
     return { video: { roomCreate: true, roomList: true, roomAdmin: true, roomJoin: true, ...(room ? { room } : {}) }, sip: { admin: true, call: true } }
   }
 
-  async call<T = Record<string, any>>(service: 'livekit.RoomService' | 'livekit.SIP', method: string, body: unknown): Promise<T> {
+  async call<T = Record<string, unknown>>(service: 'livekit.RoomService' | 'livekit.SIP', method: string, body: unknown): Promise<T> {
     const res = await this.fetchFn(`${this.url.replace(/\/$/, '')}/twirp/${service}/${method}`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', authorization: `Bearer ${signToken(this.apiKey, this.apiSecret, this.grants(body))}` },
@@ -64,7 +64,9 @@ export class LiveKitApi {
       let msg = text
       try {
         msg = (JSON.parse(text) as { msg?: string }).msg ?? text
-      } catch {}
+      } catch {
+        // not JSON: the body itself is the message
+      }
       throw new LiveKitError(`LiveKit ${method} failed (${res.status}): ${msg}`, res.status)
     }
     return (text ? JSON.parse(text) : {}) as T

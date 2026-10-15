@@ -271,7 +271,8 @@ export class DirectorySync {
       }
       try {
         await store.upsertMapping(next)
-        before ? report.updated++ : report.created++
+        if (before) report.updated++
+        else report.created++
       } catch (err) {
         // Another process wrote meanwhile (two Gateways synchronising at once): reported, repaired by the next run.
         this.opts.log?.error({ err, userId: next.userId }, 'directory synchronisation: mapping not written')

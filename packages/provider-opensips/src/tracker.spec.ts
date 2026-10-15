@@ -195,7 +195,7 @@ describe('CallTracker', () => {
       tracker.handle('E_TWAKEPHONE_CALLING', call(`c${i}`, '101', '102'))
       tracker.handle('E_ACC_MISSED_EVENT', missed(`c${i}`, '101', '102', '480', 1792002800))
     }
-    const ended = tracker['ended'] as Set<string>
+    const ended = tracker['ended']
     expect(ended.size).toBe(10_000)
     expect(ended.has('c49')).toBe(false)
     expect(ended.has('c50')).toBe(true)
@@ -215,7 +215,7 @@ describe('CallTracker', () => {
     // Neither is registered: offline, told once, then not kept.
     expect(presences()).toEqual(['101:offline', '103:offline'])
     expect([...tracker.presences().keys()]).toEqual([])
-    expect((tracker['busy'] as Map<string, number>).size).toBe(0)
+    expect(tracker['busy'].size).toBe(0)
     // One who set a presence is kept.
     tracker.setUserPresence('104', { status: 'dnd', source: 'user' })
     expect([...tracker.presences().keys()]).toEqual(['104'])

@@ -21,6 +21,7 @@ export const Directory = () => {
   useEffect(() => {
     const q = query.trim()
     if (!q || noDirectory) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- an emptied search empties the results at once
       setResults(null)
       setSearching(false)
       return

@@ -30,6 +30,9 @@ if (process.env.TEST_DATABASE_URL) {
         await other.query('INSERT INTO push_subscriptions (endpoint, tenant_id, user_id, p256dh, auth, created_at) VALUES ($1, $2, $3, $4, $5, $6)', [endpoint, 'race', 'jean', 'k-jean', 'a-jean', new Date().toISOString()])
         const saved = store.savePushSubscription(record('paul'))
         for (let i = 0; ; i++) {
+          // `other` is inside its transaction, and a backend reads pg_stat_activity once per transaction: without
+          // clearing that snapshot, a first look taken before Paul's statement waits is all it would ever see.
+          await other.query('SELECT pg_stat_clear_snapshot()')
           const { rows } = await other.query("SELECT count(*)::int AS n FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE '%INSERT INTO push_subscriptions%' AND pid <> pg_backend_pid()")
           if (rows[0].n > 0) break
           if (i > 200) throw new Error('the second save never waited on the first')

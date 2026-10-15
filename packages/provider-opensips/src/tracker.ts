@@ -131,7 +131,10 @@ export class CallTracker {
     for (const { aor, contacts } of aors) {
       const ext = userOf(aor)
       const set = dump.get(ext) ?? new Map<string, number | undefined>()
-      for (const c of contacts) typeof c === 'string' ? set.set(c, undefined) : set.set(c.uri, c.expiresAt)
+      for (const c of contacts) {
+        if (typeof c === 'string') set.set(c, undefined)
+        else set.set(c.uri, c.expiresAt)
+      }
       if (set.size) dump.set(ext, set)
     }
     for (const [ext, uris] of known) {

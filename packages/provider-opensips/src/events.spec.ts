@@ -186,7 +186,7 @@ describe('OpensipsEvents', () => {
     const [relay, other] = [await socketAt('127.0.0.3'), await socketAt('127.0.0.2')]
     const [, host, port] = /^udp:(.+):(\d+)$/.exec(events.address!)!
     const send = (s: dgram.Socket, method: string) => s.send(JSON.stringify({ jsonrpc: '2.0', method, params: {} }), Number(port), host)
-    send(relay!, 'E_FROM_RELAY')
+    send(relay, 'E_FROM_RELAY')
     await until('the event from an accepted address', () => got.includes('E_FROM_RELAY'))
     await events['renew']()
     expect(events.connected).toBe(true)
@@ -194,8 +194,8 @@ describe('OpensipsEvents', () => {
     await events['renew']()
     expect(events.connected).toBe(true)
     // Then only datagrams from an address nobody listed: degraded, with the reason, and an error in the log.
-    send(other!, 'E_ACC_CDR')
-    send(other!, 'E_ACC_CDR')
+    send(other, 'E_ACC_CDR')
+    send(other, 'E_ACC_CDR')
     await until('the ignored datagrams', () => events['foreign'] === 2)
     await events['renew']()
     expect(events.connected).toBe(false)
@@ -383,7 +383,7 @@ describe('OpensipsEvents', () => {
     await events.start()
     expect(events.connected).toBe(false)
     expect(warnings[0]).toMatch(/Event not found/)
-    events.stop()
+    await events.stop()
     await expect(events.call('ul_dump')).rejects.toThrow(/not started/)
   })
 

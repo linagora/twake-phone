@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type FormEvent } from 'react'
+import { useEffect, useRef, useState, type SyntheticEvent } from 'react'
 import type { SoftCall } from '@twake/softphone'
 import { formatNumber, toDialTarget } from '@twake/telephony-client'
 import type { Key } from '../i18n/index.js'
@@ -52,17 +52,19 @@ const Incoming = ({ call }: { call: SoftCall }) => {
   const { t } = useT()
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const act = (fn: () => Promise<void>) => async () => {
-    setBusy(true)
-    setError(null)
-    try {
-      await fn()
-    } catch (err) {
-      // The caller gave up, or another window answered first: the banner goes when the call does; say why meanwhile.
-      setError(describeCallError(err, t))
-    } finally {
-      setBusy(false)
-    }
+  const act = (fn: () => Promise<void>) => () => {
+    void (async () => {
+      setBusy(true)
+      setError(null)
+      try {
+        await fn()
+      } catch (err) {
+        // The caller gave up, or another window answered first: the banner goes when the call does; say why meanwhile.
+        setError(describeCallError(err, t))
+      } finally {
+        setBusy(false)
+      }
+    })()
   }
   // A live region, not a dialog: nothing traps the focus, the person keeps typing where they were.
   return (
@@ -94,19 +96,21 @@ const TransferForm = ({ call, onClose, onError }: { call: SoftCall; onClose: () 
   const [target, setTarget] = useState('')
   const [busy, setBusy] = useState(false)
   const dialable = toDialTarget(target)
-  const run = (fn: (target: string) => Promise<unknown>) => async (e: FormEvent) => {
+  const run = (fn: (target: string) => Promise<unknown>) => (e: SyntheticEvent) => {
     e.preventDefault()
     if (!dialable) return
-    setBusy(true)
-    onError(null)
-    try {
-      await fn(dialable)
-      onClose()
-    } catch (err) {
-      onError(describeCallError(err, t))
-    } finally {
-      setBusy(false)
-    }
+    void (async () => {
+      setBusy(true)
+      onError(null)
+      try {
+        await fn(dialable)
+        onClose()
+      } catch (err) {
+        onError(describeCallError(err, t))
+      } finally {
+        setBusy(false)
+      }
+    })()
   }
   return (
     <form id={`transfer-form-${call.id}`} className="transfer" onSubmit={run(to => call.transfer(to))} data-testid="transfer-form">
@@ -118,7 +122,7 @@ const TransferForm = ({ call, onClose, onError }: { call: SoftCall; onClose: () 
         <button type="submit" className="btn btn-primary" disabled={busy || !dialable}>
           {t('call.transferBlind')}
         </button>
-        <button type="button" className="btn" disabled={busy || !dialable} onClick={e => void run(to => phone.call(to))(e)}>
+        <button type="button" className="btn" disabled={busy || !dialable} onClick={run(to => phone.call(to))}>
           {t('call.transferConsult')}
         </button>
         <button type="button" className="btn" disabled={busy} onClick={onClose}>
@@ -141,13 +145,15 @@ const Active = ({ call, tones, original, hasOther, onError }: { call: SoftCall; 
   const [sent, setSent] = useState('')
   const transferButton = useRef<HTMLButtonElement>(null)
   const connected = call.state === 'connected' || call.state === 'held'
-  const guard = (fn: () => Promise<void> | void) => async () => {
-    onError(null)
-    try {
-      await fn()
-    } catch (err) {
-      onError(describeCallError(err, t))
-    }
+  const guard = (fn: () => Promise<void> | void) => () => {
+    void (async () => {
+      onError(null)
+      try {
+        await fn()
+      } catch (err) {
+        onError(describeCallError(err, t))
+      }
+    })()
   }
   // The form goes, the focus comes back to the button that opened it (not to the top of the page).
   const closeTransfer = () => {

@@ -24,8 +24,7 @@ describe('directory routes', () => {
   })
 
   it('serves only the tenant of the directory', async () => {
-    const dir = new MemoryContactDirectory([jean])
-    dir.servesTenant = (t: string) => t === 'acme'
+    const dir = Object.assign(new MemoryContactDirectory([jean]), { servesTenant: (t: string) => t === 'acme' })
     const app = await appWith(dir)
     expect((await app.inject({ url: '/api/v1/directory?q=dup', headers: as('alice', 'acme') })).json().items).toEqual([jean])
     expect((await app.inject({ url: '/api/v1/directory?q=dup', headers: as('alice', 'other') })).statusCode).toBe(501)

@@ -29,7 +29,8 @@ const fakeAudio = () => ({
   setSinkId: vi.fn(async (id: string) => void (audio.sinkId = id))
 })
 let audio = fakeAudio()
-const container = { appendChild: vi.fn() } as unknown as HTMLElement
+const appendChild = vi.fn()
+const container = { appendChild } as unknown as HTMLElement
 
 describe('WebAudioRinger', () => {
   beforeEach(() => {
@@ -48,7 +49,7 @@ describe('WebAudioRinger', () => {
     await ringer.setSink('bell')
     expect(audio.setSinkId).toHaveBeenCalledWith('bell')
     expect(audio.dataset['testid']).toBe('ringer')
-    expect(container.appendChild).toHaveBeenCalledWith(audio)
+    expect(appendChild).toHaveBeenCalledWith(audio)
     expect(await ringer.start()).toBe(true)
     expect(audio.paused).toBe(false)
     ringer.stop()

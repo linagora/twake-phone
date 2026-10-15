@@ -88,7 +88,9 @@ export const parseMeetingId = (input: string): string | null => {
   try {
     const url = new URL(raw)
     candidate = url.pathname.split('/').filter(Boolean).pop() ?? ''
-  } catch {}
+  } catch {
+    // not a link: the input is taken as the identifier itself
+  }
   return /^[A-Za-z0-9][A-Za-z0-9_-]{2,63}$/.test(candidate) ? candidate : null
 }
 
@@ -353,7 +355,7 @@ export class TelephonyClient {
     }
     const retry = () => {
       if (stopped) return
-      timer = setTimeout(open, backoffDelay(attempt++))
+      timer = setTimeout(() => void open(), backoffDelay(attempt++))
     }
 
     void open()

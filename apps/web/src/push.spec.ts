@@ -5,7 +5,7 @@ const KEY = Buffer.concat([Buffer.from([4]), Buffer.alloc(64, 9)]).toString('bas
 const OTHER_KEY = Buffer.concat([Buffer.from([4]), Buffer.alloc(64, 8)]).toString('base64url')
 
 /** A browser with its push manager, permission and storage, recording what the app does. */
-const fakeBrowser = ({ permission = 'default' as NotificationPermission, answer = 'granted' as NotificationPermission, existing = null as null | { key: string; endpoint: string } } = {}) => {
+const fakeBrowser = ({ permission = 'default', answer = 'granted', existing = null }: { permission?: NotificationPermission; answer?: NotificationPermission; existing?: null | { key: string; endpoint: string } } = {}) => {
   const log: string[] = []
   const store = new Map<string, string>()
   let current = existing
@@ -235,8 +235,8 @@ describe('notifications of calls (push.ts)', () => {
     expect(listener).toBeUndefined()
     // The calls the softphone rings, told to the worker (nothing when none, or no worker).
     const told: unknown[] = []
-    tellRinging({ postMessage: (m: unknown) => void told.push(m) } as never, ['c1tag'])
-    tellRinging({ postMessage: (m: unknown) => void told.push(m) } as never, [])
+    tellRinging({ postMessage: (m: unknown) => void told.push(m) }, ['c1tag'])
+    tellRinging({ postMessage: (m: unknown) => void told.push(m) }, [])
     tellRinging(null, ['c1tag'])
     expect(told).toEqual([{ type: 'twakephone.ringing', callIds: ['c1tag'] }])
   })

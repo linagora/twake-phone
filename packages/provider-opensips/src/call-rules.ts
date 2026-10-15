@@ -115,7 +115,7 @@ export class CallRules {
     for (const target of targets) if (target !== undefined) checkExtension(target, 'forward target')
     const delay = rules.noAnswer?.delaySec ?? 20
     if (!Number.isInteger(delay) || delay < NOANSWER_DELAY.min || delay > NOANSWER_DELAY.max) throw invalid(`no-answer delay must be ${NOANSWER_DELAY.min} to ${NOANSWER_DELAY.max} seconds`)
-    const holders = await Promise.all(targets.map(t => (t === undefined ? null : this.holderOf(t))))
+    const holders = await Promise.all(targets.map(async t => (t === undefined ? null : this.holderOf(t))))
     await this.query(
       `INSERT INTO call_rules (extension, tenant_id, holder, forward_always, forward_always_holder, forward_busy, forward_busy_holder, forward_noanswer, forward_noanswer_holder, noanswer_delay)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
@@ -138,6 +138,7 @@ export class CallRules {
     checkExtension(extension, 'extension')
     const message = dnd?.message ?? ''
     // The message ends up in a SIP header: one line of text, bounded.
+    // eslint-disable-next-line no-control-regex -- control characters are exactly what is refused here
     if (/[\u0000-\u001f\u007f]/.test(message) || message.length > DND_MESSAGE_MAX) throw invalid(`the message must be one line of at most ${DND_MESSAGE_MAX} characters`)
     if (dnd?.until !== undefined && Number.isNaN(Date.parse(dnd.until))) throw invalid('invalid end date')
     await this.query(
