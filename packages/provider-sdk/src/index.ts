@@ -11,7 +11,9 @@ import type {
   Presence,
   ProviderStatus,
   RingGroup,
+  DidRange,
   TelephonyEvent,
+  Trunk,
   User
 } from '@twake/telephony-types'
 
@@ -62,6 +64,11 @@ export interface TelephonyProvider {
   setGroup?(group: RingGroup, mode: 'create' | 'replace'): Promise<void>
   /** Removes a group; false when the tenant has none with that number. */
   deleteGroup?(number: string): Promise<boolean>
+  /**
+   * The trunks of the tenant with their passwords, and its direct numbers (capability `trunks`): replaces what the
+   * provider had. The Gateway checked them (ids, numbers, ranges that do not overlap).
+   */
+  setTrunks?(trunks: (Trunk & { password?: string })[], dids: DidRange[]): Promise<void>
   originate(request: OriginateRequest): Promise<Call>
   /** Releases connections and stops event streams. */
   close(): Promise<void>

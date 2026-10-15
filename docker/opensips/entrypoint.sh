@@ -21,6 +21,42 @@ set -eu
 : "${CFG_TEMPLATE:=/etc/opensips/opensips.cfg.tpl}"
 : "${CFG_OUT:=/etc/opensips/opensips.cfg}"
 : "${OPENSIPS_BIN:=/usr/sbin/opensips}"
+: "${TRUNK_SQL:=/etc/opensips/trunk.sql}"
+# The trunk's UDP socket (step 6, ADR 0016): the address OpenSIPS registers to the operator and calls from, the
+# loopback like LISTEN_IP by default (set the machine's own address to reach an operator), never port 5060 by default
+# (ARCHITECTURE §13). TRUNK_ADVERTISE (host[:port]) only when the operator must be told another address: by default
+# none is declared, the operator answers where the packets come from.
+: "${TRUNK_LISTEN_IP:=$LISTEN_IP}"
+: "${TRUNK_PORT:=5070}"
+: "${TRUNK_ADVERTISE:=}"
+# The longest a call with the operator lasts, in seconds: OpenSIPS then ends it with a BYE to both sides (a bound on
+# what the operator charges, whatever the phones do). An emergency call is never cut. 4 hours by default.
+: "${TRUNK_MAX_CALL_SEC:=14400}"
+case "$TRUNK_MAX_CALL_SEC" in
+  '' | *[!0-9]*) echo "TRUNK_MAX_CALL_SEC must be a number of seconds" >&2; exit 1 ;;
+esac
+if [ "$TRUNK_MAX_CALL_SEC" -lt 60 ] || [ "$TRUNK_MAX_CALL_SEC" -gt 86400 ]; then
+  echo "TRUNK_MAX_CALL_SEC must be 60 to 86400 seconds" >&2; exit 1
+fi
+# How often the phone of a call with the operator is asked whether it is still there (an OPTIONS in the dialog), and
+# how long it has to answer: one that does not answer within CALL_PING_TIMEOUT_SEC (put to sleep, its page closed or
+# reloaded, its network gone) has the call ended, a BYE to the operator; a shorter silence (a network that switches)
+# keeps it. A phone gone is noticed within CALL_PING_SEC + CALL_PING_TIMEOUT_SEC. Never an emergency call. In
+# seconds, 30 and 15 by default.
+: "${CALL_PING_SEC:=30}"
+case "$CALL_PING_SEC" in
+  '' | *[!0-9]*) echo "CALL_PING_SEC must be a number of seconds" >&2; exit 1 ;;
+esac
+if [ "$CALL_PING_SEC" -lt 5 ] || [ "$CALL_PING_SEC" -gt 300 ]; then
+  echo "CALL_PING_SEC must be 5 to 300 seconds" >&2; exit 1
+fi
+: "${CALL_PING_TIMEOUT_SEC:=15}"
+case "$CALL_PING_TIMEOUT_SEC" in
+  '' | *[!0-9]*) echo "CALL_PING_TIMEOUT_SEC must be a number of seconds" >&2; exit 1 ;;
+esac
+if [ "$CALL_PING_TIMEOUT_SEC" -lt 5 ] || [ "$CALL_PING_TIMEOUT_SEC" -gt 60 ]; then
+  echo "CALL_PING_TIMEOUT_SEC must be 5 to 60 seconds" >&2; exit 1
+fi
 # The call rules are read at each INVITE (sqlops, ADR 0013): on their own connections, whose queries PostgreSQL stops
 # after this many milliseconds (the call then goes on without rules), so that a slow database never holds a call.
 : "${RULES_QUERY_TIMEOUT_MS:=1000}"
@@ -45,7 +81,22 @@ case "${OPENSIPS_DB_URL##*@}" in
   *\?*) OPENSIPS_RULES_DB_URL="${OPENSIPS_DB_URL}&options=-cstatement_timeout=${RULES_QUERY_TIMEOUT_MS}" ;;
   *) OPENSIPS_RULES_DB_URL="${OPENSIPS_DB_URL}?options=-cstatement_timeout=${RULES_QUERY_TIMEOUT_MS}" ;;
 esac
-export SIP_DOMAIN LISTEN_IP SIP_PORT WS_PORT WSS_PORT OPENSIPS_DB_URL OPENSIPS_RULES_DB_URL PUSH_WAIT_SEC RTPENGINE_SOCK OPENSIPS_LOG_LEVEL OPENSIPS_MPATH MI_FIFO MI_LISTEN_IP MI_PORT TLS_CERT TLS_KEY
+case "$TRUNK_PORT" in
+  '' | *[!0-9]*) echo "TRUNK_PORT must be a port number" >&2; exit 1 ;;
+esac
+if [ "$TRUNK_PORT" -lt 1 ] || [ "$TRUNK_PORT" -gt 65535 ]; then
+  echo "TRUNK_PORT must be 1 to 65535" >&2; exit 1
+fi
+if [ "$TRUNK_LISTEN_IP" = "$LISTEN_IP" ] && [ "$TRUNK_PORT" = "$SIP_PORT" ]; then
+  echo "TRUNK_PORT must differ from SIP_PORT on the same address: the trunk has a socket of its own" >&2; exit 1
+fi
+# A name or an IPv4 address, as the trunk socket (an IPv6 one has more than one colon).
+case "$TRUNK_ADVERTISE" in
+  *[!A-Za-z0-9.:-]* | *:*:* | :* | *:) echo "TRUNK_ADVERTISE must be host or host:port" >&2; exit 1 ;;
+  '') TRUNK_SOCKET_AS='' ;;
+  *) TRUNK_SOCKET_AS=" as $TRUNK_ADVERTISE" ;;
+esac
+export SIP_DOMAIN LISTEN_IP SIP_PORT WS_PORT WSS_PORT OPENSIPS_DB_URL OPENSIPS_RULES_DB_URL PUSH_WAIT_SEC RTPENGINE_SOCK OPENSIPS_LOG_LEVEL OPENSIPS_MPATH MI_FIFO MI_LISTEN_IP MI_PORT TLS_CERT TLS_KEY TRUNK_LISTEN_IP TRUNK_PORT TRUNK_SOCKET_AS TRUNK_MAX_CALL_SEC CALL_PING_SEC CALL_PING_TIMEOUT_SEC
 
 # The MI socket (mi_datagram) has no authentication: whoever reaches it can stop OpenSIPS, drop registrations, end
 # calls, read who is registered and subscribe to the events (who calls whom). It listens on its own address, the
@@ -78,6 +129,10 @@ mi_address_is_private() {
     *) return 1 ;;
   esac
 }
+# The trunk socket is a real address of the machine: OpenSIPS registers it with the operator.
+if ! is_ipv4 "$TRUNK_LISTEN_IP" || [ "$TRUNK_LISTEN_IP" = "0.0.0.0" ]; then
+  echo "TRUNK_LISTEN_IP=$TRUNK_LISTEN_IP must be an IPv4 address of this machine (not 0.0.0.0)" >&2; exit 1
+fi
 if ! mi_address_is_private "$MI_LISTEN_IP" && [ "$MI_ALLOW_PUBLIC" != "1" ]; then
   echo "MI_LISTEN_IP=$MI_LISTEN_IP is not a loopback or private IPv4 address: the MI has no authentication." >&2
   echo "Keep it on 127.0.0.1 (or the private network the Gateway reaches it on), or set MI_ALLOW_PUBLIC=1 behind a firewall." >&2
@@ -93,8 +148,21 @@ if [ ! -f "$TLS_CERT" ] || [ ! -f "$TLS_KEY" ]; then
 fi
 
 # Only the listed variables are substituted: a "$avp(...)" of the script must stay as it is.
-envsubst '$SIP_DOMAIN $LISTEN_IP $SIP_PORT $WS_PORT $WSS_PORT $OPENSIPS_DB_URL $OPENSIPS_RULES_DB_URL $PUSH_WAIT_SEC $RTPENGINE_SOCK $OPENSIPS_LOG_LEVEL $OPENSIPS_MPATH $MI_FIFO $MI_LISTEN_IP $MI_PORT $TLS_CERT $TLS_KEY' \
+envsubst '$SIP_DOMAIN $LISTEN_IP $SIP_PORT $WS_PORT $WSS_PORT $OPENSIPS_DB_URL $OPENSIPS_RULES_DB_URL $PUSH_WAIT_SEC $RTPENGINE_SOCK $OPENSIPS_LOG_LEVEL $OPENSIPS_MPATH $MI_FIFO $MI_LISTEN_IP $MI_PORT $TLS_CERT $TLS_KEY $TRUNK_LISTEN_IP $TRUNK_PORT $TRUNK_SOCKET_AS $TRUNK_MAX_CALL_SEC $CALL_PING_SEC $CALL_PING_TIMEOUT_SEC' \
   < "$CFG_TEMPLATE" > "$CFG_OUT"
 
+# The tables of the trunks (step 6): dispatcher, dialplan and uac_registrant read theirs at start and OpenSIPS stops
+# without them; a database created before step 6 has none. Created when missing, with the numbering plan of this
+# version (trunk.sql, generated from provider-opensips), tried for a minute while the database comes up.
+if [ -f "$TRUNK_SQL" ]; then
+  tries=0
+  until PGOPTIONS="-c client_min_messages=warning" psql "$OPENSIPS_DB_URL" -v ON_ERROR_STOP=1 -q -f "$TRUNK_SQL" >/dev/null; do
+    tries=$((tries + 1))
+    if [ "$tries" -ge 30 ]; then
+      echo "The tables of the trunks could not be written into the database of OPENSIPS_DB_URL" >&2; exit 1
+    fi
+    sleep 2
+  done
+fi
 "$OPENSIPS_BIN" -C -f "$CFG_OUT"
 exec "$OPENSIPS_BIN" -F -f "$CFG_OUT" "$@"

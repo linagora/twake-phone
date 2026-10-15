@@ -1,4 +1,4 @@
-import { clampLimit, isDeclined, isMissed, type HistoryEntry, type HistoryPage, type HistoryQuery, type ConferenceRecord, type ProviderRecord, type PushSaveResult, type PushSubscriptionRecord, type Store, type UserMapping, type UserPresenceRecord, type VapidKeysRecord } from './types.js'
+import { clampLimit, isDeclined, isMissed, type HistoryEntry, type HistoryPage, type HistoryQuery, type ConferenceRecord, type DidRecord, type ProviderRecord, type PushSaveResult, type PushSubscriptionRecord, type Store, type TrunkRecord, type UserMapping, type UserPresenceRecord, type VapidKeysRecord } from './types.js'
 
 const key = (...parts: string[]) => parts.join('\u0000')
 
@@ -26,6 +26,8 @@ export class MemoryStore implements Store {
   private presences = new Map<string, UserPresenceRecord>()
   private pushSubscriptions = new Map<string, PushSubscriptionRecord>()
   private vapid: VapidKeysRecord | null = null
+  private trunks: TrunkRecord[] = []
+  private dids = new Map<string, DidRecord>()
 
   constructor(private readonly now: () => number = Date.now) {}
 
@@ -193,6 +195,41 @@ export class MemoryStore implements Store {
   async initVapidKeys(keys: VapidKeysRecord) {
     this.vapid ??= { ...keys }
     return { ...this.vapid }
+  }
+
+  async listTrunks(tenantId: string) {
+    return this.trunks.filter(t => t.tenantId === tenantId).map(t => structuredClone(t))
+  }
+
+  async upsertTrunk(record: TrunkRecord) {
+    const i = this.trunks.findIndex(t => t.tenantId === record.tenantId && t.id === record.id)
+    const copy = structuredClone(record)
+    if (i >= 0) this.trunks[i] = copy
+    else this.trunks.push(copy)
+  }
+
+  async upsertTrunks(records: TrunkRecord[]) {
+    for (const r of records) await this.upsertTrunk(r)
+  }
+
+  async deleteTrunk(tenantId: string, id: string) {
+    const before = this.trunks.length
+    this.trunks = this.trunks.filter(t => !(t.tenantId === tenantId && t.id === id))
+    for (const [k, d] of this.dids) if (d.tenantId === tenantId && d.trunkId === id) this.dids.delete(k)
+    return this.trunks.length < before
+  }
+
+  async listDids(tenantId: string) {
+    return [...this.dids.values()].filter(d => d.tenantId === tenantId).sort((a, b) => (a.first < b.first ? -1 : a.first > b.first ? 1 : 0)).map(d => ({ ...d }))
+  }
+
+  async upsertDid(record: DidRecord) {
+    if (!this.trunks.some(t => t.tenantId === record.tenantId && t.id === record.trunkId)) throw new Error(`no trunk ${record.trunkId} in this tenant`)
+    this.dids.set(key(record.tenantId, record.id), { ...record })
+  }
+
+  async deleteDid(tenantId: string, id: string) {
+    return this.dids.delete(key(tenantId, id))
   }
 
   async close() {}

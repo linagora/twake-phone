@@ -52,6 +52,8 @@ export const fakeOpensips = async () => {
     if (req.method === 'uptime') return reply({ result: { Now: 'Wed Oct 14 18:10:00 2026', 'Up since': state.upSince, 'Up time': state.upTime } })
     if (req.method === 'ul_dump') return reply({ result: state.dump })
     if (req.method === 'dlg_list') return reply({ result: state.dialogs })
+    // The trunks (step 6): OpenSIPS reads its tables again.
+    if (['ds_reload', 'reg_reload', 'dp_reload'].includes(req.method)) return reply({ result: 'OK' })
     if (req.method === 'ul_rm') {
       // Removes the AOR from the location table, as OpenSIPS does (OK even when it is not there).
       const [, aor] = req.params as [string, string]

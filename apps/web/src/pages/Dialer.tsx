@@ -1,10 +1,13 @@
-import { useEffect, useState, type FormEvent } from 'react'
+import { useEffect, useRef, useState, type FormEvent } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { formatNumber, toDialTarget } from '@twake/telephony-client'
 import { useGateway } from '../gateway.js'
 import { useT } from '../i18n/useT.js'
 import { describeCallError } from '../components/callErrors.js'
 import { usePhone } from '../softphone.js'
+
+/** How long 0 is held down to type + (the international prefix), as on a phone. */
+const PLUS_HOLD_MS = 600
 
 const KEYS: [string, string][] = [['1', ''], ['2', 'ABC'], ['3', 'DEF'], ['4', 'GHI'], ['5', 'JKL'], ['6', 'MNO'], ['7', 'PQRS'], ['8', 'TUV'], ['9', 'WXYZ'], ['*', ''], ['0', '+'], ['#', '']]
 
@@ -44,6 +47,24 @@ export const Dialer = () => {
   }, [client, t])
 
   const press = (k: string) => setNumber(n => (n.length < 32 ? n + k : n))
+  // 0 held down types + (a number abroad: + then the country code; 00 works too).
+  const hold = useRef<{ timer?: ReturnType<typeof setTimeout>; plus: boolean }>({ plus: false })
+  const startHold = (k: string) => {
+    if (k !== '0') return
+    clearTimeout(hold.current.timer)
+    hold.current.plus = false
+    hold.current.timer = setTimeout(() => {
+      hold.current.plus = true
+      press('+')
+    }, PLUS_HOLD_MS)
+  }
+  const endHold = () => clearTimeout(hold.current.timer)
+  const click = (k: string) => {
+    endHold()
+    // The + was typed while the key was held: the click that ends it types nothing more.
+    if (k === '0' && hold.current.plus) hold.current.plus = false
+    else press(k)
+  }
   const submit = async (e: FormEvent) => {
     e.preventDefault()
     const target = toDialTarget(number)
@@ -78,7 +99,17 @@ export const Dialer = () => {
         </div>
         <div className="keypad" role="group" aria-label={t('dialer.title')}>
           {KEYS.map(([k, letters]) => (
-            <button key={k} type="button" className="btn key" onClick={() => press(k)} aria-label={k}>
+            <button
+              key={k}
+              type="button"
+              className="btn key"
+              onClick={() => click(k)}
+              onPointerDown={() => startHold(k)}
+              onPointerUp={endHold}
+              onPointerLeave={endHold}
+              onContextMenu={e => k === '0' && e.preventDefault()}
+              aria-label={k === '0' ? t('dialer.zeroPlus') : k}
+            >
               {k}
               {letters ? <small aria-hidden="true">{letters}</small> : null}
             </button>

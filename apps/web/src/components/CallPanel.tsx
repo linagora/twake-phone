@@ -18,18 +18,36 @@ const REASON_KEY: Record<NonNullable<SoftCall['endReason']>, Key> = {
   failed: 'call.endedFailed',
   transferred: 'call.endedTransferred',
   dnd: 'call.endedDnd',
-  'answered-elsewhere': 'call.endedAnsweredElsewhere'
+  'answered-elsewhere': 'call.endedAnsweredElsewhere',
+  refused: 'call.endedRefusedNotAllowed'
 }
 
-const who = (call: SoftCall) => (call.remoteName ? `${call.remoteName} (${formatNumber(call.remoteNumber)})` : formatNumber(call.remoteNumber))
+/** Why the SIP server did not put a number through to the public network (step 6): an emergency number first. */
+const REFUSAL_KEY: Record<NonNullable<SoftCall['endRefusal']>, Key> = {
+  emergency: 'call.endedRefusedEmergency',
+  premium: 'call.endedRefusedPremium',
+  international: 'call.endedRefusedInternational',
+  overseas: 'call.endedRefusedOverseas',
+  invalid: 'call.endedRefusedInvalid',
+  'no-trunk': 'call.endedRefusedNoTrunk',
+  'not-allowed': 'call.endedRefusedNotAllowed'
+}
+
+/** The far end, by name and number; a caller from the public network who hides their number (step 6) said so. */
+const who = (call: SoftCall, t: (key: Key) => string) => {
+  const number = call.remoteNumber === 'anonymous' ? t('call.hiddenNumber') : formatNumber(call.remoteNumber)
+  return call.remoteName && call.remoteName.toLowerCase() !== 'anonymous' ? `${call.remoteName} (${number})` : number
+}
 
 /**
  * How a call ended, for the person: a ringing call of theirs cancelled was answered elsewhere, or given up; one
- * refused by a "do not disturb" says the message the person called left, when they left one.
+ * refused by a "do not disturb" says the message the person called left, when they left one; a number the platform
+ * does not call says why (an emergency number: to call from another phone).
  */
 const reasonKey = (call: SoftCall): Key => {
   if (call.direction === 'inbound' && call.endReason === 'cancelled') return 'call.endedCancelledInbound'
   if (call.endReason === 'dnd' && call.endMessage) return 'call.endedDndMessage'
+  if (call.endReason === 'refused') return REFUSAL_KEY[call.endRefusal ?? 'not-allowed']
   return REASON_KEY[call.endReason ?? 'hangup']
 }
 
@@ -70,7 +88,7 @@ const Incoming = ({ call }: { call: SoftCall }) => {
   return (
     <section className="call call-incoming" role="region" aria-labelledby={`call-${call.id}`} aria-live="assertive" data-testid="incoming-call">
       <p id={`call-${call.id}`} className="call-title">
-        {t('call.incoming', { who: who(call) })}
+        {t('call.incoming', { who: who(call, t) })}
       </p>
       <div className="actions">
         <button type="button" className="btn btn-primary" onClick={act(() => call.answer())} disabled={busy}>
@@ -161,12 +179,12 @@ const Active = ({ call, tones, original, hasOther, onError }: { call: SoftCall; 
     transferButton.current?.focus()
   }
   const title = call.transferring
-    ? t('call.transferringWho', { who: who(call) })
+    ? t('call.transferringWho', { who: who(call, t) })
     : !connected
-      ? t('call.dialing', { who: who(call) })
+      ? t('call.dialing', { who: who(call, t) })
       : call.state === 'held'
-        ? t('call.held', { who: who(call) })
-        : t('call.inProgress', { who: who(call) })
+        ? t('call.held', { who: who(call, t) })
+        : t('call.inProgress', { who: who(call, t) })
   const originalReady = original && (original.state === 'connected' || original.state === 'held')
   // While the transfer of the original is on its way, the consultation must stay: its dialog is what the far end
   // takes over (Replaces); hanging it up first would make the transfer fail.
@@ -177,14 +195,14 @@ const Active = ({ call, tones, original, hasOther, onError }: { call: SoftCall; 
         {title}
       </p>
       {connected && call.connectedAt ? <Timer since={call.connectedAt} /> : null}
-      {original ? <p className="badge">{t('call.consulting', { who: who(original) })}</p> : null}
+      {original ? <p className="badge">{t('call.consulting', { who: who(original, t) })}</p> : null}
       {call.remoteHold ? <p className="badge">{t('call.remoteHold')}</p> : null}
       {original?.transferring ? <p className="badge">{t('call.transferring')}</p> : null}
       {tones ? <p className="badge">{t('call.tonesReceived', { tones })}</p> : null}
       <div className="actions">
         {original && originalReady && connected ? (
           <button type="button" className="btn btn-primary" disabled={busy} onClick={guard(() => original.transferTo(call))}>
-            {t('call.transferComplete', { from: who(original), to: who(call) })}
+            {t('call.transferComplete', { from: who(original, t), to: who(call, t) })}
           </button>
         ) : null}
         {original ? (
@@ -256,7 +274,7 @@ export const CallPanel = () => {
       })}
       {lastEnded ? (
         <p className="call call-ended" role="status">
-          {t(reasonKey(lastEnded), { who: who(lastEnded), message: lastEnded.endMessage ?? '' })}
+          {t(reasonKey(lastEnded), { who: who(lastEnded, t), message: lastEnded.endMessage ?? '' })}
         </p>
       ) : null}
       {error && calls.length ? (

@@ -8,8 +8,8 @@
 #   docker compose -f docker/docker-compose.sip.yml up --build --wait
 #   OPENSIPS_WS_URL=wss://127.0.0.1:8089 SIP_DOMAIN=127.0.0.1 OPENSIPS_DB_URL=postgres://twake:twake@127.0.0.1:54320/twake ...
 #
-# Ports: 5060/udp SIP, 8088 WS, 8089 WSS, 22222/udp rtpengine control, 22223/udp its DTMF report, 30000-30100/udp RTP,
-# 54320 PostgreSQL.
+# Ports: 5060/udp SIP, 5070/udp the trunk to the operator (step 6; simulated by the e2e), 8088 WS, 8089 WSS,
+# 22222/udp rtpengine control, 22223/udp its DTMF report, 30000-30100/udp RTP, 54320 PostgreSQL.
 services:
   postgres:
     image: postgres:16
@@ -62,6 +62,21 @@ services:
       OPENSIPS_LOG_LEVEL: ${OPENSIPS_LOG_LEVEL:-2}
       # How long a call to someone without a window waits for the browser a notification wakes (5 to 120 s, ADR 0015).
       PUSH_WAIT_SEC: ${PUSH_WAIT_SEC:-30}
+      # The socket of the trunk to the operator (step 6, ADR 0016), apart from the phones' one: on the loopback here.
+      TRUNK_LISTEN_IP: ${TRUNK_LISTEN_IP:-127.0.0.1}
+      TRUNK_PORT: ${TRUNK_PORT:-5070}
+      # The address announced to the operator on that socket (host[:port]) when a NAT stands in between: the
+      # registration's binding, the Via and the Record-Route. The CI sets a TEST-NET one (192.0.2.10:5070) that the
+      # simulated operator maps back to the socket. Empty: the socket's own address.
+      TRUNK_ADVERTISE: ${TRUNK_ADVERTISE:-}
+      # A call with the operator ends by itself after this long (seconds, 60 to 86400), a BYE to both sides; an
+      # emergency call excepted.
+      TRUNK_MAX_CALL_SEC: ${TRUNK_MAX_CALL_SEC:-14400}
+      # Every this long (seconds, 5 to 300), the phone in a call with the operator is sent an OPTIONS in the call: one
+      # that does not answer it any more (its page closed, put to sleep, its network gone) has the call ended.
+      CALL_PING_SEC: ${CALL_PING_SEC:-30}
+      # How long that OPTIONS waits for its answer (seconds, 5 to 60): the first one unanswered ends the call.
+      CALL_PING_TIMEOUT_SEC: ${CALL_PING_TIMEOUT_SEC:-15}
     network_mode: host
     healthcheck:
       test: ["CMD-SHELL", "test -p /tmp/opensips_fifo"]

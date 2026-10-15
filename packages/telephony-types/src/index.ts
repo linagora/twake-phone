@@ -80,6 +80,129 @@ export interface RingGroup {
   vacant?: string[]
 }
 
+/**
+ * How the platform authenticates to its operator: it registers with a login and a password (`register`), or the
+ * operator recognises the address it sends from (`ip`; a password may still answer its challenges).
+ */
+export type TrunkAuth = 'register' | 'ip'
+/** How numbers are written to the operator: +33612345678, 33612345678, 0033612345678 or 0612345678 (French numbers). */
+export type TrunkNumberFormat = 'e164' | 'e164-no-plus' | 'international-00' | 'national'
+/** The audio codecs a trunk may carry (the browser's side is always Opus or G.711 over DTLS-SRTP). */
+export const TRUNK_CODECS = ['PCMA', 'PCMU', 'G722', 'opus'] as const
+export type TrunkCodec = (typeof TRUNK_CODECS)[number]
+/**
+ * The kinds of numbers a trunk may be allowed to call. The emergency numbers are always called, premium numbers never
+ * (step 6b brings rights per profile and caps); `international` only to the countries the trunk lists (`countries`).
+ */
+export const TRUNK_OUTBOUND_CLASSES = ['fixed', 'mobile', 'freephone', 'standard-rate', 'overseas', 'international'] as const
+export type TrunkOutboundClass = (typeof TRUNK_OUTBOUND_CLASSES)[number]
+/** What a trunk calls when its administrator does not say: metropolitan fixed, mobile, free and standard-rate numbers. */
+export const TRUNK_OUTBOUND_DEFAULT: readonly TrunkOutboundClass[] = ['fixed', 'mobile', 'freephone', 'standard-rate']
+
+/**
+ * The short numbers of the French plan the SIP server routes to the operator or refuses itself, before any
+ * extension or group (ADR 0016): the emergency numbers (15, 17, 18, 112, 114, 115, 119, 191, 196, 197, 116000,
+ * 116117), the European harmonised numbers (116xxx) and the directory enquiries (118xxx). No extension, ring group or
+ * target of a direct number may be one: dialled, it never rings anyone inside.
+ */
+export const RESERVED_NUMBER = /^(1[578]|11[2459]|19[167]|116[0-9]{3}|118[0-9]{3})$/
+/** Whether `number` is a short number of the French plan that no extension or group may have (RESERVED_NUMBER). */
+export const isReservedNumber = (number: string) => RESERVED_NUMBER.test(number)
+
+/**
+ * The internal plan: an extension, or the number of a ring group, is 2 to 6 digits, the first not 0. Dialled, anything
+ * else would be taken for a public number by the SIP server's numbering plan (a 0 or a + first, 33 and nine digits: to
+ * the operator, or refused as incomplete) or be no number at all. With RESERVED_NUMBER left out, the plan reads none of
+ * these as a public number (proven against its rules in provider-opensips).
+ */
+export const EXTENSION_FORMAT = /^[1-9][0-9]{1,5}$/
+/** Whether `number` may be an extension or a group's number: the internal plan (EXTENSION_FORMAT), not reserved. */
+export const isValidExtension = (number: string) => EXTENSION_FORMAT.test(number) && !isReservedNumber(number)
+
+/**
+ * E.164 country codes no trunk may list in `countries`: France and its overseas departments and territories (their
+ * own classes, `overseas`), and the codes of no country, charged as premium (satellites, international networks and
+ * premium rate: never called).
+ */
+export const TRUNK_COUNTRY_EXCLUDED = /^(33|262|508|59[046]|68[179]|80[08]|87[08]|88[1238]|979|991)$/
+/**
+ * What a trunk lists in `countries`: an E.164 country code, without the + ("32", "44"), or an area of the North
+ * American plan ("1876"). A country code opens the country's geographic, mobile and free numbers, never the premium,
+ * shared-cost and personal ranges the SIP server knows for it (step 6a: the countries most listed). `1` opens the
+ * United States and Canada only; another country of that plan (Jamaica, the Dominican Republic, Bermuda...) is listed
+ * by its area.
+ */
+export const TRUNK_COUNTRY = /^(1|[2-9][0-9]{0,2}|1[2-9][0-9]{2})$/
+
+/**
+ * A SIP trunk: where calls to and from the public network go (step 6, ADR 0016). The password is write-only: it is
+ * never returned, `hasPassword` tells whether one is kept.
+ */
+export interface Trunk {
+  /** Lower case letters, digits and dashes. */
+  id: string
+  /** What administrators call it. */
+  name?: string
+  auth: TrunkAuth
+  /** The operator's SIP domain: host of the Request-URI, the From of outbound calls, the address of record. */
+  domain: string
+  /** The operator's servers, `host[:port]`, tried in this order (the outbound proxy); the domain by default. */
+  proxies?: string[]
+  /** Other IP addresses the operator's calls may come from (its servers' own are accepted already). */
+  sources?: string[]
+  /** Login (authentication user name) at the operator; the user part of the address of record when it registers. */
+  username?: string
+  /** Digest realm of the operator, when known: the password is then kept by OpenSIPS as a hash for it. */
+  realm?: string
+  /** Where to register, `host[:port]` (the domain by default). */
+  registrar?: string
+  /** Seconds a registration lasts (60 to 3600, 600 by default). */
+  registerExpires?: number
+  /**
+   * The codecs the operator's side may use: what the browser offers is kept to these (no transcoding: a codec the
+   * browser does not offer, or one the operator does not take, leaves the call without one).
+   */
+  codecs: TrunkCodec[]
+  numberFormat: TrunkNumberFormat
+  /** Also asserts the number presented in a P-Asserted-Identity (some operators want it). */
+  assertIdentity?: boolean
+  /** E.164 number presented for those who have no direct number of their own. */
+  defaultNumber: string
+  /** The kinds of numbers it calls (TRUNK_OUTBOUND_DEFAULT when absent). */
+  allowed?: TrunkOutboundClass[]
+  /**
+   * The countries its international numbers may be in, as E.164 country codes without the + ("32", "44", "1"), or
+   * areas of the North American plan ("1876", TRUNK_COUNTRY): required with `international` in `allowed`, which calls
+   * these only, never a whole world, nor their premium ranges.
+   */
+  countries?: string[]
+  /**
+   * The trunk of those who have no direct number (and of the emergency numbers they call): one per tenant. Absent on
+   * every trunk: the first one written.
+   */
+  default?: boolean
+  /** Read only. */
+  hasPassword?: boolean
+}
+
+/** What an administrator writes: the trunk without its id, with a password to keep (or to change). */
+export type TrunkInput = Omit<Trunk, 'id' | 'hasPassword'> & { password?: string }
+
+/**
+ * Direct numbers (SDA/DID): one E.164 number or a range of them (same length, at most 10 000) and where their calls
+ * go: an extension or a group (`target`), or the extension that ends with the last `suffixDigits` digits of the number
+ * called. The extension a direct number reaches presents it when it calls out.
+ */
+export interface DidRange {
+  id: string
+  trunkId: string
+  first: string
+  /** Same as `first` for a single number. */
+  last: string
+  target?: string
+  suffixDigits?: number
+}
+
 export type CallState =
   | 'new'
   | 'ringing'
@@ -138,6 +261,8 @@ export interface Capabilities {
    * woken (`setWakeable`).
    */
   push?: boolean
+  /** Calls to and from the public network through SIP trunks that administrators set (`Trunk`, `DidRange`). */
+  trunks?: boolean
   conference: { dialIn: boolean; dialOut: boolean }
 }
 

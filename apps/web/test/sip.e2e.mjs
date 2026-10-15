@@ -1,5 +1,6 @@
-// End to end of steps 3 to 5 (calls, transfers, what the Gateway hears from OpenSIPS, forwards and "do not
-// disturb", ring groups, calls to someone without a window of the app): people call and transfer each other from
+// End to end of steps 3 to 6a (calls, transfers, what the Gateway hears from OpenSIPS, forwards and "do not
+// disturb", ring groups, calls to someone without a window of the app, calls to and from the public network through
+// a trunk to an operator this process simulates, apps/web/test/sip-trunk.mjs): people call and transfer each other from
 // their browsers through OpenSIPS and rtpengine; the Gateway
 // subscribes to OpenSIPS's events and shows the presence of the others in the directory and the calls in the
 // history; the forwards and the "do not disturb" set in the app are applied by OpenSIPS (`call_rules`). The SIP stack is the only thing
@@ -17,6 +18,9 @@
 //   SIP_UDP, SIP_WS      UDP and WS sockets of OpenSIPS for the user agents of this process (default 127.0.0.1:5060, ws://127.0.0.1:8088)
 //   OPENSIPS_DB_URL      the database auth_db reads (default postgres://twake:twake@127.0.0.1:54320/twake)
 //   OPENSIPS_MI_URL      the MI socket of OpenSIPS, where the Gateway subscribes to its events (default udp:127.0.0.1:8880)
+//   SIP_TRUNK            the trunk socket of OpenSIPS, where the simulated operator talks to it (default 127.0.0.1:5070)
+//   TRUNK_ADVERTISE      the address OpenSIPS announces on that socket (its own TRUNK_ADVERTISE, host:port), as behind a
+//                        NAT: the operator is told it and reaches SIP_TRUNK through it; unset, none
 //   RTPENGINE_DTMF_LOG   where rtpengine reports the tones it sees (default 127.0.0.1:22223); "off" skips the check
 //   SIP_E2E_PRESENCE_MS  how long a presence change may take to show in the directory (default 3000; raise it on a loaded runner)
 import { randomBytes } from 'node:crypto'
@@ -39,6 +43,7 @@ import { startPushService } from '../../gateway/test/push-service.mjs'
 import { startOidcMock } from './oidc-mock.mjs'
 import { serveApp } from '../server/serve.mjs'
 import { sipUa } from './sip-ua.mjs'
+import { plainRtp, startOperator } from './sip-trunk.mjs'
 
 const AUDIENCE = 'twakephone-gateway'
 const RESOURCE = 'https://gateway.twakephone.test'
@@ -50,6 +55,8 @@ const OPENSIPS_MI_URL = process.env.OPENSIPS_MI_URL ?? 'udp:127.0.0.1:8880'
 const SIP_UDP = process.env.SIP_UDP ?? '127.0.0.1:5060'
 const SIP_WS = process.env.SIP_WS ?? 'ws://127.0.0.1:8088'
 const DTMF_LOG = process.env.RTPENGINE_DTMF_LOG ?? '127.0.0.1:22223'
+const SIP_TRUNK = process.env.SIP_TRUNK ?? '127.0.0.1:5070'
+const TRUNK_ADVERTISE = process.env.TRUNK_ADVERTISE ?? ''
 const TENANT = 'e2e'
 const BROWSER = process.env.BROWSER ?? 'chromium'
 const PRESENCE_MS = Number(process.env.SIP_E2E_PRESENCE_MS) || 3_000
@@ -168,6 +175,14 @@ const wss = new URL(SIP_WSS_URL)
 const relay = await startRelay(wss.hostname, Number(wss.port || (wss.protocol === 'wss:' ? 443 : 80)), RELAY_PORT)
 const relayUrl = `${wss.protocol}//127.0.0.1:${RELAY_PORT}${wss.pathname === '/' ? '' : wss.pathname}`
 const dtmf = listenDtmf(DTMF_LOG)
+// The operator of the trunk (step 6): its login and password are this run's, made up (the operator is simulated).
+const TRUNK_LOGIN = '0033199000100'
+const TRUNK_PASSWORD = randomBytes(12).toString('base64url')
+// Two servers, as an operator gives (the second one challenges with 401); behind the NAT TRUNK_ADVERTISE plays, the
+// address OpenSIPS announces is reached at SIP_TRUNK.
+const nat = TRUNK_ADVERTISE ? { [TRUNK_ADVERTISE]: SIP_TRUNK } : {}
+const operator = await startOperator({ opensips: SIP_TRUNK, user: TRUNK_LOGIN, password: TRUNK_PASSWORD, nat })
+const operator2 = await startOperator({ opensips: SIP_TRUNK, user: TRUNK_LOGIN, password: TRUNK_PASSWORD, nat, challenge: 'www' })
 
 process.env.LOG_LEVEL ??= 'warn'
 process.env.CORS_ORIGINS = appOrigin
@@ -185,7 +200,7 @@ await store.upsertMapping({ tenantId: TENANT, userId: 'accueil', extension: '104
 // What `OPENSIPS_WS_URL` and `OPENSIPS_MI_URL` make the Gateway store at startup, pointed at the relay.
 await store.upsertProvider({ tenantId: TENANT, type: 'opensips', config: { websocketUrl: relayUrl, domain: SIP_DOMAIN, subscriberDbUrlRef: 'env:OPENSIPS_DB_URL', events: { miUrl: OPENSIPS_MI_URL } } })
 const key = randomBytes(32)
-const registry = new ProviderRegistry(await store.listProviders(), [storedOpensipsFactory({ store, key, env: { OPENSIPS_DB_URL } })])
+const registry = new ProviderRegistry(await store.listProviders(), [storedOpensipsFactory({ store, key, env: { OPENSIPS_DB_URL, OPENSIPS_TRUNK_SOCKET: `udp:${SIP_TRUNK}`, ...(TRUNK_ADVERTISE ? { OPENSIPS_TRUNK_ADVERTISE: TRUNK_ADVERTISE } : {}) } })])
 // The directory (same people as the web e2e; the ipPhone attribute holds the extension), for the presence next to each
 // contact, and Paul Leroy (105), who leaves the organisation during the run. The test changes the entries in place.
 const people = [...PEOPLE.map(p => ({ ...p })), { uid: 'pleroy', cn: 'Paul Leroy', sn: 'Leroy', givenName: 'Paul', mail: 'paul.leroy@example.test', ipPhone: '105', ou: 'Support' }]
@@ -197,7 +212,8 @@ const directorySync = new DirectorySync({ store, directory: contacts, tenantId: 
 // push service of this process only.
 const pushService = await startPushService()
 const push = new WebPush({ store, key, subject: 'mailto:e2e@example.test', allowEndpoint: url => url.origin === pushService.origin, agent: pushService.agent })
-const gateway = await buildApp(registry, { auth, store, contacts, directorySync, push, admin: { adminRole: 'twakephone-admin', adminUsers: new Set() } })
+// A call with the public network whose person has no window left is ended after 3 s here (30 s by default).
+const gateway = await buildApp(registry, { auth, store, contacts, directorySync, push, secretsKey: key, admin: { adminRole: 'twakephone-admin', adminUsers: new Set() } })
 registry.startAll()
 await gateway.listen({ host: '127.0.0.1', port: GATEWAY_PORT })
 const web = await serveApp({
@@ -282,6 +298,15 @@ const dialUntilEnded = async (page, number) => {
   }, { timeout: 20_000 })
 }
 const stats = page => page.evaluate(() => window.twakephone.stats())
+/** One MI command of OpenSIPS (JSON-RPC over its datagram socket, OPENSIPS_MI_URL), as the Gateway sends them. */
+const mi = method =>
+  new Promise((resolve, reject) => {
+    const [, host, port] = /^udp:(.+):(\d+)$/.exec(OPENSIPS_MI_URL) ?? []
+    const socket = createSocket('udp4')
+    const timer = setTimeout(() => (socket.close(), reject(new Error(`MI ${method}: no answer`))), 5_000)
+    socket.on('message', msg => (clearTimeout(timer), socket.close(), resolve(JSON.parse(msg.toString()))))
+    socket.send(JSON.stringify({ jsonrpc: '2.0', method, id: 1 }), Number(port), host)
+  })
 const soundBlocked = page => page.evaluate(() => window.twakephone.soundBlocked)
 /** Waits for the ringtone element to play (not paused, live stream) or to be quiet; says what it saw otherwise. */
 const ringerPlaying = async (page, playing) => {
@@ -1893,6 +1918,263 @@ try {
     jean = await open('jdupont', 'Jean Dupont')
     await phoneState(jean.page).getByText('En ligne').waitFor({ timeout: 20_000 })
   })
+  // Step 6a (ADR 0016): the trunk to an operator of two servers, simulated by this process (sip-trunk.mjs, as any SIP
+  // trunk does: registration and calls challenged, OPTIONS answered, G.711 A-law, re-INVITEs, REFER). Fictional
+  // numbers only (ARCEP reserves 01 99 00 xx xx and 06 39 98 xx xx for fiction; Ofcom 020 7946 0xxx).
+  await step('before any trunk, 112 is refused: no operator is connected, Alice is told to call 112 from another phone (403, emergency)', async () => {
+    const ended = await dialUntilEnded(alice.page, '112')
+    expectEqual(`${ended.endStatus} ${ended.endReason} ${ended.endRefusal}`, '403 refused emergency', 'how the call to 112 ended without a trunk')
+    await alice.page.getByText("L'appel vers 112 n'a pas pu passer par Twake Phone : appelez 112 depuis un autre téléphone").waitFor()
+  })
+  const trunkBody = {
+    name: 'Opérateur (simulé)',
+    auth: 'register',
+    domain: 'operator.example',
+    proxies: [operator.address, operator2.address],
+    username: TRUNK_LOGIN,
+    password: TRUNK_PASSWORD,
+    codecs: ['PCMA', 'PCMU'],
+    numberFormat: 'e164',
+    defaultNumber: '+33199000100'
+  }
+  await step('Alice, an administrator, sets the trunk to the operator (two servers) and its direct numbers (PUT /admin/trunks, /admin/dids): OpenSIPS registers to the first one (challenged, 401) at the address it announces, and probes both (OPTIONS); the password is never shown again', async () => {
+    const api = await asPerson(alice)
+    const trunk = await api('PUT', '/admin/trunks/operator', trunkBody)
+    expectEqual(trunk.statusCode, 201, 'PUT /admin/trunks/operator')
+    expectEqual(trunk.json().hasPassword, true, 'hasPassword')
+    // The staff's direct numbers: +33 1 99 00 01 0x rings extension 10x. A range whose last digits make an emergency
+    // number (+33 1 99 00 01 12 would ring 112) is refused, naming them.
+    const reserved = await api('PUT', '/admin/dids/staff', { trunkId: 'operator', first: '+33199000100', last: '+33199000199', suffixDigits: 3 })
+    expectEqual(`${reserved.statusCode} ${reserved.json().code}`, '400 DID_RESERVED', 'PUT /admin/dids/staff over 112')
+    const dids = await api('PUT', '/admin/dids/staff', { trunkId: 'operator', first: '+33199000100', last: '+33199000109', suffixDigits: 3 })
+    expectEqual(dids.statusCode, 201, 'PUT /admin/dids/staff')
+    const listed = await api('GET', '/admin/trunks')
+    if (listed.body.includes(TRUNK_PASSWORD)) throw new Error('GET /admin/trunks shows the password')
+    const [registration] = await operator.registered(1, 30_000)
+    if (!registration.aor.includes(`sip:${TRUNK_LOGIN}@operator.example`)) throw new Error(`registered as ${registration.aor}`)
+    // TRUNK_ADVERTISE: the operator is told the address OpenSIPS announces, in the binding and the Via.
+    if (TRUNK_ADVERTISE && !(registration.contact.includes(TRUNK_ADVERTISE) && registration.via.includes(TRUNK_ADVERTISE))) throw new Error(`registered from ${registration.via}, binding ${registration.contact}`)
+    await Promise.all([operator.probed(1, 40_000), operator2.probed(1, 40_000)])
+    expectEqual(operator2.state.registrations.length, 0, 'registrations at the second server')
+  })
+  await step('Alice dials 06 39 98 00 01, a number of Mayotte (0639): overseas numbers are not allowed on the trunk by default, refused before the operator (403, overseas)', async () => {
+    const attempts = operator.state.attempts.length + operator2.state.attempts.length
+    const ended = await dialUntilEnded(alice.page, '06 39 98 00 01')
+    expectEqual(`${ended.endStatus} ${ended.endReason} ${ended.endRefusal}`, '403 refused overseas', 'how the call to 06 39 98 00 01 ended')
+    await alice.page.getByText("Les appels vers l'outre-mer ne sont pas autorisés").waitFor()
+    expectEqual(operator.state.attempts.length + operator2.state.attempts.length, attempts, 'calls the operator was sent')
+  })
+  let mobileCall, mobileAcc, mobileAt
+  await step('Alice allows the overseas numbers on the trunk and dials 06 39 98 00 01 again: the first server (priority) is sent +33639980001 at its domain (Request-URI and To) from her direct number +33 1 99 00 01 01 (challenged, 407), nothing names OpenSIPS; plain G.711; both sides hear each other; her keypad tones reach the operator as RFC 4733 events', async () => {
+    const api = await asPerson(alice)
+    const allowed = await api('PUT', '/admin/trunks/operator', { ...trunkBody, allowed: ['fixed', 'mobile', 'freephone', 'standard-rate', 'overseas'] })
+    expectEqual(allowed.statusCode, 200, 'PUT /admin/trunks/operator (allowed)')
+    const before = operator.state.challenged
+    const second = operator2.state.attempts.length
+    mobileAcc = await lastId('acc')
+    mobileAt = new Date().toISOString()
+    await dial(alice.page, '06 39 98 00 01')
+    const call = (mobileCall = await operator.invited(invite => invite.uri === 'sip:+33639980001@operator.example'))
+    const header = name => call.invite.headers.get(name)?.[0] ?? ''
+    if (!header('from').includes('<sip:+33199000101@operator.example>')) throw new Error(`From sent to the operator: ${header('from')}`)
+    if (!header('to').startsWith('<sip:+33639980001@operator.example>')) throw new Error(`To sent to the operator: ${header('to')}`)
+    if (/opensips/i.test(call.invite.raw)) throw new Error(`OpenSIPS named to the operator: ${call.invite.raw.split('\r\n\r\n')[0]}`)
+    if (TRUNK_ADVERTISE && !(header('via').includes(TRUNK_ADVERTISE) && (call.invite.headers.get('record-route') ?? []).join(',').includes(TRUNK_ADVERTISE))) throw new Error(`Via ${header('via')}, Record-Route ${call.invite.headers.get('record-route')}`)
+    if (operator.state.challenged <= before) throw new Error('the call was not challenged by the operator')
+    expectEqual(operator2.state.attempts.length, second, 'calls the second server was sent')
+    // Plain RTP to the operator, A-law (or μ-law) only: rtpengine bridges the browser's DTLS-SRTP.
+    const offer = call.invite.body
+    const m = /^m=audio \d+ (\S+) ([\d ]+)/m.exec(offer)
+    const rtpmap = Object.fromEntries([...offer.matchAll(/^a=rtpmap:(\d+) ([^/\s]+)/gm)].map(x => [x[1], x[2]]))
+    const codecs = (m?.[2].trim().split(' ') ?? []).map(pt => rtpmap[pt] ?? { 0: 'PCMU', 8: 'PCMA' }[pt] ?? pt)
+    if (!plainRtp(offer) || !codecs.every(c => ['PCMA', 'PCMU', 'telephone-event'].includes(c)) || !codecs.includes('PCMA')) throw new Error(`offer sent to the operator: ${offer}`)
+    await alice.page.getByText('En communication avec +33 6 39 98 00 01').waitFor()
+    // The browser sends and receives RTP; the operator receives sound (the simulated microphone's tone) and sends its own.
+    const before2 = (await stats(alice.page))[0]
+    await until('RTP both ways for Alice and sound at the operator', async () => {
+      const s = (await stats(alice.page))[0]
+      return s && s.packetsReceived > before2.packetsReceived + 20 && s.packetsSent > before2.packetsSent + 20 && call.media.stats.voiced > 20 ? s : null
+    })
+    await alice.page.getByRole('button', { name: 'Clavier' }).click()
+    await alice.page.getByRole('button', { name: 'Envoyer la touche 1' }).click()
+    await until('DTMF events at the operator', () => (call.media.stats.events > 0 ? true : null))
+  })
+  await step('Alice puts the call on hold and resumes it: the operator gets both re-INVITEs in plain RTP through rtpengine; then the operator refreshes the session with a re-INVITE without SDP: the offer of Alice\'s browser reaches it as plain RTP, its answer goes back in the ACK, and both still hear each other', async () => {
+    const call = mobileCall
+    const reinvites = call.reinvites.length
+    await alice.page.getByRole('button', { name: 'Mettre en attente' }).click()
+    await alice.page.getByText('+33 6 39 98 00 01 en attente').waitFor()
+    await alice.page.getByRole('button', { name: 'Reprendre' }).click()
+    await alice.page.getByText('En communication avec +33 6 39 98 00 01').waitFor()
+    await until('the hold and resume re-INVITEs at the operator', () => (call.reinvites.length >= reinvites + 2 ? true : null))
+    const [hold, resume] = call.reinvites.slice(reinvites)
+    if (!plainRtp(hold.body) || !/^a=(sendonly|inactive)/m.test(hold.body)) throw new Error(`hold sent to the operator: ${hold.body}`)
+    if (!plainRtp(resume.body) || /^a=(sendonly|inactive)/m.test(resume.body)) throw new Error(`resume sent to the operator: ${resume.body}`)
+    const answer = await operator.reinvite(call)
+    expectEqual(answer.status, 200, 'answer to the re-INVITE without SDP')
+    if (!plainRtp(answer.body)) throw new Error(`offer of the browser in the 200: ${answer.body}`)
+    const voiced = call.media.stats.voiced
+    const before = (await stats(alice.page))[0]
+    await until('RTP both ways for Alice and sound at the operator after the late offer', async () => {
+      const s = (await stats(alice.page))[0]
+      return s && s.packetsReceived > before.packetsReceived + 20 && s.packetsSent > before.packetsSent + 20 && call.media.stats.voiced > voiced + 20 ? s : null
+    })
+  })
+  await step('no transfer with an external party: the operator\'s REFER is refused (403), and so is Alice\'s transfer to 08 99 00 00 00, which she is told about; no REFER reaches the operator; she hangs up; the CDR and her history say +33639980001', async () => {
+    const call = mobileCall
+    const accFrom = mobileAcc
+    const refer = await operator.request(call, 'REFER', { extra: ['Refer-To: <sip:+33899000000@operator.example>', 'Referred-By: <sip:+33639980001@operator.example>'] })
+    expectEqual(refer.status, 403, 'answer to the REFER of the operator')
+    await transferButton(alice.page).click()
+    await transferTarget(alice.page).fill('08 99 00 00 00')
+    await alice.page.getByRole('button', { name: 'Transférer directement' }).click()
+    await alice.page.getByRole('alert').getByText('Un appel avec un correspondant extérieur ne peut pas encore être transféré').waitFor({ timeout: 20_000 })
+    await alice.page.getByRole('button', { name: 'Fermer' }).click()
+    await alice.page.getByText('En communication avec +33 6 39 98 00 01').waitFor()
+    if (call.requests.some(r => r.method === 'REFER') || operator.state.requests.some(r => r.method === 'REFER')) throw new Error('a REFER reached the operator')
+    await alice.page.getByRole('button', { name: 'Raccrocher' }).click()
+    await operator.callState(call, 'ended')
+    expectEqual(await cdrsSince(accFrom), ['101>+33639980001 200'], 'CDR of the call to the mobile')
+    const entry = await newestCall('amartin', mobileAt)
+    expectEqual(`${entry.direction} ${entry.remoteNumber} ${entry.answered}`, 'outbound +33639980001 true', 'Alice history entry')
+  })
+  await step('the operator calls the direct number +33 1 99 00 01 02 (as a registered trunk does: the Request-URI is the binding, the To the number), the caller in nine digits (639980002, as some operators write it): Jean sees +33 6 39 98 00 02 calling and answers; both hear each other; his Récents show the caller', async () => {
+    const accFrom = await lastId('acc')
+    const placed = await operator.call('+33199000102', { from: '639980002', ruri: TRUNK_LOGIN })
+    const ringing = jean.page.getByTestId('incoming-call')
+    await ringing.getByText('Appel entrant de +33 6 39 98 00 02').waitFor({ timeout: 20_000 })
+    await ringing.getByRole('button', { name: 'Répondre' }).click()
+    const answer = await placed.final
+    expectEqual(answer.status, 200, 'answer to the operator')
+    await jean.page.getByText('En communication avec +33 6 39 98 00 02').waitFor()
+    const before = (await stats(jean.page))[0]
+    await until('RTP both ways for Jean and sound at the operator', async () => {
+      const s = (await stats(jean.page))[0]
+      return s && s.packetsReceived > before.packetsReceived + 20 && s.packetsSent > before.packetsSent + 20 && placed.media.stats.voiced > 20 ? s : null
+    })
+    expectEqual((await placed.hangup()).status, 200, 'answer to the operator BYE')
+    await until('the end of the call on Jean side', async () => (await calls(jean.page)).length === 0)
+    expectEqual(await cdrsSince(accFrom), ['+33639980002>102 200'], 'CDR of the call from the mobile')
+    // Newest first: once the history has it (Récents reads it again as the call ends).
+    await until('the call from +33 6 39 98 00 02 first in the Récents of Jean', async () => ((await recents(jean.page, 1))[0].startsWith('+33 6 39 98 00 02: Entrant') ? true : null))
+    await jean.page.getByRole('link', { name: 'Clavier' }).click()
+  })
+  await step('the operator calls Jean without SDP (a late offer) and with Privacy: id: Jean sees "Numéro masqué" and answers; the offer of his browser reaches the operator as plain RTP, the answer goes back in the ACK, both hear each other. Jean then closes TwakePhone without hanging up: his browser no longer answers the OPTIONS OpenSIPS sends in the call (CALL_PING_SEC), which ends it (BYE to the operator)', async () => {
+    const placed = await operator.call('+33199000102', { from: '+33639980002', ruri: TRUNK_LOGIN, lateOffer: true, headers: ['Privacy: id'] })
+    const ringing = jean.page.getByTestId('incoming-call')
+    await ringing.getByText('Numéro masqué').waitFor({ timeout: 20_000 })
+    if (await ringing.getByText('39 98 00 02').count()) throw new Error('the hidden number is shown')
+    await ringing.getByRole('button', { name: 'Répondre' }).click()
+    const answer = await placed.final
+    expectEqual(answer.status, 200, 'answer to the operator')
+    if (!plainRtp(answer.body)) throw new Error(`offer of the browser in the 200: ${answer.body}`)
+    await jean.page.getByText('En communication avec Numéro masqué').waitFor()
+    const before = (await stats(jean.page))[0]
+    await until('RTP both ways for Jean and sound at the operator (late offer)', async () => {
+      const s = (await stats(jean.page))[0]
+      return s && s.packetsReceived > before.packetsReceived + 20 && s.packetsSent > before.packetsSent + 20 && placed.media.stats.voiced > 20 ? s : null
+    })
+    await jean.context.close()
+    // Within CALL_PING_SEC + CALL_PING_TIMEOUT_SEC (5 + 15 in CI), the OPTIONS of OpenSIPS retransmitted meanwhile.
+    await operator.callState(placed, 'ended', 45_000)
+  })
+  await step('Jean opens TwakePhone again; the operator calls Bob\'s direct number and gives up while it rings (CANCEL): Bob stops ringing', async () => {
+    jean = await open('jdupont', 'Jean Dupont')
+    await phoneState(jean.page).getByText('En ligne').waitFor({ timeout: 20_000 })
+    const placed = await operator.call('+33199000103', { from: '+33639980002' })
+    const ringing = bob.page.getByTestId('incoming-call')
+    await ringing.getByText('Appel entrant de +33 6 39 98 00 02').waitFor({ timeout: 20_000 })
+    await placed.cancel()
+    expectEqual((await placed.final).status, 487, 'final answer to the cancelled call')
+    await ringing.waitFor({ state: 'hidden' })
+  })
+  await step('Alice dials 112: it reaches the operator as dialled (sip:112@operator.example), from her direct number; the operator refuses it (486): Alice is told to call 112 from another phone (503, emergency); then she dials Bob\'s direct number 01 99 00 01 03: it rings Bob inside, never through the operator', async () => {
+    operator.state.next.push({ reply: '486 Busy Here' })
+    const ended = await dialUntilEnded(alice.page, '112')
+    const call = await operator.invited(invite => invite.uri === 'sip:112@operator.example')
+    if (!(call.invite.headers.get('from')?.[0] ?? '').includes('<sip:+33199000101@operator.example>')) throw new Error(`From sent to the operator: ${call.invite.headers.get('from')}`)
+    expectEqual(`${ended.endStatus} ${ended.endReason} ${ended.endRefusal}`, '503 refused emergency', 'how the call to 112 ended (the operator busy)')
+    await alice.page.getByText("L'appel vers 112 n'a pas pu passer par Twake Phone : appelez 112 depuis un autre téléphone").waitFor()
+    const attempts = operator.state.attempts.length + operator2.state.attempts.length
+    await dial(alice.page, '01 99 00 01 03')
+    const ringing = bob.page.getByTestId('incoming-call')
+    await ringing.getByText('Appel entrant de Alice Martin (101)').waitFor({ timeout: 20_000 })
+    await ringing.getByRole('button', { name: 'Refuser' }).click()
+    await until('the end of the call on Alice side', async () => (await calls(alice.page)).length === 0)
+    expectEqual(operator.state.attempts.length + operator2.state.attempts.length, attempts, 'calls the operator was sent')
+  })
+  await step('numbers the platform does not call are refused before the operator, with the code and the reason the app tells: +44 20 7946 0123 (403, international), 08 99 00 00 00 (403, premium), 063998 (484)', async () => {
+    const attempts = operator.state.attempts.length + operator2.state.attempts.length
+    for (const [number, status, refusal, text] of [
+      ['+44 20 7946 0123', 403, 'international', "Les appels vers l'étranger ne sont pas autorisés : +44 20 7946 0123 n'a pas été appelé."],
+      ['08 99 00 00 00', 403, 'premium', 'Les numéros surtaxés ne sont pas autorisés'],
+      // Six digits go as dialled (an extension would); OpenSIPS knows a leading 0 for a public number, incomplete.
+      ['063998', 484, 'invalid', "06 39 98 n'est pas un numéro complet"]
+    ]) {
+      const ended = await dialUntilEnded(alice.page, number)
+      expectEqual(`${ended.endStatus} ${ended.endReason} ${ended.endRefusal}`, `${status} refused ${refusal}`, `how the call to ${number} ended`)
+      await alice.page.getByText(text).waitFor()
+    }
+    expectEqual(operator.state.attempts.length + operator2.state.attempts.length, attempts, 'calls the operator was sent')
+  })
+  await step('the first server out of order (503 at once): the call goes to the second one (challenged, 401), which answers; once the first one rang, its 503 ends the call (no second call to the person); its own Twake-Call-Refused never reaches the app; a challenge it repeats ends the call as "no trunk", never asked of the browser', async () => {
+    operator.state.next.push({ reply: '503 Service Unavailable' })
+    const challenged = operator2.state.challenged
+    await dial(alice.page, '06 39 98 00 01')
+    const call = await operator2.invited(invite => invite.uri === 'sip:+33639980001@operator.example')
+    if (operator2.state.challenged <= challenged) throw new Error('the call was not challenged by the second server')
+    if (!plainRtp(call.invite.body)) throw new Error(`offer sent to the second server: ${call.invite.body}`)
+    if (!(call.invite.headers.get('to')?.[0] ?? '').startsWith('<sip:+33639980001@operator.example>')) throw new Error(`To sent to the second server: ${call.invite.headers.get('to')}`)
+    await alice.page.getByText('En communication avec +33 6 39 98 00 01').waitFor()
+    await alice.page.getByRole('button', { name: 'Raccrocher' }).click()
+    await operator2.callState(call, 'ended')
+
+    operator.state.next.push({ ringThen: '503 Service Unavailable', afterMs: 500 })
+    const second = operator2.state.attempts.length
+    let ended = await dialUntilEnded(alice.page, '06 39 98 00 01')
+    // A proxy relays no 503 (RFC 3261 16.7): 500.
+    expectEqual(ended.endStatus, 500, 'how the call ended once the first server rang')
+    expectEqual(operator2.state.attempts.length, second, 'calls the second server was sent')
+
+    operator.state.next.push({ reply: '403 Forbidden', headers: ['Twake-Call-Refused: emergency'] })
+    ended = await dialUntilEnded(alice.page, '06 39 98 00 01')
+    // A plain refusal: the operator cannot have the app say "call 112 from another phone".
+    expectEqual(`${ended.endStatus} ${ended.endReason} ${ended.endRefusal ?? '-'}`, '403 rejected -', 'how the call refused by the operator ended')
+
+    operator.state.next.push({ rejectAuth: true })
+    ended = await dialUntilEnded(alice.page, '06 39 98 00 01')
+    expectEqual(`${ended.endStatus} ${ended.endReason} ${ended.endRefusal}`, '503 refused no-trunk', 'how the call ended when the operator challenges again')
+    await alice.page.getByText("Les appels vers l'extérieur ne sont pas disponibles pour le moment").waitFor()
+  })
+  await step('the first server answers nothing any more: OpenSIPS marks it down (OPTIONS) and the next call goes straight to the second one', async () => {
+    operator.state.dead = true
+    try {
+      await until('the first server marked down', async () => {
+        const destinations = (await mi('ds_list')).result.PARTITIONS.flatMap(p => p.SETS.flatMap(s => s.Destinations))
+        return destinations.some(d => d.URI === `sip:${operator.address}` && d.state !== 'Active') ? true : null
+      }, { timeout: 90_000, every: 2_000 })
+      const attempts = operator.state.attempts.length
+      operator2.state.next.push({ reply: '486 Busy Here' })
+      const started = Date.now()
+      const ended = await dialUntilEnded(alice.page, '06 39 98 00 01')
+      expectEqual(ended.endStatus, 486, 'how the call ended (the second server busy)')
+      if (Date.now() - started > 4_000) throw new Error(`the call waited ${Date.now() - started} ms: the dead server was tried first`)
+      expectEqual(operator.state.attempts.length, attempts, 'calls the dead server was sent')
+    } finally {
+      operator.state.dead = false
+    }
+  })
+  await step('a request to the trunk socket from an address that is not the operator is refused (403), out of a dialog or in one that is none of its calls; a call to a number that is no direct number is not found (404)', async () => {
+    const intruder = await startOperator({ opensips: SIP_TRUNK, user: 'x', password: 'y', bind: '127.0.0.2' })
+    try {
+      expectEqual((await intruder.raw('INVITE', '+33199000101')).status, 403, 'INVITE from 127.0.0.2')
+      expectEqual((await intruder.raw('BYE', '+33199000101', { toTag: 'forged' })).status, 403, 'BYE in a dialog from 127.0.0.2')
+    } finally {
+      await intruder.close()
+    }
+    const nowhere = await operator.call('+33199000250')
+    expectEqual((await nowhere.final).status, 404, 'call to a number of no range')
+  })
   await step('a registration left on a dead connection (the first one, Alice) with a no-answer forward: Bob rings at once, not after the delay', async () => {
     await setForwarding(alice, { noAnswer: '103', delay: '20' })
     relay.cutUpstream(0)
@@ -1978,6 +2260,8 @@ try {
   await relay.stop()
   await pushService.stop()
   await dtmf?.stop()
+  await operator.close()
+  await operator2.close()
   await db.end()
 }
 process.exit(failed ? 1 : 0)

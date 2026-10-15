@@ -227,6 +227,8 @@ export const sipUa = async ({ proxy, ws, domain, user, password }) => {
       callId,
       /** The final answer ("487 Request Terminated"). */
       final: finalAnswer,
+      /** The final answer as received, its headers with it. */
+      message: answered,
       /** The final answer and how long after the (authenticated) INVITE it came. */
       ended,
       provisional: () => responses.filter(r => callIdOf(r) === callId && r.status < 200).map(r => r.status),

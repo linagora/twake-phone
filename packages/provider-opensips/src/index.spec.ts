@@ -2,7 +2,7 @@ import dgram from 'node:dgram'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { RoutedEvent } from '@twake/telephony-provider-sdk'
 import type { ForwardingRules } from '@twake/telephony-types'
-import { AsyncQueue, OpensipsProvider, SUBSCRIBED_EVENTS, type CallRules, type DndRule, type PushTargets } from './index.js'
+import { AsyncQueue, OpensipsProvider, SUBSCRIBED_EVENTS, type CallRules, type DndRule, type PushTargets, type TrunkTables } from './index.js'
 import { fakeOpensips } from '../test/fake-opensips.js'
 
 const user = { id: 'alice', tenantId: 't', displayName: 'Alice', extension: '101' }
@@ -289,6 +289,52 @@ describe('OpensipsProvider call rules', () => {
     const bare = new OpensipsProvider({ websocketUrl: 'wss://sip.example.test', domain: 'sip.example.test', sipSecretFor: async () => 's', accounts })
     await bare.syncExtensions([])
     expect(given).toHaveLength(3)
+  })
+
+  it('writes the trunks where OpenSIPS reads them, and has it reload only what changed, its numbering plan once', async () => {
+    const trunk = { id: 'operator', auth: 'register' as const, domain: 'operator.example', proxies: ['192.0.2.20'], username: '0033199000100', password: 'not-a-real-one', codecs: ['PCMA' as const], numberFormat: 'e164' as const, defaultNumber: '+33199000100' }
+    const dids = [{ id: 'd1', trunkId: 'operator', first: '+33199000101', last: '+33199000101', target: '101' }]
+    const writes: unknown[] = []
+    let changed = { dispatcher: true, registrant: true }
+    const trunks = { set: async (t: unknown, d: unknown) => (writes.push([t, d]), changed) } as unknown as TrunkTables
+    const sips = await fakeOpensips()
+    cleanups.push(sips.close)
+    const warnings: string[] = []
+    const p = new OpensipsProvider({ websocketUrl: 'wss://sip.example.test', domain: 'sip.example.test', sipSecretFor: async () => 's', events: { miUrl: sips.url, timeoutMs: 300 }, trunks, logger: { info: () => undefined, warn: m => void warnings.push(m) } })
+    cleanups.push(() => p.close())
+    expect((await p.getCapabilities()).trunks).toBe(true)
+    await until('the subscription', () => p.getStatus() === 'CONNECTED')
+    const reloads = () => sips.requests.map(r => r.method).filter(m => m.endsWith('_reload'))
+    await p.setTrunks([trunk], dids)
+    expect(writes).toEqual([[[trunk], dids]])
+    expect(reloads()).toEqual(['ds_reload', 'reg_reload', 'dp_reload'])
+    // The direct numbers only: nothing to reload (OpenSIPS reads them call by call).
+    changed = { dispatcher: false, registrant: false }
+    await p.setTrunks([trunk], [])
+    expect(reloads()).toHaveLength(3)
+    // Another server: the dispatcher only, never a registration again for nothing.
+    changed = { dispatcher: true, registrant: false }
+    await p.setTrunks([{ ...trunk, proxies: ['192.0.2.21'] }], [])
+    expect(reloads()).toEqual(['ds_reload', 'reg_reload', 'dp_reload', 'ds_reload'])
+    // OpenSIPS not answering: written, not applied: the change fails (502), and is reloaded at the next one, even one
+    // that changes nothing OpenSIPS reloads.
+    sips.state.down = true
+    await expect(p.setTrunks([trunk], [])).rejects.toMatchObject({ statusCode: 502, code: 'TRUNK_RELOAD_FAILED' })
+    expect(warnings).toEqual([expect.stringMatching(/^OpenSIPS: trunks written, ds_reload \(.*\) failed: not applied until it reloads them or restarts$/)])
+    sips.state.down = false
+    changed = { dispatcher: false, registrant: false }
+    await p.setTrunks([trunk], [])
+    expect(reloads()).toEqual(['ds_reload', 'reg_reload', 'dp_reload', 'ds_reload', 'ds_reload'])
+    await p.setTrunks([trunk], [])
+    expect(reloads()).toHaveLength(5)
+    changed = { dispatcher: true, registrant: false }
+    // Without the MI: written, read at OpenSIPS's next start.
+    const bare = new OpensipsProvider({ websocketUrl: 'wss://sip.example.test', domain: 'sip.example.test', sipSecretFor: async () => 's', trunks, logger: { info: () => undefined, warn: m => void warnings.push(m) } })
+    await bare.setTrunks([trunk], [])
+    expect(warnings.at(-1)).toMatch(/^OpenSIPS: trunks written, ds_reload, dp_reload not asked \(no MI\)/)
+    // Without the tables: no trunk on this platform.
+    expect((await make().getCapabilities()).trunks).toBe(false)
+    await expect(make().setTrunks([trunk], [])).rejects.toMatchObject({ statusCode: 501 })
   })
 
   it('writes who can be woken where OpenSIPS reads it, only while it hears the events that say whom to wake', async () => {

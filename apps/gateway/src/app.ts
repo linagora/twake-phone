@@ -5,19 +5,20 @@ import swagger from '@fastify/swagger'
 import swaggerUi from '@fastify/swagger-ui'
 import { splitParticipantId, verifyWebhook, type LiveKitConferenceBridge, type MeetApi, type MeetRoom } from '@twake/conference-livekit'
 import type { MediaProvider, TelephonyProvider } from '@twake/telephony-provider-sdk'
-import type { CallDirection, Endpoint, ForwardingRules, Presence, PresenceStatus, RingGroup, TelephonyEvent, User } from '@twake/telephony-types'
+import { EXTENSION_FORMAT, isReservedNumber, type CallDirection, type DidRange, type Endpoint, type ForwardingRules, type Presence, type PresenceStatus, type RingGroup, type TelephonyEvent, type User } from '@twake/telephony-types'
 import { adminPolicyFromEnv, isAdmin, type AdminPolicy } from './admin.js'
 import { authenticatorFromEnv, TicketStore, type Authenticator, type Identity } from './auth.js'
 import { MAX_CONTACT_ID, MAX_FAVORITES, MAX_QUERY, MAX_SEARCH, RateLimiter, type ContactDirectory } from './contacts.js'
-import { StoreDirectory, parseUserMap, type UserDirectory } from './directory.js'
+import { StoreDirectory, seedUserMap, type UserDirectory } from './directory.js'
 import type { DirectorySync } from './directory-sync.js'
 import { EventBus } from './events.js'
 import { historyEntryFor } from './history.js'
 import { ENDED_TTL_SEC, MISSED_TTL_SEC, type PushMessage, type WebPush } from './push.js'
 import type { ProviderRegistry } from './registry.js'
 import { securityHeadersFor, type SecurityOptions } from './security.js'
+import { MAX_DIDS, MAX_TRUNKS, TRUNK_ID, defaultTrunk, parseDid, parseTrunk, providerTrunks, publicDid, publicTrunk, trunkRecord } from './trunks.js'
 import { MemoryStore } from './store/memory.js'
-import { isMissed, type HistoryEntry, type HistoryQuery, type Store, type UserPresenceRecord } from './store/types.js'
+import { isMissed, type HistoryEntry, type HistoryQuery, type Store, type TrunkRecord, type UserPresenceRecord } from './store/types.js'
 
 const STATUSES: PresenceStatus[] = ['available', 'busy', 'away', 'dnd', 'offline']
 const DIRECTIONS: CallDirection[] = ['inbound', 'outbound']
@@ -85,6 +86,11 @@ export interface BuildOptions {
    * provider can hold a call for them (capability `push`). Absent: the endpoints say it is not available.
    */
   push?: WebPush
+  /**
+   * The key the passwords of the trunks are encrypted with (SECRETS_KEY, step 6). Absent: a trunk can be kept without
+   * a password only.
+   */
+  secretsKey?: Buffer
   /** Phone access to Meet rooms. Absent when no LiveKit is configured: the endpoints answer 501. */
   conference?: {
     bridge: (tenantId: string) => LiveKitConferenceBridge | undefined
@@ -211,7 +217,10 @@ const NUMBER = /^[A-Za-z0-9._+-]{1,64}$/
  * 409 with a `code` the app turns into words.
  */
 export const parseGroup = async (number: string, body: unknown, isExtension: (extension: string) => Promise<boolean>, keep: readonly string[] = []): Promise<RingGroup> => {
-  if (!NUMBER.test(number)) throw refused('GROUP_NUMBER', 'invalid group number')
+  // The internal plan (2 to 6 digits, not 0 first): anything else, dialled, the SIP server takes for a public number.
+  if (!EXTENSION_FORMAT.test(number)) throw refused('GROUP_NUMBER', 'invalid group number: 2 to 6 digits, the first not 0')
+  // Dialled, an emergency number (or another short number of the French plan) goes to the operator, never to a group.
+  if (isReservedNumber(number)) throw refused('GROUP_NUMBER_RESERVED', `${number} is an emergency number or another short number of the French plan: calls to it go to the operator`)
   if (await isExtension(number)) throw Object.assign(new Error(`${number} is an extension: a group needs a number of its own`), { statusCode: 409, code: 'GROUP_NUMBER_TAKEN' })
   if (!body || typeof body !== 'object' || Array.isArray(body)) throw bad('invalid group')
   const b = body as { name?: unknown; members?: unknown }
@@ -258,7 +267,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
   if (!directory) {
     // Dev convenience: a bare in-memory gateway maps users from DEV_USER_MAP.
     const tenant = process.env.DEFAULT_TENANT ?? 'dev'
-    for (const m of parseUserMap(process.env.DEV_USER_MAP)) if (!(await store.getMappingByUser(tenant, m.userId))) await store.upsertMapping({ tenantId: tenant, ...m })
+    await seedUserMap(store, tenant, process.env.DEV_USER_MAP, message => console.warn(`WARNING: DEV_USER_MAP: ${message}`))
     directory = new StoreDirectory(store)
   }
   const dir = directory
@@ -422,6 +431,26 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
     }
   }
   const started = new Map<string, TelephonyProvider>()
+  // The trunks and direct numbers the store keeps (step 6, ADR 0016): handed to the provider when it starts, in the
+  // tenant's turn, retried until it holds (its database may be late). What it already has is not written again.
+  const trunksFor = async (tenantId: string) => ({ trunks: providerTrunks(await store.listTrunks(tenantId), options.secretsKey), dids: (await store.listDids(tenantId)).map(publicDid) })
+  const restoreTrunks = async (tenantId: string, provider: TelephonyProvider) => {
+    if (!provider.setTrunks) return
+    for (let attempt = 0; !closing; attempt++) {
+      try {
+        await inTurn(tenantId, async () => {
+          const { trunks, dids } = await trunksFor(tenantId)
+          await provider.setTrunks!(trunks, dids)
+        })
+        return
+      } catch (err) {
+        if (closing) return
+        const delay = RESTORE_RETRY_MS[Math.min(attempt, RESTORE_RETRY_MS.length - 1)]!
+        app.log.error({ err, tenantId }, `trunks not handed to the provider, retrying in ${delay / 1000} s`)
+        await new Promise(resolve => setTimeout(resolve, delay).unref())
+      }
+    }
+  }
   // Web Push (ADR 0015). Who can be woken: the holders of an extension with at least one browser subscribed, when
   // the Gateway can send pushes; written where the provider holds calls for them (always in the tenant's turn).
   const push = options.push
@@ -542,6 +571,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
   registry.onCreate = (tenantId, provider) => {
     started.set(tenantId, provider)
     void restorePresences(tenantId, provider)
+    void restoreTrunks(tenantId, provider)
     void (async () => {
       for await (const { extension, event } of provider.subscribe()) {
         try {
@@ -869,6 +899,117 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         const user = await administrator(req)
         const groups = groupsOf(registry.forTenant(user.tenantId))
         if (!(await inTurn(user.tenantId, () => groups.remove(req.params.number)))) throw Object.assign(new Error('No such group'), { statusCode: 404 })
+        return reply.code(204).send()
+      })
+
+      // Trunks to an operator and their direct numbers (capability `trunks`, ADR 0016): administrators only, one change
+      // at a time per tenant. The provider is handed the whole new set first (it checks it, writes what its SIP server
+      // reads and has it reload), then the store keeps it. When either fails, the provider is handed the set it had
+      // before (what it may have written in part goes), and the request fails: the store and the SIP server never
+      // part. A password is never shown again.
+      const trunksOf = (provider: TelephonyProvider) => {
+        if (!provider.setTrunks) throw Object.assign(new Error('Trunks are not available on this platform'), { statusCode: 501 })
+        return provider.setTrunks.bind(provider)
+      }
+      const notFound = (what: string) => Object.assign(new Error(`No such ${what}`), { statusCode: 404 })
+      const changeTrunks = async (tenantId: string, apply: ReturnType<typeof trunksOf>, trunks: TrunkRecord[], dids: DidRange[], keep: () => Promise<unknown>) => {
+        const before = await trunksFor(tenantId)
+        const undo = (err: unknown) =>
+          apply(before.trunks, before.dids).then(
+            () => {
+              throw err
+            },
+            (undoErr: unknown) => {
+              app.log.error({ err: undoErr, tenantId }, 'trunks: the previous set could not be handed back to the provider')
+              throw err
+            }
+          )
+        await apply(providerTrunks(trunks, options.secretsKey), dids).catch(undo)
+        await keep().catch(undo)
+      }
+      v1.get('/admin/trunks', async req => {
+        const user = await administrator(req)
+        trunksOf(registry.forTenant(user.tenantId))
+        return { items: (await store.listTrunks(user.tenantId)).map(publicTrunk) }
+      })
+      v1.put<{ Params: { id: string } }>('/admin/trunks/:id', async (req, reply) => {
+        const user = await administrator(req)
+        const apply = trunksOf(registry.forTenant(user.tenantId))
+        const id = req.params.id
+        if (!TRUNK_ID.test(id)) throw Object.assign(new Error('id: lower case letters, digits and dashes, 32 at most'), { statusCode: 400, code: 'TRUNK_INVALID' })
+        const { record, created } = await inTurn(user.tenantId, async () => {
+          const records = await store.listTrunks(user.tenantId)
+          const current = records.find(t => t.id === id)
+          if (!current && records.length >= MAX_TRUNKS) throw Object.assign(new Error(`At most ${MAX_TRUNKS} trunks`), { statusCode: 409 })
+          const parsed = parseTrunk(req.body, current)
+          // The default trunk stays so unless another one is made the default: a change that does not say `default`
+          // keeps the mark; `default: false` on the default trunk is refused, it would hand the number of everyone
+          // without a direct number (and their emergency calls) to another trunk without a word.
+          const given = (req.body as Record<string, unknown>).default
+          if (given === undefined && current?.config.default) parsed.config = { ...parsed.config, default: true }
+          if (given === false && current && defaultTrunk(records)?.id === id)
+            throw Object.assign(new Error('This is the default trunk: make another one the default instead'), { statusCode: 409, code: 'TRUNK_DEFAULT' })
+          const record = trunkRecord(user.tenantId, id, parsed, current, options.secretsKey)
+          // One default trunk: the one marked now, the others no longer.
+          const unmark = (t: TrunkRecord): TrunkRecord => {
+            const { default: _was, ...config } = t.config
+            return { ...t, config }
+          }
+          const unmarked = record.config.default ? records.filter(t => t.id !== id && t.config.default).map(unmark) : []
+          const updated = (t: TrunkRecord) => (t.id === id ? record : (unmarked.find(u => u.id === t.id) ?? t))
+          const next = current ? records.map(updated) : [...records.map(updated), record]
+          // The marks moved together, or not at all.
+          await changeTrunks(user.tenantId, apply, next, (await store.listDids(user.tenantId)).map(publicDid), () => store.upsertTrunks([...unmarked, record]))
+          return { record, created: !current }
+        })
+        return reply.code(created ? 201 : 200).send(publicTrunk(record))
+      })
+      v1.delete<{ Params: { id: string } }>('/admin/trunks/:id', async (req, reply) => {
+        const user = await administrator(req)
+        const apply = trunksOf(registry.forTenant(user.tenantId))
+        await inTurn(user.tenantId, async () => {
+          const records = await store.listTrunks(user.tenantId)
+          if (!records.some(t => t.id === req.params.id)) throw notFound('trunk')
+          // The default trunk gives its number to everyone without a direct number: never changed without a word.
+          if (records.length > 1 && defaultTrunk(records)?.id === req.params.id)
+            throw Object.assign(new Error('This is the default trunk: make another one the default first'), { statusCode: 409, code: 'TRUNK_DEFAULT' })
+          // Its direct numbers go with it.
+          const dids = (await store.listDids(user.tenantId)).filter(d => d.trunkId !== req.params.id).map(publicDid)
+          await changeTrunks(user.tenantId, apply, records.filter(t => t.id !== req.params.id), dids, () => store.deleteTrunk(user.tenantId, req.params.id))
+        })
+        return reply.code(204).send()
+      })
+      v1.get('/admin/dids', async req => {
+        const user = await administrator(req)
+        trunksOf(registry.forTenant(user.tenantId))
+        return { items: (await store.listDids(user.tenantId)).map(publicDid) }
+      })
+      v1.put<{ Params: { id: string } }>('/admin/dids/:id', async (req, reply) => {
+        const user = await administrator(req)
+        const provider = registry.forTenant(user.tenantId)
+        const apply = trunksOf(provider)
+        const { did, created } = await inTurn(user.tenantId, async () => {
+          const records = await store.listTrunks(user.tenantId)
+          const dids = (await store.listDids(user.tenantId)).map(publicDid)
+          const current = dids.find(d => d.id === req.params.id)
+          if (!current && dids.length >= MAX_DIDS) throw Object.assign(new Error(`At most ${MAX_DIDS} ranges of direct numbers`), { statusCode: 409 })
+          const did = parseDid(req.params.id, req.body, records, dids)
+          // A number rings an extension someone holds, or a ring group of the tenant: nothing else.
+          if (did.target && !(await store.getMappingByExtension(user.tenantId, did.target)) && !(provider.listGroups && (await provider.listGroups()).some(g => g.number === did.target)))
+            throw Object.assign(new Error(`target: ${did.target} is no extension nor ring group of this platform`), { statusCode: 400, code: 'DID_TARGET' })
+          await changeTrunks(user.tenantId, apply, records, current ? dids.map(d => (d.id === did.id ? did : d)) : [...dids, did], () => store.upsertDid({ tenantId: user.tenantId, ...did }))
+          return { did, created: !current }
+        })
+        return reply.code(created ? 201 : 200).send(did)
+      })
+      v1.delete<{ Params: { id: string } }>('/admin/dids/:id', async (req, reply) => {
+        const user = await administrator(req)
+        const apply = trunksOf(registry.forTenant(user.tenantId))
+        await inTurn(user.tenantId, async () => {
+          const dids = (await store.listDids(user.tenantId)).map(publicDid)
+          if (!dids.some(d => d.id === req.params.id)) throw notFound('direct number')
+          await changeTrunks(user.tenantId, apply, await store.listTrunks(user.tenantId), dids.filter(d => d.id !== req.params.id), () => store.deleteDid(user.tenantId, req.params.id))
+        })
         return reply.code(204).send()
       })
 

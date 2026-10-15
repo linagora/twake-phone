@@ -263,6 +263,31 @@ describe('Softphone', () => {
     expect([away.endReason, away.endMessage]).toEqual(['unavailable', undefined])
   })
 
+  it('tells a number the SIP server does not put through to the public network, and why', async () => {
+    const { phone, ua } = await setup()
+    const response = (status_code: number, headers: Record<string, string> = {}) => ({ status_code, reason_phrase: 'x', getHeader: (name: string) => headers[name] })
+    for (const [number, status, word, refusal] of [
+      ['112', 403, 'emergency', 'emergency'],
+      ['0899000000', 403, 'premium', 'premium'],
+      ['+442079460123', 403, ' International ', 'international'],
+      ['+262262000000', 403, 'overseas', 'overseas'],
+      ['063998', 484, 'invalid', 'invalid'],
+      ['0639980001', 503, 'no-trunk', 'no-trunk'],
+      ['0639980002', 403, 'satellite', 'not-allowed']
+    ] as const) {
+      const call = await phone.call(number)
+      ua().lastCall!.emit('failed', { originator: 'remote', cause: 'Rejected', message: response(status, { 'Twake-Call-Refused': word }) })
+      expect([call.endReason, call.endStatus, call.endRefusal], number).toEqual(['refused', status, refusal])
+    }
+    // Without the header, or with another status, the usual reasons.
+    const plain = await phone.call('0639980003')
+    ua().lastCall!.emit('failed', { originator: 'remote', cause: 'Rejected', message: response(403) })
+    expect([plain.endReason, plain.endRefusal]).toEqual(['rejected', undefined])
+    const busy = await phone.call('0639980004')
+    ua().lastCall!.emit('failed', { originator: 'remote', cause: 'Busy', message: response(486, { 'Twake-Call-Refused': 'premium' }) })
+    expect([busy.endReason, busy.endRefusal]).toEqual(['busy', undefined])
+  })
+
   it('shows who answered a call it placed, as the SIP server asserts it (a member of a ring group), and transfers the call as placed', async () => {
     const { phone, ua } = await setup()
     const call = await phone.call('200')
@@ -523,6 +548,19 @@ describe('Softphone', () => {
       s.emit('unhold', { originator: 'local' })
       s.reofferDone!()
       await expect(refused).rejects.toMatchObject({ code: 'transfer-refused', status: 403, reason: 'rejected' })
+      expect(call.state).toBe('connected')
+      // A call with the public network: the SIP server says it transfers none (step 6a), the app says so.
+      const external = call.transfer('105')
+      await Promise.resolve()
+      s.emit('hold', { originator: 'local' })
+      s.reofferDone!()
+      await Promise.resolve()
+      await Promise.resolve()
+      s.referSubscriber!.emit('requestFailed', { response: { status_code: 403, reason_phrase: 'Transfer Not Allowed', getHeader: (name: string) => (name === 'Twake-Call-Refused' ? 'transfer-external' : undefined) }, cause: 'Rejected' })
+      await Promise.resolve()
+      s.emit('unhold', { originator: 'local' })
+      s.reofferDone!()
+      await expect(external).rejects.toMatchObject({ code: 'transfer-external', status: 403 })
       expect(call.state).toBe('connected')
       const silent = call.transfer('104')
       await Promise.resolve()

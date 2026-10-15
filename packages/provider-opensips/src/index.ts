@@ -1,19 +1,22 @@
 import type { MediaProvider, ProviderFactory, RoutedEvent, TelephonyProvider } from '@twake/telephony-provider-sdk'
-import type { Call, Capabilities, Endpoint, ForwardingRules, MediaSession, OriginateRequest, Presence, ProviderStatus, RingGroup, User } from '@twake/telephony-types'
+import type { Call, Capabilities, DidRange, Endpoint, ForwardingRules, MediaSession, OriginateRequest, Presence, ProviderStatus, RingGroup, Trunk, User } from '@twake/telephony-types'
 import type { CallGroups } from './call-groups.js'
 import type { CallRules } from './call-rules.js'
 import type { PushTargets } from './push-targets.js'
+import type { TrunkTables } from './trunks.js'
 import { OpensipsEvents, parseDlgList, parseUlDump, type EventsLogger } from './events.js'
 import { AsyncQueue } from './queue.js'
 import { CallTracker } from './tracker.js'
 
 export { SubscriberProvisioner, digestHashes, SUBSCRIBER_SCHEMA, SUBSCRIBER_SQL, EXTRA_COLUMNS, SUBSCRIBER_TABLE_VERSION, ACC_TABLE_VERSION, MISSED_CALLS_TABLE_VERSION, type SubscriberProvisionerOptions, type Queryable } from './subscriber.js'
 export { OpensipsEvents, parseDlgList, parseUlDump, parseUdpUrl, type EventsLogger, type OpensipsEventsOptions, type RegisteredContact } from './events.js'
-export { CallTracker, userOf, type ContactRegistration, type TelephonyPresence } from './tracker.js'
+export { CallTracker, userOf, isExternalParty, type ContactRegistration, type TelephonyPresence } from './tracker.js'
 export { CallRules, CALL_RULES_SCHEMA, DND_MESSAGE_MAX, NOANSWER_DELAY, type CallRulesOptions, type DndRule, type ExtensionHolder } from './call-rules.js'
 export { CallGroups, CALL_GROUPS_SCHEMA, DISPLAY_NAMES_SCHEMA, GROUP_MEMBERS_MAX, NAME_MAX, sipDisplayName, type CallGroupsOptions } from './call-groups.js'
 export { PushTargets, PUSH_TARGETS_SCHEMA, type PushTargetsOptions } from './push-targets.js'
 export { AsyncQueue } from './queue.js'
+export { TrunkTables, TRUNK_SCHEMA, TRUNK_SQL, DEFAULT_TRUNK_SOCKET, SOURCES_SET, DISPATCHER_TABLE_VERSION, DIALPLAN_TABLE_VERSION, REGISTRANT_TABLE_VERSION, codecFlags, projectTrunks, trunkSecret, type TrunkTablesOptions } from './trunks.js'
+export { DIALPLAN_RULES, DIALPLAN_SQL, DP_CLASSIFY, DP_INBOUND, DP_NORMALISE, OUTBOUND_ALLOWABLE, OUTBOUND_ALLOWED, classify, translate, type DialplanRule, type NumberClass } from './numbering.js'
 
 /**
  * The event the Gateway raises itself through the MI after each subscription to tell it hears OpenSIPS
@@ -81,6 +84,11 @@ export interface OpensipsConfig {
    */
   pushTargets?: PushTargets
   /**
+   * The trunks and direct numbers OpenSIPS reads (ADR 0016): its dispatcher, registrations and numbering plan are
+   * reloaded through the MI when they change. Without it, no call to or from the public network.
+   */
+  trunks?: TrunkTables
+  /**
    * The SIP accounts (`subscriber`) OpenSIPS authenticates and routes by: `reconcile` removes those the Gateway
    * wrote for a user who no longer holds the extension, and returns their extensions (SubscriberProvisioner's
    * reconcileAccounts). Without it, an account outlives its holder's mapping.
@@ -116,6 +124,10 @@ export class OpensipsProvider implements TelephonyProvider, MediaProvider {
   private startTimer?: ReturnType<typeof setTimeout>
   /** Tells the end of a chosen presence (a "do not disturb" until a date) when it comes. */
   private expiryTimer?: ReturnType<typeof setTimeout>
+  /** Whether OpenSIPS reloaded the numbering plan the Gateway wrote at its start (once per start of the provider). */
+  private dialplanLoaded = false
+  /** What OpenSIPS was asked to reload and did not: asked again at the next change, whatever it changes. */
+  private readonly pendingReloads = new Set<string>()
 
   constructor(private readonly config: OpensipsConfig) {
     for (const [name, value] of Object.entries({ websocketUrl: config.websocketUrl, domain: config.domain })) {
@@ -204,6 +216,7 @@ export class OpensipsProvider implements TelephonyProvider, MediaProvider {
       forwarding: !!this.config.callRules,
       groups: !!this.config.callGroups,
       push: !!this.config.pushTargets && !!this.events,
+      trunks: !!this.config.trunks,
       conference: { dialIn: false, dialOut: false }
     }
   }
@@ -298,6 +311,41 @@ export class OpensipsProvider implements TelephonyProvider, MediaProvider {
   async setWakeableOne(holder: { extension: string; userId: string }, on: boolean) {
     if (!this.config.pushTargets) return
     await this.config.pushTargets.setOne(holder, on && !!this.events)
+  }
+
+  /**
+   * The trunks and direct numbers of the tenant (ADR 0016), written into OpenSIPS's database; then OpenSIPS reloads
+   * what changed: its dispatcher (the operator's servers), its registrations (only when they changed: an operator
+   * stops answering an address that registers too often, ARCHITECTURE §13), and, once per start, its numbering plan.
+   * A reload that fails fails the change (502, code TRUNK_RELOAD_FAILED: written, not applied; asked again at the next
+   * change). Without the MI, OpenSIPS reads them at its next start (logged).
+   */
+  async setTrunks(trunks: (Trunk & { password?: string })[], dids: DidRange[]) {
+    if (!this.config.trunks) throw Object.assign(new Error('Trunks are not available on this platform'), { statusCode: 501 })
+    const changed = await this.config.trunks.set(trunks, dids)
+    const log = this.config.logger ?? console
+    const wanted = new Set([...this.pendingReloads, ...(changed.dispatcher ? ['ds_reload'] : []), ...(changed.registrant ? ['reg_reload'] : []), ...(this.dialplanLoaded ? [] : ['dp_reload'])])
+    const reloads = ['ds_reload', 'reg_reload', 'dp_reload'].filter(m => wanted.has(m))
+    if (!reloads.length) return
+    if (!this.events) {
+      log.warn(`OpenSIPS: trunks written, ${reloads.join(', ')} not asked (no MI): OpenSIPS reads them at its next start`)
+      return
+    }
+    const failed: string[] = []
+    for (const method of reloads) {
+      try {
+        await this.events.call(method)
+        this.pendingReloads.delete(method)
+        if (method === 'dp_reload') this.dialplanLoaded = true
+      } catch (err) {
+        this.pendingReloads.add(method)
+        failed.push(`${method} (${err instanceof Error ? err.message : String(err)})`)
+      }
+    }
+    if (failed.length) {
+      log.warn(`OpenSIPS: trunks written, ${failed.join(', ')} failed: not applied until it reloads them or restarts`)
+      throw Object.assign(new Error(`OpenSIPS did not reload the trunks: ${failed.join(', ')}`), { statusCode: 502, code: 'TRUNK_RELOAD_FAILED' })
+    }
   }
 
   async getForwarding(user: User): Promise<ForwardingRules> {

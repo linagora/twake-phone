@@ -21,6 +21,8 @@ describe('parseGroup', () => {
   it('refuses a number that is an extension, or not a number, a bad name, members that are not extensions', async () => {
     await expect(parseGroup('101', { name: 'G', members: ['102'] }, ours)).rejects.toMatchObject({ statusCode: 409, code: 'GROUP_NUMBER_TAKEN' })
     for (const number of ["200' OR 1=1", 'sip:200@x', '2 00', 'x'.repeat(65)]) await expect(parseGroup(number, { name: 'G', members: ['102'] }, ours)).rejects.toMatchObject({ statusCode: 400, code: 'GROUP_NUMBER' })
+    // The internal plan only (2 to 6 digits, the first not 0): anything else, dialled, is taken for a public number.
+    for (const number of ['0101', '01', '0199000101', '+33199000101', '1234567', '2', 'sales']) await expect(parseGroup(number, { name: 'G', members: ['102'] }, ours), number).rejects.toMatchObject({ statusCode: 400, code: 'GROUP_NUMBER' })
     for (const name of ['', '   ', 'two\nlines', 'x'.repeat(65), 42]) await expect(parseGroup('200', { name, members: ['102'] }, ours)).rejects.toMatchObject({ statusCode: 400, code: 'GROUP_NAME' })
     for (const members of [[], ['', ' '], 'not a list', Array.from({ length: 13 }, () => '101')]) {
       const res = parseGroup('200', { name: 'G', members }, anyButGroup)
@@ -30,6 +32,12 @@ describe('parseGroup', () => {
     }
     for (const member of ['104', '+33612345678', "102' OR 1=1", 7]) await expect(parseGroup('200', { name: 'G', members: [member] }, ours)).rejects.toMatchObject({ statusCode: 400, code: 'GROUP_MEMBER_NOT_EXTENSION' })
     await expect(parseGroup('200', null, ours)).rejects.toMatchObject({ statusCode: 400 })
+  })
+
+  it('never takes an emergency number or another short number of the French plan: dialled, it goes to the operator', async () => {
+    for (const number of ['15', '17', '18', '112', '114', '115', '119', '191', '196', '197', '116000', '116117', '116006', '118218'])
+      await expect(parseGroup(number, { name: 'Urgences', members: ['101'] }, ours), number).rejects.toMatchObject({ statusCode: 400, code: 'GROUP_NUMBER_RESERVED' })
+    for (const number of ['16', '113', '1120', '116', '150']) await expect(parseGroup(number, { name: 'G', members: ['101'] }, ours), number).resolves.toMatchObject({ number })
   })
 
   it('takes 12 members, what one call of the SIP server rings, and refuses 13 before looking any up', async () => {
@@ -109,6 +117,10 @@ describe('ring group routes', () => {
     expect([res.statusCode, res.json().code]).toEqual([409, 'GROUP_NUMBER_TAKEN'])
     res = await app.inject({ method: 'POST', url: '/api/v1/admin/groups', headers: admin, payload: { number: '201', name: 'X', members: ['103'] } })
     expect([res.statusCode, res.json().code]).toEqual([400, 'GROUP_MEMBER_NOT_EXTENSION'])
+    // 115 (the social emergency number) is nobody's: the group is not made, the provider never sees it.
+    res = await app.inject({ method: 'POST', url: '/api/v1/admin/groups', headers: admin, payload: { number: '115', name: 'Accueil social', members: ['101'] } })
+    expect([res.statusCode, res.json().code]).toEqual([400, 'GROUP_NUMBER_RESERVED'])
+    expect(groups.has('115')).toBe(false)
     expect((await app.inject({ method: 'DELETE', url: '/api/v1/admin/groups/200', headers: admin })).statusCode).toBe(204)
     expect((await app.inject({ method: 'DELETE', url: '/api/v1/admin/groups/200', headers: admin })).statusCode).toBe(404)
     expect(groups.size).toBe(0)

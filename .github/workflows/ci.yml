@@ -79,6 +79,13 @@ jobs:
       fail-fast: false
       matrix:
         browser: [chromium, firefox, msedge]
+    # OpenSIPS annonce au trunk une adresse de documentation (TEST-NET-1), comme derrière un NAT : l'opérateur simulé
+    # la reçoit (enregistrement, Via, Record-Route) et la ramène vers la socket du trunk (docker-compose.sip.yml, e2e).
+    # Le téléphone d'un appel avec l'opérateur est interrogé (OPTIONS dans l'appel) toutes les 5 s plutôt que 30 : un
+    # téléphone parti met fin à l'appel en quelques secondes (e2e).
+    env:
+      TRUNK_ADVERTISE: 192.0.2.10:5070
+      CALL_PING_SEC: "5"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -118,6 +125,13 @@ jobs:
       - name: Microsoft Edge
         if: matrix.browser == 'msedge'
         run: microsoft-edge --version || npx playwright-core install msedge
+      # Le trunk tel que le script d'OpenSIPS le traite, sans navigateur (téléphones SIP et opérateurs simulés en
+      # Node) : une fois, il ne dépend d'aucun navigateur.
+      - name: Trunk SIP (téléphones et opérateurs simulés, sans navigateur)
+        if: matrix.browser == 'chromium'
+        run: node apps/web/test/trunk.sip.mjs
+        env:
+          OPENSIPS_DB_URL: postgres://twake:twake@127.0.0.1:54320/twake
       - name: e2e SIP (trois personnes dans ${{ matrix.browser }}, micro simulé, OpenSIPS et rtpengine en Docker)
         run: node apps/web/test/sip.e2e.mjs
         env:

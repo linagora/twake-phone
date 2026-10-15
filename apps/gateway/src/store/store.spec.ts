@@ -12,8 +12,33 @@ if (process.env.TEST_DATABASE_URL) {
     const store = new PgStore(process.env.TEST_DATABASE_URL!)
     await store.migrate()
     const pool = (store as unknown as { pool: { query(sql: string): Promise<unknown> } }).pool
-    await pool.query('TRUNCATE provider_configs, user_mappings, call_history, sip_credentials, conferences, favorites, user_presence, push_subscriptions, vapid_keys RESTART IDENTITY')
+    await pool.query('TRUNCATE provider_configs, user_mappings, call_history, sip_credentials, conferences, favorites, user_presence, push_subscriptions, vapid_keys, trunk_configs, direct_numbers RESTART IDENTITY')
     return store
+  })
+
+  describe('PgStore, trunks written together', () => {
+    it('writes all of them or none: the default mark is never on two trunks, nor on none', async () => {
+      const store = new PgStore(process.env.TEST_DATABASE_URL!)
+      await store.migrate()
+      const config = { auth: 'ip' as const, domain: 'operator.example', codecs: ['PCMA' as const], numberFormat: 'e164' as const, defaultNumber: '+33199000100' }
+      try {
+        await store.upsertTrunks([
+          { tenantId: 'atomic', id: 'main', config: { ...config, default: true } },
+          { tenantId: 'atomic', id: 'backup', config }
+        ])
+        // The second write fails (PostgreSQL keeps no NUL in a jsonb): the first one is undone with it.
+        await expect(
+          store.upsertTrunks([
+            { tenantId: 'atomic', id: 'backup', config: { ...config, default: true } },
+            { tenantId: 'atomic', id: 'main', config: { ...config, name: 'nul\u0000' } }
+          ])
+        ).rejects.toThrow()
+        expect((await store.listTrunks('atomic')).map(t => `${t.id}:${t.config.default ?? false}`)).toEqual(['main:true', 'backup:false'])
+      } finally {
+        for (const id of ['backup', 'main']) await store.deleteTrunk('atomic', id)
+        await store.close()
+      }
+    })
   })
 
   describe('PgStore, a push subscription saved by two people at once', () => {

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { TelephonyEvent } from '@twake/telephony-types'
-import { CallTracker, userOf } from './tracker.js'
+import { CallTracker, isExternalParty, userOf } from './tracker.js'
 
 // The events as OpenSIPS 3.6 sends them (captured on the Docker stack), trimmed to what the tracker reads.
 // usrloc's `expires` is an absolute time (seconds since the epoch).
@@ -100,6 +100,33 @@ describe('CallTracker', () => {
     tracker.handle('E_TWAKEPHONE_CALLING', call('c4', '101', '102'))
     tracker.handle('E_ACC_MISSED_EVENT', missed('c4', '101', '102', '477', 1792002830))
     expect(calls().slice(-1)).toEqual(['101:call.failed:outbound:102:failed'])
+    expect(tracker.activeCalls()).toEqual([])
+  })
+
+  it('tells only our side of a call with the public network: the number of the far end is nobody to tell nor keep busy (step 6)', () => {
+    const { tracker, events, presences, calls, clear } = make()
+    for (const ext of ['101', '102']) tracker.handle('E_UL_CONTACT_INSERT', contact(ext, `sip:${ext}@x.invalid`))
+    clear()
+    // Out to a fictional mobile (ARCEP), answered, then hung up.
+    tracker.handle('E_TWAKEPHONE_CALLING', call('o1', '101', '+33639980001'))
+    tracker.handle('E_TWAKEPHONE_RINGING', call('o1', '101', '+33639980001'))
+    tracker.handle('E_TWAKEPHONE_ANSWERED', call('o1', '101', '+33639980001'))
+    tracker.handle('E_ACC_CDR', cdr('o1', '101', '+33639980001', 12, 1792000900))
+    expect(calls()).toEqual([
+      '101:call.created:outbound:+33639980001:new',
+      '101:call.ringing:outbound:+33639980001:ringing',
+      '101:call.connected:outbound:+33639980001:connected',
+      '101:call.ended:outbound:+33639980001:ended'
+    ])
+    expect(presences()).toEqual(['101:busy', '101:available'])
+    clear()
+    // In on a direct number, from a caller who hides their number, not answered.
+    tracker.handle('E_TWAKEPHONE_CALLING', call('i1', 'anonymous', '102'))
+    tracker.handle('E_TWAKEPHONE_RINGING', call('i1', 'anonymous', '102'))
+    tracker.handle('E_ACC_MISSED_EVENT', missed('i1', 'anonymous', '102', '487', 1792000950))
+    expect(calls()).toEqual(['102:call.ringing:inbound:anonymous:ringing', '102:call.ended:inbound:anonymous:missed'])
+    expect(presences()).toEqual(['102:busy', '102:available'])
+    expect(events.every(e => !isExternalParty(e.extension))).toBe(true)
     expect(tracker.activeCalls()).toEqual([])
   })
 

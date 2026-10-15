@@ -2,13 +2,14 @@ import { LiveKitConferenceBridge, MeetApi } from '@twake/conference-livekit'
 import { buildApp } from './app.js'
 import { authenticatorFromEnv } from './auth.js'
 import { parseKey } from './crypto.js'
-import { StoreDirectory, parseUserMap } from './directory.js'
+import { StoreDirectory, reservedInUse, seedUserMap } from './directory.js'
 import { DirectorySync, parseInterval } from './directory-sync.js'
 import { ldapDirectoryFromEnv } from './ldap-directory.js'
 import { storedOpensipsFactory, type StoredOpensipsConfig } from './providers.js'
 import { WebPush, parsePushServices, parseVapidSubject } from './push.js'
 import { ProviderRegistry } from './registry.js'
 import { PgStore } from './store/pg.js'
+import { trunkFromEnv, trunkRecord } from './trunks.js'
 
 const env = process.env
 const need = (name: string): string => {
@@ -56,9 +57,20 @@ if (env.OPENSIPS_WS_URL && !(await store.listProviders()).some(p => p.tenantId =
   await store.upsertProvider({ tenantId: tenant, type: 'opensips', config })
 }
 // DEV_USER_MAP seeds a mapping once; it never overwrites what an administrator or the directory wrote since.
-for (const m of parseUserMap(env.DEV_USER_MAP)) if (!(await store.getMappingByUser(tenant, m.userId))) await store.upsertMapping({ tenantId: tenant, ...m })
+await seedUserMap(store, tenant, env.DEV_USER_MAP, message => console.warn(`WARNING: USER_EXTENSIONS (DEV_USER_MAP): ${message}`))
 
 const key = env.SECRETS_KEY ? parseKey(env.SECRETS_KEY) : undefined
+
+// Step 6 (ADR 0016): a first trunk to the operator and its direct numbers from TRUNK_* (docker/pilot/README.md), when
+// the tenant has none; administrators change them from then on (/v1/admin/trunks, /v1/admin/dids), the variables are
+// not read again. The password is kept encrypted with SECRETS_KEY.
+const seed = trunkFromEnv(env)
+if (seed && !(await store.listTrunks(tenant)).length) {
+  await store.upsertTrunk(trunkRecord(tenant, seed.id, seed.parsed, undefined, key))
+  for (const did of seed.dids) await store.upsertDid({ tenantId: tenant, ...did })
+}
+// The password is in the database from then on, encrypted; left in the environment it is one more copy to protect.
+if (seed && env.TRUNK_PASSWORD) console.warn('TRUNK_PASSWORD: the trunk is in the database now (its password encrypted); remove TRUNK_PASSWORD from the environment (.env)')
 
 const registry = new ProviderRegistry(await store.listProviders(), [storedOpensipsFactory({ store, ...(key ? { key } : {}) })])
 
@@ -129,6 +141,7 @@ const app = await buildApp(registry, {
   ...(hstsMaxAge !== undefined ? { security: { hstsMaxAge, hstsIncludeSubDomains: env.HSTS_INCLUDE_SUBDOMAINS === '1' } } : {}),
   auth: authenticatorFromEnv(env),
   ...(push ? { push } : {}),
+  ...(key ? { secretsKey: key } : {}),
   ...(conference ? { conference } : {})
 })
 directorySync?.useLogger(app.log)
@@ -136,4 +149,8 @@ const syncEvery = parseInterval(env.LDAP_SYNC_INTERVAL, 3_600_000)
 if (directorySync && syncEvery > 0) directorySync.start(syncEvery)
 app.addHook('onClose', async () => directorySync?.stop())
 registry.startAll()
+// Extensions and groups kept from before step 6a that are emergency numbers (or other short numbers of the French
+// plan): a call to them goes to the operator, never to whoever has them. Said at each start until changed.
+for (const what of await reservedInUse(store, tenant, await groupNumbers(tenant).catch(() => [])))
+  console.warn(`WARNING: ${what} is an emergency number or another short number of the French plan: dialled, it goes to the operator, never there; give it another number`)
 await app.listen({ host: env.HOST ?? '0.0.0.0', port: Number(env.PORT ?? 8080) })

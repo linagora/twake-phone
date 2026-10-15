@@ -1,7 +1,7 @@
 import { readdir, readFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import pg from 'pg'
-import { clampLimit, type ConferenceRecord, type HistoryEntry, type HistoryPage, type HistoryQuery, type MappingSource, type ProviderRecord, type PushSaveResult, type PushSubscriptionRecord, type Store, type UserMapping, type UserPresenceRecord, type VapidKeysRecord } from './types.js'
+import { clampLimit, type ConferenceRecord, type DidRecord, type HistoryEntry, type HistoryPage, type HistoryQuery, type MappingSource, type ProviderRecord, type PushSaveResult, type PushSubscriptionRecord, type Store, type TrunkRecord, type UserMapping, type UserPresenceRecord, type VapidKeysRecord } from './types.js'
 
 const MIGRATIONS = fileURLToPath(new URL('../../migrations/', import.meta.url))
 
@@ -14,6 +14,8 @@ type HistoryRow = { tenant_id: string; user_id: string; call_id: string; directi
 type PresenceRow = { tenant_id: string; user_id: string; status: UserPresenceRecord['status']; since: Timestamp; until: Timestamp | null; message: string | null }
 type ConferenceRow = { tenant_id: string; meeting_id: string; owner_user_id: string; pin: string | null; created_at: Timestamp }
 type PushRow = { tenant_id: string; user_id: string; endpoint: string; p256dh: string; auth: string; created_at: Timestamp }
+type TrunkRow = { tenant_id: string; id: string; config: TrunkRecord['config']; password_enc: string | null }
+type DidRow = { tenant_id: string; id: string; trunk_id: string; first_number: string; last_number: string; target: string | null; suffix_digits: number }
 
 const toEntry = (r: HistoryRow): HistoryEntry => ({
   tenantId: r.tenant_id,
@@ -293,6 +295,66 @@ export class PgStore implements Store {
   async initVapidKeys(keys: VapidKeysRecord) {
     await this.pool.query('INSERT INTO vapid_keys (id, public_key, private_key_enc) VALUES (1, $1, $2) ON CONFLICT (id) DO NOTHING', [keys.publicKey, keys.privateKeyEnc])
     return (await this.getVapidKeys())!
+  }
+
+  async listTrunks(tenantId: string): Promise<TrunkRecord[]> {
+    const { rows } = await this.pool.query<TrunkRow>('SELECT tenant_id, id, config, password_enc FROM trunk_configs WHERE tenant_id = $1 ORDER BY created_at, id', [tenantId])
+    return rows.map(r => ({ tenantId: r.tenant_id, id: r.id, config: r.config, ...(r.password_enc !== null ? { passwordEnc: r.password_enc } : {}) }))
+  }
+
+  async upsertTrunk(t: TrunkRecord) {
+    await this.upsertTrunks([t])
+  }
+
+  async upsertTrunks(records: TrunkRecord[]) {
+    const client = await this.pool.connect()
+    try {
+      await client.query('BEGIN')
+      for (const t of records)
+        await client.query(
+          `INSERT INTO trunk_configs (tenant_id, id, config, password_enc) VALUES ($1, $2, $3, $4)
+           ON CONFLICT (tenant_id, id) DO UPDATE SET config = EXCLUDED.config, password_enc = EXCLUDED.password_enc`,
+          [t.tenantId, t.id, JSON.stringify(t.config), t.passwordEnc ?? null]
+        )
+      await client.query('COMMIT')
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => undefined)
+      throw err
+    } finally {
+      client.release()
+    }
+  }
+
+  async deleteTrunk(tenantId: string, id: string) {
+    const r = await this.pool.query('DELETE FROM trunk_configs WHERE tenant_id = $1 AND id = $2', [tenantId, id])
+    return (r.rowCount ?? 0) > 0
+  }
+
+  async listDids(tenantId: string): Promise<DidRecord[]> {
+    const { rows } = await this.pool.query<DidRow>('SELECT * FROM direct_numbers WHERE tenant_id = $1 ORDER BY first_number, id', [tenantId])
+    return rows.map(r => ({
+      tenantId: r.tenant_id,
+      id: r.id,
+      trunkId: r.trunk_id,
+      first: r.first_number,
+      last: r.last_number,
+      ...(r.target !== null ? { target: r.target } : {}),
+      ...(r.suffix_digits ? { suffixDigits: r.suffix_digits } : {})
+    }))
+  }
+
+  async upsertDid(d: DidRecord) {
+    await this.pool.query(
+      `INSERT INTO direct_numbers (tenant_id, id, trunk_id, first_number, last_number, target, suffix_digits) VALUES ($1, $2, $3, $4, $5, $6, $7)
+       ON CONFLICT (tenant_id, id) DO UPDATE SET trunk_id = EXCLUDED.trunk_id, first_number = EXCLUDED.first_number, last_number = EXCLUDED.last_number,
+         target = EXCLUDED.target, suffix_digits = EXCLUDED.suffix_digits`,
+      [d.tenantId, d.id, d.trunkId, d.first, d.last, d.target ?? null, d.suffixDigits ?? 0]
+    )
+  }
+
+  async deleteDid(tenantId: string, id: string) {
+    const r = await this.pool.query('DELETE FROM direct_numbers WHERE tenant_id = $1 AND id = $2', [tenantId, id])
+    return (r.rowCount ?? 0) > 0
   }
 
   async close() {

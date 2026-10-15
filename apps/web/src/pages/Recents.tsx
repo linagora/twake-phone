@@ -58,7 +58,7 @@ export const Recents = () => {
           {items.map(it => (
             <li key={it.id}>
               <span>
-                <strong>{formatNumber(it.remoteNumber)}</strong>
+                <strong>{it.remoteNumber === 'anonymous' ? t('call.hiddenNumber') : formatNumber(it.remoteNumber)}</strong>
                 <br />
                 <span className={`badge${it.missed ? ' missed' : ''}`}>{recentLabel(it, t)}</span>
               </span>

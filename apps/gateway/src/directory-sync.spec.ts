@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import type { Contact } from '@twake/telephony-types'
 import { MemoryContactDirectory } from './contacts.js'
 import { DirectorySync, MAX_INTERVAL_MS, extensionOf, parseInterval } from './directory-sync.js'
+import { reservedInUse, seedUserMap } from './directory.js'
 import { MemoryStore } from './store/memory.js'
 
 const person = (id: string, name: string, extension?: string, department = 'Support'): Contact => ({
@@ -134,6 +135,42 @@ describe('DirectorySync', () => {
     expect(await store.getMappingByUser('acme', 'alice')).toMatchObject({ extension: '101' })
   })
 
+  it('never gives a person an emergency number or another short number of the French plan: dialled, it goes to the operator', async () => {
+    const { store, directory, sync } = setup([person('alice', 'Alice', '101'), person('bob', 'Bob', '102')])
+    await sync.run()
+    // Alice is given 112 in the directory, Carol (new) 15, Dan 116006, Eve 118218: none of them gets it.
+    directory.listAll = async () => [person('alice', 'Alice', '112'), person('bob', 'Bob', '102'), person('carol', 'Carol', '15'), person('dan', 'Dan', '116006'), person('eve', 'Eve', '118218'), person('fay', 'Fay', '1120')]
+    const report = await sync.run()
+    expect(report.conflicts).toEqual([
+      { userId: 'alice', extension: '112', heldBy: '', reserved: true },
+      { userId: 'carol', extension: '15', heldBy: '', reserved: true },
+      { userId: 'dan', extension: '116006', heldBy: '', reserved: true },
+      { userId: 'eve', extension: '118218', heldBy: '', reserved: true }
+    ])
+    expect(report).toMatchObject({ created: 1, removed: 0 })
+    // Alice keeps the extension she had; nobody holds a reserved number; 1120 is an extension like any other.
+    expect(await store.getMappingByUser('acme', 'alice')).toMatchObject({ extension: '101' })
+    for (const n of ['112', '15', '116006', '118218']) expect(await store.getMappingByExtension('acme', n), n).toBeNull()
+    expect(await store.getMappingByUser('acme', 'fay')).toMatchObject({ extension: '1120' })
+  })
+
+  it('never gives a person an extension out of the internal plan (2 to 6 digits, the first not 0): dialled, it would go to the operator', async () => {
+    const { store, directory, sync } = setup([person('alice', 'Alice', '101')])
+    await sync.run()
+    directory.listAll = async () => [person('alice', 'Alice', '0101'), person('bob', 'Bob', '0199000102'), person('carol', 'Carol', '1234567'), person('dan', 'Dan', '7'), person('eve', 'Eve', '104')]
+    const report = await sync.run()
+    expect(report.conflicts).toEqual([
+      { userId: 'alice', extension: '0101', heldBy: '', invalid: true },
+      { userId: 'bob', extension: '0199000102', heldBy: '', invalid: true },
+      { userId: 'carol', extension: '1234567', heldBy: '', invalid: true },
+      { userId: 'dan', extension: '7', heldBy: '', invalid: true }
+    ])
+    // Alice keeps the extension she had; the others get none; Eve's is of the plan.
+    expect(await store.getMappingByUser('acme', 'alice')).toMatchObject({ extension: '101' })
+    for (const userId of ['bob', 'carol', 'dan']) expect(await store.getMappingByUser('acme', userId), userId).toBeNull()
+    expect(await store.getMappingByUser('acme', 'eve')).toMatchObject({ extension: '104' })
+  })
+
   it('refuses to remove anything when the directory lists nobody', async () => {
     const people = [person('alice', 'Alice', '101')]
     const { store, directory, sync } = setup(people)
@@ -255,5 +292,34 @@ describe('extensionOf and parseInterval', () => {
     expect(() => parseInterval('30d', 7)).toThrow(/at most 24 days/)
     expect(() => parseInterval('99999999999', 7)).toThrow(/at most 24 days/)
     expect(() => new DirectorySync({ store: new MemoryStore(), directory: new MemoryContactDirectory([]), tenantId: 't' }).start(MAX_INTERVAL_MS + 1)).toThrow(/out of range/)
+  })
+})
+
+describe('the short numbers of the French plan (an emergency number...) as extensions', () => {
+  it('seeds DEV_USER_MAP (USER_EXTENSIONS of the pilot kit) without them, and says which were left out', async () => {
+    const store = new MemoryStore()
+    const warned: string[] = []
+    await store.upsertMapping({ tenantId: 'acme', userId: 'bob', extension: '150' })
+    await seedUserMap(store, 'acme', 'alice:101,bob:102,carol:112,dan:18,eve:116006', m => warned.push(m))
+    expect((await store.listMappings('acme')).map(m => `${m.userId}:${m.extension}`).sort()).toEqual(['alice:101', 'bob:150'])
+    expect(warned).toHaveLength(3)
+    expect(warned[0]).toMatch(/^carol:112 left out: 112 is an emergency number/)
+  })
+
+  it('seeds DEV_USER_MAP with extensions of the internal plan only (2 to 6 digits, the first not 0)', async () => {
+    const store = new MemoryStore()
+    const warned: string[] = []
+    await seedUserMap(store, 'acme', 'alice:101,bob:0102,carol:1234567,dan:+33199000104,eve:105', m => warned.push(m))
+    expect((await store.listMappings('acme')).map(m => `${m.userId}:${m.extension}`).sort()).toEqual(['alice:101', 'eve:105'])
+    expect(warned).toHaveLength(3)
+    expect(warned[0]).toMatch(/^bob:0102 left out: an extension is 2 to 6 digits, the first not 0/)
+  })
+
+  it('names the extensions and ring groups kept from before that are one, to be changed', async () => {
+    const store = new MemoryStore()
+    await store.upsertMapping({ tenantId: 'acme', userId: 'alice', extension: '101' })
+    await store.upsertMapping({ tenantId: 'acme', userId: 'carol', extension: '115' })
+    expect(await reservedInUse(store, 'acme', ['200', '17'])).toEqual(['extension 115 (carol)', 'ring group 17'])
+    expect(await reservedInUse(store, 'other', [])).toEqual([])
   })
 })
