@@ -209,6 +209,47 @@ export const storeContract = (name: string, make: () => Promise<Store>) =>
       await s.close()
     })
 
+    it('keeps the trunks and direct numbers of each tenant, in order, and removes the numbers with their trunk', async () => {
+      const s = await make()
+      const config = { auth: 'register' as const, domain: 'operator.example', proxies: ['192.0.2.20'], username: '0033199000100', codecs: ['PCMA' as const, 'PCMU' as const], numberFormat: 'e164' as const, defaultNumber: '+33199000100' }
+      await s.upsertTrunk({ tenantId: 'A', id: 'main', config, passwordEnc: 'enc1' })
+      await s.upsertTrunk({ tenantId: 'A', id: 'backup', config: { ...config, auth: 'ip', sources: ['192.0.2.30'] } })
+      await s.upsertTrunk({ tenantId: 'B', id: 'main', config: { ...config, domain: 'other.example' } })
+      // Replaced, it keeps its place: the first one serves the callers no direct number names.
+      await s.upsertTrunk({ tenantId: 'A', id: 'main', config: { ...config, registerExpires: 900 }, passwordEnc: 'enc2' })
+      const a = await s.listTrunks('A')
+      expect(a.map(t => t.id)).toEqual(['main', 'backup'])
+      expect(a[0]).toEqual({ tenantId: 'A', id: 'main', config: { ...config, registerExpires: 900 }, passwordEnc: 'enc2' })
+      expect(a[1]!.passwordEnc).toBeUndefined()
+      expect((await s.listTrunks('B'))[0]!.config.domain).toBe('other.example')
+      expect(await s.listTrunks('C')).toEqual([])
+
+      await s.upsertDid({ tenantId: 'A', id: 'sales', trunkId: 'main', first: '+33199000110', last: '+33199000119', suffixDigits: 3 })
+      await s.upsertDid({ tenantId: 'A', id: 'reception', trunkId: 'main', first: '+33199000101', last: '+33199000101', target: '101' })
+      await s.upsertDid({ tenantId: 'A', id: 'support', trunkId: 'backup', first: '+33199000200', last: '+33199000200', target: '600' })
+      await s.upsertDid({ tenantId: 'B', id: 'reception', trunkId: 'main', first: '+33199000101', last: '+33199000101', target: '200' })
+      // A trunk of another tenant, or none: refused.
+      await expect(s.upsertDid({ tenantId: 'C', id: 'x', trunkId: 'main', first: '+33199000300', last: '+33199000300', target: '1' })).rejects.toThrow()
+      await expect(s.upsertDid({ tenantId: 'A', id: 'x', trunkId: 'nope', first: '+33199000300', last: '+33199000300', target: '1' })).rejects.toThrow()
+      expect(await s.listDids('A')).toEqual([
+        { tenantId: 'A', id: 'reception', trunkId: 'main', first: '+33199000101', last: '+33199000101', target: '101' },
+        { tenantId: 'A', id: 'sales', trunkId: 'main', first: '+33199000110', last: '+33199000119', suffixDigits: 3 },
+        { tenantId: 'A', id: 'support', trunkId: 'backup', first: '+33199000200', last: '+33199000200', target: '600' }
+      ])
+      await s.upsertDid({ tenantId: 'A', id: 'reception', trunkId: 'main', first: '+33199000101', last: '+33199000101', target: '102' })
+      expect((await s.listDids('A'))[0]!.target).toBe('102')
+      expect(await s.deleteDid('A', 'sales')).toBe(true)
+      expect(await s.deleteDid('A', 'sales')).toBe(false)
+      expect(await s.deleteDid('B', 'support')).toBe(false)
+      // A trunk goes with its numbers, in its tenant only.
+      expect(await s.deleteTrunk('A', 'main')).toBe(true)
+      expect(await s.deleteTrunk('A', 'main')).toBe(false)
+      expect((await s.listTrunks('A')).map(t => t.id)).toEqual(['backup'])
+      expect((await s.listDids('A')).map(d => d.id)).toEqual(['support'])
+      expect((await s.listDids('B')).map(d => d.id)).toEqual(['reception'])
+      await s.close()
+    })
+
     it('keeps the first VAPID keys it is given', async () => {
       const s = await make()
       expect(await s.getVapidKeys()).toBeNull()

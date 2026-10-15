@@ -1,4 +1,4 @@
-import type { CallDirection, CallState, PresenceStatus } from '@twake/telephony-types'
+import type { CallDirection, CallState, DidRange, PresenceStatus, Trunk } from '@twake/telephony-types'
 
 export interface ProviderRecord {
   tenantId: string
@@ -117,6 +117,23 @@ export interface VapidKeysRecord {
   privateKeyEnc: string
 }
 
+/**
+ * A trunk to an operator (step 6, ADR 0016), as an administrator set it: its settings in `config`, its password
+ * apart, encrypted with SECRETS_KEY (or an `env:NAME` reference, kept as it is). The first one kept serves the callers
+ * no direct number names.
+ */
+export interface TrunkRecord {
+  tenantId: string
+  id: string
+  config: Omit<Trunk, 'id' | 'hasPassword'>
+  passwordEnc?: string
+}
+
+/** A range of direct numbers of a trunk (SDA), and the extension or group it rings. */
+export interface DidRecord extends DidRange {
+  tenantId: string
+}
+
 export interface Store {
   listProviders(): Promise<ProviderRecord[]>
   upsertProvider(record: ProviderRecord): Promise<void>
@@ -174,6 +191,18 @@ export interface Store {
   getVapidKeys(): Promise<VapidKeysRecord | null>
   /** Keeps `keys` unless some are kept already (another instance was first): those kept, either way. */
   initVapidKeys(keys: VapidKeysRecord): Promise<VapidKeysRecord>
+
+  /** The trunks of a tenant, in the order they were first kept. */
+  listTrunks(tenantId: string): Promise<TrunkRecord[]>
+  /** Adds or replaces a trunk; a replaced one keeps its place. */
+  upsertTrunk(record: TrunkRecord): Promise<void>
+  /** Removes a trunk and its direct numbers. Whether it was there. */
+  deleteTrunk(tenantId: string, id: string): Promise<boolean>
+  /** The direct numbers of a tenant, by first number. */
+  listDids(tenantId: string): Promise<DidRecord[]>
+  /** Adds or replaces a range; its trunk must exist in the tenant (else it throws). */
+  upsertDid(record: DidRecord): Promise<void>
+  deleteDid(tenantId: string, id: string): Promise<boolean>
 
   close(): Promise<void>
 }

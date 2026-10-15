@@ -16,6 +16,7 @@ import { historyEntryFor } from './history.js'
 import { ENDED_TTL_SEC, MISSED_TTL_SEC, type PushMessage, type WebPush } from './push.js'
 import type { ProviderRegistry } from './registry.js'
 import { securityHeadersFor, type SecurityOptions } from './security.js'
+import { MAX_DIDS, MAX_TRUNKS, TRUNK_ID, parseDid, parseTrunk, providerTrunks, publicDid, publicTrunk, trunkRecord } from './trunks.js'
 import { MemoryStore } from './store/memory.js'
 import { isMissed, type HistoryEntry, type HistoryQuery, type Store, type UserPresenceRecord } from './store/types.js'
 
@@ -85,6 +86,11 @@ export interface BuildOptions {
    * provider can hold a call for them (capability `push`). Absent: the endpoints say it is not available.
    */
   push?: WebPush
+  /**
+   * The key the passwords of the trunks are encrypted with (SECRETS_KEY, step 6). Absent: a trunk can be kept without
+   * a password only.
+   */
+  secretsKey?: Buffer
   /** Phone access to Meet rooms. Absent when no LiveKit is configured: the endpoints answer 501. */
   conference?: {
     bridge: (tenantId: string) => LiveKitConferenceBridge | undefined
@@ -422,6 +428,26 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
     }
   }
   const started = new Map<string, TelephonyProvider>()
+  // The trunks and direct numbers the store keeps (step 6, ADR 0016): handed to the provider when it starts, in the
+  // tenant's turn, retried until it holds (its database may be late). What it already has is not written again.
+  const trunksFor = async (tenantId: string) => ({ trunks: providerTrunks(await store.listTrunks(tenantId), options.secretsKey), dids: (await store.listDids(tenantId)).map(publicDid) })
+  const restoreTrunks = async (tenantId: string, provider: TelephonyProvider) => {
+    if (!provider.setTrunks) return
+    for (let attempt = 0; !closing; attempt++) {
+      try {
+        await inTurn(tenantId, async () => {
+          const { trunks, dids } = await trunksFor(tenantId)
+          await provider.setTrunks!(trunks, dids)
+        })
+        return
+      } catch (err) {
+        if (closing) return
+        const delay = RESTORE_RETRY_MS[Math.min(attempt, RESTORE_RETRY_MS.length - 1)]!
+        app.log.error({ err, tenantId }, `trunks not handed to the provider, retrying in ${delay / 1000} s`)
+        await new Promise(resolve => setTimeout(resolve, delay).unref())
+      }
+    }
+  }
   // Web Push (ADR 0015). Who can be woken: the holders of an extension with at least one browser subscribed, when
   // the Gateway can send pushes; written where the provider holds calls for them (always in the tenant's turn).
   const push = options.push
@@ -542,6 +568,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
   registry.onCreate = (tenantId, provider) => {
     started.set(tenantId, provider)
     void restorePresences(tenantId, provider)
+    void restoreTrunks(tenantId, provider)
     void (async () => {
       for await (const { extension, event } of provider.subscribe()) {
         try {
@@ -869,6 +896,81 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         const user = await administrator(req)
         const groups = groupsOf(registry.forTenant(user.tenantId))
         if (!(await inTurn(user.tenantId, () => groups.remove(req.params.number)))) throw Object.assign(new Error('No such group'), { statusCode: 404 })
+        return reply.code(204).send()
+      })
+
+      // Trunks to an operator and their direct numbers (capability `trunks`, ADR 0016): administrators only, one change
+      // at a time per tenant. The provider is handed the whole new set first (it checks and writes what its SIP server
+      // reads), then the store keeps it: a set the provider refused is not kept. A password is never shown again.
+      const trunksOf = (provider: TelephonyProvider) => {
+        if (!provider.setTrunks) throw Object.assign(new Error('Trunks are not available on this platform'), { statusCode: 501 })
+        return provider.setTrunks.bind(provider)
+      }
+      const notFound = (what: string) => Object.assign(new Error(`No such ${what}`), { statusCode: 404 })
+      v1.get('/admin/trunks', async req => {
+        const user = await administrator(req)
+        trunksOf(registry.forTenant(user.tenantId))
+        return { items: (await store.listTrunks(user.tenantId)).map(publicTrunk) }
+      })
+      v1.put<{ Params: { id: string } }>('/admin/trunks/:id', async (req, reply) => {
+        const user = await administrator(req)
+        const apply = trunksOf(registry.forTenant(user.tenantId))
+        const id = req.params.id
+        if (!TRUNK_ID.test(id)) throw Object.assign(new Error('id: lower case letters, digits and dashes, 32 at most'), { statusCode: 400, code: 'TRUNK_INVALID' })
+        const { record, created } = await inTurn(user.tenantId, async () => {
+          const records = await store.listTrunks(user.tenantId)
+          const current = records.find(t => t.id === id)
+          if (!current && records.length >= MAX_TRUNKS) throw Object.assign(new Error(`At most ${MAX_TRUNKS} trunks`), { statusCode: 409 })
+          const record = trunkRecord(user.tenantId, id, parseTrunk(req.body, current), current, options.secretsKey)
+          const next = current ? records.map(t => (t.id === id ? record : t)) : [...records, record]
+          await apply(providerTrunks(next, options.secretsKey), (await store.listDids(user.tenantId)).map(publicDid))
+          await store.upsertTrunk(record)
+          return { record, created: !current }
+        })
+        return reply.code(created ? 201 : 200).send(publicTrunk(record))
+      })
+      v1.delete<{ Params: { id: string } }>('/admin/trunks/:id', async (req, reply) => {
+        const user = await administrator(req)
+        const apply = trunksOf(registry.forTenant(user.tenantId))
+        await inTurn(user.tenantId, async () => {
+          const records = await store.listTrunks(user.tenantId)
+          if (!records.some(t => t.id === req.params.id)) throw notFound('trunk')
+          // Its direct numbers go with it.
+          const dids = (await store.listDids(user.tenantId)).filter(d => d.trunkId !== req.params.id).map(publicDid)
+          await apply(providerTrunks(records.filter(t => t.id !== req.params.id), options.secretsKey), dids)
+          await store.deleteTrunk(user.tenantId, req.params.id)
+        })
+        return reply.code(204).send()
+      })
+      v1.get('/admin/dids', async req => {
+        const user = await administrator(req)
+        trunksOf(registry.forTenant(user.tenantId))
+        return { items: (await store.listDids(user.tenantId)).map(publicDid) }
+      })
+      v1.put<{ Params: { id: string } }>('/admin/dids/:id', async (req, reply) => {
+        const user = await administrator(req)
+        const apply = trunksOf(registry.forTenant(user.tenantId))
+        const { did, created } = await inTurn(user.tenantId, async () => {
+          const records = await store.listTrunks(user.tenantId)
+          const dids = (await store.listDids(user.tenantId)).map(publicDid)
+          const current = dids.find(d => d.id === req.params.id)
+          if (!current && dids.length >= MAX_DIDS) throw Object.assign(new Error(`At most ${MAX_DIDS} ranges of direct numbers`), { statusCode: 409 })
+          const did = parseDid(req.params.id, req.body, records, dids)
+          await apply(providerTrunks(records, options.secretsKey), current ? dids.map(d => (d.id === did.id ? did : d)) : [...dids, did])
+          await store.upsertDid({ tenantId: user.tenantId, ...did })
+          return { did, created: !current }
+        })
+        return reply.code(created ? 201 : 200).send(did)
+      })
+      v1.delete<{ Params: { id: string } }>('/admin/dids/:id', async (req, reply) => {
+        const user = await administrator(req)
+        const apply = trunksOf(registry.forTenant(user.tenantId))
+        await inTurn(user.tenantId, async () => {
+          const dids = (await store.listDids(user.tenantId)).map(publicDid)
+          if (!dids.some(d => d.id === req.params.id)) throw notFound('direct number')
+          await apply(providerTrunks(await store.listTrunks(user.tenantId), options.secretsKey), dids.filter(d => d.id !== req.params.id))
+          await store.deleteDid(user.tenantId, req.params.id)
+        })
         return reply.code(204).send()
       })
 

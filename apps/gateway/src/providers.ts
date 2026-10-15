@@ -1,4 +1,4 @@
-import { OpensipsProvider, SubscriberProvisioner, type EventsLogger, type SubscriberProvisionerOptions } from '@twake/provider-opensips'
+import { DEFAULT_TRUNK_SOCKET, OpensipsProvider, SubscriberProvisioner, type EventsLogger, type SubscriberProvisionerOptions } from '@twake/provider-opensips'
 import type { ProviderContext, ProviderFactory } from '@twake/telephony-provider-sdk'
 import { SipSecrets } from './sip-secrets.js'
 import type { Store } from './store/types.js'
@@ -28,6 +28,11 @@ export interface StoredOpensipsConfig {
    * host (`from`: OpenSIPS sends them from the address its kernel picks). Without it: no presence, no history.
    */
   events?: { miUrl: string; listen?: string; advertise?: string; from?: string[] }
+  /**
+   * The UDP socket of OpenSIPS for the trunks (`udp:IP:PORT`, its TRUNK_LISTEN_IP and TRUNK_PORT): where it registers
+   * and calls the operator from (step 6, ADR 0016). OPENSIPS_TRUNK_SOCKET, else udp:127.0.0.1:5070.
+   */
+  trunkSocket?: string
 }
 
 export interface OpensipsFactoryDeps {
@@ -109,6 +114,8 @@ export const storedOpensipsFactory = ({ store, key, env = process.env, provision
         callGroups: provisioner.callGroups({ ready: ensureSchema, tenantId }),
         // Who can be woken for a call (their browser subscribed to notifications), in the same database (ADR 0015).
         pushTargets: provisioner.pushTargets({ ready: ensureSchema, tenantId }),
+        // The trunks to an operator and their direct numbers, as OpenSIPS reads them, in the same database (ADR 0016).
+        trunks: provisioner.trunkTables({ ready: ensureSchema, tenantId, socket: config.trunkSocket ?? env.OPENSIPS_TRUNK_SOCKET ?? DEFAULT_TRUNK_SOCKET }),
         // The SIP accounts follow the mappings: one written for a user who no longer holds the extension goes (ADR 0014).
         accounts: {
           async reconcile(holders) {

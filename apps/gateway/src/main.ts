@@ -9,6 +9,7 @@ import { storedOpensipsFactory, type StoredOpensipsConfig } from './providers.js
 import { WebPush, parsePushServices, parseVapidSubject } from './push.js'
 import { ProviderRegistry } from './registry.js'
 import { PgStore } from './store/pg.js'
+import { trunkFromEnv, trunkRecord } from './trunks.js'
 
 const env = process.env
 const need = (name: string): string => {
@@ -59,6 +60,15 @@ if (env.OPENSIPS_WS_URL && !(await store.listProviders()).some(p => p.tenantId =
 for (const m of parseUserMap(env.DEV_USER_MAP)) if (!(await store.getMappingByUser(tenant, m.userId))) await store.upsertMapping({ tenantId: tenant, ...m })
 
 const key = env.SECRETS_KEY ? parseKey(env.SECRETS_KEY) : undefined
+
+// Step 6 (ADR 0016): a first trunk to the operator and its direct numbers from TRUNK_* (docker/pilot/README.md), when
+// the tenant has none; administrators change them from then on (/v1/admin/trunks, /v1/admin/dids), the variables are
+// not read again. The password is kept encrypted with SECRETS_KEY.
+const seed = trunkFromEnv(env)
+if (seed && !(await store.listTrunks(tenant)).length) {
+  await store.upsertTrunk(trunkRecord(tenant, seed.id, seed.parsed, undefined, key))
+  for (const did of seed.dids) await store.upsertDid({ tenantId: tenant, ...did })
+}
 
 const registry = new ProviderRegistry(await store.listProviders(), [storedOpensipsFactory({ store, ...(key ? { key } : {}) })])
 
@@ -129,6 +139,7 @@ const app = await buildApp(registry, {
   ...(hstsMaxAge !== undefined ? { security: { hstsMaxAge, hstsIncludeSubDomains: env.HSTS_INCLUDE_SUBDOMAINS === '1' } } : {}),
   auth: authenticatorFromEnv(env),
   ...(push ? { push } : {}),
+  ...(key ? { secretsKey: key } : {}),
   ...(conference ? { conference } : {})
 })
 directorySync?.useLogger(app.log)

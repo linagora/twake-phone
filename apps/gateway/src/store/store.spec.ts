@@ -12,7 +12,7 @@ if (process.env.TEST_DATABASE_URL) {
     const store = new PgStore(process.env.TEST_DATABASE_URL!)
     await store.migrate()
     const pool = (store as unknown as { pool: { query(sql: string): Promise<unknown> } }).pool
-    await pool.query('TRUNCATE provider_configs, user_mappings, call_history, sip_credentials, conferences, favorites, user_presence, push_subscriptions, vapid_keys RESTART IDENTITY')
+    await pool.query('TRUNCATE provider_configs, user_mappings, call_history, sip_credentials, conferences, favorites, user_presence, push_subscriptions, vapid_keys, trunk_configs, direct_numbers RESTART IDENTITY')
     return store
   })
 
