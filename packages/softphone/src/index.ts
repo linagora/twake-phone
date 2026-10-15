@@ -25,9 +25,10 @@ export type EndReason = 'hangup' | 'rejected' | 'busy' | 'no-answer' | 'unavaila
 
 /**
  * Why the SIP server refused a call to the public network (step 6, ADR 0016), as its REFUSED_HEADER says (with 403,
- * 484 or 503): an emergency number (to call from another phone), a premium, international or overseas one (not
- * allowed), a number that is none (`invalid`), no trunk to reach the operator (`no-trunk`). Any other word:
- * `not-allowed`.
+ * 484 or 503): an emergency number while no operator is connected (to call from another phone), a premium,
+ * international or overseas one (not allowed), a number that is none (`invalid`), no trunk to reach the operator, or
+ * one that does not work (`no-trunk`). Any other word: `not-allowed`. A transfer refused because the call is with the
+ * public network says `transfer-external` (a CallError of that code).
  */
 export type CallRefusal = 'emergency' | 'premium' | 'international' | 'overseas' | 'invalid' | 'no-trunk' | 'not-allowed'
 export const REFUSED_HEADER = 'Twake-Call-Refused'
@@ -86,6 +87,7 @@ export type CallErrorCode =
   | 'transfer-in-progress'
   | 'transfer-self'
   | 'transfer-refused'
+  | 'transfer-external'
   | 'transfer-failed'
   | 'transfer-no-answer'
 
@@ -597,10 +599,12 @@ class WebCall implements SoftCall {
       const timer = setTimeout(() => settle(new CallError('transfer-no-answer', 'Transfer failed: no answer', undefined, 'no-answer')), TRANSFER_TIMEOUT_MS)
       this.referPending = settle
       this.changed(this)
-      subscriber.on('requestFailed', (e: { response?: { status_code?: number; reason_phrase?: string } | null; cause?: string }) => {
+      subscriber.on('requestFailed', (e: { response?: { status_code?: number; reason_phrase?: string; getHeader?: (name: string) => string | undefined } | null; cause?: string }) => {
         const status = e.response?.status_code
         const detail = e.response ? `${e.response.status_code} ${e.response.reason_phrase ?? ''}`.trim() : (e.cause ?? 'no answer')
-        settle(new CallError('transfer-refused', `Transfer refused: ${detail}`, status, status === undefined ? 'no-answer' : STATUS_TO_REASON[status] ?? 'failed'))
+        // A call with the public network: the SIP server transfers none yet (step 6a).
+        const external = status === 403 && e.response?.getHeader?.(REFUSED_HEADER)?.trim().toLowerCase() === 'transfer-external'
+        settle(new CallError(external ? 'transfer-external' : 'transfer-refused', `Transfer refused: ${detail}`, status, status === undefined ? 'no-answer' : STATUS_TO_REASON[status] ?? 'failed'))
       })
       subscriber.on('failed', (e: { status_line?: { status_code?: string; reason_phrase?: string } }) => {
         const status = Number(e.status_line?.status_code) || undefined

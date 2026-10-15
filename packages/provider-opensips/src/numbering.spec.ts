@@ -1,14 +1,15 @@
 import { describe, expect, it } from 'vitest'
-import { DIALPLAN_RULES, DIALPLAN_SQL, DP_CLASSIFY, DP_NORMALISE, OUTBOUND_ALLOWED, classify, translate } from './numbering.js'
+import { DIALPLAN_RULES, DIALPLAN_SQL, DP_CLASSIFY, DP_INBOUND, DP_NORMALISE, OUTBOUND_ALLOWABLE, OUTBOUND_ALLOWED, classify, translate } from './numbering.js'
 
-// Fictional numbers only: ARCEP reserves 01 99 00 xx xx and 06 39 98 xx xx for fiction, Ofcom 020 7946 0xxx. The
-// other kinds of numbers are written with a subscriber part of zeros.
+// Fictional numbers only: ARCEP reserves 01 99 00 xx xx and 06 39 98 xx xx for fiction (the latter in the block of
+// Mayotte, 0639: an overseas number), Ofcom 020 7946 0xxx. The other kinds of numbers are written with a subscriber
+// part of zeros.
 
 describe('the numbering plan (dialplan, dpid 1 then 2)', () => {
   it('writes a French number in E.164 whichever way it is dialled or received', () => {
-    for (const input of ['0639980001', '+33639980001', '+330639980001', '0033639980001', '00330639980001', '33639980001'])
-      expect(classify(input), input).toEqual({ number: '+33639980001', class: 'mobile' })
-    expect(classify('0199000101')).toEqual({ number: '+33199000101', class: 'fixed' })
+    for (const input of ['0199000101', '+33199000101', '+330199000101', '0033199000101', '00330199000101', '33199000101'])
+      expect(classify(input), input).toEqual({ number: '+33199000101', class: 'fixed' })
+    expect(classify('0600000000')).toEqual({ number: '+33600000000', class: 'mobile' })
     expect(classify('0900000000')).toEqual({ number: '+33900000000', class: 'fixed' })
     expect(classify('0700000000')).toEqual({ number: '+33700000000', class: 'mobile' })
   })
@@ -34,6 +35,30 @@ describe('the numbering plan (dialplan, dpid 1 then 2)', () => {
     expect(classify('00590590000000')?.class).toBe('overseas')
   })
 
+  it('classes the overseas numbers of the French plan as overseas however they are written, not as fixed or mobile', () => {
+    // Réunion and Mayotte, Guadeloupe (with Saint-Martin and Saint-Barthélemy), Guiana, Martinique: fixed and mobile.
+    for (const prefix of ['0262', '0263', '0269', '0590', '0594', '0596', '0639', '0690', '0691', '0692', '0693', '0694', '0696', '0697']) {
+      const national = `${prefix}000000`
+      const e164 = `+33${national.slice(1)}`
+      for (const input of [national, e164, `0033${national.slice(1)}`]) expect(classify(input), input).toEqual({ number: e164, class: 'overseas' })
+    }
+    // ARCEP's fictional mobile numbers are in the block of Mayotte.
+    expect(classify('06 39 98 00 01'.replace(/ /g, ''))).toEqual({ number: '+33639980001', class: 'overseas' })
+    // Their metropolitan neighbours stay fixed or mobile.
+    for (const n of ['0261000000', '0264000000', '0591000000', '0595000000']) expect(classify(n)?.class, n).toBe('fixed')
+    for (const n of ['0638000000', '0640000000', '0698000000', '0699000000']) expect(classify(n)?.class, n).toBe('mobile')
+  })
+
+  it('reads the nine-digit national form some operators send, only for what they send', () => {
+    expect(classify('199000101', { inbound: true })).toEqual({ number: '+33199000101', class: 'fixed' })
+    expect(classify('639980002', { inbound: true })).toEqual({ number: '+33639980002', class: 'overseas' })
+    expect(translate(DP_INBOUND, '199000101')).toEqual({ output: '+33199000101', attrs: 'e164' })
+    // Dialled, nine digits are no public number (an extension could have them); the rules of dpid 1 come first.
+    expect(classify('199000101')).toBeNull()
+    expect(classify('0199000101', { inbound: true })).toEqual({ number: '+33199000101', class: 'fixed' })
+    expect(classify('12345678', { inbound: true })).toBeNull()
+  })
+
   it('refuses what looks like a public number and is none, rather than taking it for an extension', () => {
     for (const n of ['0', '06399800', '063998000123', '+33', '+3363998', '+336399800012', '+0123456789', '0033', '+12', '00']) expect(classify(n)?.class, n).toBe('invalid')
   })
@@ -42,13 +67,15 @@ describe('the numbering plan (dialplan, dpid 1 then 2)', () => {
     for (const n of ['101', '104', '200', 'alice', 'anonymous', '']) expect(classify(n), n).toBeNull()
   })
 
-  it('lets out, in 6a, the metropolitan numbers that cost nothing more than a call', () => {
+  it('lets out, by default, the metropolitan numbers that cost nothing more than a call; overseas and abroad only when a trunk allows them, premium never', () => {
     expect([...OUTBOUND_ALLOWED].sort()).toEqual(['fixed', 'freephone', 'mobile', 'standard-rate'])
+    expect([...OUTBOUND_ALLOWABLE].sort()).toEqual(['fixed', 'freephone', 'international', 'mobile', 'overseas', 'standard-rate'])
   })
 
   it('tries the rules in ascending priority, as dp_translate does', () => {
     expect(translate(DP_NORMALISE, '0639980001')).toEqual({ output: '+33639980001', attrs: 'e164' })
-    expect(translate(DP_CLASSIFY, '+33639980001')).toEqual({ output: '+33639980001', attrs: 'mobile' })
+    expect(translate(DP_CLASSIFY, '+33639980001')).toEqual({ output: '+33639980001', attrs: 'overseas' })
+    expect(translate(DP_CLASSIFY, '+33600000000')).toEqual({ output: '+33600000000', attrs: 'mobile' })
     const shuffled = [...DIALPLAN_RULES].reverse()
     expect(translate(DP_NORMALISE, '112', shuffled)).toEqual({ output: '112', attrs: 'emergency' })
   })
@@ -62,7 +89,7 @@ describe('the numbering plan (dialplan, dpid 1 then 2)', () => {
       expect((r.repl ?? '').length).toBeLessThanOrEqual(32)
       expect(() => new RegExp(r.match)).not.toThrow()
     }
-    expect(DIALPLAN_SQL).toMatch(/^DELETE FROM dialplan WHERE dpid IN \(1, 2\);/)
+    expect(DIALPLAN_SQL).toMatch(/^DELETE FROM dialplan WHERE dpid IN \(1, 2, 3\);/)
     expect(DIALPLAN_SQL).toContain("(1, 21, 1, '^\\+330?([1-9][0-9]{8})$', 0, '^\\+330?([1-9][0-9]{8})$', '+33\\1', 0, 'e164')")
     expect(DIALPLAN_SQL.match(/\n {2}\(/g)).toHaveLength(DIALPLAN_RULES.length)
   })

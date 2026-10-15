@@ -69,6 +69,11 @@ export interface TelephonyProvider {
    * provider had. The Gateway checked them (ids, numbers, ranges that do not overlap).
    */
   setTrunks?(trunks: (Trunk & { password?: string })[], dids: DidRange[]): Promise<void>
+  /**
+   * Ends an answered call with the public network on the SIP server's side (the operator's leg is not left open): the
+   * Gateway asks it for a call whose browser is gone without hanging up. Throws for any other call.
+   */
+  endCall?(callId: string): Promise<void>
   originate(request: OriginateRequest): Promise<Call>
   /** Releases connections and stops event streams. */
   close(): Promise<void>

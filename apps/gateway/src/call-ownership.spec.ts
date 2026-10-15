@@ -62,3 +62,69 @@ describe('call ownership', () => {
     expect(acted).toEqual(['hangup bob-call'])
   })
 })
+
+describe('calls with the public network whose browser is gone', () => {
+  /** A provider that reports answered calls for alice (101) and records which it is asked to end. */
+  const setup = async (graceMs: number) => {
+    const ended: string[] = []
+    const answered = (id: string, remoteNumber: string): { extension: string; event: TelephonyEvent } => ({ extension: '101', event: { type: 'call.connected', timestamp: new Date().toISOString(), payload: { call: { ...call(id, 'connected'), remoteNumber } } } })
+    const factory: ProviderFactory<unknown> = {
+      type: 'fake',
+      create: () =>
+        ({
+          getStatus: () => 'CONNECTED',
+          getCapabilities: async () => ({}) as never,
+          subscribe: async function* () {
+            yield answered('outside', '+33639980001')
+            yield answered('inside', '102')
+          },
+          // The provider ends a call with the public network only.
+          endCall: async (id: string) => {
+            ended.push(id)
+            if (id === 'inside') throw Object.assign(new Error('internal'), { statusCode: 409 })
+          },
+          close: async () => {}
+        }) as unknown as TelephonyProvider
+    }
+    const store = new MemoryStore()
+    await store.upsertMapping({ tenantId: 'dev', userId: 'alice', extension: '101' })
+    const registry = new ProviderRegistry([{ tenantId: 'dev', type: 'fake', config: {} }], [factory])
+    const app = await buildApp(registry, { store, orphanCallGraceMs: graceMs })
+    registry.startAll()
+    await app.listen({ port: 0 })
+    const port = (app.server.address() as { port: number }).port
+    const open = async () => {
+      const { ticket } = (await app.inject({ method: 'POST', url: '/api/v1/ws-ticket', headers: as('alice') })).json()
+      const ws = new WebSocket(`ws://127.0.0.1:${port}/api/v1/ws?ticket=${ticket}`)
+      await new Promise(resolve => (ws.onmessage = resolve))
+      return ws
+    }
+    const close = (ws: WebSocket) => new Promise(resolve => ((ws.onclose = resolve), ws.close()))
+    await new Promise(r => setTimeout(r, 50)) // let the event pump record the calls
+    return { app, ended, open, close }
+  }
+
+  it('asks the provider to end them once no window of the person is left for the grace period', async () => {
+    const { app, ended, open, close } = await setup(100)
+    const first = await open()
+    const second = await open()
+    await close(first)
+    await new Promise(r => setTimeout(r, 250))
+    // Another window is open: the calls are still the person's.
+    expect(ended).toEqual([])
+    await close(second)
+    await new Promise(r => setTimeout(r, 250))
+    expect(ended.sort()).toEqual(['inside', 'outside'])
+    await app.close()
+  })
+
+  it('leaves them to a person whose window comes back within the grace period', async () => {
+    const { app, ended, open, close } = await setup(300)
+    await close(await open())
+    const again = await open()
+    await new Promise(r => setTimeout(r, 450))
+    expect(ended).toEqual([])
+    await close(again)
+    await app.close()
+  })
+})

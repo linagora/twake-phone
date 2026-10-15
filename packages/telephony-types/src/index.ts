@@ -90,6 +90,14 @@ export type TrunkNumberFormat = 'e164' | 'e164-no-plus' | 'international-00' | '
 /** The audio codecs a trunk may carry (the browser's side is always Opus or G.711 over DTLS-SRTP). */
 export const TRUNK_CODECS = ['PCMA', 'PCMU', 'G722', 'opus'] as const
 export type TrunkCodec = (typeof TRUNK_CODECS)[number]
+/**
+ * The kinds of numbers a trunk may be allowed to call. The emergency numbers are always called, premium numbers never
+ * (step 6b brings rights per profile and caps).
+ */
+export const TRUNK_OUTBOUND_CLASSES = ['fixed', 'mobile', 'freephone', 'standard-rate', 'overseas', 'international'] as const
+export type TrunkOutboundClass = (typeof TRUNK_OUTBOUND_CLASSES)[number]
+/** What a trunk calls when its administrator does not say: metropolitan fixed, mobile, free and standard-rate numbers. */
+export const TRUNK_OUTBOUND_DEFAULT: readonly TrunkOutboundClass[] = ['fixed', 'mobile', 'freephone', 'standard-rate']
 
 /**
  * A SIP trunk: where calls to and from the public network go (step 6, ADR 0016). The password is write-only: it is
@@ -115,13 +123,23 @@ export interface Trunk {
   registrar?: string
   /** Seconds a registration lasts (60 to 3600, 600 by default). */
   registerExpires?: number
-  /** In order of preference. */
+  /**
+   * The codecs the operator's side may use: what the browser offers is kept to these (no transcoding: a codec the
+   * browser does not offer, or one the operator does not take, leaves the call without one).
+   */
   codecs: TrunkCodec[]
   numberFormat: TrunkNumberFormat
   /** Also asserts the number presented in a P-Asserted-Identity (some operators want it). */
   assertIdentity?: boolean
   /** E.164 number presented for those who have no direct number of their own. */
   defaultNumber: string
+  /** The kinds of numbers it calls (TRUNK_OUTBOUND_DEFAULT when absent). */
+  allowed?: TrunkOutboundClass[]
+  /**
+   * The trunk of those who have no direct number (and of the emergency numbers they call): one per tenant. Absent on
+   * every trunk: the first one written.
+   */
+  default?: boolean
   /** Read only. */
   hasPassword?: boolean
 }

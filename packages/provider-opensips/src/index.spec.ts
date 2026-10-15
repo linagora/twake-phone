@@ -316,10 +316,18 @@ describe('OpensipsProvider call rules', () => {
     changed = { dispatcher: true, registrant: false }
     await p.setTrunks([{ ...trunk, proxies: ['192.0.2.21'] }], [])
     expect(reloads()).toEqual(['ds_reload', 'reg_reload', 'dp_reload', 'ds_reload'])
-    // OpenSIPS not answering: written all the same, said so.
+    // OpenSIPS not answering: written, not applied: the change fails (502), and is reloaded at the next one, even one
+    // that changes nothing OpenSIPS reloads.
     sips.state.down = true
+    await expect(p.setTrunks([trunk], [])).rejects.toMatchObject({ statusCode: 502, code: 'TRUNK_RELOAD_FAILED' })
+    expect(warnings).toEqual([expect.stringMatching(/^OpenSIPS: trunks written, ds_reload \(.*\) failed: not applied until it reloads them or restarts$/)])
+    sips.state.down = false
+    changed = { dispatcher: false, registrant: false }
     await p.setTrunks([trunk], [])
-    expect(warnings).toEqual([expect.stringMatching(/^OpenSIPS: ds_reload failed \(.*\); the trunks are read at its next start$/)])
+    expect(reloads()).toEqual(['ds_reload', 'reg_reload', 'dp_reload', 'ds_reload', 'ds_reload'])
+    await p.setTrunks([trunk], [])
+    expect(reloads()).toHaveLength(5)
+    changed = { dispatcher: true, registrant: false }
     // Without the MI: written, read at OpenSIPS's next start.
     const bare = new OpensipsProvider({ websocketUrl: 'wss://sip.example.test', domain: 'sip.example.test', sipSecretFor: async () => 's', trunks, logger: { info: () => undefined, warn: m => void warnings.push(m) } })
     await bare.setTrunks([trunk], [])
@@ -327,6 +335,31 @@ describe('OpensipsProvider call rules', () => {
     // Without the tables: no trunk on this platform.
     expect((await make().getCapabilities()).trunks).toBe(false)
     await expect(make().setTrunks([trunk], [])).rejects.toMatchObject({ statusCode: 501 })
+  })
+
+  it('ends on OpenSIPS an answered call with the public network only, by its Call-ID (dlg_end_dlg)', async () => {
+    const sips = await fakeOpensips()
+    cleanups.push(sips.close)
+    const p = new OpensipsProvider({ websocketUrl: 'wss://sip.example.test', domain: 'sip.example.test', sipSecretFor: async () => 's', events: { miUrl: sips.url }, logger: quiet })
+    cleanups.push(() => p.close())
+    const got: RoutedEvent[] = []
+    void (async () => {
+      for await (const e of p.subscribe()) got.push(e)
+    })()
+    await until('the subscription', () => p.getStatus() === 'CONNECTED')
+    // Fictional numbers (ARCEP's ranges for fiction): a call to a mobile, one from the operator, one to 112, one inside.
+    for (const [callid, caller, callee] of [['out', '101', '+33639980001'], ['in', '+33639980002', '102'], ['sos', '103', '112'], ['inside', '101', '104']]) {
+      sips.push('E_TWAKEPHONE_CALLING', { callid, caller, callee, dialled: callee })
+      sips.push('E_TWAKEPHONE_ANSWERED', { callid, caller, callee, dialled: callee })
+    }
+    sips.push('E_TWAKEPHONE_CALLING', { callid: 'ringing', caller: '101', callee: '+33199000150', dialled: '+33199000150' })
+    await until('the calls', () => got.filter(e => e.event.type === 'call.connected').length >= 4 && got.some(e => e.event.type !== 'call.connected' && 'call' in e.event.payload && e.event.payload.call.id === 'ringing'))
+    for (const id of ['out', 'in', 'sos']) await p.endCall(id)
+    expect(sips.requests.filter(r => r.method === 'dlg_end_dlg').map(r => r.params)).toEqual([['out'], ['in'], ['sos']])
+    await expect(p.endCall('inside')).rejects.toMatchObject({ statusCode: 409 })
+    await expect(p.endCall('ringing')).rejects.toMatchObject({ statusCode: 409 })
+    await expect(p.endCall('nobody')).rejects.toMatchObject({ statusCode: 404 })
+    await expect(make().endCall('out')).rejects.toMatchObject({ statusCode: 501 })
   })
 
   it('writes who can be woken where OpenSIPS reads it, only while it hears the events that say whom to wake', async () => {

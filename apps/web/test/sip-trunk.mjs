@@ -1,8 +1,13 @@
 // A SIP operator for the trunk of the e2e (step 6, ADR 0016): what OVHcloud or any SIP trunk does, as far as the
 // RFCs say, over UDP on this host. It is the registrar of the trunk (digest, 401) and challenges each call it is sent
-// (407); it answers the OPTIONS of OpenSIPS's dispatcher; it answers the calls OpenSIPS sends it (180, then 200 with
-// G.711 A-law) and places calls to the trunk's direct numbers, with media both ways: it sends an A-law tone over RTP
-// and counts the RTP it receives. No retransmissions of its own (the loopback loses no datagram), one SDP per call.
+// (407, or 401 with `challenge: 'www'`); it answers the OPTIONS of OpenSIPS's dispatcher; it answers the calls OpenSIPS
+// sends it (100, 180, then 200 with G.711 A-law), or as the test asks for the next ones (`state.next`: refused at once,
+// after ringing, never answered, challenged for ever); it places calls to the trunk's direct numbers (with an offer,
+// or none: a late offer), sends re-INVITEs without SDP in either kind of call, and records every request it gets in a
+// dialog (REFER, re-INVITE, BYE...). Media both ways: an A-law tone over RTP out, the RTP received counted (sound,
+// and RFC 4733 events). `dead` plays a server that answers nothing at all. Behind a NAT (`nat`): what OpenSIPS
+// announces (TRUNK_ADVERTISE) is reached at its real address. No retransmissions of its own (the loopback loses no
+// datagram).
 import { createHash, randomBytes } from 'node:crypto'
 import { createSocket } from 'node:dgram'
 
@@ -28,6 +33,8 @@ const parse = raw => {
 const one = (msg, name) => msg.headers.get(name)?.[0] ?? ''
 const tagOf = value => /;tag=([^;>\s]+)/.exec(value)?.[1]
 const param = (header, name) => new RegExp(`${name}="([^"]*)"`, 'i').exec(header)?.[1]
+/** The Record-Route of a message, one URI per entry, in order. */
+const routeSet = msg => [...(msg.headers.get('record-route') ?? [])].flatMap(v => v.split(/,\s*(?=<)/))
 
 /** G.711 A-law of a 16-bit sample. */
 const alaw = sample => {
@@ -42,8 +49,11 @@ const alaw = sample => {
 /** 20 ms of a 440 Hz tone at 8 kHz, in A-law: what the operator's side says. */
 const TONE = Buffer.from(Array.from({ length: 160 }, (_, i) => alaw(Math.round(8000 * Math.sin((2 * Math.PI * 440 * i) / 8000)))))
 
-const sdpFor = (port, sessionId) =>
-  ['v=0', `o=operator ${sessionId} 1 IN IP4 127.0.0.1`, 's=-', 'c=IN IP4 127.0.0.1', 't=0 0', `m=audio ${port} RTP/AVP 8 101`, 'a=rtpmap:8 PCMA/8000', 'a=rtpmap:101 telephone-event/8000', 'a=fmtp:101 0-16', 'a=ptime:20', 'a=sendrecv', ''].join('\r\n')
+/** Our SDP: A-law and DTMF events, on the payload type the offer gave them when we answer one (`events`). */
+const sdpFor = (port, sessionId, version = 1, events = 101) =>
+  ['v=0', `o=operator ${sessionId} ${version} IN IP4 127.0.0.1`, 's=-', 'c=IN IP4 127.0.0.1', 't=0 0', `m=audio ${port} RTP/AVP 8 ${events}`, 'a=rtpmap:8 PCMA/8000', `a=rtpmap:${events} telephone-event/8000`, `a=fmtp:${events} 0-16`, 'a=ptime:20', 'a=sendrecv', ''].join('\r\n')
+/** The payload type of DTMF events (RFC 4733) in an offer. */
+const eventsOf = sdp => Number(/^a=rtpmap:(\d+) telephone-event\/8000/m.exec(sdp ?? '')?.[1] ?? 101)
 
 /** Where the far end wants its RTP, from its SDP; and the payload types it offers. */
 const remoteMedia = sdp => {
@@ -51,6 +61,8 @@ const remoteMedia = sdp => {
   const m = /^m=audio (\d+) (\S+) ([\d ]+)/m.exec(sdp)
   return host && m ? { host, port: Number(m[1]), proto: m[2], payloads: m[3].trim().split(' ').map(Number) } : undefined
 }
+/** Whether an SDP is plain RTP, as an operator takes it: RTP/AVP, no ICE, DTLS nor SDES. */
+export const plainRtp = sdp => remoteMedia(sdp)?.proto === 'RTP/AVP' && !/^a=(candidate|fingerprint|crypto|ice-ufrag):/m.test(sdp)
 
 /** One call's media: a socket of its own, a tone every 20 ms to the far end, the RTP received counted. */
 const media = async () => {
@@ -59,23 +71,33 @@ const media = async () => {
     socket.once('error', reject)
     socket.bind(0, '127.0.0.1', resolve)
   })
-  const stats = { sent: 0, received: 0, voiced: 0 }
+  // events: RFC 4733 packets (a dynamic payload type, four bytes: the tone, end and volume, duration), the tones the
+  // far end sent, whatever payload type its side gave them.
+  const stats = { sent: 0, received: 0, voiced: 0, events: 0 }
   socket.on('message', buf => {
     if (buf.length < 12 || buf[0] >> 6 !== 2) return
     stats.received++
-    // A-law silence is 0xD5 (and 0x55): a packet with other values carries sound.
     const payload = buf.subarray(12)
+    if ((buf[1] & 0x7f) >= 96 && payload.length === 4 && payload[0] <= 15) {
+      stats.events++
+      return
+    }
+    // A-law silence is 0xD5 (and 0x55): a packet with other values carries sound.
     if (payload.some(b => b !== 0xd5 && b !== 0x55)) stats.voiced++
   })
   let timer
+  let target
   const ssrc = randomBytes(4).readUInt32BE(0)
   let seq = Math.floor(Math.random() * 1000)
   let ts = Math.floor(Math.random() * 100000)
   return {
     port: socket.address().port,
     stats,
+    /** Sends to `to` from now on (a new answer moves it). */
     start(to) {
-      if (timer || !to) return
+      if (!to) return
+      target = to
+      if (timer) return
       timer = setInterval(() => {
         const header = Buffer.alloc(12)
         header[0] = 0x80
@@ -84,7 +106,7 @@ const media = async () => {
         header.writeUInt32BE(ts >>> 0, 4)
         header.writeUInt32BE(ssrc, 8)
         ts += 160
-        socket.send(Buffer.concat([header, TONE]), to.port, to.host)
+        socket.send(Buffer.concat([header, TONE]), target.port, target.host)
         stats.sent++
       }, 20)
     },
@@ -102,10 +124,11 @@ const media = async () => {
 
 /**
  * The operator, on 127.0.0.1 (a random port unless `port`): `opensips` is OpenSIPS's trunk socket ("host:port"),
- * `user` and `password` the trunk's credentials, `realm` the realm of its challenges. `bind` another loopback
- * address plays someone who is not the operator.
+ * `user` and `password` the trunk's credentials, `realm` the realm of its challenges, `challenge` how it challenges
+ * the calls ('proxy': 407, 'www': 401). `bind` another loopback address plays someone who is not the operator. `nat`:
+ * addresses OpenSIPS announces ("host:port") and where they really are, as a NAT in front of it would map them.
  */
-export const startOperator = async ({ opensips, user, password, realm = 'operator.example', domain = 'operator.example', bind = '127.0.0.1', port = 0, answerDelayMs = 300 }) => {
+export const startOperator = async ({ opensips, user, password, realm = 'operator.example', domain = 'operator.example', bind = '127.0.0.1', port = 0, answerDelayMs = 300, challenge = 'proxy', nat = {} }) => {
   const [osHost, osPort] = opensips.split(':')
   const socket = createSocket('udp4')
   await new Promise((resolve, reject) => {
@@ -113,9 +136,13 @@ export const startOperator = async ({ opensips, user, password, realm = 'operato
     socket.bind(port, bind, resolve)
   })
   const address = `${bind}:${socket.address().port}`
-  const send = (text, host = osHost, p = Number(osPort)) => new Promise((resolve, reject) => socket.send(text, p, host, err => (err ? reject(err) : resolve())))
+  const send = (text, host = osHost, p = Number(osPort)) => {
+    const real = nat[`${host}:${p}`]
+    const [h, rp] = real ? real.split(':') : [host, p]
+    return new Promise((resolve, reject) => socket.send(text, Number(rp), h, err => (err ? reject(err) : resolve())))
+  }
   const nonces = new Set()
-  const challenge = () => {
+  const challengeHeader = () => {
     const nonce = token()
     nonces.add(nonce)
     return `Digest realm="${realm}", nonce="${nonce}", algorithm=MD5, qop="auth"`
@@ -135,8 +162,12 @@ export const startOperator = async ({ opensips, user, password, realm = 'operato
     return param(authorization, 'response') === expected
   }
 
-  // refuseWith: the final answer to the calls OpenSIPS sends ("486 Busy Here"), instead of answering them.
-  const state = { options: 0, registrations: [], invites: [], challenged: 0, refuseWith: undefined }
+  // refuseWith: the final answer to the calls OpenSIPS sends ("486 Busy Here"), instead of answering them. next: how
+  // to treat the next calls, one entry each: { reply, headers } (a final answer at once), { ringThen } (100 and 180,
+  // then that final answer), { ringOnly: true } (100 and 180, nothing more), { silent: true } (no answer at all),
+  // { rejectAuth: true } (challenged again whatever the credentials). dead: a server that answers nothing, OPTIONS
+  // included. requests: every request received (method, Request-URI, headers, body), in order.
+  const state = { options: 0, registrations: [], invites: [], attempts: [], challenged: 0, refuseWith: undefined, next: [], dead: false, requests: [] }
   const waiters = new Set()
   const changed = () => {
     for (const w of waiters) w()
@@ -173,7 +204,7 @@ export const startOperator = async ({ opensips, user, password, realm = 'operato
     const via = one(req, 'via')
     const rport = /;rport=(\d+)/.exec(via)?.[1]
     const received = /;received=([\d.]+)/.exec(via)?.[1]
-    const sent = /^SIP\/2\.0\/UDP ([\d.]+):?(\d+)?/.exec(via)
+    const sent = /^SIP\/2\.0\/UDP ([\w.-]+):?(\d+)?/.exec(via)
     return send(lines.join('\r\n'), received ?? sent?.[1] ?? osHost, Number(rport ?? sent?.[2] ?? 5060))
   }
 
@@ -181,15 +212,76 @@ export const startOperator = async ({ opensips, user, password, realm = 'operato
   const dialogs = new Map()
   /** Calls we placed, by Call-ID. */
   const placed = new Map()
+  /** The branches of the INVITEs we leave unanswered: their retransmissions too. */
+  const silenced = new Set()
   const responses = []
+  const withBody = (lines, b = '') => [...lines, ...(b ? ['Content-Type: application/sdp'] : []), `Content-Length: ${Buffer.byteLength(b)}`, '', b].join('\r\n')
+  const response = (callId, cseq, accept, what, timeoutMs = 15_000) =>
+    until(what, () => {
+      const i = responses.findIndex(r => one(r, 'call-id') === callId && one(r, 'cseq') === cseq && accept(r))
+      return i < 0 ? undefined : responses.splice(i, 1)[0]
+    }, timeoutMs)
 
-  socket.on('message', async (buf, rinfo) => {
+  /**
+   * A request of ours in the dialog of `call`, as its UAC (placed) or UAS (received) side: to the remote target,
+   * through the route set; resolves with its final answer.
+   */
+  const inDialog = async (call, method, { body = '', extra = [] } = {}) => {
+    const cseq = (call.cseq = (call.cseq ?? 1) + 1)
+    const b = `z9hG4bK${token()}`
+    const lines = [
+      `${method} ${call.remoteTarget} SIP/2.0`,
+      `Via: SIP/2.0/UDP ${address};branch=${b};rport`,
+      'Max-Forwards: 70',
+      `From: ${call.local}`,
+      `To: ${call.remote}`,
+      `Call-ID: ${call.callId}`,
+      `CSeq: ${cseq} ${method}`,
+      `Contact: <sip:operator@${address}>`,
+      ...call.route.map(r => `Route: ${r}`),
+      ...extra
+    ]
+    await send(withBody(lines, body))
+    if (method === 'ACK') return undefined
+    return response(call.callId, `${cseq} ${method}`, r => r.status >= 200, `the answer to our ${method}`)
+  }
+  /** A re-INVITE of ours without SDP (an operator refreshing its session): our answer in the ACK of its 2xx. */
+  const reinvite = async call => {
+    const answer = await inDialog(call, 'INVITE')
+    call.offers = [...(call.offers ?? []), answer]
+    if (answer.status >= 200 && answer.status < 300) {
+      const far = remoteMedia(answer.body)
+      call.version = (call.version ?? 1) + 1
+      await send(
+        withBody(
+          [
+            `ACK ${call.remoteTarget} SIP/2.0`,
+            `Via: SIP/2.0/UDP ${address};branch=z9hG4bK${token()};rport`,
+            'Max-Forwards: 70',
+            `From: ${call.local}`,
+            `To: ${call.remote}`,
+            `Call-ID: ${call.callId}`,
+            `CSeq: ${call.cseq} ACK`,
+            `Contact: <sip:operator@${address}>`,
+            ...call.route.map(r => `Route: ${r}`)
+          ],
+          sdpFor(call.media.port, call.sessionId, call.version, eventsOf(answer.body))
+        )
+      )
+      call.media.start(far)
+    }
+    return answer
+  }
+
+  socket.on('message', async buf => {
     const msg = parse(buf.toString())
+    if (state.dead) return
     if (msg.status !== undefined) {
       responses.push(msg)
       changed()
       return
     }
+    state.requests.push({ method: msg.method, uri: msg.uri, headers: msg.headers, body: msg.body, callId: one(msg, 'call-id') })
     const callId = one(msg, 'call-id')
     switch (msg.method) {
       case 'OPTIONS':
@@ -199,51 +291,90 @@ export const startOperator = async ({ opensips, user, password, realm = 'operato
         break
       case 'REGISTER': {
         if (!authorized(one(msg, 'authorization'), 'REGISTER')) {
-          await reply(msg, '401 Unauthorized', { headers: [`WWW-Authenticate: ${challenge()}`] })
+          await reply(msg, '401 Unauthorized', { headers: [`WWW-Authenticate: ${challengeHeader()}`] })
           break
         }
         const expires = Number(/expires=(\d+)/i.exec(one(msg, 'contact'))?.[1] ?? one(msg, 'expires') ?? 3600)
-        state.registrations.push({ aor: one(msg, 'to'), contact: one(msg, 'contact'), expires, from: `${rinfo.address}:${rinfo.port}` })
+        state.registrations.push({ aor: one(msg, 'to'), contact: one(msg, 'contact'), via: one(msg, 'via'), expires, from: `${msg.headers.get('via')?.[0]}` })
         await reply(msg, '200 OK', { headers: [`Expires: ${expires}`], toTag: token() })
         changed()
         break
       }
       case 'INVITE': {
-        const known = dialogs.get(callId)
-        if (known) {
-          // A re-INVITE (hold): our same SDP.
-          await reply(msg, '200 OK', { body: sdpFor(known.media.port, known.sessionId), toTag: known.tag })
+        const known = dialogs.get(callId) ?? placed.get(callId)
+        if (known && tagOf(one(msg, 'to'))) {
+          // A re-INVITE (hold, resume, a late offer): our same media, a new version of our SDP.
+          known.reinvites.push(msg)
+          known.version = (known.version ?? 1) + 1
+          const far = remoteMedia(msg.body)
+          if (far) known.media.start(far)
+          await reply(msg, '200 OK', { body: sdpFor(known.media.port, known.sessionId, known.version, known.events ?? (msg.body ? eventsOf(msg.body) : 101)), toTag: known.tag })
+          changed()
           break
         }
-        if (!authorized(one(msg, 'proxy-authorization'), 'INVITE')) {
+        const branch = /;branch=([^;,\s]+)/.exec(one(msg, 'via'))?.[1]
+        if (silenced.has(branch)) break
+        state.attempts.push(msg)
+        const behaviour = state.next[0]
+        if (behaviour?.silent) {
+          silenced.add(branch)
+          state.next.shift()
+          changed()
+          break
+        }
+        const authHeader = challenge === 'www' ? one(msg, 'authorization') : one(msg, 'proxy-authorization')
+        if (behaviour?.rejectAuth || !authorized(authHeader, 'INVITE')) {
+          if (behaviour?.rejectAuth && authHeader) state.next.shift()
           state.challenged++
-          await reply(msg, '407 Proxy Authentication Required', { headers: [`Proxy-Authenticate: ${challenge()}`], toTag: token() })
+          await reply(msg, challenge === 'www' ? '401 Unauthorized' : '407 Proxy Authentication Required', { headers: [`${challenge === 'www' ? 'WWW' : 'Proxy'}-Authenticate: ${challengeHeader()}`], toTag: token() })
+          changed()
           break
         }
-        const call = { invite: msg, tag: token(), sessionId: Date.now(), media: await media(), far: remoteMedia(msg.body), state: 'ringing' }
+        if (behaviour) state.next.shift()
+        const tag = token()
+        const call = { invite: msg, tag, sessionId: Date.now(), media: await media(), far: remoteMedia(msg.body), events: msg.body ? eventsOf(msg.body) : 101, state: 'ringing', reinvites: [], requests: [] }
+        // As the UAS of this dialog: our tag in the To, the route set as received, the far end at its Contact.
+        Object.assign(call, { callId, local: `${one(msg, 'to')};tag=${tag}`, remote: one(msg, 'from'), route: routeSet(msg), remoteTarget: /<([^>]+)>/.exec(one(msg, 'contact'))?.[1] })
         dialogs.set(callId, call)
         state.invites.push(call)
         changed()
+        if (behaviour?.reply) {
+          call.state = 'refused'
+          call.media.stop()
+          await reply(msg, behaviour.reply, { headers: behaviour.headers ?? [], toTag: tag })
+          changed()
+          break
+        }
         await reply(msg, '100 Trying')
-        await reply(msg, '180 Ringing', { toTag: call.tag })
+        await reply(msg, '180 Ringing', { toTag: tag })
+        if (behaviour?.ringOnly) break
         setTimeout(async () => {
           if (call.state !== 'ringing') return
-          if (state.refuseWith) {
+          const refusal = behaviour?.ringThen ?? state.refuseWith
+          if (refusal) {
             call.state = 'refused'
             call.media.stop()
-            await reply(msg, state.refuseWith, { toTag: call.tag })
+            await reply(msg, refusal, { toTag: tag })
             changed()
             return
           }
           call.state = 'answered'
-          await reply(msg, '200 OK', { body: sdpFor(call.media.port, call.sessionId), toTag: call.tag })
+          await reply(msg, '200 OK', { body: sdpFor(call.media.port, call.sessionId, 1, call.events), toTag: tag })
           call.media.start(call.far)
           changed()
-        }, answerDelayMs)
+        }, behaviour?.ringThen ? (behaviour.afterMs ?? answerDelayMs) : answerDelayMs)
         break
       }
-      case 'ACK':
+      case 'ACK': {
+        // The answer to an offer we made in a 2xx (a call OpenSIPS sent us without SDP).
+        const call = dialogs.get(callId)
+        const far = remoteMedia(msg.body)
+        if (call && far) {
+          call.far = far
+          call.media.start(far)
+        }
         break
+      }
       case 'CANCEL': {
         await reply(msg, '200 OK')
         const call = dialogs.get(callId)
@@ -259,22 +390,21 @@ export const startOperator = async ({ opensips, user, password, realm = 'operato
         await reply(msg, '200 OK')
         const call = dialogs.get(callId) ?? placed.get(callId)
         if (call) {
+          call.requests?.push(msg)
           call.state = 'ended'
           call.media.stop()
         }
         changed()
         break
       }
-      default:
-        await reply(msg, '200 OK')
+      default: {
+        // REFER, INFO, NOTIFY... in a dialog: recorded, accepted as an operator executing it would.
+        ;(dialogs.get(callId) ?? placed.get(callId))?.requests?.push(msg)
+        await reply(msg, msg.method === 'REFER' ? '202 Accepted' : '200 OK')
+        changed()
+      }
     }
   })
-
-  const response = (callId, cseq, accept, what, timeoutMs = 15_000) =>
-    until(what, () => {
-      const i = responses.findIndex(r => one(r, 'call-id') === callId && one(r, 'cseq') === cseq && accept(r))
-      return i < 0 ? undefined : responses.splice(i, 1)[0]
-    }, timeoutMs)
 
   return {
     address,
@@ -285,21 +415,35 @@ export const startOperator = async ({ opensips, user, password, realm = 'operato
     probed: (count = 1, timeoutMs = 40_000) => until(`${count} OPTIONS from the dispatcher`, () => state.options >= count, timeoutMs),
     /** The next call OpenSIPS sends us that `test` takes (its INVITE, after the challenge), with its media. */
     invited: (test = () => true, timeoutMs = 20_000) => until('a call from OpenSIPS', () => state.invites.find(c => !c.seen && test(c.invite)), timeoutMs).then(c => ((c.seen = true), c)),
-    /** Waits for `call` (one we received or placed) to reach `wanted` ('answered', 'ended', 'cancelled'). */
+    /** Waits for `call` (one we received or placed) to reach `wanted` ('answered', 'ended', 'cancelled', 'refused'). */
     callState: (call, wanted, timeoutMs = 20_000) => until(`the call in state ${wanted}`, () => call.state === wanted, timeoutMs),
+    /** Resolves once `test` holds (re-checked at each message). */
+    until,
+    /** Sends a re-INVITE without SDP in `call` (received or placed): resolves with the 2xx and its offer, answered. */
+    reinvite,
+    /** Any request of ours in the dialog of `call` (a REFER, an INFO...): resolves with its final answer. */
+    request: (call, method, { body, extra } = {}) => inDialog(call, method, { body, extra }),
+    /** Ends a call OpenSIPS sent us (our BYE). */
+    async hangupReceived(call) {
+      const answer = await inDialog(call, 'BYE')
+      call.state = 'ended'
+      call.media.stop()
+      return answer
+    },
     /**
-     * Calls `number` at OpenSIPS (`ruri`: the Request-URI's user, the number by default; `from`: the caller's number):
-     * resolves with the call, whose `final` is its final answer; on a 200 it ACKs and sends its media.
+     * Calls `number` at OpenSIPS (`ruri`: the Request-URI's user, the number by default; `from`: the caller's number;
+     * `headers`: more of them; `lateOffer`: no SDP, the offer comes in the 2xx and our answer in the ACK): resolves
+     * with the call, whose `final` is its final answer; on a 200 it ACKs and sends its media.
      */
-    async call(number, { from = '+33639980002', ruri = number, timeoutMs = 30_000 } = {}) {
+    async call(number, { from = '+33639980002', ruri = number, timeoutMs = 30_000, headers = [], lateOffer = false } = {}) {
       const callId = `op-${token()}`
       const fromTag = token()
       const m = await media()
       const sessionId = Date.now()
       const uri = `sip:${ruri}@${opensips}`
       const branch = `z9hG4bK${token()}`
-      const body = sdpFor(m.port, sessionId)
-      const call = { callId, media: m, state: 'calling', provisional: [] }
+      const body = lateOffer ? '' : sdpFor(m.port, sessionId)
+      const call = { callId, media: m, sessionId, state: 'calling', provisional: [], reinvites: [], requests: [], local: `<sip:${from}@${domain}>;tag=${fromTag}`, remote: `<sip:${number}@${domain}>`, route: [] }
       placed.set(callId, call)
       // In the dialog (the ACK of a 2xx, the BYE), the Request-URI is the remote target (the answer's Contact), the
       // Route the route set: a Request-URI naming OpenSIPS itself would read as coming from a strict router.
@@ -308,16 +452,15 @@ export const startOperator = async ({ opensips, user, password, realm = 'operato
           `${method} ${target} SIP/2.0`,
           `Via: SIP/2.0/UDP ${address};branch=${b};rport`,
           'Max-Forwards: 70',
-          `From: <sip:${from}@${domain}>;tag=${fromTag}`,
-          `To: ${call.to ?? `<sip:${number}@${domain}>`}`,
+          `From: ${call.local}`,
+          `To: ${call.remote}`,
           `Call-ID: ${callId}`,
           `CSeq: ${cseq} ${method}`,
           `Contact: <sip:operator@${address}>`,
-          ...(call.route ?? []).map(r => `Route: ${r}`),
+          ...call.route.map(r => `Route: ${r}`),
           ...extra
         ]
-      const withBody = (lines, b = '') => [...lines, ...(b ? ['Content-Type: application/sdp'] : []), `Content-Length: ${Buffer.byteLength(b)}`, '', b].join('\r\n')
-      await send(withBody(head('INVITE', 1, branch), body))
+      await send(withBody(head('INVITE', 1, branch, headers), body))
       call.final = response(callId, '1 INVITE', r => r.status >= 200, `the final answer to ${number}`, timeoutMs).then(async answer => {
         call.provisional = responses.filter(r => one(r, 'call-id') === callId && r.status < 200).map(r => r.status)
         if (answer.status >= 300) {
@@ -325,12 +468,14 @@ export const startOperator = async ({ opensips, user, password, realm = 'operato
           call.state = 'failed'
           return answer
         }
-        call.to = one(answer, 'to')
+        call.remote = one(answer, 'to')
         // The route set of the dialog: the Record-Route of the answer, reversed (we are the caller).
-        call.route = [...(answer.headers.get('record-route') ?? [])].flatMap(v => v.split(/,\s*(?=<)/)).reverse()
-        call.remoteTarget = /<([^>]+)>/.exec(one(answer, 'contact'))?.[1]
+        call.route = routeSet(answer).reverse()
+        call.remoteTarget = /<([^>]+)>/.exec(one(answer, 'contact'))?.[1] ?? uri
         call.state = 'answered'
-        await send(withBody(head('ACK', 1, `z9hG4bK${token()}`, [], call.remoteTarget ?? uri)))
+        call.answer = answer
+        // A late offer: the offer is in the 2xx, our answer goes in the ACK.
+        await send(withBody(head('ACK', 1, `z9hG4bK${token()}`, [], call.remoteTarget), lateOffer ? sdpFor(m.port, sessionId, 1, eventsOf(answer.body)) : ''))
         m.start(remoteMedia(answer.body))
         changed()
         return answer
@@ -338,23 +483,24 @@ export const startOperator = async ({ opensips, user, password, realm = 'operato
       call.final.catch(() => undefined)
       call.cancel = () => send(withBody(head('CANCEL', 1, branch)))
       call.hangup = async () => {
-        const b = `z9hG4bK${token()}`
-        await send(withBody(head('BYE', 2, b, [], call.remoteTarget ?? uri)))
+        const answer = await inDialog(call, 'BYE')
         call.state = 'ended'
         m.stop()
-        return response(callId, '2 BYE', r => r.status >= 200, 'the answer to our BYE')
+        return answer
       }
       return call
     },
-    /** Sends any raw request to OpenSIPS's trunk socket and resolves with the final answer. */
-    async raw(method, number) {
-      const callId = `raw-${token()}`
+    /**
+     * Sends any raw request to OpenSIPS's trunk socket and resolves with the final answer; `callId` and `toTag` make
+     * it one that claims a dialog.
+     */
+    async raw(method, number, { callId = `raw-${token()}`, toTag } = {}) {
       const text = [
         `${method} sip:${number}@${opensips} SIP/2.0`,
         `Via: SIP/2.0/UDP ${address};branch=z9hG4bK${token()};rport`,
         'Max-Forwards: 70',
         `From: <sip:+33639980003@${domain}>;tag=${token()}`,
-        `To: <sip:${number}@${domain}>`,
+        `To: <sip:${number}@${domain}>${toTag ? `;tag=${toTag}` : ''}`,
         `Call-ID: ${callId}`,
         `CSeq: 1 ${method}`,
         `Contact: <sip:operator@${address}>`,

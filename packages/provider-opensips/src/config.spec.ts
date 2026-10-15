@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { afterAll, describe, expect, it } from 'vitest'
-import { OUTBOUND_ALLOWED } from './numbering.js'
+import { OUTBOUND_ALLOWABLE } from './numbering.js'
 
 // The OpenSIPS configuration this provider talks to (docker/opensips): rendered by its entrypoint with OpenSIPS
 // itself replaced by a stub, then read as text. The real thing is proven by the SIP e2e.
@@ -313,8 +313,10 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     const callerName = section('route[caller_name]', 'route[group_next]')
     expect(callerName).toContain('if ($avp(named) != NULL)\n\t\treturn(1);')
     expect(callerName.indexOf('if (!($hdr(From) =~ "<"))')).toBeLessThan(callerName.indexOf('uac_replace_from("$var(caller_name)", "");'))
-    // The other: the number a call to the operator presents, in place of the extension (step 6).
-    expect(cfg.match(/uac_replace_from\(/g)).toHaveLength(2)
+    // The others: the number a call to the operator presents, in place of the extension, and the caller of a call from
+    // the operator as read (step 6).
+    expect(cfg.match(/uac_replace_from\(/g)).toHaveLength(3)
+    expect(callerName).toContain('uac_replace_from("", "$avp(caller_uri)");')
     expect(section('route[trunk_out_loaded]', 'route[trunk_number]')).toContain('uac_replace_from("", "sip:$var(from_user)@$avp(t_domain)");')
     // Once the first read resumed (the rules, or the names of a Replaces), before anything rings.
     expect(section('route[rules_loaded]', 'route[rules_step]').indexOf('route(caller_name);')).toBeLessThan(section('route[rules_loaded]', 'route[rules_step]').indexOf('route(rules_step);'))
@@ -333,8 +335,9 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
       expect(inDialog, header).toContain(`remove_hf("${header}");`)
       expect(anyReply, header).toContain(`remove_hf("${header}");`)
     }
-    // Names not read: the From is left as the phone sent it (never emptied).
-    expect(callerName.indexOf('if ($avp(names_read) != 1)\n\t\treturn(-1);')).toBeLessThan(callerName.indexOf('uac_replace_from('))
+    // Names not read: the From is left as the phone sent it (never emptied); a call from the operator excepted, whose
+    // From never reaches a browser.
+    expect(callerName.indexOf('if ($avp(names_read) != 1)\n\t\treturn(-1);')).toBeLessThan(callerName.indexOf('uac_replace_from("$var(caller_name)", "");'))
     const onreply = cfg.slice(cfg.indexOf('onreply_route[rtp] {'), cfg.indexOf('route[event_attrs]'))
     expect(onreply.indexOf('remove_hf("P-Asserted-Identity");')).toBeLessThan(onreply.indexOf('append_hf("P-Asserted-Identity: '))
     expect(onreply).toContain('append_hf("P-Asserted-Identity: \\"$var(pai_name)\\" <sip:$var(pai_ext)@$avp(domain)>\\r\\n");')
@@ -563,7 +566,11 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
       [{ TRUNK_PORT: '50x' }, /TRUNK_PORT must be a port number/],
       [{ TRUNK_PORT: '70000' }, /TRUNK_PORT must be 1 to 65535/],
       [{ TRUNK_LISTEN_IP: '0.0.0.0' }, /TRUNK_LISTEN_IP=0\.0\.0\.0 must be/],
-      [{ TRUNK_ADVERTISE: 'a b' }, /TRUNK_ADVERTISE must be host or host:port/]
+      [{ TRUNK_LISTEN_IP: '2001:db8::1' }, /TRUNK_LISTEN_IP=2001:db8::1 must be an IPv4 address/],
+      [{ TRUNK_ADVERTISE: 'a b' }, /TRUNK_ADVERTISE must be host or host:port/],
+      [{ TRUNK_ADVERTISE: '2001:db8::1' }, /TRUNK_ADVERTISE must be host or host:port/],
+      [{ TRUNK_MAX_CALL_SEC: '59' }, /TRUNK_MAX_CALL_SEC must be 60 to 86400/],
+      [{ TRUNK_MAX_CALL_SEC: '1h' }, /TRUNK_MAX_CALL_SEC must be a number/]
     ] as const) {
       const { status, stderr } = render(env)
       expect(status, JSON.stringify(env)).toBe(1)
@@ -574,9 +581,12 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(cfg).toContain('modparam("dispatcher", "ds_probing_sock", "udp:127.0.0.1:5070")')
     expect(cfg).toContain('modparam("dispatcher", "ds_ping_interval", 15)')
     for (const module of ['dispatcher', 'dialplan', 'uac_auth', 'uac_registrant']) expect(cfg).toContain(`loadmodule "${module}.so"`)
+    // A server that answers nothing is down: the 408 tm makes up for an OPTIONS left unanswered is no answer.
+    const codes = /modparam\("dispatcher", "options_reply_codes", "([0-9,]+)"\)/.exec(cfg)?.[1]?.split(',')
+    expect(codes).toEqual(['401', '403', '404', '405', '407', '500', '501', '503'])
   })
 
-  it('lets out only the numbers allowed, refuses emergency ones before anything else, and says why', () => {
+  it('lets out only the numbers a trunk may call, the emergency ones always, and says why the others are refused', () => {
     const { cfg } = render()
     const section = (name: string, next: string) => cfg.slice(cfg.indexOf(`\n${name} {`), cfg.indexOf(`\n${next} {`))
     const main = cfg.slice(cfg.indexOf('\nroute {'), cfg.indexOf('\nroute[outbound_policy] {'))
@@ -586,20 +596,117 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(classify).toBeGreaterThan(0)
     expect(classify).toBeLessThan(main.indexOf('if (!t_newtran()) {'))
     expect(main.indexOf('if ($var(pstn) == 1) {\n\t\troute(trunk_out);\n\t\texit;\n\t}')).toBeGreaterThan(main.indexOf('if (!t_newtran()) {'))
+    expect(main).toContain('$avp(num_class) = $var(num_class);')
     const policy = section('route[outbound_policy]', 'route[trunk_out]')
-    expect(policy.indexOf('if ($var(num_class) == "emergency") {')).toBeLessThan(policy.indexOf('dp_translate(2,'))
-    expect(policy).toContain('send_reply(403, "Emergency Calls Not Routed");')
+    // An emergency number goes to the trunk, before any other class is read; a premium one never.
+    expect(policy.indexOf('if ($var(num_class) == "emergency") {\n\t\t$var(pstn) = 1;\n\t\treturn(1);\n\t}')).toBeGreaterThan(0)
+    expect(policy.indexOf('if ($var(num_class) == "emergency")')).toBeLessThan(policy.indexOf('dp_translate(2,'))
+    expect(policy).not.toContain('Emergency Calls Not Routed')
     expect(policy).toContain('send_reply(484, "Address Incomplete");')
     expect(policy).toContain('send_reply(403, "Destination Not Allowed");')
-    // The classes allowed are those of OUTBOUND_ALLOWED, nothing else sets $var(pstn).
+    // The classes that may go on are those a trunk may be allowed (OUTBOUND_ALLOWABLE), never `premium`.
     const allowed = [...policy.matchAll(/case "([a-z-]+)":/g)].map(m => m[1]).filter(c => c !== 'invalid')
-    expect(allowed.sort()).toEqual([...OUTBOUND_ALLOWED].sort())
-    expect(cfg.match(/\$var\(pstn\) = 1;/g)).toHaveLength(1)
-    // The trunk's credentials answer its challenge once; a server that fails gives way to the next one.
+    expect(allowed.sort()).toEqual([...OUTBOUND_ALLOWABLE].sort())
+    expect(cfg.match(/\$var\(pstn\) = 1;/g)).toHaveLength(2)
+    expect(policy.match(/\$var\(pstn\) = 1;/g)).toHaveLength(2)
+    // What the trunk allows is checked once it is read; an emergency number skips that check and keeps its digits.
+    const loaded = section('route[trunk_out_loaded]', 'route[trunk_number]')
+    const internal = loaded.indexOf('if ($avp(t_internal) != NULL')
+    const check = loaded.indexOf('if ($avp(num_class) != "emergency") {\n\t\t$var(mark) = "," + $avp(num_class) + ",";')
+    expect([internal, check].every(i => i > 0)).toBe(true)
+    expect(internal).toBeLessThan(check)
+    expect(loaded).toContain('if ($avp(t_allowed) == NULL || $(avp(t_allowed){s.index,$var(mark)}) == NULL) {')
+    expect(loaded).toContain('$var(to_user) = $avp(callee);\n\tif ($avp(num_class) != "emergency") {\n\t\troute(trunk_number, $avp(callee));')
+    // No trunk at all: an emergency number is told to be called from another phone, anything else has no trunk.
+    const noTrunk = loaded.slice(loaded.indexOf('if ($var(trunk_rc) == -2) {'), loaded.indexOf('if ($var(trunk_rc) < 0) {'))
+    expect(noTrunk).toContain('append_to_reply("Twake-Call-Refused: emergency\\r\\n");\n\t\t\tt_reply(403, "Emergency Calls Not Routed");')
+    expect(noTrunk).toContain('append_to_reply("Twake-Call-Refused: no-trunk\\r\\n");\n\t\tt_reply(503, "No Trunk");')
+    // One of our own direct numbers rings inside, as if dialled (its rules, groups...), never through the operator.
+    expect(loaded.slice(internal, check)).toContain('route(rules_next);\n\t\texit;')
+  })
+
+  it('answers the challenge of each server once, never passes one on, and tries another server only while nothing rang', () => {
+    const { cfg } = render()
+    const section = (name: string, next: string) => cfg.slice(cfg.indexOf(`\n${name} {`), cfg.indexOf(`\n${next} {`))
     const failed = section('failure_route[trunk_failed]', 'route[trunk_in]')
-    expect(failed).toContain('if (t_check_status("401|407") && $avp(t_challenged) == NULL')
-    expect(failed).toContain('if (t_check_status("408|500|503") && ds_next_dst()) {')
+    expect(failed).toContain('if ($avp(t_challenged) == NULL && $avp(t_pass) != NULL && $avp(t_pass) != "") {')
+    // A challenge left unanswered (a second one, no password): 503 no-trunk to the browser, not the operator's 401/407.
+    const challenge = failed.slice(failed.indexOf('if (t_check_status("401|407")) {'), failed.indexOf('if (t_check_status("408|5[0-9][0-9]")'))
+    expect(challenge.trimEnd().endsWith('append_to_reply("Twake-Call-Refused: no-trunk\\r\\n");\n\t\tt_reply(503, "Trunk Authentication Failed");\n\t\texit;\n\t}')).toBe(true)
+    // The next server: only for no answer at all or an error before any provisional answer; challenged anew there.
+    const next = failed.slice(failed.indexOf('if (t_check_status("408|5[0-9][0-9]") && $avp(t_rang) == NULL && ds_next_dst()) {'))
+    expect(next.length).toBeGreaterThan(0)
+    expect(next).toContain('$(avp(t_challenged)[*]) = NULL;')
     expect(failed.replace(/#.*$/gm, '').trimEnd().endsWith('rtpengine_delete();\n\troute(account_missed);\n}')).toBe(true)
+    // Any reply of the operator under 200 (100 Trying, 180...) holds the call to that server.
+    expect(section('onreply_route[rtp]', 'route[event_attrs]')).toContain('if ($rs < 200 && $dlg_val(trunk) == "callee")\n\t\t$avp(t_rang) = 1;')
+    expect(section('route[trunk_out_loaded]', 'route[trunk_number]')).toContain('$(avp(t_rang)[*]) = NULL;')
+  })
+
+  it('never lets a call with the operator be transferred by it, from either side', () => {
+    const { cfg } = render()
+    const main = cfg.slice(cfg.indexOf('\nroute {'), cfg.indexOf('\nroute[outbound_policy] {'))
+    const inDialog = main.slice(main.indexOf('if (has_totag()) {'), main.indexOf('if (is_method("CANCEL")) {'))
+    const refer = inDialog.indexOf('if (is_method("REFER") && $dlg_val(trunk) != NULL) {')
+    expect(refer).toBeGreaterThan(inDialog.indexOf('if (!match_dialog()) {'))
+    expect(refer).toBeLessThan(inDialog.indexOf('route(relay);'))
+    expect(inDialog.slice(refer)).toMatch(/^[^]*?send_reply\(403, "Transfer Not Allowed"\);\n\t\t\texit;/)
+    // Nor completed by an INVITE with Replaces of such a call.
+    expect(cfg).toContain('\tif ($dlg_val(trunk) != NULL)\n\t\t$var(replaces_trunk) = 1;\n\tunload_dialog_ctx();')
+    const replaced = main.indexOf('if ($var(replaces_trunk) == 1) {')
+    expect(replaced).toBeGreaterThan(main.indexOf('route(replaces_target);'))
+    expect(replaced).toBeLessThan(main.indexOf('record_route();'))
+  })
+
+  it('hears the operator only on the trunk socket, in a dialog as out of one', () => {
+    const { cfg } = render()
+    const main = cfg.slice(cfg.indexOf('\nroute {'), cfg.indexOf('\nroute[outbound_policy] {'))
+    const known = main.indexOf('if ($socket_in(ip) == "127.0.0.1" && $socket_in(port) == 5070 && !ds_is_in_list("$si", 0)) {')
+    expect(known).toBeGreaterThan(0)
+    expect(known).toBeLessThan(main.indexOf('if (has_totag()) {'))
+  })
+
+  it('makes rtpengine take an offer made in a 2xx (an INVITE without SDP) and its answer in the ACK', () => {
+    const { cfg } = render()
+    const section = (name: string, next: string) => cfg.slice(cfg.indexOf(`\n${name} {`), cfg.indexOf(`\n${next} {`))
+    const main = cfg.slice(cfg.indexOf('\nroute {'), cfg.indexOf('\nroute[outbound_policy] {'))
+    const inDialog = main.slice(main.indexOf('if (has_totag()) {'), main.indexOf('if (is_method("CANCEL")) {'))
+    expect(inDialog).toContain('} else if (is_method("INVITE")) {\n\t\t\troute(late_offer);\n\t\t\tt_on_reply("rtp");\n\t\t}')
+    expect(inDialog).toContain('if (is_method("ACK") && $dlg_val(late_answer) == "1" && has_body_part("application/sdp")) {')
+    expect(section('route[trunk_in]', 'route[inbound_number]')).toContain('if (!has_body_part("application/sdp")) {\n\t\t$(avp(late_offer)[*]) = NULL;\n\t\t$avp(late_offer) = "trunk";')
+    const reply = section('onreply_route[rtp]', 'route[event_attrs]')
+    expect(reply).toContain('if ($avp(late_offer) != NULL) {\n\t\t\tif ($rs >= 200 && $rs < 300)\n\t\t\t\troute(rtp_late_offer);\n\t\t} else {\n\t\t\troute(rtp_answer);')
+    expect(section('route[rtp_late_offer]', 'route')).toContain('$dlg_val(late_answer) = "1";')
+  })
+
+  it('bounds every call with the operator, and ends it with a BYE to both sides at TRUNK_MAX_CALL_SEC', () => {
+    const { cfg } = render({ TRUNK_MAX_CALL_SEC: '7200' })
+    expect(cfg).toContain('\tif ($var(pstn) == 1)\n\t\tcreate_dialog("B");\n\telse\n\t\tcreate_dialog();')
+    expect(cfg.match(/\$DLG_timeout = 7200;/g)).toHaveLength(2)
+    expect(cfg).toContain('\tcreate_dialog("B");\n\t$DLG_timeout = 7200;\n\t$dlg_val(trunk) = "caller";')
+    expect(render().cfg).toContain('$DLG_timeout = 14400;')
+  })
+
+  it('tells the operator nothing of the inside: the number as it writes them in the To, no version, no "do not disturb" nor refusal of ours', () => {
+    const { cfg } = render()
+    const section = (name: string, next: string) => cfg.slice(cfg.indexOf(`\n${name} {`), cfg.indexOf(`\n${next} {`))
+    expect(cfg).toContain('server_header="Server: TwakePhone"\nuser_agent_header="User-Agent: TwakePhone"')
+    expect(section('route[trunk_out_loaded]', 'route[trunk_number]')).toContain('uac_replace_to("", "sip:$var(to_user)@$avp(t_domain)");')
+    const dnd = section('route[dnd_reply]', 'route[forwarded]')
+    expect(dnd.indexOf('if ($dlg_val(trunk) == "caller")\n\t\t$var(dnd_told) = 0;')).toBeLessThan(dnd.indexOf('append_to_reply("Twake-Dnd: 1\\r\\n");'))
+    expect(cfg.slice(cfg.indexOf('\nonreply_route {'), cfg.indexOf('\nonreply_route[rtp] {'))).toContain('remove_hf("Twake-Call-Refused");')
+    expect(section('onreply_route[rtp]', 'route[event_attrs]')).toContain('remove_hf("Twake-Call-Refused");')
+  })
+
+  it('reads the caller of the operator in the national forms only operators send, and hides it under Privacy: id', () => {
+    const { cfg } = render()
+    const section = (name: string, next: string) => cfg.slice(cfg.indexOf(`\n${name} {`), cfg.indexOf(`\n${next} {`))
+    expect(section('route[inbound_number]', 'route[trunk_in_loaded]')).toContain('if (!dp_translate(1, "$var(in)", $var(n), $var(n_class)) && !dp_translate(3, "$var(in)", $var(n), $var(n_class)))')
+    const trunkIn = section('route[trunk_in]', 'route[inbound_number]')
+    for (const what of ['$rU', '$tU', '$fU']) expect(trunkIn).toContain(`route(inbound_number, ${what})`)
+    expect(trunkIn).toContain('if (is_present_hf("Privacy") && $hdr(Privacy) =~ "(^|[;, ])id([;, ]|$)")\n\t\t$var(from_number) = "anonymous";')
+    // The browser sees the caller as read, never the operator's From.
+    expect(section('route[caller_name]', 'route[tables_4c]')).toContain('if ($avp(caller_uri) != NULL) {\n\t\tuac_replace_from("", "$avp(caller_uri)");')
   })
 
   it('takes calls on the trunk socket from the operator only, and rings what its direct number names', () => {
@@ -608,10 +715,7 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     const main = cfg.slice(cfg.indexOf('\nroute {'), cfg.indexOf('\nroute[outbound_policy] {'))
     expect(main).toContain('if ($socket_in(ip) == "127.0.0.1" && $socket_in(port) == 5070) {\n\t\troute(trunk_in);\n\t\texit;\n\t}')
     expect(main.indexOf('route(trunk_in);')).toBeLessThan(main.indexOf('www_authorize('))
-    const trunkIn = section('route[trunk_in]', 'route[trunk_in_loaded]')
-    const known = trunkIn.indexOf('if (!ds_is_in_list("$si", 0)) {')
-    expect(known).toBeGreaterThan(0)
-    expect(known).toBeLessThan(trunkIn.indexOf('if (is_method("ACK"))'))
+    const trunkIn = section('route[trunk_in]', 'route[inbound_number]')
     for (const header of ['Route', 'P-Asserted-Identity', 'P-Preferred-Identity', 'Remote-Party-ID']) expect(trunkIn).toContain(`remove_hf("${header}");`)
     expect(trunkIn).toContain('send_reply(404, "Not Found");')
     // The extension the number reaches rings as if it were dialled: its rules, forwards, "do not disturb", groups, push.

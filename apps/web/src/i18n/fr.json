@@ -262,13 +262,14 @@
   "settings.notificationsError": "Les notifications n'ont pas pu être réglées.",
   "auth.openingCall": "Connexion pour prendre l'appel…",
   "dialer.zeroPlus": "0 (maintenir pour +)",
-  "call.endedRefusedEmergency": "Les numéros d'urgence ne sont pas acheminés depuis Twake Phone : appelez {who} depuis un autre téléphone (mobile ou ligne fixe).",
+  "call.endedRefusedEmergency": "Aucun opérateur n'est relié à Twake Phone : appelez {who} depuis un autre téléphone (mobile ou ligne fixe).",
   "call.endedRefusedPremium": "Les numéros surtaxés ne sont pas autorisés : {who} n'a pas été appelé.",
   "call.endedRefusedInternational": "Les appels vers l'étranger ne sont pas autorisés : {who} n'a pas été appelé.",
   "call.endedRefusedOverseas": "Les appels vers l'outre-mer ne sont pas autorisés : {who} n'a pas été appelé.",
   "call.endedRefusedInvalid": "{who} n'est pas un numéro complet : vérifiez-le.",
-  "call.endedRefusedNoTrunk": "Les appels vers l'extérieur ne sont pas configurés sur cette plateforme : {who} n'a pas été appelé.",
+  "call.endedRefusedNoTrunk": "Les appels vers l'extérieur ne sont pas disponibles pour le moment (aucun opérateur configuré ou joignable) : {who} n'a pas été appelé.",
   "call.endedRefusedNotAllowed": "Ce numéro n'est pas autorisé : {who} n'a pas été appelé.",
-  "call.errorTransferNotAllowed": "Transfert impossible : ce numéro n'est pas autorisé{status}.",
-  "call.hiddenNumber": "Numéro masqué"
+  "call.errorTransferNotAllowed": "Transfert impossible : ce numéro n'est pas autorisé, ou l'appel est avec un correspondant extérieur, que Twake Phone ne transfère pas encore{status}.",
+  "call.hiddenNumber": "Numéro masqué",
+  "call.errorTransferExternal": "Un appel avec un correspondant extérieur ne peut pas encore être transféré : donnez-lui le numéro à rappeler{status}."
 }

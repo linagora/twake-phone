@@ -262,13 +262,14 @@
   "settings.notificationsError": "Notifications could not be set.",
   "auth.openingCall": "Signing in to take the call…",
   "dialer.zeroPlus": "0 (hold for +)",
-  "call.endedRefusedEmergency": "Emergency numbers are not routed from Twake Phone: call {who} from another phone (mobile or landline).",
+  "call.endedRefusedEmergency": "No operator is connected to Twake Phone: call {who} from another phone (mobile or landline).",
   "call.endedRefusedPremium": "Premium-rate numbers are not allowed: {who} was not called.",
   "call.endedRefusedInternational": "Calls abroad are not allowed: {who} was not called.",
   "call.endedRefusedOverseas": "Calls to the French overseas territories are not allowed: {who} was not called.",
   "call.endedRefusedInvalid": "{who} is not a complete number: check it.",
-  "call.endedRefusedNoTrunk": "Outside calls are not set up on this platform: {who} was not called.",
+  "call.endedRefusedNoTrunk": "Outside calls are not available right now (no operator set up or reachable): {who} was not called.",
   "call.endedRefusedNotAllowed": "This number is not allowed: {who} was not called.",
-  "call.errorTransferNotAllowed": "Transfer not possible: this number is not allowed{status}.",
-  "call.hiddenNumber": "Hidden number"
+  "call.errorTransferNotAllowed": "Transfer not possible: this number is not allowed, or the call is with an external party, which Twake Phone does not transfer yet{status}.",
+  "call.hiddenNumber": "Hidden number",
+  "call.errorTransferExternal": "A call with an external party cannot be transferred yet: give them the number to call back{status}."
 }

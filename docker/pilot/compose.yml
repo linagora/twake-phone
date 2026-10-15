@@ -98,6 +98,8 @@ services:
       TRUNK_LISTEN_IP: ${TRUNK_LISTEN_IP:-127.0.0.1}
       TRUNK_PORT: ${TRUNK_PORT:-5070}
       TRUNK_ADVERTISE:
+      # A call with the operator ends by itself after this long (seconds, 60 to 86400; 4 hours by default).
+      TRUNK_MAX_CALL_SEC:
     healthcheck:
       # One MI request over UDP (mi_datagram, loopback): healthy once OpenSIPS answers, not once its fifo exists.
       test: ["CMD", "bash", "-c", "exec 3<>/dev/udp/127.0.0.1/8880 && printf '{\"jsonrpc\":\"2.0\",\"method\":\"version\",\"id\":\"health\"}' >&3 && read -r -t 2 -n 1 _ <&3"]
@@ -160,6 +162,8 @@ services:
       # numbers, written once when there is none (the administration API changes them afterwards). README, "Relier un
       # opérateur".
       OPENSIPS_TRUNK_SOCKET: udp:${TRUNK_LISTEN_IP:-127.0.0.1}:${TRUNK_PORT:-5070}
+      # The address OpenSIPS announces there (its TRUNK_ADVERTISE): what a trunk registers as its binding.
+      OPENSIPS_TRUNK_ADVERTISE: ${TRUNK_ADVERTISE:-}
       TRUNK_ID:
       TRUNK_NAME:
       TRUNK_AUTH:
@@ -175,6 +179,7 @@ services:
       TRUNK_NUMBER_FORMAT:
       TRUNK_ASSERT_IDENTITY:
       TRUNK_DEFAULT_NUMBER:
+      TRUNK_ALLOWED:
       TRUNK_DIDS:
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/ready').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"]

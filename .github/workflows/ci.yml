@@ -79,6 +79,10 @@ jobs:
       fail-fast: false
       matrix:
         browser: [chromium, firefox, msedge]
+    # OpenSIPS annonce au trunk une adresse de documentation (TEST-NET-1), comme derrière un NAT : l'opérateur simulé
+    # la reçoit (enregistrement, Via, Record-Route) et la ramène vers la socket du trunk (docker-compose.sip.yml, e2e).
+    env:
+      TRUNK_ADVERTISE: 192.0.2.10:5070
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

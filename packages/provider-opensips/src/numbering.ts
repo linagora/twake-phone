@@ -6,12 +6,19 @@
 export const DP_NORMALISE = 1
 /** dpid of the rules that say what kind of number an E.164 number is. */
 export const DP_CLASSIFY = 2
+/**
+ * dpid of the rules tried on what the operator sends when DP_NORMALISE knows none: the national forms some operators
+ * use and nobody dials (nine digits without the 0). Never for what a person dials: 612345678 could be an extension.
+ */
+export const DP_INBOUND = 3
 
 /**
- * What a number is. `emergency`: a French emergency number, never routed by accident; `e164`: normalised, then
- * classified; `invalid`: looks like a public number (a leading 0 or +) and is none. For an E.164 number: `fixed`
- * (+33 1 to 5 and 9), `mobile` (+33 6 and 7), `freephone` (+33 800 to 805), `standard-rate` (+33 806 to 809, charged as
- * a normal call), `premium` (the other +33 8), `overseas` (the French overseas territories), `international`.
+ * What a number is. `emergency`: a French emergency number (routed to the operator as dialled, whatever the policy);
+ * `e164`: normalised, then classified; `invalid`: looks like a public number (a leading 0 or +) and is none. For an
+ * E.164 number: `fixed` (+33 1 to 5 and 9), `mobile` (+33 6 and 7), `freephone` (+33 800 to 805), `standard-rate`
+ * (+33 806 to 809, charged as a normal call), `premium` (the other +33 8), `overseas` (the French overseas
+ * departments and territories, whether dialled with their own country code or as a French number: +33 262, 263 and
+ * 269, 590, 594 and 596, 639, 690 to 697), `international`.
  */
 export type NumberClass = 'emergency' | 'e164' | 'invalid' | 'fixed' | 'mobile' | 'freephone' | 'standard-rate' | 'premium' | 'overseas' | 'international'
 
@@ -32,7 +39,10 @@ export interface DialplanRule {
 /** The rewrite of a rule that keeps the number as it is. */
 const KEEP = '^(.*)$'
 
-/** The emergency numbers of France: 15, 17, 18, 112, 114 (deaf and hard of hearing), 115, 119, 191, 196, 197, 116000, 116117. */
+/**
+ * The emergency numbers of France: 15, 17, 18, 112, 114 (deaf and hard of hearing), 115, 119, 191, 196, 197, 116000,
+ * and 116117 (the doctors on duty). Routed to the operator as they are (ADR 0016).
+ */
 const EMERGENCY = '^(1[578]|11[2459]|19[167]|116000|116117)$'
 
 /**
@@ -52,6 +62,10 @@ export const DIALPLAN_RULES: readonly DialplanRule[] = [
   // Looks like a public number, is none: refused (484) rather than taken for an extension.
   { dpid: DP_NORMALISE, pr: 90, match: '^[+0]', subst: KEEP, repl: '\\1', attrs: 'invalid' },
 
+  // The overseas departments and territories numbered in the French plan (ARCEP): Réunion and Mayotte (262, 263, 269,
+  // 639, 692, 693), Guadeloupe, Saint-Martin and Saint-Barthélemy (590, 690, 691), Guiana (594, 694), Martinique (596,
+  // 696, 697). Before the fixed and mobile numbers they would otherwise be.
+  { dpid: DP_CLASSIFY, pr: 9, match: '^\\+33(26[239]|59[046]|639|69[0-7])[0-9]{6}$', subst: KEEP, repl: '\\1', attrs: 'overseas' },
   { dpid: DP_CLASSIFY, pr: 10, match: '^\\+33[1-59][0-9]{8}$', subst: KEEP, repl: '\\1', attrs: 'fixed' },
   { dpid: DP_CLASSIFY, pr: 11, match: '^\\+33[67][0-9]{8}$', subst: KEEP, repl: '\\1', attrs: 'mobile' },
   { dpid: DP_CLASSIFY, pr: 12, match: '^\\+3380[0-5][0-9]{6}$', subst: KEEP, repl: '\\1', attrs: 'freephone' },
@@ -62,14 +76,19 @@ export const DIALPLAN_RULES: readonly DialplanRule[] = [
   // Réunion and Mayotte, Saint-Pierre-et-Miquelon, Guadeloupe and the French Antilles, Guiana, Martinique, Wallis and
   // Futuna, New Caledonia, French Polynesia: charged as abroad by most operators.
   { dpid: DP_CLASSIFY, pr: 20, match: '^\\+(262|508|59[046]|68[179])', subst: KEEP, repl: '\\1', attrs: 'overseas' },
-  { dpid: DP_CLASSIFY, pr: 30, match: '^\\+', subst: KEEP, repl: '\\1', attrs: 'international' }
+  { dpid: DP_CLASSIFY, pr: 30, match: '^\\+', subst: KEEP, repl: '\\1', attrs: 'international' },
+
+  { dpid: DP_INBOUND, pr: 10, match: '^([1-9][0-9]{8})$', subst: '^([1-9][0-9]{8})$', repl: '+33\\1', attrs: 'e164' }
 ]
 
 /**
- * The classes of 6a's outbound calls: everything else is refused (route[outbound_policy] of opensips.cfg.tpl, where
- * step 6b's rights and caps will plug in).
+ * The classes a trunk calls when its administrator says nothing (`allowed`): everything else is refused
+ * (route[outbound_policy] and route[trunk_out_loaded] of opensips.cfg.tpl, where step 6b's rights and caps will plug
+ * in). An administrator may add `overseas` and `international` to a trunk; `premium` never goes out in 6a.
  */
 export const OUTBOUND_ALLOWED: readonly NumberClass[] = ['fixed', 'mobile', 'freephone', 'standard-rate']
+/** What a trunk may be allowed to call. */
+export const OUTBOUND_ALLOWABLE: readonly NumberClass[] = [...OUTBOUND_ALLOWED, 'overseas', 'international']
 
 /** dp_translate on these rules: the first match of `dpid` by priority, rewritten, with its class; null when none. */
 export const translate = (dpid: number, input: string, rules: readonly DialplanRule[] = DIALPLAN_RULES): { output: string; attrs: NumberClass } | null => {
@@ -84,11 +103,11 @@ export const translate = (dpid: number, input: string, rules: readonly DialplanR
 }
 
 /**
- * What OpenSIPS makes of a number dialled or received: its E.164 form and class, `emergency` or `invalid` as they
- * are, or null for an extension or a group.
+ * What OpenSIPS makes of a number dialled (or, `inbound`, received from the operator): its E.164 form and class,
+ * `emergency` or `invalid` as they are, or null for an extension or a group.
  */
-export const classify = (input: string): { number: string; class: NumberClass } | null => {
-  const normalised = translate(DP_NORMALISE, input)
+export const classify = (input: string, { inbound = false } = {}): { number: string; class: NumberClass } | null => {
+  const normalised = translate(DP_NORMALISE, input) ?? (inbound ? translate(DP_INBOUND, input) : null)
   if (!normalised) return null
   if (normalised.attrs !== 'e164') return { number: normalised.output, class: normalised.attrs }
   const kind = translate(DP_CLASSIFY, normalised.output)
@@ -101,7 +120,7 @@ const quote = (s: string | undefined) => (s === undefined ? 'NULL' : `'${s.repla
  * The SQL that puts these rules in place of those of the same dpids, in one statement list (one implicit
  * transaction): OpenSIPS loads them at its start, and again on MI `dp_reload`.
  */
-export const DIALPLAN_SQL = `DELETE FROM dialplan WHERE dpid IN (${DP_NORMALISE}, ${DP_CLASSIFY});
+export const DIALPLAN_SQL = `DELETE FROM dialplan WHERE dpid IN (${DP_NORMALISE}, ${DP_CLASSIFY}, ${DP_INBOUND});
 INSERT INTO dialplan (dpid, pr, match_op, match_exp, match_flags, subst_exp, repl_exp, disabled, attrs) VALUES
 ${DIALPLAN_RULES.map(r => `  (${r.dpid}, ${r.pr}, 1, ${quote(r.match)}, 0, ${quote(r.subst)}, ${quote(r.repl)}, 0, ${quote(r.attrs)})`).join(',\n')};
 `

@@ -9,7 +9,7 @@ import { StoreDirectory } from './directory.js'
 import { EventBus } from './events.js'
 import { ProviderRegistry } from './registry.js'
 import { MemoryStore } from './store/memory.js'
-import { parseDid, parseTrunk, providerTrunks, publicTrunk, trunkFromEnv, trunkRecord } from './trunks.js'
+import { defaultTrunk, parseDid, parseTrunk, providerTrunks, publicTrunk, trunkFromEnv, trunkRecord } from './trunks.js'
 
 // Fictional numbers only (ARCEP: 01 99 00 xx xx, 06 39 98 xx xx), documentation addresses (RFC 5737) and names.
 const trunk = { auth: 'register', domain: 'operator.example', proxies: ['192.0.2.20', 'sip2.operator.example:5070'], username: '0033199000100', password: 'not-a-real-one', codecs: ['PCMA', 'PCMU'], defaultNumber: '+33199000100' }
@@ -21,10 +21,14 @@ describe('parseTrunk', () => {
       password: 'not-a-real-one'
     })
     // Recognised by its address: no login needed; the format is E.164 by default.
-    expect(parseTrunk({ auth: 'ip', domain: 'operator.example', sources: ['192.0.2.30', '2001:db8::1'], codecs: ['G722', 'PCMA'], defaultNumber: '+33199000100' })).toEqual({
-      config: { auth: 'ip', domain: 'operator.example', sources: ['192.0.2.30', '2001:db8::1'], codecs: ['G722', 'PCMA'], numberFormat: 'e164', defaultNumber: '+33199000100' },
+    expect(parseTrunk({ auth: 'ip', domain: 'operator.example', sources: ['192.0.2.30', '192.0.2.31'], codecs: ['G722', 'PCMA'], defaultNumber: '+33199000100' })).toEqual({
+      config: { auth: 'ip', domain: 'operator.example', sources: ['192.0.2.30', '192.0.2.31'], codecs: ['G722', 'PCMA'], numberFormat: 'e164', defaultNumber: '+33199000100' },
       password: undefined
     })
+    // A trunk that registers may name the addresses its operator calls from too (its SBCs are not always its
+    // servers); what it may call, and whether it is the default one.
+    expect(parseTrunk({ ...trunk, sources: ['192.0.2.30'], allowed: ['fixed', 'mobile', 'overseas'], default: true }).config).toMatchObject({ sources: ['192.0.2.30'], allowed: ['fixed', 'mobile', 'overseas'], default: true })
+    expect(parseTrunk({ ...trunk, default: false }).config).not.toHaveProperty('default')
   })
 
   it('refuses anything that could not go into a SIP message or the database of the SIP server, naming the field', () => {
@@ -48,7 +52,14 @@ describe('parseTrunk', () => {
       [{ password: 'x'.repeat(65) }, /^password/],
       [{ password: undefined }, /registers needs a username and a password/],
       [{ username: undefined }, /registers needs a username and a password/],
-      [{ sources: ['192.0.2.30'] }, /^sources/],
+      [{ sources: ['2001:db8::1'] }, /^sources/],
+      [{ proxies: ['[2001:db8::20]:5060'] }, /^proxies/],
+      [{ registrar: '[2001:db8::20]' }, /^registrar/],
+      [{ allowed: [] }, /^allowed/],
+      [{ allowed: ['premium'] }, /^allowed/],
+      [{ allowed: ['emergency'] }, /^allowed/],
+      [{ allowed: ['fixed', 'fixed'] }, /^allowed/],
+      [{ default: 'yes' }, /^default/],
       [{ name: 'two\nlines' }, /^name/]
     ]
     for (const [change, error] of bad) {
@@ -80,6 +91,17 @@ describe('parseTrunk', () => {
     // Without SECRETS_KEY: a trunk without a password only.
     expect(() => trunkRecord('A', 'operator', parseTrunk(trunk), undefined, undefined)).toThrow(/SECRETS_KEY/)
     expect(() => providerTrunks([first], undefined)).toThrow(/SECRETS_KEY/)
+  })
+
+  it('hands the default trunk first (the one marked, else the first one): its number is presented by whoever has none', () => {
+    const ip = { auth: 'ip', domain: 'operator.example', codecs: ['PCMA'], defaultNumber: '+33199000100' }
+    const a = trunkRecord('A', 'a', parseTrunk(ip), undefined, undefined)
+    const b = trunkRecord('A', 'b', parseTrunk({ ...ip, defaultNumber: '+33199000200' }), undefined, undefined)
+    const c = trunkRecord('A', 'c', parseTrunk({ ...ip, default: true }), undefined, undefined)
+    expect(defaultTrunk([a, b])?.id).toBe('a')
+    expect(defaultTrunk([a, b, c])?.id).toBe('c')
+    expect(providerTrunks([a, b, c], undefined).map(t => t.id)).toEqual(['c', 'a', 'b'])
+    expect(providerTrunks([], undefined)).toEqual([])
   })
 })
 
@@ -124,16 +146,19 @@ describe('trunkFromEnv', () => {
       TRUNK_USERNAME: '0033199000100',
       TRUNK_PASSWORD: 'not-a-real-one',
       TRUNK_DEFAULT_NUMBER: '+33199000100',
+      TRUNK_SOURCES: '192.0.2.40',
       TRUNK_DIDS: '+33199000101=101, +33199000110..+33199000119=last:3'
     })
     expect(seed).toEqual({
       id: 'operator',
-      parsed: { config: { auth: 'register', domain: 'operator.example', proxies: ['192.0.2.20', '192.0.2.21:5070'], username: '0033199000100', codecs: ['PCMA', 'PCMU'], numberFormat: 'e164', defaultNumber: '+33199000100' }, password: 'not-a-real-one' },
+      parsed: { config: { auth: 'register', domain: 'operator.example', proxies: ['192.0.2.20', '192.0.2.21:5070'], sources: ['192.0.2.40'], username: '0033199000100', codecs: ['PCMA', 'PCMU'], numberFormat: 'e164', defaultNumber: '+33199000100' }, password: 'not-a-real-one' },
       dids: [
         { id: 'operator-1', trunkId: 'operator', first: '+33199000101', last: '+33199000101', target: '101' },
         { id: 'operator-2', trunkId: 'operator', first: '+33199000110', last: '+33199000119', suffixDigits: 3 }
       ]
     })
+    expect(trunkFromEnv({ TRUNK_DOMAIN: 'operator.example', TRUNK_AUTH: 'ip', TRUNK_DEFAULT_NUMBER: '+33199000100', TRUNK_ALLOWED: 'fixed, mobile,overseas' })?.parsed.config.allowed).toEqual(['fixed', 'mobile', 'overseas'])
+    expect(() => trunkFromEnv({ TRUNK_DOMAIN: 'operator.example', TRUNK_AUTH: 'ip', TRUNK_DEFAULT_NUMBER: '+33199000100', TRUNK_ALLOWED: 'premium' })).toThrow(/^TRUNK_\*: allowed/)
     expect(() => trunkFromEnv({ TRUNK_DOMAIN: 'operator.example', TRUNK_DEFAULT_NUMBER: '+33199000100' })).toThrow(/^TRUNK_\*: a trunk that registers needs/)
     expect(() => trunkFromEnv({ TRUNK_DOMAIN: 'operator.example', TRUNK_AUTH: 'ip', TRUNK_DEFAULT_NUMBER: '+33199000100', TRUNK_DIDS: '+33199000101' })).toThrow(/^TRUNK_DIDS: "\+33199000101" is not/)
     expect(() => trunkFromEnv({ TRUNK_DOMAIN: 'operator.example', TRUNK_AUTH: 'ip', TRUNK_DEFAULT_NUMBER: '+33199000100', TRUNK_DIDS: '+33199000101=101,+33199000101=102' })).toThrow(/^TRUNK_DIDS \+33199000101=102: .*operator-1/)
@@ -144,17 +169,26 @@ describe('trunk routes', () => {
   const setup = async (opts: { withTrunks?: boolean; key?: Buffer | null; store?: MemoryStore; refuse?: boolean } = {}) => {
     process.env.AUTH_MODE = 'dev'
     const store = opts.store ?? new MemoryStore()
+    // Who holds the extensions the direct numbers ring (tenant A), and its ring group 200.
+    await store.upsertMapping({ tenantId: 'A', userId: 'alice', extension: '101' })
+    await store.upsertMapping({ tenantId: 'A', userId: 'jean', extension: '102' })
     const handed: { trunks: (Trunk & { password?: string })[]; dids: DidRange[] }[] = []
+    // fail: what the provider throws at the next set it is handed (written, then not reloaded: a 502).
+    const control: { fail?: Error } = {}
     const provider = {
       getStatus: () => 'CONNECTED',
       getCapabilities: async () => ({ trunks: opts.withTrunks !== false }),
       subscribe: async function* () {},
       close: async () => {},
+      listGroups: async () => [{ number: '200', name: 'Accueil', members: ['101'] }],
       ...(opts.withTrunks !== false
         ? {
             setTrunks: async (trunks: (Trunk & { password?: string })[], dids: DidRange[]) => {
               if (opts.refuse) throw Object.assign(new Error('refused by the SIP server'), { statusCode: 400 })
               handed.push({ trunks, dids })
+              const fail = control.fail
+              control.fail = undefined
+              if (fail) throw fail
             }
           }
         : {})
@@ -172,7 +206,7 @@ describe('trunk routes', () => {
     })
     registry.startAll()
     const as = (user: string, roles?: string, tenant = 'A') => ({ 'x-dev-user': user, 'x-dev-tenant': tenant, ...(roles ? { 'x-dev-roles': roles } : {}) })
-    return { app, as, admin: as('root', 'twakephone-admin'), handed, store, key }
+    return { app, as, admin: as('root', 'twakephone-admin'), handed, store, key, control }
   }
 
   it('lets an administrator set a trunk and its direct numbers, hands them whole to the provider, never shows the password', async () => {
@@ -240,6 +274,60 @@ describe('trunk routes', () => {
     expect((await keyless.app.inject({ method: 'PUT', url: '/api/v1/admin/trunks/operator', headers: keyless.admin, payload: trunk })).statusCode).toBe(501)
     const { password: _password, ...withoutPassword } = trunk
     expect((await keyless.app.inject({ method: 'PUT', url: '/api/v1/admin/trunks/operator', headers: keyless.admin, payload: { ...withoutPassword, auth: 'ip' } })).statusCode).toBe(201)
+  })
+
+  it('rings only an extension someone holds or a ring group of the tenant', async () => {
+    const { app, admin, store } = await setup()
+    await app.inject({ method: 'PUT', url: '/api/v1/admin/trunks/operator', headers: admin, payload: trunk })
+    const nobody = await app.inject({ method: 'PUT', url: '/api/v1/admin/dids/x', headers: admin, payload: { trunkId: 'operator', first: '+33199000150', target: '150' } })
+    expect(nobody.statusCode).toBe(400)
+    expect(nobody.json()).toMatchObject({ code: 'DID_TARGET' })
+    expect((await app.inject({ method: 'PUT', url: '/api/v1/admin/dids/group', headers: admin, payload: { trunkId: 'operator', first: '+33199000120', target: '200' } })).statusCode).toBe(201)
+    expect((await app.inject({ method: 'PUT', url: '/api/v1/admin/dids/jean', headers: admin, payload: { trunkId: 'operator', first: '+33199000102', target: '102' } })).statusCode).toBe(201)
+    expect((await store.listDids('A')).map(d => d.id).sort()).toEqual(['group', 'jean'])
+  })
+
+  it('lets an administrator choose the default trunk, and never removes it while another trunk is left', async () => {
+    const { app, admin, handed, store } = await setup()
+    const ip = { auth: 'ip', domain: 'operator.example', codecs: ['PCMA'], defaultNumber: '+33199000100' }
+    expect((await app.inject({ method: 'PUT', url: '/api/v1/admin/trunks/main', headers: admin, payload: ip })).statusCode).toBe(201)
+    expect((await app.inject({ method: 'PUT', url: '/api/v1/admin/trunks/backup', headers: admin, payload: { ...ip, defaultNumber: '+33199000200' } })).statusCode).toBe(201)
+    expect(handed.at(-1)!.trunks.map(t => t.id)).toEqual(['main', 'backup'])
+    // The first one is the default: removing it would change the number everyone presents.
+    const refused = await app.inject({ method: 'DELETE', url: '/api/v1/admin/trunks/main', headers: admin })
+    expect(refused.statusCode).toBe(409)
+    expect(refused.json()).toMatchObject({ code: 'TRUNK_DEFAULT' })
+    // Another one made the default: handed first, the mark taken from the one that had it.
+    expect((await app.inject({ method: 'PUT', url: '/api/v1/admin/trunks/backup', headers: admin, payload: { ...ip, defaultNumber: '+33199000200', default: true } })).statusCode).toBe(200)
+    expect(handed.at(-1)!.trunks.map(t => t.id)).toEqual(['backup', 'main'])
+    expect((await app.inject({ method: 'PUT', url: '/api/v1/admin/trunks/main', headers: admin, payload: { ...ip, default: true } })).statusCode).toBe(200)
+    expect(handed.at(-1)!.trunks.map(t => t.id)).toEqual(['main', 'backup'])
+    expect((await store.listTrunks('A')).map(t => `${t.id}:${t.config.default ?? false}`)).toEqual(['main:true', 'backup:false'])
+    expect((await app.inject({ method: 'DELETE', url: '/api/v1/admin/trunks/main', headers: admin })).statusCode).toBe(409)
+    expect((await app.inject({ method: 'DELETE', url: '/api/v1/admin/trunks/backup', headers: admin })).statusCode).toBe(204)
+    // The last one goes.
+    expect((await app.inject({ method: 'DELETE', url: '/api/v1/admin/trunks/main', headers: admin })).statusCode).toBe(204)
+  })
+
+  it('fails a change OpenSIPS did not apply (502), keeps the store and the provider on the previous set, the same when the store fails', async () => {
+    const { app, admin, handed, store, control } = await setup()
+    expect((await app.inject({ method: 'PUT', url: '/api/v1/admin/trunks/operator', headers: admin, payload: trunk })).statusCode).toBe(201)
+    control.fail = Object.assign(new Error('OpenSIPS did not reload the trunks'), { statusCode: 502, code: 'TRUNK_RELOAD_FAILED' })
+    const res = await app.inject({ method: 'PUT', url: '/api/v1/admin/trunks/operator', headers: admin, payload: { ...trunk, registerExpires: 900 } })
+    expect(res.statusCode).toBe(502)
+    expect(res.json()).toMatchObject({ code: 'TRUNK_RELOAD_FAILED' })
+    expect((await store.listTrunks('A'))[0]!.config.registerExpires).toBeUndefined()
+    // Handed the new set, then the previous one again.
+    expect(handed.slice(-2).map(h => h.trunks[0]!.registerExpires)).toEqual([900, undefined])
+    // The store fails after the provider took the set: the provider is handed the previous one.
+    const upsertDid = store.upsertDid.bind(store)
+    store.upsertDid = async () => {
+      throw new Error('database down')
+    }
+    expect((await app.inject({ method: 'PUT', url: '/api/v1/admin/dids/reception', headers: admin, payload: { trunkId: 'operator', first: '+33199000101', target: '101' } })).statusCode).toBe(500)
+    expect(handed.slice(-2).map(h => h.dids.length)).toEqual([1, 0])
+    store.upsertDid = upsertDid
+    expect(await store.listDids('A')).toEqual([])
   })
 
   it('hands the provider the trunks the store kept as soon as it starts', async () => {

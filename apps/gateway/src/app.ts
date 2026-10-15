@@ -5,7 +5,7 @@ import swagger from '@fastify/swagger'
 import swaggerUi from '@fastify/swagger-ui'
 import { splitParticipantId, verifyWebhook, type LiveKitConferenceBridge, type MeetApi, type MeetRoom } from '@twake/conference-livekit'
 import type { MediaProvider, TelephonyProvider } from '@twake/telephony-provider-sdk'
-import type { CallDirection, Endpoint, ForwardingRules, Presence, PresenceStatus, RingGroup, TelephonyEvent, User } from '@twake/telephony-types'
+import type { CallDirection, DidRange, Endpoint, ForwardingRules, Presence, PresenceStatus, RingGroup, TelephonyEvent, User } from '@twake/telephony-types'
 import { adminPolicyFromEnv, isAdmin, type AdminPolicy } from './admin.js'
 import { authenticatorFromEnv, TicketStore, type Authenticator, type Identity } from './auth.js'
 import { MAX_CONTACT_ID, MAX_FAVORITES, MAX_QUERY, MAX_SEARCH, RateLimiter, type ContactDirectory } from './contacts.js'
@@ -16,9 +16,9 @@ import { historyEntryFor } from './history.js'
 import { ENDED_TTL_SEC, MISSED_TTL_SEC, type PushMessage, type WebPush } from './push.js'
 import type { ProviderRegistry } from './registry.js'
 import { securityHeadersFor, type SecurityOptions } from './security.js'
-import { MAX_DIDS, MAX_TRUNKS, TRUNK_ID, parseDid, parseTrunk, providerTrunks, publicDid, publicTrunk, trunkRecord } from './trunks.js'
+import { MAX_DIDS, MAX_TRUNKS, TRUNK_ID, defaultTrunk, parseDid, parseTrunk, providerTrunks, publicDid, publicTrunk, trunkRecord } from './trunks.js'
 import { MemoryStore } from './store/memory.js'
-import { isMissed, type HistoryEntry, type HistoryQuery, type Store, type UserPresenceRecord } from './store/types.js'
+import { isMissed, type HistoryEntry, type HistoryQuery, type Store, type TrunkRecord, type UserPresenceRecord } from './store/types.js'
 
 const STATUSES: PresenceStatus[] = ['available', 'busy', 'away', 'dnd', 'offline']
 const DIRECTIONS: CallDirection[] = ['inbound', 'outbound']
@@ -40,6 +40,8 @@ const RESTORE_RETRY_MS = [1_000, 5_000, 15_000, 30_000]
 const PUSH_PURGE_GRACE_MS = 3_600_000
 /** Longest wait of a change for the one before it (a provider whose database hangs): the next one then goes. */
 const TURN_MAX_MS = 10_000
+/** How long a person may be without any event socket before their answered calls with the public network are ended. */
+const ORPHAN_CALL_GRACE_MS = 30_000
 /** One line of text: no control character (a message for callers ends up in a SIP header). */
 // eslint-disable-next-line no-control-regex -- control characters are exactly what is refused here
 const CONTROL = /[\u0000-\u001f\u007f]/
@@ -91,6 +93,12 @@ export interface BuildOptions {
    * a password only.
    */
   secretsKey?: Buffer
+  /**
+   * How long a person may have no event socket open (no window of the app) before the Gateway asks the provider to
+   * end their answered calls with the public network (ADR 0016): a browser gone without hanging up must not leave the
+   * operator's leg open and charged. Default 30 s (a window reloading, an event socket coming back, keeps its call).
+   */
+  orphanCallGraceMs?: number
   /** Phone access to Meet rooms. Absent when no LiveKit is configured: the endpoints answer 501. */
   conference?: {
     bridge: (tenantId: string) => LiveKitConferenceBridge | undefined
@@ -280,6 +288,53 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
     callOwners.set(call.id, owners)
     // Forget finished calls after a grace period (late actions such as a double click still resolve).
     if (event.type === 'call.ended' || event.type === 'call.failed') setTimeout(() => callOwners.delete(call.id), 5 * 60_000).unref()
+    // The person's answered calls, for the ones to end once no window of theirs is left (orphans, below).
+    const key = ownerKey(tenantId, userId)
+    if (event.type === 'call.connected' || event.type === 'call.held' || event.type === 'call.resumed') {
+      const calls = answeredCalls.get(key) ?? new Set<string>()
+      answeredCalls.set(key, calls.add(call.id))
+    } else if (event.type === 'call.ended' || event.type === 'call.failed') {
+      answeredCalls.get(key)?.delete(call.id)
+      if (!answeredCalls.get(key)?.size) answeredCalls.delete(key)
+    }
+  }
+  // A call with the public network whose browser is gone without hanging up (closed, crashed, put to sleep) would keep
+  // the operator's leg open and charged (ADR 0016). The browser is the app: once a person has had no event socket for
+  // orphanCallGraceMs, the provider is asked to end their answered calls (it ends only those with the public network:
+  // a colleague's browser ends an internal call itself).
+  const answeredCalls = new Map<string, Set<string>>()
+  const eventSockets = new Map<string, number>()
+  const orphanTimers = new Map<string, ReturnType<typeof setTimeout>>()
+  const orphanGraceMs = options.orphanCallGraceMs ?? ORPHAN_CALL_GRACE_MS
+  const socketOpened = (tenantId: string, userId: string) => {
+    const key = ownerKey(tenantId, userId)
+    eventSockets.set(key, (eventSockets.get(key) ?? 0) + 1)
+    clearTimeout(orphanTimers.get(key))
+    orphanTimers.delete(key)
+  }
+  const socketClosed = (tenantId: string, userId: string) => {
+    const key = ownerKey(tenantId, userId)
+    const left = (eventSockets.get(key) ?? 1) - 1
+    if (left > 0) return void eventSockets.set(key, left)
+    eventSockets.delete(key)
+    if (!answeredCalls.get(key)?.size) return
+    clearTimeout(orphanTimers.get(key))
+    const timer = setTimeout(() => {
+      orphanTimers.delete(key)
+      if (eventSockets.has(key)) return
+      const provider = registry.forTenant(tenantId)
+      if (!provider.endCall) return
+      for (const callId of answeredCalls.get(key) ?? []) {
+        provider.endCall(callId).then(
+          () => app.log.info({ tenantId, userId, callId }, 'call with the public network ended: no window of its person is left'),
+          (err: { statusCode?: number }) => {
+            if (err?.statusCode !== 404 && err?.statusCode !== 409) app.log.warn({ err, tenantId, callId }, 'orphan call not ended')
+          }
+        )
+      }
+    }, orphanGraceMs)
+    timer.unref()
+    orphanTimers.set(key, timer)
   }
 
   const app = Fastify({
@@ -900,13 +955,30 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
       })
 
       // Trunks to an operator and their direct numbers (capability `trunks`, ADR 0016): administrators only, one change
-      // at a time per tenant. The provider is handed the whole new set first (it checks and writes what its SIP server
-      // reads), then the store keeps it: a set the provider refused is not kept. A password is never shown again.
+      // at a time per tenant. The provider is handed the whole new set first (it checks it, writes what its SIP server
+      // reads and has it reload), then the store keeps it. When either fails, the provider is handed the set it had
+      // before (what it may have written in part goes), and the request fails: the store and the SIP server never
+      // part. A password is never shown again.
       const trunksOf = (provider: TelephonyProvider) => {
         if (!provider.setTrunks) throw Object.assign(new Error('Trunks are not available on this platform'), { statusCode: 501 })
         return provider.setTrunks.bind(provider)
       }
       const notFound = (what: string) => Object.assign(new Error(`No such ${what}`), { statusCode: 404 })
+      const changeTrunks = async (tenantId: string, apply: ReturnType<typeof trunksOf>, trunks: TrunkRecord[], dids: DidRange[], keep: () => Promise<unknown>) => {
+        const before = await trunksFor(tenantId)
+        const undo = (err: unknown) =>
+          apply(before.trunks, before.dids).then(
+            () => {
+              throw err
+            },
+            (undoErr: unknown) => {
+              app.log.error({ err: undoErr, tenantId }, 'trunks: the previous set could not be handed back to the provider')
+              throw err
+            }
+          )
+        await apply(providerTrunks(trunks, options.secretsKey), dids).catch(undo)
+        await keep().catch(undo)
+      }
       v1.get('/admin/trunks', async req => {
         const user = await administrator(req)
         trunksOf(registry.forTenant(user.tenantId))
@@ -922,9 +994,18 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
           const current = records.find(t => t.id === id)
           if (!current && records.length >= MAX_TRUNKS) throw Object.assign(new Error(`At most ${MAX_TRUNKS} trunks`), { statusCode: 409 })
           const record = trunkRecord(user.tenantId, id, parseTrunk(req.body, current), current, options.secretsKey)
-          const next = current ? records.map(t => (t.id === id ? record : t)) : [...records, record]
-          await apply(providerTrunks(next, options.secretsKey), (await store.listDids(user.tenantId)).map(publicDid))
-          await store.upsertTrunk(record)
+          // One default trunk: the one marked now, the others no longer.
+          const unmark = (t: TrunkRecord): TrunkRecord => {
+            const { default: _was, ...config } = t.config
+            return { ...t, config }
+          }
+          const unmarked = record.config.default ? records.filter(t => t.id !== id && t.config.default).map(unmark) : []
+          const updated = (t: TrunkRecord) => (t.id === id ? record : (unmarked.find(u => u.id === t.id) ?? t))
+          const next = current ? records.map(updated) : [...records.map(updated), record]
+          await changeTrunks(user.tenantId, apply, next, (await store.listDids(user.tenantId)).map(publicDid), async () => {
+            for (const t of unmarked) await store.upsertTrunk(t)
+            await store.upsertTrunk(record)
+          })
           return { record, created: !current }
         })
         return reply.code(created ? 201 : 200).send(publicTrunk(record))
@@ -935,10 +1016,12 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         await inTurn(user.tenantId, async () => {
           const records = await store.listTrunks(user.tenantId)
           if (!records.some(t => t.id === req.params.id)) throw notFound('trunk')
+          // The default trunk gives its number to everyone without a direct number: never changed without a word.
+          if (records.length > 1 && defaultTrunk(records)?.id === req.params.id)
+            throw Object.assign(new Error('This is the default trunk: make another one the default first'), { statusCode: 409, code: 'TRUNK_DEFAULT' })
           // Its direct numbers go with it.
           const dids = (await store.listDids(user.tenantId)).filter(d => d.trunkId !== req.params.id).map(publicDid)
-          await apply(providerTrunks(records.filter(t => t.id !== req.params.id), options.secretsKey), dids)
-          await store.deleteTrunk(user.tenantId, req.params.id)
+          await changeTrunks(user.tenantId, apply, records.filter(t => t.id !== req.params.id), dids, () => store.deleteTrunk(user.tenantId, req.params.id))
         })
         return reply.code(204).send()
       })
@@ -949,15 +1032,18 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
       })
       v1.put<{ Params: { id: string } }>('/admin/dids/:id', async (req, reply) => {
         const user = await administrator(req)
-        const apply = trunksOf(registry.forTenant(user.tenantId))
+        const provider = registry.forTenant(user.tenantId)
+        const apply = trunksOf(provider)
         const { did, created } = await inTurn(user.tenantId, async () => {
           const records = await store.listTrunks(user.tenantId)
           const dids = (await store.listDids(user.tenantId)).map(publicDid)
           const current = dids.find(d => d.id === req.params.id)
           if (!current && dids.length >= MAX_DIDS) throw Object.assign(new Error(`At most ${MAX_DIDS} ranges of direct numbers`), { statusCode: 409 })
           const did = parseDid(req.params.id, req.body, records, dids)
-          await apply(providerTrunks(records, options.secretsKey), current ? dids.map(d => (d.id === did.id ? did : d)) : [...dids, did])
-          await store.upsertDid({ tenantId: user.tenantId, ...did })
+          // A number rings an extension someone holds, or a ring group of the tenant: nothing else.
+          if (did.target && !(await store.getMappingByExtension(user.tenantId, did.target)) && !(provider.listGroups && (await provider.listGroups()).some(g => g.number === did.target)))
+            throw Object.assign(new Error(`target: ${did.target} is no extension nor ring group of this platform`), { statusCode: 400, code: 'DID_TARGET' })
+          await changeTrunks(user.tenantId, apply, records, current ? dids.map(d => (d.id === did.id ? did : d)) : [...dids, did], () => store.upsertDid({ tenantId: user.tenantId, ...did }))
           return { did, created: !current }
         })
         return reply.code(created ? 201 : 200).send(did)
@@ -968,8 +1054,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         await inTurn(user.tenantId, async () => {
           const dids = (await store.listDids(user.tenantId)).map(publicDid)
           if (!dids.some(d => d.id === req.params.id)) throw notFound('direct number')
-          await apply(providerTrunks(await store.listTrunks(user.tenantId), options.secretsKey), dids.filter(d => d.id !== req.params.id))
-          await store.deleteDid(user.tenantId, req.params.id)
+          await changeTrunks(user.tenantId, apply, await store.listTrunks(user.tenantId), dids.filter(d => d.id !== req.params.id), () => store.deleteDid(user.tenantId, req.params.id))
         })
         return reply.code(204).send()
       })
@@ -1135,9 +1220,11 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         const send = (event: TelephonyEvent) => socket.send(JSON.stringify(event))
         const unsubscribe = bus.subscribe(user.tenantId, user.id, send)
         const unsubscribeTenant = bus.subscribeTenant(user.tenantId, send)
+        socketOpened(user.tenantId, user.id)
         socket.on('close', () => {
           unsubscribe()
           unsubscribeTenant()
+          socketClosed(user.tenantId, user.id)
         })
         // The session is accepted: the client may read the state now (and reset its backoff), every change from
         // here on reaches it. Not an event; a socket closed before it is a failed attempt.

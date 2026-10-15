@@ -65,6 +65,12 @@ services:
       # The socket of the trunk to the operator (step 6, ADR 0016), apart from the phones' one: on the loopback here.
       TRUNK_LISTEN_IP: ${TRUNK_LISTEN_IP:-127.0.0.1}
       TRUNK_PORT: ${TRUNK_PORT:-5070}
+      # The address announced to the operator on that socket (host[:port]) when a NAT stands in between: the
+      # registration's binding, the Via and the Record-Route. The CI sets a TEST-NET one (192.0.2.10:5070) that the
+      # simulated operator maps back to the socket. Empty: the socket's own address.
+      TRUNK_ADVERTISE: ${TRUNK_ADVERTISE:-}
+      # A call with the operator ends by itself after this long (seconds, 60 to 86400), a BYE to both sides.
+      TRUNK_MAX_CALL_SEC: ${TRUNK_MAX_CALL_SEC:-14400}
     network_mode: host
     healthcheck:
       test: ["CMD-SHELL", "test -p /tmp/opensips_fifo"]

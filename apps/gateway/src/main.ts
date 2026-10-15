@@ -69,6 +69,8 @@ if (seed && !(await store.listTrunks(tenant)).length) {
   await store.upsertTrunk(trunkRecord(tenant, seed.id, seed.parsed, undefined, key))
   for (const did of seed.dids) await store.upsertDid({ tenantId: tenant, ...did })
 }
+// The password is in the database from then on, encrypted; left in the environment it is one more copy to protect.
+if (seed && env.TRUNK_PASSWORD) console.warn('TRUNK_PASSWORD: the trunk is in the database now (its password encrypted); remove TRUNK_PASSWORD from the environment (.env)')
 
 const registry = new ProviderRegistry(await store.listProviders(), [storedOpensipsFactory({ store, ...(key ? { key } : {}) })])
 

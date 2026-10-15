@@ -29,6 +29,15 @@ set -eu
 : "${TRUNK_LISTEN_IP:=$LISTEN_IP}"
 : "${TRUNK_PORT:=5070}"
 : "${TRUNK_ADVERTISE:=}"
+# The longest a call with the operator lasts, in seconds: OpenSIPS then ends it with a BYE to both sides (a browser
+# gone without one never leaves the operator's leg open longer). 4 hours by default.
+: "${TRUNK_MAX_CALL_SEC:=14400}"
+case "$TRUNK_MAX_CALL_SEC" in
+  '' | *[!0-9]*) echo "TRUNK_MAX_CALL_SEC must be a number of seconds" >&2; exit 1 ;;
+esac
+if [ "$TRUNK_MAX_CALL_SEC" -lt 60 ] || [ "$TRUNK_MAX_CALL_SEC" -gt 86400 ]; then
+  echo "TRUNK_MAX_CALL_SEC must be 60 to 86400 seconds" >&2; exit 1
+fi
 # The call rules are read at each INVITE (sqlops, ADR 0013): on their own connections, whose queries PostgreSQL stops
 # after this many milliseconds (the call then goes on without rules), so that a slow database never holds a call.
 : "${RULES_QUERY_TIMEOUT_MS:=1000}"
@@ -62,12 +71,13 @@ fi
 if [ "$TRUNK_LISTEN_IP" = "$LISTEN_IP" ] && [ "$TRUNK_PORT" = "$SIP_PORT" ]; then
   echo "TRUNK_PORT must differ from SIP_PORT on the same address: the trunk has a socket of its own" >&2; exit 1
 fi
+# A name or an IPv4 address, as the trunk socket (an IPv6 one has more than one colon).
 case "$TRUNK_ADVERTISE" in
-  *[!A-Za-z0-9.:-]*) echo "TRUNK_ADVERTISE must be host or host:port" >&2; exit 1 ;;
+  *[!A-Za-z0-9.:-]* | *:*:* | :* | *:) echo "TRUNK_ADVERTISE must be host or host:port" >&2; exit 1 ;;
   '') TRUNK_SOCKET_AS='' ;;
   *) TRUNK_SOCKET_AS=" as $TRUNK_ADVERTISE" ;;
 esac
-export SIP_DOMAIN LISTEN_IP SIP_PORT WS_PORT WSS_PORT OPENSIPS_DB_URL OPENSIPS_RULES_DB_URL PUSH_WAIT_SEC RTPENGINE_SOCK OPENSIPS_LOG_LEVEL OPENSIPS_MPATH MI_FIFO MI_LISTEN_IP MI_PORT TLS_CERT TLS_KEY TRUNK_LISTEN_IP TRUNK_PORT TRUNK_SOCKET_AS
+export SIP_DOMAIN LISTEN_IP SIP_PORT WS_PORT WSS_PORT OPENSIPS_DB_URL OPENSIPS_RULES_DB_URL PUSH_WAIT_SEC RTPENGINE_SOCK OPENSIPS_LOG_LEVEL OPENSIPS_MPATH MI_FIFO MI_LISTEN_IP MI_PORT TLS_CERT TLS_KEY TRUNK_LISTEN_IP TRUNK_PORT TRUNK_SOCKET_AS TRUNK_MAX_CALL_SEC
 
 # The MI socket (mi_datagram) has no authentication: whoever reaches it can stop OpenSIPS, drop registrations, end
 # calls, read who is registered and subscribe to the events (who calls whom). It listens on its own address, the
@@ -119,7 +129,7 @@ if [ ! -f "$TLS_CERT" ] || [ ! -f "$TLS_KEY" ]; then
 fi
 
 # Only the listed variables are substituted: a "$avp(...)" of the script must stay as it is.
-envsubst '$SIP_DOMAIN $LISTEN_IP $SIP_PORT $WS_PORT $WSS_PORT $OPENSIPS_DB_URL $OPENSIPS_RULES_DB_URL $PUSH_WAIT_SEC $RTPENGINE_SOCK $OPENSIPS_LOG_LEVEL $OPENSIPS_MPATH $MI_FIFO $MI_LISTEN_IP $MI_PORT $TLS_CERT $TLS_KEY $TRUNK_LISTEN_IP $TRUNK_PORT $TRUNK_SOCKET_AS' \
+envsubst '$SIP_DOMAIN $LISTEN_IP $SIP_PORT $WS_PORT $WSS_PORT $OPENSIPS_DB_URL $OPENSIPS_RULES_DB_URL $PUSH_WAIT_SEC $RTPENGINE_SOCK $OPENSIPS_LOG_LEVEL $OPENSIPS_MPATH $MI_FIFO $MI_LISTEN_IP $MI_PORT $TLS_CERT $TLS_KEY $TRUNK_LISTEN_IP $TRUNK_PORT $TRUNK_SOCKET_AS $TRUNK_MAX_CALL_SEC' \
   < "$CFG_TEMPLATE" > "$CFG_OUT"
 
 # The tables of the trunks (step 6): dispatcher, dialplan and uac_registrant read theirs at start and OpenSIPS stops

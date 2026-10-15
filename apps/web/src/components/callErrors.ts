@@ -31,7 +31,8 @@ const CODE_KEY: Partial<Record<CallError['code'], Key>> = {
   'offer-refused': 'call.errorOfferRefused',
   'transfer-in-progress': 'call.errorTransferInProgress',
   'transfer-self': 'call.errorTransferSelf',
-  'transfer-refused': 'call.errorTransferRefused'
+  'transfer-refused': 'call.errorTransferRefused',
+  'transfer-external': 'call.errorTransferExternal'
 }
 
 /** A softphone error in the person's language (the SIP status stays, for whoever reports it); anything else as it came. */

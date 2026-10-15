@@ -33,6 +33,11 @@ export interface StoredOpensipsConfig {
    * and calls the operator from (step 6, ADR 0016). OPENSIPS_TRUNK_SOCKET, else udp:127.0.0.1:5070.
    */
   trunkSocket?: string
+  /**
+   * The address OpenSIPS announces on that socket (`host[:port]`, its TRUNK_ADVERTISE): the registrations bind to it.
+   * OPENSIPS_TRUNK_ADVERTISE, else none (the socket's own address).
+   */
+  trunkAdvertise?: string
 }
 
 export interface OpensipsFactoryDeps {
@@ -115,7 +120,7 @@ export const storedOpensipsFactory = ({ store, key, env = process.env, provision
         // Who can be woken for a call (their browser subscribed to notifications), in the same database (ADR 0015).
         pushTargets: provisioner.pushTargets({ ready: ensureSchema, tenantId }),
         // The trunks to an operator and their direct numbers, as OpenSIPS reads them, in the same database (ADR 0016).
-        trunks: provisioner.trunkTables({ ready: ensureSchema, tenantId, socket: config.trunkSocket ?? (env.OPENSIPS_TRUNK_SOCKET || DEFAULT_TRUNK_SOCKET) }),
+        trunks: provisioner.trunkTables({ ready: ensureSchema, tenantId, socket: config.trunkSocket ?? (env.OPENSIPS_TRUNK_SOCKET || DEFAULT_TRUNK_SOCKET), ...((config.trunkAdvertise ?? env.OPENSIPS_TRUNK_ADVERTISE) ? { advertise: (config.trunkAdvertise ?? env.OPENSIPS_TRUNK_ADVERTISE)! } : {}) }),
         // The SIP accounts follow the mappings: one written for a user who no longer holds the extension goes (ADR 0014).
         accounts: {
           async reconcile(holders) {

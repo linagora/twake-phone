@@ -1,4 +1,4 @@
-import { TRUNK_CODECS, type DidRange, type Trunk, type TrunkAuth, type TrunkCodec, type TrunkNumberFormat } from '@twake/telephony-types'
+import { TRUNK_CODECS, TRUNK_OUTBOUND_CLASSES, type DidRange, type Trunk, type TrunkAuth, type TrunkCodec, type TrunkNumberFormat, type TrunkOutboundClass } from '@twake/telephony-types'
 import { decrypt, encrypt } from './crypto.js'
 import type { DidRecord, TrunkRecord } from './store/types.js'
 
@@ -10,8 +10,8 @@ export const TRUNK_ID = /^[a-z0-9][a-z0-9-]{0,31}$/
 const E164 = /^\+[1-9][0-9]{6,14}$/
 /** A host name (labels of letters, digits and dashes). */
 const HOST = /^(?=.{1,253}$)[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$/
+// IPv4 only, as OpenSIPS's trunk socket (TRUNK_LISTEN_IP of entrypoint.sh): an IPv6 address could never reach it.
 const IPV4 = /^(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}$/
-const IPV6 = /^[0-9a-fA-F:]{2,39}$/
 /** What may go into the user part of a SIP URI (and a quoted SQL literal of the SIP server), nothing else. */
 const SIP_USER = /^[A-Za-z0-9._+-]{1,64}$/
 // eslint-disable-next-line no-control-regex -- control characters are exactly what is refused here
@@ -30,11 +30,10 @@ const MAX_SOURCES = 16
 const invalid = (message: string) => Object.assign(new Error(message), { statusCode: 400, code: 'TRUNK_INVALID' })
 
 const hostPort = (value: string) => {
-  const bracketed = /^\[([0-9a-fA-F:]+)\](:(\d{1,5}))?$/.exec(value)
-  const m = bracketed ?? /^([^:]+)(:(\d{1,5}))?$/.exec(value)
+  const m = /^([^:]+)(:(\d{1,5}))?$/.exec(value)
   if (!m) return false
   if (m[3] !== undefined && !(Number(m[3]) >= 1 && Number(m[3]) <= 65535)) return false
-  return bracketed ? IPV6.test(m[1]!) : HOST.test(m[1]!) || IPV4.test(m[1]!)
+  return HOST.test(m[1]!) || IPV4.test(m[1]!)
 }
 
 const text = (body: Record<string, unknown>, field: string, check: (v: string) => boolean, what: string): string | undefined => {
@@ -66,7 +65,7 @@ export const parseTrunk = (body: unknown, current?: Pick<TrunkRecord, 'passwordE
   if (!domain) throw invalid('domain: the operator\'s SIP domain is required')
   const name = text(b, 'name', v => v.length <= 64 && !CONTROL.test(v), '64 characters at most, on one line')
   const proxies = list(b, 'proxies', MAX_PROXIES, hostPort, 'servers, host[:port]')
-  const sources = list(b, 'sources', MAX_SOURCES, v => IPV4.test(v) || IPV6.test(v), 'IP addresses')
+  const sources = list(b, 'sources', MAX_SOURCES, v => IPV4.test(v), 'IPv4 addresses')
   const username = text(b, 'username', v => SIP_USER.test(v), 'letters, digits and . _ + - only, 64 at most')
   const realm = text(b, 'realm', v => v.length <= 128 && !CONTROL.test(v) && !/["\\]/.test(v), '128 characters at most, no quote')
   const registrar = text(b, 'registrar', hostPort, 'host[:port]')
@@ -76,10 +75,19 @@ export const parseTrunk = (body: unknown, current?: Pick<TrunkRecord, 'passwordE
     registerExpires = b.registerExpires as number
   }
   const codecs = b.codecs
-  if (!Array.isArray(codecs) || !codecs.length || !codecs.every(c => TRUNK_CODECS.includes(c as TrunkCodec)) || new Set(codecs).size !== codecs.length) throw invalid(`codecs: some of ${TRUNK_CODECS.join(', ')}, each once, in order of preference`)
+  if (!Array.isArray(codecs) || !codecs.length || !codecs.every(c => TRUNK_CODECS.includes(c as TrunkCodec)) || new Set(codecs).size !== codecs.length) throw invalid(`codecs: some of ${TRUNK_CODECS.join(', ')}, each once (the operator is offered these only)`)
   const numberFormat = (b.numberFormat ?? 'e164') as TrunkNumberFormat
   if (!FORMATS.includes(numberFormat)) throw invalid(`numberFormat: ${FORMATS.join(', ')}`)
   if (b.assertIdentity !== undefined && typeof b.assertIdentity !== 'boolean') throw invalid('assertIdentity: true or false')
+  // What it may call (step 6a): the emergency numbers always, premium ones never, the rest as chosen here; absent, the
+  // metropolitan fixed, mobile, free and standard-rate numbers.
+  let allowed: TrunkOutboundClass[] | undefined
+  if (b.allowed !== undefined && b.allowed !== null) {
+    const a = b.allowed
+    if (!Array.isArray(a) || !a.length || !a.every(c => TRUNK_OUTBOUND_CLASSES.includes(c as TrunkOutboundClass)) || new Set(a).size !== a.length) throw invalid(`allowed: some of ${TRUNK_OUTBOUND_CLASSES.join(', ')}, each once`)
+    allowed = a as TrunkOutboundClass[]
+  }
+  if (b.default !== undefined && typeof b.default !== 'boolean') throw invalid('default: true or false')
   const defaultNumber = text(b, 'defaultNumber', v => E164.test(v), 'an E.164 number (+ then 7 to 15 digits)')
   if (!defaultNumber) throw invalid('defaultNumber: the number presented by those without a direct number is required')
   let password: string | null | undefined
@@ -90,7 +98,6 @@ export const parseTrunk = (body: unknown, current?: Pick<TrunkRecord, 'passwordE
   }
   const hasPassword = password === undefined ? !!current?.passwordEnc : password !== null
   if (auth === 'register' && !(username && hasPassword)) throw invalid('a trunk that registers needs a username and a password')
-  if (auth === 'register' && sources) throw invalid('sources: for a trunk that does not register (auth ip)')
   return {
     config: {
       ...(name ? { name } : {}),
@@ -105,6 +112,8 @@ export const parseTrunk = (body: unknown, current?: Pick<TrunkRecord, 'passwordE
       codecs: codecs as TrunkCodec[],
       numberFormat,
       ...(b.assertIdentity ? { assertIdentity: true } : {}),
+      ...(allowed ? { allowed } : {}),
+      ...(b.default ? { default: true } : {}),
       defaultNumber
     },
     password
@@ -153,18 +162,30 @@ export const trunkRecord = (tenantId: string, id: string, parsed: ReturnType<typ
   return { tenantId, id, config: parsed.config, ...(passwordEnc ? { passwordEnc } : {}) }
 }
 
-/** What the provider is handed: each trunk with its password in clear (OpenSIPS answers the challenges with it). */
-export const providerTrunks = (records: readonly TrunkRecord[], key: Buffer | undefined): (Trunk & { password?: string })[] =>
-  records.map(r => {
+/**
+ * The trunk whose number those without a direct number present, and through which they call: the one marked
+ * `default`, else the first one.
+ */
+export const defaultTrunk = (records: readonly TrunkRecord[]): TrunkRecord | undefined => records.find(r => r.config.default) ?? records[0]
+
+/**
+ * What the provider is handed, the default trunk first: each trunk with its password in clear (OpenSIPS answers the
+ * challenges with it).
+ */
+export const providerTrunks = (records: readonly TrunkRecord[], key: Buffer | undefined): (Trunk & { password?: string })[] => {
+  const first = defaultTrunk(records)
+  return [...(first ? [first] : []), ...records.filter(r => r !== first)].map(r => {
     if (r.passwordEnc && !key) throw new Error(`SECRETS_KEY is required to read the password of trunk ${r.id}`)
     return { id: r.id, ...r.config, ...(r.passwordEnc ? { password: decrypt(r.passwordEnc, key!) } : {}) }
   })
+}
 
 /**
  * A first trunk from the environment (the pilot kit), when the tenant has none: TRUNK_DOMAIN and TRUNK_DEFAULT_NUMBER
  * at least; TRUNK_AUTH (register by default), TRUNK_ID (operator), TRUNK_NAME, TRUNK_PROXIES and TRUNK_SOURCES
  * (comma-separated), TRUNK_USERNAME, TRUNK_PASSWORD, TRUNK_REALM, TRUNK_REGISTRAR, TRUNK_EXPIRES, TRUNK_CODECS
- * (PCMA,PCMU by default), TRUNK_NUMBER_FORMAT, TRUNK_ASSERT_IDENTITY=1; TRUNK_DIDS, comma-separated
+ * (PCMA,PCMU by default), TRUNK_NUMBER_FORMAT, TRUNK_ASSERT_IDENTITY=1, TRUNK_ALLOWED (comma-separated classes:
+ * fixed, mobile, freephone, standard-rate by default; overseas, international on demand); TRUNK_DIDS, comma-separated
  * `FIRST[..LAST]=TARGET` where TARGET is an extension or a group, or `last:N` for the extension made of the last N
  * digits of the number called. Undefined without TRUNK_DOMAIN; throws on anything invalid (named).
  */
@@ -192,6 +213,7 @@ export const trunkFromEnv = (env: NodeJS.ProcessEnv): { id: string; parsed: Retu
       codecs: env.TRUNK_CODECS ? csv(env.TRUNK_CODECS) : ['PCMA', 'PCMU'],
       ...(env.TRUNK_NUMBER_FORMAT ? { numberFormat: env.TRUNK_NUMBER_FORMAT } : {}),
       ...(env.TRUNK_ASSERT_IDENTITY === '1' ? { assertIdentity: true } : {}),
+      ...(env.TRUNK_ALLOWED ? { allowed: csv(env.TRUNK_ALLOWED) } : {}),
       defaultNumber: env.TRUNK_DEFAULT_NUMBER
     })
   } catch (err) {

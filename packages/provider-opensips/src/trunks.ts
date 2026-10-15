@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import type { DidRange, Trunk } from '@twake/telephony-types'
+import { TRUNK_OUTBOUND_CLASSES, TRUNK_OUTBOUND_DEFAULT, type DidRange, type Trunk } from '@twake/telephony-types'
 import { DIALPLAN_SQL } from './numbering.js'
 import type { Queryable } from './subscriber.js'
 
@@ -18,9 +18,11 @@ export const REGISTRANT_TABLE_VERSION = 3
 /**
  * OpenSIPS's own tables as its scripts create them, our two, and the numbering plan. `trunks`: one row per trunk,
  * with what the script needs for an outbound call (where, as whom, how numbers are written, which codecs, the number
- * presented by default) and `setid`, its set of `dispatcher`. `dids`: the direct numbers, a range of E.164 numbers
+ * presented by default, the kinds of numbers it may call as `,fixed,mobile,`) and `setid`, its set of `dispatcher`.
+ * `dids`: the direct numbers, a range of E.164 numbers
  * of the same length, to an extension or group (`target`) or to the extension that ends with their last
- * `suffix_digits` digits. `tenant_id` is whose they are: OpenSIPS does not read it (one tenant per database).
+ * `suffix_digits` digits. `tenant_id` is whose they are: OpenSIPS does not read it, and one tenant only may have trunks
+ * in a database (TrunkTables refuses a second one).
  * Run as a whole by docker/opensips/entrypoint.sh before OpenSIPS starts (a database created before step 6 has none
  * of these tables, and OpenSIPS would not start without them) and at each start of the Gateway.
  */
@@ -83,6 +85,7 @@ CREATE TABLE IF NOT EXISTS trunks (
     default_number VARCHAR(16) NOT NULL,
     reg_aor VARCHAR(255) DEFAULT '' NOT NULL
 );
+ALTER TABLE trunks ADD COLUMN IF NOT EXISTS allowed VARCHAR(128) DEFAULT ',${TRUNK_OUTBOUND_DEFAULT.join(',')},' NOT NULL;
 CREATE TABLE IF NOT EXISTS dids (
     id VARCHAR(64) PRIMARY KEY NOT NULL,
     tenant_id TEXT DEFAULT '' NOT NULL,
@@ -112,9 +115,10 @@ ${TRUNK_SCHEMA.trim()}
 /** The UDP socket of OpenSIPS for the trunks (`udp:IP:PORT`): where it registers and sends from, never 5060 by default. */
 export const DEFAULT_TRUNK_SOCKET = 'udp:127.0.0.1:5070'
 
-const SOCKET = /^udp:([0-9.]+|\[[0-9a-fA-F:]+\]):(\d{1,5})$/
-const HOST_PORT = /^([A-Za-z0-9.-]+|\[[0-9a-fA-F:]+\])(:\d{1,5})?$/
-const IP = /^([0-9]{1,3}(\.[0-9]{1,3}){3}|[0-9a-fA-F:]+)$/
+// IPv4 only, as entrypoint.sh's TRUNK_LISTEN_IP: an operator's address in IPv6 could never reach an IPv4 socket.
+const SOCKET = /^udp:([0-9]{1,3}(?:\.[0-9]{1,3}){3}):(\d{1,5})$/
+const HOST_PORT = /^([A-Za-z0-9.-]+)(:\d{1,5})?$/
+const IP = /^[0-9]{1,3}(\.[0-9]{1,3}){3}$/
 const E164 = /^\+[1-9][0-9]{6,14}$/
 /** What may go into a SIP URI's user part or a quoted SQL literal here, and nothing else. */
 const SIP_USER = /^[A-Za-z0-9._+-]{1,64}$/
@@ -141,11 +145,16 @@ interface Projection {
 
 const invalid = (message: string) => Object.assign(new Error(message), { statusCode: 400 })
 
-/** Rows of the four tables for these trunks and numbers; throws on anything that could not go into them. */
-export const projectTrunks = (trunks: (Trunk & { password?: string })[], dids: DidRange[], socket: string): Projection => {
+/**
+ * Rows of the four tables for these trunks and numbers, the first trunk the one of those without a direct number;
+ * throws on anything that could not go into them. `advertise` (`host[:port]`, TRUNK_ADVERTISE of entrypoint.sh): the
+ * address OpenSIPS announces on the trunk socket, which the registrations bind to.
+ */
+export const projectTrunks = (trunks: (Trunk & { password?: string })[], dids: DidRange[], socket: string, advertise?: string): Projection => {
   const s = SOCKET.exec(socket)
-  if (!s) throw new Error(`Trunk socket ${socket} is not udp:IP:PORT`)
-  const bindingHost = `${s[1]}:${s[2]}`
+  if (!s) throw new Error(`Trunk socket ${socket} is not udp:IPv4:PORT`)
+  if (advertise !== undefined && !HOST_PORT.test(advertise)) throw new Error(`Trunk advertised address ${advertise} is not host[:port]`)
+  const bindingHost = advertise ? (advertise.includes(':') ? advertise : `${advertise}:${s[2]}`) : `${s[1]}:${s[2]}`
   const out: Projection = { trunks: [], dids: [], dispatcher: [], registrant: [] }
   trunks.forEach((t, position) => {
     if (!/^[a-z0-9][a-z0-9-]{0,31}$/.test(t.id)) throw invalid(`Trunk id ${t.id} is not valid`)
@@ -162,11 +171,14 @@ export const projectTrunks = (trunks: (Trunk & { password?: string })[], dids: D
     const register = t.auth === 'register'
     if (register && !(username && t.password)) throw invalid(`Trunk ${t.id}: registering needs a user name and a password`)
     const aor = register ? `sip:${username}@${t.domain}` : ''
-    out.trunks.push([t.id, setid, position, t.domain, t.numberFormat, t.assertIdentity ? 1 : 0, username, secret, t.realm ?? '', codecFlags(t.codecs), t.defaultNumber, aor])
-    // The operator's servers, in order (failover by priority), each probed with OPTIONS (probe_mode 1): it keeps the
-    // NAT open towards each (ARCHITECTURE §13). Its other addresses: inactive (never chosen), only recognised.
-    servers.forEach((p, i) => out.dispatcher.push([setid, `sip:${p}`, socket, 0, 1, '1', i, '', t.id]))
-    for (const ip of t.sources ?? []) out.dispatcher.push([setid, `sip:${ip.includes(':') ? `[${ip}]` : ip}`, socket, 1, 0, '1', 100, '', t.id])
+    const allowed = t.allowed ?? TRUNK_OUTBOUND_DEFAULT
+    if (!allowed.every(c => (TRUNK_OUTBOUND_CLASSES as readonly string[]).includes(c))) throw invalid(`Trunk ${t.id}: allowed is some of ${TRUNK_OUTBOUND_CLASSES.join(', ')}`)
+    out.trunks.push([t.id, setid, position, t.domain, t.numberFormat, t.assertIdentity ? 1 : 0, username, secret, t.realm ?? '', codecFlags(t.codecs), t.defaultNumber, aor, `,${allowed.join(',')},`])
+    // The operator's servers, in order, each probed with OPTIONS (probe_mode 1): it keeps the NAT open towards each
+    // (ARCHITECTURE §13). The dispatcher tries the highest priority first (algorithm 8): the first server has the
+    // highest. Its other addresses: inactive (never chosen), only recognised, at priority 0.
+    servers.forEach((p, i) => out.dispatcher.push([setid, `sip:${p}`, socket, 0, 1, '1', servers.length - i, '', t.id]))
+    for (const ip of t.sources ?? []) out.dispatcher.push([setid, `sip:${ip}`, socket, 1, 0, '1', 0, '', t.id])
     if (register) {
       const registrar = `sip:${t.registrar ?? t.domain}`
       const proxy = t.proxies?.length ? `sip:${t.proxies[0]}` : null
@@ -191,6 +203,8 @@ export interface TrunkTablesOptions {
   tenantId?: string
   /** OpenSIPS's trunk socket (TRUNK_LISTEN_IP and TRUNK_PORT of entrypoint.sh): DEFAULT_TRUNK_SOCKET by default. */
   socket?: string
+  /** The address OpenSIPS announces on it (TRUNK_ADVERTISE), `host[:port]`: the registrations bind to it. */
+  advertise?: string
 }
 
 const sameRows = (a: unknown[][], b: unknown[][]) => JSON.stringify(a) === JSON.stringify(b)
@@ -199,36 +213,45 @@ const sameRows = (a: unknown[][], b: unknown[][]) => JSON.stringify(a) === JSON.
 export class TrunkTables {
   private readonly tenantId: string
   readonly socket: string
+  readonly advertise: string | undefined
 
   constructor(private readonly opts: TrunkTablesOptions) {
     this.tenantId = opts.tenantId ?? 'default'
     this.socket = opts.socket ?? DEFAULT_TRUNK_SOCKET
-    if (!SOCKET.test(this.socket)) throw new Error(`Trunk socket ${this.socket} is not udp:IP:PORT`)
+    this.advertise = opts.advertise || undefined
+    if (!SOCKET.test(this.socket)) throw new Error(`Trunk socket ${this.socket} is not udp:IPv4:PORT`)
+    if (this.advertise !== undefined && !HOST_PORT.test(this.advertise)) throw new Error(`Trunk advertised address ${this.advertise} is not host[:port]`)
   }
 
   /** What the database holds for the tenant now, in the order of projectTrunks. */
   private async current(q: Queryable): Promise<Projection> {
     const rows = async (text: string) => (((await q.query(text, [this.tenantId])) as { rows?: Record<string, unknown>[] } | undefined)?.rows ?? []).map(r => Object.values(r))
     return {
-      trunks: await rows('SELECT id, setid, position, domain, number_format, assert_identity, auth_username, auth_password, auth_realm, codec_flags, default_number, reg_aor FROM trunks WHERE tenant_id = $1 ORDER BY position'),
+      trunks: await rows('SELECT id, setid, position, domain, number_format, assert_identity, auth_username, auth_password, auth_realm, codec_flags, default_number, reg_aor, allowed FROM trunks WHERE tenant_id = $1 ORDER BY position'),
       dids: await rows('SELECT id, trunk_id, first_number, last_number, target, suffix_digits FROM dids WHERE tenant_id = $1 ORDER BY first_number, id'),
-      dispatcher: await rows('SELECT setid, destination, socket, state, probe_mode, weight, priority, attrs, description FROM dispatcher WHERE setid IN (SELECT setid FROM trunks WHERE tenant_id = $1) ORDER BY setid, state, priority, id'),
+      dispatcher: await rows('SELECT setid, destination, socket, state, probe_mode, weight, priority, attrs, description FROM dispatcher WHERE setid IN (SELECT setid FROM trunks WHERE tenant_id = $1) ORDER BY setid, state, priority DESC, id'),
       registrant: await rows("SELECT registrar, proxy, aor, username, password, binding_uri, expiry, forced_socket FROM registrant WHERE aor IN (SELECT reg_aor FROM trunks WHERE tenant_id = $1 AND reg_aor <> '') ORDER BY id")
     }
   }
 
   /**
    * Exactly these trunks and direct numbers for the tenant, in one transaction. Nothing is written when the database
-   * holds them already: OpenSIPS is asked to reload nothing (a registration is not sent again for nothing).
+   * holds them already: OpenSIPS is asked to reload nothing (a registration is not sent again for nothing). Refused
+   * (409) when another tenant has trunks in this database: OpenSIPS's script reads one tenant's trunks only.
    */
   async set(trunks: (Trunk & { password?: string })[], dids: DidRange[]): Promise<{ dispatcher: boolean; registrant: boolean }> {
-    const wanted = projectTrunks(trunks, dids, this.socket)
+    const wanted = projectTrunks(trunks, dids, this.socket, this.advertise)
     wanted.dids.sort((a, b) => String(a[2]).localeCompare(String(b[2])) || String(a[0]).localeCompare(String(b[0])))
     await this.opts.ready?.()
     const client = this.opts.pool.connect ? await this.opts.pool.connect() : undefined
     const q = client ?? this.opts.pool
     try {
       await q.query('BEGIN')
+      if (wanted.trunks.length) {
+        const other = (await q.query('SELECT tenant_id FROM trunks WHERE tenant_id <> $1 LIMIT 1', [this.tenantId])) as { rows?: unknown[] } | undefined
+        if (other?.rows?.length)
+          throw Object.assign(new Error("OpenSIPS's database holds the trunks of another tenant: trunks for one tenant per database"), { statusCode: 409, code: 'TRUNK_OTHER_TENANT' })
+      }
       const now = await this.current(q)
       const changed = {
         dispatcher: !sameRows(now.dispatcher, wanted.dispatcher),
@@ -244,7 +267,7 @@ export class TrunkTables {
       await q.query('DELETE FROM trunks WHERE tenant_id = $1', [this.tenantId])
       for (const r of wanted.trunks)
         await q.query(
-          'INSERT INTO trunks (tenant_id, id, setid, position, domain, number_format, assert_identity, auth_username, auth_password, auth_realm, codec_flags, default_number, reg_aor) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)',
+          'INSERT INTO trunks (tenant_id, id, setid, position, domain, number_format, assert_identity, auth_username, auth_password, auth_realm, codec_flags, default_number, reg_aor, allowed) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)',
           [this.tenantId, ...r]
         )
       for (const r of wanted.dids) await q.query('INSERT INTO dids (tenant_id, id, trunk_id, first_number, last_number, target, suffix_digits) VALUES ($1, $2, $3, $4, $5, $6, $7)', [this.tenantId, ...r])

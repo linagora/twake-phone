@@ -154,6 +154,7 @@ CREATE TABLE IF NOT EXISTS trunks (
     default_number VARCHAR(16) NOT NULL,
     reg_aor VARCHAR(255) DEFAULT '' NOT NULL
 );
+ALTER TABLE trunks ADD COLUMN IF NOT EXISTS allowed VARCHAR(128) DEFAULT ',fixed,mobile,freephone,standard-rate,' NOT NULL;
 CREATE TABLE IF NOT EXISTS dids (
     id VARCHAR(64) PRIMARY KEY NOT NULL,
     tenant_id TEXT DEFAULT '' NOT NULL,
@@ -164,7 +165,7 @@ CREATE TABLE IF NOT EXISTS dids (
     suffix_digits SMALLINT DEFAULT 0 NOT NULL
 );
 CREATE INDEX IF NOT EXISTS dids_first_number_idx ON dids (first_number);
-DELETE FROM dialplan WHERE dpid IN (1, 2);
+DELETE FROM dialplan WHERE dpid IN (1, 2, 3);
 INSERT INTO dialplan (dpid, pr, match_op, match_exp, match_flags, subst_exp, repl_exp, disabled, attrs) VALUES
   (1, 10, 1, '^(1[578]|11[2459]|19[167]|116000|116117)$', 0, '^(.*)$', '\1', 0, 'emergency'),
   (1, 20, 1, '^0([1-9][0-9]{8})$', 0, '^0([1-9][0-9]{8})$', '+33\1', 0, 'e164'),
@@ -174,6 +175,7 @@ INSERT INTO dialplan (dpid, pr, match_op, match_exp, match_flags, subst_exp, rep
   (1, 30, 1, '^\+[1-9][0-9]{6,14}$', 0, '^(.*)$', '\1', 0, 'e164'),
   (1, 31, 1, '^00([1-9][0-9]{6,14})$', 0, '^00([1-9][0-9]{6,14})$', '+\1', 0, 'e164'),
   (1, 90, 1, '^[+0]', 0, '^(.*)$', '\1', 0, 'invalid'),
+  (2, 9, 1, '^\+33(26[239]|59[046]|639|69[0-7])[0-9]{6}$', 0, '^(.*)$', '\1', 0, 'overseas'),
   (2, 10, 1, '^\+33[1-59][0-9]{8}$', 0, '^(.*)$', '\1', 0, 'fixed'),
   (2, 11, 1, '^\+33[67][0-9]{8}$', 0, '^(.*)$', '\1', 0, 'mobile'),
   (2, 12, 1, '^\+3380[0-5][0-9]{6}$', 0, '^(.*)$', '\1', 0, 'freephone'),
@@ -181,7 +183,8 @@ INSERT INTO dialplan (dpid, pr, match_op, match_exp, match_flags, subst_exp, rep
   (2, 14, 1, '^\+338[1-9][0-9]{7}$', 0, '^(.*)$', '\1', 0, 'premium'),
   (2, 15, 1, '^\+33', 0, '^(.*)$', '\1', 0, 'invalid'),
   (2, 20, 1, '^\+(262|508|59[046]|68[179])', 0, '^(.*)$', '\1', 0, 'overseas'),
-  (2, 30, 1, '^\+', 0, '^(.*)$', '\1', 0, 'international');
+  (2, 30, 1, '^\+', 0, '^(.*)$', '\1', 0, 'international'),
+  (3, 10, 1, '^([1-9][0-9]{8})$', 0, '^([1-9][0-9]{8})$', '+33\1', 0, 'e164');
 ALTER TABLE subscriber ADD COLUMN IF NOT EXISTS holder TEXT;
 ALTER TABLE acc ADD COLUMN IF NOT EXISTS caller VARCHAR(64) DEFAULT '' NOT NULL;
 ALTER TABLE acc ADD COLUMN IF NOT EXISTS callee VARCHAR(64) DEFAULT '' NOT NULL;

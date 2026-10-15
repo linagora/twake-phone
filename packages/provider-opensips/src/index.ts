@@ -16,7 +16,7 @@ export { CallGroups, CALL_GROUPS_SCHEMA, DISPLAY_NAMES_SCHEMA, GROUP_MEMBERS_MAX
 export { PushTargets, PUSH_TARGETS_SCHEMA, type PushTargetsOptions } from './push-targets.js'
 export { AsyncQueue } from './queue.js'
 export { TrunkTables, TRUNK_SCHEMA, TRUNK_SQL, DEFAULT_TRUNK_SOCKET, DISPATCHER_TABLE_VERSION, DIALPLAN_TABLE_VERSION, REGISTRANT_TABLE_VERSION, codecFlags, projectTrunks, trunkSecret, type TrunkTablesOptions } from './trunks.js'
-export { DIALPLAN_RULES, DIALPLAN_SQL, DP_CLASSIFY, DP_NORMALISE, OUTBOUND_ALLOWED, classify, translate, type DialplanRule, type NumberClass } from './numbering.js'
+export { DIALPLAN_RULES, DIALPLAN_SQL, DP_CLASSIFY, DP_INBOUND, DP_NORMALISE, OUTBOUND_ALLOWABLE, OUTBOUND_ALLOWED, classify, translate, type DialplanRule, type NumberClass } from './numbering.js'
 
 /**
  * The event the Gateway raises itself through the MI after each subscription to tell it hears OpenSIPS
@@ -126,6 +126,8 @@ export class OpensipsProvider implements TelephonyProvider, MediaProvider {
   private expiryTimer?: ReturnType<typeof setTimeout>
   /** Whether OpenSIPS reloaded the numbering plan the Gateway wrote at its start (once per start of the provider). */
   private dialplanLoaded = false
+  /** What OpenSIPS was asked to reload and did not: asked again at the next change, whatever it changes. */
+  private readonly pendingReloads = new Set<string>()
 
   constructor(private readonly config: OpensipsConfig) {
     for (const [name, value] of Object.entries({ websocketUrl: config.websocketUrl, domain: config.domain })) {
@@ -315,26 +317,49 @@ export class OpensipsProvider implements TelephonyProvider, MediaProvider {
    * The trunks and direct numbers of the tenant (ADR 0016), written into OpenSIPS's database; then OpenSIPS reloads
    * what changed: its dispatcher (the operator's servers), its registrations (only when they changed: an operator
    * stops answering an address that registers too often, ARCHITECTURE §13), and, once per start, its numbering plan.
-   * Without the MI, OpenSIPS reads them at its next start (logged).
+   * A reload that fails fails the change (502, code TRUNK_RELOAD_FAILED: written, not applied; asked again at the next
+   * change). Without the MI, OpenSIPS reads them at its next start (logged).
    */
   async setTrunks(trunks: (Trunk & { password?: string })[], dids: DidRange[]) {
     if (!this.config.trunks) throw Object.assign(new Error('Trunks are not available on this platform'), { statusCode: 501 })
     const changed = await this.config.trunks.set(trunks, dids)
     const log = this.config.logger ?? console
-    const reloads = [...(changed.dispatcher ? ['ds_reload'] : []), ...(changed.registrant ? ['reg_reload'] : []), ...(this.dialplanLoaded ? [] : ['dp_reload'])]
+    const wanted = new Set([...this.pendingReloads, ...(changed.dispatcher ? ['ds_reload'] : []), ...(changed.registrant ? ['reg_reload'] : []), ...(this.dialplanLoaded ? [] : ['dp_reload'])])
+    const reloads = ['ds_reload', 'reg_reload', 'dp_reload'].filter(m => wanted.has(m))
     if (!reloads.length) return
     if (!this.events) {
       log.warn(`OpenSIPS: trunks written, ${reloads.join(', ')} not asked (no MI): OpenSIPS reads them at its next start`)
       return
     }
+    const failed: string[] = []
     for (const method of reloads) {
       try {
         await this.events.call(method)
+        this.pendingReloads.delete(method)
         if (method === 'dp_reload') this.dialplanLoaded = true
       } catch (err) {
-        log.warn(`OpenSIPS: ${method} failed (${err instanceof Error ? err.message : String(err)}); the trunks are read at its next start`)
+        this.pendingReloads.add(method)
+        failed.push(`${method} (${err instanceof Error ? err.message : String(err)})`)
       }
     }
+    if (failed.length) {
+      log.warn(`OpenSIPS: trunks written, ${failed.join(', ')} failed: not applied until it reloads them or restarts`)
+      throw Object.assign(new Error(`OpenSIPS did not reload the trunks: ${failed.join(', ')}`), { statusCode: 502, code: 'TRUNK_RELOAD_FAILED' })
+    }
+  }
+
+  /**
+   * Ends a call with the public network on OpenSIPS's side (a BYE to each party it can reach, the operator's leg
+   * first of all): for a call whose browser went without hanging up (the Gateway, ADR 0016). 404 for a call it does
+   * not know, 409 for an internal one (both parties are browsers, which end their calls themselves) or one not
+   * answered.
+   */
+  async endCall(callId: string) {
+    if (!this.events) throw Object.assign(new Error('Ending a call needs the MI of OpenSIPS'), { statusCode: 501 })
+    const withOperator = this.tracker.isWithOperator(callId)
+    if (withOperator === undefined) throw Object.assign(new Error('No such call'), { statusCode: 404 })
+    if (!withOperator || !this.tracker.isConnected(callId)) throw Object.assign(new Error('Only an answered call with the public network is ended here'), { statusCode: 409 })
+    await this.events.call('dlg_end_dlg', [callId])
   }
 
   async getForwarding(user: User): Promise<ForwardingRules> {
