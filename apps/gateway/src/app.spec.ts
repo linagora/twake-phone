@@ -67,6 +67,24 @@ describe('gateway', () => {
     const res = await app.inject('/api/v1/me')
     expect(res.statusCode).toBe(401)
   })
+
+  it('lets an allowed origin send PUT and DELETE, which a browser preflights (Firefox enforces the methods)', async () => {
+    process.env.CORS_ORIGINS = 'https://phone.example.org'
+    try {
+      const app = await buildApp(new ProviderRegistry([]))
+      for (const method of ['PUT', 'DELETE']) {
+        const res = await app.inject({
+          method: 'OPTIONS',
+          url: '/api/v1/me/forwarding',
+          headers: { origin: 'https://phone.example.org', 'access-control-request-method': method }
+        })
+        expect(res.statusCode).toBe(204)
+        expect(String(res.headers['access-control-allow-methods']).split(/,\s*/)).toContain(method)
+      }
+    } finally {
+      delete process.env.CORS_ORIGINS
+    }
+  })
 })
 
 describe('event stream', () => {

@@ -247,6 +247,8 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
   // Origins of the Twake apps allowed to call the Gateway from a browser.
   await app.register(cors, {
     origin: process.env.CORS_ORIGINS?.split(',') ?? false,
+    // The plugin's default is GET, HEAD and POST: the browser's preflight would refuse every PUT and DELETE.
+    methods: ['GET', 'HEAD', 'POST', 'PUT', 'DELETE'],
     allowedHeaders: ['authorization', 'content-type', 'idempotency-key', 'x-cozy-instance']
   })
   await app.register(swagger, { openapi: { info: { title: 'Twake Telephony Gateway', version: '0.1.0' } } })
