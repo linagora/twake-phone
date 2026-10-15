@@ -54,6 +54,11 @@ const expiryOf = (v: unknown, nowMs: number): number | undefined => {
 }
 
 const REFUSED = new Set([486, 600, 603])
+/**
+ * Declined by the callee: 603 (what the softphone answers when its user refuses) or 600. A 486 is not: a second
+ * window already in a call answers it, and tm prefers it to the other windows' silence.
+ */
+const DECLINED = new Set([600, 603])
 /** How the caller sees a call that did not go through, from the final SIP status: refused, or not reachable. */
 const failedState = (code: number): CallState => (REFUSED.has(code) ? 'rejected' : code === 487 ? 'ended' : 'failed')
 
@@ -73,28 +78,55 @@ export class CallTracker {
     private readonly now: () => string = () => new Date().toISOString()
   ) {}
 
-  /** The registrations as OpenSIPS holds them now (`ul_dump`): replaces what the events built so far. */
-  seedRegistrations(aors: { aor: string; contacts: (string | ContactRegistration)[] }[]) {
-    const seen = new Set<string>()
+  /** The contacts known now, to take before asking `ul_dump`: a resync only removes what was known before it. */
+  knownContacts(): Map<string, Set<string>> {
+    return new Map([...this.contacts].map(([ext, set]) => [ext, new Set(set.keys())]))
+  }
+
+  /** The calls known now, to take before asking `dlg_list`: a resync only ends what was known before it. */
+  knownCalls(): Set<string> {
+    return new Set(this.calls.keys())
+  }
+
+  /**
+   * The registrations as OpenSIPS held them when it answered `ul_dump`: replaces what was `known` before the
+   * question (all that is known when not given). A registration told while the answer was on its way is kept.
+   */
+  seedRegistrations(aors: { aor: string; contacts: (string | ContactRegistration)[] }[], known = this.knownContacts()) {
+    const dump = new Map<string, Map<string, number | undefined>>()
     for (const { aor, contacts } of aors) {
       const ext = userOf(aor)
-      seen.add(ext)
-      if (contacts.length) this.contacts.set(ext, new Map(contacts.map(c => (typeof c === 'string' ? [c, undefined] : [c.uri, c.expiresAt]))))
-      else this.contacts.delete(ext)
+      const set = dump.get(ext) ?? new Map<string, number | undefined>()
+      for (const c of contacts) typeof c === 'string' ? set.set(c, undefined) : set.set(c.uri, c.expiresAt)
+      if (set.size) dump.set(ext, set)
     }
-    for (const ext of [...this.contacts.keys()]) if (!seen.has(ext)) this.contacts.delete(ext)
+    for (const [ext, uris] of known) {
+      const set = this.contacts.get(ext)
+      if (!set) continue
+      for (const uri of uris) if (!dump.get(ext)?.has(uri)) set.delete(uri)
+      if (set.size === 0) this.contacts.delete(ext)
+    }
+    for (const [ext, fresh] of dump) {
+      const set = this.contacts.get(ext) ?? new Map<string, number | undefined>()
+      for (const [uri, expiresAt] of fresh) set.set(uri, expiresAt)
+      this.contacts.set(ext, set)
+    }
     this.tellPresences()
   }
 
   /**
-   * The dialogs OpenSIPS holds now (`dlg_list`): a call we track that OpenSIPS no longer has is over (its CDR
-   * was lost), one we do not know is in progress (states 1 to 4: unconfirmed, ringing, answered, confirmed), and
-   * one we track that went further meanwhile is told so.
+   * The dialogs OpenSIPS held when it answered `dlg_list`: a call `known` before the question that OpenSIPS no
+   * longer has is over (its CDR was lost: no tombstone, a late CDR still records it); one we do not know is in
+   * progress (states 1 to 4: unconfirmed, ringing, answered, confirmed), and one we track that went further
+   * meanwhile is told so. A call that started while the answer was on its way is left alone.
    */
-  seedDialogs(dialogs: { callid: string; state: number; caller: string; callee: string; startedAt?: string }[]) {
+  seedDialogs(dialogs: { callid: string; state: number; caller: string; callee: string; startedAt?: string }[], known = this.knownCalls()) {
     const live = dialogs.filter(d => d.state >= 1 && d.state <= 4)
     const alive = new Set(live.map(d => d.callid))
-    for (const call of [...this.calls.values()]) if (!alive.has(call.id)) this.end(call, this.now(), 'ended', call.connectedAt ? 'ended' : 'missed')
+    for (const id of known) {
+      const call = this.calls.get(id)
+      if (call && !alive.has(id)) this.end(call, this.now(), 'ended', call.connectedAt ? 'ended' : 'missed', false)
+    }
     for (const d of live) {
       if (this.ended.has(d.callid)) continue
       let call = this.calls.get(d.callid)
@@ -115,11 +147,13 @@ export class CallTracker {
     this.tellPresences()
   }
 
-  /** Nothing is known any more (OpenSIPS gone): everyone is offline until the next resync says otherwise. */
+  /**
+   * The subscription lapsed (OpenSIPS gone for longer than its life): the registrations are forgotten, everyone
+   * is offline until the next resync says otherwise. The calls are kept: that resync ends those OpenSIPS no longer
+   * has, with their history, and a CDR that comes meanwhile still records its call.
+   */
   reset() {
     this.contacts.clear()
-    this.calls.clear()
-    this.busy.clear()
     this.tellPresences()
   }
 
@@ -132,7 +166,7 @@ export class CallTracker {
       if (set.size === 0) this.contacts.delete(ext)
     }
     const limit = nowMs - MAX_CALL_MS
-    for (const c of [...this.calls.values()]) if (Date.parse(c.startedAt) < limit) this.end(c, now, 'ended', c.connectedAt ? 'ended' : 'missed')
+    for (const c of [...this.calls.values()]) if (Date.parse(c.startedAt) < limit) this.end(c, now, 'ended', c.connectedAt ? 'ended' : 'missed', false)
     this.tellPresences()
   }
 
@@ -169,14 +203,14 @@ export class CallTracker {
         break
       }
       case 'E_TWAKEPHONE_RINGING': {
-        const call = this.calls.get(str(p.callid))
+        const call = this.find(p, now)
         if (!call || call.rang) return
         this.rings(call)
         this.tellBoth(call, 'call.ringing', 'ringing')
         break
       }
       case 'E_TWAKEPHONE_ANSWERED': {
-        const call = this.calls.get(str(p.callid))
+        const call = this.find(p, now)
         if (!call || call.connectedAt) return
         this.rings(call)
         call.connectedAt = now
@@ -186,8 +220,11 @@ export class CallTracker {
       case 'E_ACC_CDR': {
         // The reference end of an answered call, on OpenSIPS's clock: `time` is when it was answered, the
         // duration how long it lasted (milliseconds when acc gives them).
-        const call = this.calls.get(str(p.callid))
+        const created = epochMs(p.created)
+        const call = this.find(p, created !== undefined ? iso(created) : now)
         if (!call) return
+        // Answered: both sides knew of it.
+        this.rings(call)
         const answeredMs = epochMs(p.time)
         const ms = num(p.ms_duration)
         const sec = num(p.duration)
@@ -204,7 +241,7 @@ export class CallTracker {
         if (!call) return
         const code = Number(p.sip_code) || 0
         const at = epochMs(p.time)
-        this.end(call, at !== undefined ? iso(at) : now, failedState(code), REFUSED.has(code) ? 'rejected' : 'missed')
+        this.end(call, at !== undefined ? iso(at) : now, failedState(code), DECLINED.has(code) ? 'rejected' : 'missed')
         break
       }
       default:
@@ -240,6 +277,20 @@ export class CallTracker {
   /** The calls in progress, for a look at the state. */
   activeCalls(): Call[] {
     return [...this.calls.values()].map(c => this.toCall(c, c.caller, c.connectedAt ? 'connected' : c.rang ? 'ringing' : 'new'))
+  }
+
+  /**
+   * The call these parameters name. One whose CALLING was lost is born of the first later event that names both
+   * parties (ringing, answer, CDR); one that ended is never brought back.
+   */
+  private find(p: Record<string, unknown>, startedAt: string): TrackedCall | undefined {
+    const id = str(p.callid)
+    if (!id || this.ended.has(id)) return undefined
+    const call = this.calls.get(id)
+    if (call) return call
+    const caller = userOf(str(p.caller))
+    const callee = userOf(str(p.callee))
+    return caller && callee ? this.start(id, caller, callee, startedAt) : undefined
   }
 
   private start(id: string, caller: string, callee: string, startedAt: string): TrackedCall {
@@ -283,13 +334,18 @@ export class CallTracker {
     for (const ext of c.caller === c.callee ? [c.caller] : [c.caller, c.callee]) this.tell(c, ext, type, state)
   }
 
-  /** Tells each side how its call ended; the callee only hears of a call its phone rang for. */
-  private end(c: TrackedCall, endedAt: string, callerState: CallState, calleeState: CallState) {
+  /**
+   * Tells each side how its call ended; the callee only hears of a call its phone rang for. An end OpenSIPS told
+   * leaves a tombstone; one deduced (a resync, a call too old) does not, so the real end may still come.
+   */
+  private end(c: TrackedCall, endedAt: string, callerState: CallState, calleeState: CallState, tombstone = true) {
     this.calls.delete(c.id)
     this.count(c.caller, -1)
     if (c.rang) this.count(c.callee, -1)
-    this.ended.add(c.id)
-    if (this.ended.size > MAX_TOMBSTONES) this.ended.delete(this.ended.values().next().value!)
+    if (tombstone) {
+      this.ended.add(c.id)
+      if (this.ended.size > MAX_TOMBSTONES) this.ended.delete(this.ended.values().next().value!)
+    }
     const timestamp = this.now()
     const event = (ext: string, state: CallState): TelephonyEvent => ({ type: state === 'failed' ? 'call.failed' : 'call.ended', timestamp, payload: { call: this.toCall(c, ext, state, endedAt) } })
     this.emit(c.caller, event(c.caller, callerState))

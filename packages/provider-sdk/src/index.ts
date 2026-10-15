@@ -22,6 +22,8 @@ export interface RoutedEvent {
 export interface TelephonyProvider {
   readonly id: string
   getStatus(): ProviderStatus
+  /** Why the status is not CONNECTED, in a few words without addresses or secrets (it may be shown unauthenticated). */
+  getStatusReason?(): string | undefined
   getCapabilities(): Promise<Capabilities>
   getPresence(user: User): Promise<Presence>
   setPresence(user: User, presence: Presence): Promise<void>

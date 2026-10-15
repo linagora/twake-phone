@@ -20,14 +20,27 @@ import { isMissed, type HistoryEntry, type HistoryQuery, type Store } from './st
 
 const STATUSES: PresenceStatus[] = ['available', 'busy', 'away', 'dnd', 'offline']
 const DIRECTIONS: CallDirection[] = ['inbound', 'outbound']
-const HISTORY_STATUS = ['missed', 'answered', 'failed']
+const HISTORY_STATUS = ['missed', 'declined', 'answered', 'failed']
+/** How long recording a call in the history may take before the pump moves on (a database that hangs). */
+const HISTORY_WRITE_MS = 5_000
 const BROWSER_ENDPOINT: Endpoint = { id: 'browser', type: 'browser', label: 'Twake Phone' }
 
-const isMediaProvider = (p: TelephonyProvider): p is TelephonyProvider & MediaProvider => 'getSession' in p
+/** `promise`, or a rejection once `ms` passed without it settling (it still runs, its result is ignored). */
+const within = <T>(promise: Promise<T>, ms: number, what: string): Promise<T> => {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(new Error(`${what}: no answer within ${ms} ms`)), ms)
+  })
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer))
+}
+
+const isMediaProvider =(p: TelephonyProvider): p is TelephonyProvider & MediaProvider => 'getSession' in p
 
 export interface BuildOptions {
   bus?: EventBus
   store?: Store
+  /** How long a history write may take before the event goes on without it. Default 5 s. */
+  historyWriteTimeoutMs?: number
   directory?: UserDirectory
   /** The people one can look up and call. Absent when no directory is configured: the endpoints answer 501. */
   contacts?: ContactDirectory
@@ -103,6 +116,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
   const auth = options.auth ?? authenticatorFromEnv(process.env)
   const admin = options.admin ?? adminPolicyFromEnv(process.env)
   const tickets = options.tickets ?? new TicketStore()
+  const historyWriteMs = options.historyWriteTimeoutMs ?? HISTORY_WRITE_MS
   let directory = options.directory
   if (!directory) {
     // Dev convenience: a bare in-memory gateway maps users from DEV_USER_MAP.
@@ -182,9 +196,10 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
       return
     }
     trackOwner(tenantId, userId, event)
-    // Recorded before it is told: the app reloads its history when it hears that a call ended.
+    // Recorded before it is told: the app reloads its history when it hears that a call ended. A database that
+    // hangs holds the tenant's events for a few seconds at most, not for good.
     const entry = historyEntryFor(tenantId, userId, event)
-    if (entry) await store.addHistory(entry).catch(err => app.log.error({ err }, 'could not record call history'))
+    if (entry) await within(store.addHistory(entry), historyWriteMs, 'history write').catch(err => app.log.error({ err, callId: entry.callId }, 'could not record call history'))
     bus.publish(tenantId, userId, event)
   }
   registry.onCreate = (tenantId, provider) => {
@@ -207,10 +222,13 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
   // Ready while every provider can place calls: DEGRADED (events lost, calls still going through) says so in the
   // body without taking the Gateway out of service.
   app.get('/ready', async (_req, reply) => {
-    const statuses = registry.all().map(p => p.getStatus())
+    const providers = registry.all()
+    const statuses = providers.map(p => p.getStatus())
     const ready = statuses.every(s => s === 'CONNECTED' || s === 'DEGRADED')
     const degraded = statuses.filter(s => s === 'DEGRADED').length
-    return reply.code(ready ? 200 : 503).send({ ready, ...(degraded ? { degraded } : {}) })
+    // Why, in the providers' few words (no addresses): the details are in the log.
+    const reasons = [...new Set(providers.flatMap(p => (p.getStatus() === 'CONNECTED' ? [] : [p.getStatusReason?.()])).filter((r): r is string => !!r))]
+    return reply.code(ready ? 200 : 503).send({ ready, ...(degraded ? { degraded } : {}), ...(reasons.length ? { reasons } : {}) })
   })
   app.get('/openapi.json', async () => app.swagger())
 
@@ -544,6 +562,9 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
           unsubscribe()
           unsubscribeTenant()
         })
+        // The session is accepted: the client may read the state now (and reset its backoff), every change from
+        // here on reaches it. Not an event; a socket closed before it is a failed attempt.
+        socket.send(JSON.stringify({ type: 'stream.ready' }))
       })
 
       if (process.env.AUTH_MODE === 'dev') {

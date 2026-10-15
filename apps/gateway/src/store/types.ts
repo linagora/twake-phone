@@ -38,10 +38,13 @@ export interface HistoryEntry {
 /** A missed call: inbound, never answered, and not declined by the user (state `missed`, not `rejected`). */
 export const isMissed = (e: Pick<HistoryEntry, 'direction' | 'answered' | 'state'>) => e.direction === 'inbound' && !e.answered && e.state === 'missed'
 
+/** A call the user declined: inbound, never answered, refused (state `rejected`). */
+export const isDeclined = (e: Pick<HistoryEntry, 'direction' | 'answered' | 'state'>) => e.direction === 'inbound' && !e.answered && e.state === 'rejected'
+
 export interface HistoryQuery {
   direction?: CallDirection
-  /** missed: inbound never answered nor declined; answered; failed. */
-  status?: 'missed' | 'answered' | 'failed'
+  /** missed: inbound never answered nor declined; declined: inbound the user refused; answered; failed. */
+  status?: 'missed' | 'declined' | 'answered' | 'failed'
   /** Substring of the remote number. */
   number?: string
   from?: string

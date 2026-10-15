@@ -67,7 +67,7 @@ describe('CallTracker', () => {
     expect(presences()).toEqual(['101:available', '102:available'])
   })
 
-  it('tells a refused call as rejected to both, a cancelled one as missed to the callee, an unreachable one to the caller only', () => {
+  it('tells a declined call (603, 600) as rejected to both, a busy one (486) as missed to the callee, a cancelled one as missed, an unreachable one to the caller only', () => {
     const { tracker, calls, clear } = make()
     for (const ext of ['101', '102']) tracker.handle('E_UL_CONTACT_INSERT', contact(ext, `sip:${ext}@x.invalid`))
     clear()
@@ -75,6 +75,17 @@ describe('CallTracker', () => {
     tracker.handle('E_TWAKEPHONE_RINGING', call('c1', '101', '102'))
     tracker.handle('E_ACC_MISSED_EVENT', missed('c1', '101', '102', '603', 1792002800))
     expect(calls().slice(-2)).toEqual(['101:call.ended:outbound:102:rejected', '102:call.ended:inbound:101:rejected'])
+    clear()
+    tracker.handle('E_TWAKEPHONE_CALLING', call('c600', '101', '102'))
+    tracker.handle('E_TWAKEPHONE_RINGING', call('c600', '101', '102'))
+    tracker.handle('E_ACC_MISSED_EVENT', missed('c600', '101', '102', '600', 1792002801))
+    expect(calls().slice(-2)).toEqual(['101:call.ended:outbound:102:rejected', '102:call.ended:inbound:101:rejected'])
+    clear()
+    // A second window already in a call answers 486, and tm prefers it to the others' silence: nobody declined.
+    tracker.handle('E_TWAKEPHONE_CALLING', call('c486', '101', '102'))
+    tracker.handle('E_TWAKEPHONE_RINGING', call('c486', '101', '102'))
+    tracker.handle('E_ACC_MISSED_EVENT', missed('c486', '101', '102', '486', 1792002802))
+    expect(calls().slice(-2)).toEqual(['101:call.ended:outbound:102:rejected', '102:call.ended:inbound:101:missed'])
     clear()
     tracker.handle('E_TWAKEPHONE_CALLING', call('c2', '101', '102'))
     tracker.handle('E_TWAKEPHONE_RINGING', call('c2', '101', '102'))
@@ -92,14 +103,39 @@ describe('CallTracker', () => {
     expect(tracker.activeCalls()).toEqual([])
   })
 
+  it('creates a call whose CALLING was lost from a later event naming both sides (ringing, answer, CDR), never one that ended', () => {
+    const { tracker, calls, events, clear } = make()
+    tracker.handle('E_ACC_CDR', cdr('lost1', '103', '101', 30, 1792002800))
+    expect(calls()).toEqual(['103:call.ended:outbound:101:ended', '101:call.ended:inbound:103:ended'])
+    // Started when the INVITE came (`created`), answered at `time`.
+    expect((events[0]!.event.payload as { call: { startedAt: string; connectedAt: string } }).call).toMatchObject({ startedAt: '2026-10-14T18:33:19.000Z', connectedAt: '2026-10-14T18:33:20.000Z' })
+    clear()
+    tracker.handle('E_TWAKEPHONE_RINGING', call('lost2', '103', '101'))
+    tracker.handle('E_TWAKEPHONE_ANSWERED', call('lost2', '103', '101'))
+    tracker.handle('E_ACC_CDR', cdr('lost2', '103', '101', 5, 1792002810))
+    expect(calls()).toEqual([
+      '103:call.ringing:outbound:101:ringing',
+      '101:call.ringing:inbound:103:ringing',
+      '103:call.connected:outbound:101:connected',
+      '101:call.connected:inbound:103:connected',
+      '103:call.ended:outbound:101:ended',
+      '101:call.ended:inbound:103:ended'
+    ])
+    clear()
+    tracker.handle('E_TWAKEPHONE_ANSWERED', call('lost3', '103', '101'))
+    expect(tracker.activeCalls().map(c => `${c.id}:${c.state}`)).toEqual(['lost3:connected'])
+    expect(tracker.telephonyPresence('101')).toBe('busy')
+    clear()
+    // Not without both sides, not after its end, not from a missed call (did the callee's phone ring?).
+    tracker.handle('E_ACC_CDR', cdr('lost1', '103', '101', 30, 1792002800))
+    tracker.handle('E_TWAKEPHONE_RINGING', { callid: 'lost4', caller: '', callee: '101' })
+    tracker.handle('E_ACC_CDR', { ...cdr('lost5', '103', '101', 30, 1792002800), caller: undefined })
+    tracker.handle('E_ACC_MISSED_EVENT', missed('lost6', '103', '101', '487', 1792002800))
+    expect(events).toEqual([])
+  })
+
   it('records the end of a call whose start it never saw once the dialogs read say it is in progress (a Gateway started mid-call)', () => {
     const { tracker, calls, events, clear } = make()
-    // Neither seen starting nor among the dialogs: an unknown call is born of nothing but a CALLING.
-    tracker.handle('E_ACC_CDR', cdr('ghost', '103', '101', 30, 1792002800))
-    tracker.handle('E_ACC_MISSED_EVENT', missed('ghost2', '103', '101', '487', 1792002800))
-    tracker.handle('E_TWAKEPHONE_RINGING', call('ghost3', '103', '101'))
-    tracker.handle('E_TWAKEPHONE_ANSWERED', call('ghost3', '103', '101'))
-    expect(events).toEqual([])
     tracker.seedDialogs([{ callid: 'old', state: 4, caller: '103', callee: '101', startedAt: '2026-10-14T18:33:20.000Z' }])
     clear()
     tracker.handle('E_ACC_CDR', cdr('old', '103', '101', 31, 1792002800, 30_500))
@@ -233,8 +269,41 @@ describe('CallTracker', () => {
     expect(presences()).toEqual(['101:offline', '103:busy'])
     expect(tracker.presenceOf('102').status).toBe('busy')
     clear()
+    // The subscription lapsed: the registrations are forgotten, the calls kept (busy is still true) until a
+    // resync ends those OpenSIPS no longer has, with their history.
     tracker.reset()
+    expect(presences()).toEqual([])
+    expect(tracker.presenceOf('102').status).toBe('busy')
+    tracker.seedRegistrations([])
+    tracker.seedDialogs([])
+    expect(calls()).toEqual(['103:call.ended:outbound:102:ended', '102:call.ended:inbound:103:ended'])
     expect(presences()).toEqual(['102:offline', '103:offline'])
+  })
+
+  it('only ends or removes in a resync what it knew before asking: what came while the answer was on its way is newer', () => {
+    const { tracker, presences, calls, clear } = make()
+    tracker.handle('E_UL_CONTACT_INSERT', contact('101', 'sip:a@x.invalid'))
+    tracker.handle('E_TWAKEPHONE_CALLING', call('old', '101', '104'))
+    const contacts = tracker.knownContacts()
+    // 103 registers, 101 adds a window, while ul_dump's answer (taken before) is on its way.
+    tracker.handle('E_UL_CONTACT_INSERT', contact('103', 'sip:c@x.invalid'))
+    tracker.handle('E_UL_CONTACT_INSERT', contact('101', 'sip:b@x.invalid'))
+    clear()
+    tracker.seedRegistrations([{ aor: '102', contacts: ['sip:d@x.invalid'] }], contacts)
+    expect(presences()).toEqual(['102:available'])
+    expect(['101', '102', '103'].map(e => tracker.telephonyPresence(e))).toEqual(['busy', 'available', 'available'])
+    const calls0 = tracker.knownCalls()
+    tracker.handle('E_TWAKEPHONE_CALLING', call('new', '102', '103'))
+    clear()
+    tracker.seedDialogs([], calls0)
+    // Only the call known before the question ends; the one that started meanwhile goes on.
+    expect(calls()).toEqual(['101:call.ended:outbound:104:ended'])
+    expect(tracker.activeCalls().map(c => c.id)).toEqual(['new'])
+    // A resync deduced that end: no tombstone, the CDR that comes late still records the call (its history
+    // keeps the first end).
+    clear()
+    tracker.handle('E_ACC_CDR', cdr('old', '101', '104', 3, 1792002800))
+    expect(calls()).toEqual(['101:call.ended:outbound:104:ended', '104:call.ended:inbound:101:ended'])
   })
 
   it('reads every live dialog state: 1 calling, 2 ringing, 3 and 4 answered; 5 (deleted) is over', () => {

@@ -60,6 +60,7 @@ describe('OpensipsEvents', () => {
     cleanups.push(() => events.stop())
     await events.start()
     expect(events.connected).toBe(false)
+    expect(events.reason).toMatch(/MI does not answer/)
     expect(resyncs).toBe(0)
     sips.state.down = false
     await until('the subscription', () => events.connected, 5_000)
@@ -73,6 +74,55 @@ describe('OpensipsEvents', () => {
     await until('the resubscription', () => events.connected, 5_000)
     expect(resyncs).toBe(2)
     expect(statuses).toEqual([true, false, true])
+    expect(events.reason).toBeUndefined()
+  })
+
+  it('lives through a failed renewal (the subscription still lives in OpenSIPS), and tells only once it expired without one', async () => {
+    const sips = await fakeOpensips()
+    cleanups.push(sips.close)
+    let expired = 0
+    const got: string[] = []
+    const events = new OpensipsEvents({ miUrl: sips.url, events: ['E_ACC_CDR'], expireSec: 1, timeoutMs: 50, onEvent: m => got.push(m), onExpired: () => void expired++, logger: quiet })
+    cleanups.push(() => events.stop())
+    await events.start()
+    // One MI reply lost: degraded, but OpenSIPS keeps sending until the expiry of the last subscription.
+    sips.state.down = true
+    await events['renew']()
+    expect(events.connected).toBe(false)
+    expect(events.live).toBe(true)
+    expect(expired).toBe(0)
+    sips.push('E_ACC_CDR', { callid: 'c1' })
+    await until('the CDR sent meanwhile', () => got.length === 1)
+    await until('the expiry', () => expired === 1)
+    expect(events.live).toBe(false)
+    sips.state.down = false
+    await until('the resubscription', () => events.connected, 5_000)
+    expect(events.live).toBe(true)
+    expect(expired).toBe(1)
+  })
+
+  it('logs an error once the state of OpenSIPS could not be read three times in a row, and says why it is degraded', async () => {
+    const sips = await fakeOpensips()
+    cleanups.push(sips.close)
+    const errors: string[] = []
+    let fail = true
+    const onResync = () => {
+      if (fail) throw new Error('OpenSIPS MI ul_dump: no reply within 50 ms')
+    }
+    const events = new OpensipsEvents({ miUrl: sips.url, events: ['E_ACC_CDR'], onEvent: () => undefined, onResync, logger: { ...quiet, error: m => errors.push(m) } })
+    cleanups.push(() => events.stop())
+    await events.start()
+    expect(events.connected).toBe(false)
+    expect(events.reason).toMatch(/state of OpenSIPS cannot be read/)
+    await events['renew']()
+    expect(errors).toEqual([])
+    await events['renew']()
+    expect(errors).toHaveLength(1)
+    expect(errors[0]).toMatch(/3 times in a row.*one MI datagram \(about 64 KB\)/)
+    fail = false
+    await events['renew']()
+    expect(events.connected).toBe(true)
+    expect(events.reason).toBeUndefined()
   })
 
   it('survives any datagram: null, an array, a number, a string, garbage, a reply nobody waits for', async () => {
@@ -117,6 +167,50 @@ describe('OpensipsEvents', () => {
     for (const i of ids) expect(i).toMatch(/^[0-9a-f]{24}$/)
   })
 
+  it('accepts the events from the addresses it is given besides the MI host, and is degraded while only others arrive', async () => {
+    const sips = await fakeOpensips()
+    cleanups.push(sips.close)
+    const got: string[] = []
+    const errors: string[] = []
+    const statuses: boolean[] = []
+    const events = new OpensipsEvents({ miUrl: sips.url, from: ['127.0.0.3'], events: ['E_ACC_CDR'], onEvent: m => got.push(m), onStatus: s => statuses.push(s), logger: { ...quiet, error: m => errors.push(m) } })
+    cleanups.push(() => events.stop())
+    await events.start()
+    const socketAt = async (host: string) => {
+      const s = dgram.createSocket('udp4')
+      await new Promise<void>(r => s.bind(0, host, r))
+      cleanups.push(() => new Promise<void>(r => s.close(() => r())))
+      return s
+    }
+    // event_datagram sends from the address its kernel picks for the route, not always the MI one.
+    const [relay, other] = [await socketAt('127.0.0.3'), await socketAt('127.0.0.2')]
+    const [, host, port] = /^udp:(.+):(\d+)$/.exec(events.address!)!
+    const send = (s: dgram.Socket, method: string) => s.send(JSON.stringify({ jsonrpc: '2.0', method, params: {} }), Number(port), host)
+    send(relay!, 'E_FROM_RELAY')
+    await until('the event from an accepted address', () => got.includes('E_FROM_RELAY'))
+    await events['renew']()
+    expect(events.connected).toBe(true)
+    // A renewal period with nothing at all is quiet, not deaf.
+    await events['renew']()
+    expect(events.connected).toBe(true)
+    // Then only datagrams from an address nobody listed: degraded, with the reason, and an error in the log.
+    send(other!, 'E_ACC_CDR')
+    send(other!, 'E_ACC_CDR')
+    await until('the ignored datagrams', () => events['foreign'] === 2)
+    await events['renew']()
+    expect(events.connected).toBe(false)
+    expect(events.reason).toMatch(/not accepted \(OPENSIPS_EVENTS_FROM\)/)
+    expect(errors).toHaveLength(1)
+    expect(errors[0]).toMatch(/only datagrams from 127\.0\.0\.2 arrived.*OPENSIPS_EVENTS_FROM/)
+    expect(got).toEqual(['E_FROM_RELAY'])
+    // An accepted one comes again: heard.
+    sips.push('E_ACC_CDR', {})
+    await until('the event from the MI host', () => got.length === 2)
+    await events['renew']()
+    expect(events.connected).toBe(true)
+    expect(statuses).toEqual([true, false, true])
+  })
+
   it('reads the state again when OpenSIPS restarted between two renewals, and only then', async () => {
     const sips = await fakeOpensips()
     cleanups.push(sips.close)
@@ -129,18 +223,27 @@ describe('OpensipsEvents', () => {
     await events['renew']()
     expect([resyncs, renewed]).toEqual([1, 1])
     // Restarted between two renewals: no failure was seen, the subscription is gone, the start time changed.
+    // "Up time" is measured on the wall clock: going back (NTP) is not a restart, only "Up since" says so.
+    sips.state.upTime = '1 [sec]'
+    await events['renew']()
+    expect([resyncs, renewed]).toEqual([1, 2])
     sips.restart('Wed Oct 14 18:05:00 2026')
     await events['renew']()
-    expect([resyncs, renewed]).toEqual([2, 1])
+    expect([resyncs, renewed]).toEqual([2, 2])
     expect(sips.subscriptions.map(s => s.event)).toEqual(['E_UL_CONTACT_INSERT'])
     expect(events.connected).toBe(true)
   })
 
-  it('unsubscribes when it stops (expire 0), best effort', async () => {
+  it('unsubscribes when it stops (expire 0), best effort, but not from a fixed address the next instance may hold', async () => {
     const sips = await fakeOpensips()
     cleanups.push(sips.close)
     const events = new OpensipsEvents({ miUrl: sips.url, events: ['E_UL_CONTACT_INSERT', 'E_ACC_CDR'], onEvent: () => undefined, logger: quiet })
+    const delays: number[] = []
+    const schedule = events['schedule'].bind(events)
+    events['schedule'] = (ms: number) => void (delays.push(ms), schedule(ms))
     await events.start()
+    // An address of its own (any free port): renewed at half the expiry from the start.
+    expect(delays).toEqual([60_000])
     expect(sips.subscriptions).toHaveLength(2)
     await events.stop()
     expect(sips.subscriptions).toEqual([])
@@ -154,21 +257,79 @@ describe('OpensipsEvents', () => {
     const t0 = Date.now()
     await e2.stop()
     expect(Date.now() - t0).toBeLessThan(1_500)
+    // A fixed address (a port, or an advertised one): a redeployed instance subscribes with the same one, maybe
+    // before this one stops. No unsubscription, and a first renewal soon after the start, in case an older
+    // instance unsubscribed it meanwhile.
+    const third = await fakeOpensips()
+    cleanups.push(third.close)
+    const squatter = dgram.createSocket('udp4')
+    await new Promise<void>(r => squatter.bind(0, '127.0.0.1', r))
+    const port = squatter.address().port
+    await new Promise<void>(r => squatter.close(() => r()))
+    for (const where of [{ advertise: '127.0.0.1:9' }, { listen: `127.0.0.1:${port}` }, {}]) {
+      const fixed = new OpensipsEvents({ miUrl: third.url, ...where, events: ['E_ACC_CDR'], onEvent: () => undefined, logger: quiet })
+      const fixedDelays: number[] = []
+      const reschedule = fixed['schedule'].bind(fixed)
+      fixed['schedule'] = (ms: number) => void (fixedDelays.push(ms), reschedule(ms))
+      await fixed.start()
+      await fixed['renew']()
+      expect(fixedDelays).toEqual('advertise' in where || 'listen' in where ? [5_000, 60_000] : [60_000, 60_000])
+      await fixed.stop()
+    }
+    // Only the instance on a free port of its own unsubscribed.
+    expect(third.requests.filter(r => r.method === 'event_subscribe' && r.params[2] === 0)).toHaveLength(1)
+    expect(third.subscriptions.map(s => s.socket)).toEqual(['udp:127.0.0.1:9', 'udp:127.0.0.1:9', `udp:127.0.0.1:${port}`, `udp:127.0.0.1:${port}`])
   })
 
-  it('tells OpenSIPS the advertised address, and refuses one it could not send to', async () => {
+  it('listens on a wildcard without an advertised address when OpenSIPS is on this host: tells it the loopback, with a warning', async () => {
+    const sips = await fakeOpensips()
+    cleanups.push(sips.close)
+    const got: string[] = []
+    const warnings: string[] = []
+    const events = new OpensipsEvents({ miUrl: sips.url, listen: '0.0.0.0', events: ['E_ACC_CDR'], onEvent: m => got.push(m), logger: { info: () => undefined, warn: m => warnings.push(m) } })
+    cleanups.push(() => events.stop())
+    await events.start()
+    expect(events.connected).toBe(true)
+    expect(sips.subscriptions[0]!.socket).toMatch(/^udp:127\.0\.0\.1:\d+$/)
+    expect(warnings.some(w => /listening on 0\.0\.0\.0 without an advertised address.*told 127\.0\.0\.1/.test(w))).toBe(true)
+    sips.push('E_ACC_CDR', {})
+    await until('the event', () => got.length === 1)
+  })
+
+  it('tells OpenSIPS the advertised address; a configuration that cannot work is logged and leaves it degraded, never thrown', async () => {
     const sips = await fakeOpensips()
     cleanups.push(sips.close)
     const events = new OpensipsEvents({ miUrl: sips.url, listen: '127.0.0.1:0', advertise: 'gateway.example.test:9999', events: ['E_ACC_CDR'], onEvent: () => undefined, logger: quiet })
     cleanups.push(() => events.stop())
     await events.start()
     expect(sips.subscriptions[0]!.socket).toBe('udp:gateway.example.test:9999')
-    const bare = { miUrl: sips.url, events: ['E'], onEvent: () => undefined }
-    expect(() => new OpensipsEvents({ ...bare, listen: '0.0.0.0' })).toThrow(/wildcard/)
+    const warnings: string[] = []
+    const bare = { miUrl: sips.url, events: ['E'], onEvent: () => undefined, logger: { info: () => undefined, warn: (m: string) => warnings.push(m) } }
     expect(new OpensipsEvents({ ...bare, listen: '0.0.0.0:7000', advertise: '192.0.2.10' }).address).toBeUndefined()
-    expect(() => new OpensipsEvents({ ...bare, listen: '0.0.0.0', advertise: '0.0.0.0' })).toThrow(/advertise/)
-    expect(() => new OpensipsEvents({ ...bare, listen: '[::1]:7000' })).toThrow(/IPv4/)
-    expect(() => new OpensipsEvents({ ...bare, miUrl: 'udp:[::1]:8880' })).toThrow(/IPv4/)
+    const bad = [
+      { miUrl: 'udp:192.0.2.1:8880', listen: '0.0.0.0' },
+      { listen: '0.0.0.0', advertise: '0.0.0.0' },
+      { listen: '[::1]:7000' },
+      { miUrl: 'udp:[::1]:8880' },
+      { listen: 'nope:x' },
+      { miUrl: 'tcp:127.0.0.1:8880' }
+    ]
+    for (const config of bad) {
+      const e = new OpensipsEvents({ ...bare, ...config })
+      await e.start()
+      expect(e.address).toBeUndefined()
+      expect(e.connected).toBe(false)
+      expect(e.reason).toMatch(/invalid configuration/)
+      await e.stop()
+    }
+    expect(warnings.map(w => /^OpenSIPS events disabled, calls still work: (.*)$/.exec(w)?.[1])).toEqual([
+      expect.stringMatching(/wildcard: set the address OpenSIPS sends the events to \(advertise\)/),
+      expect.stringMatching(/advertise address must be one OpenSIPS can send to/),
+      expect.stringMatching(/listen address must be IPv4/),
+      expect.stringMatching(/MI URL must be IPv4/),
+      expect.stringMatching(/host\[:port\]/),
+      expect.stringMatching(/MI URL must be udp:host:port/)
+    ])
   })
 
   it('refuses an event OpenSIPS does not know, and stops cleanly', async () => {
@@ -187,7 +348,6 @@ describe('OpensipsEvents', () => {
     expect(parseUdpUrl('udp:127.0.0.1:8880', 'x')).toEqual({ host: '127.0.0.1', port: 8880 })
     expect(parseUdpUrl('udp://[::1]:8880', 'x')).toEqual({ host: '::1', port: 8880 })
     expect(() => parseUdpUrl('tcp:127.0.0.1:8880', 'MI')).toThrow(/MI must be udp:host:port/)
-    expect(() => new OpensipsEvents({ miUrl: 'udp:127.0.0.1:1', listen: 'nope:x', events: ['E'], onEvent: () => undefined })).toThrow(/host\[:port\]/)
     expect(() => new OpensipsEvents({ miUrl: 'udp:127.0.0.1:1', events: [], onEvent: () => undefined })).toThrow(/nothing to subscribe/)
   })
 

@@ -6,8 +6,8 @@ export const fakeOpensips = async () => {
   const socket = dgram.createSocket('udp4')
   const subscriptions: { event: string; socket: string; expire: number }[] = []
   const requests: { id: string; method: string; params: unknown[] }[] = []
-  /** `down`: received but never answered (requests still counts them). `upSince`: what MI `uptime` says. */
-  const state = { down: false, received: 0, upSince: 'Wed Oct 14 18:00:00 2026', dump: { Domains: [{ name: 'location', hash_size: 512, AORs: [] as unknown[] }] }, dialogs: { Dialogs: [] as unknown[] } }
+  /** `down`: received but never answered (requests still counts them). `upSince`, `upTime`: what MI `uptime` says. */
+  const state = { down: false, received: 0, upSince: 'Wed Oct 14 18:00:00 2026', upTime: '600 [sec]', dump: { Domains: [{ name: 'location', hash_size: 512, AORs: [] as unknown[] }] }, dialogs: { Dialogs: [] as unknown[] } }
   socket.on('message', (raw, rinfo) => {
     state.received++
     if (state.down) return
@@ -23,7 +23,7 @@ export const fakeOpensips = async () => {
       } else subscriptions.push({ event, socket: to, expire })
       return reply({ result: 'OK' })
     }
-    if (req.method === 'uptime') return reply({ result: { Now: 'Wed Oct 14 18:10:00 2026', 'Up since': state.upSince, 'Up time': '600 [sec]' } })
+    if (req.method === 'uptime') return reply({ result: { Now: 'Wed Oct 14 18:10:00 2026', 'Up since': state.upSince, 'Up time': state.upTime } })
     if (req.method === 'ul_dump') return reply({ result: state.dump })
     if (req.method === 'dlg_list') return reply({ result: state.dialogs })
     return reply({ error: { code: -32601, message: 'Method not found' } })

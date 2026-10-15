@@ -104,32 +104,50 @@ describe('OpensipsProvider', () => {
     await until('a failed attempt', () => warnings.some(w => /no reply within 50 ms; retrying/.test(w)))
     expect(sips.state.received).toBeGreaterThan(0)
     expect(p.getStatus()).toBe('DEGRADED')
+    expect(p.getStatusReason()).toMatch(/MI does not answer/)
     expect((await p.getCapabilities()).presence.realtime).toBe(false)
   })
 
-  it('forgets what OpenSIPS told once it stops answering (everyone offline), and reads it again when it is back', async () => {
+  it('keeps what OpenSIPS told through a failed renewal, forgets the registrations once the subscription lapsed, and ends the lost calls when it is back', async () => {
     const sips = await fakeOpensips()
     cleanups.push(sips.close)
-    const p = new OpensipsProvider({ websocketUrl: 'wss://sip.example.test', domain: 'sip.example.test', sipSecretFor: async () => 's', events: { miUrl: sips.url, timeoutMs: 50 }, logger: quiet })
+    const p = new OpensipsProvider({ websocketUrl: 'wss://sip.example.test', domain: 'sip.example.test', sipSecretFor: async () => 's', events: { miUrl: sips.url, expireSec: 1, timeoutMs: 50 }, logger: quiet })
     cleanups.push(() => p.close())
     const got: string[] = []
     void (async () => {
-      for await (const e of p.subscribe()) if (e.event.type === 'presence.changed') got.push(`${e.extension}:${e.event.payload.presence.status}`)
+      for await (const e of p.subscribe()) got.push(`${e.extension}:${e.event.type}:${e.event.type === 'presence.changed' ? e.event.payload.presence.status : (e.event.payload as { call: { state: string } }).call.state}`)
     })()
     await until('the subscription', () => p.getStatus() === 'CONNECTED')
-    sips.push('E_UL_CONTACT_INSERT', { aor: '101', uri: 'sip:a@x.invalid' })
-    await until('101 available', () => got.length === 1)
+    for (const aor of ['101', '102', '103']) sips.push('E_UL_CONTACT_INSERT', { aor, uri: `sip:${aor}@x.invalid`, expires: Math.floor(Date.now() / 1000) + 300 })
+    for (const [callid, callee] of [['c1', '102'], ['c2', '103']]) {
+      sips.push('E_TWAKEPHONE_CALLING', { callid, caller: '101', callee })
+      sips.push('E_TWAKEPHONE_ANSWERED', { callid, caller: '101', callee })
+    }
+    await until('both calls', () => got.filter(g => g.endsWith(':call.connected:connected')).length === 4)
+    got.splice(0)
+    // One lost MI reply: degraded, but the subscription still lives and nothing is forgotten.
     sips.state.down = true
     await p['events']!['renew']()
     expect(p.getStatus()).toBe('DEGRADED')
+    expect((await p.getCapabilities()).presence.realtime).toBe(true)
+    expect(got).toEqual([])
+    // A call ends meanwhile: its CDR still makes its history.
+    sips.push('E_ACC_CDR', { callid: 'c1', caller: '101', callee: '102', time: Math.floor(Date.now() / 1000) - 3, duration: 3, ms_duration: 3000, created: Math.floor(Date.now() / 1000) - 4 })
+    await until('the end of c1', () => got.includes('101:call.ended:ended'))
+    expect(got).toEqual(['101:call.ended:ended', '102:call.ended:ended', '102:presence.changed:available'])
+    got.splice(0)
+    // No renewal for the whole life of the subscription: the registrations no longer hold; c2 is kept, not dropped.
+    await until('the expiry', () => got.length > 0, 3_000)
+    expect(got.sort()).toEqual(['102:presence.changed:offline'])
     expect((await p.getCapabilities()).presence.realtime).toBe(false)
-    await until('101 offline', () => got.length === 2)
-    expect(got).toEqual(['101:available', '101:offline'])
+    expect(p['tracker'].activeCalls().map(c => c.id)).toEqual(['c2'])
+    got.splice(0)
+    // Back, with 101 and 103 registered and c2 gone while nobody listened: it ends, with its history.
+    sips.state.dump.Domains[0]!.AORs.push(...['101', '103'].map(aor => ({ AOR: aor, Contacts: [{ Contact: `sip:${aor}@x.invalid`, Expires: 300 }] })))
     sips.state.down = false
-    sips.state.dump.Domains[0]!.AORs.push({ AOR: '101', Contacts: [{ Contact: 'sip:a@x.invalid', Expires: 300 }] })
-    await p['events']!['renew']()
-    await until('101 available again', () => got.length === 3)
-    expect(got[2]).toBe('101:available')
+    await until('the resync', () => p.getStatus() === 'CONNECTED', 5_000)
+    expect(got.sort()).toEqual(['101:call.ended:ended', '101:presence.changed:available', '103:call.ended:ended', '103:presence.changed:available'])
+    expect(p['tracker'].activeCalls()).toEqual([])
   })
 
   it('reads OpenSIPS again when it restarted between two renewals, and lets unrefreshed registrations lapse', async () => {
@@ -168,7 +186,9 @@ describe('OpensipsProvider', () => {
     cleanups.push(() => p.close())
     await until('the failure', () => warnings.some(w => /not started: .*EADDRINUSE.*retrying in 1 s/.test(w)))
     await new Promise<void>(r => squatter.close(() => r()))
+    expect(p.getStatusReason()).toMatch(/cannot listen/)
     await until('the subscription', () => p.getStatus() === 'CONNECTED', 5_000)
+    expect(p.getStatusReason()).toBeUndefined()
     expect(sips.subscriptions[0]!.socket).toBe(`udp:127.0.0.1:${port}`)
   })
 })
@@ -186,5 +206,22 @@ describe('AsyncQueue', () => {
     for (let i = 0; i < 5; i++) q.push(i)
     expect(drops).toEqual([1, 4])
     q.close()
+  })
+
+  it('drops what can be dropped first: the oldest presence makes room for a call event, a new presence is dropped', async () => {
+    const q = new AsyncQueue<string>(3, undefined, s => s.startsWith('presence'))
+    for (const s of ['presence1', 'call1', 'presence2', 'call2', 'presence3', 'call3', 'call4']) q.push(s)
+    // presence1 then presence2 made room for call2 and call3; presence3 was dropped; call4 had no room left.
+    expect(q.dropped).toBe(4)
+    const it = q[Symbol.asyncIterator]()
+    expect([(await it.next()).value, (await it.next()).value, (await it.next()).value]).toEqual(['call1', 'call2', 'call3'])
+    q.close()
+  })
+
+  it('a provider queue drops the presences before the call events when the Gateway does not keep up', () => {
+    const p = new OpensipsProvider({ websocketUrl: 'wss://sip.example.test', domain: 'sip.example.test', sipSecretFor: async () => 's', logger: quiet })
+    const q = p['queue'] as AsyncQueue<RoutedEvent>
+    expect(q['droppable']({ extension: '101', event: { type: 'presence.changed', timestamp: '', payload: { userId: '', presence: { status: 'busy', source: 'telephony' } } } })).toBe(true)
+    expect(q['droppable']({ extension: '101', event: { type: 'call.ended', timestamp: '', payload: { call: { id: 'c', direction: 'inbound', state: 'ended', remoteNumber: '102', startedAt: '' } } } })).toBe(false)
   })
 })

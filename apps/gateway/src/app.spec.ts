@@ -40,20 +40,25 @@ describe('gateway', () => {
     expect(res.json().calling.outbound).toBe(true)
   })
 
-  it('is ready while every provider can place calls, and says which are degraded', async () => {
-    const statuses = new Map<string, string>([['A', 'CONNECTED'], ['B', 'DEGRADED']])
-    const factory: ProviderFactory<unknown> = { type: 'fake', create: (_c: unknown, ctx?: { tenantId: string }) => ({ ...fakeFactory.create({}), getStatus: () => statuses.get(ctx?.tenantId ?? '') }) as unknown as TelephonyProvider }
-    const registry = new ProviderRegistry([{ tenantId: 'A', type: 'fake', config: {} }, { tenantId: 'B', type: 'fake', config: {} }], [factory])
+  it('is ready while every provider can place calls, and says which are degraded and why', async () => {
+    const statuses = new Map<string, string>([['A', 'CONNECTED'], ['B', 'DEGRADED'], ['C', 'DEGRADED']])
+    const factory: ProviderFactory<unknown> = {
+      type: 'fake',
+      create: (_c: unknown, ctx?: { tenantId: string }) =>
+        ({ ...fakeFactory.create({}), getStatus: () => statuses.get(ctx?.tenantId ?? ''), getStatusReason: () => (ctx?.tenantId === 'A' ? 'shown only while not connected' : 'events: OpenSIPS MI does not answer') }) as unknown as TelephonyProvider
+    }
+    const registry = new ProviderRegistry(['A', 'B', 'C'].map(tenantId => ({ tenantId, type: 'fake', config: {} })), [factory])
     const app = await buildApp(registry)
     registry.startAll()
     let res = await app.inject('/ready')
-    expect([res.statusCode, res.json()]).toEqual([200, { ready: true, degraded: 1 }])
+    expect([res.statusCode, res.json()]).toEqual([200, { ready: true, degraded: 2, reasons: ['events: OpenSIPS MI does not answer'] }])
+    statuses.set('C', 'CONNECTED')
     statuses.set('B', 'CONNECTED')
     res = await app.inject('/ready')
     expect([res.statusCode, res.json()]).toEqual([200, { ready: true }])
     statuses.set('A', 'DISCONNECTED')
     res = await app.inject('/ready')
-    expect([res.statusCode, res.json()]).toEqual([503, { ready: false }])
+    expect([res.statusCode, res.json()]).toEqual([503, { ready: false, reasons: ['shown only while not connected'] }])
   })
 
   it('rejects unauthenticated calls', async () => {
@@ -72,15 +77,19 @@ describe('event stream', () => {
     await app.listen({ port: 0 })
     const port = (app.server.address() as { port: number }).port
 
+    // Open once the Gateway says the session is accepted: from then on, every event reaches it.
     const open = (user: string) =>
       new Promise<{ ws: WebSocket; got: string[] }>(resolve => {
         const ws = new WebSocket(`ws://127.0.0.1:${port}/api/v1/ws?user=${user}`)
         const got: string[] = []
-        ws.onmessage = e => got.push(String(e.data))
-        ws.onopen = () => resolve({ ws, got })
+        ws.onmessage = e => {
+          got.push(String(e.data))
+          if (got.length === 1) resolve({ ws, got })
+        }
       })
     const alice = await open('alice')
     const bob = await open('bob')
+    expect(alice.got).toEqual(['{"type":"stream.ready"}'])
 
     await app.inject({
       method: 'POST',
@@ -90,8 +99,8 @@ describe('event stream', () => {
     })
     await new Promise(r => setTimeout(r, 100))
 
-    expect(JSON.parse(alice.got[0]!).type).toBe('call.ringing')
-    expect(bob.got).toHaveLength(0)
+    expect(JSON.parse(alice.got[1]!).type).toBe('call.ringing')
+    expect(bob.got).toEqual(['{"type":"stream.ready"}'])
     alice.ws.close()
     bob.ws.close()
     await app.close()
@@ -146,6 +155,7 @@ describe('history, tenants and tickets', () => {
     const items = (await app.inject({ url: '/api/v1/calls/history', headers: as('alice') })).json().items
     expect(items).toEqual([expect.objectContaining({ id: 'd', state: 'rejected', missed: false })])
     expect((await app.inject({ url: '/api/v1/calls/history?status=missed', headers: as('alice') })).json().items).toEqual([])
+    expect((await app.inject({ url: '/api/v1/calls/history?status=declined', headers: as('alice') })).json().items.map((e: { id: string }) => e.id)).toEqual(['d'])
   })
 
   it('rejects malformed filters instead of passing them on', async () => {
@@ -219,14 +229,14 @@ describe('presence of the tenant', () => {
     return { factory: { type: 'pushing', create } as ProviderFactory<unknown>, push }
   }
   const presence = (status: Presence['status']): TelephonyEvent => ({ type: 'presence.changed', timestamp: '2026-10-14T18:00:00.000Z', payload: { userId: '', presence: { status, source: 'telephony' } } })
-  const setup = async (store = new MemoryStore(), bus = new EventBus()) => {
+  const setup = async (store = new MemoryStore(), bus = new EventBus(), historyWriteTimeoutMs?: number) => {
     process.env.AUTH_MODE = 'dev'
     await store.upsertMapping({ tenantId: 'A', userId: 'alice', extension: '101' })
     await store.upsertMapping({ tenantId: 'A', userId: 'bob', extension: '102' })
     await store.upsertMapping({ tenantId: 'B', userId: 'carol', extension: '101' })
     const { factory, push } = pushing()
     const registry = new ProviderRegistry([{ tenantId: 'A', type: 'pushing', config: {} }, { tenantId: 'B', type: 'pushing', config: {} }], [factory])
-    const app = await buildApp(registry, { store, bus, directory: new StoreDirectory(store), tickets: new TicketStore() })
+    const app = await buildApp(registry, { store, bus, directory: new StoreDirectory(store), tickets: new TicketStore(), ...(historyWriteTimeoutMs ? { historyWriteTimeoutMs } : {}) })
     registry.startAll()
     const as = (user: string, tenant = 'A') => ({ 'x-dev-user': user, 'x-dev-tenant': tenant })
     return { app, push, as }
@@ -270,6 +280,25 @@ describe('presence of the tenant', () => {
     await app.close()
   })
 
+  it('does not wait for a history write that hangs longer than its timeout: the events go on', async () => {
+    const store = new (class extends MemoryStore {
+      override async addHistory(entry: HistoryEntry) {
+        if (entry.callId === 'c1') return new Promise<void>(() => undefined)
+        return super.addHistory(entry)
+      }
+    })()
+    const bus = new EventBus()
+    const { app, push } = await setup(store, bus, 30)
+    const seen: string[] = []
+    bus.subscribe('A', 'alice', e => seen.push(e.type === 'call.ended' ? e.payload.call.id : e.type))
+    push('101', ended('c1'))
+    push('101', ended('c2'))
+    await new Promise(r => setTimeout(r, 200))
+    expect(seen).toEqual(['c1', 'c2'])
+    expect((await store.listHistory('A', 'alice')).items.map(e => e.callId)).toEqual(['c2'])
+    await app.close()
+  })
+
   it('lists the presence of every extension the provider told about, to anyone of the tenant and to nobody else', async () => {
     const { app, push, as } = await setup()
     push('101', presence('available'))
@@ -296,8 +325,11 @@ describe('presence of the tenant', () => {
       return new Promise<{ ws: WebSocket; got: TelephonyEvent[] }>(resolve => {
         const ws = new WebSocket(`ws://127.0.0.1:${port}/api/v1/ws?ticket=${ticket}`)
         const got: TelephonyEvent[] = []
-        ws.onmessage = e => got.push(JSON.parse(String(e.data)))
-        ws.onopen = () => resolve({ ws, got })
+        ws.onmessage = e => {
+          const message = JSON.parse(String(e.data))
+          if (message.type === 'stream.ready') resolve({ ws, got })
+          else got.push(message)
+        }
       })
     }
     const alice = await open('alice')

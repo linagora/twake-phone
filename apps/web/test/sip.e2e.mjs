@@ -170,7 +170,8 @@ const web = await serveApp({
   policy: { connectSrc: [new URL(relayUrl).origin] }
 })
 const db = new pg.Pool({ connectionString: OPENSIPS_DB_URL, max: 1 })
-// The CDRs of this run only: the rows written after it started (the database may keep other runs', or be shared).
+// The CDRs written after this run started: those of earlier runs the database kept are left out. Two runs at once
+// on the same database would still see each other's rows: one run at a time per database.
 const lastId = async table => (await db.query(`SELECT coalesce(max(id), 0) AS id FROM ${table}`)).rows[0].id
 const since = { acc: await lastId('acc'), missed_calls: await lastId('missed_calls') }
 

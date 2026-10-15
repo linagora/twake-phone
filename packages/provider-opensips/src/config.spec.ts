@@ -34,12 +34,13 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
   })
 
   it('takes a private MI address, and refuses any other one unless MI_ALLOW_PUBLIC=1', () => {
-    for (const ip of ['127.0.0.1', '10.1.2.3', '172.20.0.2', '192.168.1.5']) {
+    for (const ip of ['127.0.0.1', '10.1.2.3', '172.20.0.2', '192.168.1.5', '10.255.0.9', '169.254.0.1']) {
       const { status, cfg } = render({ MI_LISTEN_IP: ip })
       expect(status, ip).toBe(0)
       expect(cfg).toContain(`"udp:${ip}:8880"`)
     }
-    for (const ip of ['0.0.0.0', '203.0.113.5', '172.32.0.1', '10.example.test', '::']) {
+    // Not an IPv4 address at all: four numbers from 0 to 255, nothing more, nothing less.
+    for (const ip of ['0.0.0.0', '203.0.113.5', '172.32.0.1', '10.example.test', '::', '10.0.0.256', '127.0.0.1.5', '10.0.1', '10..0.1', '10.0.0.1.', '.10.0.0.1', '10.0.0.0001', '192.168.1.*']) {
       const { status, stderr } = render({ MI_LISTEN_IP: ip })
       expect(status, ip).toBe(1)
       expect(stderr).toMatch(/no authentication/)
@@ -60,7 +61,8 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     // The 404 of an extension nobody registered goes through a transaction (acc sees it): announced just before.
     expect(lines.slice(lookup, lookup + 4)).toEqual(['if (!lookup("location")) {', expect.stringMatching(/^#/), 'route(calling);', 't_reply(404, "Not Found");'])
     expect(cfg.match(/raise_event\("E_TWAKEPHONE_CALLING"/g)).toHaveLength(1)
-    expect(cfg.slice(cfg.indexOf('route[calling]'))).toMatch(/^route\[calling\] \{\s+route\(event_attrs\);\s+raise_event\("E_TWAKEPHONE_CALLING"/)
+    // The transaction exists before the call is announced: acc sees every final reply, the 500 of a failed relay too.
+    expect(cfg.slice(cfg.indexOf('route[calling]'))).toMatch(/^route\[calling\] \{\s+if \(!t_newtran\(\)\) \{\s+sl_reply_error\(\);\s+exit;\s+\}\s+route\(event_attrs\);\s+raise_event\("E_TWAKEPHONE_CALLING"/)
   })
 
   it('clears every value of the event attribute lists before building them again', () => {

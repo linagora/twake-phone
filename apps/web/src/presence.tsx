@@ -13,7 +13,7 @@ export interface Presences {
 
 const PresenceContext = createContext<Presences | null>(null)
 
-/** The presence of everyone, by extension: loaded from the Gateway at start and at each reconnection, then kept up to date by its events. */
+/** The presence of everyone, by extension: loaded from the Gateway each time the event stream is established, then kept up to date by its events. */
 export const PresenceProvider = ({ children }: { children: ReactNode }) => {
   const { client, onEvent, onConnected } = useGateway()
   const [realtime, setRealtime] = useState(false)
@@ -30,8 +30,8 @@ export const PresenceProvider = ({ children }: { children: ReactNode }) => {
     const stopEvents = onEvent(event => {
       if (event.type === 'presence.changed' && event.payload.extension) sync.changed(event.payload.extension, event.payload.presence)
     })
+    // Nothing to show before the stream is established (realtime is false): read then, not also at start.
     const stopConnected = onConnected(() => sync.load())
-    sync.load()
     return () => {
       sync.stop()
       stopEvents()

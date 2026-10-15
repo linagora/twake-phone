@@ -6,12 +6,15 @@ export class AsyncQueue<T> implements AsyncIterable<T> {
   private dropping = false
 
   /**
-   * At most `max` items wait for the consumer: past that (a consumer stuck on a slow database), new items are
-   * dropped, and `onDrop` is told once per overflow with the number dropped so far.
+   * At most `max` items wait for the consumer: past that (a consumer stuck on a slow database), an item is
+   * dropped, and `onDrop` is told once per overflow with the number dropped so far. The `droppable` ones go first
+   * (a presence, which the next one replaces): the oldest waiting one makes room for a new item that is not; only
+   * when none waits is the new item itself dropped.
    */
   constructor(
     private readonly max = 10_000,
-    private readonly onDrop?: (dropped: number) => void
+    private readonly onDrop?: (dropped: number) => void,
+    private readonly droppable: (item: T) => boolean = () => true
   ) {}
 
   /** Items dropped since the queue was created. */
@@ -29,7 +32,9 @@ export class AsyncQueue<T> implements AsyncIterable<T> {
       this.dropped++
       if (!this.dropping) this.onDrop?.(this.dropped)
       this.dropping = true
-      return
+      const victim = this.droppable(item) ? -1 : this.items.findIndex(this.droppable)
+      if (victim < 0) return
+      this.items.splice(victim, 1)
     }
     this.items.push(item)
   }

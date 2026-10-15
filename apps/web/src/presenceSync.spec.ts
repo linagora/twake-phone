@@ -32,7 +32,7 @@ describe('PresenceSync', () => {
     sync.stop()
   })
 
-  it('keeps a change heard while a list is on its way, and ignores a list a newer read replaced', async () => {
+  it('keeps a change heard while a list is on its way, and reads once more after it however often it was asked meanwhile', async () => {
     const gw = gateway()
     let state: PresenceState | undefined
     const sync = new PresenceSync(gw.getPresences, s => (state = s))
@@ -41,13 +41,19 @@ describe('PresenceSync', () => {
     gw.asked[0]!.resolve(page({ '101': 'available', '103': 'offline' }))
     await Promise.resolve()
     expect(flat(state)).toEqual(['101:busy', '103:offline'])
+    // A burst of reconnections: one read on its way, one more after it, not one each.
     sync.load()
     sync.load()
-    gw.asked[2]!.resolve(page({ '101': 'dnd' }))
-    await Promise.resolve()
+    sync.load()
+    expect(gw.asked).toHaveLength(2)
     gw.asked[1]!.resolve(page({ '101': 'away' }))
     await Promise.resolve()
+    expect(flat(state)).toEqual(['101:away'])
+    expect(gw.asked).toHaveLength(3)
+    gw.asked[2]!.resolve(page({ '101': 'dnd' }))
+    await Promise.resolve()
     expect(flat(state)).toEqual(['101:dnd'])
+    expect(gw.asked).toHaveLength(3)
     sync.stop()
   })
 

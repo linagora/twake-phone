@@ -27,12 +27,30 @@ export SIP_DOMAIN LISTEN_IP SIP_PORT WS_PORT WSS_PORT OPENSIPS_DB_URL RTPENGINE_
 # calls, read who is registered and subscribe to the events (who calls whom). It listens on its own address, the
 # loopback by default, never on LISTEN_IP because SIP is opened to a network: a private address (the Gateway on
 # another host of an internal network) is accepted, any other one only with MI_ALLOW_PUBLIC=1.
-mi_address_is_private() {
+# A dotted IPv4 address: four numbers from 0 to 255, nothing else.
+is_ipv4() {
   case "$1" in
-    '' | *[!0-9.]*) return 1 ;;
+    '' | *[!0-9.]* | .* | *. | *..*) return 1 ;;
   esac
+  saved_ifs=$IFS
+  IFS=.
+  # Split on the dots (no glob character can be left after the check above).
+  # shellcheck disable=SC2086
+  set -- $1
+  IFS=$saved_ifs
+  [ "$#" -eq 4 ] || return 1
+  for octet in "$@"; do
+    case "$octet" in
+      ? | ?? | ???) ;;
+      *) return 1 ;;
+    esac
+    [ "$octet" -le 255 ] || return 1
+  done
+}
+mi_address_is_private() {
+  is_ipv4 "$1" || return 1
   case "$1" in
-    127.*.*.* | 10.*.*.* | 192.168.*.* | 172.1[6-9].*.* | 172.2[0-9].*.* | 172.3[01].*.* | 169.254.*.*) return 0 ;;
+    127.* | 10.* | 192.168.* | 172.1[6-9].* | 172.2[0-9].* | 172.3[01].* | 169.254.*) return 0 ;;
     *) return 1 ;;
   esac
 }

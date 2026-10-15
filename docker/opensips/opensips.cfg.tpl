@@ -272,8 +272,14 @@ route {
 	route(relay);
 }
 
-# Ringing, answer and end follow: our own events, then acc's CDR or missed call.
+# Ringing, answer and end follow: our own events, then acc's CDR or missed call. The transaction comes first
+# (t_relay and t_reply use it): from then on every final reply, the 500 below included, goes through it and acc
+# tells how the call ended; a request it cannot be created for is refused before anything is announced.
 route[calling] {
+	if (!t_newtran()) {
+		sl_reply_error();
+		exit;
+	}
 	route(event_attrs);
 	raise_event("E_TWAKEPHONE_CALLING", $avp(ev_attr), $avp(ev_val));
 }
@@ -281,7 +287,7 @@ route[calling] {
 route[relay] {
 	# A registered contact that cannot be reached (window gone without unregistering) makes tm answer
 	# 477 "Send failed" itself: the softphone renders it as "unreachable" (proven by the e2e). The 500 below is
-	# for a relay that fails before any reply.
+	# for a relay that fails before any reply, sent through the transaction route[calling] created.
 	if (!t_relay())
 		send_reply(500, "Internal Error");
 }

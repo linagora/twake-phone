@@ -6,13 +6,15 @@ import { isIP } from 'node:net'
 // How the Gateway hears OpenSIPS (ADR 0011): the Event Interface of OpenSIPS pushes JSON-RPC notifications over UDP
 // (`event_datagram`) to whoever subscribed through the Management Interface (`mi_datagram`, JSON-RPC over UDP too).
 // One socket does both: MI requests go out of it (the replies come back to it) and the events are delivered to it.
-// Nothing on this socket is authenticated: only datagrams from the MI host are read, and the port stays on a
-// network OpenSIPS and the Gateway trust (the loopback by default).
+// Nothing on this socket is authenticated: only datagrams from the MI host (or the addresses given in `from`) are
+// read, and the port stays on a network OpenSIPS and the Gateway trust (the loopback by default).
 
 /** The log the event source writes to; `console` by default. */
 export interface EventsLogger {
   info(message: string): void
   warn(message: string): void
+  /** What needs someone's attention; `warn` when absent. */
+  error?(message: string): void
 }
 
 export interface OpensipsEventsOptions {
@@ -25,6 +27,12 @@ export interface OpensipsEventsOptions {
    * `listen`, a container or a NAT in between). The port defaults to the bound one.
    */
   advertise?: string
+  /**
+   * The addresses the events may come from besides the MI host (IPv4 or names): `event_datagram` sends from an
+   * unbound socket, so the kernel picks the source address of the route to the Gateway, which is not always the
+   * MI one (a bridged container, a host with several addresses).
+   */
+  from?: string[]
   /** The events to subscribe to (E_UL_CONTACT_INSERT, E_ACC_CDR…). */
   events: string[]
   /** Seconds a subscription lives in OpenSIPS; renewed at half of it. Default 120. */
@@ -37,6 +45,11 @@ export interface OpensipsEventsOptions {
   onResync?(): Promise<void> | void
   /** A renewal went through without needing a resync: time for periodic housekeeping. */
   onRenewed?(): void
+  /**
+   * No renewal went through for the whole life of the last subscription: OpenSIPS has dropped it, and what it told
+   * may no longer hold. A single failed renewal is not that: the subscription lives on and events keep coming.
+   */
+  onExpired?(): void
   onStatus?(connected: boolean): void
   logger?: EventsLogger
 }
@@ -63,8 +76,13 @@ const parseHostPort = (value: string, what: string) => {
 }
 
 const WILDCARD = new Set(['0.0.0.0', '::', ''])
+const isLoopback = (host: string) => /^127\./.test(host) || host === 'localhost'
 
 const RETRY_MS = [1_000, 2_000, 5_000, 10_000, 30_000]
+/** After a start on a fixed address, the first renewal comes this soon: a previous instance may have unsubscribed it. */
+const FIRST_RENEWAL_MS = 5_000
+/** Resyncs failing in a row before it is logged as an error. */
+const RESYNC_ALERT = 3
 
 type Rpc = { id?: unknown; method?: unknown; params?: unknown; result?: unknown; error?: { code?: number; message?: string } }
 
@@ -72,48 +90,89 @@ type Rpc = { id?: unknown; method?: unknown; params?: unknown; result?: unknown;
  * Keeps the Gateway subscribed to the events of one OpenSIPS and hands them over as they come. OpenSIPS forgets
  * its subscribers when it restarts and after their expiry: the subscription is renewed on a timer, and a renewal
  * that follows a failure (or the first one), or that finds OpenSIPS restarted since the last one (MI `uptime`),
- * triggers `onResync` so the state is read again rather than guessed.
+ * triggers `onResync` so the state is read again rather than guessed. A configuration that cannot work (an
+ * address it cannot listen on or announce) is logged and leaves it degraded: calls do not depend on it.
  */
 export class OpensipsEvents {
   private socket?: dgram.Socket
-  private readonly mi: { host: string; port: number }
-  private readonly listen: { host: string; port: number }
+  private readonly mi: { host: string; port: number } = { host: '', port: 0 }
+  private readonly listen: { host: string; port: number } = { host: '127.0.0.1', port: 0 }
   private readonly advertise?: { host: string; port: number }
+  /** Why this configuration cannot work, logged once; nothing is started. */
+  private readonly broken?: string
   private readonly pending = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }>()
-  /** The addresses datagrams are accepted from: those of the MI host. */
+  /** The addresses datagrams are accepted from: the MI host's and those of `from`. */
   private sources = new Set<string>()
+  /** Since the last renewal: events read, datagrams ignored (and the last address they came from). */
+  private heard = 0
   private foreign = 0
+  private foreignFrom = ''
+  /** Only ignored datagrams arrived during the last renewal period: OpenSIPS sends from an address not accepted. */
+  private deaf = false
   /** When OpenSIPS started, as its MI `uptime` says: a change means it restarted. */
   private upSince?: string
-  private upTime?: number
   private timer?: ReturnType<typeof setTimeout>
+  private expiry?: ReturnType<typeof setTimeout>
   private stopped = false
   private failures = 0
+  private resyncFailures = 0
+  private renewals = 0
   private subscribed = false
+  /** The last subscription still lives in OpenSIPS (renewed within its expiry). */
+  private alive = false
+  private notStarted = false
+  private status = false
   private readonly log: EventsLogger
 
   constructor(private readonly options: OpensipsEventsOptions) {
-    this.mi = parseUdpUrl(options.miUrl, 'OpenSIPS MI URL')
-    if (isIP(this.mi.host) === 6) throw new Error(`OpenSIPS MI URL must be IPv4 or a host name, got ${options.miUrl}`)
-    if (isIP(this.mi.host)) this.sources.add(this.mi.host)
-    this.listen = parseHostPort(options.listen ?? '127.0.0.1', 'listen')
-    if (options.advertise) {
-      this.advertise = parseHostPort(options.advertise, 'advertise')
-      if (WILDCARD.has(this.advertise.host)) throw new Error(`events advertise address must be one OpenSIPS can send to, got ${options.advertise}`)
-    } else if (WILDCARD.has(this.listen.host)) {
-      throw new Error(`events listen address ${options.listen} is a wildcard: set the address OpenSIPS sends the events to (advertise)`)
-    }
     this.log = options.logger ?? console
     if (options.events.length === 0) throw new Error('OpenSIPS events: nothing to subscribe to')
+    try {
+      this.mi = parseUdpUrl(options.miUrl, 'OpenSIPS MI URL')
+      if (isIP(this.mi.host) === 6) throw new Error(`OpenSIPS MI URL must be IPv4 or a host name, got ${options.miUrl}`)
+      this.listen = parseHostPort(options.listen ?? '127.0.0.1', 'listen')
+      if (options.advertise) {
+        this.advertise = parseHostPort(options.advertise, 'advertise')
+        if (WILDCARD.has(this.advertise.host)) throw new Error(`events advertise address must be one OpenSIPS can send to, got ${options.advertise}`)
+      } else if (WILDCARD.has(this.listen.host)) {
+        if (!isLoopback(this.mi.host)) throw new Error(`events listen address ${options.listen} is a wildcard: set the address OpenSIPS sends the events to (advertise)`)
+        // OpenSIPS on this host: it reaches the wildcard socket on the loopback (what a bare 0.0.0.0 used to mean).
+        this.advertise = { host: '127.0.0.1', port: 0 }
+        this.log.warn(`OpenSIPS events: listening on ${options.listen} without an advertised address; OpenSIPS (${this.mi.host}) is told 127.0.0.1`)
+      }
+    } catch (err) {
+      this.broken = err instanceof Error ? err.message : String(err)
+      this.log.warn(`OpenSIPS events disabled, calls still work: ${this.broken}`)
+    }
   }
 
+  /** Subscribed, and the events arrive from an accepted address. */
   get connected() {
-    return this.subscribed
+    return this.subscribed && !this.deaf
+  }
+
+  /** The last subscription still lives in OpenSIPS: its events come, even while a renewal is failing. */
+  get live() {
+    return this.alive && !this.deaf
+  }
+
+  /** Why the events are not heard, in a few words (no address: it may be shown unauthenticated). */
+  get reason(): string | undefined {
+    if (this.broken) return 'events: invalid configuration (see the log)'
+    if (this.notStarted) return 'events: cannot listen (see the log)'
+    if (!this.subscribed) return this.resyncFailures > 0 ? 'events: the state of OpenSIPS cannot be read (see the log)' : 'events: OpenSIPS MI does not answer'
+    if (this.deaf) return 'events: datagrams come only from addresses that are not accepted (OPENSIPS_EVENTS_FROM)'
+    return undefined
+  }
+
+  /** The listening address is fixed (a port, or an advertised address): another instance may use the same one. */
+  private get fixed() {
+    return this.listen.port !== 0 || !!this.options.advertise
   }
 
   /** Binds the socket and subscribes; failures to subscribe are retried in the background until `stop()`. */
   async start() {
-    if (this.socket || this.stopped) return
+    if (this.socket || this.stopped || this.broken) return
     const socket = dgram.createSocket('udp4')
     socket.on('message', (msg, rinfo) => {
       // Whatever arrives, the process keeps running.
@@ -133,9 +192,11 @@ export class OpensipsEvents {
         })
       })
     } catch (err) {
+      this.notStarted = true
       socket.close()
       throw err
     }
+    this.notStarted = false
     if (this.stopped) {
       socket.close()
       return
@@ -144,13 +205,17 @@ export class OpensipsEvents {
     await this.renew()
   }
 
-  /** Stops renewing, unsubscribes (best effort: expire 0) and closes the socket. */
+  /**
+   * Stops renewing and closes the socket. Unsubscribes (best effort: expire 0) only from an address no other
+   * instance can hold: on a fixed one, the instance that replaces this one may already be subscribed with it.
+   */
   async stop() {
     if (this.stopped) return
     this.stopped = true
     clearTimeout(this.timer)
+    clearTimeout(this.expiry)
     const address = this.address
-    if (this.subscribed && address) {
+    if (this.subscribed && address && !this.fixed) {
       await Promise.allSettled(this.options.events.map(event => this.request('event_subscribe', [event, address, 0], 500)))
     }
     for (const p of this.pending.values()) {
@@ -160,7 +225,9 @@ export class OpensipsEvents {
     this.pending.clear()
     this.socket?.close()
     this.socket = undefined
-    this.setSubscribed(false)
+    this.subscribed = false
+    this.alive = false
+    this.updateStatus()
   }
 
   /** The address OpenSIPS sends the events to, once started. */
@@ -198,7 +265,8 @@ export class OpensipsEvents {
 
   private receive(raw: Buffer, from: string) {
     if (!this.sources.has(from)) {
-      if (this.foreign++ === 0) this.log.warn(`OpenSIPS events: ignoring a datagram from ${from}, which is not the MI host ${this.mi.host}`)
+      if (this.foreign++ === 0) this.log.warn(`OpenSIPS events: ignoring a datagram from ${from}, which is neither the MI host ${this.mi.host} nor in OPENSIPS_EVENTS_FROM`)
+      this.foreignFrom = from
       return
     }
     let parsed: unknown
@@ -224,6 +292,7 @@ export class OpensipsEvents {
       return
     }
     if (typeof msg.method === 'string') {
+      this.heard++
       const params = msg.params && typeof msg.params === 'object' && !Array.isArray(msg.params) ? (msg.params as Record<string, unknown>) : {}
       try {
         this.options.onEvent(msg.method, params)
@@ -233,14 +302,21 @@ export class OpensipsEvents {
     }
   }
 
-  /** The addresses of the MI host, looked up again at each renewal when it is a name (a container may move). */
+  /** The accepted addresses, looked up again at each renewal for names (a container may move). */
   private async resolveSources() {
-    if (isIP(this.mi.host)) return
-    const found = await lookup(this.mi.host, { all: true, family: 4 })
-    this.sources = new Set(found.map(a => a.address))
+    const resolve = async (host: string) => (isIP(host) ? [host] : (await lookup(host, { all: true, family: 4 })).map(a => a.address))
+    const sources = new Set(await resolve(this.mi.host))
+    for (const host of this.options.from ?? []) {
+      try {
+        for (const a of await resolve(host)) sources.add(a)
+      } catch (err) {
+        this.log.warn(`OpenSIPS events: accepted source ${host} not found: ${err instanceof Error ? err.message : String(err)}`)
+      }
+    }
+    this.sources = sources
   }
 
-  /** Whether OpenSIPS restarted since the last renewal, from MI `uptime`: another "Up since", or a smaller "Up time". */
+  /** Whether OpenSIPS restarted since the last renewal: MI `uptime` gives another "Up since" (set once at startup). */
   private async restarted(): Promise<boolean> {
     let result: unknown
     try {
@@ -250,14 +326,25 @@ export class OpensipsEvents {
       if ((err as MiError).code !== undefined) return false
       throw err
     }
-    const r = (result && typeof result === 'object' ? result : {}) as Record<string, unknown>
-    const since = typeof r['Up since'] === 'string' ? r['Up since'] : undefined
-    const time = Number.parseInt(String(r['Up time'] ?? ''), 10)
-    // "Up since" is set once at startup (to the second); "Up time" going back catches a restart within that second.
-    const restarted = (since !== undefined && this.upSince !== undefined && since !== this.upSince) || (Number.isFinite(time) && this.upTime !== undefined && time < this.upTime)
+    const since = (result && typeof result === 'object' ? (result as Record<string, unknown>)['Up since'] : undefined) as unknown
+    if (typeof since !== 'string') return false
+    const restarted = this.upSince !== undefined && since !== this.upSince
     this.upSince = since
-    this.upTime = Number.isFinite(time) ? time : undefined
     return restarted
+  }
+
+  /** Only ignored datagrams during the period that just ended: the events come from an address not accepted. */
+  private checkSources() {
+    const deaf = this.heard === 0 && this.foreign > 0
+    if (deaf && !this.deaf) {
+      ;(this.log.error ?? this.log.warn).call(
+        this.log,
+        `OpenSIPS events: since the last renewal only datagrams from ${this.foreignFrom} arrived, none from an accepted address (${[...this.sources].join(', ')}). event_datagram sends from the address its kernel picks for the route: add it to OPENSIPS_EVENTS_FROM`
+      )
+    } else if (this.foreign > 1) this.log.warn(`OpenSIPS events: ${this.foreign} datagrams ignored from addresses that are not accepted`)
+    this.deaf = deaf
+    this.heard = 0
+    this.foreign = 0
   }
 
   private async renew() {
@@ -270,23 +357,50 @@ export class OpensipsEvents {
       await this.resolveSources()
       const restarted = await this.restarted()
       for (const event of this.options.events) await this.call('event_subscribe', [event, address, expire])
-      if (!wasSubscribed || restarted) {
+      const lapsed = !this.alive
+      this.keepAlive(expire)
+      this.checkSources()
+      if (!wasSubscribed || restarted || lapsed) {
         if (restarted) this.log.info('OpenSIPS restarted since the last renewal: reading its state again')
-        await this.options.onResync?.()
+        try {
+          await this.options.onResync?.()
+          this.resyncFailures = 0
+        } catch (err) {
+          if (++this.resyncFailures === RESYNC_ALERT) {
+            ;(this.log.error ?? this.log.warn).call(
+              this.log,
+              `OpenSIPS events: the state of OpenSIPS could not be read ${RESYNC_ALERT} times in a row (ul_dump, dlg_list): ${err instanceof Error ? err.message : String(err)}. With many registered browsers the reply may not fit in one MI datagram (about 64 KB).`
+            )
+          }
+          throw err
+        }
         if (!wasSubscribed) this.log.info(`OpenSIPS events: subscribed at ${this.mi.host}:${this.mi.port}, delivered to ${address}`)
       } else this.options.onRenewed?.()
-      if (this.foreign > 1) this.log.warn(`OpenSIPS events: ${this.foreign} datagrams ignored from hosts other than ${this.mi.host}`)
-      this.foreign = 0
       this.failures = 0
-      this.setSubscribed(true)
-      this.schedule((expire * 1000) / 2)
+      this.subscribed = true
+      this.updateStatus()
+      this.schedule(this.renewals++ === 0 && this.fixed ? Math.min(FIRST_RENEWAL_MS, (expire * 1000) / 2) : (expire * 1000) / 2)
     } catch (err) {
       if (this.stopped) return
       const delay = RETRY_MS[Math.min(this.failures++, RETRY_MS.length - 1)]!
       if (wasSubscribed || this.failures === 1) this.log.warn(`OpenSIPS events: ${err instanceof Error ? err.message : String(err)}; retrying in ${delay / 1000} s`)
-      this.setSubscribed(false)
+      this.subscribed = false
+      this.updateStatus()
       this.schedule(delay)
     }
+  }
+
+  /** The subscription now lives `expire` seconds in OpenSIPS: past that without a renewal, it is gone. */
+  private keepAlive(expire: number) {
+    this.alive = true
+    clearTimeout(this.expiry)
+    this.expiry = setTimeout(() => {
+      if (this.stopped) return
+      this.alive = false
+      this.log.warn('OpenSIPS events: the subscription expired without a renewal; what OpenSIPS told is forgotten until it answers again')
+      this.options.onExpired?.()
+    }, expire * 1000)
+    this.expiry.unref?.()
   }
 
   private schedule(ms: number) {
@@ -296,9 +410,10 @@ export class OpensipsEvents {
     this.timer.unref?.()
   }
 
-  private setSubscribed(value: boolean) {
-    if (this.subscribed === value) return
-    this.subscribed = value
+  private updateStatus() {
+    const value = this.connected
+    if (this.status === value) return
+    this.status = value
     this.options.onStatus?.(value)
   }
 }

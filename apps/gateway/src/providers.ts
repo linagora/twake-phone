@@ -79,9 +79,10 @@ export interface StoredOpensipsConfig {
   /**
    * Where to hear OpenSIPS (ADR 0011): its MI socket (`udp:host:port` of `mi_datagram`), the address this Gateway
    * listens on for the events (`host[:port]`) and, when OpenSIPS must be given another one (a wildcard `listen`, a
-   * container), the address it sends them to (`advertise`). Without it: no presence, no history.
+   * container), the address it sends them to (`advertise`), and the addresses they may come from besides the MI
+   * host (`from`: OpenSIPS sends them from the address its kernel picks). Without it: no presence, no history.
    */
-  events?: { miUrl: string; listen?: string; advertise?: string }
+  events?: { miUrl: string; listen?: string; advertise?: string; from?: string[] }
 }
 
 export interface OpensipsFactoryDeps {
