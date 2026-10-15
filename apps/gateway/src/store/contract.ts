@@ -173,4 +173,38 @@ export const storeContract = (name: string, make: () => Promise<Store>) =>
       expect(await s.getConference('abc-defg')).toBeNull()
       await s.close()
     })
+
+    it('keeps push subscriptions per tenant and user, one per endpoint: a browser given to someone else moves to them', async () => {
+      const s = await make()
+      const sub = (tenantId: string, userId: string, endpoint: string, createdAt: string) => ({ tenantId, userId, endpoint, p256dh: 'BKey', auth: 'secret', createdAt })
+      await s.savePushSubscription(sub('A', 'jean', 'https://push.example.test/1', '2026-10-15T10:00:00.000Z'))
+      await s.savePushSubscription(sub('A', 'jean', 'https://push.example.test/2', '2026-10-15T09:00:00.000Z'))
+      await s.savePushSubscription(sub('B', 'jean', 'https://push.example.test/3', '2026-10-15T10:00:00.000Z'))
+      expect((await s.listPushSubscriptions('A', 'jean')).map(r => r.endpoint)).toEqual(['https://push.example.test/2', 'https://push.example.test/1'])
+      expect(await s.listPushSubscriptions('A', 'jean')).toContainEqual(sub('A', 'jean', 'https://push.example.test/1', '2026-10-15T10:00:00.000Z'))
+      expect(await s.listPushUsers('A')).toEqual(['jean'])
+      // Another person signs in on Jean's browser: it is theirs now.
+      await s.savePushSubscription(sub('A', 'paul', 'https://push.example.test/1', '2026-10-15T11:00:00.000Z'))
+      expect((await s.listPushSubscriptions('A', 'jean')).map(r => r.endpoint)).toEqual(['https://push.example.test/2'])
+      expect(await s.listPushUsers('A')).toEqual(['jean', 'paul'])
+      // Only one's own, inside one's tenant.
+      expect(await s.deletePushSubscription('A', 'jean', 'https://push.example.test/1')).toBe(false)
+      expect(await s.deletePushSubscription('A', 'jean', 'https://push.example.test/3')).toBe(false)
+      expect(await s.deletePushSubscription('A', 'jean', 'https://push.example.test/2')).toBe(true)
+      expect(await s.listPushUsers('A')).toEqual(['paul'])
+      // Gone at its push service: removed whoever had it.
+      expect(await s.deletePushEndpoint('https://push.example.test/3')).toEqual({ tenantId: 'B', userId: 'jean' })
+      expect(await s.deletePushEndpoint('https://push.example.test/3')).toBeNull()
+      expect(await s.listPushUsers('B')).toEqual([])
+      await s.close()
+    })
+
+    it('keeps the first VAPID keys it is given', async () => {
+      const s = await make()
+      expect(await s.getVapidKeys()).toBeNull()
+      expect(await s.initVapidKeys({ publicKey: 'pub1', privateKeyEnc: 'enc1' })).toEqual({ publicKey: 'pub1', privateKeyEnc: 'enc1' })
+      expect(await s.initVapidKeys({ publicKey: 'pub2', privateKeyEnc: 'enc2' })).toEqual({ publicKey: 'pub1', privateKeyEnc: 'enc1' })
+      expect(await s.getVapidKeys()).toEqual({ publicKey: 'pub1', privateKeyEnc: 'enc1' })
+      await s.close()
+    })
   })

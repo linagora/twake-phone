@@ -8,6 +8,8 @@ describe('contentSecurityPolicy', () => {
     expect(csp).toContain("script-src 'self'")
     expect(csp).toContain("frame-ancestors 'none'")
     expect(csp).toContain("object-src 'none'")
+    // The service worker of the notifications, from the app's own origin only.
+    expect(csp).toContain("worker-src 'self'")
     expect(csp).not.toContain('unsafe')
   })
   it('adds the extra connect origins and the allowed ancestors', () => {

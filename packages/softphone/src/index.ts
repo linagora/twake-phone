@@ -330,6 +330,9 @@ class WebCall implements SoftCall {
       // 477 "Send failed": the SIP server could not deliver to the far end (a registration left on a dead
       // connection); for the person it is the same as nobody there.
       if (this.endStatus === 477 && this.endReason === 'failed') this.endReason = 'unavailable'
+      // 408: nobody answered in time (JsSIP counts it as unavailable), such as a call held for someone without a
+      // window whose browser did not wake.
+      if (this.endStatus === 408 && this.endReason === 'unavailable') this.endReason = 'no-answer'
       // A call ringing here, cancelled because another phone took it (the SIP server's CANCEL says so).
       const request = e.message as { method?: string; getHeader?: (name: string) => string | undefined } | undefined
       if (direction === 'inbound' && this.endReason === 'cancelled' && request?.method === 'CANCEL' && answeredElsewhere(request.getHeader?.('Reason'))) this.endReason = 'answered-elsewhere'

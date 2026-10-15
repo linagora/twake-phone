@@ -2,7 +2,7 @@ import dgram from 'node:dgram'
 import { afterEach, describe, expect, it } from 'vitest'
 import type { RoutedEvent } from '@twake/telephony-provider-sdk'
 import type { ForwardingRules } from '@twake/telephony-types'
-import { AsyncQueue, OpensipsProvider, SUBSCRIBED_EVENTS, type CallRules, type DndRule } from './index.js'
+import { AsyncQueue, OpensipsProvider, SUBSCRIBED_EVENTS, type CallRules, type DndRule, type PushTargets } from './index.js'
 import { fakeOpensips } from '../test/fake-opensips.js'
 
 const user = { id: 'alice', tenantId: 't', displayName: 'Alice', extension: '101' }
@@ -289,6 +289,47 @@ describe('OpensipsProvider call rules', () => {
     const bare = new OpensipsProvider({ websocketUrl: 'wss://sip.example.test', domain: 'sip.example.test', sipSecretFor: async () => 's', accounts })
     await bare.syncExtensions([])
     expect(given).toHaveLength(3)
+  })
+
+  it('writes who can be woken where OpenSIPS reads it, only while it hears the events that say whom to wake', async () => {
+    const written: string[] = []
+    const pushTargets = {
+      set: async (t: { extension: string; userId: string }[]) => void written.push(`set ${t.map(h => `${h.extension}=${h.userId}`).join(',')}`),
+      reconcile: async (t: { extension: string; userId: string }[]) => void written.push(`reconcile ${t.map(h => `${h.extension}=${h.userId}`).join(',')}`)
+    } as unknown as PushTargets
+    const sips = await fakeOpensips()
+    cleanups.push(sips.close)
+    const p = new OpensipsProvider({ websocketUrl: 'wss://sip.example.test', domain: 'sip.example.test', sipSecretFor: async () => 's', events: { miUrl: sips.url }, pushTargets, logger: quiet })
+    cleanups.push(() => p.close())
+    expect((await p.getCapabilities()).push).toBe(true)
+    await p.setWakeable([{ extension: '102', userId: 'jean' }])
+    await p.syncExtensions([{ extension: '102', userId: 'jean' }])
+    expect(written).toEqual(['set 102=jean', 'reconcile 102=jean'])
+    // Without the events, nobody would hear whom to wake: nobody can be (OpenSIPS would hold calls for nothing).
+    const deaf = new OpensipsProvider({ websocketUrl: 'wss://sip.example.test', domain: 'sip.example.test', sipSecretFor: async () => 's', pushTargets })
+    expect((await deaf.getCapabilities()).push).toBe(false)
+    await deaf.setWakeable([{ extension: '102', userId: 'jean' }])
+    expect(written.at(-1)).toBe('set ')
+    // Without the table, nothing to write.
+    expect((await make().getCapabilities()).push).toBe(false)
+    await make().setWakeable([{ extension: '102', userId: 'jean' }])
+  })
+
+  it('subscribes to the wake event and hands it to the person to wake', async () => {
+    const sips = await fakeOpensips()
+    cleanups.push(sips.close)
+    const p = new OpensipsProvider({ websocketUrl: 'wss://sip.example.test', domain: 'sip.example.test', sipSecretFor: async () => 's', events: { miUrl: sips.url }, logger: quiet })
+    cleanups.push(() => p.close())
+    const got: RoutedEvent[] = []
+    void (async () => {
+      for await (const e of p.subscribe()) got.push(e)
+    })()
+    await until('the subscription', () => p.getStatus() === 'CONNECTED')
+    expect(sips.subscriptions.map(s => s.event)).toContain('E_TWAKEPHONE_WAKE')
+    sips.push('E_TWAKEPHONE_CALLING', { callid: 'w1', caller: '101', callee: '102', dialled: '102' })
+    sips.push('E_TWAKEPHONE_WAKE', { callid: 'w1', caller: '101', callee: '102', dialled: '102', wait: 30 })
+    await until('the wake', () => got.some(e => e.event.type === 'call.wake'))
+    expect(got.find(e => e.event.type === 'call.wake')).toMatchObject({ extension: '102', event: { payload: { waitSec: 30, call: { id: 'w1', remoteNumber: '101', direction: 'inbound' } } } })
   })
 
   it('keeps the choice out of the tracker when the table refuses it', async () => {

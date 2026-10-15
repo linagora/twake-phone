@@ -12,6 +12,7 @@ describe('serveApp', () => {
     await mkdir(join(dir, 'static'))
     await writeFile(join(dir, 'static', 'app.abc123.js'), 'console.log(1)')
     await writeFile(join(dir, 'public.json'), '{"dev":true}')
+    await writeFile(join(dir, 'sw.js'), 'self.addEventListener("push", () => {})')
     web = await serveApp({ dir, port: 0, config: { gatewayUrl: 'http://127.0.0.1:8080', oidc: { authority: 'http://127.0.0.1:9000', clientId: 'x' } }, policy: { frameAncestors: ['https://chat.example.org'] } })
   })
   afterAll(() => web.stop())
@@ -29,6 +30,11 @@ describe('serveApp', () => {
     const config = await get('/config.json')
     expect(config.headers.get('cache-control')).toBe('no-store')
     expect((await config.json()).oidc.clientId).toBe('x')
+    // The service worker at the root (its scope is the whole app), as a script, never kept stale by a cache.
+    const sw = await get('/sw.js')
+    expect(sw.headers.get('content-type')).toBe('text/javascript; charset=utf-8')
+    expect(sw.headers.get('cache-control')).toBe('no-cache')
+    expect(sw.headers.get('content-security-policy')).toContain("worker-src 'self'")
     // The dev config of the build never leaks: /config.json is generated, whatever dist holds.
     expect((await (await get('/public.json')).json()).dev).toBe(true)
   })

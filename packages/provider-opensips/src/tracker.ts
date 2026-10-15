@@ -26,6 +26,12 @@ interface TrackedCall {
    * the others hear nothing more of it. Nobody answered: each one that rang has a missed call.
    */
   group?: { ringing: Set<string>; told: boolean }
+  /**
+   * The extensions OpenSIPS held the call for while their browsers were woken (step 5, ADR 0015): the callee, or
+   * members of a group, with no window. Not busy (nothing of theirs rings), but the call is theirs: one that does not
+   * go through is a missed call for them, as if their phone had rung.
+   */
+  woken?: Set<string>
   connectedAt?: string
 }
 
@@ -241,6 +247,17 @@ export class CallTracker {
         call.dnd = { told: str(p.told) !== '0' }
         break
       }
+      case 'E_TWAKEPHONE_WAKE': {
+        // Nobody of `callee` (the extension the call reached, or a member of the group dialled) is registered:
+        // OpenSIPS holds the call `wait` seconds while the Gateway wakes their browsers.
+        const call = this.find(p, now)
+        const who = userOf(str(p.callee))
+        if (!call || !who || call.connectedAt || who === call.caller) return
+        ;(call.woken ??= new Set()).add(who)
+        const waitSec = num(p.wait) ?? 0
+        this.emit(who, { type: 'call.wake', timestamp: this.now(), payload: { call: this.toCall(call, who, 'ringing'), waitSec, ...(call.group ? { group: call.dialled } : {}) } })
+        return
+      }
       case 'E_TWAKEPHONE_RINGING': {
         const call = this.find(p, now)
         // A group call: `callee` is the member whose phone rings.
@@ -409,6 +426,8 @@ export class CallTracker {
     for (const other of group.ringing) if (other !== member) this.count(other, -1)
     const rang = group.ringing.has(member)
     group.ringing.clear()
+    // Those woken for it hear nothing more either: a colleague took the call.
+    call.woken?.clear()
     call.callee = member
     call.rang = rang
   }
@@ -416,10 +435,10 @@ export class CallTracker {
   /** The call goes to `to` now: the callee it leaves is told it ended (missed, or declined) if its phone rang for it. */
   private moveTo(call: TrackedCall, to: string, code: number, now: string) {
     if (!to || call.callee === to) return
-    if (call.rang) {
-      this.count(call.callee, -1)
-      if (call.callee !== call.caller) this.emit(call.callee, { type: 'call.ended', timestamp: this.now(), payload: { call: this.toCall(call, call.callee, DECLINED.has(code) ? 'rejected' : 'missed', now) } })
-    }
+    // Woken for it (its browser was, nothing of its rang): missed all the same.
+    const woken = call.woken?.delete(call.callee) ?? false
+    if (call.rang) this.count(call.callee, -1)
+    if ((call.rang || woken) && call.callee !== call.caller) this.emit(call.callee, { type: 'call.ended', timestamp: this.now(), payload: { call: this.toCall(call, call.callee, DECLINED.has(code) ? 'rejected' : 'missed', now) } })
     call.callee = to
     call.rang = false
   }
@@ -473,10 +492,12 @@ export class CallTracker {
     this.calls.delete(c.id)
     this.count(c.caller, -1)
     if (c.rang) this.count(c.callee, -1)
-    // The members of a group whose phone rang and nobody answered: a missed call for each.
-    const members = [...(c.group?.ringing ?? [])]
-    for (const m of members) this.count(m, -1)
+    // The members of a group whose phone rang and nobody answered: a missed call for each; and so for those woken.
+    const rang = [...(c.group?.ringing ?? [])]
+    for (const m of rang) this.count(m, -1)
     c.group?.ringing.clear()
+    const callee = c.callee !== c.caller && (c.rang || !!c.woken?.has(c.callee))
+    const members = [...new Set([...rang, ...[...(c.woken ?? [])].filter(m => m !== c.callee && m !== c.caller)])]
     if (tombstone) {
       this.ended.add(c.id)
       if (this.ended.size > MAX_TOMBSTONES) this.ended.delete(this.ended.values().next().value!)
@@ -484,7 +505,7 @@ export class CallTracker {
     const timestamp = this.now()
     const event = (ext: string, state: CallState): TelephonyEvent => ({ type: state === 'failed' ? 'call.failed' : 'call.ended', timestamp, payload: { call: this.toCall(c, ext, state, endedAt) } })
     this.emit(c.caller, event(c.caller, callerState))
-    if (c.rang && c.callee !== c.caller) this.emit(c.callee, event(c.callee, calleeState))
+    if (callee) this.emit(c.callee, event(c.callee, calleeState))
     for (const m of members) this.emit(m, event(m, 'missed'))
   }
 

@@ -29,6 +29,8 @@ export const contentSecurityPolicy = ({ gatewayUrl, oidcAuthority, frameAncestor
     "img-src 'self' data:",
     "font-src 'self'",
     `connect-src ${connect.join(' ')}`,
+    // The service worker of the notifications (public/sw.js, step 5): ours only.
+    "worker-src 'self'",
     "frame-src 'none'",
     "object-src 'none'",
     "base-uri 'self'",

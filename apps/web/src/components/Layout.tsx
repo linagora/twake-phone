@@ -1,10 +1,11 @@
-import { useEffect, useRef } from 'react'
-import { NavLink, Outlet, useLocation } from 'react-router-dom'
+import { useEffect, useMemo, useRef } from 'react'
+import { NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom'
 import { useAuth } from '../auth/AuthProvider.js'
 import { displayNameFor } from '../auth/oidc.js'
 import { useGateway } from '../gateway.js'
 import type { Key } from '../i18n/index.js'
 import { useT } from '../i18n/useT.js'
+import { browserPush, calledFor, forgetPushAtSignOut, resyncPush } from '../push.js'
 import { usePhone } from '../softphone.js'
 import { CallPanel } from './CallPanel.js'
 
@@ -19,12 +20,29 @@ const LINKS: [string, Key][] = [
 export const Layout = () => {
   const { t } = useT()
   const { state, signOut } = useAuth()
-  const { me } = useGateway()
+  const { me, client } = useGateway()
   const phone = usePhone()
+  const push = useMemo(() => browserPush(), [])
+  const navigate = useNavigate()
   const name = displayNameFor(me, state.status === 'signed-in' ? state.user : null)
   // The administration link shows only to administrators; the Gateway refuses the others anyway.
   const links = LINKS.filter(([to]) => to !== '/admin' || me?.features?.admin)
-  const { pathname } = useLocation()
+  const { pathname, search } = useLocation()
+  // Opened by the notification of a call: signed in, the softphone registers and the call rings here. The address
+  // keeps no trace of it (a reload is no reason to do anything about that call).
+  useEffect(() => {
+    if (calledFor(search) !== null) navigate(pathname, { replace: true })
+  }, [search, pathname, navigate])
+  // The subscription to notifications this person made on this browser, handed to the Gateway again at each start.
+  useEffect(() => {
+    if (me?.extension) resyncPush(client, push, me.id).catch(() => undefined)
+  }, [client, push, me?.id, me?.extension])
+  const signOutHere = async () => {
+    await phone.shutdown()
+    // The next person on this browser does not get this one's calls.
+    if (me) await forgetPushAtSignOut(client, push, me.id)
+    await signOut()
+  }
   const main = useRef<HTMLElement>(null)
   const firstRender = useRef(true)
   // A route change in a SPA is a page change for assistive tech: the title says where we are, the focus follows (RGAA 8.5, 12.7).
@@ -62,7 +80,7 @@ export const Layout = () => {
               </button>
             </span>
           ) : null}
-          <button type="button" className="btn" onClick={() => void phone.shutdown().then(signOut)}>
+          <button type="button" className="btn" onClick={() => void signOutHere()}>
             {t('auth.signout')}
           </button>
         </div>

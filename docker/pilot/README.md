@@ -2,7 +2,7 @@
 
 Tout le MVP web sur une seule machine Linux joignable depuis Internet, pour que quelques personnes s'appellent depuis leur navigateur : l'app, la passerelle, OpenSIPS et rtpengine, PostgreSQL, derrière Caddy qui sert le tout en HTTPS sur un seul nom de domaine. Le profil `demo` ajoute un fournisseur d'identité (Keycloak) et un annuaire (OpenLDAP) avec trois personnes de test, pour essayer sans rien brancher. Sans ce profil, le kit se raccorde à votre SSO et à votre annuaire.
 
-Ce que le pilote permet : se connecter, trouver un collègue dans l'annuaire avec sa présence, l'appeler de navigateur à navigateur, le mettre en attente, le transférer, retrouver ses appels dans les Récents. Ce qu'il ne permet pas encore : appeler ou recevoir des numéros extérieurs (étape 6, trunk OVH), sonner quand aucun onglet n'est ouvert (étape 5, Web Push), le mobile.
+Ce que le pilote permet : se connecter, trouver un collègue dans l'annuaire avec sa présence, l'appeler de navigateur à navigateur, le mettre en attente, le transférer, retrouver ses appels dans les Récents, être prévenu d'un appel quand aucune fenêtre de l'app n'est ouverte (notifications d'appel à activer dans Réglages, navigateur lancé ; la machine doit joindre en HTTPS les services de push des navigateurs, `PUSH_PROXY` pour passer par un proxy). Ce qu'il ne permet pas encore : appeler ou recevoir des numéros extérieurs (étape 6, trunk OVH), le mobile.
 
 ## Ce qu'il faut
 

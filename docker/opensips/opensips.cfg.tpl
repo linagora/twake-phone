@@ -139,6 +139,16 @@ modparam("sqlops", "db_url", "${OPENSIPS_RULES_DB_URL}")
 # not are they left out, for every process, 30 s ($shv(no4c_until)), and the read is made again without them.
 loadmodule "cfgutils.so"
 modparam("cfgutils", "shvset", "no4c_until=i:0")
+# The table of step 5 (`push_targets`) likewise: when the database says it is missing, nobody is woken for 30 s.
+modparam("cfgutils", "shvset", "no5_until=i:0")
+
+#### Calls to someone without a window (step 5, ADR 0015): when the extension a call reaches has no registered window
+#### and its holder has a browser to wake (`push_targets`, written by the Gateway for a person with a push
+#### subscription), the transaction waits for a window to register (t_wait_for_new_branches) while the Gateway sends
+#### the push (E_TWAKEPHONE_WAKE); the first window that registers (E_UL_CONTACT_INSERT, notify_on_event of the
+#### event_routing module) is rung in that very transaction (t_inject_branches). Nobody within the delay: the
+#### no-answer forward, or the failure as before (route[hold]).
+loadmodule "event_routing.so"
 
 #### Accounting: CDRs in the database (the reference history) and the same as events for the Gateway (E_ACC_EVENT at
 #### the answer, E_ACC_CDR at the end of the dialog, E_ACC_MISSED_EVENT for a call that did not go through). Caller,
@@ -391,12 +401,27 @@ route[ring_now] {
 	# The call starts: told to the Gateway only now, once nothing can refuse it without a transaction: from here on,
 	# acc tells how it ended.
 	route(calling);
+	# Nobody registered, a browser to wake (route[wake_loaded]): the call waits for it.
+	if ($avp(wake) == 1)
+		route(hold);
+	# A ring group whose members with a window ring now, and whose members without one are woken (route[group_hold]).
+	if ($avp(group) != NULL && $avp(g_woken) > 0 && $avp(g_windows) == 0)
+		route(group_hold);
+	# Relayed from the request route: windows that cannot be reached may still have a browser to wake (3).
+	$var(relay_request) = 1;
 	route(relay_call);
+	if ($rc == 3)
+		route(wake_next);
+	if ($avp(group) != NULL && $avp(g_woken) > 0)
+		route(group_hold);
 }
 
 # The caller cancelled while the rules were read (the transaction exists, so tm accepts its CANCEL, but nothing rang
 # yet): no offer, no call told to the Gateway, a missed call for the extension dialled.
 route[cancelled] {
+	# The offer made before looking for a browser to wake (route[wake_next]) is over.
+	if ($avp(rtp_on) != NULL)
+		rtpengine_delete();
 	route(account_missed);
 	t_reply(487, "Request Terminated");
 	exit;
@@ -490,6 +515,13 @@ route[read_failed] {
 		return(-1);
 	}
 	$avp(q_again) = 1;
+	# `push_targets` (step 5) likewise: when the database says it is missing, nobody is woken for 30 s, and the read
+	# goes again without it.
+	if ($avp(q5) == 1 && route(table_5_missing)) {
+		$shv(no5_until) = $Ts + 30;
+		xlog("L_WARN", "call $ci: the database has no push_targets (the Gateway of step 5 creates it): nobody woken for 30 s\n");
+		return(1);
+	}
 	if ($avp(q4c) == 1 && route(tables_4c_missing)) {
 		$shv(no4c_until) = $Ts + 30;
 		xlog("L_WARN", "call $ci: the database has no call_groups or display_names (the Gateway of step 4c creates them): ring groups and directory names left out for 30 s\n");
@@ -508,6 +540,182 @@ route[tables_4c_missing] {
 	if ($var(missing) == 1)
 		return(1);
 	return(-1);
+}
+
+# Whether the database says `push_targets` is missing (as route[tables_4c_missing]).
+route[table_5_missing] {
+	$var(missing) = 0;
+	if (!sql_query_one("SELECT CASE WHEN to_regclass('push_targets') IS NULL THEN 1 ELSE 0 END", "$var(missing)"))
+		return(-1);
+	if ($var(missing) == 1)
+		return(1);
+	return(-1);
+}
+
+#### Calls to someone without a window (step 5, ADR 0015) ##############################################################
+# The extension the call reaches ($avp(callee)) has no registered window. When its holder has a browser the Gateway
+# can wake (a row of `push_targets`), the transaction waits for a window of theirs to register: the Gateway sends the
+# push (E_TWAKEPHONE_WAKE), the notification opens the app, which registers, and that window rings in the same
+# transaction (route[woken]). Only from the request route (a failure_route cannot hold a transaction), once per call;
+# after the wait, the no-answer forward, or the failure as before (failure_route). The caller hears it ringing
+# meanwhile (a 180 of ours).
+
+# Whether $avp(callee) can be woken: one read, asynchronous as the others. The media offer is made first: the read
+# keeps it in the transaction, and the branch of a window that registers is built from the request it keeps.
+route[wake_next] {
+	$avp(wake_checked) = $avp(callee);
+	if ($shv(no5_until) > $Ts || !($avp(callee) =~ "^[A-Za-z0-9._+-]{1,64}$")) {
+		route(not_woken);
+		exit;
+	}
+	if ($avp(rtp_on) == NULL && has_body_part("application/sdp"))
+		route(rtp_offer);
+	$(avp(q4c)[*]) = NULL;
+	$avp(q5) = 1;
+	$(avp(wake_row)[*]) = NULL;
+	$var(wake_query) = "SELECT 1 FROM push_targets WHERE extension = '" + $avp(callee) + "'";
+	async(sql_query_one("$var(wake_query)", "$avp(wake_row)"), wake_loaded);
+}
+
+route[wake_loaded] {
+	# 1: a browser to wake; -2: none; any other failure (timeout, database down): read again once, then nobody woken.
+	$var(wake_rc) = $rc;
+	if (t_was_cancelled())
+		route(cancelled);
+	if ($var(wake_rc) < 0 && $var(wake_rc) != -2 && route(read_failed)) {
+		route(wake_next);
+		exit;
+	}
+	$(avp(q_again)[*]) = NULL;
+	$(avp(q5)[*]) = NULL;
+	if ($var(wake_rc) == 1) {
+		$avp(wake) = 1;
+		# The rules its forwards lead to, as for any ringing (route[ring]), then route[hold].
+		route(ring);
+		exit;
+	}
+	if ($var(wake_rc) < 0 && $var(wake_rc) != -2)
+		xlog("L_WARN", "call $ci: whether $avp(callee) can be woken not read ($var(wake_rc), twice), not woken\n");
+	route(not_woken);
+	exit;
+}
+
+# Nobody to wake: on as before. Windows that could not be reached: the relay's failure (route[relay_failed]); none:
+# the no-answer forward at once, or nobody to ring (route[rules_step], which no longer looks for a browser).
+route[not_woken] {
+	if ($avp(relay_dead) == 1) {
+		$var(relay_rc) = -6;
+		route(relay_failed);
+	}
+	route(rules_step);
+	exit;
+}
+
+# The call waits for a window of $avp(callee): the no-answer delay when they have that forward (it goes when nobody
+# answered within it), PUSH_WAIT_SEC otherwise. A phony branch keeps the transaction alive that long
+# (t_wait_for_new_branches, armed with that delay): a CANCEL ends it at once (487), and its timeout (408) is the
+# failure failure_route handles as a no answer. A window that registers meanwhile rings (route[woken]).
+route[hold] {
+	$var(wait) = ${PUSH_WAIT_SEC};
+	if ($avp(r_noanswer) != NULL && $avp(r_delay) != NULL)
+		$var(wait) = $avp(r_delay);
+	$T_fr_inv_timeout = $var(wait);
+	if ($avp(relay_dead) == 1)
+		route(past_dead_branches);
+	if (!t_wait_for_new_branches()) {
+		xlog("L_ERR", "call $ci: cannot hold the call for a window of $avp(callee)\n");
+		route(unreachable);
+	}
+	$avp(held) = 1;
+	$(avp(wake_filter)[*]) = NULL;
+	$avp(wake_filter) = "aor=" + $avp(callee);
+	if (!notify_on_event("E_UL_CONTACT_INSERT", $avp(wake_filter), "woken", $var(wait)))
+		xlog("L_ERR", "call $ci: no window of $avp(callee) will ring (notify_on_event failed), the call waits $var(wait) s\n");
+	route(event_attrs);
+	$avp(ev_attr) = "wait";
+	$avp(ev_val) = $var(wait);
+	raise_event("E_TWAKEPHONE_WAKE", $avp(ev_attr), $avp(ev_val));
+	t_reply(180, "Ringing");
+	exit;
+}
+
+# Windows that could not be reached (route[relay_call]) leave their failed branches in the transaction. tm answers a
+# CANCEL of a held call with 487 at once only when the phony branch is the only one of the current set; with them, it
+# would wait out the delay (408, the missed call and the caller's end of the call that late). A relay from the request
+# route starts a new set of branches even when it adds none: one to a transport OpenSIPS does not listen on fails
+# before it adds a branch, nothing is sent, and the set starts past the failed ones.
+route[past_dead_branches] {
+	$du = "sip:127.0.0.1:9;transport=sctp";
+	t_relay();
+	resetdsturi();
+}
+
+# A window of a held callee registered (event_routing's notification route: no context of the call but its
+# transaction): it rings in that transaction, built from the request the transaction keeps (Record-Route, the media
+# offer, the caller's name), with the call's reply and failure routes. "l": the call no longer waits for the phony
+# branch, it ends as this ringing does (another window registering meanwhile rings too). A call already over: nothing.
+route[woken] {
+	if (!t_inject_branches("event", "l"))
+		xlog("L_NOTICE", "a window of $avp(aor) registered, its held call is over ($rc)\n");
+}
+
+# A ring group whose members without a window can be woken ($avp(gw_ext), the first $avp(g_woken) of them in their
+# order): after the windows of the others are relayed (none at all: the caller hears it ringing, a 180 of ours), the
+# transaction waits PUSH_WAIT_SEC for one window of each of them (t_wait_for_new_branches with that many branches:
+# once each has had one, the call ends as the ringing does), each is woken (E_TWAKEPHONE_WAKE names the member and
+# the group) and the first window each registers rings with the others (route[group_woken]). A member who wakes
+# counts as a window that must decline for the group to be declined (failure_route).
+route[group_hold] {
+	$var(wait) = ${PUSH_WAIT_SEC};
+	$T_fr_inv_timeout = $var(wait);
+	$var(ok) = 0;
+	if (t_wait_for_new_branches($avp(g_woken)))
+		$var(ok) = 1;
+	# The windows woken ring as long as any member's (tm's default).
+	$T_fr_inv_timeout = NULL;
+	if ($var(ok) == 0) {
+		xlog("L_ERR", "call $ci: group $avp(group) cannot wait for its members to wake\n");
+		$(avp(g_woken)[*]) = NULL;
+		if ($avp(g_windows) == 0)
+			route(unreachable);
+		return(-1);
+	}
+	$avp(held) = 1;
+	$var(n) = 0;
+	while ($(avp(gw_ext)[$var(n)]) != NULL)
+		$var(n) = $var(n) + 1;
+	# The stack holds them last first: from its end, the first $avp(g_woken).
+	$var(j) = $var(n) - 1;
+	$var(left) = $avp(g_woken);
+	while ($var(j) >= 0 && $var(left) > 0) {
+		$var(member) = $(avp(gw_ext)[$var(j)]);
+		$(avp(wake_filter)[*]) = NULL;
+		$avp(wake_filter) = "aor=" + $var(member);
+		if (!notify_on_event("E_UL_CONTACT_INSERT", $avp(wake_filter), "group_woken", $var(wait)))
+			xlog("L_ERR", "call $ci: no window of $var(member) will ring in group $avp(group) (notify_on_event failed)\n");
+		$avp(ev_callee) = $var(member);
+		route(event_attrs);
+		$avp(ev_attr) = "wait";
+		$avp(ev_val) = $var(wait);
+		raise_event("E_TWAKEPHONE_WAKE", $avp(ev_attr), $avp(ev_val));
+		$var(j) = $var(j) - 1;
+		$var(left) = $var(left) - 1;
+	}
+	$var(windows) = $avp(g_windows) + $avp(g_woken);
+	$(avp(g_windows)[*]) = NULL;
+	$avp(g_windows) = $var(windows);
+	if ($var(windows) == $avp(g_woken)) {
+		t_reply(180, "Ringing");
+		exit;
+	}
+}
+
+# A window of a member of a held ring group registered: it rings in the group's transaction, tagged with the member
+# (onreply_route[rtp] finds the member's name in the group's list).
+route[group_woken] {
+	$(msg.branch.attr(gext)[0]) = $avp(aor);
+	if (!t_inject_branches("event"))
+		xlog("L_NOTICE", "a window of $avp(aor) registered, the group call it was woken for is over ($rc)\n");
 }
 
 #### Ring groups (step 4c, ADR 0014) ###################################################################################
@@ -531,8 +739,20 @@ route[group_next] {
 	if ($avp(caller) =~ "^[A-Za-z0-9._+-]{1,64}$")
 		$var(group_caller) = $avp(caller);
 	route(name_sql);
-	$var(group_query) = "SELECT x.ext, coalesce((SELECT " + $var(name_sql) + " FROM display_names n WHERE n.extension = x.ext), '') FROM call_groups g CROSS JOIN LATERAL unnest(g.members) WITH ORDINALITY AS x(ext, pos) WHERE g.number = '" + $rU + "' AND x.ext <> '" + $var(group_caller) + "' AND NOT EXISTS (SELECT 1 FROM call_rules r WHERE r.extension = x.ext AND r.dnd AND (r.dnd_until IS NULL OR r.dnd_until > now())) ORDER BY x.pos";
-	async(sql_query("$var(group_query)", "$avp(g_ext);$avp(g_name)"), group_loaded);
+	# Step 5: whether each member has a browser to wake (`push_targets`), while that table may be named.
+	$(avp(g_wake)[*]) = NULL;
+	$(avp(q5)[*]) = NULL;
+	$var(wake_col) = "0";
+	if ($shv(no5_until) <= $Ts) {
+		$avp(q5) = 1;
+		$var(wake_col) = "CASE WHEN EXISTS (SELECT 1 FROM push_targets p WHERE p.extension = x.ext) THEN 1 ELSE 0 END";
+	}
+	# The media offer before the read: a member's window that a push wakes rings in a branch built from the request
+	# the transaction keeps, which the read updates (route[wake_next]).
+	if ($avp(rtp_on) == NULL && has_body_part("application/sdp"))
+		route(rtp_offer);
+	$var(group_query) = "SELECT x.ext, coalesce((SELECT " + $var(name_sql) + " FROM display_names n WHERE n.extension = x.ext), ''), " + $var(wake_col) + " FROM call_groups g CROSS JOIN LATERAL unnest(g.members) WITH ORDINALITY AS x(ext, pos) WHERE g.number = '" + $rU + "' AND x.ext <> '" + $var(group_caller) + "' AND NOT EXISTS (SELECT 1 FROM call_rules r WHERE r.extension = x.ext AND r.dnd AND (r.dnd_until IS NULL OR r.dnd_until > now())) ORDER BY x.pos";
+	async(sql_query("$var(group_query)", "$avp(g_ext);$avp(g_name);$avp(g_wake)"), group_loaded);
 }
 
 route[group_loaded] {
@@ -545,6 +765,7 @@ route[group_loaded] {
 		exit;
 	}
 	$(avp(q_again)[*]) = NULL;
+	$(avp(q5)[*]) = NULL;
 	if ($var(group_rc) < 0 && $var(group_rc) != -2)
 		xlog("L_WARN", "call $ci: members of group $rU not read ($var(group_rc), twice)\n");
 	route(group_ring);
@@ -571,12 +792,19 @@ route[group_ring] {
 	$(avp(w_ext)[*]) = NULL;
 	$(avp(w_name)[*]) = NULL;
 	$(avp(w_rank)[*]) = NULL;
+	$(avp(gw_ext)[*]) = NULL;
 	# The lists are stacks: the window collected last is at index 0.
 	$var(windows) = 0;
+	# Members with a window, and members without one whose browser can be woken (step 5).
+	$var(members_on) = 0;
+	$var(to_wake) = 0;
 	$var(i) = 0;
 	while ($(avp(g_ext)[$var(i)]) != NULL) {
 		$var(ext) = $(avp(g_ext)[$var(i)]);
 		$var(name) = $(avp(g_name)[$var(i)]);
+		$var(wake) = 0;
+		if ($(avp(g_wake)[$var(i)]) != NULL)
+			$var(wake) = $(avp(g_wake)[$var(i)]);
 		$var(i) = $var(i) + 1;
 		$var(found) = 0;
 		if ($var(ext) =~ "^[A-Za-z0-9._+-]{1,64}$") {
@@ -614,11 +842,36 @@ route[group_ring] {
 			# remove_msg_branch() counts the appended branches from 0, without the Request-URI.
 			while ($msg.branch.last_idx > 0)
 				remove_msg_branch(0);
+			$var(members_on) = $var(members_on) + 1;
+		} else if ($var(wake) == 1 && $var(ext) =~ "^[A-Za-z0-9._+-]{1,64}$") {
+			$avp(gw_ext) = $var(ext);
+			$var(to_wake) = $var(to_wake) + 1;
 		}
+	}
+	# Room for the members to wake: one destination each, and the branch that keeps the call waiting for them, out
+	# of 12; every member with a window keeps one first. Those that do not fit are not woken (logged).
+	$var(woken) = $var(to_wake);
+	$var(room) = 11 - $var(members_on);
+	if ($var(woken) > $var(room))
+		$var(woken) = $var(room);
+	if ($var(woken) < $var(to_wake))
+		xlog("L_WARN", "call $ci: group $avp(group): $var(to_wake) members to wake, room for $var(woken)\n");
+	$var(cap) = 12;
+	if ($var(woken) > 0)
+		$var(cap) = 11 - $var(woken);
+	$avp(g_woken) = $var(woken);
+	if ($var(windows) == 0 && $var(woken) > 0) {
+		# Nobody has a window: the call waits for the members a push wakes (route[group_hold]).
+		$ru = "sip:" + $avp(group) + "@" + $avp(domain);
+		$avp(g_windows) = 0;
+		route(ring);
+		exit;
 	}
 	if ($var(windows) == 0) {
 		xlog("L_NOTICE", "call $ci: nobody of group $avp(group) to ring\n");
 		$ru = "sip:" + $avp(group) + "@" + $avp(domain);
+		if ($avp(rtp_on) != NULL)
+			rtpengine_delete();
 		route(account_missed);
 		route(calling);
 		t_reply(480, "Temporarily Unavailable");
@@ -634,7 +887,7 @@ route[group_ring] {
 		$var(j) = $var(windows) - 1;
 		while ($var(j) >= 0) {
 			if ($(avp(w_rank)[$var(j)]) == $var(rank)) {
-				if ($var(placed) >= 12) {
+				if ($var(placed) >= $var(cap)) {
 					$var(left) = $var(left) + 1;
 				} else if ($var(first) < 0) {
 					# The Request-URI, set last: append_msg_branch() would copy its destination into the branches.
@@ -820,6 +1073,8 @@ route[rules_step] {
 				$avp(d_retry) = $avp(r_retry);
 		}
 	}
+	# In the request route, where the transaction may be held for a browser to wake (route[wake_next]).
+	$var(may_wake) = 1;
 	route(rules_decide);
 	$var(decided) = $rc;
 	if ($var(decided) == 1) {
@@ -830,14 +1085,20 @@ route[rules_step] {
 		route(ring);
 		exit;
 	}
+	if ($var(decided) == 3) {
+		route(wake_next);
+		exit;
+	}
 	route(unreachable);
 	exit;
 }
 
 # The rules of the extension reached, loaded in $avp(r_*): 1 the call moved to another extension (load its rules
-# next), 2 its windows are found (ring them), -1 nobody to ring. A refusal ends the script (route[dnd_refuse]).
-# Before ringing: the immediate forward; during a "do not disturb", the no-answer forward, else the busy one, else a
-# refusal. Nobody registered: the no-answer forward, at once (nobody can answer).
+# next), 2 its windows are found (ring them), 3 nobody registered but a browser of theirs may be woken (in the
+# request route only, $var(may_wake), once per extension: route[wake_next] reads whether it can), -1 nobody to ring.
+# A refusal ends the script (route[dnd_refuse]). Before ringing: the immediate forward; during a "do not disturb",
+# the no-answer forward, else the busy one, else a refusal. Nobody registered: a browser to wake (step 5), else the
+# no-answer forward, at once (nobody can answer).
 route[rules_decide] {
 	$var(next) = "";
 	if ($avp(r_always) != NULL)
@@ -852,6 +1113,8 @@ route[rules_decide] {
 		route(dnd_refuse);
 	if (lookup("location"))
 		return(2);
+	if ($var(may_wake) == 1 && $avp(held) == NULL && ($avp(wake_checked) == NULL || $avp(wake_checked) != $avp(callee)))
+		return(3);
 	if ($avp(r_noanswer) != NULL && route(forward_to, $avp(r_noanswer)))
 		return(1);
 	return(-1);
@@ -887,6 +1150,8 @@ route[preload_query] {
 # nobody (-1). An extension the preload did not return has no rules (no row, or the preload failed).
 route[rules_local] {
 	$var(local_hops) = 0;
+	# After a failure: no browser is woken any more (no transaction to hold from here).
+	$var(may_wake) = 0;
 	while ($var(local_hops) < 4) {
 		$var(local_hops) = $var(local_hops) + 1;
 		if (route(rules_query))
@@ -932,6 +1197,9 @@ route[rules_preloaded] {
 route[unreachable] {
 	if ($avp(d_dnd) == 1)
 		route(dnd_refuse_dialled);
+	# The offer made before looking for a browser to wake (route[wake_next]) is over.
+	if ($avp(rtp_on) != NULL)
+		rtpengine_delete();
 	route(account_missed);
 	route(calling);
 	if ($avp(fwd_hops) == 0 && $avp(dialled_unread) != 1)
@@ -1111,6 +1379,21 @@ route[relay_call] {
 	if ($var(relay_rc) > 0)
 		return(1);
 	xlog("L_NOTICE", "call $ci: relay to $avp(callee) failed ($var(relay_rc))\n");
+	# Windows left registered on dead WebSockets (a laptop put to sleep): from the request route, the browser may be
+	# woken like that of someone without a window (route[wake_next]; tm freed the branches it could not send, the
+	# transaction can still wait for a new one): 3, and route[ring_now] reads whether. Nobody to wake: on with
+	# route[relay_failed] there.
+	if ($var(relay_rc) == -6 && $var(relay_request) == 1 && $avp(group) == NULL && $avp(held) == NULL && ($avp(wake_checked) == NULL || $avp(wake_checked) != $avp(callee))) {
+		$avp(relay_dead) = 1;
+		return(3);
+	}
+	route(relay_failed);
+}
+
+# The relay failed ($var(relay_rc)): the no-answer forward when no window could be reached, else the failure.
+route[relay_failed] {
+	# A forward's relay is not held for a browser to wake (route[relay_call]).
+	$var(relay_request) = 0;
 	if ($var(relay_rc) == -6)
 		$var(dnd_code) = 477;
 	else
@@ -1193,8 +1476,17 @@ onreply_route[rtp] {
 		$var(member_name) = "";
 		if ($avp(group) != NULL && $tm.branch.attr(gext) != NULL) {
 			$var(member) = $tm.branch.attr(gext);
-			if ($tm.branch.attr(gname) != NULL)
+			if ($tm.branch.attr(gname) != NULL) {
 				$var(member_name) = $tm.branch.attr(gname);
+			} else {
+				# A window a push woke (route[group_woken]): its name is the member's in the group's list.
+				$var(k) = 0;
+				while ($(avp(g_ext)[$var(k)]) != NULL) {
+					if ($(avp(g_ext)[$var(k)]) == $var(member) && $var(member_name) == "")
+						$var(member_name) = $(avp(g_name)[$var(k)]);
+					$var(k) = $var(k) + 1;
+				}
+			}
 		}
 		if (($rs == 180 || $rs == 183) && $var(member) != "") {
 			$var(mark) = "," + $var(member) + ",";
@@ -1278,6 +1570,8 @@ route[event_attrs] {
 }
 
 failure_route[call_failed] {
+	# No transaction can be held from here (route[relay_call]).
+	$var(relay_request) = 0;
 	# Cancelled: the media session is over, free rtpengine's ports; the missed call is the callee's.
 	if (t_was_cancelled()) {
 		rtpengine_delete();

@@ -27,6 +27,15 @@ set -eu
 case "$RULES_QUERY_TIMEOUT_MS" in
   '' | *[!0-9]*) echo "RULES_QUERY_TIMEOUT_MS must be a number of milliseconds" >&2; exit 1 ;;
 esac
+# How long a call to someone without a window waits for a browser of theirs to wake (step 5, ADR 0015), in seconds,
+# when they have no no-answer forward (whose delay it is otherwise).
+: "${PUSH_WAIT_SEC:=30}"
+case "$PUSH_WAIT_SEC" in
+  '' | *[!0-9]*) echo "PUSH_WAIT_SEC must be a number of seconds" >&2; exit 1 ;;
+esac
+if [ "$PUSH_WAIT_SEC" -lt 5 ] || [ "$PUSH_WAIT_SEC" -gt 120 ]; then
+  echo "PUSH_WAIT_SEC must be 5 to 120 seconds" >&2; exit 1
+fi
 # The parameters of the URL follow the host: a "?" in the password (OpenSIPS ends it at the "@") is not one.
 case "${OPENSIPS_DB_URL##*@}" in
   *\?options=* | *\&options=*)
@@ -36,7 +45,7 @@ case "${OPENSIPS_DB_URL##*@}" in
   *\?*) OPENSIPS_RULES_DB_URL="${OPENSIPS_DB_URL}&options=-cstatement_timeout=${RULES_QUERY_TIMEOUT_MS}" ;;
   *) OPENSIPS_RULES_DB_URL="${OPENSIPS_DB_URL}?options=-cstatement_timeout=${RULES_QUERY_TIMEOUT_MS}" ;;
 esac
-export SIP_DOMAIN LISTEN_IP SIP_PORT WS_PORT WSS_PORT OPENSIPS_DB_URL OPENSIPS_RULES_DB_URL RTPENGINE_SOCK OPENSIPS_LOG_LEVEL OPENSIPS_MPATH MI_FIFO MI_LISTEN_IP MI_PORT TLS_CERT TLS_KEY
+export SIP_DOMAIN LISTEN_IP SIP_PORT WS_PORT WSS_PORT OPENSIPS_DB_URL OPENSIPS_RULES_DB_URL PUSH_WAIT_SEC RTPENGINE_SOCK OPENSIPS_LOG_LEVEL OPENSIPS_MPATH MI_FIFO MI_LISTEN_IP MI_PORT TLS_CERT TLS_KEY
 
 # The MI socket (mi_datagram) has no authentication: whoever reaches it can stop OpenSIPS, drop registrations, end
 # calls, read who is registered and subscribe to the events (who calls whom). It listens on its own address, the
@@ -84,7 +93,7 @@ if [ ! -f "$TLS_CERT" ] || [ ! -f "$TLS_KEY" ]; then
 fi
 
 # Only the listed variables are substituted: a "$avp(...)" of the script must stay as it is.
-envsubst '$SIP_DOMAIN $LISTEN_IP $SIP_PORT $WS_PORT $WSS_PORT $OPENSIPS_DB_URL $OPENSIPS_RULES_DB_URL $RTPENGINE_SOCK $OPENSIPS_LOG_LEVEL $OPENSIPS_MPATH $MI_FIFO $MI_LISTEN_IP $MI_PORT $TLS_CERT $TLS_KEY' \
+envsubst '$SIP_DOMAIN $LISTEN_IP $SIP_PORT $WS_PORT $WSS_PORT $OPENSIPS_DB_URL $OPENSIPS_RULES_DB_URL $PUSH_WAIT_SEC $RTPENGINE_SOCK $OPENSIPS_LOG_LEVEL $OPENSIPS_MPATH $MI_FIFO $MI_LISTEN_IP $MI_PORT $TLS_CERT $TLS_KEY' \
   < "$CFG_TEMPLATE" > "$CFG_OUT"
 
 "$OPENSIPS_BIN" -C -f "$CFG_OUT"

@@ -37,4 +37,16 @@ describe('TelephonyClient presence and forwarding', () => {
     expect(err).not.toHaveProperty('code')
     expect(err).not.toHaveProperty('detail')
   })
+
+  it('subscribes and unsubscribes a browser to notifications, with only what the Gateway needs', async () => {
+    const { asked, client } = gateway(() => new Response('{"available":true,"publicKey":"BKey","subscriptions":1}', { status: 200 }))
+    await client.getPushSubscriptions()
+    await client.addPushSubscription({ endpoint: 'https://push.example.test/1', keys: { p256dh: 'p', auth: 'a' }, expirationTime: null } as never)
+    await client.removePushSubscription('https://push.example.test/1')
+    expect(asked).toEqual([
+      { url: 'https://gw.example.test/api/v1/me/push-subscriptions', method: undefined, body: undefined },
+      { url: 'https://gw.example.test/api/v1/me/push-subscriptions', method: 'POST', body: { endpoint: 'https://push.example.test/1', keys: { p256dh: 'p', auth: 'a' } } },
+      { url: 'https://gw.example.test/api/v1/me/push-subscriptions', method: 'DELETE', body: { endpoint: 'https://push.example.test/1' } }
+    ])
+  })
 })

@@ -58,7 +58,21 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     const offer = ring.indexOf('route(rtp_offer);')
     const calling = ring.indexOf('route(calling);', offer)
     expect([offer, calling].every(i => i > 0)).toBe(true)
-    expect(ring[calling + 1]).toBe('route(relay_call);')
+    // Then the relay, unless the call waits for a browser to wake (step 5): the callee's (route[hold]), or members of
+    // a ring group nobody of which has a window (route[group_hold]); the others are woken once their colleagues ring.
+    expect(ring.slice(calling + 1).filter(l => l && !l.startsWith('#'))).toEqual([
+      'if ($avp(wake) == 1)',
+      'route(hold);',
+      'if ($avp(group) != NULL && $avp(g_woken) > 0 && $avp(g_windows) == 0)',
+      'route(group_hold);',
+      '$var(relay_request) = 1;',
+      'route(relay_call);',
+      'if ($rc == 3)',
+      'route(wake_next);',
+      'if ($avp(group) != NULL && $avp(g_woken) > 0)',
+      'route(group_hold);',
+      '}'
+    ])
     // One offer per call: a forward after a failure sends the same one on.
     expect(ring[offer - 1]).toBe('if ($avp(rtp_on) == NULL && has_body_part("application/sdp"))')
     expect(section('route[rules_decide]', 'route[preload_query]')).toContain('if (lookup("location"))\n\t\treturn(2);')
@@ -101,7 +115,8 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
       ['route[rules_loaded]', 'route[rules_step]', 'route(rules_step);'],
       ['route[ring_loaded]', 'route[ring_now]', 'route(ring_now);'],
       ['route[names_loaded]', 'route[caller_name]', 'route(ring);'],
-      ['route[group_loaded]', 'route[group_ring]', 'route(group_ring);']
+      ['route[group_loaded]', 'route[group_ring]', 'route(group_ring);'],
+      ['route[wake_loaded]', 'route[hold]', 'route(ring);']
     ] as const) {
       const body = section(resume, next)
       const check = body.indexOf('if (t_was_cancelled())\n\t\troute(cancelled);')
@@ -110,7 +125,9 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     }
     const cancelled = section('route[cancelled]', 'route[name_sql]')
     expect(cancelled).toContain('route(account_missed);\n\tt_reply(487, "Request Terminated");\n\texit;')
-    expect(cancelled.replace(/#.*$/gm, '')).not.toMatch(/rtp|calling|raise_event/)
+    // Nothing told; the only media session to end is the offer made before looking for a browser to wake.
+    expect(cancelled.replace(/#.*$/gm, '')).not.toMatch(/calling|raise_event|rtp_offer|rtpengine_offer/)
+    expect(cancelled).toContain('if ($avp(rtp_on) != NULL)\n\t\trtpengine_delete();')
   })
 
   it('reads nothing in failure_route: the rules a failure may need are read before the ringing, asynchronously', () => {
@@ -130,14 +147,17 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     // One row per extension reached, with or without rules, and no NULL (sql_query would add "<null>"): the lists stay aligned.
     expect(preload).toContain('FROM (SELECT DISTINCT extension FROM reach) AS x LEFT JOIN call_rules r ON r.extension = x.extension')
     // Each query is asynchronous (the rules, the first of them with the caller's name, the names of a Replaces, the
-    // members of a group, the preload), none is run where async is not available. The one synchronous query asks the
-    // catalog whether the tables of step 4c exist, only after a read failed, from the routes that resume a read.
-    expect(cfg.match(/sql_query/g)).toHaveLength(6)
-    expect(cfg.match(/async\(sql_query/g)).toHaveLength(5)
-    expect(section('route[tables_4c_missing]', 'route[group_next]').match(/sql_query_one\(/g)).toHaveLength(1)
+    // members of a group, the preload, whether the callee can be woken), none is run where async is not available.
+    // The two synchronous queries ask the catalog whether the tables of step 4c, or that of step 5, exist, only after
+    // a read failed, from the routes that resume a read.
+    expect(cfg.match(/sql_query/g)).toHaveLength(8)
+    expect(cfg.match(/async\(sql_query/g)).toHaveLength(6)
+    expect(section('route[tables_4c_missing]', 'route[table_5_missing]').match(/sql_query_one\(/g)).toHaveLength(1)
+    expect(section('route[table_5_missing]', 'route[wake_next]').match(/sql_query_one\(/g)).toHaveLength(1)
     expect(cfg.match(/route\(tables_4c_missing\)/g)).toHaveLength(1)
+    expect(cfg.match(/route\(table_5_missing\)/g)).toHaveLength(1)
     const callers = [...cfg.matchAll(/route\(read_failed\)/g)].map(m => cfg.lastIndexOf('\nroute[', m.index))
-    expect(new Set(callers.map(i => cfg.slice(i + 1, cfg.indexOf(']', i)) + ']'))).toEqual(new Set(['route[rules_loaded]', 'route[ring_loaded]', 'route[names_loaded]', 'route[group_loaded]']))
+    expect(new Set(callers.map(i => cfg.slice(i + 1, cfg.indexOf(']', i)) + ']'))).toEqual(new Set(['route[rules_loaded]', 'route[ring_loaded]', 'route[names_loaded]', 'route[group_loaded]', 'route[wake_loaded]']))
     expect(cfg.slice(cfg.indexOf('failure_route['))).not.toMatch(/sql_query|async\(/)
     expect(cfg.slice(cfg.indexOf('failure_route['))).toContain('route(rules_local);')
     expect(section('route[rules_local]', 'route[rules_preloaded]')).toContain('route(rules_preloaded);')
@@ -327,7 +347,9 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     // At most 12 destinations (MAX_BRANCHES): rank by rank, each member's first window before anyone's second; the
     // windows left out are logged.
     expect(ring).toContain('if ($(avp(w_rank)[$var(j)]) == $var(rank)) {')
-    expect(ring).toContain('if ($var(placed) >= 12) {')
+    // A member woken by a push (step 5) takes one of them, and the branch that keeps the call waiting another.
+    expect(ring).toContain('if ($var(placed) >= $var(cap)) {')
+    expect(ring).toContain('$var(cap) = 12;\n\tif ($var(woken) > 0)\n\t\t$var(cap) = 11 - $var(woken);')
     expect(ring).toContain('while ($msg.branch.last_idx > 0)\n\t\t\t\tremove_msg_branch(0);')
     expect(ring).toContain('xlog("L_WARN", "call $ci: group $avp(group): $var(left) of its $var(windows) windows left out, a call rings 12 at most\\n");')
     expect(ring).toContain('$avp(g_windows) = $var(placed);')
@@ -386,6 +408,80 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(section('route[group_loaded]', 'route[group_ring]')).toContain('if ($var(group_rc) < 0 && $var(group_rc) != -2 && route(read_failed)) {\n\t\troute(group_next);\n\t\texit;\n\t}')
     // The members' query always needs call_groups: its failure is never taken for missing tables.
     expect(section('route[group_next]', 'route[group_loaded]')).toContain('$(avp(q4c)[*]) = NULL;')
+  })
+
+  it('holds a call to someone without a window while the Gateway wakes their browser, from the request route only, once per call', () => {
+    const { cfg } = render({ PUSH_WAIT_SEC: '25' })
+    const section = (name: string, next: string) => cfg.slice(cfg.indexOf(`${name} {`), cfg.indexOf(`${next} {`))
+    expect(cfg).toContain('loadmodule "event_routing.so"')
+    expect(cfg).toContain('modparam("cfgutils", "shvset", "no5_until=i:0")')
+    // Nobody registered: a browser to wake is looked for once per extension, from the request route only.
+    const decide = section('route[rules_decide]', 'route[preload_query]')
+    const lookup = decide.indexOf('if (lookup("location"))\n\t\treturn(2);')
+    const wake = decide.indexOf('if ($var(may_wake) == 1 && $avp(held) == NULL && ($avp(wake_checked) == NULL || $avp(wake_checked) != $avp(callee)))\n\t\treturn(3);')
+    expect(wake).toBeGreaterThan(lookup)
+    expect(wake).toBeLessThan(decide.indexOf('route(forward_to, $avp(r_noanswer))'))
+    expect(section('route[rules_step]', 'route[rules_decide]')).toContain('$var(may_wake) = 1;\n\troute(rules_decide);')
+    expect(section('route[rules_local]', 'route[rules_preloaded]')).toContain('$var(may_wake) = 0;')
+    // One asynchronous read on the primary key, the user part checked first, the media offer made before it.
+    const next = section('route[wake_next]', 'route[wake_loaded]')
+    expect(next.indexOf('$avp(wake_checked) = $avp(callee);')).toBeLessThan(next.indexOf('async('))
+    expect(next.indexOf('!($avp(callee) =~ "^[A-Za-z0-9._+-]{1,64}$")')).toBeLessThan(next.indexOf('$var(wake_query) ='))
+    expect(next.indexOf('route(rtp_offer);')).toBeLessThan(next.indexOf('async('))
+    expect(next).toContain(`$var(wake_query) = "SELECT 1 FROM push_targets WHERE extension = '" + $avp(callee) + "'";`)
+    expect(next).toContain('async(sql_query_one("$var(wake_query)", "$avp(wake_row)"), wake_loaded);')
+    expect(next).toContain('if ($shv(no5_until) > $Ts || ')
+    // The table missing (to_regclass, never a guess): nobody woken for 30 s, the read made again without it.
+    const failed = section('route[read_failed]', 'route[tables_4c_missing]')
+    expect(failed).toContain('if ($avp(q5) == 1 && route(table_5_missing)) {\n\t\t$shv(no5_until) = $Ts + 30;')
+    expect(section('route[table_5_missing]', 'route[wake_next]')).toContain("to_regclass('push_targets') IS NULL")
+    expect(section('route[group_next]', 'route[group_loaded]')).toContain('if ($shv(no5_until) <= $Ts) {\n\t\t$avp(q5) = 1;')
+    // Nobody to wake: on as before; windows that could not be reached end as a failed relay, never in a loop.
+    const notWoken = section('route[not_woken]', 'route[hold]')
+    expect(notWoken.indexOf('route(relay_failed);')).toBeLessThan(notWoken.indexOf('route(rules_step);'))
+    expect(section('route[wake_loaded]', 'route[not_woken]')).toContain('if ($var(wake_rc) == 1) {\n\t\t$avp(wake) = 1;')
+    // The hold: the no-answer delay, else PUSH_WAIT_SEC; a phony branch armed with it; the window that registers
+    // rings in the transaction; the Gateway told (E_TWAKEPHONE_WAKE); the caller hears it ringing.
+    const hold = section('route[hold]', 'route[woken]')
+    expect(hold).toContain('$var(wait) = 25;')
+    expect(hold).toContain('if ($avp(r_noanswer) != NULL && $avp(r_delay) != NULL)\n\t\t$var(wait) = $avp(r_delay);')
+    expect(hold.indexOf('$T_fr_inv_timeout = $var(wait);')).toBeLessThan(hold.indexOf('t_wait_for_new_branches()'))
+    expect(hold).toContain('$avp(wake_filter) = "aor=" + $avp(callee);')
+    expect(hold).toContain('notify_on_event("E_UL_CONTACT_INSERT", $avp(wake_filter), "woken", $var(wait))')
+    expect(hold.indexOf('raise_event("E_TWAKEPHONE_WAKE"')).toBeLessThan(hold.indexOf('t_reply(180, "Ringing");'))
+    // Windows that could not be reached: their failed branches left behind first, so that a CANCEL ends the wait at
+    // once (a relay that adds no branch, to a transport OpenSIPS does not listen on), the destination reset after.
+    expect(hold.indexOf('if ($avp(relay_dead) == 1)\n\t\troute(past_dead_branches);')).toBeLessThan(hold.indexOf('t_wait_for_new_branches()'))
+    const past = section('route[past_dead_branches]', 'route[woken]')
+    expect(past).toContain('$du = "sip:127.0.0.1:9;transport=sctp";\n\tt_relay();\n\tresetdsturi();')
+    expect(cfg).not.toMatch(/listen\s*=\s*sctp/)
+    expect(section('route[woken]', 'route[group_hold]')).toContain('t_inject_branches("event", "l")')
+    // A group: the woken members' windows are tagged with the member, and the wait counts one branch per member.
+    const groupHold = section('route[group_hold]', 'route[group_woken]')
+    expect(groupHold).toContain('t_wait_for_new_branches($avp(g_woken))')
+    expect(groupHold).toContain('notify_on_event("E_UL_CONTACT_INSERT", $avp(wake_filter), "group_woken", $var(wait))')
+    expect(groupHold).toContain('$avp(ev_callee) = $var(member);')
+    expect(section('route[group_woken]', 'route[group_next]')).toContain('$(msg.branch.attr(gext)[0]) = $avp(aor);')
+    // Only the request route holds: failure_route says so before it may relay, and never reaches the hold.
+    const failure = cfg.slice(cfg.indexOf('failure_route['))
+    expect(failure).toContain('$var(relay_request) = 0;')
+    expect(failure).not.toMatch(/route\((hold|group_hold|wake_next|not_woken)\)/)
+    const relay = section('route[relay_call]', 'route[relay_failed]')
+    expect(relay).toContain('if ($var(relay_rc) == -6 && $var(relay_request) == 1 && $avp(group) == NULL && $avp(held) == NULL && ')
+    expect(section('route[relay_failed]', 'onreply_route')).toContain('$var(relay_request) = 0;')
+    // A woken callee or member is an event attribute of its own; nothing the UA sent goes in it.
+    expect(cfg.match(/raise_event\("E_TWAKEPHONE_WAKE"/g)).toHaveLength(2)
+  })
+
+  it('refuses a PUSH_WAIT_SEC that is no number of seconds from 5 to 120', () => {
+    for (const v of ['4', '121', 'abc', '10s', '-5']) {
+      const { status, stderr } = render({ PUSH_WAIT_SEC: v })
+      expect(status, v).toBe(1)
+      expect(stderr).toMatch(/PUSH_WAIT_SEC/)
+    }
+    expect(render({ PUSH_WAIT_SEC: '5' }).status).toBe(0)
+    expect(render({ PUSH_WAIT_SEC: '120' }).cfg).toContain('$var(wait) = 120;')
+    expect(render().cfg).toContain('$var(wait) = 30;')
   })
 
   it('never answers 404 for a number whose rules could not be read: it may be a ring group', () => {

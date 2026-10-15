@@ -235,6 +235,13 @@ describe('Softphone', () => {
     const cancelled = await phone.call('104')
     ua().lastCall!.emit('failed', { originator: 'local', cause: 'Canceled' })
     expect(cancelled.endReason).toBe('cancelled')
+    // A 408 is a no answer (JsSIP counts it as unavailable); a 477, nobody there.
+    const late = await phone.call('102')
+    ua().lastCall!.emit('failed', { originator: 'remote', cause: 'Unavailable', message: { status_code: 408, reason_phrase: 'Request Timeout', getHeader: () => undefined } })
+    expect([late.endReason, late.endStatus]).toEqual(['no-answer', 408])
+    const dead = await phone.call('102')
+    ua().lastCall!.emit('failed', { originator: 'system', cause: 'SIP Failure Code', message: { status_code: 477, reason_phrase: 'Send failed', getHeader: () => undefined } })
+    expect([dead.endReason, dead.endStatus]).toEqual(['unavailable', 477])
   })
 
   it('tells a call refused by a "do not disturb" from a plain 480, with the message the person called left', async () => {

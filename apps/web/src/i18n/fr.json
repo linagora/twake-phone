@@ -249,5 +249,16 @@
   "admin.groupMembersInvalid": "Un groupe a de 1 à 12 membres.",
   "admin.groupMemberNotExtension": "Seuls les postes de votre organisation peuvent être membres d'un groupe.",
   "admin.groupSyncRunning": "Une synchronisation de l'annuaire est en cours : réessayez dans un instant.",
-  "call.endedAnsweredElsewhere": "Appel de {who} pris sur un autre poste."
+  "call.endedAnsweredElsewhere": "Appel de {who} pris sur un autre poste.",
+  "settings.notifications": "Notifications d'appel",
+  "settings.notificationsHint": "Quand aucune fenêtre de TwakePhone n'est ouverte, ce navigateur vous montre vos appels : cliquez sur la notification pour répondre. Le navigateur doit rester lancé.",
+  "settings.notificationsOn": "Activées sur ce navigateur.",
+  "settings.notificationsOff": "Désactivées sur ce navigateur.",
+  "settings.notificationsEnable": "Activer les notifications",
+  "settings.notificationsDisable": "Désactiver les notifications",
+  "settings.notificationsDenied": "Le navigateur bloque les notifications de ce site : autorisez-les dans ses réglages, puis réessayez.",
+  "settings.notificationsUnsupported": "Ce navigateur ne sait pas recevoir de notifications d'appel.",
+  "settings.notificationsUnavailable": "Les notifications d'appel ne sont pas proposées sur cette plateforme.",
+  "settings.notificationsError": "Les notifications n'ont pas pu être réglées.",
+  "auth.openingCall": "Connexion pour prendre l'appel…"
 }

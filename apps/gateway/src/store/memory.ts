@@ -1,4 +1,4 @@
-import { clampLimit, isDeclined, isMissed, type HistoryEntry, type HistoryPage, type HistoryQuery, type ConferenceRecord, type ProviderRecord, type Store, type UserMapping, type UserPresenceRecord } from './types.js'
+import { clampLimit, isDeclined, isMissed, type HistoryEntry, type HistoryPage, type HistoryQuery, type ConferenceRecord, type ProviderRecord, type PushSubscriptionRecord, type Store, type UserMapping, type UserPresenceRecord, type VapidKeysRecord } from './types.js'
 
 const key = (...parts: string[]) => parts.join('\u0000')
 
@@ -24,6 +24,8 @@ export class MemoryStore implements Store {
   private secrets = new Map<string, { secretEnc: string; rotatedAt: string }>()
   private favorites = new Map<string, string[]>()
   private presences = new Map<string, UserPresenceRecord>()
+  private pushSubscriptions = new Map<string, PushSubscriptionRecord>()
+  private vapid: VapidKeysRecord | null = null
 
   constructor(private readonly now: () => number = Date.now) {}
 
@@ -146,6 +148,40 @@ export class MemoryStore implements Store {
 
   async deleteConference(meetingId: string) {
     this.conferences.delete(meetingId)
+  }
+
+  async listPushSubscriptions(tenantId: string, userId: string) {
+    return [...this.pushSubscriptions.values()].filter(r => r.tenantId === tenantId && r.userId === userId).sort((a, b) => (a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : 0)).map(r => ({ ...r }))
+  }
+
+  async listPushUsers(tenantId: string) {
+    return [...new Set([...this.pushSubscriptions.values()].filter(r => r.tenantId === tenantId).map(r => r.userId))].sort()
+  }
+
+  async savePushSubscription(record: PushSubscriptionRecord) {
+    this.pushSubscriptions.set(record.endpoint, { ...record })
+  }
+
+  async deletePushSubscription(tenantId: string, userId: string, endpoint: string) {
+    const r = this.pushSubscriptions.get(endpoint)
+    if (!r || r.tenantId !== tenantId || r.userId !== userId) return false
+    return this.pushSubscriptions.delete(endpoint)
+  }
+
+  async deletePushEndpoint(endpoint: string) {
+    const r = this.pushSubscriptions.get(endpoint)
+    if (!r) return null
+    this.pushSubscriptions.delete(endpoint)
+    return { tenantId: r.tenantId, userId: r.userId }
+  }
+
+  async getVapidKeys() {
+    return this.vapid ? { ...this.vapid } : null
+  }
+
+  async initVapidKeys(keys: VapidKeysRecord) {
+    this.vapid ??= { ...keys }
+    return { ...this.vapid }
   }
 
   async close() {}

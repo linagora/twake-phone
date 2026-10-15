@@ -60,6 +60,8 @@ services:
       OPENSIPS_DB_URL: postgres://twake:twake@127.0.0.1:54320/twake
       RTPENGINE_SOCK: udp:127.0.0.1:22222
       OPENSIPS_LOG_LEVEL: ${OPENSIPS_LOG_LEVEL:-2}
+      # How long a call to someone without a window waits for the browser a notification wakes (5 to 120 s, ADR 0015).
+      PUSH_WAIT_SEC: ${PUSH_WAIT_SEC:-30}
     network_mode: host
     healthcheck:
       test: ["CMD-SHELL", "test -p /tmp/opensips_fifo"]

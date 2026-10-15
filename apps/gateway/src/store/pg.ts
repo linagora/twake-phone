@@ -1,7 +1,7 @@
 import { readdir, readFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import pg from 'pg'
-import { clampLimit, type ConferenceRecord, type HistoryEntry, type HistoryPage, type HistoryQuery, type ProviderRecord, type Store, type UserMapping, type UserPresenceRecord } from './types.js'
+import { clampLimit, type ConferenceRecord, type HistoryEntry, type HistoryPage, type HistoryQuery, type ProviderRecord, type PushSubscriptionRecord, type Store, type UserMapping, type UserPresenceRecord, type VapidKeysRecord } from './types.js'
 
 const MIGRATIONS = fileURLToPath(new URL('../../migrations/', import.meta.url))
 
@@ -222,6 +222,48 @@ export class PgStore implements Store {
 
   async deleteConference(meetingId: string) {
     await this.pool.query('DELETE FROM conferences WHERE meeting_id = $1', [meetingId])
+  }
+
+  private pushSubscription(r: Record<string, any>): PushSubscriptionRecord {
+    return { tenantId: r.tenant_id, userId: r.user_id, endpoint: r.endpoint, p256dh: r.p256dh, auth: r.auth, createdAt: new Date(r.created_at).toISOString() }
+  }
+
+  async listPushSubscriptions(tenantId: string, userId: string) {
+    const { rows } = await this.pool.query('SELECT * FROM push_subscriptions WHERE tenant_id = $1 AND user_id = $2 ORDER BY created_at, endpoint', [tenantId, userId])
+    return rows.map(r => this.pushSubscription(r))
+  }
+
+  async listPushUsers(tenantId: string) {
+    const { rows } = await this.pool.query('SELECT DISTINCT user_id FROM push_subscriptions WHERE tenant_id = $1 ORDER BY user_id', [tenantId])
+    return rows.map(r => r.user_id as string)
+  }
+
+  async savePushSubscription(s: PushSubscriptionRecord) {
+    await this.pool.query(
+      `INSERT INTO push_subscriptions (endpoint, tenant_id, user_id, p256dh, auth, created_at) VALUES ($1, $2, $3, $4, $5, $6)
+       ON CONFLICT (endpoint) DO UPDATE SET tenant_id = EXCLUDED.tenant_id, user_id = EXCLUDED.user_id, p256dh = EXCLUDED.p256dh, auth = EXCLUDED.auth, created_at = EXCLUDED.created_at`,
+      [s.endpoint, s.tenantId, s.userId, s.p256dh, s.auth, s.createdAt]
+    )
+  }
+
+  async deletePushSubscription(tenantId: string, userId: string, endpoint: string) {
+    const r = await this.pool.query('DELETE FROM push_subscriptions WHERE tenant_id = $1 AND user_id = $2 AND endpoint = $3', [tenantId, userId, endpoint])
+    return (r.rowCount ?? 0) > 0
+  }
+
+  async deletePushEndpoint(endpoint: string) {
+    const { rows } = await this.pool.query('DELETE FROM push_subscriptions WHERE endpoint = $1 RETURNING tenant_id, user_id', [endpoint])
+    return rows[0] ? { tenantId: rows[0].tenant_id as string, userId: rows[0].user_id as string } : null
+  }
+
+  async getVapidKeys(): Promise<VapidKeysRecord | null> {
+    const { rows } = await this.pool.query('SELECT public_key, private_key_enc FROM vapid_keys WHERE id = 1')
+    return rows[0] ? { publicKey: rows[0].public_key, privateKeyEnc: rows[0].private_key_enc } : null
+  }
+
+  async initVapidKeys(keys: VapidKeysRecord) {
+    await this.pool.query('INSERT INTO vapid_keys (id, public_key, private_key_enc) VALUES (1, $1, $2) ON CONFLICT (id) DO NOTHING', [keys.publicKey, keys.privateKeyEnc])
+    return (await this.getVapidKeys())!
   }
 
   async close() {
