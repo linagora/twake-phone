@@ -1,0 +1,20 @@
+{
+  "//": "For ESLint only (eslint.config.mjs): the files no package tsconfig compiles (specs, test helpers, the storage contract), so the type-checked rules read them too.",
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "composite": false,
+    "declaration": false,
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "jsx": "react-jsx",
+    "types": ["node"]
+  },
+  "include": [
+    "packages/*/src/**/*.spec.ts",
+    "packages/*/src/**/*.spec.tsx",
+    "packages/*/test/**/*.ts",
+    "packages/phone-link/src/modules.d.ts",
+    "apps/gateway/src/**/*.spec.ts",
+    "apps/gateway/src/store/contract.ts"
+  ]
+}

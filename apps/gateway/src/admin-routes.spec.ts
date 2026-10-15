@@ -28,12 +28,12 @@ describe('admin policy', () => {
     expect(isAdmin({ userId: 'root', tenantId: 'acme' }, policy)).toBe(false)
   })
   it('reads ADMIN_ROLE and ADMIN_USERS, a bare user id being in the default tenant', () => {
-    const p = adminPolicyFromEnv({ DEFAULT_TENANT: 'acme', ADMIN_USERS: ' alice, other:bob ,' } as never)
+    const p = adminPolicyFromEnv({ DEFAULT_TENANT: 'acme', ADMIN_USERS: ' alice, other:bob ,' })
     expect(p.adminRole).toBe('twakephone-admin')
     expect([...p.adminUsers]).toEqual(['acme:alice', 'other:bob'])
-    expect(adminPolicyFromEnv({ ADMIN_ROLE: 'phone-admin' } as never)).toEqual({ adminRole: 'phone-admin', adminUsers: new Set() })
+    expect(adminPolicyFromEnv({ ADMIN_ROLE: 'phone-admin' })).toEqual({ adminRole: 'phone-admin', adminUsers: new Set() })
     // The same default tenant as the dev authenticator, so ADMIN_USERS=alice works on a dev box.
-    expect([...adminPolicyFromEnv({ AUTH_MODE: 'dev', ADMIN_USERS: 'alice' } as never).adminUsers]).toEqual(['dev:alice'])
+    expect([...adminPolicyFromEnv({ AUTH_MODE: 'dev', ADMIN_USERS: 'alice' }).adminUsers]).toEqual(['dev:alice'])
   })
 })
 

@@ -142,8 +142,8 @@ describe('DevAuthenticator and configuration', () => {
   })
 
   it('refuses to start in cozy mode without an instance allow-list, and on an unknown mode', () => {
-    expect(() => authenticatorFromEnv({ AUTH_MODE: 'cozy' } as never)).toThrow(/COZY_INSTANCE_PATTERN/)
-    expect(() => authenticatorFromEnv({ AUTH_MODE: 'nope' } as never)).toThrow(/Unknown AUTH_MODE/)
-    expect(() => authenticatorFromEnv({ AUTH_MODE: 'jwt' } as never)).toThrow(/JWT_JWKS_URL/)
+    expect(() => authenticatorFromEnv({ AUTH_MODE: 'cozy' })).toThrow(/COZY_INSTANCE_PATTERN/)
+    expect(() => authenticatorFromEnv({ AUTH_MODE: 'nope' })).toThrow(/Unknown AUTH_MODE/)
+    expect(() => authenticatorFromEnv({ AUTH_MODE: 'jwt' })).toThrow(/JWT_JWKS_URL/)
   })
 })

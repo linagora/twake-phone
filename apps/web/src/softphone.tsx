@@ -79,11 +79,13 @@ export const SoftphoneProvider = ({ children }: { children: ReactNode }) => {
   const [soundBlocked, setSoundBlocked] = useState(false)
   const phone = useRef<Softphone | null>(null)
   const devicesRef = useRef(devices)
+  // eslint-disable-next-line react-hooks/refs -- the latest value, read by an effect without restarting it
   devicesRef.current = devices
   const extension = me?.extension
   // The name goes in the From header at registration; a change (directory synchronisation) applies at the next
   // start, never by restarting the softphone in the middle of a call.
   const nameRef = useRef(displayName)
+  // eslint-disable-next-line react-hooks/refs -- the latest value, read by an effect without restarting it
   nameRef.current = displayName
 
   useEffect(() => {

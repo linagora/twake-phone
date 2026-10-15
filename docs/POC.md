@@ -28,7 +28,7 @@ Règle : aucune notion Asterisk/PJSIP/AMI/ARI en dehors de `provider-asterisk`, 
 
 ## Démarrer
 
-Prérequis : Node 22+ (24 pour `apps/phone`, voir `.nvmrc`), Yarn 1, Docker.
+Prérequis : Node 22.13 ou plus (24 pour `apps/phone`, voir `.nvmrc`), Yarn 1, Docker.
 
 ```bash
 yarn install && yarn build && yarn test      # packages + gateway (aucun service externe)

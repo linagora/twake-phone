@@ -36,9 +36,8 @@ jobs:
           cache: yarn
       - run: yarn install --frozen-lockfile
       - run: yarn build
-      - run: yarn typecheck
-      # ESLint sur tout le monorepo (eslint.config.mjs), après le build : les règles typées lisent les dist/*.d.ts.
-      - run: yarn lint
+      - id: typecheck
+        run: yarn typecheck
       - name: Tests unitaires et contrat de stockage (mémoire et PostgreSQL)
         run: yarn test
         env:
@@ -64,6 +63,12 @@ jobs:
           name: e2e-web-failure
           path: apps/web/dist/e2e-failure.png
           if-no-files-found: ignore
+      # ESLint sur tout le monorepo (eslint.config.mjs), en dernier et quel que soit le résultat des tests : une
+      # erreur de lint ne cache pas celui des tests, et inversement. Après le build : l'app web et les specs lisent
+      # les dist/*.d.ts des paquets.
+      - name: Lint (ESLint)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: yarn lint
 
   sip-e2e:
     name: SIP (OpenSIPS, rtpengine, ${{ matrix.browser }})

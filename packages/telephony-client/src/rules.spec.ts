@@ -7,7 +7,7 @@ describe('TelephonyClient presence and forwarding', () => {
   const gateway = (answer: () => Response) => {
     const asked: { url: string; method?: string; body?: unknown }[] = []
     vi.stubGlobal('fetch', async (url: string, init: RequestInit = {}) => {
-      asked.push({ url, method: init.method, body: init.body ? JSON.parse(String(init.body)) : undefined })
+      asked.push({ url, method: init.method, body: init.body ? JSON.parse(init.body as string) : undefined })
       return answer()
     })
     return { asked, client: new TelephonyClient({ baseUrl: 'https://gw.example.test', getToken: async () => 'token' }) }

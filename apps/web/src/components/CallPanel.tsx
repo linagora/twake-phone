@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type FormEvent } from 'react'
+import { useEffect, useRef, useState, type SyntheticEvent } from 'react'
 import type { SoftCall } from '@twake/softphone'
 import { formatNumber, toDialTarget } from '@twake/telephony-client'
 import type { Key } from '../i18n/index.js'
@@ -96,7 +96,7 @@ const TransferForm = ({ call, onClose, onError }: { call: SoftCall; onClose: () 
   const [target, setTarget] = useState('')
   const [busy, setBusy] = useState(false)
   const dialable = toDialTarget(target)
-  const run = (fn: (target: string) => Promise<unknown>) => (e: FormEvent) => {
+  const run = (fn: (target: string) => Promise<unknown>) => (e: SyntheticEvent) => {
     e.preventDefault()
     if (!dialable) return
     void (async () => {
@@ -122,7 +122,7 @@ const TransferForm = ({ call, onClose, onError }: { call: SoftCall; onClose: () 
         <button type="submit" className="btn btn-primary" disabled={busy || !dialable}>
           {t('call.transferBlind')}
         </button>
-        <button type="button" className="btn" disabled={busy || !dialable} onClick={e => void run(to => phone.call(to))(e)}>
+        <button type="button" className="btn" disabled={busy || !dialable} onClick={run(to => phone.call(to))}>
           {t('call.transferConsult')}
         </button>
         <button type="button" className="btn" disabled={busy} onClick={onClose}>

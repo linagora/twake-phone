@@ -5,7 +5,7 @@ import { requestCall, type IntentsConstructor } from './index.js'
 const client = { getStackClient: () => ({ uri: 'https://user1.twake.local' }), getInstanceOptions: () => ({ subdomain: 'flat' }) }
 
 /** A fake cozy-interapp whose service answers with `answer` (or fails). */
-const fakeIntents = (answer: unknown | Error) => {
+const fakeIntents = (answer: unknown) => {
   const start = vi.fn(async (_el: HTMLElement) => {
     if (answer instanceof Error) throw answer
     return answer

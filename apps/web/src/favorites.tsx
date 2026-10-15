@@ -43,6 +43,7 @@ export const FavoritesProvider = ({ children }: { children: ReactNode }) => {
   }, [client, enabled])
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- signed out, the list empties at once; signed in, it loads
     void reload()
   }, [reload])
 

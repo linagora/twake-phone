@@ -14,11 +14,11 @@ Ce que le dépôt n'enforce pas encore et qui est à régler par un administrate
 
 ## Avant d'ouvrir une PR
 
-Node 22 ou plus récent.
+Node 22.13 ou plus (ESLint 10 le demande).
 
 ```bash
 yarn install && yarn build
-yarn typecheck && yarn lint && yarn test   # packages, Gateway, app web (lint après build : il lit les types)
+yarn typecheck && yarn lint && yarn test   # packages, Gateway, app web (lint après build : l'app web et les specs lisent les dist des paquets)
 yarn e2e:web                           # app web dans Chromium, sans Docker (une fois : npx playwright-core install chromium)
 ```
 
