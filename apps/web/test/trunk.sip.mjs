@@ -168,8 +168,19 @@ const untilAlert = async (what, test, timeoutMs = 5_000) => {
 /** A call refused for `word` (Twake-Call-Refused), 403. */
 const refused = (what, call, word) => expect(what, call.final.status === 403 && header(call.final, 'twake-call-refused') === word, `${call.final.first} ${header(call.final, 'twake-call-refused')}`)
 const sentToOperators = () => [A, B, C].reduce((n, op) => n + op.state.attempts.length, 0)
-/** Today's CDRs of an extension's calls to the public network (acc.external 'out'), and their seconds. */
-const usedToday = async ext => (await db.query("SELECT count(*)::int AS calls, coalesce(sum(duration), 0)::int AS seconds FROM acc WHERE external = 'out' AND caller = $1 AND time >= date_trunc('day', localtimestamp)", [ext])).rows[0]
+// The calls of the steps of 6b hung up after an answer: their CDR is written at the end of the dialog, just after the
+// BYE; what the caps count waits for each.
+const hungUp = []
+const hangupOut = async (phone, call) => {
+  await phone.hangup(call)
+  hungUp.push(call.callId)
+}
+/** Today's CDRs of an extension's calls to the public network (acc.external 'out'), and their seconds, all written. */
+const usedToday = async ext => {
+  for (const id of hungUp.splice(0)) await cdrOf(id)
+  return usedRows(ext)
+}
+const usedRows = async ext => (await db.query("SELECT count(*)::int AS calls, coalesce(sum(duration), 0)::int AS seconds FROM acc WHERE external = 'out' AND caller = $1 AND time >= date_trunc('day', localtimestamp)", [ext])).rows[0]
 const until = async (what, fn, timeoutMs) => {
   const end = Date.now() + timeoutMs
   for (;;) {
@@ -500,7 +511,7 @@ try {
     expect('the emergency call', left(sos.callId) > MAX_CALL_SEC + 3600, `${left(sos.callId)} s left`)
     expect('the other call', left(other.callId) <= MAX_CALL_SEC, `${left(other.callId)} s left`)
     await p301.hangup(sos)
-    await p301.hangup(other)
+    await hangupOut(p301, other)
   })
 
   await step('review 3, n°2: the trunk of the caller\'s direct number refuses an emergency call (403): it goes through the default trunk', async () => {
@@ -583,11 +594,11 @@ try {
     expect('the alert', alert.param === 'concurrent' && alert.scope === 'user' && alert.number === '+33199000031', JSON.stringify(alert))
     const sos = await p301.dial('112')
     expect('112 during the call', sos.final.status === 200, sos.final.first)
-    await p301.hangup(sos)
-    await p301.hangup(first)
+    await hangupOut(p301, sos)
+    await hangupOut(p301, first)
     const again = await p301.dial('0199000032')
     expect('a call once the first ended', again.final.status === 200, again.final.first)
-    await p301.hangup(again)
+    await hangupOut(p301, again)
   })
 
   await step('6b, FR-D7: a cap of external calls at a time for the organisation: 303 is refused while 301 is in one (scope tenant), and calls once it ended', async () => {
@@ -598,7 +609,7 @@ try {
     refused('303 meanwhile', await p303.dial('0199000034'), 'limit')
     const alert = await untilAlert('limit alert', (m, p) => m === 'E_TWAKEPHONE_LIMIT' && p.caller === '303')
     expect('the alert', alert.param === 'concurrent' && alert.scope === 'tenant', JSON.stringify(alert))
-    await p301.hangup(first)
+    await hangupOut(p301, first)
     busy(C)
     await atOperator(C, await p303.dial('0199000034'))
   })
@@ -609,11 +620,11 @@ try {
     alerts.length = 0
     const sos = await p301.dial('112')
     expect('112', sos.final.status === 200, sos.final.first)
-    await p301.hangup(sos)
+    await hangupOut(p301, sos)
     expect('the CDR of 112', (await cdrOf(sos.callId)).external === 'emergency')
     const call = await p301.dial('0199000040')
     expect('the last call of the day', call.final.status === 200, call.final.first)
-    await p301.hangup(call)
+    await hangupOut(p301, call)
     expect('its CDR', (await cdrOf(call.callId)).external === 'out')
     refused('the next one', await p301.dial('0199000041'), 'limit')
     const alert = await untilAlert('limit alert', (m, p) => m === 'E_TWAKEPHONE_LIMIT' && p.caller === '301')
@@ -643,7 +654,7 @@ try {
       // Its CDR written (at the end of the dialog, just after the BYEs): the seconds it used count from then on.
       expect('its CDR', (await cdrOf(call.callId)).duration >= 8)
       const next = await p301.dial('0199000051')
-      if (next.final.status === 200) await p301.hangup(next)
+      if (next.final.status === 200) await hangupOut(p301, next)
       refused('the next one', next, 'limit')
       const alert = await untilAlert('limit alert', (m, p) => m === 'E_TWAKEPHONE_LIMIT' && p.caller === '301')
       expect('the alert', alert.param === 'dailyMinutes' && alert.scope === 'user', JSON.stringify(alert))
