@@ -115,7 +115,7 @@ export const storedOpensipsFactory = ({ store, key, env = process.env, provision
         // Who can be woken for a call (their browser subscribed to notifications), in the same database (ADR 0015).
         pushTargets: provisioner.pushTargets({ ready: ensureSchema, tenantId }),
         // The trunks to an operator and their direct numbers, as OpenSIPS reads them, in the same database (ADR 0016).
-        trunks: provisioner.trunkTables({ ready: ensureSchema, tenantId, socket: config.trunkSocket ?? env.OPENSIPS_TRUNK_SOCKET ?? DEFAULT_TRUNK_SOCKET }),
+        trunks: provisioner.trunkTables({ ready: ensureSchema, tenantId, socket: config.trunkSocket ?? (env.OPENSIPS_TRUNK_SOCKET || DEFAULT_TRUNK_SOCKET) }),
         // The SIP accounts follow the mappings: one written for a user who no longer holds the extension goes (ADR 0014).
         accounts: {
           async reconcile(holders) {

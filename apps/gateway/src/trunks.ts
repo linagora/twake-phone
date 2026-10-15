@@ -171,7 +171,7 @@ export const providerTrunks = (records: readonly TrunkRecord[], key: Buffer | un
 export const trunkFromEnv = (env: NodeJS.ProcessEnv): { id: string; parsed: ReturnType<typeof parseTrunk>; dids: DidRange[] } | undefined => {
   if (!env.TRUNK_DOMAIN) return undefined
   const csv = (v: string | undefined) => (v ?? '').split(',').map(s => s.trim()).filter(Boolean)
-  const id = env.TRUNK_ID ?? 'operator'
+  const id = env.TRUNK_ID || 'operator'
   if (!TRUNK_ID.test(id)) throw new Error('TRUNK_ID: lower case letters, digits and dashes, 32 at most')
   const at = (what: string) => (err: unknown) => {
     throw new Error(`${what}: ${err instanceof Error ? err.message : String(err)}`)
@@ -179,7 +179,7 @@ export const trunkFromEnv = (env: NodeJS.ProcessEnv): { id: string; parsed: Retu
   let parsed: ReturnType<typeof parseTrunk>
   try {
     parsed = parseTrunk({
-      auth: env.TRUNK_AUTH ?? 'register',
+      auth: env.TRUNK_AUTH || 'register',
       domain: env.TRUNK_DOMAIN,
       ...(env.TRUNK_NAME ? { name: env.TRUNK_NAME } : {}),
       ...(env.TRUNK_PROXIES ? { proxies: csv(env.TRUNK_PROXIES) } : {}),

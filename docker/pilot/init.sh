@@ -141,6 +141,16 @@ umask 077
     echo "LDAP_ATTR_EXTENSION="
     echo "USER_EXTENSIONS="
   fi
+  echo
+  echo "# A trunk to an operator, to call and be called from the public network (README, \"Relier un opérateur\"):"
+  echo "# TRUNK_LISTEN_IP (an address of this machine; open TRUNK_PORT/udp, 5070, to the operator only), TRUNK_DOMAIN,"
+  echo "# TRUNK_USERNAME, TRUNK_PASSWORD, TRUNK_DEFAULT_NUMBER, TRUNK_DIDS. Read once, while no trunk is set."
+  echo "# TRUNK_LISTEN_IP="
+  echo "# TRUNK_DOMAIN="
+  echo "# TRUNK_USERNAME="
+  echo "# TRUNK_PASSWORD="
+  echo "# TRUNK_DEFAULT_NUMBER="
+  echo "# TRUNK_DIDS="
 } > .env
 echo "Wrote $(pwd)/.env (media address $interface)."
 [ $demo = 0 ] || echo "Demo accounts alice (administrator), bob and carole: their passwords are ALICE_PASSWORD, BOB_PASSWORD and CAROLE_PASSWORD in .env."

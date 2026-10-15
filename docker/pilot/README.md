@@ -48,6 +48,45 @@ Pour un essai sur un réseau interne, sans Let's Encrypt : `./init.sh phone.test
 2. Récupérer l'autorité après le premier démarrage : `docker compose cp caddy:/data/caddy/pki/authorities/local/root.crt ./twakephone-ca.crt`.
 3. L'importer sur chaque poste comme autorité de confiance (Chrome et Edge : magasin du système ; Firefox : Paramètres, Certificats, Autorités).
 
+## Relier un opérateur (trunk SIP, étape 6a)
+
+Sans trunk, on s'appelle entre postes. Avec un trunk SIP (OVHcloud ou tout trunk standard, ADR 0016), chacun compose un numéro public depuis le clavier et présente son numéro direct (SDA), et les numéros directs font sonner un poste ou un groupe. Les numéros d'urgence, surtaxés, d'outre-mer et de l'étranger ne sortent jamais (403 dans l'app, avec la raison) : appeler le 112 se fait depuis un autre téléphone.
+
+1. **Le socket du trunk.** OpenSIPS parle à l'opérateur par un socket UDP à lui (jamais celui des téléphones) : `TRUNK_LISTEN_IP`, une adresse de la machine (l'adresse privée derrière un NAT 1:1 ; `127.0.0.1` par défaut, donc fermé), et `TRUNK_PORT` (`5070` par défaut). Aucune adresse externe n'est annoncée : l'opérateur répond là d'où viennent les paquets, ce qui suffit derrière un NAT 1:1. `TRUNK_ADVERTISE` (`hôte[:port]`) seulement si l'opérateur le demande.
+2. **Le pare-feu.** Ouvrir `TRUNK_PORT/udp` aux seules adresses de l'opérateur (celles qu'il publie pour son trunk), pas à tout Internet : OpenSIPS refuse déjà (403) ce qui vient d'une autre adresse, mais rien ne sert de l'exposer. Le son de l'opérateur arrive sur la plage RTP de rtpengine (`30000-30100/udp`), déjà ouverte.
+3. **Le trunk dans `.env`** (lu au démarrage de la passerelle, seulement quand aucun trunk n'est en base ; ensuite, l'API d'administration fait foi) :
+
+   | Variable | Sens |
+   |---|---|
+   | `TRUNK_DOMAIN` | le domaine SIP de l'opérateur ; sans lui, pas de trunk |
+   | `TRUNK_AUTH` | `register` (par défaut : identifiant et mot de passe, la machine s'enregistre) ou `ip` (l'opérateur reconnaît l'adresse de la machine) |
+   | `TRUNK_USERNAME`, `TRUNK_PASSWORD` | l'identifiant et le mot de passe du trunk (`register`) ; le mot de passe est gardé chiffré par `SECRETS_KEY` et n'est jamais rendu par l'API |
+   | `TRUNK_REALM`, `TRUNK_REGISTRAR`, `TRUNK_EXPIRES` | le realm du défi (sinon celui que l'opérateur nomme), le serveur d'enregistrement (sinon le domaine), la durée d'enregistrement en secondes |
+   | `TRUNK_PROXIES` | les serveurs de l'opérateur, dans l'ordre, séparés par des virgules (`hôte[:port]`) : le premier qui répond aux OPTIONS reçoit les appels, le suivant sur 408, 500 ou 503 ; le domaine par défaut |
+   | `TRUNK_SOURCES` | (`ip`) les autres adresses d'où l'opérateur appelle |
+   | `TRUNK_CODECS` | `PCMA,PCMU` par défaut (G.711) ; rtpengine convertit pour le navigateur |
+   | `TRUNK_NUMBER_FORMAT` | comment l'opérateur écrit les numéros : `e164` (`+33199000100`, par défaut), `e164-no-plus` (`33199000100`), `international-00` (`0033199000100`) ou `national` (`0199000100`) |
+   | `TRUNK_ASSERT_IDENTITY` | `1` pour ajouter un `P-Asserted-Identity` au numéro présenté |
+   | `TRUNK_DEFAULT_NUMBER` | le numéro présenté par un poste sans numéro direct (E.164) |
+   | `TRUNK_DIDS` | les numéros directs, séparés par des virgules : `+33199000100..+33199000199=last:3` (chaque numéro fait sonner le poste de ses 3 derniers chiffres), `+33199000200=500` (un numéro vers un poste ou un groupe) |
+   | `TRUNK_ID`, `TRUNK_NAME` | l'identifiant (`operator` par défaut) et le nom affiché du trunk |
+
+   Par exemple, avec les numéros que l'ARCEP réserve à la fiction :
+
+   ```bash
+   TRUNK_LISTEN_IP=10.0.0.5
+   TRUNK_DOMAIN=sip.operator.example
+   TRUNK_USERNAME=0033199000100
+   TRUNK_PASSWORD=...
+   TRUNK_DEFAULT_NUMBER=+33199000100
+   TRUNK_DIDS=+33199000100..+33199000199=last:3
+   ```
+
+   puis `docker compose up -d --wait`. `docker compose logs opensips` montre l'enregistrement et les sondes.
+4. **Ensuite, par l'API** (un administrateur, avec son jeton d'accès) : `GET`, `PUT` ou `DELETE` `https://<domaine>/api/v1/admin/trunks/<id>` et `/api/v1/admin/dids/<id>` (le corps de `PUT` reprend les champs ci-dessus : `auth`, `domain`, `proxies`, `username`, `password`, `codecs`, `numberFormat`, `defaultNumber` ; pour un numéro direct `trunkId`, `first`, `last`, et `target` ou `suffixDigits`). Un `PUT` sans `password` garde l'ancien. OpenSIPS ne se réenregistre que si le trunk a changé.
+
+Ce qui vient des leçons du POC sur une ligne réelle ([ARCHITECTURE §13](../../docs/ARCHITECTURE.md)) : un socket pour le trunk, à part de celui des téléphones ; des OPTIONS toutes les 15 s vers chaque serveur de l'opérateur, qui gardent ouvert le passage du NAT ; aucune adresse externe déclarée par défaut. Rien n'a encore été vérifié contre un vrai trunk OVHcloud : le premier pilote le fera (la forme de ses INVITE, son realm, ses adresses).
+
 ## Exploiter
 
 | Quoi | Comment |
@@ -75,7 +114,7 @@ docker compose up -d --build --wait --wait-timeout 600
 | caddy | `:80/tcp`, `:443/tcp`, `:443/udp` (HTTP/3) | HTTPS (Let's Encrypt, ou sa propre autorité avec `TLS=internal`) ; `/api/*` vers la passerelle, `/sip` vers le WebSocket d'OpenSIPS, `/auth/*` vers Keycloak (sauf ses consoles), le reste vers l'app ; pas d'API d'administration |
 | web | `127.0.0.1:8081` | l'app (fichiers, `config.json`, CSP) |
 | gateway | `127.0.0.1:8080`, événements d'OpenSIPS sur un port UDP libre de la boucle | API, WebSocket des événements, comptes SIP |
-| opensips | `127.0.0.1` : `8088` (WS), `8089` (WSS, certificat auto-signé, inutilisé ici), `5060/udp`, MI `8880/udp` ; et un port UDP éphémère sur toutes les adresses par processus qui a envoyé un événement à la passerelle (le socket d'envoi d'`event_datagram`, que le module ne lie pas et où OpenSIPS ne lit rien ; dès le démarrage, la passerelle en levant un pour s'assurer qu'elle entend OpenSIPS) | registrar et routage ; le navigateur le joint par `wss://<domaine>/sip` |
+| opensips | `127.0.0.1` : `8088` (WS), `8089` (WSS, certificat auto-signé, inutilisé ici), `5060/udp`, MI `8880/udp` ; le trunk sur `TRUNK_LISTEN_IP:TRUNK_PORT/udp` (`127.0.0.1:5070` par défaut) ; et un port UDP éphémère sur toutes les adresses par processus qui a envoyé un événement à la passerelle (le socket d'envoi d'`event_datagram`, que le module ne lie pas et où OpenSIPS ne lit rien ; dès le démarrage, la passerelle en levant un pour s'assurer qu'elle entend OpenSIPS) | registrar et routage ; le navigateur le joint par `wss://<domaine>/sip` |
 | rtpengine | `30000-30100/udp` sur `RTPENGINE_INTERFACE` ; contrôle `127.0.0.1:22222/udp`, CLI `127.0.0.1:9900` | le son (DTLS-SRTP, ICE) |
 | postgres | `127.0.0.1:54320`, mot de passe exigé | comptes SIP (`subscriber`), CDR, données de la passerelle |
 | keycloak (`demo`) | `127.0.0.1:8180` | royaume `twakephone`, client `twakephone-web`, trois personnes |
@@ -87,6 +126,7 @@ Réseau hôte pour les services qui se parlent sur la boucle et pour rtpengine (
 
 - **Pas de son.** Les ports `30000-30100/udp` ne sont pas ouverts (pare-feu de la machine et du cloud), ou `RTPENGINE_INTERFACE` ne donne pas l'adresse publique. Un réseau d'entreprise qui bloque l'UDP sortant empêche aussi le son (pas de TURN dans le pilote).
 - **« Hors ligne » dans l'app, l'enregistrement SIP échoue.** `docker compose logs opensips` : le domaine doit résoudre au démarrage d'OpenSIPS (« could not resolve advertised name »).
+- **Le trunk ne s'enregistre pas, ou les appels vers l'extérieur échouent (503).** `docker compose logs opensips` : un 403 de l'opérateur dit un identifiant, un mot de passe ou une adresse que l'opérateur ne connaît pas ; aucune réponse, un pare-feu ou un `TRUNK_LISTEN_IP` qui n'est pas l'adresse de la machine. Un appel entrant refusé en 403 vient d'une adresse que le trunk ne connaît pas (`TRUNK_SOURCES`), un 404 d'un numéro qui n'est dans aucune plage de `TRUNK_DIDS`.
 - **Le certificat n'est pas émis.** Le domaine ne pointe pas sur la machine, ou le port 80 est fermé : `docker compose logs caddy`.
 - **Connexion refusée par la passerelle (401).** Le jeton n'a pas la bonne audience ou le bon émetteur : `JWT_ISSUER` doit être exactement l'`issuer` du fournisseur, `JWT_AUDIENCE` dans le `aud` du jeton d'accès.
 - **Personne dans l'annuaire, ou personne n'a de poste.** `LDAP_ATTR_EXTENSION` manque, ou l'identifiant LDAP diffère de celui du SSO ; l'écran d'administration montre la source de l'annuaire, la dernière synchronisation et ses conflits, et la relance.
