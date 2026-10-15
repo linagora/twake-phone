@@ -887,6 +887,28 @@ describe('Softphone', () => {
     }
   })
 
+  it('registers the same Contact and instance after a restart: the new registration replaces the one left on a dead connection', async () => {
+    vi.useFakeTimers()
+    try {
+      const { ua, uas, configs } = await setup()
+      ua().emit('registered', {})
+      // A REGISTER lost with its connection (the WebSocket cut while it was sent): a restart.
+      ua().emit('registrationFailed', { cause: 'Connection Error' })
+      await vi.advanceTimersByTimeAsync(1_000)
+      expect(uas).toHaveLength(2)
+      const [first, second] = configs as { contact_uri?: string; instance_id?: string }[]
+      expect(first!.contact_uri).toMatch(/^sip:[a-z0-9]{8,}@[a-z0-9]{8,}\.invalid;transport=ws$/)
+      expect(first!.instance_id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
+      expect(second!.contact_uri).toBe(first!.contact_uri)
+      expect(second!.instance_id).toBe(first!.instance_id)
+      // Another softphone (another window): its own.
+      const other = await setup()
+      expect((other.configs[0] as { contact_uri?: string }).contact_uri).not.toBe(first!.contact_uri)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('does not restart on a first failure to reach the server (JsSIP retries the socket itself)', async () => {
     vi.useFakeTimers()
     try {
