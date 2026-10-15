@@ -1305,6 +1305,22 @@ try {
     cdp.on('ServiceWorker.workerErrorReported', e => seen.push(`error: ${e.errorMessage.errorMessage}`))
     await cdp.send('ServiceWorker.enable')
     const registrationId = await until('the service worker of the app', async () => ids.get(`${appOrigin}/`))
+    // What the worker does with the push, for a failure to say (kept in the worker while it runs).
+    for (const w of who.context.serviceWorkers()) {
+      await w.evaluate(() => {
+        const log = (self.__e2e = [])
+        self.addEventListener('push', e => log.push(`push ${e.data ? e.data.text().length : 'without data'}`))
+        self.addEventListener('notificationclose', e => log.push(`closed ${e.notification.title}`))
+        const show = self.registration.showNotification.bind(self.registration)
+        self.registration.showNotification = (title, options) => {
+          log.push(`show ${title}`)
+          return show(title, options).then(
+            () => self.registration.getNotifications().then(ns => log.push(`shown, ${ns.length} listed`)),
+            e => (log.push(`refused ${e.name} ${e.message}`), Promise.reject(e))
+          )
+        }
+      }).catch(e => seen.push(`not watched: ${e.message}`))
+    }
     await cdp.send('ServiceWorker.deliverPushMessage', { origin: appOrigin, registrationId, data: text })
     return { seen, detach: () => cdp.detach().catch(() => undefined) }
   }
@@ -1411,7 +1427,8 @@ try {
               .then(r => `${Notification.permission}; ${r}; ${navigator.userAgent}`)
           )
           .catch(e => `not asked: ${e.message}`)
-        throw new Error(`${err.message}; workers: ${JSON.stringify(workers.map(w => w.url()))}; DevTools: ${delivered.seen.join(', ')}; probe: ${probe}`)
+        const log = await workers[0]?.evaluate(() => JSON.stringify(self.__e2e ?? null)).catch(e => `not read: ${e.message}`)
+        throw new Error(`${err.message}; workers: ${JSON.stringify(workers.map(w => w.url()))}; DevTools: ${delivered.seen.join(', ')}; worker: ${log}; probe: ${probe}`)
       })
       await delivered.detach()
       expectEqual(`${shown.title} | ${shown.body}`, 'Appel de Alice Martin (101) | Cliquez pour répondre dans TwakePhone.', 'the notification')
