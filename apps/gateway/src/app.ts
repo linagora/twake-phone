@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto'
+import { createHmac, hkdfSync } from 'node:crypto'
 import Fastify, { type FastifyRequest } from 'fastify'
 import cors from '@fastify/cors'
 import websocket from '@fastify/websocket'
@@ -25,7 +25,18 @@ import { ALERT_RETENTION_DAYS, clampLimit, isMissed, type HistoryEntry, type His
 /** What the SIP server raises for the administrators (TelephonyAlert). */
 const ALERT_KINDS = ['fraud-warning', 'fraud-critical', 'limit', 'rights', 'emergency'] as const
 /** An extension as the log names it: the same short hash for the same tenant and extension, never the extension. */
-const pseudonym = (tenantId: string, extension: string) => createHash('sha256').update(`${tenantId}\u0000${extension}`).digest('hex').slice(0, 12)
+/**
+ * The extension of an alert in the log (second review 6b, n°7): a keyed hash (HMAC-SHA-256, with a key the Gateway
+ * derives from SECRETS_KEY), the same for one extension of one tenant, that the log alone does not give back (a plain
+ * hash of 2 to 6 digits is reversed by trying them all). Without SECRETS_KEY, none: the extension is left out.
+ */
+const pseudonymizer = (secretsKey: Buffer | undefined) => {
+  if (!secretsKey) return undefined
+  const key = Buffer.from(hkdfSync('sha256', secretsKey, Buffer.alloc(0), 'twake-phone: extensions in the log', 32))
+  return (tenantId: string, extension: string) => createHmac('sha256', key).update(`${tenantId}\u0000${extension}`).digest('hex').slice(0, 16)
+}
+/** The cursor of a page of alerts (`next`, `before`): the last repeat (ms) and id of the last alert of the page. */
+const ALERT_CURSOR = /^([0-9]{1,15})-([1-9][0-9]{0,17})$/
 
 const STATUSES: PresenceStatus[] = ['available', 'busy', 'away', 'dnd', 'offline']
 const DIRECTIONS: CallDirection[] = ['inbound', 'outbound']
@@ -269,6 +280,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
   const store = options.store ?? new MemoryStore()
   const auth = options.auth ?? authenticatorFromEnv(process.env)
   const admin = options.admin ?? adminPolicyFromEnv(process.env)
+  const pseudonym = pseudonymizer(options.secretsKey)
   const tickets = options.tickets ?? new TicketStore()
   const historyWriteMs = options.historyWriteTimeoutMs ?? HISTORY_WRITE_MS
   const turnMaxMs = options.turnMaxMs ?? TURN_MAX_MS
@@ -351,7 +363,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
       // The log says what and how much, never whom nor the number called: the extension as a hash only (the same one
       // across lines, to follow it), the rest in the store, for the administrators.
       const { kind, param, scope, value, threshold } = alert
-      app.log.warn({ tenantId, alert: { kind, param, scope, value, threshold, ...(alert.extension ? { ext: pseudonym(tenantId, alert.extension) } : {}) } }, `telephony alert: ${kind} ${param}`)
+      app.log.warn({ tenantId, alert: { kind, param, scope, value, threshold, ...(alert.extension && pseudonym ? { ext: pseudonym(tenantId, alert.extension) } : {}) } }, `telephony alert: ${kind} ${param}`)
       await within(store.addAlert({ tenantId, at: event.timestamp, alert }), historyWriteMs, 'alert write').catch(err => app.log.error({ err, tenantId }, 'could not record the alert'))
       return
     }
@@ -1131,20 +1143,27 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
           return { userId, profileId: profileId ?? null }
         })
       })
-      // The alerts, the newest opened first, a page at a time (`next`: the `before` of the next page), of one kind or
-      // param if asked. Each one once while it repeats: `count` times, the last at `lastAt`.
+      // The alerts, the latest repeated first, a page at a time (`next`: the `before` of the next page), of one kind
+      // or param if asked. Each one once while it repeats: `count` times, the last at `lastAt` (its fields those of the
+      // last), the first at `at` (`first`: its value and number).
       v1.get<{ Querystring: { limit?: string; before?: string; kind?: string; param?: string } }>('/admin/alerts', async req => {
         const user = await administrator(req)
         const q = req.query
         const bad = (message: string) => Object.assign(new Error(message), { statusCode: 400, code: 'ALERTS_QUERY' })
-        if (q.before !== undefined && !/^[1-9][0-9]{0,17}$/.test(q.before)) throw bad('before: the `next` of a previous page')
+        const cursor = q.before === undefined ? undefined : ALERT_CURSOR.exec(q.before)
+        if (q.before !== undefined && !cursor) throw bad('before: the `next` of a previous page')
         if (q.kind !== undefined && !(ALERT_KINDS as readonly string[]).includes(q.kind)) throw bad(`kind: one of ${ALERT_KINDS.join(', ')}`)
         if (q.param !== undefined && !/^[A-Za-z-]{1,32}$/.test(q.param)) throw bad('param: a threshold, a cap or a class of numbers')
         const asked = q.limit === undefined ? 50 : Number(q.limit)
         if (!Number.isInteger(asked)) throw bad('limit: a whole number')
         const limit = clampLimit(asked)
-        const items = await store.listAlerts(user.tenantId, { limit, ...(q.before ? { before: q.before } : {}), ...(q.kind ? { kind: q.kind as (typeof ALERT_KINDS)[number] } : {}), ...(q.param ? { param: q.param } : {}) })
-        return { items: items.map(({ id, at, lastAt, count, alert }) => ({ id, at, lastAt, count, ...alert })), ...(items.length === limit ? { next: items.at(-1)!.id } : {}) }
+        const before = cursor ? { lastAt: new Date(Number(cursor[1])).toISOString(), id: cursor[2]! } : undefined
+        const items = await store.listAlerts(user.tenantId, { limit, ...(before ? { before } : {}), ...(q.kind ? { kind: q.kind as (typeof ALERT_KINDS)[number] } : {}), ...(q.param ? { param: q.param } : {}) })
+        const last = items.at(-1)
+        return {
+          items: items.map(({ id, at, lastAt, count, alert, first }) => ({ id, at, lastAt, count, ...alert, first: { ...(first.value !== undefined ? { value: first.value } : {}), ...(first.number ? { number: first.number } : {}) } })),
+          ...(last && items.length === limit ? { next: `${Date.parse(last.lastAt)}-${last.id}` } : {})
+        }
       })
 
       // Right to erasure of one's own call history.

@@ -216,6 +216,14 @@ CREATE TABLE IF NOT EXISTS outbound_reservations (
     until TIMESTAMPTZ NOT NULL
 );
 CREATE INDEX IF NOT EXISTS outbound_reservations_until_idx ON outbound_reservations (until);
+CREATE TABLE IF NOT EXISTS outbound_usage_missed (
+    id BIGSERIAL PRIMARY KEY NOT NULL,
+    call_key VARCHAR(32) NOT NULL,
+    subject VARCHAR(64) NOT NULL,
+    ended TIMESTAMPTZ NOT NULL,
+    seconds BIGINT DEFAULT 0 NOT NULL,
+    answered BOOLEAN NOT NULL
+);
 CREATE TABLE IF NOT EXISTS fraud_detection (
     ruleid SERIAL PRIMARY KEY NOT NULL,
     profileid INTEGER NOT NULL,
@@ -349,9 +357,9 @@ DECLARE
   u_dc BIGINT; u_ds BIGINT; u_mc BIGINT; u_ms BIGINT;
   t_dc BIGINT; t_ds BIGINT; t_mc BIGINT; t_ms BIGINT;
   r_user BIGINT; r_tenant BIGINT;
+  n_user BIGINT; n_tenant BIGINT;
   allot BIGINT := p_max;
   share BIGINT;
-  slots BIGINT;
   why TEXT := '';
   why_scope TEXT := '';
   dur INTEGER;
@@ -359,8 +367,7 @@ DECLARE
   caps INTEGER[];
   used BIGINT[];
   reserved BIGINT[];
-  conc INTEGER[];
-  active INTEGER[];
+  ncalls BIGINT[];
   names TEXT[] := ARRAY['dailyMinutes', 'monthlyMinutes', 'dailyMinutes', 'monthlyMinutes'];
   scopes TEXT[] := ARRAY['user', 'user', 'tenant', 'tenant'];
 BEGIN
@@ -388,10 +395,20 @@ BEGIN
     RETURN QUERY SELECT 'limit'::text, 'concurrent'::text, 'tenant'::text, 0;
     RETURN;
   END IF;
-  SELECT coalesce(sum(u.calls) FILTER (WHERE u.period = 'd'), 0), coalesce(sum(u.seconds) FILTER (WHERE u.period = 'd'), 0), coalesce(sum(u.calls) FILTER (WHERE u.period = 'm'), 0), coalesce(sum(u.seconds) FILTER (WHERE u.period = 'm'), 0)
-    INTO u_dc, u_ds, u_mc, u_ms FROM outbound_usage u WHERE u.scope = 'user' AND u.subject = p_ext AND ((u.period = 'd' AND u.start = today) OR (u.period = 'm' AND u.start = month));
-  SELECT coalesce(sum(u.calls) FILTER (WHERE u.period = 'd'), 0), coalesce(sum(u.seconds) FILTER (WHERE u.period = 'd'), 0), coalesce(sum(u.calls) FILTER (WHERE u.period = 'm'), 0), coalesce(sum(u.seconds) FILTER (WHERE u.period = 'm'), 0)
-    INTO t_dc, t_ds, t_mc, t_ms FROM outbound_usage u WHERE u.scope = 'tenant' AND u.subject = '' AND ((u.period = 'd' AND u.start = today) OR (u.period = 'm' AND u.start = month));
+  -- One call at a time from here (n°3): what was used, what the others hold, read as they are, then this one's share
+  -- reserved. A CDR being counted waits for it (at most TRIGGER_LOCK_TIMEOUT: then it is counted as missed).
+  PERFORM pg_advisory_xact_lock(60170017);
+  SELECT coalesce(sum(u.calls) FILTER (WHERE u.scope = 'user' AND u.period = 'd'), 0), coalesce(sum(u.seconds) FILTER (WHERE u.scope = 'user' AND u.period = 'd'), 0),
+         coalesce(sum(u.calls) FILTER (WHERE u.scope = 'user' AND u.period = 'm'), 0), coalesce(sum(u.seconds) FILTER (WHERE u.scope = 'user' AND u.period = 'm'), 0),
+         coalesce(sum(u.calls) FILTER (WHERE u.scope = 'tenant' AND u.period = 'd'), 0), coalesce(sum(u.seconds) FILTER (WHERE u.scope = 'tenant' AND u.period = 'd'), 0),
+         coalesce(sum(u.calls) FILTER (WHERE u.scope = 'tenant' AND u.period = 'm'), 0), coalesce(sum(u.seconds) FILTER (WHERE u.scope = 'tenant' AND u.period = 'm'), 0)
+    INTO u_dc, u_ds, u_mc, u_ms, t_dc, t_ds, t_mc, t_ms
+    FROM (SELECT x.scope, x.subject, x.period, x.start, x.calls, x.seconds FROM outbound_usage x
+          WHERE (x.scope = 'user' AND x.subject = p_ext) OR (x.scope = 'tenant' AND x.subject = '')
+          UNION ALL
+          -- What a CDR could not count yet (a lock held when it was written).
+          SELECT a.scope, a.subject, a.period, a.start, a.calls, a.seconds FROM outbound_usage_missed mi CROSS JOIN LATERAL twake_outbound_add(mi.subject, mi.ended, mi.seconds) a WHERE mi.answered) u
+    WHERE ((u.scope = 'user' AND u.subject = p_ext) OR (u.scope = 'tenant' AND u.subject = '')) AND ((u.period = 'd' AND u.start = today) OR (u.period = 'm' AND u.start = month));
   -- Answered calls of the period, and the calls in progress (this one counted).
   IF uc[2] > 0 AND u_dc + p_user_active > uc[2] THEN
     RETURN QUERY SELECT 'limit'::text, 'dailyCalls'::text, 'user'::text, 0;
@@ -409,23 +426,25 @@ BEGIN
     RETURN QUERY SELECT 'limit'::text, 'monthlyCalls'::text, 'tenant'::text, 0;
     RETURN;
   END IF;
+  -- The critical duration of the thresholds of this number (the longest prefix, as fraud_detection matches it): what
+  -- the call may last, hence the most it reserves (n°5).
+  SELECT f.call_duration_critical INTO dur FROM fraud_detection f WHERE f.profileid = 1 AND p_number LIKE f.prefix || '%' ORDER BY length(f.prefix) DESC LIMIT 1;
+  IF dur > 0 AND dur < allot THEN
+    allot := dur;
+  END IF;
   IF uc[3] > 0 OR uc[5] > 0 OR tc[3] > 0 OR tc[5] > 0 THEN
-    -- One call at a time shares the minutes out: what the others hold is known.
-    PERFORM pg_advisory_xact_lock(60170017);
-    SELECT coalesce(sum(r.seconds) FILTER (WHERE r.subject = p_ext), 0), coalesce(sum(r.seconds), 0) INTO r_user, r_tenant
-      FROM outbound_reservations r WHERE r.until > now() AND r.call_key <> p_key;
+    -- The calls in progress that hold minutes (their reservations, the ended ones not counted yet excepted).
+    SELECT coalesce(sum(r.seconds) FILTER (WHERE r.subject = p_ext), 0), count(*) FILTER (WHERE r.subject = p_ext), coalesce(sum(r.seconds), 0), count(*)
+      INTO r_user, n_user, r_tenant, n_tenant
+      FROM outbound_reservations r WHERE r.until > now() AND r.call_key <> p_key AND NOT EXISTS (SELECT 1 FROM outbound_usage_missed mi WHERE mi.call_key = r.call_key);
     caps := ARRAY[uc[3], uc[5], tc[3], tc[5]];
     used := ARRAY[u_ds, u_ms, t_ds, t_ms];
     reserved := ARRAY[r_user, r_user, r_tenant, r_tenant];
-    conc := ARRAY[uc[1], uc[1], tc[1], tc[1]];
-    active := ARRAY[p_user_active, p_user_active, p_tenant_active, p_tenant_active];
+    ncalls := ARRAY[n_user, n_user, n_tenant, n_tenant];
     FOR i IN 1..4 LOOP
       IF caps[i] > 0 THEN
-        slots := 1;
-        IF conc[i] > 0 THEN
-          slots := greatest(1, conc[i] - (active[i] - 1));
-        END IF;
-        share := floor((caps[i]::bigint * 60 - used[i] - reserved[i])::numeric / slots);
+        -- What is left, divided by the calls in progress plus this one: alone, it gets all of it.
+        share := floor(greatest(caps[i]::bigint * 60 - used[i] - reserved[i], 0)::numeric / (ncalls[i] + 1));
         IF share < allot THEN
           allot := share;
           why := names[i];
@@ -440,45 +459,125 @@ BEGIN
     INSERT INTO outbound_reservations AS r (call_key, subject, seconds, until) VALUES (p_key, p_ext, allot, now() + make_interval(secs => allot + 300))
       ON CONFLICT (call_key) DO UPDATE SET subject = EXCLUDED.subject, seconds = EXCLUDED.seconds, until = EXCLUDED.until;
   END IF;
-  -- The critical duration of the thresholds of this number (the longest prefix, as fraud_detection matches it).
-  SELECT f.call_duration_critical INTO dur FROM fraud_detection f WHERE f.profileid = 1 AND p_number LIKE f.prefix || '%' ORDER BY length(f.prefix) DESC LIMIT 1;
-  IF dur > 0 AND dur < allot THEN
-    allot := dur;
-  END IF;
   RETURN QUERY SELECT 'ok'::text, why, why_scope, allot::integer;
 END
 $twake$;
+-- The seconds of a call answered p_secs before p_end: per day and month of Europe/Paris they were spent in (a call
+-- across midnight counts in both days), the call itself on the day it was answered (the day that takes what rounding
+-- left, so that the seconds add up).
+CREATE OR REPLACE FUNCTION twake_outbound_add(p_who TEXT, p_end TIMESTAMPTZ, p_secs BIGINT)
+RETURNS TABLE (scope TEXT, subject TEXT, period TEXT, start DATE, calls INTEGER, seconds BIGINT)
+LANGUAGE sql STABLE AS $twake$
+  WITH b AS (
+    SELECT (p_end - make_interval(secs => greatest(p_secs, 0))) AT TIME ZONE 'Europe/Paris' AS a, p_end AT TIME ZONE 'Europe/Paris' AS e, greatest(p_secs, 0) AS total
+  ), days AS (
+    SELECT g::date AS d, round(extract(epoch FROM least(b.e, g + interval '1 day') - greatest(b.a, g)))::bigint AS s, g::date = b.a::date AS first, b.total
+      FROM b CROSS JOIN generate_series(date_trunc('day', b.a), date_trunc('day', b.e), interval '1 day') AS g
+  ), per AS (
+    SELECT days.d, CASE WHEN days.first THEN days.total - (sum(days.s) OVER () - days.s) ELSE days.s END AS s, days.first::int AS c FROM days
+  ), who AS (
+    SELECT * FROM (VALUES ('user', p_who), ('tenant', '')) AS w(scope, subject)
+  )
+  SELECT who.scope, who.subject, 'd', per.d, per.c, per.s FROM per CROSS JOIN who
+  UNION ALL
+  SELECT who.scope, who.subject, 'm', date_trunc('month', per.d)::date, sum(per.c)::int, sum(per.s)::bigint FROM per CROSS JOIN who GROUP BY who.scope, who.subject, date_trunc('month', per.d)
+$twake$;
+-- What CDRs could not count when they were written (a lock held then), counted now: their reservations released,
+-- their seconds added. Never waits more than TRIGGER_LOCK_TIMEOUT; what it cannot do waits for the next time. How
+-- many it counted.
+CREATE OR REPLACE FUNCTION twake_outbound_reconcile() RETURNS INTEGER
+LANGUAGE plpgsql SET lock_timeout = '200ms' AS $twake$
+DECLARE
+  mi outbound_usage_missed%ROWTYPE;
+  done INTEGER := 0;
+BEGIN
+  FOR mi IN SELECT * FROM outbound_usage_missed x ORDER BY x.id LIMIT 1000 FOR UPDATE SKIP LOCKED LOOP
+    BEGIN
+      DELETE FROM outbound_reservations r WHERE r.call_key = mi.call_key;
+      IF mi.answered THEN
+        INSERT INTO outbound_usage AS u (scope, subject, period, start, calls, seconds)
+          SELECT a.scope, a.subject, a.period, a.start, a.calls, a.seconds FROM twake_outbound_add(mi.subject, mi.ended, mi.seconds) a
+          ON CONFLICT (scope, subject, period, start) DO UPDATE SET calls = u.calls + EXCLUDED.calls, seconds = u.seconds + EXCLUDED.seconds;
+      END IF;
+      DELETE FROM outbound_usage_missed x WHERE x.id = mi.id;
+      done := done + 1;
+    EXCEPTION WHEN lock_not_available OR query_canceled OR others THEN
+      RAISE WARNING 'twake_outbound_reconcile: % (counted later)', SQLERRM;
+      RETURN done;
+    END;
+  END LOOP;
+  RETURN done;
+END
+$twake$;
 CREATE OR REPLACE FUNCTION twake_outbound_cdr() RETURNS trigger
-LANGUAGE plpgsql AS $twake$
+LANGUAGE plpgsql SET lock_timeout = '200ms' AS $twake$
 #variable_conflict use_column
 DECLARE
+  answered BOOLEAN := TG_TABLE_NAME = 'acc';
   d DATE;
   m DATE;
-  secs BIGINT;
-  who TEXT;
+  secs BIGINT := 0;
+  who TEXT := coalesce(NEW.caller, '');
 BEGIN
-  -- Never a CDR lost for this: whatever fails here is only logged.
+  IF answered THEN
+    secs := greatest(coalesce(NEW.duration, 0), 0);
+  END IF;
+  -- Never a CDR lost nor held for this: a lock waited for TRIGGER_LOCK_TIMEOUT at most (the function's own setting:
+  -- a statement_timeout set here would not apply), whatever fails is only logged, and counted later.
   BEGIN
     DELETE FROM outbound_reservations r WHERE r.call_key = md5(NEW.callid);
-    IF TG_TABLE_NAME = 'acc' THEN
-      secs := greatest(coalesce(NEW.duration, 0), 0);
-      who := coalesce(NEW.caller, '');
+    IF answered THEN
       -- The day the call was answered, in Europe/Paris: the CDR is written at its end.
       d := ((now() - make_interval(secs => secs)) AT TIME ZONE 'Europe/Paris')::date;
       m := date_trunc('month', d)::date;
+      -- One count at a time with twake_outbound(), which reads what is counted and what is reserved (n°3).
+      PERFORM pg_advisory_xact_lock(60170017);
       -- The first CDR of a day: what is two months old goes, with the reservations past.
       IF NOT EXISTS (SELECT 1 FROM outbound_usage u WHERE u.scope = 'tenant' AND u.subject = '' AND u.period = 'd' AND u.start = d) THEN
         DELETE FROM outbound_usage u WHERE u.start < (m - interval '1 month');
         DELETE FROM outbound_reservations r WHERE r.until < now();
       END IF;
-      INSERT INTO outbound_usage AS u (scope, subject, period, start, calls, seconds) VALUES
-        ('user', who, 'd', d, 1, secs), ('user', who, 'm', m, 1, secs), ('tenant', '', 'd', d, 1, secs), ('tenant', '', 'm', m, 1, secs)
-        ON CONFLICT (scope, subject, period, start) DO UPDATE SET calls = u.calls + 1, seconds = u.seconds + EXCLUDED.seconds;
+      INSERT INTO outbound_usage AS u (scope, subject, period, start, calls, seconds)
+        SELECT a.scope, a.subject, a.period, a.start, a.calls, a.seconds FROM twake_outbound_add(who, now(), secs) a
+        ON CONFLICT (scope, subject, period, start) DO UPDATE SET calls = u.calls + EXCLUDED.calls, seconds = u.seconds + EXCLUDED.seconds;
     END IF;
-  EXCEPTION WHEN others THEN
-    RAISE WARNING 'twake_outbound_cdr: %', SQLERRM;
+  EXCEPTION WHEN lock_not_available OR query_canceled OR others THEN
+    RAISE WARNING 'twake_outbound_cdr: % (counted later)', SQLERRM;
+    BEGIN
+      INSERT INTO outbound_usage_missed (call_key, subject, ended, seconds, answered) VALUES (md5(NEW.callid), who, now(), secs, answered);
+    EXCEPTION WHEN lock_not_available OR query_canceled OR others THEN
+      RAISE WARNING 'twake_outbound_cdr: % (not counted)', SQLERRM;
+    END;
+    RETURN NULL;
+  END;
+  -- What an earlier CDR could not count: counted now.
+  BEGIN
+    IF EXISTS (SELECT 1 FROM outbound_usage_missed LIMIT 1) THEN
+      PERFORM twake_outbound_reconcile();
+    END IF;
+  EXCEPTION WHEN lock_not_available OR query_canceled OR others THEN
+    RAISE WARNING 'twake_outbound_cdr: % (counted later)', SQLERRM;
   END;
   RETURN NULL;
+END
+$twake$;
+-- Before OpenSIPS starts again (docker/opensips/entrypoint.sh: no call yet). The calls it restores are the rows of
+-- dialog (answered calls only: one ringing at the crash is lost): the reservations of any other call are released
+-- (n°4); the emergency calls restored (dialog profile trunk_emergency), never asked whether their phone is still
+-- there, end within p_emergency_sec at most (n°10); what CDRs could not count is counted.
+CREATE OR REPLACE FUNCTION twake_outbound_restart(p_emergency_sec INTEGER) RETURNS TEXT
+LANGUAGE plpgsql SET lock_timeout = '5s' AS $twake$
+DECLARE
+  counted INTEGER;
+  released INTEGER;
+  bounded INTEGER;
+BEGIN
+  counted := twake_outbound_reconcile();
+  DELETE FROM outbound_reservations r WHERE NOT EXISTS (SELECT 1 FROM dialog dl WHERE md5(dl.callid) = r.call_key);
+  GET DIAGNOSTICS released = ROW_COUNT;
+  UPDATE dialog dl SET timeout = least(dl.timeout, extract(epoch FROM now())::integer + p_emergency_sec) WHERE dl.profiles LIKE '%trunk_emergency%';
+  GET DIAGNOSTICS bounded = ROW_COUNT;
+  RETURN format('%s reservation(s) of calls lost released, %s emergency call(s) bounded to %s s, %s CDR(s) counted', released, bounded, p_emergency_sec, counted);
 END
 $twake$;
 RESET check_function_bodies;

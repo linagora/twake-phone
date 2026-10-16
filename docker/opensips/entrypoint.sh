@@ -176,6 +176,12 @@ if [ -f "$TRUNK_SQL" ]; then
     fi
     sleep 2
   done
+  # Before any call (step 6b, second review n°4 and n°10): the minutes reserved for the calls a crash lost (one that
+  # was ringing then is in no row of `dialog`) are released, the emergency calls OpenSIPS restores end within 2 h at
+  # most (their phone is never asked whether it is still there), and what CDRs could not count is counted. A failure
+  # only leaves the reservations to their expiry: OpenSIPS starts all the same.
+  PGOPTIONS="-c client_min_messages=warning" psql "$OPENSIPS_DB_URL" -v ON_ERROR_STOP=1 -qAt -c "SELECT twake_outbound_restart(7200)" \
+    || echo "The calls lost at the last stop could not be cleared from the database of OPENSIPS_DB_URL" >&2
 fi
 "$OPENSIPS_BIN" -C -f "$CFG_OUT"
 exec "$OPENSIPS_BIN" -F -f "$CFG_OUT" "$@"

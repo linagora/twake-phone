@@ -126,8 +126,11 @@ loadmodule "dialog.so"
 # The calls in progress are kept in the database too (`dialog`, written every 5 s, step 6b): OpenSIPS restarted (a
 # crash, an update) reads them back, with their timers (TRUNK_MAX_CALL_SEC, the minutes allotted), their dialog
 # profiles (the calls at the same time the caps count) and what acc needs for their CDR: a BYE after the restart ends
-# the call on both sides and writes its CDR. A call younger than 5 s at a crash is lost. fraud_detection keeps its
-# counters in memory only: they start again from zero (ADR 0017; the caps, kept in `outbound_usage`, do not).
+# the call on both sides and writes its CDR. Lost at a crash: a call still ringing, whatever its age (a dialog is
+# written once answered), and one answered less than 5 s before; the minutes reserved for them are released before
+# OpenSIPS starts again (entrypoint.sh, twake_outbound_restart()), and the emergency calls restored end within
+# EMERGENCY_RESTORED_SEC (2 h: their phone is never asked about). fraud_detection keeps its counters in memory only:
+# they start again from zero (ADR 0017; the caps, kept in `outbound_usage`, do not).
 modparam("dialog", "db_mode", 2)
 modparam("dialog", "db_url", "${OPENSIPS_DB_URL}")
 modparam("dialog", "db_update_period", 5)
@@ -146,9 +149,9 @@ modparam("dialog", "default_timeout", 14400)
 # TRUNK_MAX_CALL_SEC, a call with the operator ends too (create_dialog("B")), an emergency call excepted.
 modparam("dialog", "options_ping_interval", ${CALL_PING_SEC})
 # The calls to the public network in progress (step 6b, route[outbound_count]): per caller's extension, and all of them
-# (one organisation per OpenSIPS). An emergency call is in neither.
+# (one organisation per OpenSIPS). An emergency call is in neither, but in trunk_emergency: how a restart knows it.
 modparam("dialog", "profiles_with_value", "trunk_caller")
-modparam("dialog", "profiles_no_value", "trunk_out")
+modparam("dialog", "profiles_no_value", "trunk_out;trunk_emergency")
 loadmodule "rtpengine.so"
 modparam("rtpengine", "rtpengine_sock", "${RTPENGINE_SOCK}")
 
@@ -242,6 +245,8 @@ modparam("fraud_detection", "db_url", "${OPENSIPS_DB_URL}")
 # say (route[default_trunk]). None until read. With it, the direct number of each extension on that trunk, in memory
 # (cachedb_local, `dn:<extension>`): the caller's own number presented all the same (step 6b).
 modparam("cfgutils", "shvset", "dt_setid=i:0")
+# The generation of the direct numbers last read (timer_route[default_trunk]).
+modparam("cfgutils", "shvset", "dn_gen=i:0")
 loadmodule "cachedb_local.so"
 
 #### Routing ###########################################################################################################
@@ -717,8 +722,9 @@ route[trunk_out] {
 # An emergency call must not depend on the database (ADR 0016): the default trunk as this process last read it
 # (timer_route[default_trunk], every 15 s), whatever the database says now. Its servers are in OpenSIPS's memory
 # (dispatcher). Taken when the trunk of the call could not be read, or when none of its servers is up and the default
-# trunk is another one; the caller's own direct number on that trunk presented, as last read, else the trunk's own
-# number. Returns -1 when it has none, or it is the trunk tried already.
+# trunk is another one; the caller's own direct number on that trunk presented, as last read
+# (however long ago: second review 6b, n°1), else the trunk's own number. Returns -1 when it has none, or it is the
+# trunk tried already.
 route[default_trunk] {
 	if ($shv(dt_setid) == 0 || ($avp(t_setid) != NULL && $avp(t_setid) == $shv(dt_setid)))
 		return(-1);
@@ -740,8 +746,9 @@ route[default_trunk] {
 	$avp(t_realm) = $shv(dt_realm);
 	$avp(t_codecs) = $shv(dt_codecs);
 	$avp(t_presented) = $shv(dt_number);
-	if ($avp(caller) =~ "^[A-Za-z0-9._+-]{1,64}$" && cache_fetch("local", "dn:$avp(caller)", $var(dn)) && $var(dn) =~ "^\+[1-9][0-9]{6,14}$")
-		$avp(t_presented) = $var(dn);
+	# "<number>|<generation>": one of the last read that succeeded (an extension that lost its number then is not).
+	if ($avp(caller) =~ "^[A-Za-z0-9._+-]{1,64}$" && cache_fetch("local", "dn:$avp(caller)", $var(dn)) && $(var(dn){s.select,1,|}) =~ "^[0-9]+$" && $(var(dn){s.select,1,|}{s.int}) >= $shv(dn_gen) && $(var(dn){s.select,0,|}) =~ "^\+[1-9][0-9]{6,14}$")
+		$avp(t_presented) = $(var(dn){s.select,0,|});
 	return(1);
 }
 timer_route[default_trunk, 15] {
@@ -755,17 +762,23 @@ timer_route[default_trunk, 15] {
 		$shv(dt_codecs) = $var(d_codecs);
 		$shv(dt_number) = $var(d_number);
 		$shv(dt_setid) = $var(d_setid);
-		# The direct number of each extension on it (5000 at most), kept a minute: read again before.
+		# The direct number of each extension on it (5000 at most), kept until a read succeeds again (second review 6b,
+		# n°1: a database down for longer than a read's period must not change the number an emergency call
+		# presents): written with the next generation, which only then becomes the one read; an extension absent
+		# from it keeps an older one, never read again (route[default_trunk]).
 		$(avp(dn_ext)[*]) = NULL;
 		$(avp(dn_num)[*]) = NULL;
 		if (sql_query("SELECT s.username, d.number FROM subscriber s CROSS JOIN LATERAL (SELECT CASE WHEN x.suffix_digits > 0 THEN left(x.first_number, length(x.first_number) - x.suffix_digits) || s.username ELSE x.first_number END AS number FROM dids x WHERE x.trunk_id = (SELECT id FROM trunks ORDER BY position LIMIT 1) AND ((x.suffix_digits = 0 AND x.target = s.username) OR (x.suffix_digits = length(s.username) AND left(x.first_number, length(x.first_number) - x.suffix_digits) || s.username BETWEEN x.first_number AND x.last_number)) ORDER BY x.suffix_digits, x.first_number LIMIT 1) d LIMIT 5000", "$avp(dn_ext);$avp(dn_num)")) {
+			$var(dn_next) = $shv(dn_gen) + 1;
 			$var(i) = 0;
 			while ($(avp(dn_ext)[$var(i)]) != NULL) {
 				$var(dn_key) = "dn:" + $(avp(dn_ext)[$var(i)]);
-				$var(dn_val) = $(avp(dn_num)[$var(i)]);
-				cache_store("local", "$var(dn_key)", "$var(dn_val)", 60);
+				# The number first: a string, to which "+" adds the generation as text (an integer first would add).
+				$var(dn_val) = $(avp(dn_num)[$var(i)]) + "|" + $var(dn_next);
+				cache_store("local", "$var(dn_key)", "$var(dn_val)", 0);
 				$var(i) = $var(i) + 1;
 			}
+			$shv(dn_gen) = $var(dn_next);
 		}
 	} else if ($rc == -2) {
 		# No trunk any more.
@@ -829,6 +842,7 @@ route[trunk_out_loaded] {
 	# call ends past its longest duration (B, $DLG_timeout below): BYE to both.
 	if ($avp(num_class) == "emergency") {
 		create_dialog("B");
+		set_dlg_profile("trunk_emergency");
 		$acc_extra(external) = "emergency";
 	} else {
 		create_dialog("BP");
@@ -913,10 +927,11 @@ route[trunk_out_send] {
 	route(trunk_contact, $avp(t_contact));
 	t_on_branch("trunk_out");
 	# An emergency call lasts until a party hangs up (no OPTIONS to the phone, above): never cut at TRUNK_MAX_CALL_SEC.
-	# A week bounds what the dialog module keeps. Any other one ends when its time is up ($avp(o_max_sec),
+	# A day bounds what the dialog module keeps of one both sides forgot (second review 6b, n°10; restored by a
+	# restart, 2 h more at most). Any other one ends when its time is up ($avp(o_max_sec),
 	# route[outbound_loaded]: TRUNK_MAX_CALL_SEC, its share of the minutes left, the critical duration of its number).
 	if ($avp(num_class) == "emergency")
-		$DLG_timeout = 604800;
+		$DLG_timeout = 86400;
 	else if ($avp(o_max_sec) != NULL && $avp(o_max_sec) > 0)
 		$DLG_timeout = $avp(o_max_sec);
 	else
@@ -1446,7 +1461,8 @@ route[did_fallback] {
 	$(avp(gd_ext)[*]) = NULL;
 	$var(relay_request) = 0;
 	if ($avp(fb_kind) == "group") {
-		# Its members as route[group_next] would read them, none to wake (no transaction is held from here).
+		# Its members as route[group_next] would read them, none to wake (no transaction is held from here), but those
+		# the call has rung already (the number's target, the forwards it took: second review 6b, n°9).
 		$var(i) = 0;
 		$var(more) = 1;
 		while ($var(more) == 1 && $var(i) < 32) {
@@ -1454,9 +1470,12 @@ route[did_fallback] {
 			if ($var(member) == NULL || $var(member) == "") {
 				$var(more) = 0;
 			} else {
-				$avp(g_ext) = $var(member);
-				$avp(g_name) = "";
-				$avp(g_wake) = 0;
+				$var(mark) = "," + $var(member) + ",";
+				if ($(avp(fwd_seen){s.index,$var(mark)}) == NULL) {
+					$avp(g_ext) = $var(member);
+					$avp(g_name) = "";
+					$avp(g_wake) = 0;
+				}
 			}
 			$var(i) = $var(i) + 1;
 		}

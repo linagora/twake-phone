@@ -3,8 +3,10 @@ import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { FRAUD_DEFAULTS } from '@twake/telephony-types'
 import { afterAll, describe, expect, it } from 'vitest'
 import { OUTBOUND_ALLOWABLE } from './numbering.js'
+import { EMERGENCY_RESTORED_SEC } from './outbound.js'
 
 // The OpenSIPS configuration this provider talks to (docker/opensips): rendered by its entrypoint with OpenSIPS
 // itself replaced by a stub, then read as text. The real thing is proven by the SIP e2e.
@@ -700,7 +702,7 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(loaded).toContain('if ($avp(num_class) == "emergency" && route(default_trunk)) {')
     expect(send).toContain('if (!route(default_trunk) || !ds_select_dst($avp(t_setid), 8, "f")) {\n\t\t\troute(emergency_failed, "no server up");')
     // Never cut at TRUNK_MAX_CALL_SEC.
-    expect(send).toContain('if ($avp(num_class) == "emergency")\n\t\t$DLG_timeout = 604800;\n\telse if ($avp(o_max_sec) != NULL && $avp(o_max_sec) > 0)\n\t\t$DLG_timeout = $avp(o_max_sec);\n\telse\n\t\t$DLG_timeout = 7200;')
+    expect(send).toContain('if ($avp(num_class) == "emergency")\n\t\t$DLG_timeout = 86400;\n\telse if ($avp(o_max_sec) != NULL && $avp(o_max_sec) > 0)\n\t\t$DLG_timeout = $avp(o_max_sec);\n\telse\n\t\t$DLG_timeout = 7200;')
     // Review 6b, n°2: nothing of step 6b is read for it (rights, caps, thresholds): it goes once the trunk is known,
     // told to the Gateway, never refused for it. The others go through the rules (route[outbound_query]) first.
     const emergency = loaded.slice(loaded.lastIndexOf('if ($avp(num_class) != "emergency") {'))
@@ -847,7 +849,7 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     // direct numbers stays an internal call, route[trunk_out_loaded]).
     expect(cfg.slice(cfg.indexOf('\nroute {'), cfg.indexOf('\nroute[outbound_policy] {'))).toContain('\n\tcreate_dialog();\n')
     const loaded = section('route[trunk_out_loaded]', 'route[trunk_headers]')
-    const flags = loaded.indexOf('if ($avp(num_class) == "emergency") {\n\t\tcreate_dialog("B");\n\t\t$acc_extra(external) = "emergency";\n\t} else {\n\t\tcreate_dialog("BP");\n\t\t$acc_extra(external) = "out";\n\t}')
+    const flags = loaded.indexOf('if ($avp(num_class) == "emergency") {\n\t\tcreate_dialog("B");\n\t\tset_dlg_profile("trunk_emergency");\n\t\t$acc_extra(external) = "emergency";\n\t} else {\n\t\tcreate_dialog("BP");\n\t\t$acc_extra(external) = "out";\n\t}')
     expect(flags).toBeGreaterThan(loaded.indexOf('route(rules_next);\n\t\texit;'))
     expect(cfg.match(/\$DLG_timeout = 7200;/g)).toHaveLength(2)
     expect(cfg).toContain('\tcreate_dialog("Bp");\n\t$DLG_timeout = 7200;\n\t$dlg_val(trunk) = "caller";')
@@ -1035,5 +1037,51 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     const unreachable = lines(section('route[unreachable]', 'route[forward_to]'))
     const reply = unreachable.indexOf('t_reply(404, "Not Found");')
     expect(unreachable.slice(reply - 1, reply + 3)).toEqual(['if ($avp(fwd_hops) == 0 && $avp(dialled_unread) != 1)', 't_reply(404, "Not Found");', 'else', 't_reply(480, "Temporarily Unavailable");'])
+  })
+  it('keeps what an emergency call presents however long the database is down, bounds the emergency calls a restart restores, and never rings a fallback group where the call has been (second review 6b, n°1, n°4, n°9, n°10)', () => {
+    const { cfg } = render()
+    const section = (name: string, next: string) => cfg.slice(cfg.indexOf(`\n${name} {`), cfg.indexOf(`\n${next} {`))
+    // n°1: the direct numbers kept with no expiry, of the generation of the last read that succeeded.
+    const timer = section('timer_route[default_trunk, 15]', 'route[emergency_failed]')
+    expect(timer).toContain('cache_store("local", "$var(dn_key)", "$var(dn_val)", 0);')
+    // The number (a string) first: an integer before "+" makes it a sum, which fails (no value stored).
+    expect(timer).toContain('$var(dn_val) = $(avp(dn_num)[$var(i)]) + "|" + $var(dn_next);')
+    expect(cfg).not.toMatch(/cache_store\("local", "\$var\(dn_key\)"[^)]*, [1-9][0-9]*\);/)
+    expect(timer.indexOf('$shv(dn_gen) = $var(dn_next);')).toBeGreaterThan(timer.indexOf('cache_store("local", "$var(dn_key)"'))
+    expect(section('route[default_trunk]', 'timer_route[default_trunk, 15]')).toContain('$(var(dn){s.select,1,|}{s.int}) >= $shv(dn_gen)')
+    expect(cfg).toContain('modparam("cfgutils", "shvset", "dn_gen=i:0")')
+    // n°10: the emergency calls known as such in the database (their profile), a day at most, 2 h once restored.
+    expect(cfg).toContain('modparam("dialog", "profiles_no_value", "trunk_out;trunk_emergency")')
+    const entry = readFileSync(join(dir, 'entrypoint.sh'), 'utf8')
+    expect(entry).toContain(`-c "SELECT twake_outbound_restart(${EMERGENCY_RESTORED_SEC})"`)
+    // n°4: before OpenSIPS starts, after the tables are there.
+    expect(entry.indexOf('twake_outbound_restart')).toBeGreaterThan(entry.indexOf('-f "$TRUNK_SQL"'))
+    expect(entry.indexOf('twake_outbound_restart')).toBeLessThan(entry.indexOf('exec "$OPENSIPS_BIN"'))
+    // n°9: a member of the fallback group the call rang already (the number's target, a forward) is not rung again.
+    const fallback = section('route[did_fallback]', 'route[did_fallback_undo]')
+    expect(fallback).toMatch(/\$var\(mark\) = "," \+ \$var\(member\) \+ ",";\n\t+if \(\$\(avp\(fwd_seen\)\{s\.index,\$var\(mark\)\}\) == NULL\) \{\n\t+\$avp\(g_ext\) = \$var\(member\);/)
+  })
+  it('tells the pilot how long a direct number and its fallback ring, the thresholds of overseas numbers, and that internal calls take media ports too (second review 6b, n°6, n°12, n°13)', () => {
+    const tpl = readFileSync(join(dir, 'opensips.cfg.tpl'), 'utf8')
+    const pilot = readFileSync(join(dir, '../pilot/README.md'), 'utf8')
+    const adr = readFileSync(join(dir, '../../docs/adr/0017-droits-plafonds-fraude-repli.md'), 'utf8')
+    const init = readFileSync(join(dir, '../pilot/init.sh'), 'utf8')
+    // n°6: the target rings fr_inv_timeout, then the fallback as long; a no-answer forward at the operator only longer.
+    const ring = Number(/modparam\("tm", "fr_inv_timeout", ([0-9]+)\)/.exec(tpl)?.[1])
+    expect(ring).toBeGreaterThan(0)
+    expect(pilot).toContain(`Le numéro sonne ${ring} s, puis le repli ${ring} s : ${2 * ring} s en tout.`)
+    expect(pilot).toContain('le renvoi sur indisponibilité seulement')
+    expect(pilot).toContain(`à plus de ${2 * ring} s`)
+    expect(adr).toContain(`la cible du numéro sonne ${ring} s (\`fr_inv_timeout\`, ou le délai de son renvoi sur non-réponse), puis le repli ${ring} s, soit ${2 * ring} s en tout`)
+    expect(pilot).not.toContain('renvoi sur non-réponse et sur indisponibilité de la ligne')
+    // n°13: the thresholds of abroad, which overseas numbers have, as FRAUD_DEFAULTS sets them.
+    const abroad = FRAUD_DEFAULTS.international
+    expect(pilot).toContain(`un avertissement au ${abroad.callsPerMinute?.warning}e appel dans la minute, un refus (\`fraud\`) au ${abroad.callsPerMinute?.critical}e`)
+    expect(pilot).toContain(`un avertissement au ${abroad.sequentialCalls?.warning}e appel à la suite vers le même numéro, un refus au ${abroad.sequentialCalls?.critical}e`)
+    expect(pilot).toContain(`${abroad.dailyAttempts?.warning} et ${abroad.dailyAttempts?.critical} tentatives par jour`)
+    // n°12: the media range counts internal calls, which no cap bounds; init.sh says so and checks ufw.
+    expect(pilot).toContain('**appels internes compris**')
+    expect(init).toContain('internal ones included')
+    expect(init).toContain("! ufw status 2>/dev/null | grep -q '30000:30999/udp'")
   })
 })

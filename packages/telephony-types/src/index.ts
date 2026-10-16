@@ -153,8 +153,8 @@ export const OUTBOUND_CAPS = ['concurrent', 'dailyCalls', 'dailyMinutes', 'month
 /**
  * The caps that hold before any setting (ADR 0017), so that a stolen account costs a bounded amount from the first
  * day: per person, two calls at the same time and 300 minutes a day; for the organisation, 20 calls at the same time
- * and 3000 minutes a day. A minute cap is shared between the calls that may still be placed at once (each one is
- * allotted its share of what is left when it starts, and ends when that is used). Raised, or lifted (`null`), by an
+ * and 3000 minutes a day. A minute cap is shared between the calls in progress (each one is allotted, when it starts,
+ * what is left divided by those calls plus itself, all of it when alone, and ends when that is used). Raised, or lifted (`null`), by an
  * administrator: `caps` of a profile, `userCaps` and `caps` of the policy.
  */
 export const OUTBOUND_CAP_DEFAULTS: { user: OutboundCaps; tenant: OutboundCaps } = {

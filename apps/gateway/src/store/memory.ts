@@ -254,14 +254,16 @@ export class MemoryStore implements Store {
       open.alert = structuredClone(record.alert)
       return
     }
-    this.alerts.push({ ...structuredClone(record), id: String(++this.alertId), lastAt: record.at, count: 1 })
+    this.alerts.push({ ...structuredClone(record), id: String(++this.alertId), lastAt: record.at, count: 1, first: structuredClone(record.alert) })
   }
 
   async listAlerts(tenantId: string, query: AlertQuery = {}) {
-    const before = query.before !== undefined ? Number(query.before) : Infinity
+    // The latest repeated first, the newest opened among those of the same instant.
+    const order = (a: StoredAlert, b: StoredAlert) => Date.parse(b.lastAt) - Date.parse(a.lastAt) || Number(b.id) - Number(a.id)
+    const cursor = query.before ? ({ lastAt: query.before.lastAt, id: query.before.id } as StoredAlert) : undefined
     return this.alerts
-      .filter(a => a.tenantId === tenantId && Number(a.id) < before && (!query.kind || a.alert.kind === query.kind) && (!query.param || a.alert.param === query.param))
-      .sort((a, b) => Number(b.id) - Number(a.id))
+      .filter(a => a.tenantId === tenantId && (!cursor || order(cursor, a) < 0) && (!query.kind || a.alert.kind === query.kind) && (!query.param || a.alert.param === query.param))
+      .sort(order)
       .slice(0, clampLimit(query.limit))
       .map(a => structuredClone(a))
   }

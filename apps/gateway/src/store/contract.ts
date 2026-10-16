@@ -222,7 +222,7 @@ export const storeContract = (name: string, make: () => Promise<Store>) =>
       await s.close()
     })
 
-    it('keeps one alert while it repeats (count, last time), a new one after an hour of silence, per tenant (review 6b, n°7)', async () => {
+    it('keeps one alert while it repeats (count, last time, first and last words), a new one after an hour of silence, per tenant, the latest repeated first (review 6b, n°7; second review, n°8)', async () => {
       const s = await make()
       const alert = { kind: 'limit' as const, param: 'concurrent', scope: 'user' as const, extension: '101', number: '+33199000201' }
       await s.addAlert({ tenantId: 'A', at: '2026-10-15T10:00:00.000Z', alert })
@@ -237,26 +237,31 @@ export const storeContract = (name: string, make: () => Promise<Store>) =>
       // Past an hour of silence: a new one.
       await s.addAlert({ tenantId: 'A', at: '2026-10-15T12:30:00.000Z', alert })
       const a = await s.listAlerts('A', { limit: 10 })
+      // By their last repeat: the one opened first but repeated at 11:20 comes before those of 10:40 to 10:42.
       expect(a.map(r => [r.alert.kind, r.alert.param, r.alert.extension, r.count])).toEqual([
         ['limit', 'concurrent', '101', 1],
+        ['limit', 'concurrent', '101', 3],
         ['rights', 'international', '101', 1],
         ['limit', 'dailyMinutes', '101', 1],
-        ['limit', 'concurrent', '102', 1],
-        ['limit', 'concurrent', '101', 3]
+        ['limit', 'concurrent', '102', 1]
       ])
-      expect(a[4]).toMatchObject({ tenantId: 'A', at: '2026-10-15T10:00:00.000Z', lastAt: '2026-10-15T11:20:00.000Z', count: 3, alert })
-      expect((await s.listAlerts('B'))[0]).toMatchObject({ count: 1 })
+      expect(a[1]).toMatchObject({ tenantId: 'A', at: '2026-10-15T10:00:00.000Z', lastAt: '2026-10-15T11:20:00.000Z', count: 3, alert })
+      // What the first said is kept (its number), what the last said too.
+      const repeated = { ...alert }
+      await s.addAlert({ tenantId: 'A', at: '2026-10-15T12:40:00.000Z', alert: { ...repeated, number: '+33199000203', value: 9 } })
+      expect((await s.listAlerts('A', { limit: 1 }))[0]).toMatchObject({ count: 2, first: alert, alert: { number: '+33199000203', value: 9 } })
+      expect((await s.listAlerts('B'))[0]).toMatchObject({ count: 1, first: alert })
       expect(await s.listAlerts('C')).toEqual([])
-      // A page at a time (before the last id of the page before), of one kind or param.
+      // A page at a time (after the last of the page before: its last repeat and id), of one kind or param.
       const first = await s.listAlerts('A', { limit: 2 })
       expect(first).toHaveLength(2)
-      const second = await s.listAlerts('A', { limit: 2, before: first[1]!.id })
+      const second = await s.listAlerts('A', { limit: 2, before: { lastAt: first[1]!.lastAt, id: first[1]!.id } })
       expect(second.map(r => r.id)).toEqual(a.slice(2, 4).map(r => r.id))
       expect((await s.listAlerts('A', { kind: 'rights' })).map(r => r.alert.param)).toEqual(['international'])
-      expect((await s.listAlerts('A', { param: 'concurrent' })).map(r => r.alert.extension)).toEqual(['101', '102', '101'])
+      expect((await s.listAlerts('A', { param: 'concurrent' })).map(r => r.alert.extension)).toEqual(['101', '101', '102'])
       // Purged from their last repeat on, every tenant's.
       expect(await s.purgeAlerts('2026-10-15T11:00:00.000Z')).toBe(4)
-      expect((await s.listAlerts('A')).map(r => r.lastAt)).toEqual(['2026-10-15T12:30:00.000Z', '2026-10-15T11:20:00.000Z'])
+      expect((await s.listAlerts('A')).map(r => r.lastAt)).toEqual(['2026-10-15T12:40:00.000Z', '2026-10-15T11:20:00.000Z'])
       expect(await s.listAlerts('B')).toEqual([])
       await s.close()
     })

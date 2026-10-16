@@ -151,19 +151,27 @@ export interface AlertRecord {
 
 /**
  * An alert as kept: one per kind, param, scope and extension while it repeats (`count` times, the last at `lastAt`,
- * what the last one said in `alert`), a new one past ALERT_DEDUP_MS of silence. `id` orders them (the newest opened
- * first) and pages them.
+ * what the last one said in `alert`, what the first one said in `first`), a new one past ALERT_DEDUP_MS of silence.
+ * Listed by their last repeat, the latest first (second review 6b, n°8: an attack that goes on for days stays on
+ * top), `id` breaking ties.
  */
 export interface StoredAlert extends AlertRecord {
   id: string
   lastAt: string
   count: number
+  first: TelephonyAlert
 }
 
-/** A page of the alerts of a tenant: `before` an id (the next page), of one `kind` or `param`, `limit` at most. */
+/** Where a page of alerts starts: after this one (its last repeat and id). */
+export interface AlertCursor {
+  lastAt: string
+  id: string
+}
+
+/** A page of the alerts of a tenant: `before` the last one of the page before, of one `kind` or `param`, `limit` at most. */
 export interface AlertQuery {
   limit?: number
-  before?: string
+  before?: AlertCursor
   kind?: TelephonyAlert['kind']
   param?: string
 }
@@ -253,7 +261,7 @@ export interface Store {
   setOutbound(record: OutboundRecord): Promise<void>
   /** Keeps an alert: a repeat of an open one (same alertKey, within ALERT_DEDUP_MS of its last) counts in it. */
   addAlert(record: AlertRecord): Promise<void>
-  /** The alerts of a tenant, the newest opened first, `limit` at most (clamped as a page). */
+  /** The alerts of a tenant, the latest repeated first, `limit` at most (clamped as a page). */
   listAlerts(tenantId: string, query?: AlertQuery): Promise<StoredAlert[]>
   /** Removes the alerts of every tenant whose last repeat is before `before` (ISO); how many. */
   purgeAlerts(before: string): Promise<number>

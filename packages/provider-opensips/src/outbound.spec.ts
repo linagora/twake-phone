@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs'
 import pg from 'pg'
 import { FRAUD_DEFAULTS, type OutboundProfile, type Trunk } from '@twake/telephony-types'
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
-import { FRAUD_OVERSEAS_PREFIXES, FRAUD_PROFILE, OUTBOUND_SCHEMA, OutboundTables, projectOutbound } from './outbound.js'
+import { EMERGENCY_RESTORED_SEC, FRAUD_OVERSEAS_PREFIXES, FRAUD_PROFILE, OUTBOUND_SCHEMA, OutboundTables, TRIGGER_LOCK_TIMEOUT, projectOutbound } from './outbound.js'
 import { SUBSCRIBER_SQL } from './subscriber.js'
 import { TRUNK_SCHEMA, TRUNK_SQL, TrunkTables, projectTrunks } from './trunks.js'
 
@@ -124,7 +124,7 @@ if (process.env.TEST_DATABASE_URL) {
       await pool.query("INSERT INTO subscriber (username, domain, holder) VALUES ('101', '', 'alice'), ('102', '', 'bob'), ('103', '', 'carol')")
     })
     beforeEach(async () => {
-      await pool.query('DELETE FROM acc; DELETE FROM missed_calls; DELETE FROM outbound_usage; DELETE FROM outbound_reservations')
+      await pool.query('DELETE FROM acc; DELETE FROM missed_calls; DELETE FROM outbound_usage; DELETE FROM outbound_reservations; DELETE FROM outbound_usage_missed; DELETE FROM dialog')
     })
     afterAll(async () => {
       await pool.query('DROP SCHEMA IF EXISTS spec_outbound CASCADE')
@@ -182,8 +182,14 @@ if (process.env.TEST_DATABASE_URL) {
       expect(await ask('101', { user: 2, tenant: 2, key })).toMatchObject({ verdict: 'ok' })
       expect(await ask('101', { user: 3, tenant: 3, key })).toEqual({ verdict: 'limit', reason: 'concurrent', reason_scope: 'user', max_sec: 0 })
       expect(await ask('101', { user: 1, tenant: 21, key })).toEqual({ verdict: 'limit', reason: 'concurrent', reason_scope: 'tenant', max_sec: 0 })
-      // 300 minutes a day a person, two calls at a time: half of them; 3000 for the organisation, 20 at a time.
-      expect((await ask('101', { user: 1, tenant: 1, key })).max_sec).toBe(9000)
+      // 300 minutes a day a person, 3000 for the organisation: a call alone may have all that is left, but no more than
+      // the critical duration of its number (4 h in France, 1 h abroad), and reserves no more (second review 6b, n°5).
+      expect((await ask('101', { user: 1, tenant: 1, key })).max_sec).toBe(14400)
+      expect((await pool.query('SELECT seconds FROM outbound_reservations WHERE call_key = md5($1)', [key])).rows).toEqual([{ seconds: 14400 }])
+      expect((await ask('101', { user: 1, tenant: 1, key: 'abroad', number: '442079460123', cls: 'international' })).max_sec).toBe(Math.floor((18000 - 14400) / 2))
+      await pool.query("DELETE FROM outbound_reservations WHERE call_key = md5('one-call')")
+      expect((await ask('101', { user: 2, tenant: 2, key: 'abroad', number: '442079460123', cls: 'international' })).max_sec).toBe(3600)
+      expect((await pool.query("SELECT seconds FROM outbound_reservations WHERE call_key = md5('abroad')")).rows).toEqual([{ seconds: 3600 }])
       const t = new OutboundTables({ pool, ready, tenantId: 'spec-A' })
       await t.set({ caps: { concurrent: null, dailyMinutes: null }, userCaps: { concurrent: null, dailyMinutes: null } }, [], [])
       expect(await ask('101', { user: 50, tenant: 500 })).toEqual({ verdict: 'ok', reason: '', reason_scope: '', max_sec: 14400 })
@@ -220,31 +226,51 @@ if (process.env.TEST_DATABASE_URL) {
       expect(await ask('103', { min: 5 })).toMatchObject({ verdict: 'ok', reason: 'monthlyMinutes', reason_scope: 'tenant', max_sec: 6000 - 5905 })
     })
 
-    it('shares the minutes left between the calls that may still be placed at once, reserves each share until its CDR or missed call (review 6b, n°4)', async () => {
+    it('shares the minutes left between the calls in progress as PostgreSQL holds them, whatever OpenSIPS counted, and reserves each share until its CDR or missed call (second review 6b, n°3, n°5)', async () => {
       const t = new OutboundTables({ pool, ready, tenantId: 'spec-A' })
       await t.set({ caps: { concurrent: null, dailyMinutes: null } }, [{ id: 'p', allowed: ['fixed'], caps: { concurrent: 3, dailyMinutes: 10 } }], [{ userId: 'alice', profileId: 'p' }])
-      // 600 s, three calls at a time: the first gets a third, the second half of what is left, the third the rest.
-      const a = await ask('101', { user: 1, key: 'a' })
-      const b = await ask('101', { user: 2, key: 'b' })
-      const c = await ask('101', { user: 3, key: 'c' })
-      expect([a.max_sec, b.max_sec, c.max_sec]).toEqual([200, 200, 200])
-      expect(a.max_sec + b.max_sec + c.max_sec).toBeLessThanOrEqual(600)
-      expect((await pool.query('SELECT count(*)::int AS n FROM outbound_reservations')).rows[0].n).toBe(3)
+      // 600 s. Alone (whatever count OpenSIPS passes, 3 here), a call gets all that is left, as long as it may last
+      // (300 s here); the next one half of what the first leaves, the third a third of what the two leave.
+      const a = await ask('101', { user: 3, key: 'a', max: 300, min: 5 })
+      const b = await ask('101', { user: 1, key: 'b', min: 5 })
+      const c = await ask('101', { user: 2, key: 'c', min: 5 })
+      expect([a.max_sec, b.max_sec, c.max_sec]).toEqual([300, 150, 50])
+      expect((await pool.query('SELECT sum(seconds)::int AS s FROM outbound_reservations')).rows[0].s).toBeLessThanOrEqual(600)
       // Asked again for the same call (a retry): its own reservation does not count against it.
-      expect((await ask('101', { user: 3, key: 'c' })).max_sec).toBe(200)
+      expect((await ask('101', { user: 3, key: 'c', min: 5 })).max_sec).toBe(50)
       // The first ends after 50 s: its CDR releases its reservation and counts its 50 s.
       await cdr('101', 'out', 50, 'a')
       expect((await pool.query('SELECT call_key FROM outbound_reservations ORDER BY call_key')).rows.map(r => r.call_key)).toEqual([...['b', 'c'].map(k => md5(k))].sort())
       // A call that rang out (its missed call) releases its own.
       await pool.query("INSERT INTO missed_calls (method, callid, time, caller, external) VALUES ('INVITE', 'b', localtimestamp, '101', 'out')")
       expect((await pool.query('SELECT count(*)::int AS n FROM outbound_reservations')).rows[0].n).toBe(1)
-      // Left: 600 - 50 used - 200 reserved by c = 350, for the two calls that may still be placed.
-      expect((await ask('101', { user: 2, key: 'd' })).max_sec).toBe(175)
+      // Left: 600 - 50 used - 50 reserved by c = 500, for c and this one.
+      expect((await ask('101', { user: 2, key: 'd', min: 5 })).max_sec).toBe(250)
       // Less than the shortest call: refused.
       expect(await ask('101', { user: 2, key: 'e', min: 400 })).toEqual({ verdict: 'limit', reason: 'dailyMinutes', reason_scope: 'user', max_sec: 0 })
       // A reservation past its time (OpenSIPS gone) holds nothing.
       await pool.query("UPDATE outbound_reservations SET until = now() - interval '1 second'")
-      expect((await ask('101', { user: 1, key: 'f' })).max_sec).toBe(Math.floor(550 / 3))
+      expect((await ask('101', { user: 1, key: 'f', min: 5 })).max_sec).toBe(550)
+    })
+
+    it('gives two calls asked at the same instant the same outcome every time, whichever PostgreSQL serves first, never more than is left (second review 6b, n°3)', async () => {
+      const t = new OutboundTables({ pool, ready, tenantId: 'spec-A' })
+      await t.set({ caps: { concurrent: null, dailyMinutes: null } }, [{ id: 'p', allowed: ['fixed'], caps: { concurrent: 2, dailyMinutes: 10 } }], [{ userId: 'alice', profileId: 'p' }])
+      const two = new pg.Pool({ connectionString: process.env.TEST_DATABASE_URL, max: 2, options: '-c search_path=spec_outbound -c TimeZone=UTC' })
+      try {
+        const rounds = new Set<string>()
+        for (let i = 0; i < 10; i++) {
+          await pool.query('DELETE FROM outbound_reservations')
+          // As OpenSIPS counts them under its lock: one sees 1 call in progress, the other 2.
+          const asked = await Promise.all([1, 2].map(n => two.query('SELECT * FROM twake_outbound($1, $2, $3, $4, $5, md5($6), $7, $8)', ['101', 'fixed', '33199000201', n, n, `r${i}-${n}`, 14400, 60]).then(r => r.rows[0] as Verdict)))
+          rounds.add(asked.map(v => `${v.verdict}:${v.max_sec}`).sort().join(' '))
+          expect(asked.reduce((sum, v) => sum + v.max_sec, 0)).toBeLessThanOrEqual(600)
+        }
+        // The first served holds the 600 s (prepaid-like): the other finds nothing left, every round alike.
+        expect([...rounds]).toEqual(['limit:0 ok:600'])
+      } finally {
+        await two.end()
+      }
     })
 
     it('bounds a call by the critical duration of the thresholds of its number, overseas as abroad (review 6b, n°14)', async () => {
@@ -265,16 +291,84 @@ if (process.env.TEST_DATABASE_URL) {
       if (since < 120) return
       await cdr('102', 'out', since - 60)
       expect(await usage('user', '102')).toEqual({ calls: 1, seconds: since - 60 })
-      // Answered before midnight in Paris: yesterday's.
+      // Answered a minute before midnight in Paris: yesterday's call, its seconds since midnight today's (n°11).
       await cdr('102', 'out', since + 60)
-      expect(await usage('user', '102')).toEqual({ calls: 1, seconds: since - 60 })
+      expect(await usage('user', '102')).toEqual({ calls: 1, seconds: 2 * since - 60 })
+    })
+
+    it('counts the seconds of a call across midnight in each day and month they were spent in, the call itself on the day it was answered (second review 6b, n°11)', async () => {
+      const add = async (end: string, secs: number) =>
+        (await pool.query("SELECT scope, subject, period, start::text AS start, calls, seconds::int AS seconds FROM twake_outbound_add('101', $1::timestamptz, $2) WHERE scope = 'user' ORDER BY period, start", [end, secs])).rows
+      // Ended at 00:10 on 1 November in Paris (23:10 UTC the day before), answered 20 min before: 10 min each side.
+      expect(await add('2026-10-31T23:10:00Z', 1200)).toEqual([
+        { scope: 'user', subject: '101', period: 'd', start: '2026-10-31', calls: 1, seconds: 600 },
+        { scope: 'user', subject: '101', period: 'd', start: '2026-11-01', calls: 0, seconds: 600 },
+        { scope: 'user', subject: '101', period: 'm', start: '2026-10-01', calls: 1, seconds: 600 },
+        { scope: 'user', subject: '101', period: 'm', start: '2026-11-01', calls: 0, seconds: 600 }
+      ])
+      // Within a day: all of it there; the organisation's rows alike.
+      expect(await add('2026-10-15T10:00:00.400Z', 61)).toEqual([
+        { scope: 'user', subject: '101', period: 'd', start: '2026-10-15', calls: 1, seconds: 61 },
+        { scope: 'user', subject: '101', period: 'm', start: '2026-10-01', calls: 1, seconds: 61 }
+      ])
+      expect((await pool.query("SELECT count(*)::int AS n, sum(seconds)::int AS s FROM twake_outbound_add('101', '2026-10-31T23:10:00.700Z', 1201) WHERE scope = 'tenant' AND period = 'd'")).rows[0]).toEqual({ n: 2, s: 1201 })
+    })
+
+    it('never holds a CDR for a lock on what counts it: written at once, counted as missed, read by the caps, counted by the next CDR (second review 6b, n°2)', async () => {
+      const t = new OutboundTables({ pool, ready, tenantId: 'spec-A' })
+      await t.set({ caps: { concurrent: null, dailyMinutes: null } }, [{ id: 'p', allowed: ['fixed'], caps: { concurrent: null, dailyMinutes: 10 } }], [{ userId: 'alice', profileId: 'p' }])
+      expect(TRIGGER_LOCK_TIMEOUT).toBe('200ms')
+      expect(await ask('101', { key: 'held', min: 5 })).toMatchObject({ max_sec: 600 })
+      const locker = new pg.Client({ connectionString: process.env.TEST_DATABASE_URL, options: '-c search_path=spec_outbound' })
+      await locker.connect()
+      try {
+        await locker.query('BEGIN')
+        await locker.query('LOCK TABLE outbound_usage IN EXCLUSIVE MODE')
+        await locker.query('LOCK TABLE outbound_reservations IN EXCLUSIVE MODE')
+        const started = Date.now()
+        await cdr('101', 'out', 100, 'held')
+        // Written within the trigger's lock timeout (a few of them at most), not when the lock goes.
+        expect(Date.now() - started).toBeLessThan(1500)
+        expect((await pool.query("SELECT count(*)::int AS n FROM acc WHERE callid = 'held'")).rows[0].n).toBe(1)
+        expect((await pool.query('SELECT subject, seconds::int AS seconds, answered FROM outbound_usage_missed')).rows).toEqual([{ subject: '101', seconds: 100, answered: true }])
+      } finally {
+        await locker.query('ROLLBACK')
+        await locker.end()
+      }
+      // The caps read it already: 600 - 100 left, the reservation of the call over.
+      expect((await ask('101', { key: 'next', min: 5 })).max_sec).toBe(500)
+      await pool.query('DELETE FROM outbound_reservations')
+      // The next CDR counts it, and itself.
+      await cdr('101', 'out', 20)
+      expect((await pool.query('SELECT count(*)::int AS n FROM outbound_usage_missed')).rows[0].n).toBe(0)
+      expect(await usage('user', '101')).toEqual({ calls: 2, seconds: 120 })
+    })
+
+    it('at a restart, releases the reservations of the calls the crash lost and bounds the emergency calls restored (second review 6b, n°4, n°10)', async () => {
+      const dialog = (callid: string, profiles: string, timeout: number) =>
+        pool.query("INSERT INTO dialog (dlg_id, callid, from_uri, from_tag, to_uri, to_tag, caller_cseq, callee_cseq, caller_ping_cseq, callee_ping_cseq, caller_sock, callee_sock, state, start_time, timeout, profiles) VALUES ((random() * 1e12)::bigint, $1, 'sip:101@x', 'a', 'sip:112@x', 'b', '1', '1', 0, 0, 'udp:127.0.0.1:5060', 'udp:127.0.0.1:5070', 4, extract(epoch FROM now())::int, $2, $3)", [callid, timeout, profiles])
+      const now = Math.floor(Date.now() / 1000)
+      await dialog('answered', 'trunk_caller#101#,trunk_out##', now + 3000)
+      await dialog('sos', 'trunk_emergency##', now + 604800)
+      await pool.query("INSERT INTO outbound_reservations (call_key, subject, seconds, until) VALUES (md5('answered'), '101', 300, now() + interval '1 hour'), (md5('ringing'), '101', 300, now() + interval '1 hour')")
+      expect(EMERGENCY_RESTORED_SEC).toBe(7200)
+      expect((await pool.query('SELECT twake_outbound_restart($1) AS r', [EMERGENCY_RESTORED_SEC])).rows[0].r).toMatch(/^1 reservation\(s\) of calls lost released, 1 emergency call\(s\) bounded/)
+      expect((await pool.query('SELECT call_key FROM outbound_reservations')).rows).toEqual([{ call_key: md5('answered') }])
+      const left = (await pool.query("SELECT callid, timeout - extract(epoch FROM now())::int AS left FROM dialog ORDER BY callid")).rows as { callid: string; left: number }[]
+      expect(left[0]).toMatchObject({ callid: 'answered' })
+      expect(left[0]!.left).toBeGreaterThan(2900)
+      expect(left[1]).toMatchObject({ callid: 'sos' })
+      expect(left[1]!.left).toBeLessThanOrEqual(EMERGENCY_RESTORED_SEC)
+      expect(left[1]!.left).toBeGreaterThan(EMERGENCY_RESTORED_SEC - 60)
     })
 
     it('answers the query of route[outbound_query] with the verdict and the longest the call may last', async () => {
       const t = new OutboundTables({ pool, ready, tenantId: 'spec-A' })
       await t.set({ caps: { concurrent: 5, dailyMinutes: null } }, PROFILES, [{ userId: 'alice', profileId: 'national' }])
       const query = scriptQuery('outbound_query', { o_ext: '101', o_class: 'mobile', o_number: '33639980001', u_active: '1', t_active: '1', o_key: md5('call') }).replace('${TRUNK_MAX_CALL_SEC}', '14400').replace('${TRUNK_MIN_CALL_SEC}', '60')
-      expect((await pool.query(query)).rows[0]).toEqual({ verdict: 'ok', reason: 'dailyMinutes', reason_scope: 'user', max_sec: 1800 })
+      // Mayotte (0639): an hour at most, though the 60 minutes of her day are left.
+      expect((await pool.query(query)).rows[0]).toEqual({ verdict: 'ok', reason: '', reason_scope: '', max_sec: 3600 })
+      expect((await pool.query(query.replace("'33639980001'", "'33199000201'"))).rows[0]).toEqual({ verdict: 'ok', reason: 'dailyMinutes', reason_scope: 'user', max_sec: 3600 })
       // And the query of route[trunk_out] reads the trunk only (n°2): nothing of step 6b there.
       expect(scriptQuery('trunk_query', { ext: '101', called: '+33639980001' })).not.toMatch(/twake_outbound|outbound_/)
     })

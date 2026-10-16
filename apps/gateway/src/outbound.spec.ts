@@ -1,4 +1,4 @@
-import { randomBytes } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import { describe, expect, it } from 'vitest'
 import type { ProviderFactory, RoutedEvent, TelephonyProvider } from '@twake/telephony-provider-sdk'
 import type { OutboundAssignment, OutboundPolicy, OutboundProfile, TelephonyEvent } from '@twake/telephony-types'
@@ -89,7 +89,7 @@ describe('the fallback (FR-C8, review 6b, n°1)', () => {
 
 describe('outbound routes', () => {
   type Handed = [OutboundPolicy, OutboundProfile[], OutboundAssignment[]]
-  const setup = async (opts: { store?: MemoryStore; without?: boolean; events?: RoutedEvent[]; beforeStart?: (app: Awaited<ReturnType<typeof buildApp>>) => void } = {}) => {
+  const setup = async (opts: { store?: MemoryStore; without?: boolean; noSecretsKey?: boolean; events?: RoutedEvent[]; beforeStart?: (app: Awaited<ReturnType<typeof buildApp>>) => void } = {}) => {
     process.env.AUTH_MODE = 'dev'
     const store = opts.store ?? new MemoryStore()
     await store.upsertMapping({ tenantId: 'A', userId: 'alice', extension: '101' })
@@ -122,7 +122,7 @@ describe('outbound routes', () => {
       published.push(event)
       publish(tenantId, userId, event)
     }
-    const app = await buildApp(registry, { store, bus, directory: new StoreDirectory(store), tickets: new TicketStore(), admin: { adminRole: 'twakephone-admin', adminUsers: new Set() }, secretsKey: randomBytes(32) })
+    const app = await buildApp(registry, { store, bus, directory: new StoreDirectory(store), tickets: new TicketStore(), admin: { adminRole: 'twakephone-admin', adminUsers: new Set() }, ...(opts.noSecretsKey ? {} : { secretsKey: randomBytes(32) }) })
     opts.beforeStart?.(app)
     registry.startAll()
     const as = (user: string, roles?: string, tenant = 'A') => ({ 'x-dev-user': user, 'x-dev-tenant': tenant, ...(roles ? { 'x-dev-roles': roles } : {}) })
@@ -203,14 +203,14 @@ describe('outbound routes', () => {
     await settle(async () => (await store.listAlerts('A')).length === 2)
     const list = await app.inject({ url: '/api/v1/admin/alerts?limit=10', headers: admin })
     expect(list.json().items).toEqual([
-      { id: expect.any(String), at: '2026-10-15T10:01:00.000Z', lastAt: '2026-10-15T10:01:00.000Z', count: 1, ...limit, userId: 'alice' },
-      { id: expect.any(String), at: '2026-10-15T10:00:00.000Z', lastAt: '2026-10-15T10:00:00.000Z', count: 1, ...alert, userId: 'alice' }
+      { id: expect.any(String), at: '2026-10-15T10:01:00.000Z', lastAt: '2026-10-15T10:01:00.000Z', count: 1, ...limit, userId: 'alice', first: expect.any(Object) },
+      { id: expect.any(String), at: '2026-10-15T10:00:00.000Z', lastAt: '2026-10-15T10:00:00.000Z', count: 1, ...alert, userId: 'alice', first: expect.any(Object) }
     ])
     expect(list.json()).not.toHaveProperty('next')
     expect(published).toEqual([])
   })
 
-  it('counts an alert that repeats in one, pages them (next), filters them, and logs neither the number nor the extension nor who (review 6b, n°7)', async () => {
+  it('counts an alert that repeats in one, lists the latest repeated first, pages them (next), filters them, and logs neither the number nor the extension nor who (review 6b, n°7; second review, n°7, n°8)', async () => {
     const limit = { kind: 'limit' as const, param: 'concurrent', scope: 'user' as const, extension: '101', number: '+33199000004' }
     const at = (min: number) => new Date(Date.parse('2026-10-15T10:00:00.000Z') + min * 60_000).toISOString()
     const events: RoutedEvent[] = [
@@ -235,7 +235,7 @@ describe('outbound routes', () => {
     await settle(() => ofA().length === 52)
     const all = (await app.inject({ url: '/api/v1/admin/alerts', headers: admin })).json()
     expect(all.items.map((a: { kind: string; count: number }) => [a.kind, a.count])).toEqual([['emergency', 1], ['rights', 1], ['limit', 50]])
-    expect(all.items[2]).toMatchObject({ at: at(0), lastAt: at(49) })
+    expect(all.items[2]).toMatchObject({ at: at(0), lastAt: at(49), number: '+33199000004', first: { number: '+33199000004' } })
     const first = (await app.inject({ url: '/api/v1/admin/alerts?limit=2', headers: admin })).json()
     expect(first.items.map((a: { kind: string }) => a.kind)).toEqual(['emergency', 'rights'])
     const second = (await app.inject({ url: `/api/v1/admin/alerts?limit=2&before=${first.next}`, headers: admin })).json()
@@ -243,7 +243,7 @@ describe('outbound routes', () => {
     expect(second).not.toHaveProperty('next')
     expect((await app.inject({ url: '/api/v1/admin/alerts?kind=rights', headers: admin })).json().items).toHaveLength(1)
     expect((await app.inject({ url: '/api/v1/admin/alerts?param=burst', headers: admin })).json().items).toMatchObject([{ kind: 'emergency', value: 3 }])
-    for (const bad of ['kind=other', 'before=abc', 'param=a%20b', 'limit=x']) {
+    for (const bad of ['kind=other', 'before=abc', 'before=12', 'param=a%20b', 'limit=x']) {
       const res = await app.inject({ url: `/api/v1/admin/alerts?${bad}`, headers: admin })
       expect(res.statusCode, bad).toBe(400)
       expect(res.json()).toMatchObject({ code: 'ALERTS_QUERY' })
@@ -253,8 +253,49 @@ describe('outbound routes', () => {
     for (const secret of ['+33199000004', '+442079460123', '"101"', 'alice']) expect(text, secret).not.toContain(secret)
     expect(ofA()).toHaveLength(52)
     const hashes = new Set(ofA().map(l => (l as [{ alert: { ext: string } }])[0].alert.ext))
-    expect([...hashes]).toEqual([expect.stringMatching(/^[0-9a-f]{12}$/)])
+    expect([...hashes]).toEqual([expect.stringMatching(/^[0-9a-f]{16}$/)])
+    // Keyed (SECRETS_KEY): trying every extension of 2 to 6 digits with the tenant, as a plain hash, finds nothing.
+    const [hash] = [...hashes] as [string]
+    const plain = (ext: string) => createHash('sha256').update(`A\u0000${ext}`).digest('hex')
+    for (let n = 10; n < 1_000_000; n++) if (plain(String(n)).startsWith(hash.slice(0, 12))) throw new Error(`the extension ${n} is found from the log`)
     expect((ofA()[0] as unknown[])[0]).toMatchObject({ alert: { kind: 'limit', param: 'concurrent', scope: 'user' } })
+  })
+
+  it('repeated for days, an alert stays on top of those that came once since (second review 6b, n°8)', async () => {
+    // One every 59 minutes for two days: always within an hour of the one before.
+    const at = (h: number) => new Date(Date.parse('2026-10-15T10:00:00.000Z') + h * 3_540_000).toISOString()
+    const attack = { kind: 'fraud-warning' as const, param: 'callsPerMinute', scope: 'user' as const, extension: '101', value: 4, threshold: 3 }
+    const events: RoutedEvent[] = [
+      ...Array.from({ length: 48 }, (_, h): RoutedEvent => ({ extension: '101', event: { type: 'alert.raised', timestamp: at(h), payload: { alert: { ...attack, value: 4 + h } } } })),
+      ...Array.from({ length: 30 }, (_, i): RoutedEvent => ({ extension: '102', event: { type: 'alert.raised', timestamp: at(i + 1), payload: { alert: { kind: 'limit', param: `p${i}`, scope: 'user', extension: '102' } } } }))
+    ]
+    const { app, admin, store } = await setup({ events })
+    await settle(async () => (await store.listAlerts('A', { limit: 100 })).length === 31)
+    const page = (await app.inject({ url: '/api/v1/admin/alerts?limit=10', headers: admin })).json()
+    expect(page.items[0]).toMatchObject({ kind: 'fraud-warning', count: 48, at: at(0), lastAt: at(47), value: 51, first: { value: 4 } })
+    const rest = (await app.inject({ url: `/api/v1/admin/alerts?limit=50&before=${page.next}`, headers: admin })).json()
+    expect(rest.items).toHaveLength(21)
+    expect(new Set([...page.items, ...rest.items].map((a: { id: string }) => a.id)).size).toBe(31)
+  })
+
+  it('logs no extension at all without SECRETS_KEY (second review 6b, n°7)', async () => {
+    const logged: unknown[] = []
+    const { store } = await setup({
+      noSecretsKey: true,
+      events: [{ extension: '101', event: { type: 'alert.raised', timestamp: '2026-10-15T10:00:00.000Z', payload: { alert: { kind: 'limit', param: 'concurrent', scope: 'user', extension: '101' } } } }],
+      beforeStart: built => {
+        const warn = built.log.warn.bind(built.log)
+        built.log.warn = ((...args: Parameters<typeof warn>) => {
+          logged.push(args)
+          return warn(...args)
+        })
+      }
+    })
+    await settle(async () => (await store.listAlerts('A')).length === 1)
+    await settle(() => logged.some(l => (l as [{ tenantId?: string }])[0].tenantId === 'A'))
+    const line = logged.find(l => (l as [{ tenantId?: string }])[0].tenantId === 'A') as [{ alert: Record<string, unknown> }]
+    expect(line[0].alert).not.toHaveProperty('ext')
+    expect(line[0].alert).toMatchObject({ kind: 'limit', param: 'concurrent' })
   })
 
   it('purges the alerts past their retention every hour, from their last repeat (review 6b, n°7)', async () => {
