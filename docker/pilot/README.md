@@ -122,6 +122,15 @@ Désactivé par défaut : le kit ne contient ni LiveKit ni LiveKit SIP, OpenSIPS
 
 Un appel d'une salle part au nom du poste de la personne qui l'a demandé, avec ses droits, ses plafonds et son numéro direct ; jamais une urgence. OpenSIPS ne le prend qu'avec l'autorisation que la passerelle a écrite pour cet appel (`dial_out_grants`, usage unique, 30 s) : le compte de LiveKit SIP, que LiveKit rend à quiconque a une clé de son API, n'y suffit pas. L'appelé voit « Meet (nom de la personne) », le CDR porte `via = meet`. Rien de cela n'a été vérifié contre une instance de Meet : seulement contre LiveKit et LiveKit SIP en CI. À vérifier au premier pilote : l'adresse que rtpengine annonce à LiveKit SIP quand il a une interface privée et une publique (`RTPENGINE_INTERFACE`).
 
+## Webhooks (étape 10a)
+
+Les outils de l'organisation (CRM, supervision, ticketing) s'abonnent aux événements de la téléphonie dans l'app : Administration > Webhooks, ou par l'API (`/api/v1/webhooks`, voir le [README](../../README.md)). L'administrateur y déclare d'abord les domaines autorisés, puis l'adresse `https` de chaque outil et les événements qu'il veut (appels qui sonnent, décrochés, terminés, manqués, présences, trunk dégradé). Le secret de signature n'est montré qu'une fois. Les livraisons partent de la passerelle, qui doit donc pouvoir joindre ces adresses en HTTPS sortant.
+
+- `WEBHOOK_PRIVATE_NETWORKS` : les réseaux internes qu'un webhook peut joindre (CIDR séparés par des virgules, par exemple le réseau du CRM du bénéficiaire). Vide par défaut : un domaine autorisé qui résout vers une adresse privée, de boucle locale ou réservée est refusé à chaque livraison, et aucune redirection n'est suivie.
+- Les secrets sont gardés chiffrés par `SECRETS_KEY` : un `.env` avec une autre clé les rend illisibles (l'écran le dit pour chaque livraison en échec), et il faut alors tirer un nouveau secret pour chaque abonnement.
+- `trunk.degraded` : la passerelle relit l'état du trunk toutes les 30 s ; un serveur qui ne répond plus aux sondes, ou l'enregistrement perdu, deux relevés de suite, est dit une fois.
+- Le journal des livraisons est gardé 30 jours ; une livraison sans réponse 2xx est retentée 8 fois, sur environ deux heures.
+
 ## Exploiter
 
 | Quoi | Comment |

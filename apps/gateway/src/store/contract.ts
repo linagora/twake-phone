@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import type { HistoryEntry, Store } from './types.js'
+import type { HistoryEntry, Store, WebhookSubscriptionRecord } from './types.js'
 import { EMPTY_OUTBOUND, outboundVersion } from '../outbound.js'
 
 const entry = (over: Partial<HistoryEntry>): HistoryEntry => ({
@@ -489,6 +489,156 @@ export const storeContract = (name: string, make: () => Promise<Store>) =>
       expect(await s.initVapidKeys({ publicKey: 'pub1', privateKeyEnc: 'enc1' })).toEqual({ publicKey: 'pub1', privateKeyEnc: 'enc1' })
       expect(await s.initVapidKeys({ publicKey: 'pub2', privateKeyEnc: 'enc2' })).toEqual({ publicKey: 'pub1', privateKeyEnc: 'enc1' })
       expect(await s.getVapidKeys()).toEqual({ publicKey: 'pub1', privateKeyEnc: 'enc1' })
+      await s.close()
+    })
+
+    const subscription = (over: Partial<WebhookSubscriptionRecord>): WebhookSubscriptionRecord => ({
+      tenantId: 'A',
+      id: 'wh_0000000000000001',
+      url: 'https://crm.example.org/in',
+      events: ['call.missed'],
+      enabled: true,
+      secretEnc: 'enc',
+      createdAt: '2026-10-16T10:00:00.000Z',
+      updatedAt: '2026-10-16T10:00:00.000Z',
+      ...over
+    })
+
+    it('keeps the webhook subscriptions and allowed domains of each tenant apart, up to a number per tenant', async () => {
+      const s = await make()
+      expect(await s.addWebhookSubscription(subscription({ description: 'CRM', createdBy: 'alice' }), 2)).toBe(true)
+      expect(await s.addWebhookSubscription(subscription({ id: 'wh_0000000000000002', events: ['call.ringing', 'trunk.degraded'], createdAt: '2026-10-16T10:01:00.000Z' }), 2)).toBe(true)
+      expect(await s.addWebhookSubscription(subscription({ id: 'wh_0000000000000003' }), 2)).toBe(false)
+      expect(await s.addWebhookSubscription(subscription({ tenantId: 'B', id: 'wh_0000000000000004' }), 2)).toBe(true)
+      expect((await s.listWebhookSubscriptions('A')).map(w => w.id)).toEqual(['wh_0000000000000001', 'wh_0000000000000002'])
+      expect(await s.getWebhookSubscription('A', 'wh_0000000000000001')).toEqual(subscription({ description: 'CRM', createdBy: 'alice' }))
+      expect(await s.getWebhookSubscription('B', 'wh_0000000000000001')).toBeNull()
+      expect(await s.updateWebhookSubscription(subscription({ url: 'https://crm.example.org/v2', updatedAt: '2026-10-16T11:00:00.000Z' }))).toBe(true)
+      expect((await s.getWebhookSubscription('A', 'wh_0000000000000001'))?.url).toBe('https://crm.example.org/v2')
+      expect(await s.updateWebhookSubscription(subscription({ tenantId: 'B' }))).toBe(false)
+      expect(await s.deleteWebhookSubscription('B', 'wh_0000000000000001')).toBe(false)
+      expect(await s.deleteWebhookSubscription('A', 'wh_0000000000000002')).toBe(true)
+      expect((await s.listWebhookSubscriptions('A')).map(w => w.id)).toEqual(['wh_0000000000000001'])
+      expect(await s.getWebhookDomains('A')).toEqual([])
+      await s.setWebhookDomains('A', ['crm.example.org', '*.hooks.example.net'])
+      await s.setWebhookDomains('B', ['b.example.org'])
+      expect(await s.getWebhookDomains('A')).toEqual(['crm.example.org', '*.hooks.example.net'])
+      await s.setWebhookDomains('A', ['*.hooks.example.net'])
+      expect(await s.getWebhookDomains('A')).toEqual(['*.hooks.example.net'])
+      expect(await s.getWebhookDomains('B')).toEqual(['b.example.org'])
+      await s.close()
+    })
+
+    it('queues an event once per subscription that takes it, enabled, whoever queues it again', async () => {
+      const s = await make()
+      await s.addWebhookSubscription(subscription({}), 20)
+      await s.addWebhookSubscription(subscription({ id: 'wh_0000000000000002', events: ['call.missed', 'call.ended'] }), 20)
+      await s.addWebhookSubscription(subscription({ id: 'wh_0000000000000003', events: ['call.ended'] }), 20)
+      await s.addWebhookSubscription(subscription({ id: 'wh_0000000000000004', enabled: false }), 20)
+      await s.addWebhookSubscription(subscription({ tenantId: 'B', id: 'wh_0000000000000005' }), 20)
+      const at = '2026-10-16T10:00:00.000Z'
+      expect(await s.enqueueWebhookEvent('A', 'evt_1', 'call.missed', '{"id":"evt_1"}', at)).toBe(2)
+      // Heard again (another Gateway, the same event): nothing more.
+      expect(await s.enqueueWebhookEvent('A', 'evt_1', 'call.missed', '{"id":"evt_1"}', at)).toBe(0)
+      expect(await s.enqueueWebhookEvent('A', 'evt_2', 'presence.changed', '{}', at)).toBe(0)
+      const log = await s.listWebhookDeliveries('A', 'wh_0000000000000002')
+      expect(log.map(d => [d.eventId, d.eventType, d.status, d.attempts, d.body, d.createdAt, d.nextAttemptAt])).toEqual([['evt_1', 'call.missed', 'pending', 0, '{"id":"evt_1"}', at, at]])
+      expect(log[0]!.id).toMatch(/^dlv_[0-9a-f]{32}$/)
+      expect(await s.listWebhookDeliveries('A', 'wh_0000000000000003')).toEqual([])
+      expect(await s.listWebhookDeliveries('B', 'wh_0000000000000005')).toEqual([])
+      // One subscription, whatever it takes (a test); none of another tenant.
+      const test = await s.enqueueWebhookDelivery('A', 'wh_0000000000000003', 'evt_t', 'webhook.test', '{}', at)
+      expect([test?.subscriptionId, test?.eventType, test?.status]).toEqual(['wh_0000000000000003', 'webhook.test', 'pending'])
+      expect(await s.enqueueWebhookDelivery('B', 'wh_0000000000000003', 'evt_u', 'webhook.test', '{}', at)).toBeNull()
+      await s.close()
+    })
+
+    it('hands each due delivery to one claimer at a time, until its lease ends, and keeps the outcome of the one that holds it', async () => {
+      const s = await make()
+      await s.addWebhookSubscription(subscription({}), 20)
+      const t = (sec: number) => new Date(Date.parse('2026-10-16T10:00:00.000Z') + sec * 1000).toISOString()
+      await s.enqueueWebhookEvent('A', 'evt_1', 'call.missed', '{"n":1}', t(0))
+      await s.enqueueWebhookEvent('A', 'evt_2', 'call.missed', '{"n":2}', t(5))
+      expect(await s.claimWebhookDeliveries(t(-1), t(59), 10)).toEqual([])
+      const [first, ...rest] = await s.claimWebhookDeliveries(t(1), t(61), 10)
+      expect(rest).toEqual([])
+      expect([first?.eventId, first?.attempts, first?.url, first?.secretEnc, first?.lastAttemptAt]).toEqual(['evt_1', 1, 'https://crm.example.org/in', 'enc', t(1)])
+      // Held: not handed again before its lease ends; the other one once due.
+      expect((await s.claimWebhookDeliveries(t(10), t(70), 10)).map(d => d.eventId)).toEqual(['evt_2'])
+      // Failed, due again later; an outcome with another claim is ignored.
+      expect(await s.completeWebhookDelivery(first!.id, 'not-the-claim', { delivered: true, at: t(2), status: 204 })).toBe(false)
+      expect(await s.completeWebhookDelivery(first!.id, first!.claim, { delivered: false, at: t(2), status: 500, error: 'http', retryAt: t(30) })).toBe(true)
+      expect(await s.completeWebhookDelivery(first!.id, first!.claim, { delivered: true, at: t(3), status: 204 })).toBe(false)
+      let d = (await s.listWebhookDeliveries('A', 'wh_0000000000000001', { status: 'pending' })).find(x => x.eventId === 'evt_1')
+      expect([d?.status, d?.attempts, d?.lastStatus, d?.lastError, d?.nextAttemptAt]).toEqual(['pending', 1, 500, 'http', t(30)])
+      const again = await s.claimWebhookDeliveries(t(30), t(90), 10)
+      expect(again.map(x => [x.eventId, x.attempts])).toEqual([['evt_1', 2]])
+      expect(await s.completeWebhookDelivery(again[0]!.id, again[0]!.claim, { delivered: true, at: t(31), status: 204 })).toBe(true)
+      d = (await s.listWebhookDeliveries('A', 'wh_0000000000000001', { status: 'delivered' }))[0]
+      expect([d?.eventId, d?.status, d?.lastStatus, d?.lastError, d?.deliveredAt, d?.nextAttemptAt]).toEqual(['evt_1', 'delivered', 204, undefined, t(31), undefined])
+      // A lease that ended without an outcome (the Gateway stopped): handed again, counted as another attempt.
+      const taken = await s.claimWebhookDeliveries(t(71), t(131), 10)
+      expect(taken.map(x => [x.eventId, x.attempts])).toEqual([['evt_2', 2]])
+      // Failed for good: no retry.
+      expect(await s.completeWebhookDelivery(taken[0]!.id, taken[0]!.claim, { delivered: false, at: t(72), error: 'timeout' })).toBe(true)
+      d = (await s.listWebhookDeliveries('A', 'wh_0000000000000001', { status: 'failed' }))[0]
+      expect([d?.eventId, d?.status, d?.lastError, d?.lastStatus, d?.nextAttemptAt]).toEqual(['evt_2', 'failed', 'timeout', undefined, undefined])
+      expect(await s.claimWebhookDeliveries(t(1000), t(1060), 10)).toEqual([])
+      await s.close()
+    })
+
+    it('replays a delivery that is over, lists the log a page at a time, and purges it once old', async () => {
+      const s = await make()
+      await s.addWebhookSubscription(subscription({}), 20)
+      const t = (sec: number) => new Date(Date.parse('2026-10-16T10:00:00.000Z') + sec * 1000).toISOString()
+      for (let i = 1; i <= 5; i++) await s.enqueueWebhookEvent('A', `evt_${i}`, 'call.missed', `{"n":${i}}`, t(i))
+      const page1 = await s.listWebhookDeliveries('A', 'wh_0000000000000001', { limit: 2 })
+      expect(page1.map(d => d.eventId)).toEqual(['evt_5', 'evt_4'])
+      const page2 = await s.listWebhookDeliveries('A', 'wh_0000000000000001', { limit: 2, before: { createdAt: page1[1]!.createdAt, id: page1[1]!.id } })
+      expect(page2.map(d => d.eventId)).toEqual(['evt_3', 'evt_2'])
+      const target = page2[0]!
+      expect(await s.replayWebhookDelivery('A', 'wh_0000000000000001', target.id, t(10))).toBe('pending')
+      // The three due at t(3) delivered (evt_1 to evt_3); evt_3 replayed.
+      const claimed = await s.claimWebhookDeliveries(t(3), t(63), 10)
+      expect(claimed.map(d => d.eventId).sort()).toEqual(['evt_1', 'evt_2', 'evt_3'])
+      for (const c of claimed) await s.completeWebhookDelivery(c.id, c.claim, { delivered: true, at: t(4), status: 200 })
+      const replayed = await s.replayWebhookDelivery('A', 'wh_0000000000000001', target.id, t(100))
+      expect(replayed !== 'pending' && [replayed?.status, replayed?.attempts, replayed?.nextAttemptAt, replayed?.eventId, replayed?.lastStatus, replayed?.deliveredAt]).toEqual(['pending', 0, t(100), 'evt_3', undefined, undefined])
+      expect(await s.replayWebhookDelivery('B', 'wh_0000000000000001', target.id, t(100))).toBeNull()
+      expect(await s.replayWebhookDelivery('A', 'wh_0000000000000001', 'dlv_00000000000000000000000000000000', t(100))).toBeNull()
+      // Old ones go unless pending: evt_1 and evt_2 (delivered), not evt_3 (replayed) nor those queued since.
+      expect(await s.purgeWebhookDeliveries(t(3.5))).toBe(2)
+      expect((await s.listWebhookDeliveries('A', 'wh_0000000000000001')).map(d => d.eventId)).toEqual(['evt_5', 'evt_4', 'evt_3'])
+      await s.close()
+    })
+
+    it('fails the pending deliveries of a subscription disabled, and drops them with a subscription deleted', async () => {
+      const s = await make()
+      await s.addWebhookSubscription(subscription({}), 20)
+      await s.enqueueWebhookEvent('A', 'evt_1', 'call.missed', '{}', '2026-10-16T10:00:00.000Z')
+      await s.updateWebhookSubscription(subscription({ enabled: false }))
+      const [d] = await s.listWebhookDeliveries('A', 'wh_0000000000000001')
+      expect([d?.status, d?.lastError]).toEqual(['failed', 'disabled'])
+      expect(await s.claimWebhookDeliveries('2026-10-16T11:00:00.000Z', '2026-10-16T11:01:00.000Z', 10)).toEqual([])
+      expect(await s.enqueueWebhookEvent('A', 'evt_2', 'call.missed', '{}', '2026-10-16T10:00:00.000Z')).toBe(0)
+      await s.deleteWebhookSubscription('A', 'wh_0000000000000001')
+      expect(await s.listWebhookDeliveries('A', 'wh_0000000000000001')).toEqual([])
+      await s.close()
+    })
+
+    it('keeps what the subscribers were told of a trunk or a person, and says what it was only to the one write that changed it', async () => {
+      const s = await make()
+      expect(await s.setWebhookState('A', 'trunk:main', 'up', '2026-10-16T10:00:00.000Z')).toBeUndefined()
+      expect(await s.setWebhookState('A', 'trunk:main', 'up', '2026-10-16T10:00:30.000Z')).toBeNull()
+      expect(await s.setWebhookState('A', 'trunk:main', 'down', '2026-10-16T10:01:00.000Z')).toBe('up')
+      expect(await s.setWebhookState('A', 'trunk:main', 'down', '2026-10-16T10:01:00.000Z')).toBeNull()
+      expect(await s.setWebhookState('B', 'trunk:main', 'down', '2026-10-16T10:01:00.000Z')).toBeUndefined()
+      expect(await s.setWebhookState('A', 'trunk:main', 'degraded', '2026-10-16T10:02:00.000Z')).toBe('down')
+      expect(await s.setWebhookState('A', 'presence:jdupont', 'busy', '2026-10-16T10:02:00.000Z')).toBeUndefined()
+      // Two Gateways that heard the same change at once: one of them only finds it new.
+      const both = await Promise.all([s.setWebhookState('A', 'presence:jdupont', 'available', '2026-10-16T10:03:00.000Z'), s.setWebhookState('A', 'presence:jdupont', 'available', '2026-10-16T10:03:00.020Z')])
+      expect(both.filter(x => x === 'busy')).toHaveLength(1)
+      expect(both.filter(x => x === null)).toHaveLength(1)
       await s.close()
     })
   })

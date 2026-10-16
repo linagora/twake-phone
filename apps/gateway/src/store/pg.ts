@@ -1,8 +1,10 @@
+import { randomBytes } from 'node:crypto'
 import { readdir, readFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import pg from 'pg'
 import { EMPTY_OUTBOUND, outboundVersion, staleOutbound } from '../outbound.js'
-import { ALERT_DEDUP_MS, alertKey, clampLimit, type AlertQuery, type AlertRecord, type StoredAlert, type ConferenceRecord, type DidRecord, type OutboundHand, type OutboundRecord, type OutboundRules, type HistoryEntry, type HistoryPage, type HistoryQuery, type MappingSource, type ProviderRecord, type PushSaveResult, type PushSubscriptionRecord, type Store, type TrunkRecord, type UserMapping, type UserPresenceRecord, type VapidKeysRecord } from './types.js'
+import { ALERT_DEDUP_MS, alertKey, clampLimit, type AlertQuery, type AlertRecord, type StoredAlert, type ConferenceRecord, type DidRecord, type OutboundHand, type OutboundRecord, type OutboundRules, type HistoryEntry, type HistoryPage, type HistoryQuery, type MappingSource, type ProviderRecord, type PushSaveResult, type PushSubscriptionRecord, type Store, type TrunkRecord, type UserMapping, type UserPresenceRecord, type VapidKeysRecord, type ClaimedDelivery, type WebhookAttemptResult, type WebhookDeliveryQuery, type WebhookDeliveryRecord, type WebhookSubscriptionRecord } from './types.js'
+import type { WebhookEventType } from '@twake/telephony-types'
 
 const MIGRATIONS = fileURLToPath(new URL('../../migrations/', import.meta.url))
 
@@ -31,6 +33,56 @@ const alertOf = (r: AlertRow): StoredAlert => ({
   ...(r.acknowledged_at ? { acknowledgedAt: new Date(r.acknowledged_at).toISOString() } : {}),
   ...(r.acknowledged_by ? { acknowledgedBy: r.acknowledged_by } : {})
 })
+
+type WebhookRow = { id: string; tenant_id: string; url: string; events: WebhookEventType[]; description: string | null; enabled: boolean; secret_enc: string; created_at: Timestamp; updated_at: Timestamp; created_by: string | null }
+const webhookOf = (r: WebhookRow): WebhookSubscriptionRecord => ({
+  tenantId: r.tenant_id,
+  id: r.id,
+  url: r.url,
+  events: r.events,
+  ...(r.description !== null ? { description: r.description } : {}),
+  enabled: r.enabled,
+  secretEnc: r.secret_enc,
+  createdAt: new Date(r.created_at).toISOString(),
+  updatedAt: new Date(r.updated_at).toISOString(),
+  ...(r.created_by !== null ? { createdBy: r.created_by } : {})
+})
+type DeliveryRow = {
+  id: string
+  tenant_id: string
+  subscription_id: string
+  event_id: string
+  event_type: string
+  body: string
+  status: WebhookDeliveryRecord['status']
+  attempts: number
+  created_at: Timestamp
+  next_attempt_at: Timestamp | null
+  last_attempt_at: Timestamp | null
+  last_status: number | null
+  last_error: string | null
+  delivered_at: Timestamp | null
+}
+const DELIVERY_COLUMNS = 'id, tenant_id, subscription_id, event_id, event_type, body, status, attempts, created_at, next_attempt_at, last_attempt_at, last_status, last_error, delivered_at'
+const iso = (t: Timestamp) => new Date(t).toISOString()
+const deliveryOf = (r: DeliveryRow): WebhookDeliveryRecord => ({
+  tenantId: r.tenant_id,
+  id: r.id,
+  subscriptionId: r.subscription_id,
+  eventId: r.event_id,
+  eventType: r.event_type,
+  body: r.body,
+  status: r.status,
+  attempts: r.attempts,
+  createdAt: iso(r.created_at),
+  ...(r.next_attempt_at ? { nextAttemptAt: iso(r.next_attempt_at) } : {}),
+  ...(r.last_attempt_at ? { lastAttemptAt: iso(r.last_attempt_at) } : {}),
+  ...(r.last_status !== null ? { lastStatus: r.last_status } : {}),
+  ...(r.last_error !== null ? { lastError: r.last_error } : {}),
+  ...(r.delivered_at ? { deliveredAt: iso(r.delivered_at) } : {})
+})
+/** A new delivery's id, drawn by PostgreSQL (gen_random_uuid, PostgreSQL 13 and later). */
+const NEW_DELIVERY_ID = "'dlv_' || replace(gen_random_uuid()::text, '-', '')"
 
 const toEntry = (r: HistoryRow): HistoryEntry => ({
   tenantId: r.tenant_id,
@@ -507,7 +559,162 @@ export class PgStore implements Store {
     return r.rowCount ?? 0
   }
 
+  async listWebhookSubscriptions(tenantId: string) {
+    const { rows } = await this.pool.query<WebhookRow>('SELECT * FROM webhook_subscriptions WHERE tenant_id = $1 ORDER BY created_at, id', [tenantId])
+    return rows.map(webhookOf)
+  }
+
+  async getWebhookSubscription(tenantId: string, id: string) {
+    const { rows } = await this.pool.query<WebhookRow>('SELECT * FROM webhook_subscriptions WHERE tenant_id = $1 AND id = $2', [tenantId, id])
+    return rows[0] ? webhookOf(rows[0]) : null
+  }
+
+  /** Runs `run` in a transaction (rolled back when it throws). */
+  private async inTransaction<T>(run: (client: pg.PoolClient) => Promise<T>): Promise<T> {
+    const client = await this.pool.connect()
+    try {
+      await client.query('BEGIN')
+      const out = await run(client)
+      await client.query('COMMIT')
+      return out
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => undefined)
+      throw err
+    } finally {
+      client.release()
+    }
+  }
+
+  async addWebhookSubscription(w: WebhookSubscriptionRecord, max: number) {
+    return this.inTransaction(async client => {
+      // One writer of a tenant's subscriptions at a time: the count and the write go together.
+      await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [`webhook_subscriptions|${w.tenantId}`])
+      const { rows } = await client.query<{ n: number }>('SELECT count(*)::int AS n FROM webhook_subscriptions WHERE tenant_id = $1', [w.tenantId])
+      if ((rows[0]?.n ?? 0) >= max) return false
+      await client.query(
+        'INSERT INTO webhook_subscriptions (id, tenant_id, url, events, description, enabled, secret_enc, created_at, updated_at, created_by) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)',
+        [w.id, w.tenantId, w.url, w.events, w.description ?? null, w.enabled, w.secretEnc, w.createdAt, w.updatedAt, w.createdBy ?? null]
+      )
+      return true
+    })
+  }
+
+  async updateWebhookSubscription(w: WebhookSubscriptionRecord) {
+    return this.inTransaction(async client => {
+      const r = await client.query(
+        'UPDATE webhook_subscriptions SET url = $3, events = $4, description = $5, enabled = $6, secret_enc = $7, updated_at = $8 WHERE tenant_id = $1 AND id = $2',
+        [w.tenantId, w.id, w.url, w.events, w.description ?? null, w.enabled, w.secretEnc, w.updatedAt]
+      )
+      if (r.rowCount && !w.enabled)
+        await client.query("UPDATE webhook_deliveries SET status = 'failed', last_error = 'disabled', next_attempt_at = NULL, claim = NULL WHERE subscription_id = $1 AND status = 'pending'", [w.id])
+      return !!r.rowCount
+    })
+  }
+
+  async deleteWebhookSubscription(tenantId: string, id: string) {
+    const r = await this.pool.query('DELETE FROM webhook_subscriptions WHERE tenant_id = $1 AND id = $2', [tenantId, id])
+    return !!r.rowCount
+  }
+
+  async getWebhookDomains(tenantId: string) {
+    const { rows } = await this.pool.query<{ domain: string }>('SELECT domain FROM webhook_domains WHERE tenant_id = $1 ORDER BY position', [tenantId])
+    return rows.map(r => r.domain)
+  }
+
+  async setWebhookDomains(tenantId: string, domains: string[]) {
+    await this.inTransaction(async client => {
+      await client.query('DELETE FROM webhook_domains WHERE tenant_id = $1', [tenantId])
+      if (domains.length) await client.query('INSERT INTO webhook_domains (tenant_id, position, domain) SELECT $1, n, d FROM unnest($2::text[]) WITH ORDINALITY AS u(d, n)', [tenantId, domains])
+    })
+  }
+
+  async enqueueWebhookEvent(tenantId: string, eventId: string, eventType: WebhookEventType, body: string, at: string) {
+    const r = await this.pool.query(
+      `INSERT INTO webhook_deliveries (id, tenant_id, subscription_id, event_id, event_type, body, created_at, next_attempt_at)
+       SELECT ${NEW_DELIVERY_ID}, tenant_id, id, $2, $3, $4, $5, $5 FROM webhook_subscriptions WHERE tenant_id = $1 AND enabled AND $3 = ANY (events)
+       ON CONFLICT (subscription_id, event_id) DO NOTHING`,
+      [tenantId, eventId, eventType, body, at]
+    )
+    return r.rowCount ?? 0
+  }
+
+  async enqueueWebhookDelivery(tenantId: string, subscriptionId: string, eventId: string, eventType: string, body: string, at: string) {
+    const { rows } = await this.pool.query<DeliveryRow>(
+      `INSERT INTO webhook_deliveries (id, tenant_id, subscription_id, event_id, event_type, body, created_at, next_attempt_at)
+       SELECT ${NEW_DELIVERY_ID}, tenant_id, id, $3, $4, $5, $6, $6 FROM webhook_subscriptions WHERE tenant_id = $1 AND id = $2
+       ON CONFLICT (subscription_id, event_id) DO NOTHING RETURNING ${DELIVERY_COLUMNS}`,
+      [tenantId, subscriptionId, eventId, eventType, body, at]
+    )
+    return rows[0] ? deliveryOf(rows[0]) : null
+  }
+
+  async claimWebhookDeliveries(now: string, leaseUntil: string, limit: number) {
+    const claim = randomBytes(12).toString('hex')
+    // The due ones no other Gateway holds (SKIP LOCKED: those another one is taking are left to it), each held until
+    // leaseUntil: if its outcome never comes (that Gateway stopped), it is due again then.
+    const { rows } = await this.pool.query<DeliveryRow & { url: string; secret_enc: string }>(
+      `WITH due AS (
+         SELECT id FROM webhook_deliveries WHERE status = 'pending' AND next_attempt_at <= $1 ORDER BY next_attempt_at LIMIT $3 FOR UPDATE SKIP LOCKED
+       )
+       UPDATE webhook_deliveries d SET attempts = d.attempts + 1, last_attempt_at = $1, next_attempt_at = $2, claim = $4
+       FROM due, webhook_subscriptions s WHERE d.id = due.id AND s.id = d.subscription_id
+       RETURNING ${DELIVERY_COLUMNS.split(', ').map(c => `d.${c}`).join(', ')}, s.url, s.secret_enc`,
+      [now, leaseUntil, limit, claim]
+    )
+    return rows.map((r): ClaimedDelivery => ({ ...deliveryOf(r), url: r.url, secretEnc: r.secret_enc, claim }))
+  }
+
+  async completeWebhookDelivery(id: string, claim: string, result: WebhookAttemptResult) {
+    const r = result.delivered
+      ? await this.pool.query("UPDATE webhook_deliveries SET status = 'delivered', delivered_at = $3, last_status = $4, last_error = NULL, next_attempt_at = NULL, claim = NULL WHERE id = $1 AND claim = $2 AND status = 'pending'", [id, claim, result.at, result.status])
+      : await this.pool.query(
+          "UPDATE webhook_deliveries SET status = CASE WHEN $3::timestamptz IS NULL THEN 'failed' ELSE 'pending' END, next_attempt_at = $3, last_status = $4, last_error = $5, claim = NULL WHERE id = $1 AND claim = $2 AND status = 'pending'",
+          [id, claim, result.retryAt ?? null, result.status ?? null, result.error]
+        )
+    return !!r.rowCount
+  }
+
+  async listWebhookDeliveries(tenantId: string, subscriptionId: string, query: WebhookDeliveryQuery = {}) {
+    const { rows } = await this.pool.query<DeliveryRow>(
+      `SELECT ${DELIVERY_COLUMNS} FROM webhook_deliveries
+       WHERE tenant_id = $1 AND subscription_id = $2 AND ($3::timestamptz IS NULL OR (created_at, id) < ($3::timestamptz, $4::text)) AND ($5::text IS NULL OR status = $5)
+       ORDER BY created_at DESC, id DESC LIMIT $6`,
+      [tenantId, subscriptionId, query.before?.createdAt ?? null, query.before?.id ?? null, query.status ?? null, clampLimit(query.limit)]
+    )
+    return rows.map(deliveryOf)
+  }
+
+  async replayWebhookDelivery(tenantId: string, subscriptionId: string, id: string, at: string) {
+    const { rows } = await this.pool.query<DeliveryRow>(
+      `UPDATE webhook_deliveries SET status = 'pending', attempts = 0, next_attempt_at = $4, claim = NULL, last_status = NULL, last_error = NULL, delivered_at = NULL
+       WHERE tenant_id = $1 AND subscription_id = $2 AND id = $3 AND status <> 'pending' RETURNING ${DELIVERY_COLUMNS}`,
+      [tenantId, subscriptionId, id, at]
+    )
+    if (rows[0]) return deliveryOf(rows[0])
+    const pending = await this.pool.query('SELECT 1 FROM webhook_deliveries WHERE tenant_id = $1 AND subscription_id = $2 AND id = $3', [tenantId, subscriptionId, id])
+    return pending.rowCount ? ('pending' as const) : null
+  }
+
+  async purgeWebhookDeliveries(before: string) {
+    const r = await this.pool.query("DELETE FROM webhook_deliveries WHERE created_at < $1 AND status <> 'pending'", [before])
+    return r.rowCount ?? 0
+  }
+
+  async setWebhookState(tenantId: string, subject: string, state: string, at: string) {
+    return this.inTransaction(async client => {
+      // One writer of a subject at a time (a lock that holds whether its row exists yet or not): of two Gateways that
+      // heard the same change, the second finds it written.
+      await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [`webhook_state|${tenantId}|${subject}`])
+      const { rows } = await client.query<{ state: string }>('SELECT state FROM webhook_state WHERE tenant_id = $1 AND subject = $2', [tenantId, subject])
+      const before = rows[0]?.state
+      if (before === state) return null
+      await client.query('INSERT INTO webhook_state (tenant_id, subject, state, since) VALUES ($1, $2, $3, $4) ON CONFLICT (tenant_id, subject) DO UPDATE SET state = EXCLUDED.state, since = EXCLUDED.since', [tenantId, subject, state, at])
+      return before
+    })
+  }
+
   async close() {
     await this.pool.end()
   }
 }
+

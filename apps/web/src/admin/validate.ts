@@ -7,6 +7,7 @@ import {
   TRUNK_COUNTRY_EXCLUDED,
   TRUNK_OUTBOUND_CLASSES,
   TRUNK_OUTBOUND_DEFAULT,
+  WEBHOOK_EVENT_TYPES,
   type DidRange,
   type FraudRule,
   type FraudThreshold,
@@ -17,7 +18,8 @@ import {
   type TrunkCodec,
   type TrunkInput,
   type TrunkNumberFormat,
-  type TrunkOutboundClass
+  type TrunkOutboundClass,
+  type WebhookEventType
 } from '@twake/telephony-client'
 import type { Key } from '../i18n/index.js'
 
@@ -436,11 +438,15 @@ const GENERAL: Record<string, Key> = {
   DID_LIMIT: 'admin.err.didLimit',
   PROFILE_LIMIT: 'admin.err.profileLimit',
   OUTBOUND_STALE: 'admin.err.stale',
-  ALERT_CHANGED: 'admin.alert.changed'
+  ALERT_CHANGED: 'admin.alert.changed',
+  WEBHOOK_LIMIT: 'admin.webhooks.err.limit',
+  WEBHOOK_RATE: 'admin.webhooks.err.rate',
+  WEBHOOK_PENDING: 'admin.webhooks.err.pending',
+  WEBHOOK_DOMAINS: 'admin.webhooks.err.domains'
 }
 
 /** The words of GENERAL that name a number. */
-const GENERAL_PARAMS: Record<string, Record<string, number>> = { PROFILE_LIMIT: { max: MAX_PROFILES } }
+const GENERAL_PARAMS: Record<string, Record<string, number>> = { PROFILE_LIMIT: { max: MAX_PROFILES }, WEBHOOK_LIMIT: { max: 20 } }
 
 /** A value written with its keys in order (a profile from the Gateway may list them in any order): to compare. */
 const canonical = (v: unknown): string =>
@@ -576,5 +582,73 @@ export const groupRefusal = (err: unknown) =>
     if (code === 'GROUP_NAME') return { field: 'name', problem: p('admin.groupNameInvalid') }
     if (code === 'GROUP_MEMBERS') return { field: 'members', problem: p('admin.groupMembersInvalid') }
     if (code === 'GROUP_MEMBER_NOT_EXTENSION') return { field: 'members', problem: p('admin.groupMemberNotExtension') }
+    return undefined
+  })
+
+// ---------------------------------------------------------------------------------------------------------------
+// Webhooks (step 10a)
+
+/** Domains allowed at most, and subscriptions, as the Gateway (MAX_WEBHOOK_DOMAINS, MAX_WEBHOOKS). */
+export const WEBHOOK_DOMAINS_MAX = 50
+export const WEBHOOKS_MAX = 20
+const WEBHOOK_LABEL = '[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?'
+const WEBHOOK_DOMAIN = new RegExp(`^(?=.{1,253}$)(?:\\*\\.)?${WEBHOOK_LABEL}(?:\\.${WEBHOOK_LABEL})+$`)
+
+/** The domains as typed (one per line, or separated by commas), as the Gateway keeps them, or what is wrong. */
+export const checkWebhookDomains = (text: string): { domains?: string[]; problem?: Problem } => {
+  const domains: string[] = []
+  for (const raw of splitList(text)) {
+    const d = raw.toLowerCase().replace(/\.$/, '')
+    if (!WEBHOOK_DOMAIN.test(d) && !IPV4.test(d)) return { problem: p('admin.webhooks.err.domain', { domain: raw.slice(0, 80) }) }
+    if (!domains.includes(d)) domains.push(d)
+  }
+  if (domains.length > WEBHOOK_DOMAINS_MAX) return { problem: p('admin.webhooks.err.domainsMax', { max: WEBHOOK_DOMAINS_MAX }) }
+  return { domains }
+}
+
+/** Whether `host` is one of `domains` (exactly, or a subdomain of a `*.` entry), as the Gateway compares them. */
+export const webhookHostAllowed = (host: string, domains: readonly string[]) => domains.some(d => (d.startsWith('*.') ? host.endsWith(d.slice(1)) && host.length > d.length - 1 : host === d))
+
+export interface WebhookForm {
+  url: string
+  events: WebhookEventType[]
+  description: string
+  enabled: boolean
+}
+export type WebhookField = 'url' | 'events' | 'description' | 'form'
+export const WEBHOOK_FIELDS: WebhookField[] = ['url', 'events', 'description']
+export const emptyWebhook = (): WebhookForm => ({ url: '', events: ['call.missed'], description: '', enabled: true })
+
+/**
+ * The subscription as the Gateway takes it (POST /webhooks, PUT /webhooks/:id), or what is wrong. Whether http is
+ * allowed is the operator's: the Gateway says it.
+ */
+export const checkWebhook = (f: WebhookForm, domains: readonly string[]): { webhook?: { url: string; events: WebhookEventType[]; description?: string; enabled: boolean }; problems: Problems<WebhookField> } => {
+  const problems: Problems<WebhookField> = {}
+  const raw = f.url.trim()
+  let url: URL | undefined
+  try {
+    url = raw && raw.length <= 2048 ? new URL(raw) : undefined
+  } catch {
+    url = undefined
+  }
+  if (!url || (url.protocol !== 'https:' && url.protocol !== 'http:') || url.username || url.password || url.hash) problems.url = p('admin.webhooks.err.url')
+  else if (!webhookHostAllowed(url.hostname.toLowerCase().replace(/^\[|\]$/g, '').replace(/\.$/, ''), domains)) problems.url = p('admin.webhooks.err.urlDomain', { host: url.hostname })
+  const events = WEBHOOK_EVENT_TYPES.filter(e => f.events.includes(e))
+  if (!events.length) problems.events = p('admin.webhooks.err.events')
+  const description = f.description.trim()
+  if (description.length > 200 || CONTROL.test(description)) problems.description = p('admin.webhooks.err.description')
+  if (Object.keys(problems).length) return { problems }
+  return { problems, webhook: { url: raw, events, ...(description ? { description } : {}), enabled: f.enabled } }
+}
+
+/** The refusals of the webhook routes, on the field they are about. */
+export const webhookRefusal = (err: unknown) =>
+  refusalOf<WebhookField>(err, (_field, code) => {
+    if (code === 'WEBHOOK_URL') return { field: 'url', problem: p('admin.webhooks.err.url') }
+    if (code === 'WEBHOOK_URL_SCHEME') return { field: 'url', problem: p('admin.webhooks.err.urlScheme') }
+    if (code === 'WEBHOOK_DOMAIN') return { field: 'url', problem: p('admin.webhooks.err.urlDomainServer') }
+    if (code === 'WEBHOOK_EVENTS') return { field: 'events', problem: p('admin.webhooks.err.events') }
+    if (code === 'WEBHOOK_DESCRIPTION') return { field: 'description', problem: p('admin.webhooks.err.description') }
     return undefined
   })

@@ -3,7 +3,7 @@ import { act } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { MemoryRouter, Route, Routes } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { AdminAlert, DidRange, OutboundSettings, Trunk } from '@twake/telephony-client'
+import type { AdminAlert, DidRange, OutboundSettings, Trunk, WebhookDelivery, WebhookSubscription } from '@twake/telephony-client'
 import type { useGateway } from '../../gateway.js'
 import { I18nProvider, useT } from '../../i18n/useT.js'
 import { Admin } from './Admin.js'
@@ -13,6 +13,7 @@ import { Numbers } from './Numbers.js'
 import { Rights } from './Rights.js'
 import { RingGroups } from './RingGroups.js'
 import { STATUS_POLL_MS, Trunks } from './Trunks.js'
+import { Webhooks } from './Webhooks.js'
 
 type Gateway = ReturnType<typeof useGateway>
 let gateway: Pick<Gateway, 'client' | 'me' | 'meError'>
@@ -142,7 +143,7 @@ describe('the administration screens (step 7)', () => {
     gateway = { client: client(), me: { id: 'alice', displayName: 'Alice', features: { admin: true } }, meError: null }
     await render('/admin/trunks', <Trunks />)
     const links = [...host.querySelectorAll('nav a')]
-    expect(links.map(a => a.textContent)).toEqual(['Comptes', 'Trunks', 'Numéros directs', "Groupes d'appel", "Droits d'appel", 'Plafonds et seuils', 'Alertes'])
+    expect(links.map(a => a.textContent)).toEqual(['Comptes', 'Trunks', 'Numéros directs', "Groupes d'appel", "Droits d'appel", 'Plafonds et seuils', 'Alertes', 'Webhooks'])
     expect(links.find(a => a.getAttribute('aria-current') === 'page')?.textContent).toBe('Trunks')
     // The trunk, how it is doing, and its password never shown.
     expect(text()).toContain('Opérateur (operator)')
@@ -772,5 +773,108 @@ describe('the administration screens (step 7)', () => {
     expect(createGroup).toHaveBeenCalledWith({ number: '200', name: 'Accueil', members: ['101', '102'] })
     expect($('#group-number-error')?.textContent).toContain('Un groupe de votre organisation a déjà ce numéro')
     expect(document.activeElement?.id).toBe('group-number')
+  })
+  /** Types into a text area as a person does. */
+  const typeArea = (el: Element | null, value: string) => {
+    const area = el as HTMLTextAreaElement
+    const { set } = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value') as { set: (this: HTMLTextAreaElement, v: string) => void }
+    act(() => {
+      set.call(area, value)
+      area.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+  }
+  const hook: WebhookSubscription = { id: 'wh_00000000000000a1', url: 'https://crm.example.org/in', events: ['call.missed'], description: 'CRM', enabled: true, deliverable: true, createdAt: '2026-10-16T08:00:00.000Z', updatedAt: '2026-10-16T08:00:00.000Z' }
+  const webhooksClient = (over: Record<string, unknown> = {}) => ({
+    getWebhookDomains: vi.fn(async () => ({ domains: ['crm.example.org'] })),
+    setWebhookDomains: vi.fn(async (domains: string[]) => ({ domains })),
+    listWebhooks: vi.fn(async () => ({ items: [hook] })),
+    createWebhook: vi.fn(),
+    updateWebhook: vi.fn(),
+    deleteWebhook: vi.fn(),
+    renewWebhookSecret: vi.fn(),
+    testWebhook: vi.fn(),
+    listWebhookDeliveries: vi.fn(async () => ({ items: [] })),
+    replayWebhookDelivery: vi.fn(),
+    ...over
+  })
+
+  it('lists the subscriptions, checks a new one against the allowed domains before sending, and shows its secret once (step 10a)', async () => {
+    const createWebhook = vi.fn(async () => ({ ...hook, id: 'wh_00000000000000a2', url: 'https://crm.example.org/v2', events: ['call.missed', 'trunk.degraded'], secret: 'whsec_shown-once' }))
+    admin(webhooksClient({ createWebhook }))
+    await render('/admin/webhooks', <Webhooks />)
+    expect(text()).toContain('https://crm.example.org/in (CRM) : Appel manqué.')
+    expect(($('#webhook-domains') as HTMLTextAreaElement).value).toBe('crm.example.org')
+    type($('#webhook-url'), 'https://other.example.net/in')
+    // A missed call is ticked first: untick it, nothing is left.
+    click($('[id="webhook-events-call.missed"]'))
+    await submit($('#webhook-url')!.closest('form'))
+    expect(createWebhook).not.toHaveBeenCalled()
+    expect(document.activeElement?.id).toBe('webhook-url')
+    expect($('#webhook-url-error')?.textContent).toContain("other.example.net n'est pas parmi les domaines autorisés")
+    expect($('#webhook-events-error')?.textContent).toContain('au moins un événement')
+    type($('#webhook-url'), 'https://crm.example.org/v2')
+    click($('[id="webhook-events-call.missed"]'))
+    click($('[id="webhook-events-trunk.degraded"]'))
+    await submit($('#webhook-url')!.closest('form'))
+    await flush()
+    expect(createWebhook).toHaveBeenCalledWith({ url: 'https://crm.example.org/v2', events: ['call.missed', 'trunk.degraded'], enabled: true })
+    // The secret, once, the focus on it; gone once copied.
+    expect(($('#webhook-secret-value') as HTMLInputElement).value).toBe('whsec_shown-once')
+    expect(document.activeElement?.id).toBe('webhook-secret-value')
+    click(button(host, "J'ai copié le secret"))
+    expect($('#webhook-secret-value')).toBeNull()
+    expect(text()).not.toContain('whsec_shown-once')
+  })
+
+  it("puts the Gateway's refusal of an address on its field, and refuses a domain that is none (step 10a)", async () => {
+    const createWebhook = vi.fn(async () => {
+      throw refused(400, 'WEBHOOK_URL_SCHEME', 'url: https only')
+    })
+    const setWebhookDomains = vi.fn(async (domains: string[]) => ({ domains }))
+    admin(webhooksClient({ createWebhook, setWebhookDomains }))
+    await render('/admin/webhooks', <Webhooks />)
+    type($('#webhook-url'), 'http://crm.example.org/in')
+    await submit($('#webhook-url')!.closest('form'))
+    await flush()
+    expect($('#webhook-url-error')?.textContent).toContain('Une adresse https.')
+    expect(document.activeElement?.id).toBe('webhook-url')
+
+    typeArea($('#webhook-domains'), 'crm.example.org\nintranet')
+    await submit($('#webhook-domains')!.closest('form'))
+    expect(setWebhookDomains).not.toHaveBeenCalled()
+    expect($('#webhook-domains-error')?.textContent).toContain("intranet n'est pas un nom de domaine")
+    expect($('#webhook-domains')?.getAttribute('aria-describedby')).toBe('webhook-domains-hint webhook-domains-error')
+    typeArea($('#webhook-domains'), 'CRM.example.org, *.hooks.example.net')
+    await submit($('#webhook-domains')!.closest('form'))
+    await flush()
+    expect(setWebhookDomains).toHaveBeenCalledWith(['crm.example.org', '*.hooks.example.net'])
+    expect(text()).toContain('Domaines enregistrés (2).')
+  })
+
+  it('shows the log of a subscription, what each delivery came to, and replays one (step 10a)', async () => {
+    const delivery: WebhookDelivery = { id: `dlv_${'1'.repeat(32)}`, eventId: `evt_${'2'.repeat(32)}`, eventType: 'call.missed', status: 'failed', attempts: 9, createdAt: '2026-10-16T08:00:00.000Z', lastStatus: 503, lastError: 'http' }
+    const listWebhookDeliveries = vi.fn(async () => ({ items: [delivery, { ...delivery, id: `dlv_${'3'.repeat(32)}`, status: 'failed' as const, lastStatus: undefined, lastError: 'destination-refused', attempts: 1 }] }))
+    const replayWebhookDelivery = vi.fn(async () => ({ ...delivery, status: 'pending', attempts: 0 }))
+    admin(webhooksClient({ listWebhookDeliveries, replayWebhookDelivery }))
+    await render('/admin/webhooks', <Webhooks />)
+    click(host.querySelector('[aria-label="Journal des envois à https://crm.example.org/in"]'))
+    await flush()
+    expect(listWebhookDeliveries).toHaveBeenCalledWith('wh_00000000000000a1', { limit: 20 })
+    expect(document.activeElement?.id).toBe('webhook-log')
+    expect(text()).toContain('réponse 503')
+    expect(text()).toContain('adresse du réseau interne refusée')
+    click(button(host, 'Renvoyer'))
+    await flush()
+    expect(replayWebhookDelivery).toHaveBeenCalledWith('wh_00000000000000a1', delivery.id)
+    expect(text()).toContain('Envoi relancé')
+  })
+
+  it('says webhooks are not available on a platform without SECRETS_KEY (step 10a)', async () => {
+    const no = async () => {
+      throw refused(501, '', 'Webhooks are not available on this platform (SECRETS_KEY is not set)')
+    }
+    admin(webhooksClient({ getWebhookDomains: vi.fn(no), listWebhooks: vi.fn(no) }))
+    await render('/admin/webhooks', <Webhooks />)
+    expect(text()).toContain('Les webhooks ne sont pas disponibles sur cette plateforme')
   })
 })

@@ -1,4 +1,4 @@
-import type { CallDirection, CallState, DidRange, OutboundAssignment, OutboundPolicy, OutboundProfile, PresenceStatus, TelephonyAlert, Trunk } from '@twake/telephony-types'
+import type { CallDirection, CallState, DidRange, OutboundAssignment, OutboundPolicy, OutboundProfile, PresenceStatus, TelephonyAlert, Trunk, WebhookEventType } from '@twake/telephony-types'
 
 export interface ProviderRecord {
   tenantId: string
@@ -190,6 +190,75 @@ export interface AlertQuery {
   state?: 'open' | 'acknowledged'
 }
 
+/**
+ * A tool an administrator subscribed to the organisation's events (step 10a, ADR 0020): where it listens, which
+ * events it takes, and the secret its deliveries are signed with, encrypted with SECRETS_KEY (shown once, never read
+ * back by the API). Disabled, it gets nothing.
+ */
+export interface WebhookSubscriptionRecord {
+  tenantId: string
+  id: string
+  url: string
+  events: WebhookEventType[]
+  description?: string
+  enabled: boolean
+  secretEnc: string
+  createdAt: string
+  updatedAt: string
+  /** The administrator who created it. */
+  createdBy?: string
+}
+
+/**
+ * Where a delivery stands: `pending` (due at `nextAttemptAt`, or being sent: a Gateway took it until then),
+ * `delivered` (answered 2xx), `failed` (its attempts used, or refused for good: its domain no longer allowed, its
+ * subscription disabled).
+ */
+export type WebhookDeliveryStatus = 'pending' | 'delivered' | 'failed'
+
+/** One event for one subscription, and how its delivery went. `body`: the exact JSON sent at each attempt. */
+export interface WebhookDeliveryRecord {
+  tenantId: string
+  id: string
+  subscriptionId: string
+  eventId: string
+  eventType: string
+  body: string
+  status: WebhookDeliveryStatus
+  attempts: number
+  createdAt: string
+  nextAttemptAt?: string
+  lastAttemptAt?: string
+  /** The HTTP status of the last answer, when there was one. */
+  lastStatus?: number
+  /** Why the last attempt failed, in a few words (never an address). */
+  lastError?: string
+  deliveredAt?: string
+}
+
+/** A delivery a Gateway took to send (claimWebhookDeliveries): until `leaseUntil`, the others leave it. */
+export interface ClaimedDelivery extends WebhookDeliveryRecord {
+  url: string
+  secretEnc: string
+  /** What the outcome is recorded with (completeWebhookDelivery): an outcome of a lease taken back since is ignored. */
+  claim: string
+}
+
+/** The outcome of an attempt: delivered, or failed and due again at `retryAt` (absent: failed for good). */
+export type WebhookAttemptResult =
+  | { delivered: true; at: string; status: number }
+  | { delivered: false; at: string; status?: number; error: string; retryAt?: string }
+
+/** A page of a subscription's deliveries, the latest first: `before` the last one of the page before. */
+export interface WebhookDeliveryQuery {
+  limit?: number
+  before?: { createdAt: string; id: string }
+  status?: WebhookDeliveryStatus
+}
+
+/** How long the log of deliveries is kept (purged by the Gateway every hour). */
+export const WEBHOOK_RETENTION_DAYS = 30
+
 /** How long the alerts are kept (from their last repeat): purged by the Gateway every hour (purgeAlerts). */
 export const ALERT_RETENTION_DAYS = 90
 /** An alert that repeats within this time of its last one counts in it, instead of a new one. */
@@ -304,6 +373,58 @@ export interface Store {
   acknowledgeAlert(tenantId: string, id: string, by: string, at: string, seen: string, count: number): Promise<StoredAlert | null>
   /** Removes the alerts of every tenant whose last repeat is before `before` (ISO); how many. */
   purgeAlerts(before: string): Promise<number>
+
+  /** The subscriptions of a tenant, oldest first. */
+  listWebhookSubscriptions(tenantId: string): Promise<WebhookSubscriptionRecord[]>
+  getWebhookSubscription(tenantId: string, id: string): Promise<WebhookSubscriptionRecord | null>
+  /**
+   * Adds one, unless the tenant has `max` already (false then, nothing written): the count and the write go together,
+   * whatever Gateway writes.
+   */
+  addWebhookSubscription(record: WebhookSubscriptionRecord, max: number): Promise<boolean>
+  /**
+   * Replaces one of the tenant (false when it has none of that id). Disabled, its pending deliveries are failed
+   * (`disabled`): nothing it was owed is sent once it is enabled again, unless replayed.
+   */
+  updateWebhookSubscription(record: WebhookSubscriptionRecord): Promise<boolean>
+  /** Removes one and its deliveries. Whether it was there. */
+  deleteWebhookSubscription(tenantId: string, id: string): Promise<boolean>
+  /** The domains the tenant allows its subscriptions to point to, as written. */
+  getWebhookDomains(tenantId: string): Promise<string[]>
+  setWebhookDomains(tenantId: string, domains: string[]): Promise<void>
+  /**
+   * Queues `body` (the event `eventId` of type `eventType`) for each enabled subscription of the tenant that takes
+   * this type, once per subscription and event whoever queues it again (another Gateway heard it too). Due at `at`.
+   * How many deliveries were queued.
+   */
+  enqueueWebhookEvent(tenantId: string, eventId: string, eventType: WebhookEventType, body: string, at: string): Promise<number>
+  /** Queues `body` for one subscription of the tenant, whatever it takes (a test): the delivery, or null without it. */
+  enqueueWebhookDelivery(tenantId: string, subscriptionId: string, eventId: string, eventType: string, body: string, at: string): Promise<WebhookDeliveryRecord | null>
+  /**
+   * Takes up to `limit` pending deliveries due at `now` (the earliest due first), whatever tenant, that no other
+   * Gateway holds: each one counts an attempt and is held until `leaseUntil` (then due again, if its outcome never
+   * came). Two Gateways never take the same one at the same time.
+   */
+  claimWebhookDeliveries(now: string, leaseUntil: string, limit: number): Promise<ClaimedDelivery[]>
+  /** Records the outcome of an attempt taken with `claim`; ignored (false) when the lease was taken back since. */
+  completeWebhookDelivery(id: string, claim: string, result: WebhookAttemptResult): Promise<boolean>
+  /** A page of a subscription's deliveries, the latest first (clamped as a page). */
+  listWebhookDeliveries(tenantId: string, subscriptionId: string, query?: WebhookDeliveryQuery): Promise<WebhookDeliveryRecord[]>
+  /**
+   * Sends a delivery again (its attempts from zero, due at `at`): the delivery as it is then; `pending` when it is
+   * still pending (not replayed); null when the subscription of the tenant has none of that id.
+   */
+  replayWebhookDelivery(tenantId: string, subscriptionId: string, id: string, at: string): Promise<WebhookDeliveryRecord | 'pending' | null>
+  /** Removes the deliveries of every tenant created before `before` (ISO), unless pending; how many. */
+  purgeWebhookDeliveries(before: string): Promise<number>
+
+  /**
+   * Keeps what the subscribers were last told of `subject` (step 10a: `trunk:<id>` its health, `presence:<user>` a
+   * person's status) as `state` since `at`, if it changed: what it was before (undefined when never kept), or null
+   * when it was already that (nothing written). Of two Gateways writing the same change, only one sees it changed:
+   * the event is told once.
+   */
+  setWebhookState(tenantId: string, subject: string, state: string, at: string): Promise<string | undefined | null>
 
   close(): Promise<void>
 }

@@ -11,6 +11,7 @@ import { WebPush, parsePushServices, parseVapidSubject } from './push.js'
 import { ProviderRegistry } from './registry.js'
 import { PgStore } from './store/pg.js'
 import { trunkFromEnv, trunkRecord } from './trunks.js'
+import { parseNetworks } from './webhook-delivery.js'
 
 const env = process.env
 const need = (name: string): string => {
@@ -157,6 +158,13 @@ const groupNumbers = async (tenantId: string) => {
   return provider.listGroups ? (await provider.listGroups()).map(g => g.number) : []
 }
 const directorySync = contacts && env.LDAP_ATTR_EXTENSION ? new DirectorySync({ store, directory: contacts, tenantId: env.LDAP_TENANT ?? tenant, reserved: async t => [...(await groupNumbers(t)), ...(conference && accessNumber ? [accessNumber] : [])] }) : undefined
+// Webhooks (step 10a, ADR 0020), with SECRETS_KEY: deliveries in https only, never to this host or the private
+// networks, unless the operator opens some (WEBHOOK_PRIVATE_NETWORKS, CIDR, comma-separated: a CRM of its own
+// network) or allows http (WEBHOOK_ALLOW_HTTP=1, development only).
+const webhookOpen = parseNetworks(env.WEBHOOK_PRIVATE_NETWORKS)
+const webhookHttp = env.WEBHOOK_ALLOW_HTTP === '1'
+if (webhookHttp) console.warn('WARNING: WEBHOOK_ALLOW_HTTP=1: webhooks may be delivered in clear (http), for development only')
+if (!key) console.warn('WARNING: no webhooks without SECRETS_KEY (their secrets are kept encrypted with it)')
 const hstsMaxAge = env.HSTS_MAX_AGE ? Number(env.HSTS_MAX_AGE) : undefined
 if (hstsMaxAge !== undefined && !(Number.isInteger(hstsMaxAge) && hstsMaxAge >= 0)) throw new Error('HSTS_MAX_AGE must be a number of seconds')
 const app = await buildApp(registry, {
@@ -168,6 +176,7 @@ const app = await buildApp(registry, {
   auth: authenticatorFromEnv(env),
   ...(push ? { push } : {}),
   ...(key ? { secretsKey: key } : {}),
+  webhooks: { policy: { allowHttp: webhookHttp }, open: webhookOpen },
   ...(conference ? { conference } : {})
 })
 directorySync?.useLogger(app.log)
