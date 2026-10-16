@@ -31,6 +31,7 @@ import { execSync } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
 import { createSocket } from 'node:dgram'
 import pg from 'pg'
+import { parseDlgContext } from '../../../packages/provider-opensips/dist/events.js'
 import { EMERGENCY_RESTORED_SEC } from '../../../packages/provider-opensips/dist/outbound.js'
 import { SubscriberProvisioner } from '../../../packages/provider-opensips/dist/subscriber.js'
 import { sipPhone } from './sip-phone.mjs'
@@ -1090,6 +1091,58 @@ try {
     await w302.close()
   })
 
+  await step("step 8b: a conference's room call goes where its grant says, as it says: in the place of a call (Replaces, written by OpenSIPS from the grant) to the phone that has it, past its forward; to the person who made it (Twake-Join); its CDR and its events say conference; a room's other calls say a room calls; a phone's Twake-Join or Twake-Room never passes", async () => {
+    p302.st.asleep = true
+    const w302 = await phone('302', { ws: true })
+    await mi('event_subscribe', ['E_TWAKEPHONE_CALLING', alertAddress, 900])
+    try {
+      // The call between 301 and 302 that becomes a conference: OpenSIPS keeps the tag of the phone that answered.
+      const x = await p301.dial('302')
+      expect('the call answered', x.final.status === 200, x.final.first)
+      const rung = await w302.incoming(i => header(i, 'call-id') === x.callId)
+      const fromTag = /;tag=([^;>\s]+)/.exec(x.local)?.[1]
+      const dialog = parseDlgContext((await mi('dlg_list_ctx', { callid: x.callId })).result)
+      expect('the dialog of the call, as the Gateway reads it', dialog?.state === 4 && dialog.caller === '301' && dialog.callerTag === fromTag && dialog.values.callee === '302' && dialog.values.callee_tag === rung.tag, JSON.stringify(dialog))
+      // 302 forwards everything to 303 meanwhile: never the call that takes the place of its own.
+      await db.query("INSERT INTO call_rules (extension, tenant_id, forward_always) VALUES ('302', $1, '303') ON CONFLICT (extension) DO UPDATE SET forward_always = '303'", [TENANT])
+      const at303 = p303.calls.size
+      const replaces = `${x.callId};to-tag=${rung.tag};from-tag=${fromTag}`
+      const lk = await room('301')
+      const moved = await lk.dial('302', { extra: [`X-Twake-Grant: ${await grants.grant('301', '302', 30, { replaces })}`] })
+      expect('the room\'s call in the place of the call', moved.final.status === 200, moved.final.first)
+      const replacing = await w302.incoming(i => header(i, 'call-id') === moved.callId)
+      expect('its Replaces, as the grant says', header(replacing.invite, 'replaces') === replaces, header(replacing.invite, 'replaces'))
+      expect('a conference\'s call', header(replacing.invite, 'twake-room') === 'conference' && !replacing.invite.headers.has('twake-join') && !replacing.invite.headers.has('x-twake-grant'), JSON.stringify([...replacing.invite.headers.keys()]))
+      expect('not forwarded', p303.calls.size === at303, `${p303.calls.size - at303}`)
+      // The window of the person who made it: the token of the grant, nothing else.
+      const join = randomBytes(16).toString('hex')
+      const joined = await lk.dial('301', { extra: [`X-Twake-Grant: ${await grants.grant('301', '301', 30, { join })}`] })
+      expect('the room\'s call to whoever made the conference', joined.final.status === 200, joined.final.first)
+      const toMaker = await p301.incoming(i => header(i, 'call-id') === joined.callId)
+      expect('its token', header(toMaker.invite, 'twake-join') === join && header(toMaker.invite, 'twake-room') === 'conference' && !toMaker.invite.headers.has('replaces'), JSON.stringify(Object.fromEntries(toMaker.invite.headers)))
+      const calling = await untilAlert('the events of the conference\'s calls', (m, p) => m === 'E_TWAKEPHONE_CALLING' && p.callid === joined.callId)
+      const callingMoved = await untilAlert('the event of the call in the place of the other', (m, p) => m === 'E_TWAKEPHONE_CALLING' && p.callid === moved.callId)
+      expect('the events say conference', calling.conference === '1' && callingMoved.conference === '1' && callingMoved.callee === '302' && callingMoved.caller === '301', JSON.stringify([calling, callingMoved]))
+      for (const c of [moved, joined]) expect('the room\'s BYE', (await lk.hangup(c)).status === 200)
+      for (const c of [moved, joined]) await until('the CDR of a conference\'s call', async () => (await db.query('SELECT via FROM acc WHERE callid = $1', [c.callId])).rows[0]?.via === 'conference', 5_000)
+      expect('the BYE of the call', (await p301.hangup(x)).status === 200)
+      await db.query("DELETE FROM call_rules WHERE extension = '302'")
+      // A room's call of step 8 says a room calls; neither a phone nor LiveKit SIP writes these headers.
+      const plain = await lk.dial('302', { extra: [`X-Twake-Grant: ${await grants.grant('301', '302')}`, `Twake-Join: ${join}`, 'Twake-Room: conference'] })
+      const plainRung = await w302.incoming(i => header(i, 'call-id') === plain.callId)
+      expect('a room of Meet calls', header(plainRung.invite, 'twake-room') === 'meet' && !plainRung.invite.headers.has('twake-join') && (plainRung.invite.headers.get('twake-room') ?? []).length === 1, JSON.stringify(Object.fromEntries(plainRung.invite.headers)))
+      await lk.hangup(plain)
+      const spoofed = await p303.dial('302', { extra: [`Twake-Join: ${join}`, 'Twake-Room: conference'] })
+      const spoofedRung = await w302.incoming(i => header(i, 'call-id') === spoofed.callId)
+      expect('a phone\'s Twake-Join and Twake-Room', !spoofedRung.invite.headers.has('twake-join') && !spoofedRung.invite.headers.has('twake-room'), JSON.stringify([...spoofedRung.invite.headers.keys()]))
+      await p303.hangup(spoofed)
+    } finally {
+      await db.query("DELETE FROM call_rules WHERE extension = '302'")
+      await mi('event_subscribe', ['E_TWAKEPHONE_CALLING', alertAddress, 0]).catch(() => undefined)
+      await w302.close()
+    }
+  })
+
   await step('step 8: LiveKit SIP draws its o= session id and version as any 64-bit number: a browser gets them below 2^63 (RFC 8829; Firefox refuses an offer otherwise), its codecs kept', async () => {
     p302.st.asleep = true
     const w302 = await phone('302', { ws: true })
@@ -1256,7 +1309,7 @@ try {
     .then(() => mi('fraud_reload'))
     .catch(err => console.log(`outbound rules not removed: ${err.message}`))
   await db.query("DELETE FROM call_groups WHERE number IN ('3900', '3901', '3902')").catch(() => undefined)
-  await db.query("DELETE FROM call_rules WHERE extension = '303'").catch(() => undefined)
+  await db.query("DELETE FROM call_rules WHERE extension IN ('302', '303')").catch(() => undefined)
   await db.query('DELETE FROM dial_out_grants WHERE tenant_id = $1', [TENANT]).catch(() => undefined)
   await db.query('DELETE FROM outbound_usage').catch(() => undefined)
   await tables.set([], []).catch(err => console.log(`trunks not removed: ${err.message}`))

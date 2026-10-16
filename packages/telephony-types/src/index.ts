@@ -364,6 +364,11 @@ export interface Call {
   /** When the call was answered; absent for missed, rejected or failed calls. */
   connectedAt?: string
   endedAt?: string
+  /**
+   * A call that took the place of another one of this person's in a conference (step 8b, ADR 0019): the room called
+   * them in it. `remoteNumber` is then whoever made the conference (themselves, for that person).
+   */
+  conference?: boolean
 }
 
 export interface OriginateRequest {

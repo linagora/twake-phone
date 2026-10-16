@@ -170,6 +170,13 @@ export class MemoryStore implements Store {
     return [...this.conferences.values()].filter(c => c.tenantId === tenantId && (ownerUserId === undefined || c.ownerUserId === ownerUserId)).length
   }
 
+  async listConferences(tenantId: string, ownerUserId: string) {
+    return [...this.conferences.values()]
+      .filter(c => c.tenantId === tenantId && c.ownerUserId === ownerUserId)
+      .sort((a, b) => (a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : 0))
+      .map(c => ({ ...c }))
+  }
+
   async deleteConference(meetingId: string) {
     this.conferences.delete(meetingId)
   }

@@ -1,10 +1,12 @@
 import { useEffect, useRef, useState, type SyntheticEvent } from 'react'
 import type { SoftCall } from '@twake/softphone'
 import { formatNumber, toDialTarget } from '@twake/telephony-client'
+import type { ConferenceParticipant } from '@twake/telephony-types'
+import { useGateway } from '../gateway.js'
 import type { Key } from '../i18n/index.js'
 import { useT } from '../i18n/useT.js'
 import { usePhone } from '../softphone.js'
-import { describeCallError } from './callErrors.js'
+import { describeCallError, describeConferenceError } from './callErrors.js'
 
 const TONES = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '*', '0', '#']
 
@@ -19,7 +21,8 @@ const REASON_KEY: Record<NonNullable<SoftCall['endReason']>, Key> = {
   transferred: 'call.endedTransferred',
   dnd: 'call.endedDnd',
   'answered-elsewhere': 'call.endedAnsweredElsewhere',
-  refused: 'call.endedRefusedNotAllowed'
+  refused: 'call.endedRefusedNotAllowed',
+  conference: 'call.endedConference'
 }
 
 /** Why the SIP server did not put a number through to the public network (step 6): an emergency number first. */
@@ -111,6 +114,184 @@ const Incoming = ({ call }: { call: SoftCall }) => {
   )
 }
 
+/** How often the participants of a conference are read again (the Gateway's reads are limited to 60 a minute). */
+const PARTICIPANTS_EVERY_MS = 5_000
+
+/**
+ * Whom to add to a conference (step 8b): typed once, then called by the room. `run` makes the conference first when
+ * the call is not one yet. The form closes as soon as it is sent: the call shows the progress, the panel any error.
+ */
+const AddParticipantForm = ({ id, run, onClose, onError, making }: { id: string; run: (number: string) => Promise<void>; onClose: () => void; onError: (message: string | null) => void; making: boolean }) => {
+  const { t } = useT()
+  const [target, setTarget] = useState('')
+  const dialable = toDialTarget(target)
+  const submit = (e: SyntheticEvent) => {
+    e.preventDefault()
+    if (!dialable) return
+    onError(null)
+    onClose()
+    run(dialable).catch((err: unknown) => onError(describeConferenceError(err, t, { making, who: formatNumber(dialable) })))
+  }
+  return (
+    <form id={id} className="transfer" onSubmit={submit} data-testid="add-participant-form">
+      <div className="field">
+        <label htmlFor={`${id}-target`}>{t('call.addParticipantTarget')}</label>
+        <input id={`${id}-target`} type="tel" inputMode="tel" autoComplete="off" value={target} onChange={e => setTarget(e.target.value)} />
+      </div>
+      <div className="actions">
+        <button type="submit" className="btn btn-primary" disabled={!dialable}>
+          {t('call.addParticipantSubmit')}
+        </button>
+        <button type="button" className="btn" onClick={onClose}>
+          {t('call.addParticipantClose')}
+        </button>
+      </div>
+    </form>
+  )
+}
+
+/** A participant of a conference, as the room has them: their number (or name), for the person. */
+const participantLabel = (p: ConferenceParticipant) => (p.number ? formatNumber(p.number) : (p.displayName ?? p.id))
+
+/** The participants of a conference this window made, read every few seconds and after each action on one. */
+const Participants = ({ meetingId, onError }: { meetingId: string; onError: (message: string | null) => void }) => {
+  const { t } = useT()
+  const { client, me } = useGateway()
+  const [people, setPeople] = useState<ConferenceParticipant[] | null>(null)
+  const [version, setVersion] = useState(0)
+  useEffect(() => {
+    let cancelled = false
+    const read = () =>
+      client.getCallConference(meetingId).then(
+        c => !cancelled && setPeople(c.participants),
+        () => undefined
+      )
+    void read()
+    const timer = setInterval(() => void read(), PARTICIPANTS_EVERY_MS)
+    return () => {
+      cancelled = true
+      clearInterval(timer)
+    }
+  }, [client, meetingId, version])
+  const act = (fn: () => Promise<void>) => () => {
+    void (async () => {
+      onError(null)
+      try {
+        await fn()
+      } catch (err) {
+        onError(describeConferenceError(err, t))
+      } finally {
+        setVersion(v => v + 1)
+      }
+    })()
+  }
+  if (!people) return <p className="badge">{t('conference.loading')}</p>
+  return (
+    <ul className="list participants" aria-label={t('conference.participants')} data-testid="conference-participants">
+      {people.map(p => {
+        const label = participantLabel(p)
+        const self = !!me?.extension && p.number === me.extension
+        return (
+          <li key={p.id} data-testid="conference-participant">
+            <span>
+              {label}
+              {self ? ` ${t('conference.you')}` : ''}
+              {p.muted ? (
+                <>
+                  {' '}
+                  <span className="badge">{t('conference.muted')}</span>
+                </>
+              ) : null}
+            </span>
+            {!self ? (
+              <span className="actions">
+                {!p.muted ? (
+                  <button type="button" className="btn" aria-label={t('conference.muteWho', { who: label })} onClick={act(() => client.muteParticipant(meetingId, p.id))}>
+                    {t('conference.mute')}
+                  </button>
+                ) : null}
+                <button type="button" className="btn" aria-label={t('conference.removeWho', { who: label })} onClick={act(() => client.removeParticipant(meetingId, p.id))}>
+                  {t('conference.remove')}
+                </button>
+              </span>
+            ) : null}
+          </li>
+        )
+      })}
+    </ul>
+  )
+}
+
+/**
+ * A call of a conference (step 8b). The window that made it (`conferenceOf`) has the participants, adds more,
+ * removes or mutes one, and ends it for everyone; anyone else in it mutes their microphone or leaves. Leaving is
+ * hanging up one's own call: the others go on.
+ */
+const ConferenceCall = ({ call, tones, onError }: { call: SoftCall; tones: string; onError: (message: string | null) => void }) => {
+  const { t } = useT()
+  const phone = usePhone()
+  const { client } = useGateway()
+  const [adding, setAdding] = useState(false)
+  const addButton = useRef<HTMLButtonElement>(null)
+  const mine = !!call.conferenceOf
+  const meetingId = call.conferenceOf ? phone.rooms[call.conferenceOf] : undefined
+  const inviting = meetingId ? (phone.inviting[meetingId] ?? []) : []
+  const connected = call.state === 'connected' || call.state === 'held'
+  const guard = (fn: () => Promise<void> | void) => () => {
+    void (async () => {
+      onError(null)
+      try {
+        await fn()
+      } catch (err) {
+        onError(describeConferenceError(err, t))
+      }
+    })()
+  }
+  const closeAdd = () => {
+    setAdding(false)
+    addButton.current?.focus()
+  }
+  return (
+    <section className="call call-conference" aria-labelledby={`call-${call.id}`} data-testid="conference">
+      <p id={`call-${call.id}`} className="call-title" role="status">
+        {mine ? t('conference.title') : t('conference.titleWith', { who: who(call, t) })}
+      </p>
+      {connected && call.connectedAt ? <Timer since={call.connectedAt} /> : null}
+      {mine && !meetingId ? <p className="badge">{t('conference.starting')}</p> : null}
+      <div role="status">
+        {inviting.map(n => (
+          <p key={n} className="badge">
+            {t('conference.inviting', { who: formatNumber(n) })}
+          </p>
+        ))}
+      </div>
+      {tones ? <p className="badge">{t('call.tonesReceived', { tones })}</p> : null}
+      {meetingId ? <Participants meetingId={meetingId} onError={onError} /> : null}
+      <div className="actions">
+        {connected ? (
+          <button type="button" className="btn" aria-pressed={call.muted} onClick={guard(() => call.setMuted(!call.muted))}>
+            {call.muted ? t('call.unmute') : t('call.mute')}
+          </button>
+        ) : null}
+        {meetingId ? (
+          <button ref={addButton} type="button" className="btn" aria-pressed={adding} aria-controls={`add-${call.id}`} onClick={() => (adding ? closeAdd() : setAdding(true))}>
+            {t('call.addParticipant')}
+          </button>
+        ) : null}
+        <button type="button" className="btn btn-danger" onClick={guard(() => call.hangup())}>
+          {t('conference.leave')}
+        </button>
+        {meetingId ? (
+          <button type="button" className="btn btn-danger" onClick={guard(() => client.endCallConference(meetingId))}>
+            {t('conference.end')}
+          </button>
+        ) : null}
+      </div>
+      {adding && meetingId ? <AddParticipantForm id={`add-${call.id}`} making={false} run={n => phone.inviteToConference(meetingId, n)} onClose={closeAdd} onError={onError} /> : null}
+    </section>
+  )
+}
+
 /** Where to send the person: typed once, then transferred at once or called first (consultation). */
 const TransferForm = ({ call, onClose, onError }: { call: SoftCall; onClose: () => void; onError: (message: string | null) => void }) => {
   const { t } = useT()
@@ -162,10 +343,13 @@ const TransferForm = ({ call, onClose, onError }: { call: SoftCall; onClose: () 
  */
 const Active = ({ call, tones, original, hasOther, onError }: { call: SoftCall; tones: string; original?: SoftCall; hasOther: boolean; onError: (message: string | null) => void }) => {
   const { t } = useT()
+  const phone = usePhone()
   const [keypad, setKeypad] = useState(false)
   const [transfer, setTransfer] = useState(false)
+  const [adding, setAdding] = useState(false)
   const [sent, setSent] = useState('')
   const transferButton = useRef<HTMLButtonElement>(null)
+  const addButton = useRef<HTMLButtonElement>(null)
   const connected = call.state === 'connected' || call.state === 'held'
   const guard = (fn: () => Promise<void> | void) => () => {
     void (async () => {
@@ -182,6 +366,14 @@ const Active = ({ call, tones, original, hasOther, onError }: { call: SoftCall; 
     setTransfer(false)
     transferButton.current?.focus()
   }
+  const closeAdd = () => {
+    setAdding(false)
+    addButton.current?.focus()
+  }
+  // A call a room places (step 8) is neither held nor transferred; a call between two people can become a
+  // conference (step 8b), once nothing else is going on.
+  const room = !!call.room
+  const canAdd = phone.conferenceAvailable && !room && !hasOther && !original
   const title = call.transferring
     ? t('call.transferringWho', { who: who(call, t) })
     : !connected
@@ -218,18 +410,25 @@ const Active = ({ call, tones, original, hasOther, onError }: { call: SoftCall; 
         {connected ? (
           <>
             {/* With two calls, hold and resume belong to the consultation (automatic): no switching between the two. */}
-            <button type="button" className="btn" aria-pressed={call.state === 'held'} disabled={busy || hasOther} onClick={guard(() => (call.state === 'held' ? call.resume() : call.hold()))}>
-              {call.state === 'held' ? t('call.resume') : t('call.hold')}
-            </button>
+            {!room ? (
+              <button type="button" className="btn" aria-pressed={call.state === 'held'} disabled={busy || hasOther} onClick={guard(() => (call.state === 'held' ? call.resume() : call.hold()))}>
+                {call.state === 'held' ? t('call.resume') : t('call.hold')}
+              </button>
+            ) : null}
             <button type="button" className="btn" aria-pressed={call.muted} onClick={guard(() => call.setMuted(!call.muted))}>
               {call.muted ? t('call.unmute') : t('call.mute')}
             </button>
             <button type="button" className="btn" aria-pressed={keypad} aria-controls={`dtmf-${call.id}`} onClick={() => setKeypad(k => !k)}>
               {t('call.keypad')}
             </button>
-            {!hasOther ? (
+            {!hasOther && !room ? (
               <button ref={transferButton} type="button" className="btn" aria-pressed={transfer} aria-controls={`transfer-form-${call.id}`} disabled={busy} onClick={() => (transfer ? closeTransfer() : setTransfer(true))}>
                 {t('call.transfer')}
+              </button>
+            ) : null}
+            {canAdd ? (
+              <button ref={addButton} type="button" className="btn" aria-pressed={adding} aria-controls={`add-${call.id}`} disabled={busy} onClick={() => (adding ? closeAdd() : setAdding(true))}>
+                {t('call.addParticipant')}
               </button>
             ) : null}
           </>
@@ -239,7 +438,8 @@ const Active = ({ call, tones, original, hasOther, onError }: { call: SoftCall; 
           {t('call.hangup')}
         </button>
       </div>
-      {transfer && connected && !hasOther ? <TransferForm call={call} onClose={closeTransfer} onError={onError} /> : null}
+      {transfer && connected && !hasOther && !room ? <TransferForm call={call} onClose={closeTransfer} onError={onError} /> : null}
+      {adding && connected && canAdd ? <AddParticipantForm id={`add-${call.id}`} making run={n => phone.addParticipant(call, n)} onClose={closeAdd} onError={onError} /> : null}
       {keypad && connected ? (
         <div id={`dtmf-${call.id}`} className="dtmf">
           <div className="keypad" role="group" aria-label={t('call.keypad')}>
@@ -268,11 +468,17 @@ export const CallPanel = () => {
   const { calls, lastEnded, tones } = usePhone()
   const [error, setError] = useState<string | null>(null)
   if (!calls.length && !lastEnded) return null
-  const ours = calls.filter(c => !(c.direction === 'inbound' && c.state === 'ringing'))
+  // A call answered at once (it takes the place of one of ours, or joins the conference we make) never rings here.
+  const ringing = (c: SoftCall) => c.direction === 'inbound' && c.state === 'ringing' && !c.replacedCallId && !c.conferenceOf
+  // The call that becomes a conference goes quiet, then ends: the conference shows in its place.
+  const moved = new Set(calls.flatMap(c => (c.conferenceOf ? [c.conferenceOf] : c.room === 'conference' && c.replacedCallId ? [c.replacedCallId] : [])))
+  const shown = calls.filter(c => !moved.has(c.id))
+  const ours = shown.filter(c => !ringing(c))
   return (
     <div className="calls" data-testid="calls">
-      {calls.map(call => {
-        if (call.direction === 'inbound' && call.state === 'ringing') return <Incoming key={call.id} call={call} />
+      {shown.map(call => {
+        if (ringing(call)) return <Incoming key={call.id} call={call} />
+        if (call.room === 'conference') return <ConferenceCall key={call.id} call={call} tones={tones[call.id] ?? ''} onError={setError} />
         const original = call.consultationOf ? ours.find(c => c.id === call.consultationOf) : undefined
         return <Active key={call.id} call={call} tones={tones[call.id] ?? ''} hasOther={ours.length > 1} onError={setError} {...(original ? { original } : {})} />
       })}

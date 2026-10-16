@@ -59,7 +59,15 @@ export interface TelephonyProvider {
    * SIP server refuses a room's call it was not told of. `token` goes with the call (ConferenceBridgeProvider's
    * dialParticipant, `grant`); `revoke` withdraws it when the call never reached the SIP server.
    */
-  grantRoomCall?(grant: { extension: string; number: string; ttlSec?: number }): Promise<{ token: string; revoke(): Promise<void> }>
+  grantRoomCall?(grant: RoomCallGrant): Promise<{ token: string; revoke(): Promise<void> }>
+  /**
+   * A call in progress between two of the tenant's extensions, as the SIP server holds it (step 8b, ADR 0019): its
+   * parties (the extensions where it reached, a ring group's member who answered, a forward's target) and the tags
+   * of its dialog, which a room's call that takes its place names (Replaces). `external` for an answered call with
+   * the public network or a room (no room's call takes its place: the platform has no B2BUA); undefined when the
+   * SIP server has no such call answered (ringing, over, never there).
+   */
+  callBetweenExtensions?(callId: string): Promise<CallParties | 'external' | undefined>
   /**
    * The access number of Meet's rooms as the SIP server has it (step 8): `number` undefined when its rooms are off
    * there; undefined when it cannot say. The Gateway compares it with its own at its start.
@@ -120,6 +128,31 @@ export interface ConferenceBridgeProvider {
   dialParticipant(meetingId: string, number: string, options?: { from?: string; grant?: string }): Promise<ConferenceParticipant>
   disconnectParticipant(participantId: string): Promise<void>
   muteParticipant(participantId: string): Promise<void>
+}
+
+/**
+ * What a room's call may do (step 8 and 8b): `extension` calls `number`, once, within `ttlSec` seconds. `replaces`
+ * (step 8b): it takes the place of that call of `number` (`callid;to-tag=…;from-tag=…`, the dialog as `number` sees
+ * it), answered at once by the phone that has it and never sent elsewhere; `join`: it goes to `extension` itself
+ * (`number` is theirs), carries that token (Twake-Join), and only the window that asked for it answers it.
+ */
+export interface RoomCallGrant {
+  extension: string
+  number: string
+  ttlSec?: number
+  replaces?: string
+  join?: string
+}
+
+/** The parties of a call between two extensions, and its dialog (callBetweenExtensions). */
+export interface CallParties {
+  callId: string
+  /** The extension that placed it, and the From tag. */
+  caller: string
+  callerTag: string
+  /** The extension it reached (who answered), and the To tag. */
+  callee: string
+  calleeTag: string
 }
 
 /** Pushes a user's SIP secret where the SIP server checks it. The Gateway generates and keeps the secret. */

@@ -11,6 +11,11 @@ import type { Queryable } from './subscriber.js'
  * characters drawn by the Gateway; `extension`: whose call it is (the From LiveKit SIP writes); `number`: the number
  * the room calls, as the Gateway gave it to LiveKit (the INVITE's Request-URI); `expires_at`: after which nothing
  * takes it any more. OpenSIPS deletes the row it takes; the Gateway the rows past their time, at each grant.
+ * Step 8b (ADR 0019), for the calls of a room that take the place of a call in progress (a conference): `replaces`,
+ * the dialog of that call as `number` sees it (`callid;to-tag=…;from-tag=…`), which OpenSIPS writes in a Replaces
+ * header of its own (any LiveKit SIP sends is refused); `join_token`, the token OpenSIPS writes in Twake-Join, for the
+ * call of the person who made the conference (`number` is their own extension). Either one: the call goes straight
+ * to the phones of `number`, without their forwards nor their "do not disturb".
  */
 export const DIAL_OUT_GRANTS_SCHEMA = `
 CREATE TABLE IF NOT EXISTS dial_out_grants (
@@ -20,6 +25,8 @@ CREATE TABLE IF NOT EXISTS dial_out_grants (
     number VARCHAR(64) NOT NULL,
     expires_at TIMESTAMP WITH TIME ZONE NOT NULL
 );
+ALTER TABLE dial_out_grants ADD COLUMN IF NOT EXISTS replaces VARCHAR(320);
+ALTER TABLE dial_out_grants ADD COLUMN IF NOT EXISTS join_token VARCHAR(64);
 `
 
 /** The header LiveKit SIP carries the grant in (CreateSIPParticipant's `headers`), and OpenSIPS reads. */
@@ -29,6 +36,15 @@ export const GRANT_TTL_SEC = 30
 
 const SIP_USER = /^[A-Za-z0-9._+-]{1,64}$/
 const NUMBER = /^\+?[0-9*#]{2,20}$/
+/**
+ * A dialog as Replaces names it (RFC 3891): a Call-ID and two tags, of characters a header carries as they are (no
+ * space, comma, semicolon, quote or line break: nothing more than that header could be written with it).
+ */
+export const REPLACES = /^[A-Za-z0-9._~!%*+@:-]{1,200};to-tag=[A-Za-z0-9._~!%*+-]{1,50};from-tag=[A-Za-z0-9._~!%*+-]{1,50}$/
+/** The token of the call of the person who made a conference (Twake-Join): 32 hexadecimal characters, drawn by their window. */
+export const JOIN_TOKEN = /^[0-9a-f]{32}$/
+/** The header that carries it to the person's windows. */
+export const JOIN_HEADER = 'Twake-Join'
 
 export interface DialOutGrantsOptions {
   pool: Queryable
@@ -48,17 +64,33 @@ export class DialOutGrants {
   }
 
   /**
-   * A grant for one call of a room: `extension` calls `number`, within `ttlSec` seconds. Returns the token to hand
+   * A grant for one call of a room: `extension` calls `number`, within `ttlSec` seconds; `replaces` or `join` (step
+   * 8b, see the schema), one of them at most, a join for the person's own extension only. Returns the token to hand
    * LiveKit SIP. The tenant's grants past their time go first.
    */
-  async grant(extension: string, number: string, ttlSec = GRANT_TTL_SEC): Promise<string> {
+  async grant(extension: string, number: string, ttlSec = GRANT_TTL_SEC, conference: { replaces?: string; join?: string } = {}): Promise<string> {
     if (!SIP_USER.test(extension)) throw Object.assign(new Error('Extension is not a valid SIP user'), { statusCode: 400 })
     if (!NUMBER.test(number)) throw Object.assign(new Error('Invalid phone number'), { statusCode: 400 })
     if (!(Number.isInteger(ttlSec) && ttlSec >= 1 && ttlSec <= 300)) throw new Error('A grant lives 1 to 300 seconds')
+    const { replaces, join } = conference
+    if (replaces !== undefined && join !== undefined) throw new Error('A grant replaces a call or joins its person, not both')
+    if (replaces !== undefined && !REPLACES.test(replaces)) throw Object.assign(new Error('Invalid call to replace'), { statusCode: 400 })
+    if (join !== undefined && !(JOIN_TOKEN.test(join) && number === extension)) throw Object.assign(new Error('Invalid join'), { statusCode: 400 })
     const token = this.opts.token?.() ?? randomBytes(16).toString('hex')
     await this.opts.ready?.()
     await this.opts.pool.query('DELETE FROM dial_out_grants WHERE tenant_id = $1 AND expires_at < now()', [this.tenantId])
-    await this.opts.pool.query('INSERT INTO dial_out_grants (token, tenant_id, extension, number, expires_at) VALUES ($1, $2, $3, $4, now() + make_interval(secs => $5))', [token, this.tenantId, extension, number, ttlSec])
+    if (replaces === undefined && join === undefined)
+      await this.opts.pool.query('INSERT INTO dial_out_grants (token, tenant_id, extension, number, expires_at) VALUES ($1, $2, $3, $4, now() + make_interval(secs => $5))', [token, this.tenantId, extension, number, ttlSec])
+    else
+      await this.opts.pool.query('INSERT INTO dial_out_grants (token, tenant_id, extension, number, expires_at, replaces, join_token) VALUES ($1, $2, $3, $4, now() + make_interval(secs => $5), $6, $7)', [
+        token,
+        this.tenantId,
+        extension,
+        number,
+        ttlSec,
+        replaces ?? null,
+        join ?? null
+      ])
     return token
   }
 

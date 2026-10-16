@@ -3,6 +3,12 @@ import { PIN_DIGITS } from '@twake/conference-livekit'
 /** The name the Gateway gives a room without Meet (POST /conferences with `create`). */
 export const GATEWAY_ROOM = /^twake-[0-9a-f]{16}$/
 
+/**
+ * The name the Gateway gives the room of a call that becomes a conference (step 8b, POST /calls/:id/conference), with
+ * or without Meet: never Meet's, never a dispatch rule (nobody dials into it), nobody's but its call's.
+ */
+export const CALL_ROOM = /^twake-call-[0-9a-f]{16}$/
+
 /** What the sweep needs of the LiveKit bridge: the Gateway's dispatch rules, and deleting those of a room with a PIN. */
 export interface SweptBridge {
   listDialIns(): Promise<{ meetingId: string; pin: string }[]>

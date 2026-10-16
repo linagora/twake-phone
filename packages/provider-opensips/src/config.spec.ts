@@ -112,12 +112,46 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(source).toContain('if (!($avp(meet_grant) =~ "^[0-9a-f]{32}$") || !($rU =~ "^[+]?[0-9*#]{2,20}$")) {')
     expect(source.indexOf('t_reply(403, "Not Granted");')).toBeLessThan(source.indexOf('async(sql_query_one('))
     // Deleted as it is read: used once, before its expiry, for this person and this number only.
-    expect(source).toContain(`"DELETE FROM dial_out_grants g WHERE g.token = '" + $avp(meet_grant) + "' AND g.extension = '" + $fU + "' AND g.number = '" + $rU + "' AND g.expires_at > now() AND EXISTS (SELECT 1 FROM subscriber s WHERE s.username = g.extension) RETURNING 1"`)
+    expect(source).toContain(`"DELETE FROM dial_out_grants g WHERE g.token = '" + $avp(meet_grant) + "' AND g.extension = '" + $fU + "' AND g.number = '" + $rU + "' AND g.expires_at > now() AND EXISTS (SELECT 1 FROM subscriber s WHERE s.username = g.extension) RETURNING 1, coalesce(g.replaces, ''), coalesce(g.join_token, '')"`)
     const loaded = section('route[meet_source_loaded]', 'route[meet_call]')
     expect(loaded).toContain('if ($var(meet_rc) == -2) {')
     expect(loaded.indexOf('append_to_reply("Twake-Call-Refused: not-granted\\r\\n");')).toBeLessThan(loaded.indexOf('route(trunk_out);'))
     // The CDR says the call came from a room.
     expect(cfg).toContain('$acc_extra(via) = "meet";')
+  })
+
+  it("sends a conference's room call (step 8b) where its grant says, as it says, and nowhere else; no phone writes what only this script does", () => {
+    const { cfg } = render({ SIP_DOMAIN: 'sip.example.test', MEET_SIP: '192.0.2.20:5080', MEET_SIP_PASSWORD: 'not-a-real-secret-0' })
+    const section = (name: string, next: string) => cfg.slice(cfg.indexOf(`\n${name} {`), cfg.indexOf(`\n${next} {`))
+    // The grant's conference columns, read with it into AVPs of their own.
+    expect(section('route[meet_source]', 'route[meet_source_loaded]')).toContain('async(sql_query_one("$var(meet_query)", "$avp(meet_known);$avp(meet_replaces);$avp(meet_join)"), meet_source_loaded);')
+    const loaded = section('route[meet_source_loaded]', 'route[conference_leg]')
+    const at = (text: string, within = loaded) => {
+      const i = within.indexOf(text)
+      expect(i, text).toBeGreaterThan(0)
+      return i
+    }
+    // Once the grant is taken, before any trunk or rule; a room's other calls say a room calls.
+    expect(at('route(conference_leg);')).toBeGreaterThan(at('t_reply(503, "Service Unavailable");'))
+    expect(at('route(conference_leg);')).toBeLessThan(at('route(trunk_out);'))
+    expect(at('route(trunk_out);')).toBeLessThan(at('append_hf("Twake-Room: meet\\r\\n");'))
+    expect(at('append_hf("Twake-Room: meet\\r\\n");')).toBeLessThan(at('route(rules_next);'))
+    const leg = section('route[conference_leg]', 'route[meet_call]')
+    // Never the public network; the header of its grant, written by this script; then the phones of the extension.
+    expect(at('t_reply(403, "Not Granted");', leg)).toBeLessThan(at('append_hf("Replaces: $avp(meet_replaces)\\r\\n");', leg))
+    expect(leg).toContain('\telse\n\t\tappend_hf("Twake-Join: $avp(meet_join)\\r\\n");\n\tappend_hf("Twake-Room: conference\\r\\n");')
+    expect(leg).toContain('$acc_extra(via) = "conference";')
+    expect(at('if (!lookup("location")) {', leg)).toBeLessThan(at('route(names_next);', leg))
+    // No rules, no forward, no group, no trunk, no wake: the very phones of that extension.
+    expect(leg.split('\n').filter(l => !l.trim().startsWith('#')).join('\n')).not.toMatch(/\brules_|\bforward|\bgroup|\btrunk_out|\bwake/)
+    // From the phones and the operator, before anything: only this script writes them.
+    expect(cfg.match(/\tremove_hf\("Twake-Join"\);/g)).toHaveLength(2)
+    expect(cfg.match(/\tremove_hf\("Twake-Room"\);/g)).toHaveLength(2)
+    const main = cfg.slice(0, cfg.indexOf('\nroute[meet_source] {'))
+    expect(main.indexOf('remove_hf("Twake-Join");')).toBeLessThan(main.indexOf('route(meet_source);'))
+    // The tag of the phone that answered stays with the dialog; the events say which call is a conference's.
+    expect(cfg).toContain('$avp(answered) = 1;\n\t\t\t# The tag of the phone that answered: a room\'s call that takes the place of this one names it (step 8b).\n\t\t\t$dlg_val(callee_tag) = $tt;')
+    expect(section('route[event_attrs]', 'route[probe_event]')).toContain('if ($avp(conference) != NULL) {\n\t\t$avp(ev_attr) = "conference";\n\t\t$avp(ev_val) = "1";\n\t}')
   })
 
   it('counts every call LiveKit SIP answers as a try of its caller, when it comes, caps the calls at the same time, tells the administrators, and bounds every call with LiveKit SIP (step 8, third review n°1, n°2, n°3)', () => {

@@ -30,6 +30,19 @@ export interface Phone {
   unblockAudio(): Promise<boolean>
   /** Rings for a moment, so the person hears where the ringtone goes. */
   ringTest(): Promise<boolean>
+  /** This platform's rooms can call (a call can become a conference, step 8b). */
+  conferenceAvailable: boolean
+  /**
+   * « Ajouter un participant » (step 8b): the call becomes a conference in a room of its own, then the room calls
+   * `number`. Resolves once that number answered; the conference stays whatever becomes of that call.
+   */
+  addParticipant(call: SoftCall, number: string): Promise<void>
+  /** The room of a conference this window made calls `number` (the third participant, or one more). */
+  inviteToConference(meetingId: string, number: string): Promise<void>
+  /** The room of each conference this window made, by the call that became it. */
+  rooms: Record<string, string>
+  /** The numbers each room is calling now, by room. */
+  inviting: Record<string, string[]>
 }
 
 const DEVICES_KEY = 'twakephone.audio'
@@ -77,6 +90,9 @@ export const SoftphoneProvider = ({ children }: { children: ReactNode }) => {
   const [devices, setDevicesState] = useState<AudioDevices>(readDevices)
   const [devicesVersion, setDevicesVersion] = useState(0)
   const [soundBlocked, setSoundBlocked] = useState(false)
+  const [conferenceAvailable, setConferenceAvailable] = useState(false)
+  const [rooms, setRooms] = useState<Record<string, string>>({})
+  const [inviting, setInviting] = useState<Record<string, string[]>>({})
   const phone = useRef<Softphone | null>(null)
   const devicesRef = useRef(devices)
   // eslint-disable-next-line react-hooks/refs -- the latest value, read by an effect without restarting it
@@ -114,6 +130,12 @@ export const SoftphoneProvider = ({ children }: { children: ReactNode }) => {
       onCallChange: call => {
         if (cancelled) return
         setCalls(softphone.activeCalls())
+        // The conference this window made is over for it: its room is no longer this window's to show.
+        if (call.state === 'ended' && call.conferenceOf)
+          setRooms(r => {
+            const { [call.conferenceOf!]: _, ...rest } = r
+            return rest
+          })
         if (call.state === 'ended') {
           // A completed transfer ends two calls at once: what the person is told is that the transfer happened.
           setLastEnded(prev => (prev?.endReason === 'transferred' && call.endReason === 'hangup' && prev.endedAt && Date.now() - prev.endedAt.getTime() < LAST_ENDED_MS ? prev : call))
@@ -130,6 +152,11 @@ export const SoftphoneProvider = ({ children }: { children: ReactNode }) => {
     phone.current = softphone
     setState('connecting')
     setDetail(null)
+    // Whether a call can become a conference: the rooms of this platform call (step 8b).
+    client
+      .getCapabilities()
+      .then(caps => !cancelled && setConferenceAvailable(caps.conference?.dialOut === true))
+      .catch(() => undefined)
     softphone.start().catch((err: unknown) => {
       if (cancelled) return
       // No session for this user (404: no extension mapped, or no SIP server): calling is simply off.
@@ -144,8 +171,48 @@ export const SoftphoneProvider = ({ children }: { children: ReactNode }) => {
       setCalls([])
       setState('off')
       setSoundBlocked(false)
+      setRooms({})
+      setInviting({})
+      setConferenceAvailable(false)
     }
   }, [client, extension])
+
+  const inviteToConference = useCallback(
+    async (meetingId: string, number: string) => {
+      setInviting(i => ({ ...i, [meetingId]: [...(i[meetingId] ?? []), number] }))
+      try {
+        await client.inviteByPhone(meetingId, number)
+      } finally {
+        setInviting(i => {
+          const left = (i[meetingId] ?? []).filter(n => n !== number)
+          const { [meetingId]: _, ...rest } = i
+          return left.length ? { ...rest, [meetingId]: left } : rest
+        })
+      }
+    },
+    [client]
+  )
+
+  const addParticipant = useCallback(
+    async (call: SoftCall, number: string) => {
+      const softphone = phone.current
+      if (!softphone) throw new Error('Softphone not started')
+      // The token of the room's call to this window, then the Gateway makes the conference (both of us in it): the
+      // call as the SIP server names it (its Call-ID), not as this window tells its calls apart.
+      const join = softphone.expectConference(call.id)
+      let meetingId: string
+      try {
+        if (!call.sipCallId) throw new Error('No Call-ID for this call')
+        meetingId = (await client.makeConference(call.sipCallId, join)).meetingId
+      } catch (err) {
+        softphone.cancelConference()
+        throw err
+      }
+      setRooms(r => ({ ...r, [call.id]: meetingId }))
+      await inviteToConference(meetingId, number)
+    },
+    [client, inviteToConference]
+  )
 
   const call = useCallback(async (target: string) => {
     if (!phone.current) throw new Error('Softphone not started')
@@ -173,14 +240,14 @@ export const SoftphoneProvider = ({ children }: { children: ReactNode }) => {
   const ringTest = useCallback(async () => (phone.current ? phone.current.ringTest() : false), [])
 
   const value = useMemo<Phone>(
-    () => ({ state, detail, calls, lastEnded, tones, call, shutdown, devices, setDevices, devicesVersion, soundBlocked, unblockAudio, ringTest }),
-    [state, detail, calls, lastEnded, tones, call, shutdown, devices, setDevices, devicesVersion, soundBlocked, unblockAudio, ringTest]
+    () => ({ state, detail, calls, lastEnded, tones, call, shutdown, devices, setDevices, devicesVersion, soundBlocked, unblockAudio, ringTest, conferenceAvailable, addParticipant, inviteToConference, rooms, inviting }),
+    [state, detail, calls, lastEnded, tones, call, shutdown, devices, setDevices, devicesVersion, soundBlocked, unblockAudio, ringTest, conferenceAvailable, addParticipant, inviteToConference, rooms, inviting]
   )
   // What a test can read from outside: never actions, only counters (packets, calls, tones).
   useEffect(() => {
     window.twakephone = {
       state,
-      calls: calls.map(c => ({ id: c.id, direction: c.direction, state: c.state, remoteNumber: c.remoteNumber, remoteHold: c.remoteHold, muted: c.muted, renegotiating: c.renegotiating, transferring: c.transferring, ...(c.replacedCallId ? { replacedCallId: c.replacedCallId } : {}), ...(c.consultationOf ? { consultationOf: c.consultationOf } : {}) })),
+      calls: calls.map(c => ({ id: c.id, sipCallId: c.sipCallId, direction: c.direction, state: c.state, remoteNumber: c.remoteNumber, remoteHold: c.remoteHold, muted: c.muted, renegotiating: c.renegotiating, transferring: c.transferring, ...(c.replacedCallId ? { replacedCallId: c.replacedCallId } : {}), ...(c.consultationOf ? { consultationOf: c.consultationOf } : {}), ...(c.room ? { room: c.room } : {}), ...(c.conferenceOf ? { conferenceOf: c.conferenceOf } : {}) })),
       lastEnded: lastEnded ? { id: lastEnded.id, remoteNumber: lastEnded.remoteNumber, endReason: lastEnded.endReason, endStatus: lastEnded.endStatus, ...(lastEnded.endMessage ? { endMessage: lastEnded.endMessage } : {}), ...(lastEnded.endRefusal ? { endRefusal: lastEnded.endRefusal } : {}) } : null,
       tones,
       devices,

@@ -10,5 +10,5 @@ export const historyEntryFor = (tenantId: string, userId: string, event: Telepho
   const endedAt = call.endedAt ?? event.timestamp
   const answered = Boolean(call.connectedAt)
   const durationSec = answered ? Math.max(0, Math.round((Date.parse(endedAt) - Date.parse(call.connectedAt!)) / 1000)) : 0
-  return { tenantId, userId, callId: call.id, direction: call.direction, remoteNumber: call.remoteNumber, startedAt, endedAt, durationSec, state: call.state, answered }
+  return { tenantId, userId, callId: call.id, direction: call.direction, remoteNumber: call.remoteNumber, startedAt, endedAt, durationSec, state: call.state, answered, ...(call.conference ? { conference: true } : {}) }
 }

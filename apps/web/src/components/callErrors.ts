@@ -15,7 +15,8 @@ const TRANSFER_REASON_KEY: Record<EndReason, Key> = {
   transferred: 'call.errorTransferFailed',
   dnd: 'call.errorTransferDnd',
   'answered-elsewhere': 'call.errorTransferFailed',
-  refused: 'call.errorTransferNotAllowed'
+  refused: 'call.errorTransferNotAllowed',
+  conference: 'call.errorTransferFailed'
 }
 
 const CODE_KEY: Partial<Record<CallError['code'], Key>> = {
@@ -32,7 +33,32 @@ const CODE_KEY: Partial<Record<CallError['code'], Key>> = {
   'transfer-in-progress': 'call.errorTransferInProgress',
   'transfer-self': 'call.errorTransferSelf',
   'transfer-refused': 'call.errorTransferRefused',
-  'transfer-external': 'call.errorTransferExternal'
+  'transfer-external': 'call.errorTransferExternal',
+  'room-call': 'call.errorRoomCall'
+}
+
+/**
+ * Why a conference did not begin (`making`: the call was to become one) or a room did not call someone (step 8b), in
+ * the person's words: the Gateway's `code`, else a softphone error, else as it came.
+ */
+export const describeConferenceError = (err: unknown, t: T, { making = false, who = '' }: { making?: boolean; who?: string } = {}): string => {
+  const failed = err as { code?: unknown; status?: unknown } | null
+  switch (failed?.code) {
+    case 'CONFERENCE_EXTERNAL':
+      return t('conference.errorExternal')
+    case 'CALL_NOT_ANSWERED':
+      return t('conference.errorNotAnswered')
+    case 'DIAL_FAILED':
+      return making ? t('conference.errorNotStarted') : t('conference.errorDialFailed', { who })
+    case 'CONFERENCE_LIMIT':
+    case 'DIAL_OUT_LIMIT':
+      return t('conference.errorLimit')
+    case 'CONFERENCE_UNAVAILABLE':
+      return t('conference.errorUnavailable')
+  }
+  if (failed?.status === 501) return t('conference.errorUnavailable')
+  if (err instanceof CallError) return describeCallError(err, t)
+  return t('conference.errorAction', { reason: err instanceof Error ? err.message : String(err) })
 }
 
 /** A softphone error in the person's language (the SIP status stays, for whoever reports it); anything else as it came. */

@@ -11,7 +11,7 @@ const MIGRATIONS = fileURLToPath(new URL('../../migrations/', import.meta.url))
 type Timestamp = Date | string
 type ProviderRow = { tenant_id: string; site: string; type: string; config: unknown }
 type MappingRow = { tenant_id: string; user_id: string; extension: string; display_name: string | null; department: string | null; source: MappingSource; synced_at: Timestamp | null }
-type HistoryRow = { tenant_id: string; user_id: string; call_id: string; direction: HistoryEntry['direction']; remote_number: string; started_at: Timestamp; ended_at: Timestamp | null; duration_sec: number; state: HistoryEntry['state']; answered: boolean }
+type HistoryRow = { tenant_id: string; user_id: string; call_id: string; direction: HistoryEntry['direction']; remote_number: string; started_at: Timestamp; ended_at: Timestamp | null; duration_sec: number; state: HistoryEntry['state']; answered: boolean; conference: boolean }
 type PresenceRow = { tenant_id: string; user_id: string; status: UserPresenceRecord['status']; since: Timestamp; until: Timestamp | null; message: string | null }
 type ConferenceRow = { tenant_id: string; meeting_id: string; owner_user_id: string; pin: string | null; created_at: Timestamp }
 type PushRow = { tenant_id: string; user_id: string; endpoint: string; p256dh: string; auth: string; created_at: Timestamp }
@@ -42,7 +42,8 @@ const toEntry = (r: HistoryRow): HistoryEntry => ({
   ...(r.ended_at ? { endedAt: new Date(r.ended_at).toISOString() } : {}),
   durationSec: r.duration_sec,
   state: r.state,
-  answered: r.answered
+  answered: r.answered,
+  ...(r.conference ? { conference: true } : {})
 })
 
 /** PostgreSQL store. Every statement is parameterised and carries the tenant. */
@@ -130,9 +131,9 @@ export class PgStore implements Store {
 
   async addHistory(e: HistoryEntry) {
     await this.pool.query(
-      `INSERT INTO call_history (tenant_id, user_id, call_id, direction, remote_number, started_at, ended_at, duration_sec, state, answered)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) ON CONFLICT DO NOTHING`,
-      [e.tenantId, e.userId, e.callId, e.direction, e.remoteNumber, e.startedAt, e.endedAt ?? null, e.durationSec, e.state, e.answered]
+      `INSERT INTO call_history (tenant_id, user_id, call_id, direction, remote_number, started_at, ended_at, duration_sec, state, answered, conference)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) ON CONFLICT DO NOTHING`,
+      [e.tenantId, e.userId, e.callId, e.direction, e.remoteNumber, e.startedAt, e.endedAt ?? null, e.durationSec, e.state, e.answered, e.conference === true]
     )
   }
 
@@ -258,6 +259,11 @@ export class PgStore implements Store {
       [tenantId, ownerUserId ?? null]
     )
     return Number(rows[0]?.n ?? 0)
+  }
+
+  async listConferences(tenantId: string, ownerUserId: string) {
+    const { rows } = await this.pool.query<ConferenceRow>('SELECT * FROM conferences WHERE tenant_id = $1 AND owner_user_id = $2 ORDER BY created_at, meeting_id', [tenantId, ownerUserId])
+    return rows.map(r => this.conference(r)!)
   }
 
   async deleteConference(meetingId: string) {

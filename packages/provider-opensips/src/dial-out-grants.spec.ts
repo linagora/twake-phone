@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import pg from 'pg'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { DIAL_OUT_GRANTS_SCHEMA, DialOutGrants, GRANT_HEADER } from './dial-out-grants.js'
+import { DIAL_OUT_GRANTS_SCHEMA, DialOutGrants, GRANT_HEADER, JOIN_HEADER } from './dial-out-grants.js'
 import { SUBSCRIBER_SCHEMA, SUBSCRIBER_SQL, SubscriberProvisioner } from './subscriber.js'
 import { TRUNK_SQL } from './trunks.js'
 
@@ -24,6 +24,9 @@ describe('DIAL_OUT_GRANTS_SCHEMA', () => {
     expect(SUBSCRIBER_SQL).toContain('CREATE TABLE IF NOT EXISTS dial_out_grants')
     expect(TRUNK_SQL).toContain('CREATE TABLE IF NOT EXISTS dial_out_grants')
     expect(GRANT_HEADER).toBe('X-Twake-Grant')
+    expect(JOIN_HEADER).toBe('Twake-Join')
+    // Step 8b: the columns of a conference's grants, added to a table of step 8.
+    for (const sql of [SUBSCRIBER_SQL, TRUNK_SQL]) expect(sql).toContain('ALTER TABLE dial_out_grants ADD COLUMN IF NOT EXISTS replaces VARCHAR(320);\nALTER TABLE dial_out_grants ADD COLUMN IF NOT EXISTS join_token VARCHAR(64);')
   })
 })
 
@@ -43,6 +46,31 @@ describe('DialOutGrants', () => {
     })
     await grants.revoke(token)
     expect(db.queries.at(-1)).toEqual({ text: 'DELETE FROM dial_out_grants WHERE tenant_id = $1 AND token = $2', values: ['A', token] })
+  })
+
+  it("writes a conference's grant (step 8b): the call it takes the place of, or the token of the window it joins, its person's own", async () => {
+    const db = recorder()
+    const grants = new DialOutGrants({ pool: db.pool, tenantId: 'A', token: () => 'f'.repeat(32) })
+    await grants.grant('101', '102', 30, { replaces: 'a84b4c76e66710@pc33.example.test;to-tag=1928301774;from-tag=a6c85cf' })
+    await grants.grant('101', '101', 30, { join: '0123456789abcdef'.repeat(2) })
+    const inserts = db.queries.filter(q => q.text.startsWith('INSERT'))
+    expect(inserts.map(q => q.text)).toEqual(Array(2).fill('INSERT INTO dial_out_grants (token, tenant_id, extension, number, expires_at, replaces, join_token) VALUES ($1, $2, $3, $4, now() + make_interval(secs => $5), $6, $7)'))
+    expect(inserts.map(q => q.values!.slice(5))).toEqual([
+      ['a84b4c76e66710@pc33.example.test;to-tag=1928301774;from-tag=a6c85cf', null],
+      [null, '0123456789abcdef'.repeat(2)]
+    ])
+    db.queries.splice(0)
+    // Nothing a header could be written with, no join for someone else's extension nor both at once.
+    for (const [number, conference] of [
+      ['102', { replaces: 'c1;to-tag=a;from-tag=b\r\nX-Evil: 1' }],
+      ['102', { replaces: 'c1, c2;to-tag=a;from-tag=b' }],
+      ['102', { replaces: 'c1;to-tag=a' }],
+      ['102', { join: '0123456789abcdef'.repeat(2) }],
+      ['101', { join: 'G'.repeat(32) }],
+      ['101', { join: '0123456789abcdef'.repeat(2), replaces: 'c1;to-tag=a;from-tag=b' }]
+    ] as const)
+      await expect(grants.grant('101', number, 30, conference), JSON.stringify(conference)).rejects.toThrow()
+    expect(db.queries).toEqual([])
   })
 
   it('never writes a grant for something that is no SIP user, no number, or that would live too long', async () => {
@@ -91,6 +119,26 @@ if (process.env.TEST_DATABASE_URL) {
         .replace(`'" + $rU + "'`, `'${to}'`)
       return (await pool.query(sql)).rowCount
     }
+    /** The same query's row, as OpenSIPS reads it into its AVPs (meet_known, meet_replaces, meet_join). */
+    const taken = async (grant: string, from: string, to: string) => {
+      const sql = line
+        .slice(line.indexOf('"') + 1, line.lastIndexOf('"'))
+        .replace(`'" + $avp(meet_grant) + "'`, `'${grant}'`)
+        .replace(`'" + $fU + "'`, `'${from}'`)
+        .replace(`'" + $rU + "'`, `'${to}'`)
+      return (await pool.query({ text: sql, rowMode: 'array' })).rows
+    }
+
+    it("hands OpenSIPS what a conference's grant says, once (step 8b); a grant of step 8 says none of it", async () => {
+      const grants = new DialOutGrants({ pool, ready, tenantId: 'spec' })
+      const replacing = await grants.grant('9101', '9102', 30, { replaces: 'c1;to-tag=b;from-tag=a' })
+      const joining = await grants.grant('9101', '9101', 30, { join: 'e'.repeat(32) })
+      const plain = await grants.grant('9101', '9102')
+      expect(await taken(replacing, '9101', '9102')).toEqual([[1, 'c1;to-tag=b;from-tag=a', '']])
+      expect(await taken(replacing, '9101', '9102')).toEqual([])
+      expect(await taken(joining, '9101', '9101')).toEqual([[1, '', 'e'.repeat(32)]])
+      expect(await taken(plain, '9101', '9102')).toEqual([[1, '', '']])
+    })
 
     it('takes a grant once, before its expiry, for its person and its number only', async () => {
       const grants = new DialOutGrants({ pool, ready, tenantId: 'spec' })

@@ -686,10 +686,13 @@ route {
 	}
 	consume_credentials();
 	# Who calls is told by this script only (the From's display, route[caller_name]): no identity a phone asserts
-	# passes on.
+	# passes on. Nor that a room calls (Twake-Room) or for which window (Twake-Join, step 8b): this script says it of
+	# the room's calls it let through (route[meet_source_loaded]), never a phone nor LiveKit SIP.
 	remove_hf("P-Asserted-Identity");
 	remove_hf("P-Preferred-Identity");
 	remove_hf("Remote-Party-ID");
+	remove_hf("Twake-Room");
+	remove_hf("Twake-Join");
 
 	if ($rU == NULL) {
 		send_reply(484, "Address Incomplete");
@@ -854,7 +857,8 @@ route {
 
 # A room's call: its grant taken (deleted, so used once), for whoever its From names, one of our accounts, and the
 # number it calls as the Gateway gave it to LiveKit (the Request-URI), read without holding this process. Only the
-# characters of a grant (32 hexadecimal) and of a number get into the query.
+# characters of a grant (32 hexadecimal) and of a number get into the query. With the grant, what it says of a
+# conference (step 8b, ADR 0019): the call it takes the place of (`replaces`), or the window it is for (`join_token`).
 route[meet_source] {
 	$avp(meet_pstn) = $var(pstn);
 	if (!($avp(meet_grant) =~ "^[0-9a-f]{32}$") || !($rU =~ "^[+]?[0-9*#]{2,20}$")) {
@@ -863,8 +867,8 @@ route[meet_source] {
 		t_reply(403, "Not Granted");
 		exit;
 	}
-	$var(meet_query) = "DELETE FROM dial_out_grants g WHERE g.token = '" + $avp(meet_grant) + "' AND g.extension = '" + $fU + "' AND g.number = '" + $rU + "' AND g.expires_at > now() AND EXISTS (SELECT 1 FROM subscriber s WHERE s.username = g.extension) RETURNING 1";
-	async(sql_query_one("$var(meet_query)", "$avp(meet_known)"), meet_source_loaded);
+	$var(meet_query) = "DELETE FROM dial_out_grants g WHERE g.token = '" + $avp(meet_grant) + "' AND g.extension = '" + $fU + "' AND g.number = '" + $rU + "' AND g.expires_at > now() AND EXISTS (SELECT 1 FROM subscriber s WHERE s.username = g.extension) RETURNING 1, coalesce(g.replaces, ''), coalesce(g.join_token, '')";
+	async(sql_query_one("$var(meet_query)", "$avp(meet_known);$avp(meet_replaces);$avp(meet_join)"), meet_source_loaded);
 }
 
 route[meet_source_loaded] {
@@ -884,11 +888,46 @@ route[meet_source_loaded] {
 		t_reply(503, "Service Unavailable");
 		exit;
 	}
+	if (($avp(meet_replaces) != NULL && $avp(meet_replaces) != "") || ($avp(meet_join) != NULL && $avp(meet_join) != "")) {
+		route(conference_leg);
+		exit;
+	}
 	if ($avp(meet_pstn) == 1) {
 		route(trunk_out);
 		exit;
 	}
+	# The callee's phone knows a room calls (no hold nor transfer there: the room's calls are not transferred).
+	append_hf("Twake-Room: meet\r\n");
 	route(rules_next);
+	exit;
+}
+
+# A room's call of a conference (step 8b, ADR 0019), as its grant says: in the place of a call of the extension it
+# calls (Replaces, the dialog the Gateway read from this proxy: its phone that has the call answers at once and ends
+# that call), or to the person who makes the conference (Twake-Join, the token their window drew: only that window
+# answers). To the phones of that extension and nowhere else: no rules (a forward, a "do not disturb"), no ring group,
+# never the public network. Its CDR says `via` conference; its events, `conference`.
+route[conference_leg] {
+	if ($avp(meet_pstn) == 1) {
+		xlog("L_NOTICE", "meet: conference call $ci from $avp(caller) to $rU refused: not an extension\n");
+		append_to_reply("Twake-Call-Refused: not-granted\r\n");
+		t_reply(403, "Not Granted");
+		exit;
+	}
+	if ($avp(meet_replaces) != NULL && $avp(meet_replaces) != "")
+		append_hf("Replaces: $avp(meet_replaces)\r\n");
+	else
+		append_hf("Twake-Join: $avp(meet_join)\r\n");
+	append_hf("Twake-Room: conference\r\n");
+	$avp(conference) = 1;
+	$acc_extra(via) = "conference";
+	if (!lookup("location")) {
+		route(account_missed);
+		route(calling);
+		t_reply(404, "Not Found");
+		exit;
+	}
+	route(names_next);
 	exit;
 }
 
@@ -1686,6 +1725,8 @@ route[trunk_in] {
 	remove_hf("P-Asserted-Identity");
 	remove_hf("P-Preferred-Identity");
 	remove_hf("Remote-Party-ID");
+	remove_hf("Twake-Room");
+	remove_hf("Twake-Join");
 	$var(n1) = "";
 	$var(n2) = "";
 	if (route(inbound_number, $rU))
@@ -2036,6 +2077,12 @@ route[caller_name] {
 		$var(caller_name) = "Meet";
 		if ($avp(names_read) == 1 && $avp(n_caller) != NULL && $avp(n_caller) != "")
 			$var(caller_name) = "Meet (" + $avp(n_caller) + ")";
+		# A conference's call (step 8b): the person who made it, as the directory names them (the app says the rest).
+		if ($avp(conference) != NULL) {
+			$var(caller_name) = "";
+			if ($avp(names_read) == 1 && $avp(n_caller) != NULL)
+				$var(caller_name) = $avp(n_caller);
+		}
 		uac_replace_from("$var(caller_name)", "");
 		return(1);
 	}
@@ -3363,6 +3410,8 @@ onreply_route[rtp] {
 			raise_event("E_TWAKEPHONE_RINGING", $avp(ev_attr), $avp(ev_val));
 		} else if ($rs == 200 && $avp(answered) == NULL) {
 			$avp(answered) = 1;
+			# The tag of the phone that answered: a room's call that takes the place of this one names it (step 8b).
+			$dlg_val(callee_tag) = $tt;
 			# The member who answered a ring group is the callee from now on: in the CDR, in the dialog (an INVITE
 			# with Replaces for this call goes to them), in the events.
 			if ($var(member) != "") {
@@ -3422,6 +3471,11 @@ route[event_attrs] {
 	$avp(ev_val) = $avp(caller);
 	$avp(ev_attr) = "callid";
 	$avp(ev_val) = $ci;
+	# A room's call of a conference (step 8b): its callee's only (route[conference_leg]).
+	if ($avp(conference) != NULL) {
+		$avp(ev_attr) = "conference";
+		$avp(ev_val) = "1";
+	}
 }
 
 # The event the Gateway raises itself through the MI (`raise_event`) after each subscription to the events, and gets

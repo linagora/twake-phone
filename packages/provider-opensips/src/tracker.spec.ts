@@ -67,6 +67,39 @@ describe('CallTracker', () => {
     expect(presences()).toEqual(['101:available', '102:available'])
   })
 
+  it("tells a conference's calls (step 8b) to their callee only, as conferences from whoever made it, who is not kept busy by the others'", () => {
+    const { tracker, presences, calls, events, clear } = make()
+    for (const ext of ['101', '102']) tracker.handle('E_UL_CONTACT_INSERT', contact(ext, `sip:${ext}@x.invalid`))
+    clear()
+    // The room calls 101 (who made it: its own extension) then 102, at 101's name.
+    const conf = (callid: string, callee: string) => ({ ...call(callid, '101', callee), dialled: callee, conference: '1' })
+    tracker.handle('E_TWAKEPHONE_CALLING', conf('j1', '101'))
+    tracker.handle('E_TWAKEPHONE_CALLING', conf('r1', '102'))
+    expect(calls()).toEqual([])
+    expect(presences()).toEqual([])
+    for (const [id, ext] of [['j1', '101'], ['r1', '102']] as const) {
+      tracker.handle('E_TWAKEPHONE_RINGING', conf(id, ext))
+      tracker.handle('E_TWAKEPHONE_ANSWERED', conf(id, ext))
+    }
+    expect(calls()).toEqual(['101:call.ringing:outbound:101:ringing', '101:call.connected:outbound:101:connected', '102:call.ringing:inbound:101:ringing', '102:call.connected:inbound:101:connected'])
+    expect(events.filter(e => e.event.type === 'call.connected').map(e => (e.event.payload as { call: { conference?: boolean } }).call.conference)).toEqual([true, true])
+    expect(presences()).toEqual(['101:busy', '102:busy'])
+    clear()
+    // 101 leaves the conference; 102 stays in it, and 101 is no longer busy with it.
+    tracker.handle('E_ACC_CDR', { ...cdr('j1', '101', '101', 5, 1792003000), conference: '1' })
+    expect(calls()).toEqual(['101:call.ended:outbound:101:ended'])
+    expect(presences()).toEqual(['101:available'])
+    clear()
+    tracker.handle('E_ACC_CDR', cdr('r1', '101', '102', 9, 1792003000))
+    expect(calls()).toEqual(['102:call.ended:inbound:101:ended'])
+    expect(presences()).toEqual(['102:available'])
+    // One whose CALLING was lost is born a conference's from the next event that says so.
+    clear()
+    tracker.handle('E_TWAKEPHONE_RINGING', conf('r2', '102'))
+    expect(calls()).toEqual(['102:call.ringing:inbound:101:ringing'])
+    expect(presences()).toEqual(['102:busy'])
+  })
+
   it('tells a declined call (603, 600) as rejected to both, a busy one (486) as missed to the callee, a cancelled one as missed, an unreachable one to the caller only', () => {
     const { tracker, calls, clear } = make()
     for (const ext of ['101', '102']) tracker.handle('E_UL_CONTACT_INSERT', contact(ext, `sip:${ext}@x.invalid`))

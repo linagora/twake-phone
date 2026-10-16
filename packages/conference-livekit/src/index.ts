@@ -348,6 +348,26 @@ export class LiveKitConferenceBridge implements ConferenceBridgeProvider {
     for (const t of audio) await this.api.call('livekit.RoomService', 'MutePublishedTrack', { room, identity, track_sid: t.sid, muted: true })
   }
 
+  /**
+   * Ends the room for everyone in it (RoomService DeleteRoom, step 8b): LiveKit SIP hangs up each of its calls there.
+   * A room LiveKit does not have (never joined, or closed already) is no error.
+   */
+  async deleteRoom(meetingId: string): Promise<void> {
+    try {
+      await this.api.call('livekit.RoomService', 'DeleteRoom', { room: meetingId })
+    } catch (err) {
+      if (err instanceof LiveKitError && (err.status === 404 || err.twirpCode === 'not_found')) return
+      throw err
+    }
+  }
+
+  /** Which of these rooms LiveKit has now (RoomService ListRooms, step 8b): the others ended, or never began. */
+  async openRooms(names: string[]): Promise<Set<string>> {
+    if (!names.length) return new Set()
+    const res = await this.api.call<{ rooms?: { name?: string }[] }>('livekit.RoomService', 'ListRooms', { names })
+    return new Set((res.rooms ?? []).flatMap(r => (r.name && names.includes(r.name) ? [r.name] : [])))
+  }
+
   /** Participants currently in the room (web and phone), numbers filtered by the privacy setting. */
   async listParticipants(meetingId: string): Promise<ConferenceParticipant[]> {
     const res = await this.api.call<{ participants?: LkParticipant[] }>('livekit.RoomService', 'ListParticipants', { room: meetingId })

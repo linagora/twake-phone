@@ -65,6 +65,8 @@ export interface HistoryItem {
   state: string
   answered: boolean
   missed: boolean
+  /** A conference's call (step 8b): the room called the person in the place of a call of theirs. */
+  conference?: boolean
 }
 
 export interface HistoryFilter {
@@ -96,6 +98,12 @@ export interface Conference {
   url?: string
   dialIn: DialInConfiguration
   participants?: ConferenceParticipant[]
+}
+
+/** The room of a call become a conference (step 8b): no dial-in, its participants. */
+export interface CallConference {
+  meetingId: string
+  participants: ConferenceParticipant[]
 }
 
 export interface SyncReport {
@@ -440,6 +448,25 @@ export class TelephonyClient {
 
   closeConference(meetingId: string) {
     return this.request<void>(`/conferences/${encodeURIComponent(meetingId)}`, { method: 'DELETE' })
+  }
+
+  /**
+   * « Ajouter un participant » (step 8b): the call `callId` becomes a conference in a room of its own; `join` is the
+   * token the softphone drew for the room's call to this window (expectConference). Answered once both are in it
+   * (409 with `code`: CONFERENCE_EXTERNAL, CALL_NOT_ANSWERED, DIAL_FAILED). The third is then invited by phone.
+   */
+  makeConference(callId: string, join: string) {
+    return this.request<CallConference>(`/calls/${encodeURIComponent(callId)}/conference`, { method: 'POST', body: JSON.stringify({ join }) })
+  }
+
+  /** The participants of a call's conference (GET /conferences/:id, as its maker reads it). */
+  getCallConference(meetingId: string) {
+    return this.request<CallConference>(`/conferences/${encodeURIComponent(meetingId)}`)
+  }
+
+  /** Ends a call's conference for everyone in it (« Terminer pour tous »). */
+  endCallConference(meetingId: string) {
+    return this.closeConference(meetingId)
   }
 
   /** Dial-out: makes the phone ring and joins the room when answered. */

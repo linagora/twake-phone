@@ -2583,6 +2583,99 @@ try {
     expectEqual((await api('DELETE', `/conferences/${ROOM}`)).statusCode, 204, 'DELETE /conferences/:id')
     expectEqual((await api('DELETE', '/admin/dids/meet')).statusCode, 204, 'DELETE /admin/dids/meet')
   })
+  // Step 8b (ADR 0019): « Ajouter un participant ». A call between two extensions becomes a conference in a room of
+  // its own: the room calls Alice's window (its token), then Jean in the place of their call (Replaces), then Bob.
+  let CONFERENCE
+  let conferenceFrom
+  let conferenceAcc
+  /** The participants of the conference, as Alice reads them (none once LiveKit no longer has the room). */
+  const inConference = async () => {
+    const res = await (await asPerson(alice))('GET', `/conferences/${CONFERENCE}`)
+    return res.statusCode === 200 ? res.json().participants : []
+  }
+  /** The person's newest calls of the history that are a conference, once there are `count` since `after`. */
+  const conferenceCalls = (userId, after, count) =>
+    until(`${count} conference calls in the history of ${userId}`, async () => {
+      const items = (await store.listHistory(TENANT, userId, { limit: 10 })).items.filter(e => e.startedAt > after && e.conference)
+      return items.length >= count ? items : null
+    })
+  await step('step 8b: Alice calls Jean, who answers; she adds Bob (« Ajouter un participant », 103): the room calls her window, answered by itself, then Jean in the place of their call (Replaces, answered by itself); Bob rings from her extension and answers: a conference of three, each hearing the others, neither hold nor transfer', async () => {
+    conferenceFrom = new Date().toISOString()
+    conferenceAcc = await lastId('acc')
+    await aliceCallsJean(alice, jean)
+    const [original] = await calls(alice.page)
+    const [jeans] = await calls(jean.page)
+    if (!original?.sipCallId || original.sipCallId !== jeans?.sipCallId) throw new Error(`the Call-ID of the call on both sides: ${original?.sipCallId} ${jeans?.sipCallId}`)
+    await alice.page.getByRole('button', { name: 'Ajouter un participant' }).click()
+    await alice.page.getByLabel('Participant à ajouter (poste ou numéro)').fill('103')
+    await alice.page.getByRole('button', { name: 'Appeler et ajouter' }).click()
+    // Alice: the room's call to her window only, her call with Jean ended as a conference.
+    const [mine] = await until('Alice in the conference', async () => {
+      const c = await calls(alice.page)
+      return c.length === 1 && c[0].room === 'conference' && c[0].state === 'connected' ? c : null
+    }, { timeout: 30_000 })
+    expectEqual(`${mine.conferenceOf === original.id} ${mine.direction} ${mine.remoteNumber}`, 'true inbound 101', 'Alice\'s call of the conference')
+    expectEqual((await lastEnded(alice.page))?.endReason, 'conference', 'how Alice\'s call with Jean ended')
+    // Jean: the room's call in the place of theirs, from Alice's extension; his call with her ended as a conference.
+    const [his] = await until('Jean in the conference', async () => {
+      const c = await calls(jean.page)
+      return c.length === 1 && c[0].room === 'conference' && c[0].state === 'connected' ? c : null
+    }, { timeout: 30_000 })
+    expectEqual(`${his.replacedCallId === jeans.id} ${his.remoteNumber}`, 'true 101', 'Jean\'s call of the conference')
+    expectEqual((await lastEnded(jean.page))?.endReason, 'conference', 'how Jean\'s call with Alice ended')
+    await jean.page.getByText('Conférence avec Alice Martin (101)').waitFor()
+    // Bob: rung by the room, at Alice's name, as any call a room places.
+    const ringing = bob.page.getByTestId('incoming-call')
+    await ringing.waitFor({ timeout: 30_000 })
+    expectEqual((await calls(bob.page))[0]?.remoteNumber, '101', 'who calls Bob')
+    await ringing.getByRole('button', { name: 'Répondre' }).click()
+    await alice.page.getByTestId('conference-participant').nth(2).waitFor({ timeout: 20_000 })
+    const shown = await alice.page.getByTestId('conference-participant').allTextContents()
+    expectEqual(shown.length, 3, `the participants Alice sees: ${JSON.stringify(shown)}`)
+    for (const button of ['Retirer 102 de la conférence', 'Retirer 103 de la conférence', 'Terminer pour tous', 'Quitter la conférence']) await alice.page.getByRole('button', { name: button }).waitFor()
+    CONFERENCE = await until('the room of the conference, kept for Alice', async () => (await store.listConferences(TENANT, 'amartin')).find(r => /^twake-call-[0-9a-f]{16}$/.test(r.meetingId))?.meetingId ?? null)
+    expectEqual((await inConference()).map(p => `${p.kind} ${p.number}`).sort().join(', '), 'phone 101, phone 102, phone 103', 'the room of the conference')
+    // Each one hears the others, through the room.
+    await bothHearEachOther(alice, jean)
+    await bothHearEachOther(jean, bob)
+    // A call of a room is neither held nor transferred; nobody places another call meanwhile.
+    for (const who of [alice, jean, bob]) {
+      expectEqual(await who.page.getByRole('button', { name: 'Mettre en attente' }).count(), 0, `the hold button on ${who.name}'s page`)
+      expectEqual(await transferButton(who.page).count(), 0, `the transfer button on ${who.name}'s page`)
+    }
+  })
+  await step('step 8b: Alice ends the conference for everyone (« Terminer pour tous »): the three calls end, the room and its record go; the history of Alice and Jean says conference, as their Récents do', async () => {
+    await alice.page.getByRole('button', { name: 'Terminer pour tous' }).click()
+    for (const who of [alice, jean, bob]) await until(`the end of the conference on ${who.name}'s page`, async () => ((await calls(who.page)).length === 0 ? true : null), { timeout: 20_000 })
+    expectEqual((await (await asPerson(alice))('GET', `/conferences/${CONFERENCE}`)).statusCode, 404, 'GET /conferences/:id once ended')
+    expectEqual(await store.getConference(CONFERENCE), null, 'the record of the conference')
+    const [aliceIn] = await conferenceCalls('amartin', conferenceFrom, 1)
+    expectEqual(`${aliceIn.remoteNumber} ${aliceIn.direction}`, '101 inbound', 'Alice\'s history: the room called her')
+    const [jeanIn] = await conferenceCalls('jdupont', conferenceFrom, 1)
+    expectEqual(`${jeanIn.remoteNumber} ${jeanIn.direction}`, '101 inbound', 'Jean\'s history: the room called him at Alice\'s name')
+    if (!(await recents(alice.page, 1)).includes('Votre conférence: Conférence')) throw new Error(`Alice's Récents: ${JSON.stringify(await recents(alice.page, 1))}`)
+    if (!(await recents(jean.page, 1)).some(l => l.endsWith(': Conférence'))) throw new Error(`Jean's Récents: ${JSON.stringify(await recents(jean.page, 1))}`)
+    const cdrs = await until('the CDRs of the conference\'s calls', async () => {
+      const { rows } = await db.query("SELECT callee FROM acc WHERE via = 'conference' AND id > $1 ORDER BY id", [conferenceAcc])
+      return rows.length >= 2 ? rows.map(r => r.callee).sort() : null
+    })
+    expectEqual(cdrs.join(' '), '101 102', 'the CDRs of the conference\'s calls (via conference)')
+  })
+  await step('step 8b: a call with the operator cannot become a conference: Alice is told why (CONFERENCE_EXTERNAL), nobody is called, her call goes on', async () => {
+    await dial(alice.page, '06 39 98 00 06')
+    const { call, at } = await invitedAtOperator(invite => invite.uri === 'sip:+33639980006@operator.example')
+    await alice.page.getByText('En communication avec +33 6 39 98 00 06').waitFor()
+    await alice.page.getByRole('button', { name: 'Ajouter un participant' }).click()
+    await alice.page.getByLabel('Participant à ajouter (poste ou numéro)').fill('103')
+    await alice.page.getByRole('button', { name: 'Appeler et ajouter' }).click()
+    await alice.page.getByRole('alert').filter({ hasText: 'Seul un appel entre deux postes peut devenir une conférence' }).waitFor()
+    await sleep(1_000)
+    expectEqual((await calls(bob.page)).length, 0, 'calls on Bob\'s page')
+    const [still] = await calls(alice.page)
+    expectEqual(`${still?.state} ${still?.room ?? '-'}`, 'connected -', 'Alice\'s call with the operator')
+    await alice.page.getByRole('button', { name: 'Raccrocher' }).click()
+    await at.callState(call, 'ended')
+  })
   await step('a registration left on a dead connection (the first one, Alice) with a no-answer forward: Bob rings at once, not after the delay', async () => {
     await setForwarding(alice, { noAnswer: '103', delay: '20' })
     relay.cutUpstream(0)

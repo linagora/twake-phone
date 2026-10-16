@@ -307,6 +307,27 @@ describe('dial-out and moderation', () => {
     expect(() => splitParticipantId('nocolon')).toThrow()
   })
 
+  it('ends a room for everyone (DeleteRoom, step 8b), a room LiveKit does not have being no error, any other failure one', async () => {
+    const { bridge, calls } = make({})
+    await bridge.deleteRoom('twake-call-0123456789abcdef')
+    expect(calls[0]).toMatchObject({ path: 'livekit.RoomService/DeleteRoom', body: { room: 'twake-call-0123456789abcdef' } })
+    const claims = JSON.parse(Buffer.from(calls[0]!.auth.split('.')[1]!, 'base64url').toString())
+    expect(claims.video).toMatchObject({ roomAdmin: true, room: 'twake-call-0123456789abcdef' })
+    const gone = make({ 'livekit.RoomService/DeleteRoom': new TwirpFailure('requested room does not exist', 404, {}, 'not_found') })
+    await expect(gone.bridge.deleteRoom('r')).resolves.toBeUndefined()
+    const down = make({ 'livekit.RoomService/DeleteRoom': new TwirpFailure('internal', 500, {}, 'internal') })
+    await expect(down.bridge.deleteRoom('r')).rejects.toBeInstanceOf(LiveKitError)
+  })
+
+  it('tells which of some rooms LiveKit has (ListRooms, step 8b), asking nothing for none', async () => {
+    const { bridge, calls } = make({ 'livekit.RoomService/ListRooms': { rooms: [{ name: 'a' }, { name: 'other' }] } })
+    expect([...(await bridge.openRooms(['a', 'b']))]).toEqual(['a'])
+    expect(calls).toHaveLength(1)
+    expect(calls[0]).toMatchObject({ path: 'livekit.RoomService/ListRooms', body: { names: ['a', 'b'] } })
+    expect((await bridge.openRooms([])).size).toBe(0)
+    expect(calls).toHaveLength(1)
+  })
+
   it('scopes the token of room calls to that room', async () => {
     const { bridge, calls } = make({})
     await bridge.disconnectParticipant('room:bob')

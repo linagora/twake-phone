@@ -33,6 +33,8 @@ export interface HistoryEntry {
   durationSec: number
   state: CallState
   answered: boolean
+  /** A conference's call (step 8b, ADR 0019): the room called the person in the place of a call of theirs. */
+  conference?: boolean
 }
 
 /** A missed call: inbound, never answered, and not declined by the user (state `missed`, not `rejected`). */
@@ -239,6 +241,8 @@ export interface Store {
   replaceConferencePin(meetingId: string, from: string | null, to: string | null): Promise<boolean>
   /** The rooms of a tenant, or of one owner in it. */
   countConferences(tenantId: string, ownerUserId?: string): Promise<number>
+  /** The rooms of one owner, oldest first. */
+  listConferences(tenantId: string, ownerUserId: string): Promise<ConferenceRecord[]>
   deleteConference(meetingId: string): Promise<void>
 
   /** A person's subscriptions, oldest first. */
