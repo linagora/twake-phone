@@ -160,6 +160,9 @@ export interface StoredAlert extends AlertRecord {
   lastAt: string
   count: number
   first: TelephonyAlert
+  /** When an administrator acknowledged it, and who (step 7): a repeat after that opens a new alert. */
+  acknowledgedAt?: string
+  acknowledgedBy?: string
 }
 
 /** Where a page of alerts starts: after this one (its last repeat and id). */
@@ -174,6 +177,8 @@ export interface AlertQuery {
   before?: AlertCursor
   kind?: TelephonyAlert['kind']
   param?: string
+  /** Those not acknowledged yet (`open`), or those acknowledged. */
+  state?: 'open' | 'acknowledged'
 }
 
 /** How long the alerts are kept (from their last repeat): purged by the Gateway every hour (purgeAlerts). */
@@ -259,10 +264,15 @@ export interface Store {
   getOutbound(tenantId: string): Promise<OutboundRecord | null>
   /** Replaces them whole. */
   setOutbound(record: OutboundRecord): Promise<void>
-  /** Keeps an alert: a repeat of an open one (same alertKey, within ALERT_DEDUP_MS of its last) counts in it. */
+  /** Keeps an alert: a repeat of an open one (same alertKey, within ALERT_DEDUP_MS of its last, not acknowledged) counts in it. */
   addAlert(record: AlertRecord): Promise<void>
   /** The alerts of a tenant, the latest repeated first, `limit` at most (clamped as a page). */
   listAlerts(tenantId: string, query?: AlertQuery): Promise<StoredAlert[]>
+  /**
+   * Marks an alert of the tenant acknowledged, by `by` at `at` (ISO): its repeats open a new one from then on. The
+   * alert as kept then (the first acknowledgement stays), null when the tenant has none of that id.
+   */
+  acknowledgeAlert(tenantId: string, id: string, by: string, at: string): Promise<StoredAlert | null>
   /** Removes the alerts of every tenant whose last repeat is before `before` (ISO); how many. */
   purgeAlerts(before: string): Promise<number>
 

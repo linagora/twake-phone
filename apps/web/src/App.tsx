@@ -6,7 +6,14 @@ import { loadConfig, type AppConfig } from './config.js'
 import { GatewayProvider } from './gateway.js'
 import { I18nProvider, useT } from './i18n/useT.js'
 import { Layout } from './components/Layout.js'
-import { Admin } from './pages/Admin.js'
+import { Admin } from './pages/admin/Admin.js'
+import { Alerts } from './pages/admin/Alerts.js'
+import { Accounts } from './pages/admin/Directory.js'
+import { Limits } from './pages/admin/Limits.js'
+import { Numbers } from './pages/admin/Numbers.js'
+import { Rights } from './pages/admin/Rights.js'
+import { RingGroups } from './pages/admin/RingGroups.js'
+import { Trunks } from './pages/admin/Trunks.js'
 import { Dialer } from './pages/Dialer.js'
 import { ContactPage } from './pages/ContactPage.js'
 import { Directory } from './pages/Directory.js'
@@ -35,7 +42,16 @@ const Gate = ({ config }: { config: AppConfig }) => {
                 <Route path="directory" element={<Directory />} />
                 <Route path="directory/:id" element={<ContactPage />} />
                 <Route path="settings" element={<Settings config={config} />} />
-                <Route path="admin" element={<Admin />} />
+                <Route path="admin" element={<Admin />}>
+                  <Route index element={<Accounts />} />
+                  <Route path="trunks" element={<Trunks />} />
+                  <Route path="numbers" element={<Numbers />} />
+                  <Route path="groups" element={<RingGroups />} />
+                  <Route path="rights" element={<Rights />} />
+                  <Route path="limits" element={<Limits />} />
+                  <Route path="alerts" element={<Alerts />} />
+                  <Route path="*" element={<Navigate to="/admin" replace />} />
+                </Route>
                 <Route path="*" element={<Navigate to="/" replace />} />
               </Route>
             </Routes>

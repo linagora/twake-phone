@@ -1,6 +1,7 @@
 // End to end: a real browser signs in through an OpenID provider, the app shows who the Gateway says you are,
 // and signing out brings the sign-in page back. No Docker: the provider, the Gateway and the app run in this process.
 // The app is served by its production server (apps/web/server), so the policy it ships with is the one tested.
+import { randomBytes } from 'node:crypto'
 import { createServer as createHttpServer } from 'node:http'
 import { createServer } from 'node:net'
 import { fileURLToPath } from 'node:url'
@@ -51,7 +52,61 @@ const auth = new JwtAuthenticator({ jwksUrl: oidc.jwksUrl, issuer: oidc.issuer, 
 const contacts = new LdapDirectory({ url: ldap.url, tenantId: 'e2e', bindDn: READER_DN, bindPassword: READER_PASSWORD, baseDn: BASE_DN, userFilter: '(objectClass=inetOrgPerson)', attributes: { ...DEFAULT_ATTRIBUTES, extension: 'ipPhone' } })
 const store = new MemoryStore()
 const directorySync = new DirectorySync({ store, directory: contacts, tenantId: 'e2e' })
-const gateway = await buildApp(new ProviderRegistry([]), { auth, store, contacts, directorySync, admin: { adminRole: 'twakephone-admin', adminUsers: new Set() } })
+// No telephony platform at first (the dialer says so); the administration steps then give the tenant one, kept in
+// memory: what the screens send it is what a SIP server would be handed (trunks with their password, direct
+// numbers, rights), and it says its trunks are registered.
+const providers = []
+const platform = { trunks: [], dids: [], groups: [], outbound: null }
+const notHere = async () => {
+  throw Object.assign(new Error('Not on this platform'), { statusCode: 501 })
+}
+const memoryPlatform = {
+  type: 'e2e-memory',
+  create: () => ({
+    id: 'e2e-memory',
+    getStatus: () => 'CONNECTED',
+    getCapabilities: async () => ({
+      calling: { outbound: false, inbound: false, answer: false, hangup: false, hold: false, transfer: false, dtmf: false },
+      media: { browserAudio: false },
+      presence: { read: false, write: false, realtime: false, statuses: [] },
+      history: false,
+      groups: true,
+      trunks: true,
+      outboundPolicy: true,
+      conference: { dialIn: false, dialOut: false }
+    }),
+    getPresence: async () => ({ status: 'offline', source: 'system' }),
+    setPresence: async () => {},
+    syncExtensions: async () => {},
+    listGroups: async () => platform.groups,
+    setGroup: async group => {
+      platform.groups = [...platform.groups.filter(g => g.number !== group.number), group]
+    },
+    deleteGroup: async number => platform.groups.length !== (platform.groups = platform.groups.filter(g => g.number !== number)).length,
+    setTrunks: async (trunks, dids) => {
+      platform.trunks = trunks
+      platform.dids = dids
+    },
+    getTrunkStatus: async () => platform.trunks.map(t => ({ id: t.id, ...(t.auth === 'register' ? { registration: { state: 'registered' } } : {}), servers: (t.proxies ?? [t.domain]).map(address => ({ address, state: 'up' })) })),
+    setOutboundPolicy: async (policy, profiles, assignments) => {
+      platform.outbound = { policy, profiles, assignments }
+    },
+    originate: notHere,
+    answer: notHere,
+    hangup: notHere,
+    hold: notHere,
+    resume: notHere,
+    transfer: notHere,
+    sendDTMF: notHere,
+    close: async () => {},
+    // No event ever: nobody calls on this platform.
+    subscribe: async function* () {
+      await new Promise(() => {})
+      yield* []
+    }
+  })
+}
+const gateway = await buildApp(new ProviderRegistry(providers, [memoryPlatform]), { auth, store, contacts, directorySync, secretsKey: randomBytes(32), admin: { adminRole: 'twakephone-admin', adminUsers: new Set() } })
 await gateway.listen({ host: '127.0.0.1', port: GATEWAY_PORT })
 const web = await serveApp({
   dir: fileURLToPath(new URL('../dist/', import.meta.url)),
@@ -221,6 +276,157 @@ try {
     expectEqual(await page.title(), 'Settings – TwakePhone', 'document title')
     expectEqual(await page.evaluate(() => document.documentElement.lang), 'en', 'html lang')
   })
+  // Step 7: the administration screens, on a platform that has trunks (the in-memory one above).
+  const api = (url, init = {}) => gateway.inject({ url: `/api/v1${url}`, ...init, headers: { authorization: `Bearer ${session.access_token}`, ...(init.headers ?? {}) } })
+  const subnav = page.getByRole('navigation', { name: "Rubriques de l'administration" })
+  const TRUNK_PASSWORD = randomBytes(12).toString('base64url')
+  await step('an administrator adds a trunk from its screen: checked as the Gateway checks it, its password never shown again', async () => {
+    providers.push({ tenantId: 'e2e', type: 'e2e-memory', config: {} })
+    await page.getByLabel('Interface language').selectOption('fr')
+    await page.getByRole('link', { name: 'Administration' }).click()
+    await subnav.getByRole('link', { name: 'Trunks', exact: true }).click()
+    await page.getByRole('heading', { level: 2, name: 'Trunks' }).waitFor()
+    expectEqual(await page.title(), 'Trunks – Administration – TwakePhone', 'document title')
+    await page.getByText("Aucun trunk pour l'instant").waitFor()
+    // Sent empty: every problem said next to its field, the focus on the first one, nothing sent.
+    await page.getByRole('button', { name: 'Enregistrer le trunk' }).click()
+    await page.getByRole('alert').getByText('Le formulaire a 5 erreurs').waitFor()
+    expectEqual(await page.evaluate(() => document.activeElement?.id), 'trunk-id', 'focus on the first field in error')
+    expectEqual(await page.getByRole('textbox', { name: 'Identifiant', exact: true }).getAttribute('aria-invalid'), 'true', 'aria-invalid')
+    await page.getByRole('textbox', { name: 'Identifiant', exact: true }).fill('operator')
+    await page.getByLabel('Nom affiché').fill('Opérateur')
+    await page.getByLabel("Domaine SIP de l'opérateur").fill('sip.operator.example')
+    await page.getByLabel("Serveurs de l'opérateur").fill('sip1.operator.example, 192.0.2.10:5060')
+    await page.getByLabel("Identifiant chez l'opérateur").fill('twake')
+    await page.getByLabel('Mot de passe', { exact: true }).fill(TRUNK_PASSWORD)
+    await page.getByLabel('Numéro présenté par défaut').fill('01 99 00 01 00')
+    await page.getByRole('button', { name: 'Enregistrer le trunk' }).click()
+    await page.getByRole('status').getByText('Trunk operator enregistré.').waitFor()
+    const list = page.getByRole('list', { name: 'Trunks existants' })
+    await list.getByText('Opérateur (operator)').waitFor()
+    await list.getByText('enregistré (jamais affiché)').waitFor()
+    // How it is doing, as the platform says: registered, both servers reachable.
+    await list.getByText('Enregistré', { exact: true }).waitFor()
+    await list.getByText('Serveur 192.0.2.10:5060 : Joignable').waitFor()
+    // The platform got the password; neither the page nor the API ever shows it again.
+    expectEqual(platform.trunks[0]?.password, TRUNK_PASSWORD, 'password handed to the platform')
+    expectEqual(JSON.stringify(platform.trunks[0]?.proxies), JSON.stringify(['sip1.operator.example', '192.0.2.10:5060']), 'servers')
+    expectEqual(platform.trunks[0]?.defaultNumber, '+33199000100', 'default number in E.164')
+    if ((await page.content()).includes(TRUNK_PASSWORD)) throw new Error('the password is in the page')
+    if ((await api('/admin/trunks')).body.includes(TRUNK_PASSWORD)) throw new Error('the password is in the API')
+    // Changed without typing a password: the one kept stays.
+    await page.getByRole('button', { name: 'Modifier le trunk operator' }).click()
+    expectEqual(await page.getByLabel('Mot de passe', { exact: true }).inputValue(), '', 'password field empty when editing')
+    await page.getByLabel("Pays permis à l'international").fill('32')
+    await page.getByRole('button', { name: 'Enregistrer le trunk' }).click()
+    await page.locator('#trunk-countries-error').getByText("ne s'indiquent que si l'international est permis").waitFor()
+    await page.getByRole('group', { name: 'Appels permis' }).getByLabel('International').check()
+    await page.getByRole('button', { name: 'Enregistrer le trunk' }).click()
+    await page.getByRole('status').getByText('Trunk operator enregistré.').waitFor()
+    expectEqual(platform.trunks[0]?.password, TRUNK_PASSWORD, 'password kept')
+    expectEqual(JSON.stringify(platform.trunks[0]?.countries), JSON.stringify(['32']), 'countries')
+  })
+  await step('then a range of direct numbers to the extensions their last digits name, and one number to an extension', async () => {
+    await subnav.getByRole('link', { name: 'Numéros directs' }).click()
+    await page.getByRole('heading', { level: 2, name: 'Numéros directs' }).waitFor()
+    expectEqual(await page.title(), 'Numéros directs – Administration – TwakePhone', 'document title')
+    await page.getByText("Aucun numéro direct pour l'instant.").waitFor()
+    expectEqual(await page.getByLabel('Trunk', { exact: true }).inputValue(), 'operator', 'trunk chosen')
+    await page.getByRole('textbox', { name: 'Identifiant', exact: true }).fill('staff')
+    await page.getByLabel('Numéro (ou premier de la plage)').fill('01 99 00 01 00')
+    await page.getByLabel('Dernier numéro de la plage').fill('01 99 00 01 99')
+    await page.getByLabel('Le poste qui finit par les derniers chiffres du numéro appelé').check()
+    await page.getByRole('button', { name: 'Enregistrer les numéros directs' }).click()
+    // 100 to 199 hold 112, 115...: those numbers would never ring anyone inside.
+    await page.locator('#did-suffixDigits-error').getByText('112, 114, 115').waitFor()
+    expectEqual(await page.evaluate(() => document.activeElement?.id), 'did-suffixDigits', 'focus on the field in error')
+    await page.getByLabel('Dernier numéro de la plage').fill('01 99 00 01 09')
+    await page.getByRole('button', { name: 'Enregistrer les numéros directs' }).click()
+    await page.getByRole('status').getByText('Numéros directs staff enregistrés.').waitFor()
+    // One number to an extension nobody holds: the Gateway refuses it, the screen says so on the field.
+    await page.getByRole('textbox', { name: 'Identifiant', exact: true }).fill('accueil')
+    await page.getByLabel('Numéro (ou premier de la plage)').fill('+33 1 99 00 02 00')
+    await page.getByRole('combobox', { name: 'Poste ou groupe', exact: true }).fill('555')
+    const refused = page.waitForResponse(r => r.request().method() === 'PUT' && r.url().endsWith('/admin/dids/accueil'))
+    await page.getByRole('button', { name: 'Enregistrer les numéros directs' }).click()
+    expectEqual((await refused).status(), 400, 'unknown target refused by the Gateway')
+    await page.locator('#did-target-error').getByText("ni un poste attribué ni un groupe d'appel").waitFor()
+    await page.getByRole('combobox', { name: 'Poste ou groupe', exact: true }).fill('101')
+    await page.getByRole('button', { name: 'Enregistrer les numéros directs' }).click()
+    await page.getByRole('status').getByText('Numéros directs accueil enregistrés.').waitFor()
+    const list = page.getByRole('list', { name: 'Numéros directs existants' })
+    await list.getByText('+33199000100 à +33199000109').waitFor()
+    await list.getByText('101 (Alice Martin)').waitFor()
+    // What the SIP server is handed: the exit of step 7, without a console.
+    expectEqual(
+      JSON.stringify(platform.dids),
+      JSON.stringify([
+        { id: 'staff', trunkId: 'operator', first: '+33199000100', last: '+33199000109', suffixDigits: 3 },
+        { id: 'accueil', trunkId: 'operator', first: '+33199000200', last: '+33199000200', target: '101' }
+      ]),
+      'direct numbers handed to the platform'
+    )
+  })
+  await step('a rights profile limited to internal calls, given to Alice; the caps of the organisation checked before they are sent', async () => {
+    await subnav.getByRole('link', { name: "Droits d'appel" }).click()
+    await page.getByRole('heading', { level: 2, name: 'Nouveau profil' }).waitFor()
+    await page.getByRole('textbox', { name: 'Identifiant', exact: true }).fill('interne')
+    await page.getByLabel('Nom affiché').fill('Interne')
+    await page.locator('#profile-concurrent-mode').selectOption('value')
+    await page.getByLabel('Appels simultanés : valeur').fill('1')
+    await page.getByRole('button', { name: 'Enregistrer le profil', exact: true }).click()
+    await page.getByText('Profil interne enregistré.').waitFor()
+    await page.getByLabel('Profil de Alice Martin', { exact: true }).selectOption('interne')
+    await page.getByRole('button', { name: 'Appliquer le profil de Alice Martin' }).click()
+    await page.getByText('Profil de Alice Martin enregistré.').waitFor()
+    expectEqual(JSON.stringify(platform.outbound?.profiles), JSON.stringify([{ id: 'interne', name: 'Interne', allowed: [], caps: { concurrent: 1 } }]), 'profiles handed to the platform')
+    expectEqual(JSON.stringify(platform.outbound?.assignments.map(a => a.profileId)), JSON.stringify(['interne']), 'assignment')
+    await subnav.getByRole('link', { name: 'Plafonds et seuils' }).click()
+    await page.locator('#limits-tenant-concurrent-mode').selectOption('value')
+    await page.locator('#limits-tenant-concurrent').fill('0')
+    await page.locator('#limits-international-callsPerMinute-mode').selectOption('custom')
+    await page.locator('#limits-international-callsPerMinute').fill('9')
+    await page.locator('#limits-international-callsPerMinute-critical').fill('3')
+    await page.getByRole('button', { name: 'Enregistrer les plafonds et les seuils' }).click()
+    await page.getByRole('alert').getByText('Le formulaire a 2 erreurs').waitFor()
+    await page.locator('#limits-tenant-concurrent-error').getByText('Un nombre entier de 1 à 1000000').waitFor()
+    await page.locator('#limits-international-callsPerMinute-error').getByText("Le seuil d'alerte ne dépasse pas le seuil critique").waitFor()
+    expectEqual(await page.evaluate(() => document.activeElement?.id), 'limits-tenant-concurrent', 'focus on the first field in error')
+    await page.locator('#limits-tenant-concurrent').fill('10')
+    await page.locator('#limits-international-callsPerMinute-critical').fill('12')
+    await page.getByRole('button', { name: 'Enregistrer les plafonds et les seuils' }).click()
+    await page.getByText('Plafonds et seuils enregistrés.').waitFor()
+    expectEqual(JSON.stringify(platform.outbound?.policy), JSON.stringify({ caps: { concurrent: 10 }, fraud: { international: { callsPerMinute: { warning: 9, critical: 12 } } } }), 'policy handed to the platform')
+    // The profiles and who has which are kept when the caps change.
+    expectEqual(platform.outbound?.assignments.length, 1, 'assignment kept')
+  })
+  await step('the alerts the SIP server raised are listed, and acknowledged', async () => {
+    await store.addAlert({ tenantId: 'e2e', at: new Date().toISOString(), alert: { kind: 'rights', param: 'international', scope: 'user', extension: '101', number: '+442079460123' } })
+    await subnav.getByRole('link', { name: 'Alertes' }).click()
+    const table = page.getByRole('table', { name: 'Alertes' })
+    await table.getByText('Hors des droits, appel refusé').waitFor()
+    await table.getByText('101 (Alice Martin)').waitFor()
+    await table.getByText('+442079460123').waitFor()
+    await page.getByRole('button', { name: /^Acquitter l'alerte International/ }).click()
+    await page.getByText('Alerte acquittée.').waitFor()
+    await page.getByText('Aucune alerte.').waitFor()
+    const acknowledged = (await api('/admin/alerts?state=acknowledged')).json().items
+    expectEqual(acknowledged.length, 1, 'acknowledged alerts')
+    expectEqual(typeof acknowledged[0].acknowledgedBy, 'string', 'acknowledged by someone')
+  })
+  await step('in English, the refusals of the Gateway read in English too', async () => {
+    await page.getByRole('link', { name: 'Réglages' }).click()
+    await page.getByLabel("Langue de l'interface").selectOption('en')
+    await page.getByRole('link', { name: 'Administration' }).click()
+    await page.getByRole('navigation', { name: 'Administration sections' }).getByRole('link', { name: 'Direct numbers' }).click()
+    await page.getByRole('heading', { level: 2, name: 'Direct numbers' }).waitFor()
+    expectEqual(await page.title(), 'Direct numbers – Administration – TwakePhone', 'document title')
+    await page.getByRole('textbox', { name: 'Identifier', exact: true }).fill('other')
+    await page.getByLabel('Number (or first of the range)').fill('+33 1 99 00 03 00')
+    await page.getByRole('combobox', { name: 'Extension or group', exact: true }).fill('556')
+    await page.getByRole('button', { name: 'Save direct numbers' }).click()
+    await page.locator('#did-target-error').getByText('neither an assigned extension nor a ring group').waitFor()
+  })
   await step('signing out returns to the sign-in page and forgets the session', async () => {
     await page.getByRole('button', { name: 'Sign out' }).click()
     await page.waitForURL(`${oidc.issuer}/session/end**`)
@@ -241,6 +447,44 @@ try {
     } finally {
       await page.unroute(unreachable)
     }
+  })
+  await step('Bob, who is no administrator, sees no administration: neither its link, nor its screens, nor its API', async () => {
+    await page.goto(`${appOrigin}/admin/trunks`)
+    await page.getByRole('button', { name: 'Sign in' }).click()
+    await page.locator('input[name=login]').fill('bdurand')
+    await page.locator('input[name=password]').fill('whatever')
+    await page.getByRole('button', { name: 'Sign-in' }).click()
+    await page.getByRole('button', { name: 'Continue' }).click()
+    await page.waitForURL(`${appOrigin}/admin/trunks`)
+    await page.getByTestId('who').getByText('Bob Durand').waitFor()
+    await page.getByRole('alert').getByText("This screen is for the platform's administrators.").waitFor()
+    expectEqual(await page.getByRole('link', { name: 'Administration' }).count(), 0, 'administration link')
+    expectEqual(await page.getByRole('navigation', { name: 'Administration sections' }).count(), 0, 'administration navigation')
+    expectEqual(await page.getByRole('textbox', { name: 'Identifier', exact: true }).count(), 0, 'trunk form')
+    const bob = await page.evaluate(() => {
+      const key = Object.keys(sessionStorage).find(k => k.startsWith('oidc.user'))
+      return key ? JSON.parse(sessionStorage.getItem(key)).access_token : null
+    })
+    for (const [method, url, payload] of [
+      ['GET', '/admin/trunks'],
+      ['GET', '/admin/trunks/status'],
+      ['PUT', '/admin/trunks/operator', { auth: 'ip', domain: 'evil.example', codecs: ['PCMA'], defaultNumber: '+33199000100' }],
+      ['DELETE', '/admin/trunks/operator'],
+      ['GET', '/admin/dids'],
+      ['PUT', '/admin/dids/accueil', { trunkId: 'operator', first: '+33199000200', last: '+33199000200', target: '103' }],
+      ['GET', '/admin/outbound'],
+      ['PUT', '/admin/outbound', { policy: {}, profiles: [], assignments: [] }],
+      ['PUT', '/admin/outbound/users/bdurand', { profileId: null }],
+      ['GET', '/admin/users'],
+      ['GET', '/admin/alerts'],
+      ['POST', '/admin/alerts/1/acknowledge']
+    ]) {
+      const res = await gateway.inject({ method, url: `/api/v1${url}`, headers: { authorization: `Bearer ${bob}` }, ...(payload ? { payload } : {}) })
+      expectEqual(res.statusCode, 403, `${method} ${url} as Bob`)
+    }
+    // Nothing changed on the platform.
+    expectEqual(platform.trunks[0]?.domain, 'sip.operator.example', 'trunk untouched')
+    expectEqual(platform.dids.length, 2, 'direct numbers untouched')
   })
   await step('the app and the Gateway answer with their security headers', async () => {
     const app = await page.request.get(`${appOrigin}/recents`)

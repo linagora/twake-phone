@@ -20,7 +20,7 @@ import { securityHeadersFor, type SecurityOptions } from './security.js'
 import { MAX_DIDS, MAX_TRUNKS, TRUNK_ID, defaultTrunk, parseDid, parseTrunk, providerTrunks, publicDid, publicTrunk, trunkRecord } from './trunks.js'
 import { EMPTY_OUTBOUND, PROFILE_ID, parseOutbound, type Outbound } from './outbound.js'
 import { MemoryStore } from './store/memory.js'
-import { ALERT_RETENTION_DAYS, clampLimit, isMissed, type HistoryEntry, type HistoryQuery, type Store, type TrunkRecord, type UserPresenceRecord } from './store/types.js'
+import { ALERT_RETENTION_DAYS, clampLimit, isMissed, type HistoryEntry, type HistoryQuery, type Store, type StoredAlert, type TrunkRecord, type UserPresenceRecord } from './store/types.js'
 
 /** What the SIP server raises for the administrators (TelephonyAlert). */
 const ALERT_KINDS = ['fraud-warning', 'fraud-critical', 'limit', 'rights', 'emergency'] as const
@@ -37,6 +37,20 @@ const pseudonymizer = (secretsKey: Buffer | undefined) => {
 }
 /** The cursor of a page of alerts (`next`, `before`): the last repeat (ms) and id of the last alert of the page. */
 const ALERT_CURSOR = /^([0-9]{1,15})-([1-9][0-9]{0,17})$/
+/**
+ * An alert as the API shows it: its last repeat's fields, what the first one said (`first`: its value and number), and
+ * its acknowledgement (step 7).
+ */
+const publicAlert = ({ id, at, lastAt, count, alert, first, acknowledgedAt, acknowledgedBy }: StoredAlert) => ({
+  id,
+  at,
+  lastAt,
+  count,
+  ...alert,
+  first: { ...(first.value !== undefined ? { value: first.value } : {}), ...(first.number ? { number: first.number } : {}) },
+  ...(acknowledgedAt ? { acknowledgedAt } : {}),
+  ...(acknowledgedBy ? { acknowledgedBy } : {})
+})
 
 const STATUSES: PresenceStatus[] = ['available', 'busy', 'away', 'dnd', 'offline']
 const DIRECTIONS: CallDirection[] = ['inbound', 'outbound']
@@ -1009,6 +1023,21 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         trunksOf(registry.forTenant(user.tenantId))
         return { items: (await store.listTrunks(user.tenantId)).map(publicTrunk) }
       })
+      // How each trunk is doing now (step 7): its registration and servers, as the SIP server says. `available`: false
+      // when the provider cannot say (no control channel) or did not answer (logged): the screen says it does not know.
+      v1.get('/admin/trunks/status', async req => {
+        const user = await administrator(req)
+        const provider = registry.forTenant(user.tenantId)
+        trunksOf(provider)
+        if (!provider.getTrunkStatus) return { available: false, items: [] }
+        try {
+          const items = await provider.getTrunkStatus()
+          return items ? { available: true, items } : { available: false, items: [] }
+        } catch (err) {
+          req.log.warn({ err, tenantId: user.tenantId }, 'trunks: the SIP server did not say how they are doing')
+          return { available: false, items: [] }
+        }
+      })
       v1.put<{ Params: { id: string } }>('/admin/trunks/:id', async (req, reply) => {
         const user = await administrator(req)
         const apply = trunksOf(registry.forTenant(user.tenantId))
@@ -1017,7 +1046,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         const { record, created } = await inTurn(user.tenantId, async () => {
           const records = await store.listTrunks(user.tenantId)
           const current = records.find(t => t.id === id)
-          if (!current && records.length >= MAX_TRUNKS) throw Object.assign(new Error(`At most ${MAX_TRUNKS} trunks`), { statusCode: 409 })
+          if (!current && records.length >= MAX_TRUNKS) throw Object.assign(new Error(`At most ${MAX_TRUNKS} trunks`), { statusCode: 409, code: 'TRUNK_LIMIT' })
           const parsed = parseTrunk(req.body, current)
           // The default trunk stays so unless another one is made the default: a change that does not say `default`
           // keeps the mark; `default: false` on the default trunk is refused, it would hand the number of everyone
@@ -1071,7 +1100,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
           const records = await store.listTrunks(user.tenantId)
           const dids = (await store.listDids(user.tenantId)).map(publicDid)
           const current = dids.find(d => d.id === req.params.id)
-          if (!current && dids.length >= MAX_DIDS) throw Object.assign(new Error(`At most ${MAX_DIDS} ranges of direct numbers`), { statusCode: 409 })
+          if (!current && dids.length >= MAX_DIDS) throw Object.assign(new Error(`At most ${MAX_DIDS} ranges of direct numbers`), { statusCode: 409, code: 'DID_LIMIT' })
           const did = parseDid(req.params.id, req.body, records, dids)
           await checkTarget(user.tenantId, provider, 'target', did.target, 'DID_TARGET')
           await checkTarget(user.tenantId, provider, 'fallbackTarget', did.fallbackTarget, 'FALLBACK_TARGET')
@@ -1143,10 +1172,17 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
           return { userId, profileId: profileId ?? null }
         })
       })
+      // The people who hold an extension (step 7), by user id: whom a rights profile is given to, where a direct
+      // number or a fallback may ring. What the mappings say (the directory synchronisation writes them), nothing more.
+      v1.get('/admin/users', async req => {
+        const user = await administrator(req)
+        const mappings = await store.listMappings(user.tenantId)
+        return { items: mappings.map(m => ({ userId: m.userId, extension: m.extension, ...(m.displayName ? { displayName: m.displayName } : {}), ...(m.department ? { department: m.department } : {}) })) }
+      })
       // The alerts, the latest repeated first, a page at a time (`next`: the `before` of the next page), of one kind
       // or param if asked. Each one once while it repeats: `count` times, the last at `lastAt` (its fields those of the
       // last), the first at `at` (`first`: its value and number).
-      v1.get<{ Querystring: { limit?: string; before?: string; kind?: string; param?: string } }>('/admin/alerts', async req => {
+      v1.get<{ Querystring: { limit?: string; before?: string; kind?: string; param?: string; state?: string } }>('/admin/alerts', async req => {
         const user = await administrator(req)
         const q = req.query
         const bad = (message: string) => Object.assign(new Error(message), { statusCode: 400, code: 'ALERTS_QUERY' })
@@ -1154,16 +1190,24 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         if (q.before !== undefined && !cursor) throw bad('before: the `next` of a previous page')
         if (q.kind !== undefined && !(ALERT_KINDS as readonly string[]).includes(q.kind)) throw bad(`kind: one of ${ALERT_KINDS.join(', ')}`)
         if (q.param !== undefined && !/^[A-Za-z-]{1,32}$/.test(q.param)) throw bad('param: a threshold, a cap or a class of numbers')
+        if (q.state !== undefined && q.state !== 'open' && q.state !== 'acknowledged') throw bad('state: open or acknowledged')
         const asked = q.limit === undefined ? 50 : Number(q.limit)
         if (!Number.isInteger(asked)) throw bad('limit: a whole number')
         const limit = clampLimit(asked)
         const before = cursor ? { lastAt: new Date(Number(cursor[1])).toISOString(), id: cursor[2]! } : undefined
-        const items = await store.listAlerts(user.tenantId, { limit, ...(before ? { before } : {}), ...(q.kind ? { kind: q.kind as (typeof ALERT_KINDS)[number] } : {}), ...(q.param ? { param: q.param } : {}) })
+        const items = await store.listAlerts(user.tenantId, { limit, ...(before ? { before } : {}), ...(q.kind ? { kind: q.kind as (typeof ALERT_KINDS)[number] } : {}), ...(q.param ? { param: q.param } : {}), ...(q.state ? { state: q.state } : {}) })
         const last = items.at(-1)
         return {
-          items: items.map(({ id, at, lastAt, count, alert, first }) => ({ id, at, lastAt, count, ...alert, first: { ...(first.value !== undefined ? { value: first.value } : {}), ...(first.number ? { number: first.number } : {}) } })),
+          items: items.map(publicAlert),
           ...(last && items.length === limit ? { next: `${Date.parse(last.lastAt)}-${last.id}` } : {})
         }
+      })
+      // An administrator has seen it (step 7): kept with who and when; a repeat from then on opens a new alert.
+      v1.post<{ Params: { id: string } }>('/admin/alerts/:id/acknowledge', async req => {
+        const user = await administrator(req)
+        const alert = await store.acknowledgeAlert(user.tenantId, req.params.id, user.id, new Date().toISOString())
+        if (!alert) throw notFound('alert')
+        return publicAlert(alert)
       })
 
       // Right to erasure of one's own call history.

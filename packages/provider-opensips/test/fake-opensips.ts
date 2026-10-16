@@ -18,6 +18,9 @@ export const fakeOpensips = async () => {
     upTime: '600 [sec]',
     dump: { Domains: [{ name: 'location', hash_size: 512, AORs: [] as unknown[] }] },
     dialogs: { Dialogs: [] as unknown[] },
+    /** What MI ds_list and reg_list answer (step 7): the servers of the trunks, their registrations. */
+    dispatcher: { PARTITIONS: [{ name: 'default', SETS: [] as unknown[] }] },
+    registrations: { Records: [] as unknown[] },
     unknownEvents: new Set<string>(),
     eventsVia: undefined as dgram.Socket | undefined
   }
@@ -52,6 +55,8 @@ export const fakeOpensips = async () => {
     if (req.method === 'uptime') return reply({ result: { Now: 'Wed Oct 14 18:10:00 2026', 'Up since': state.upSince, 'Up time': state.upTime } })
     if (req.method === 'ul_dump') return reply({ result: state.dump })
     if (req.method === 'dlg_list') return reply({ result: state.dialogs })
+    if (req.method === 'ds_list') return reply({ result: state.dispatcher })
+    if (req.method === 'reg_list') return reply({ result: state.registrations })
     // The trunks (step 6): OpenSIPS reads its tables again.
     if (['ds_reload', 'reg_reload', 'dp_reload', 'fraud_reload'].includes(req.method)) return reply({ result: 'OK' })
     if (req.method === 'ul_rm') {

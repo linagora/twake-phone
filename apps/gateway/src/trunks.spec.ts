@@ -230,7 +230,7 @@ describe('trunkFromEnv', () => {
 })
 
 describe('trunk routes', () => {
-  const setup = async (opts: { withTrunks?: boolean; key?: Buffer | null; store?: MemoryStore; refuse?: boolean } = {}) => {
+  const setup = async (opts: { withTrunks?: boolean; key?: Buffer | null; store?: MemoryStore; refuse?: boolean; status?: () => Promise<unknown> } = {}) => {
     process.env.AUTH_MODE = 'dev'
     const store = opts.store ?? new MemoryStore()
     // Who holds the extensions the direct numbers ring (tenant A), and its ring group 200.
@@ -245,6 +245,7 @@ describe('trunk routes', () => {
       subscribe: async function* () {},
       close: async () => {},
       listGroups: async () => [{ number: '200', name: 'Accueil', members: ['101'] }],
+      ...(opts.status ? { getTrunkStatus: opts.status } : {}),
       ...(opts.withTrunks !== false
         ? {
             setTrunks: async (trunks: (Trunk & { password?: string })[], dids: DidRange[]) => {
@@ -305,6 +306,35 @@ describe('trunk routes', () => {
     expect(handed.at(-1)).toEqual({ trunks: [], dids: [] })
     expect(await store.listDids('A')).toEqual([])
     expect((await app.inject({ method: 'DELETE', url: '/api/v1/admin/trunks/operator', headers: admin })).statusCode).toBe(404)
+  })
+
+  it('says how the trunks are doing as the provider tells it, and that it does not know when it cannot tell (step 7)', async () => {
+    const said = [{ id: 'operator', registration: { state: 'registered' }, servers: [{ address: '192.0.2.20', state: 'up' }] }]
+    let answer: () => Promise<unknown> = async () => said
+    const { app, admin, as } = await setup({ status: () => answer() })
+    expect((await app.inject({ url: '/api/v1/admin/trunks/status', headers: as('bob') })).statusCode).toBe(403)
+    expect((await app.inject({ url: '/api/v1/admin/trunks/status', headers: admin })).json()).toEqual({ available: true, items: said })
+    // No control channel: unknown; no answer: unknown too, never an error page for a status.
+    answer = async () => undefined
+    expect((await app.inject({ url: '/api/v1/admin/trunks/status', headers: admin })).json()).toEqual({ available: false, items: [] })
+    answer = async () => {
+      throw new Error('MI timeout')
+    }
+    const failed = await app.inject({ url: '/api/v1/admin/trunks/status', headers: admin })
+    expect(failed.statusCode).toBe(200)
+    expect(failed.json()).toEqual({ available: false, items: [] })
+    // A provider that cannot say at all, and one without trunks.
+    expect((await (await setup()).app.inject({ url: '/api/v1/admin/trunks/status', headers: admin })).json()).toEqual({ available: false, items: [] })
+    expect((await (await setup({ withTrunks: false })).app.inject({ url: '/api/v1/admin/trunks/status', headers: admin })).statusCode).toBe(501)
+  })
+
+  it('says why it refuses one trunk or one range too many, with a code the app puts into words (step 7)', async () => {
+    const { app, admin } = await setup()
+    const { password: _password, ...ip } = { ...trunk, auth: 'ip' }
+    for (let i = 0; i < 8; i++) expect((await app.inject({ method: 'PUT', url: `/api/v1/admin/trunks/t${i}`, headers: admin, payload: ip })).statusCode).toBe(201)
+    const more = await app.inject({ method: 'PUT', url: '/api/v1/admin/trunks/t8', headers: admin, payload: ip })
+    expect(more.statusCode).toBe(409)
+    expect(more.json()).toMatchObject({ code: 'TRUNK_LIMIT' })
   })
 
   it('keeps out whoever is not an administrator, and each tenant to its own trunks', async () => {

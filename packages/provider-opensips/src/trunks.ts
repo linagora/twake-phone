@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { TRUNK_COUNTRY, TRUNK_COUNTRY_EXCLUDED, TRUNK_OUTBOUND_CLASSES, TRUNK_OUTBOUND_DEFAULT, isValidExtension, type DidRange, type Trunk } from '@twake/telephony-types'
+import { TRUNK_COUNTRY, TRUNK_COUNTRY_EXCLUDED, TRUNK_OUTBOUND_CLASSES, TRUNK_OUTBOUND_DEFAULT, isValidExtension, type DidRange, type Trunk, type TrunkRegistrationState, type TrunkServerState, type TrunkStatus } from '@twake/telephony-types'
 import { DIALPLAN_SQL } from './numbering.js'
 import { ACC_EXTERNAL_SQL, OUTBOUND_SCHEMA } from './outbound.js'
 import type { Queryable } from './subscriber.js'
@@ -229,6 +229,45 @@ export const projectTrunks = (trunks: (Trunk & { password?: string })[], dids: D
   return out
 }
 
+/** What uac_registrant's states (MI reg_list) say, in the words of the contract. */
+const REGISTRATION_STATES: Record<string, TrunkRegistrationState> = {
+  REGISTERED_STATE: 'registered',
+  REGISTERING_STATE: 'registering',
+  AUTHENTICATING_STATE: 'registering',
+  NOT_REGISTERED_STATE: 'unregistered',
+  UNREGISTERING_STATE: 'unregistered',
+  AUTHENTICATING_UNREGISTER_STATE: 'unregistered',
+  WRONG_CREDENTIALS_STATE: 'refused',
+  REGISTER_TIMEOUT_STATE: 'timeout',
+  REGISTRAR_ERROR_STATE: 'error',
+  INTERNAL_ERROR_STATE: 'error'
+}
+/** What dispatcher's states (MI ds_list) say. */
+const SERVER_STATES: Record<string, TrunkServerState> = { Active: 'up', Probing: 'probing', Inactive: 'disabled' }
+
+/**
+ * How the trunks are doing (step 7), from what OpenSIPS answers to MI `ds_list` (its servers, by set) and `reg_list`
+ * (its registrations, by address of record), for the trunks `sets` names (TrunkTables.sets: id, set, address of record
+ * of a trunk that registers). A server or a registration OpenSIPS does not list (not loaded yet) is left out; nothing
+ * else of the answers goes out (no address of record, no socket).
+ */
+export const trunkStatusFrom = (sets: readonly { id: string; setid: number; aor: string }[], dsList: unknown, regList: unknown): TrunkStatus[] => {
+  type Dest = { URI?: unknown; state?: unknown }
+  const partitions = (dsList as { PARTITIONS?: { SETS?: { id?: unknown; Destinations?: Dest[] }[] }[] } | null)?.PARTITIONS ?? []
+  const bySet = new Map<number, Dest[]>()
+  for (const p of partitions) for (const set of p.SETS ?? []) if (typeof set.id === 'number') bySet.set(set.id, [...(bySet.get(set.id) ?? []), ...(set.Destinations ?? [])])
+  const records = (regList as { Records?: { AOR?: unknown; state?: unknown; enabled?: unknown }[] } | null)?.Records ?? []
+  return sets.map(t => {
+    const servers = (bySet.get(t.setid) ?? []).flatMap(d => {
+      const state = typeof d.state === 'string' ? SERVER_STATES[d.state] : undefined
+      return typeof d.URI === 'string' && state ? [{ address: d.URI.replace(/^sips?:/, ''), state }] : []
+    })
+    const record = t.aor ? records.find(r => r.AOR === t.aor) : undefined
+    const state = record && (record.enabled === 'no' ? 'disabled' : typeof record.state === 'string' ? REGISTRATION_STATES[record.state] : undefined)
+    return { id: t.id, ...(state ? { registration: { state } } : {}), servers }
+  })
+}
+
 export interface TrunkTablesOptions {
   pool: Queryable
   /** Awaited before each query: the schema check of the provider. */
@@ -268,6 +307,13 @@ export class TrunkTables {
       dispatcher: await rows(`SELECT setid, destination, socket, state, probe_mode, weight, priority, attrs, description FROM dispatcher WHERE ${OF_TENANT} ORDER BY setid, priority DESC, id`),
       registrant: await rows("SELECT registrar, proxy, aor, username, password, binding_uri, expiry, forced_socket FROM registrant WHERE aor IN (SELECT reg_aor FROM trunks WHERE tenant_id = $1 AND reg_aor <> '') ORDER BY id")
     }
+  }
+
+  /** The tenant's trunks as OpenSIPS knows them: id, set of `dispatcher`, address of record when it registers ('' otherwise). */
+  async sets(): Promise<{ id: string; setid: number; aor: string }[]> {
+    await this.opts.ready?.()
+    const r = (await this.opts.pool.query('SELECT id, setid, reg_aor FROM trunks WHERE tenant_id = $1 ORDER BY position', [this.tenantId])) as { rows?: { id: string; setid: number; reg_aor: string }[] } | undefined
+    return (r?.rows ?? []).map(row => ({ id: row.id, setid: Number(row.setid), aor: row.reg_aor ?? '' }))
   }
 
   /**

@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useState, type FormEvent } from 'react'
 import type { RingGroup } from '@twake/telephony-client'
-import { useGateway } from '../gateway.js'
-import { useT } from '../i18n/useT.js'
-import { groupRefusalKey, parseMembers } from '../ringGroups.js'
+import { useGateway } from '../../gateway.js'
+import { useT } from '../../i18n/useT.js'
+import { groupRefusalKey, parseMembers } from '../../ringGroups.js'
 
 type Note = { kind: 'ok' | 'error'; text: string } | null
 interface Form {

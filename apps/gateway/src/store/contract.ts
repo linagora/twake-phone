@@ -266,6 +266,34 @@ export const storeContract = (name: string, make: () => Promise<Store>) =>
       await s.close()
     })
 
+    it('acknowledges an alert of the tenant once, by whom and when; a repeat after that opens a new one (step 7)', async () => {
+      const s = await make()
+      const alert = { kind: 'rights' as const, param: 'international', scope: 'user' as const, extension: '101', number: '+442079460123' }
+      await s.addAlert({ tenantId: 'A', at: '2026-10-16T10:00:00.000Z', alert })
+      await s.addAlert({ tenantId: 'A', at: '2026-10-16T10:05:00.000Z', alert })
+      const [open] = await s.listAlerts('A')
+      expect(open).not.toHaveProperty('acknowledgedAt')
+      // Another tenant, an id of none, an id that is no number: nothing.
+      expect(await s.acknowledgeAlert('B', open!.id, 'root', '2026-10-16T10:06:00.000Z')).toBeNull()
+      expect(await s.acknowledgeAlert('A', '999999', 'root', '2026-10-16T10:06:00.000Z')).toBeNull()
+      expect(await s.acknowledgeAlert('A', 'x1', 'root', '2026-10-16T10:06:00.000Z')).toBeNull()
+      expect(await s.acknowledgeAlert('A', open!.id, 'root', '2026-10-16T10:06:00.000Z')).toMatchObject({ id: open!.id, count: 2, acknowledgedAt: '2026-10-16T10:06:00.000Z', acknowledgedBy: 'root' })
+      // Acknowledged again by someone else: the first acknowledgement stays.
+      expect(await s.acknowledgeAlert('A', open!.id, 'other', '2026-10-16T10:07:00.000Z')).toMatchObject({ acknowledgedAt: '2026-10-16T10:06:00.000Z', acknowledgedBy: 'root' })
+      // Within the hour, the same alert again: a new one, not counted in the acknowledged one.
+      await s.addAlert({ tenantId: 'A', at: '2026-10-16T10:10:00.000Z', alert })
+      await s.addAlert({ tenantId: 'A', at: '2026-10-16T10:11:00.000Z', alert })
+      const all = await s.listAlerts('A')
+      expect(all.map(a => [a.count, a.acknowledgedBy ?? null])).toEqual([
+        [2, null],
+        [2, 'root']
+      ])
+      expect((await s.listAlerts('A', { state: 'open' })).map(a => a.id)).toEqual([all[0]!.id])
+      expect((await s.listAlerts('A', { state: 'acknowledged' })).map(a => a.id)).toEqual([open!.id])
+      expect(await s.listAlerts('B', { state: 'open' })).toEqual([])
+      await s.close()
+    })
+
     it('keeps the fallback of a trunk and of a range of direct numbers (step 6b)', async () => {
       const s = await make()
       await s.upsertTrunk({ tenantId: 'A', id: 'main', config: { auth: 'ip', domain: 'operator.example', codecs: ['PCMA'], numberFormat: 'e164', defaultNumber: '+33199000100', fallbackTarget: '199' } })

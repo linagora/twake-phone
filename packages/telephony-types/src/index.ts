@@ -303,8 +303,24 @@ export interface Trunk {
   hasPassword?: boolean
 }
 
-/** What an administrator writes: the trunk without its id, with a password to keep (or to change). */
-export type TrunkInput = Omit<Trunk, 'id' | 'hasPassword'> & { password?: string }
+/** What an administrator writes: the trunk without its id, with a password to keep (or to change, or `null` to remove). */
+export type TrunkInput = Omit<Trunk, 'id' | 'hasPassword'> & { password?: string | null }
+
+/**
+ * Where a trunk's registration stands, as the SIP server says it (step 7): `registered`; `registering` (sent, or
+ * answering a challenge); `unregistered`; `refused` (the operator refused the login or the password); `timeout` (the
+ * registrar did not answer); `error` (it answered an error, or the SIP server could not send); `disabled`.
+ */
+export type TrunkRegistrationState = 'registered' | 'registering' | 'unregistered' | 'refused' | 'timeout' | 'error' | 'disabled'
+/** One of a trunk's servers as the SIP server probes it: answering (`up`), not answering its probes (`probing`: no call goes there), or `disabled`. */
+export type TrunkServerState = 'up' | 'probing' | 'disabled'
+
+/** How a trunk is doing now (step 7): its registration when it registers, and each of its servers, in order. Nothing secret. */
+export interface TrunkStatus {
+  id: string
+  registration?: { state: TrunkRegistrationState }
+  servers: { address: string; state: TrunkServerState }[]
+}
 
 /**
  * Direct numbers (SDA/DID): one E.164 number or a range of them (same length, at most 10 000) and where their calls

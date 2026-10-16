@@ -261,6 +261,33 @@ describe('outbound routes', () => {
     expect((ofA()[0] as unknown[])[0]).toMatchObject({ alert: { kind: 'limit', param: 'concurrent', scope: 'user' } })
   })
 
+  it('lets an administrator acknowledge an alert of the tenant (step 7): who and when, listed open or acknowledged, a repeat opening a new one', async () => {
+    const rights = { kind: 'rights' as const, param: 'international', scope: 'user' as const, extension: '101', number: '+442079460123' }
+    const events: RoutedEvent[] = [{ extension: '101', event: { type: 'alert.raised', timestamp: '2026-10-16T10:00:00.000Z', payload: { alert: rights } } }]
+    const { app, admin, as, store } = await setup({ events })
+    await settle(async () => (await store.listAlerts('A')).length === 1)
+    const [open] = (await app.inject({ url: '/api/v1/admin/alerts', headers: admin })).json().items
+    expect(open).not.toHaveProperty('acknowledgedAt')
+    expect((await app.inject({ method: 'POST', url: `/api/v1/admin/alerts/${open.id}/acknowledge`, headers: as('bob') })).statusCode).toBe(403)
+    // Another tenant's administrator, an id of none, an id that is no number: not found.
+    expect((await app.inject({ method: 'POST', url: `/api/v1/admin/alerts/${open.id}/acknowledge`, headers: as('root', 'twakephone-admin', 'B') })).statusCode).toBe(404)
+    for (const id of ['999999', 'abc', '1%3B'])
+      expect((await app.inject({ method: 'POST', url: `/api/v1/admin/alerts/${id}/acknowledge`, headers: admin })).statusCode, id).toBe(404)
+    const acked = await app.inject({ method: 'POST', url: `/api/v1/admin/alerts/${open.id}/acknowledge`, headers: admin })
+    expect(acked.statusCode).toBe(200)
+    expect(acked.json()).toMatchObject({ id: open.id, kind: 'rights', acknowledgedBy: 'root', acknowledgedAt: expect.stringMatching(/^\d{4}-/) })
+    // Twice: the same, the first acknowledgement kept.
+    expect((await app.inject({ method: 'POST', url: `/api/v1/admin/alerts/${open.id}/acknowledge`, headers: as('carol', 'twakephone-admin') })).json().acknowledgedBy).toBe('root')
+    await store.addAlert({ tenantId: 'A', at: '2026-10-16T10:05:00.000Z', alert: rights })
+    const states = async (q: string) => (await app.inject({ url: `/api/v1/admin/alerts${q}`, headers: admin })).json().items.map((a: { id: string; acknowledgedBy?: string }) => a.acknowledgedBy ?? 'open')
+    expect(await states('')).toEqual(['open', 'root'])
+    expect(await states('?state=open')).toEqual(['open'])
+    expect(await states('?state=acknowledged')).toEqual(['root'])
+    const bad = await app.inject({ url: '/api/v1/admin/alerts?state=closed', headers: admin })
+    expect(bad.statusCode).toBe(400)
+    expect(bad.json()).toMatchObject({ code: 'ALERTS_QUERY' })
+  })
+
   it('repeated for days, an alert stays on top of those that came once since (second review 6b, n°8)', async () => {
     // One every 59 minutes for two days: always within an hour of the one before.
     const at = (h: number) => new Date(Date.parse('2026-10-15T10:00:00.000Z') + h * 3_540_000).toISOString()

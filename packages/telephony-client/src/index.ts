@@ -1,6 +1,44 @@
-import type { Call, Capabilities, ConferenceParticipant, Contact, DialInConfiguration, ForwardingRules, MediaSession, Presence, PresenceStatus, RingGroup, TelephonyEvent } from '@twake/telephony-types'
+import type { Call, Capabilities, ConferenceParticipant, Contact, DialInConfiguration, DidRange, ForwardingRules, FraudRule, MediaSession, OutboundAssignment, OutboundCaps, OutboundPolicy, OutboundProfile, Presence, PresenceStatus, RingGroup, TelephonyAlert, TelephonyEvent, Trunk, TrunkInput, TrunkStatus } from '@twake/telephony-types'
 
-export type { Contact, ContactNumber, ForwardingRules, RingGroup } from '@twake/telephony-types'
+export type {
+  Contact,
+  ContactNumber,
+  DidRange,
+  ForwardingRules,
+  FraudRule,
+  FraudThreshold,
+  OutboundAssignment,
+  OutboundCaps,
+  OutboundPolicy,
+  OutboundProfile,
+  RingGroup,
+  TelephonyAlert,
+  Trunk,
+  TrunkAuth,
+  TrunkCodec,
+  TrunkInput,
+  TrunkNumberFormat,
+  TrunkOutboundClass,
+  TrunkRegistrationState,
+  TrunkServerState,
+  TrunkStatus
+} from '@twake/telephony-types'
+// The rules the Gateway checks an administrator's settings with (step 7): the app checks them the same way before sending.
+export {
+  EXTENSION_FORMAT,
+  FRAUD_DEFAULTS,
+  FRAUD_PARAMS,
+  OUTBOUND_CAPS,
+  OUTBOUND_CAP_DEFAULTS,
+  RESERVED_NUMBER,
+  TRUNK_CODECS,
+  TRUNK_COUNTRY,
+  TRUNK_COUNTRY_EXCLUDED,
+  TRUNK_OUTBOUND_CLASSES,
+  TRUNK_OUTBOUND_DEFAULT,
+  isReservedNumber,
+  isValidExtension
+} from '@twake/telephony-types'
 
 import { backoffDelay } from './backoff.js'
 
@@ -78,6 +116,41 @@ export interface SyncReport {
 export interface DirectoryAdmin {
   source: { type: string; url?: string; tenantId?: string; baseDn?: string; userFilter?: string; attributes?: Record<string, string> }
   sync: { available: boolean; running: boolean; intervalMs?: number; last?: SyncReport }
+}
+
+/** A person who holds an extension, as administrators see them (step 7). */
+export interface AdminUser {
+  userId: string
+  extension: string
+  displayName?: string
+  department?: string
+}
+
+/** The rules of the calls to the public network, with what holds when nothing is said (`defaults`). */
+export interface OutboundSettings {
+  policy: OutboundPolicy
+  profiles: OutboundProfile[]
+  assignments: OutboundAssignment[]
+  defaults: { fraud: { national: FraudRule; international: FraudRule }; caps: { user: OutboundCaps; tenant: OutboundCaps } }
+}
+
+/** An alert as kept: its last repeat's fields, `count` repeats from `at` to `lastAt`, what the first said, and its acknowledgement. */
+export type AdminAlert = TelephonyAlert & {
+  id: string
+  at: string
+  lastAt: string
+  count: number
+  first: { value?: number; number?: string }
+  acknowledgedAt?: string
+  acknowledgedBy?: string
+}
+
+export interface AlertFilter {
+  kind?: TelephonyAlert['kind']
+  param?: string
+  state?: 'open' | 'acknowledged'
+  limit?: number
+  before?: string
 }
 
 /** Extracts the Meet room id from a pasted link or code (abc-defg-hij). */
@@ -166,6 +239,73 @@ export class TelephonyClient {
 
   async deleteGroup(number: string) {
     await this.request<void>(`/admin/groups/${encodeURIComponent(number)}`, { method: 'DELETE' })
+  }
+
+  /** The people who hold an extension (administrators only). */
+  listAdminUsers() {
+    return this.request<{ items: AdminUser[] }>('/admin/users')
+  }
+
+  /** The trunks of the organisation, never their passwords (`hasPassword`). 501: the platform has none. */
+  listTrunks() {
+    return this.request<{ items: Trunk[] }>('/admin/trunks')
+  }
+
+  /** How each trunk is doing (registration, servers); `available` false when the platform cannot say now. */
+  getTrunkStatus() {
+    return this.request<{ available: boolean; items: TrunkStatus[] }>('/admin/trunks/status')
+  }
+
+  /** Creates or replaces a trunk; `password` absent keeps the one kept, `null` removes it. Refusals carry a `code`. */
+  setTrunk(id: string, trunk: TrunkInput) {
+    return this.request<Trunk>(`/admin/trunks/${encodeURIComponent(id)}`, { method: 'PUT', body: JSON.stringify(trunk) })
+  }
+
+  /** Removes a trunk and its direct numbers (409 TRUNK_DEFAULT: the default trunk while another one is left). */
+  async deleteTrunk(id: string) {
+    await this.request<void>(`/admin/trunks/${encodeURIComponent(id)}`, { method: 'DELETE' })
+  }
+
+  listDids() {
+    return this.request<{ items: DidRange[] }>('/admin/dids')
+  }
+
+  /** Creates or replaces a range of direct numbers. */
+  setDid(range: DidRange) {
+    const { id, ...body } = range
+    return this.request<DidRange>(`/admin/dids/${encodeURIComponent(id)}`, { method: 'PUT', body: JSON.stringify(body) })
+  }
+
+  async deleteDid(id: string) {
+    await this.request<void>(`/admin/dids/${encodeURIComponent(id)}`, { method: 'DELETE' })
+  }
+
+  /** The rights profiles, who has which, the caps and thresholds, and their defaults. */
+  getOutbound() {
+    return this.request<OutboundSettings>('/admin/outbound')
+  }
+
+  /** Replaces them whole (profiles, policy, assignments). */
+  setOutbound(settings: Pick<OutboundSettings, 'policy' | 'profiles' | 'assignments'>) {
+    const { policy, profiles, assignments } = settings
+    return this.request<OutboundSettings>('/admin/outbound', { method: 'PUT', body: JSON.stringify({ policy, profiles, assignments }) })
+  }
+
+  /** Gives one person a profile, or the default one (`null`). */
+  setUserProfile(userId: string, profileId: string | null) {
+    return this.request<{ userId: string; profileId: string | null }>(`/admin/outbound/users/${encodeURIComponent(userId)}`, { method: 'PUT', body: JSON.stringify({ profileId }) })
+  }
+
+  /** A page of alerts, the latest repeated first (`next`: the `before` of the next page). */
+  listAlerts(filter: AlertFilter = {}) {
+    const params = new URLSearchParams()
+    for (const [k, v] of Object.entries(filter)) if (v !== undefined && v !== '') params.set(k, String(v))
+    const qs = params.toString()
+    return this.request<{ items: AdminAlert[]; next?: string }>(`/admin/alerts${qs ? `?${qs}` : ''}`)
+  }
+
+  acknowledgeAlert(id: string) {
+    return this.request<AdminAlert>(`/admin/alerts/${encodeURIComponent(id)}/acknowledge`, { method: 'POST' })
   }
 
   getMediaSession() {

@@ -101,3 +101,35 @@ h3 { font-size: 1rem; margin: 12px 0 8px; }
 .transfer { margin-top: 12px; }
 .transfer .field { margin-bottom: 8px; }
 .dtmf .keypad { margin: 0 0 8px; }
+/* Administration (step 7): its navigation, its lists, its forms and their errors, its tables. */
+.subnav { margin-bottom: 16px; }
+.subnav ul { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 8px; }
+.subnav a { display: inline-flex; align-items: center; padding: 8px 12px; min-height: 44px; border: 1px solid var(--border); border-radius: var(--radius); text-decoration: none; color: var(--text); background: var(--surface); }
+.subnav a[aria-current="page"] { background: var(--accent); color: var(--accent-text); border-color: transparent; font-weight: 600; }
+.field-error { color: var(--danger); font-weight: 600; }
+.field-error::before { content: "⚠ "; }
+[aria-invalid="true"] { border-color: var(--danger); border-width: 2px; }
+.field legend { padding: 0 4px; }
+.checks { display: flex; flex-wrap: wrap; gap: 4px 16px; }
+.check { display: inline-flex; align-items: center; gap: 8px; min-height: 44px; }
+.check input { width: 20px; height: 20px; min-height: 0; margin: 0; }
+.plain { list-style: none; margin: 0; padding: 0; font-size: 0.9rem; }
+.state { font-weight: 600; }
+.state-registered, .state-up { color: var(--ok); }
+.state-refused, .state-timeout, .state-error, .state-unregistered, .state-disabled, .state-fraud-critical, .state-limit, .state-rights, .state-emergency { color: var(--danger); }
+.admin-list h3 { font-size: 1.05rem; margin: 0 0 8px; overflow-wrap: anywhere; }
+.actions-end { justify-content: flex-end; align-items: flex-start; flex-wrap: wrap; }
+.actions-start { justify-content: flex-start; flex-wrap: wrap; }
+.confirm { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.cap-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 6px 12px; align-items: center; margin-bottom: 8px; }
+.cap-row label, .cap-row .field-error { grid-column: 1 / -1; }
+.cap-row input, .cap-row select, .levels input, .admin-table select { font: inherit; min-height: 44px; padding: 8px 12px; border-radius: var(--radius); border: 1px solid var(--border); background: var(--surface); color: var(--text); min-width: 0; width: 100%; }
+.levels { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.inline-form { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 12px; margin-top: 16px; }
+.inline-form .field { flex: 1 1 240px; margin-bottom: 0; }
+.filters { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 0 12px; align-items: end; }
+.table-scroll { overflow-x: auto; margin-bottom: 16px; }
+.admin-table { border-collapse: collapse; width: 100%; font-size: 0.9rem; }
+.admin-table th, .admin-table td { text-align: left; padding: 8px; border-bottom: 1px solid var(--divider); vertical-align: top; }
+.admin-table thead th { color: var(--muted); font-weight: 600; }
+@media (max-width: 720px) { .cap-row { grid-template-columns: 1fr; } }

@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef } from 'react'
 import { NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom'
+import { adminSectionOf } from '../admin/sections.js'
 import { useAuth } from '../auth/AuthProvider.js'
 import { displayNameFor } from '../auth/oidc.js'
 import { useGateway } from '../gateway.js'
@@ -66,7 +67,9 @@ export const Layout = () => {
   // A route change in a SPA is a page change for assistive tech: the title says where we are, the focus follows (RGAA 8.5, 12.7).
   useEffect(() => {
     const current = LINKS.find(([to]) => (to === '/' ? pathname === '/' : pathname.startsWith(to)))
-    document.title = current ? `${t(current[1])} – ${t('app.name')}` : t('app.name')
+    // A part of the administration (step 7) is named before it: "Trunks – Administration – TwakePhone".
+    const section = adminSectionOf(pathname)
+    document.title = current ? `${section ? `${t(section)} – ` : ''}${t(current[1])} – ${t('app.name')}` : t('app.name')
     if (firstRender.current) firstRender.current = false
     else main.current?.focus()
   }, [pathname, t])

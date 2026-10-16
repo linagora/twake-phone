@@ -247,7 +247,7 @@ export class MemoryStore implements Store {
   async addAlert(record: AlertRecord) {
     const key = alertKey(record.alert)
     const since = new Date(Date.parse(record.at) - ALERT_DEDUP_MS).toISOString()
-    const open = this.alerts.filter(a => a.tenantId === record.tenantId && alertKey(a.alert) === key && a.lastAt >= since).at(-1)
+    const open = this.alerts.filter(a => a.tenantId === record.tenantId && alertKey(a.alert) === key && a.lastAt >= since && !a.acknowledgedAt).at(-1)
     if (open) {
       if (record.at > open.lastAt) open.lastAt = record.at
       open.count++
@@ -262,10 +262,17 @@ export class MemoryStore implements Store {
     const order = (a: StoredAlert, b: StoredAlert) => Date.parse(b.lastAt) - Date.parse(a.lastAt) || Number(b.id) - Number(a.id)
     const cursor = query.before ? ({ lastAt: query.before.lastAt, id: query.before.id } as StoredAlert) : undefined
     return this.alerts
-      .filter(a => a.tenantId === tenantId && (!cursor || order(cursor, a) < 0) && (!query.kind || a.alert.kind === query.kind) && (!query.param || a.alert.param === query.param))
+      .filter(a => a.tenantId === tenantId && (!cursor || order(cursor, a) < 0) && (!query.kind || a.alert.kind === query.kind) && (!query.param || a.alert.param === query.param) && (!query.state || (query.state === 'open') === !a.acknowledgedAt))
       .sort(order)
       .slice(0, clampLimit(query.limit))
       .map(a => structuredClone(a))
+  }
+
+  async acknowledgeAlert(tenantId: string, id: string, by: string, at: string) {
+    const alert = this.alerts.find(a => a.tenantId === tenantId && a.id === id)
+    if (!alert) return null
+    if (!alert.acknowledgedAt) Object.assign(alert, { acknowledgedAt: at, acknowledgedBy: by })
+    return structuredClone(alert)
   }
 
   async purgeAlerts(before: string) {

@@ -17,7 +17,19 @@ type PushRow = { tenant_id: string; user_id: string; endpoint: string; p256dh: s
 type TrunkRow = { tenant_id: string; id: string; config: TrunkRecord['config']; password_enc: string | null }
 type DidRow = { tenant_id: string; id: string; trunk_id: string; first_number: string; last_number: string; target: string | null; suffix_digits: number; fallback_target: string | null }
 type OutboundRow = { tenant_id: string; policy: OutboundRecord['policy']; profiles: OutboundRecord['profiles']; assignments: OutboundRecord['assignments'] }
-type AlertRow = { id: string; tenant_id: string; at: Timestamp; last_at: Timestamp; count: number; alert: AlertRecord['alert']; first_alert: AlertRecord['alert'] | null }
+type AlertRow = { id: string; tenant_id: string; at: Timestamp; last_at: Timestamp; count: number; alert: AlertRecord['alert']; first_alert: AlertRecord['alert'] | null; acknowledged_at: Timestamp | null; acknowledged_by: string | null }
+const ALERT_COLUMNS = 'id::text AS id, tenant_id, at, last_at, count, alert, first_alert, acknowledged_at, acknowledged_by'
+const alertOf = (r: AlertRow): StoredAlert => ({
+  id: r.id,
+  tenantId: r.tenant_id,
+  at: new Date(r.at).toISOString(),
+  lastAt: new Date(r.last_at).toISOString(),
+  count: r.count,
+  alert: r.alert,
+  first: r.first_alert ?? r.alert,
+  ...(r.acknowledged_at ? { acknowledgedAt: new Date(r.acknowledged_at).toISOString() } : {}),
+  ...(r.acknowledged_by ? { acknowledgedBy: r.acknowledged_by } : {})
+})
 
 const toEntry = (r: HistoryRow): HistoryEntry => ({
   tenantId: r.tenant_id,
@@ -382,8 +394,9 @@ export class PgStore implements Store {
       // One writer per alert at a time: two repeats at once count in one alert, never open two.
       await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [`telephony_alerts|${a.tenantId}|${key}`])
       const repeated = await client.query(
+        // Never into an acknowledged one, even acknowledged while this waited for its row.
         `UPDATE telephony_alerts SET last_at = greatest(last_at, $3::timestamptz), count = count + 1, alert = $4
-         WHERE id = (SELECT id FROM telephony_alerts WHERE tenant_id = $1 AND dedup_key = $2 AND last_at >= $3::timestamptz - make_interval(secs => $5) ORDER BY id DESC LIMIT 1)`,
+         WHERE acknowledged_at IS NULL AND id = (SELECT id FROM telephony_alerts WHERE tenant_id = $1 AND dedup_key = $2 AND last_at >= $3::timestamptz - make_interval(secs => $5) AND acknowledged_at IS NULL ORDER BY id DESC LIMIT 1)`,
         [a.tenantId, key, a.at, JSON.stringify(a.alert), ALERT_DEDUP_MS / 1000]
       )
       if (!repeated.rowCount)
@@ -399,12 +412,24 @@ export class PgStore implements Store {
 
   async listAlerts(tenantId: string, query: AlertQuery = {}): Promise<StoredAlert[]> {
     const { rows } = await this.pool.query<AlertRow>(
-      `SELECT id::text AS id, tenant_id, at, last_at, count, alert, first_alert FROM telephony_alerts
+      `SELECT ${ALERT_COLUMNS} FROM telephony_alerts
        WHERE tenant_id = $1 AND ($2::timestamptz IS NULL OR (last_at, id) < ($2::timestamptz, $3::bigint)) AND ($4::text IS NULL OR alert->>'kind' = $4) AND ($5::text IS NULL OR alert->>'param' = $5)
+         AND ($7::text IS NULL OR ($7 = 'open') = (acknowledged_at IS NULL))
        ORDER BY last_at DESC, id DESC LIMIT $6`,
-      [tenantId, query.before?.lastAt ?? null, query.before?.id ?? null, query.kind ?? null, query.param ?? null, clampLimit(query.limit)]
+      [tenantId, query.before?.lastAt ?? null, query.before?.id ?? null, query.kind ?? null, query.param ?? null, clampLimit(query.limit), query.state ?? null]
     )
-    return rows.map(r => ({ id: r.id, tenantId: r.tenant_id, at: new Date(r.at).toISOString(), lastAt: new Date(r.last_at).toISOString(), count: r.count, alert: r.alert, first: r.first_alert ?? r.alert }))
+    return rows.map(alertOf)
+  }
+
+  async acknowledgeAlert(tenantId: string, id: string, by: string, at: string) {
+    if (!/^[1-9][0-9]{0,17}$/.test(id)) return null
+    // The first acknowledgement stays: who did it, and when.
+    const { rows } = await this.pool.query<AlertRow>(
+      `UPDATE telephony_alerts SET acknowledged_at = coalesce(acknowledged_at, $3::timestamptz), acknowledged_by = coalesce(acknowledged_by, $4)
+       WHERE tenant_id = $1 AND id = $2::bigint RETURNING ${ALERT_COLUMNS}`,
+      [tenantId, id, at, by]
+    )
+    return rows[0] ? alertOf(rows[0]) : null
   }
 
   async purgeAlerts(before: string) {

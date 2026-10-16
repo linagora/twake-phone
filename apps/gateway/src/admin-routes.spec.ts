@@ -48,6 +48,49 @@ describe('admin routes', () => {
     expect((await app.inject({ url: '/api/v1/admin/directory' })).statusCode).toBe(401)
   })
 
+  it('keeps every administration route to the administrators (step 7): 403 for anyone else, whatever they send, 401 without a session', async () => {
+    const app = await appWith({ contacts: new MemoryContactDirectory([alice]) })
+    const routes: [string, string, unknown?][] = [
+      ['GET', '/api/v1/admin/directory'],
+      ['POST', '/api/v1/admin/directory/sync'],
+      ['GET', '/api/v1/admin/users'],
+      ['GET', '/api/v1/admin/groups'],
+      ['POST', '/api/v1/admin/groups', { number: '200', name: 'x', members: ['101'] }],
+      ['PUT', '/api/v1/admin/groups/200', { name: 'x', members: ['101'] }],
+      ['DELETE', '/api/v1/admin/groups/200'],
+      ['GET', '/api/v1/admin/trunks'],
+      ['GET', '/api/v1/admin/trunks/status'],
+      ['PUT', '/api/v1/admin/trunks/operator', { auth: 'ip', domain: 'operator.example', codecs: ['PCMA'], defaultNumber: '+33199000100' }],
+      ['DELETE', '/api/v1/admin/trunks/operator'],
+      ['GET', '/api/v1/admin/dids'],
+      ['PUT', '/api/v1/admin/dids/staff', { trunkId: 'operator', first: '+33199000101', target: '101' }],
+      ['DELETE', '/api/v1/admin/dids/staff'],
+      ['GET', '/api/v1/admin/outbound'],
+      ['PUT', '/api/v1/admin/outbound', {}],
+      ['PUT', '/api/v1/admin/outbound/users/bob', { profileId: null }],
+      ['GET', '/api/v1/admin/alerts'],
+      ['POST', '/api/v1/admin/alerts/1/acknowledge']
+    ]
+    for (const [method, url, payload] of routes) {
+      const opts = { method: method as 'GET', url, ...(payload ? { payload } : {}) }
+      expect((await app.inject({ ...opts, headers: as('bob', 'staff') })).statusCode, `${method} ${url}`).toBe(403)
+      // The role of another tenant's administrator is no role here, nor a header of one's own.
+      expect((await app.inject({ ...opts, headers: { ...as('bob'), 'x-admin': 'true' } })).statusCode, `${method} ${url}`).toBe(403)
+      expect((await app.inject(opts)).statusCode, `${method} ${url} anonymous`).toBe(401)
+    }
+  })
+
+  it('lists the people who hold an extension for the administrators: user id, extension, name and department, nothing more (step 7)', async () => {
+    const store = new MemoryStore()
+    await store.upsertMapping({ tenantId: 'dev', userId: 'amartin', extension: '101', displayName: 'Alice Martin', department: 'Direction', source: 'ldap', syncedAt: '2026-10-16T08:00:00.000Z' })
+    await store.upsertMapping({ tenantId: 'dev', userId: 'jdupont', extension: '102' })
+    await store.upsertMapping({ tenantId: 'acme', userId: 'other', extension: '101' })
+    const app = await appWith({ store })
+    const res = await app.inject({ url: '/api/v1/admin/users', headers: as('root') })
+    expect(res.statusCode).toBe(200)
+    expect(res.json()).toEqual({ items: [{ userId: 'amartin', extension: '101', displayName: 'Alice Martin', department: 'Direction' }, { userId: 'jdupont', extension: '102' }] })
+  })
+
   it('shows the source and the synchronisation state, without a credential', async () => {
     const dir = new MemoryContactDirectory([alice])
     dir.describe = () => ({ type: 'ldap', url: 'ldaps://ldap.example.test', baseDn: 'ou=people', userFilter: '(objectClass=person)', attributes: { id: 'uid', extension: 'ipPhone' } })
