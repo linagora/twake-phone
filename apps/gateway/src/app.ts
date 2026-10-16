@@ -421,13 +421,14 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
     })
   }
   /**
-   * A person's presence, told once if it changed (WebhookHub.publishChange). `known`: only if something was told of
-   * them before (told again from what this Gateway knows: one never told is written, not told).
+   * A person's presence, told once if it changed (WebhookHub.publishChange). `known`: only if something is kept of
+   * what was told of them (told again from what this Gateway remembers: one never told, or erased since on whatever
+   * Gateway, is neither written nor told).
    */
   const tellPresence = (tenantId: string, userId: string, extension: string | undefined, status: PresenceStatus, known = false) =>
     hub
       ? hub
-          .publishChange(tenantId, `presence:${userId}`, status, ['presence.changed'], (previous, at) => (known && previous === undefined ? null : presenceEvent(tenantId, userId, extension, status, at)))
+          .publishChange(tenantId, `presence:${userId}`, status, ['presence.changed'], (_previous, at) => presenceEvent(tenantId, userId, extension, status, at), { known })
           .catch((err: unknown) => {
             app.log.error({ err, tenantId }, 'webhook presence not queued')
             return null
@@ -867,8 +868,8 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
       : undefined
   // This Gateway tells the changes of state from now on (all tenants), or hears the events of some tenants again
   // (those only): what changed while another one told them (or nobody, the lease lapsing) is told now, each presence
-  // it knows, still of the person it was heard for, compared to what was told. A person of whom nothing was told is
-  // written, not told (nothing changed for the subscribers: they never heard of them, or they were erased). By
+  // it knows, still of the person it was heard for, compared to what was told. A person of whom nothing is kept is
+  // neither written nor told (nothing changed for the subscribers: they never heard of them, or they were erased). By
   // batches: the API and the queue keep their share of the database meanwhile.
   hub?.onLead(async tenants => {
     for (const tenantId of tenants ?? [...started.keys()]) {

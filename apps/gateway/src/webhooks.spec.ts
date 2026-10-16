@@ -123,8 +123,9 @@ describe('a subscription as written', () => {
 })
 
 describe('the webhook hub', () => {
-  const setup = async (over: Partial<WebhookSubscriptionRecord> = {}) => {
-    const store = new MemoryStore()
+  /** `now`: the store's clock (the database's), one the test moves on its own (shared with the hubs: no drift). */
+  const setup = async (over: Partial<WebhookSubscriptionRecord> = {}, now?: () => number) => {
+    const store = new MemoryStore(now)
     await store.setWebhookDomains('acme', ['crm.example.org'])
     await store.addWebhookSubscription(subscription(over), 20)
     return store
@@ -570,23 +571,28 @@ describe('the webhook hub', () => {
     expect(await Promise.all(all.slice(0, 3))).toEqual([1, 1, 1])
   })
 
-  it('gives back a lease it gained while it stopped, at once (review 10a, third, n°11)', async () => {
+  it('gives back a lease it gained while it stopped, at once (review 10a, third, n°11; fourth, n°7)', async () => {
     const store = await setup()
-    const clock = store.clock.bind(store)
-    const slowClock = gate()
-    store.clock = async () => {
-      await slowClock.opened
-      return clock()
+    const take = store.takeWebhookLease.bind(store)
+    const slowTake = gate()
+    let asked = 0
+    store.takeWebhookLease = async (...args) => {
+      if (args[2] > 0) {
+        asked++
+        await slowTake.opened
+      }
+      return take(...args)
     }
     const { hub } = hubOn(store, () => 204, { stateLeaseMs: 60_000 })
     hub.start()
-    // Its first renewal waits on a slow database, and takes the lease (nobody held it) once the hub is stopping.
+    // Its first renewal asks the lease of a slow database, and gets it (nobody held it) once the hub is stopping.
+    await until('the lease asked', () => asked === 1)
     const stopping = hub.stop()
-    slowClock.open()
+    slowTake.open()
     await stopping
     expect(hub.leading).toBe(false)
     // Given back: another Gateway takes it at once.
-    expect(await store.takeWebhookLease(WEBHOOK_STATE_ROLE, 'gw_next', 60_000)).toBeTruthy()
+    expect(await take(WEBHOOK_STATE_ROLE, 'gw_next', 60_000)).toBeTruthy()
   })
 
   it('takes no lease back after it stopped, however late the renewal under way ends (review 10a, second, n°6)', async () => {
@@ -625,24 +631,30 @@ describe('the webhook hub', () => {
   })
 
   it('gives the lease to a Gateway that hears more tenants, and tells again what it knows of a tenant it hears again, that one only (review 10a, third, n°6)', async () => {
-    const store = await setup({ events: ['presence.changed'] })
+    // One clock for the store and the hubs, moved by the test: nothing here depends on how fast the machine is.
+    let now = Date.parse('2026-10-16T10:00:00.000Z')
+    const store = await setup({ events: ['presence.changed'] }, () => now)
     const streams = { first: new Map([['acme', true], ['beta', false]]), second: new Map([['acme', true], ['beta', true]]) }
-    const first = hubOn(store, () => 204, { streams: () => streams.first, streamSettleMs: 0, stateLeaseMs: 600 })
-    const second = hubOn(store, () => 204, { streams: () => streams.second, streamSettleMs: 0, stateLeaseMs: 600 })
+    const first = hubOn(store, () => 204, { streams: () => streams.first, streamSettleMs: 0, stateLeaseMs: 600, now: () => now })
+    const second = hubOn(store, () => 204, { streams: () => streams.second, streamSettleMs: 0, stateLeaseMs: 600, now: () => now })
     const told: (readonly string[] | undefined)[] = []
     first.hub.onLead(tenants => void told.push(tenants))
-    // Alone, the one that hears fewer takes the lease (better than nobody)...
+    // Alone, the one that hears fewer takes the lease (better than nobody), and tells what it knows...
     await first.hub.renewLease()
     expect(first.hub.leading).toBe(true)
+    await until('told', () => told.length === 1)
     // ...and gives it to one that hears more at its next renewal; never the other way round.
     await second.hub.renewLease()
     await first.hub.renewLease()
     expect(first.hub.leading).toBe(false)
+    // That one gives it back: the first takes it again, and writes once what the other could write is past (a third
+    // of the lease later), then tells again what it knows.
     await second.hub.stop()
-    await until('the first one tells again', async () => {
-      await first.hub.renewLease()
-      return first.hub.leading
-    })
+    await first.hub.renewLease()
+    expect([first.hub.leading, told.length]).toEqual([false, 1])
+    now += 200
+    await first.hub.renewLease()
+    expect(first.hub.leading).toBe(true)
     await until('all told', () => told.length === 2)
     expect(told).toEqual([undefined, undefined])
     // beta heard again: what is known of beta, and of beta only, is told again.
@@ -653,14 +665,22 @@ describe('the webhook hub', () => {
   })
 
   it('counts a stream as down, or up again, only once it stayed so: one that flaps tells nothing again (review 10a, third, n°6)', async () => {
-    const store = await setup({ events: ['presence.changed'] })
-    let now = Date.now()
+    let now = Date.parse('2026-10-16T10:00:00.000Z')
+    const store = await setup({ events: ['presence.changed'] }, () => now)
     const streams = new Map([['acme', true]])
     const { hub } = hubOn(store, () => 204, { streams: () => streams, streamSettleMs: 10_000, stateLeaseMs: 60_000, now: () => now })
     const told: (readonly string[] | undefined)[] = []
     hub.onLead(tenants => void told.push(tenants))
     await hub.renewLease()
     await until('told once', () => told.length === 1)
+    // Heard once its stream stayed up 10 s from the start (not before): what it knows of acme told again.
+    now += 9_000
+    await hub.renewLease()
+    expect(told).toHaveLength(1)
+    now += 1_000
+    await hub.renewLease()
+    await until('told as heard', () => told.length === 2)
+    expect(told[1]).toEqual(['acme'])
     // Down 4 s, then up: nothing.
     streams.set('acme', false)
     await hub.renewLease()
@@ -669,7 +689,7 @@ describe('the webhook hub', () => {
     await hub.renewLease()
     now += 20_000
     await hub.renewLease()
-    expect(told).toHaveLength(1)
+    expect(told).toHaveLength(2)
     // Down 12 s: not heard; then up 12 s: heard again, told again.
     streams.set('acme', false)
     await hub.renewLease()
@@ -679,11 +699,97 @@ describe('the webhook hub', () => {
     await hub.renewLease()
     now += 5_000
     await hub.renewLease()
-    expect(told).toHaveLength(1)
+    expect(told).toHaveLength(2)
     now += 7_000
     await hub.renewLease()
-    await until('told again', () => told.length === 2)
-    expect(told[1]).toEqual(['acme'])
+    await until('told again', () => told.length === 3)
+    expect(told[2]).toEqual(['acme'])
+  })
+
+  it('claims to hear no tenant when it starts until its stream stayed up: it takes no lease from one that hears one (review 10a, fourth, n°2)', async () => {
+    let now = Date.parse('2026-10-16T10:00:00.000Z')
+    const store = await setup({ events: ['presence.changed'] }, () => now)
+    const options = { streamSettleMs: 10_000, stateLeaseMs: 60_000, now: () => now }
+    const holder = hubOn(store, () => 204, { ...options, streams: () => new Map([['acme', true], ['beta', false]]) })
+    const starting = hubOn(store, () => 204, { ...options, streams: () => new Map([['acme', true], ['beta', true]]) })
+    await holder.hub.renewLease()
+    now += 10_000
+    // It hears acme now (one tenant).
+    await holder.hub.renewLease()
+    // The other starts, both its streams up: none heard yet, it takes nothing.
+    await starting.hub.renewLease()
+    now += 5_000
+    await starting.hub.renewLease()
+    await holder.hub.renewLease()
+    expect([holder.hub.leading, starting.hub.leading]).toEqual([true, false])
+    // Both stayed up 10 s: it hears two, more than the holder, and takes the lease.
+    now += 5_000
+    await starting.hub.renewLease()
+    await holder.hub.renewLease()
+    expect(holder.hub.leading).toBe(false)
+    now += 20_000
+    await starting.hub.renewLease()
+    expect(starting.hub.leading).toBe(true)
+  })
+
+  it('tells again what it knows once it may write, whatever its reckoning of the clock did meanwhile (review 10a, fourth, n°1)', async () => {
+    let now = Date.parse('2026-10-16T10:00:00.000Z')
+    const store = await setup({ events: ['presence.changed'] }, () => now)
+    const first = hubOn(store, () => 204, { stateLeaseMs: 60_000, now: () => now })
+    const second = hubOn(store, () => 204, { stateLeaseMs: 60_000, now: () => now })
+    const told: number[] = []
+    second.hub.onLead(() => void told.push(now))
+    await first.hub.renewLease()
+    // The first one gives the lease back (a rolling deployment): the second takes it, and writes a third of the lease
+    // later (what the first could still write by then is past).
+    await first.hub.stop()
+    await second.hub.renewLease()
+    expect([second.hub.leading, told.length]).toEqual([false, 0])
+    // Then, a renewal reads the database's clock 2 ms behind: it reckons it may not write yet, and tells nothing...
+    now += 20_000
+    const clock = store.clock.bind(store)
+    store.clock = async () => new Date(Date.parse(await clock()) - 2).toISOString()
+    await second.hub.renewLease()
+    expect([second.hub.leading, told.length]).toEqual([false, 0])
+    // ...until its reckoning reaches its window, without waiting for another renewal.
+    store.clock = clock
+    now += 3
+    await until('told again', () => told.length === 1)
+    expect(told).toEqual([now])
+  })
+
+  it('tells again in full a round cut short, once it may write again (review 10a, fourth, n°1)', async () => {
+    let now = Date.parse('2026-10-16T10:00:00.000Z')
+    const store = await setup({ events: ['presence.changed'] }, () => now)
+    const { hub } = hubOn(store, () => 204, { stateLeaseMs: 60_000, now: () => now })
+    // Another Gateway held the lease and gives it back: this one takes it, and writes a third of the lease later.
+    expect(await store.takeWebhookLease(WEBHOOK_STATE_ROLE, 'gw_other', 60_000)).toBeTruthy()
+    await store.takeWebhookLease(WEBHOOK_STATE_ROLE, 'gw_other', 0)
+    const clock = store.clock.bind(store)
+    const rounds: boolean[] = []
+    let shift = true
+    hub.onLead(async () => {
+      // During the first round, a renewal reads the database's clock 5 ms behind, just as the window opens: this
+      // Gateway reckons it may not write for now, and its round stops there (as the app's does).
+      if (shift) {
+        shift = false
+        store.clock = async () => new Date(Date.parse(await clock()) - 5).toISOString()
+        // (once the renewal that started this round ended: one renewal at a time)
+        await new Promise(r => setImmediate(r))
+        await hub.renewLease()
+        store.clock = clock
+      }
+      rounds.push(hub.leading)
+    })
+    await hub.renewLease()
+    now += 20_000
+    await hub.renewLease()
+    await until('a first round', () => rounds.length === 1)
+    expect(rounds).toEqual([false])
+    // Told again in full once its reckoning reaches the window.
+    now += 10
+    await until('told again', () => rounds.length === 2)
+    expect(rounds).toEqual([false, true])
   })
 
   it('tells the changes of a lease that changed hands between two of them, with a second Gateway whose clock lags (review 10a, second, n°14)', async () => {

@@ -138,6 +138,8 @@ export class PgStore implements Store {
   private readonly pool: pg.Pool
   /** The lease of the webhook states and the clock, on a connection of their own (never behind a rush of writes). */
   private readonly leasePool: pg.Pool
+  /** Transactions run again after a deadlock or a serialization failure (inTransaction): read by the tests. */
+  private retried = 0
 
   constructor(connectionString: string) {
     this.pool = new pg.Pool({ connectionString, max: 10 })
@@ -647,6 +649,7 @@ export class PgStore implements Store {
       return await this.transactionOnce(run)
     } catch (err) {
       if (!retryable(err)) throw err
+      this.retried++
       return this.transactionOnce(run)
     }
   }
@@ -744,8 +747,13 @@ export class PgStore implements Store {
   }
 
   async deleteWebhookSubscription(tenantId: string, id: string) {
-    const r = await this.pool.query('DELETE FROM webhook_subscriptions WHERE tenant_id = $1 AND id = $2', [tenantId, id])
-    return !!r.rowCount
+    return this.inTransaction(async client => {
+      // Its deliveries locked before it, in the order a claim and an outcome lock them (the cascade would lock the
+      // subscription first, then them: a deadlock with either).
+      await client.query('SELECT id FROM webhook_deliveries WHERE tenant_id = $1 AND subscription_id = $2 ORDER BY id FOR UPDATE', [tenantId, id])
+      const r = await client.query('DELETE FROM webhook_subscriptions WHERE tenant_id = $1 AND id = $2', [tenantId, id])
+      return !!r.rowCount
+    })
   }
 
   /**
@@ -761,6 +769,14 @@ export class PgStore implements Store {
   /** One count of a tenant's tests and replays at a time: two Gateways asked at once never both pass the last place. */
   private lockSends(client: pg.PoolClient, tenantId: string) {
     return client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [`webhook_sends|${tenantId}`])
+  }
+
+  /**
+   * One test or replay of a subscription written at a time (after lockSends, never before): its pending ones counted
+   * and the new one written together, two asked at once never both pass the cap.
+   */
+  private lockSubscriptionSends(client: pg.PoolClient, subscriptionId: string) {
+    return client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [`webhook_pending|${subscriptionId}`])
   }
 
   private countSend(client: pg.PoolClient, tenantId: string, subscriptionId: string, at: string | undefined) {
@@ -810,6 +826,7 @@ export class PgStore implements Store {
   async enqueueWebhookDelivery(tenantId: string, subscriptionId: string, eventId: string, eventType: string, body: string, at: string | undefined, maxPending?: number, quota?: WebhookSendQuota) {
     return this.inTransaction(async client => {
       if (quota) await this.lockSends(client, tenantId)
+      await this.lockSubscriptionSends(client, subscriptionId)
       const { rows: found } = await client.query<{ n: number }>(
         "SELECT (SELECT count(*) FROM (SELECT 1 FROM webhook_deliveries p WHERE p.subscription_id = s.id AND p.status = 'pending' LIMIT $3) x)::int AS n FROM webhook_subscriptions s WHERE s.tenant_id = $1 AND s.id = $2",
         [tenantId, subscriptionId, maxPending ?? 1]
@@ -817,15 +834,14 @@ export class PgStore implements Store {
       if (!found[0]) return null
       if (maxPending !== undefined && found[0].n >= maxPending) return 'full' as const
       if (quota && !(await this.sendAllowed(client, tenantId, subscriptionId, at, quota))) return 'rate' as const
-      // The cap counted in the write itself: two asked at once never pass it both.
       const { rows } = await client.query<DeliveryRow>(
         `INSERT INTO webhook_deliveries (id, tenant_id, subscription_id, event_id, event_type, body, created_at, next_attempt_at)
          SELECT ${NEW_DELIVERY_ID}, s.tenant_id, s.id, $3, $4, $5, coalesce($6::timestamptz, now()), coalesce($6::timestamptz, now()) FROM webhook_subscriptions s
-         WHERE s.tenant_id = $1 AND s.id = $2 AND ($7::int IS NULL OR (SELECT count(*) FROM (SELECT 1 FROM webhook_deliveries p WHERE p.subscription_id = s.id AND p.status = 'pending' LIMIT $7) x) < $7)
+         WHERE s.tenant_id = $1 AND s.id = $2
          ON CONFLICT (subscription_id, event_id) DO NOTHING RETURNING ${DELIVERY_COLUMNS}`,
-        [tenantId, subscriptionId, eventId, eventType, body, at ?? null, maxPending ?? null]
+        [tenantId, subscriptionId, eventId, eventType, body, at ?? null]
       )
-      if (!rows[0]) return maxPending !== undefined ? ('full' as const) : null
+      if (!rows[0]) return null
       if (quota) await this.countSend(client, tenantId, subscriptionId, at)
       return deliveryOf(rows[0])
     })
@@ -840,20 +856,23 @@ export class PgStore implements Store {
         [at?.now ?? null, at?.leaseUntil ?? null, caps.leaseMs ?? 60_000]
       )
       const { now, lease } = times[0]!
-      // The enabled subscriptions not paused that have a delivery due: one read of the index each, whatever waits behind
-      // it (a subscription with a thousand pending costs as much as one with one).
-      const { rows: ready } = await client.query<{ id: string; tenant_id: string; claimed_at: Timestamp | null; due: Timestamp }>(
-        `SELECT s.id, s.tenant_id, s.claimed_at, f.next_attempt_at AS due FROM webhook_subscriptions s
+      // The enabled subscriptions not paused that have a delivery due, and how many up to perSubscription: a few rows
+      // of the index each, whatever waits behind them (a subscription with a thousand pending costs as much as one with
+      // two).
+      const { rows: ready } = await client.query<{ id: string; tenant_id: string; claimed_at: Timestamp | null; due: Timestamp; n: number }>(
+        `SELECT s.id, s.tenant_id, s.claimed_at, f.due, f.n FROM webhook_subscriptions s
          CROSS JOIN LATERAL (
-           SELECT d.next_attempt_at FROM webhook_deliveries d
-           WHERE d.subscription_id = s.id AND d.status = 'pending' AND d.next_attempt_at <= $1 AND d.attempts < $2
-           ORDER BY d.next_attempt_at LIMIT 1
+           SELECT min(x.next_attempt_at) AS due, count(*)::int AS n FROM (
+             SELECT d.next_attempt_at FROM webhook_deliveries d
+             WHERE d.subscription_id = s.id AND d.status = 'pending' AND d.next_attempt_at <= $1 AND d.attempts < $2
+             ORDER BY d.next_attempt_at LIMIT $3
+           ) x
          ) f
-         WHERE s.enabled AND (s.paused_until IS NULL OR s.paused_until <= $1)`,
-        [now, caps.maxAttempts]
+         WHERE f.n > 0 AND s.enabled AND (s.paused_until IS NULL OR s.paused_until <= $1)`,
+        [now, caps.maxAttempts, caps.perSubscription]
       )
       if (!ready.length) return []
-      const subs = ready.map(r => ({ id: r.id, tenantId: r.tenant_id, dueAt: iso(r.due), ...(r.claimed_at ? { claimedAt: iso(r.claimed_at) } : {}) }))
+      const subs = ready.map(r => ({ id: r.id, tenantId: r.tenant_id, dueAt: iso(r.due), dueCount: r.n, ...(r.claimed_at ? { claimedAt: iso(r.claimed_at) } : {}) }))
       const heldOf = async (tenants: string[]) =>
         (
           await client.query<{ tenant_id: string; subscription_id: string; n: number }>(
@@ -932,6 +951,7 @@ export class PgStore implements Store {
         return await this.pool.query<Health>(text, values)
       } catch (err) {
         if (!retryable(err)) throw err
+        this.retried++
         return this.pool.query<Health>(text, values)
       }
     }
@@ -970,6 +990,7 @@ export class PgStore implements Store {
   async replayWebhookDelivery(tenantId: string, subscriptionId: string, id: string, at?: string, maxPending?: number, quota?: WebhookSendQuota) {
     return this.inTransaction(async client => {
       if (quota) await this.lockSends(client, tenantId)
+      await this.lockSubscriptionSends(client, subscriptionId)
       const found = async () =>
         (
           await client.query<{ status: string; erase_body: boolean; n: number }>(
@@ -1050,6 +1071,7 @@ export class PgStore implements Store {
       const { rows } = await client.query<{ state: string; newer: boolean }>('SELECT state, since >= $3::timestamptz AS newer FROM webhook_state WHERE tenant_id = $1 AND subject = $2', [tenantId, subject, exact])
       const before = rows[0]
       if (before && (before.state === state || before.newer)) return null
+      if (change.known && !before) return null
       await client.query('INSERT INTO webhook_state (tenant_id, subject, state, since) VALUES ($1, $2, $3, $4::timestamptz) ON CONFLICT (tenant_id, subject) DO UPDATE SET state = EXCLUDED.state, since = EXCLUDED.since', [tenantId, subject, state, exact])
       const e = event(before?.state, iso(at))
       const { queued, backlogged } = e ? await this.queueEvent(client, tenantId, e.id, e.type, e.body, at, { ...options, ...(e.subjectUser ? { subjectUser: e.subjectUser } : {}) }) : { queued: 0, backlogged: [] }

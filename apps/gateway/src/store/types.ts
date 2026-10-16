@@ -274,6 +274,8 @@ export interface ReadyWebhookSubscription {
   claimedAt?: string
   /** When its earliest delivery due was due. */
   dueAt?: string
+  /** How many of its deliveries are due, counted up to perSubscription (no bound when absent): no more places. */
+  dueCount?: number
 }
 
 /** What all Gateways hold of a subscription now (taken, their lease running). */
@@ -291,7 +293,7 @@ interface ClaimTenant {
   inFlight: number
   served: number
   due: number
-  subs: { id: string; held: number; claimed: number; due: number }[]
+  subs: { id: string; held: number; claimed: number; due: number; dueCount: number; given: number }[]
 }
 
 const claimTenants = (caps: Pick<WebhookClaimCaps, 'perSubscription'>, ready: readonly ReadyWebhookSubscription[], held: readonly HeldWebhookDeliveries[]) => {
@@ -306,16 +308,19 @@ const claimTenants = (caps: Pick<WebhookClaimCaps, 'perSubscription'>, ready: re
     if (!t) tenants.set(r.tenantId, (t = { id: r.tenantId, inFlight: inFlight.get(r.tenantId) ?? 0, served: -Infinity, due: Infinity, subs: [] }))
     t.served = Math.max(t.served, claimed)
     t.due = Math.min(t.due, due)
-    t.subs.push({ id: r.id, held: heldOf.get(r.id) ?? 0, claimed, due })
+    t.subs.push({ id: r.id, held: heldOf.get(r.id) ?? 0, claimed, due, dueCount: r.dueCount ?? Infinity, given: 0 })
   }
   /** Negative when `a` comes first; equal infinities are equal (never NaN). */
   const cmp = (a: number, b: number) => (a < b ? -1 : a > b ? 1 : 0)
   const byId = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0)
-  /** The subscription of a tenant served next: the one holding fewest, then the one taken from least recently, then the earliest due. */
+  /**
+   * The subscription of a tenant served next: the one holding fewest, then the one taken from least recently, then
+   * the earliest due; none that has no more due than places it was given (a place it would leave empty).
+   */
   const subOf = (t: ClaimTenant) => {
     let best: ClaimTenant['subs'][number] | undefined
     for (const x of t.subs) {
-      if (x.held >= caps.perSubscription) continue
+      if (x.held >= caps.perSubscription || x.given >= x.dueCount) continue
       if (!best || (cmp(x.held, best.held) || cmp(x.claimed, best.claimed) || cmp(x.due, best.due) || byId(x.id, best.id)) < 0) best = x
     }
     return best
@@ -365,6 +370,7 @@ export const allocateClaims = (
     const sub = subOf(best)!
     best.inFlight++
     sub.held++
+    sub.given++
     best.served = sub.claimed = SERVED_NOW + order++
     want.set(sub.id, (want.get(sub.id) ?? 0) + 1)
   }
@@ -391,7 +397,8 @@ export interface WebhookLease {
 /**
  * A change of state told once (setWebhookState): `holder` holds the lease of the role (takeWebhookLease) or nothing
  * is written. It is dated on the store's clock (the database's) unless `at` is given (tests), and must be newer than
- * what was told.
+ * what was told. `known`: only of a subject something is kept of (told again from what a Gateway remembers): one the
+ * store keeps nothing of, never told or erased since (by any Gateway), is neither written nor told.
  */
 export interface WebhookStateChange {
   tenantId: string
@@ -399,6 +406,7 @@ export interface WebhookStateChange {
   state: string
   at?: string
   holder: string
+  known?: boolean
 }
 
 /**

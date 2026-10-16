@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs'
 import pg from 'pg'
 import { describe, expect, it } from 'vitest'
 import { storeContract } from './contract.js'
@@ -90,37 +91,70 @@ if (process.env.TEST_DATABASE_URL) {
       }
     }
 
-    it('disables a subscription while the outcome of one of its deliveries is being written, without a deadlock (n°4)', async () => {
+    /** How many transactions the store ran again after a deadlock or a serialization failure. */
+    const retried = (store: PgStore) => (store as unknown as { retried: number }).retried
+
+    // Disabled by the breaker, disabled by an administrator, deleted: each while the outcome of one of the
+    // subscription's deliveries is being written, as completeWebhookDelivery writes it (the delivery first, then its
+    // subscription). None waits on a deadlock: none was run again (the order of the locks, not the retry, avoids it).
+    const whileAnOutcome: [string, (store: PgStore, tenant: string, id: string) => Promise<boolean>, string[][]][] = [
+      ['disables a failing subscription (third review, n°4)', (store, tenant, id) => store.disableFailingWebhookSubscription(tenant, id, new Date().toISOString()), [['evt_1', 'delivered'], ['evt_2', 'failed']]],
+      ['disables a subscription for an administrator (third review, n°4)', (store, tenant, id) => store.updateWebhookSubscription({ ...sub(tenant, id), enabled: false }), [['evt_1', 'delivered'], ['evt_2', 'failed']]],
+      ['deletes a subscription (fourth review, n°5)', (store, tenant, id) => store.deleteWebhookSubscription(tenant, id), []]
+    ]
+    for (const [what, write, after] of whileAnOutcome)
+      it(`${what} while the outcome of one of its deliveries is being written, without a deadlock`, async () => {
+        const store = new PgStore(process.env.TEST_DATABASE_URL!)
+        await store.migrate()
+        const other = new pg.Client({ connectionString: process.env.TEST_DATABASE_URL })
+        await other.connect()
+        const tenant = `deadlock-${Date.now()}`
+        const id = `wh_${Date.now().toString(16).padStart(16, '0').slice(-16)}`
+        try {
+          await store.addWebhookSubscription(sub(tenant, id), 20)
+          await store.enqueueWebhookEvent(tenant, 'evt_1', 'call.missed', '{}', undefined)
+          await store.enqueueWebhookEvent(tenant, 'evt_2', 'call.missed', '{}', undefined)
+          const claimed = (await store.claimWebhookDeliveries(10, { perSubscription: 10, perTenant: 10, maxAttempts: 9 })).filter(d => d.tenantId === tenant)
+          expect(claimed).toHaveLength(2)
+          const first = claimed.find(d => d.eventId === 'evt_1')!
+          // An outcome being written: the delivery first...
+          await other.query('BEGIN')
+          await other.query("UPDATE webhook_deliveries SET status = 'delivered', claim = NULL WHERE id = $1", [first.id])
+          // ...the write meanwhile waits on the delivery, holding nothing the outcome needs...
+          const written = write(store, tenant, id)
+          await waiting(other, '%webhook_%')
+          // ...which goes on with its subscription, and ends.
+          await other.query('UPDATE webhook_subscriptions SET failures = 0 WHERE id = $1', [id])
+          await other.query('COMMIT')
+          expect(await written).toBe(true)
+          expect(retried(store)).toBe(0)
+          const log = await store.listWebhookDeliveries(tenant, id)
+          expect(log.map(d => [d.eventId, d.status]).sort()).toEqual(after)
+        } finally {
+          await other.query('ROLLBACK').catch(() => undefined)
+          await other.end()
+          await store.deleteWebhookSubscription(tenant, id)
+          await store.close()
+        }
+      })
+
+    it('runs a transaction again once when PostgreSQL chose it as the victim of a deadlock, never another error (third review, n°4)', async () => {
       const store = new PgStore(process.env.TEST_DATABASE_URL!)
-      await store.migrate()
-      const other = new pg.Client({ connectionString: process.env.TEST_DATABASE_URL })
-      await other.connect()
-      const tenant = `deadlock-${Date.now()}`
-      const id = `wh_${Date.now().toString(16).padStart(16, '0').slice(-16)}`
+      const inTransaction = (store as unknown as { inTransaction: <T>(run: (client: pg.PoolClient) => Promise<T>) => Promise<T> }).inTransaction.bind(store)
       try {
-        await store.addWebhookSubscription(sub(tenant, id), 20)
-        await store.enqueueWebhookEvent(tenant, 'evt_1', 'call.missed', '{}', undefined)
-        await store.enqueueWebhookEvent(tenant, 'evt_2', 'call.missed', '{}', undefined)
-        const claimed = (await store.claimWebhookDeliveries(10, { perSubscription: 10, perTenant: 10, maxAttempts: 9 })).filter(d => d.tenantId === tenant)
-        expect(claimed).toHaveLength(2)
-        // An outcome being written, as completeWebhookDelivery writes it: the delivery first, then its subscription.
-        await other.query('BEGIN')
-        await other.query("UPDATE webhook_deliveries SET status = 'delivered', claim = NULL WHERE id = $1", [claimed[0]!.id])
-        // The breaker disables the subscription meanwhile: it waits on the delivery, holding nothing the outcome needs.
-        const disabled = store.disableFailingWebhookSubscription(tenant, id, new Date().toISOString())
-        await waiting(other, '%webhook_deliveries%')
-        await other.query('UPDATE webhook_subscriptions SET failures = 0 WHERE id = $1', [id])
-        await other.query('COMMIT')
-        expect(await disabled).toBe(true)
-        const log = await store.listWebhookDeliveries(tenant, id)
-        expect(log.map(d => [d.eventId, d.status, d.lastError]).sort()).toEqual([
-          ['evt_1', 'delivered', undefined],
-          ['evt_2', 'failed', 'disabled']
-        ])
+        let runs = 0
+        const victim = Object.assign(new Error('deadlock detected'), { code: '40P01' })
+        expect(await inTransaction(async client => (++runs === 1 ? Promise.reject(victim) : (await client.query<{ n: number }>('SELECT 1 AS n')).rows[0]!.n))).toBe(1)
+        expect([runs, retried(store)]).toEqual([2, 1])
+        // Twice a victim: the second error goes up; any other error at once.
+        runs = 0
+        await expect(inTransaction(async () => (++runs, Promise.reject(victim)))).rejects.toBe(victim)
+        expect(runs).toBe(2)
+        runs = 0
+        const other = Object.assign(new Error('unique_violation'), { code: '23505' })
+        await expect(inTransaction(async () => (++runs, Promise.reject(other)))).rejects.toBe(other)
+        expect(runs).toBe(1)
       } finally {
-        await other.query('ROLLBACK').catch(() => undefined)
-        await other.end()
-        await store.deleteWebhookSubscription(tenant, id)
         await store.close()
       }
     })
@@ -131,6 +165,8 @@ if (process.env.TEST_DATABASE_URL) {
       const tenant = `lease-${Date.now()}`
       const holder = `gw_${Date.now()}`
       try {
+        // Five subscriptions take the presences: each change queues five deliveries in its transaction.
+        for (let k = 0; k < 5; k++) await store.addWebhookSubscription({ ...sub(tenant, `wh_${(Date.now() + k).toString(16).padStart(16, '0').slice(-16)}`), events: ['presence.changed'] }, 20)
         await store.takeWebhookLease('webhook-state', holder, 0)
         // The lease of an earlier test lapses first.
         for (let i = 0; !(await store.takeWebhookLease('webhook-state', holder, 15_000, 1)); i++) {
@@ -141,7 +177,7 @@ if (process.env.TEST_DATABASE_URL) {
         let written = 0
         const writer = async (w: number) => {
           for (let n = 0; writing; n++) {
-            await store.setWebhookState({ tenantId: tenant, subject: `presence:u${w}`, state: n % 2 ? 'busy' : 'available', holder }, () => null)
+            await store.setWebhookState({ tenantId: tenant, subject: `presence:u${w}`, state: n % 2 ? 'busy' : 'available', holder }, () => ({ id: `evt_${w}_${n}_${Math.random()}`, type: 'presence.changed', body: '{}' }))
             written++
           }
         }
@@ -164,51 +200,101 @@ if (process.env.TEST_DATABASE_URL) {
         await store.takeWebhookLease('webhook-state', holder, 0)
         const pool = (store as unknown as { pool: pg.Pool }).pool
         await pool.query('DELETE FROM webhook_state WHERE tenant_id = $1', [tenant])
+        await pool.query('DELETE FROM webhook_subscriptions WHERE tenant_id = $1', [tenant])
         await store.close()
       }
     }, 30_000)
 
-    it('brings up to date a database that played migration 013 as it stood before the second review (n°12)', async () => {
-      const base = new URL(process.env.TEST_DATABASE_URL!)
-      const name = `${decodeURIComponent(base.pathname.slice(1)) || 'postgres'}_migrate_spec`
-      const own = new URL(base.toString())
-      own.pathname = `/${name}`
-      const server = new pg.Client({ connectionString: base.toString() })
-      await server.connect()
-      await server.query(`DROP DATABASE IF EXISTS "${name}" WITH (FORCE)`)
-      await server.query(`CREATE DATABASE "${name}"`)
-      const store = new PgStore(own.toString())
-      try {
-        await store.migrate()
-        const pool = (store as unknown as { pool: pg.Pool }).pool
-        // 013 as it was at the first review: what the second added taken out, 014 never played.
-        await pool.query(`
-          ALTER TABLE webhook_subscriptions DROP COLUMN backlog, DROP COLUMN backlog_at, DROP COLUMN claimed_at;
-          ALTER TABLE webhook_deliveries DROP COLUMN erase_body;
-          DROP INDEX webhook_deliveries_held_idx;
-          DROP INDEX webhook_deliveries_pending_idx;
-          CREATE INDEX webhook_deliveries_pending_idx ON webhook_deliveries (subscription_id) WHERE status = 'pending';
-          DROP TABLE webhook_sends;
-          CREATE TABLE webhook_sends (subscription_id text NOT NULL REFERENCES webhook_subscriptions (id) ON DELETE CASCADE, at timestamptz NOT NULL);
-          ALTER TABLE webhook_leases DROP COLUMN heard, DROP COLUMN write_from, DROP COLUMN write_until;
-          DELETE FROM schema_migrations WHERE name = '014_webhooks_fairness.sql';
-        `)
-        await store.migrate()
-        expect(await store.takeWebhookLease('webhook-state', 'gw_1', 15_000, 1)).toBeTruthy()
-        await store.addWebhookSubscription(sub('acme', 'wh_00000000000000a1'), 20)
-        expect(await store.enqueueWebhookDelivery('acme', 'wh_00000000000000a1', 'evt_1', 'webhook.test', '{}', undefined, 1000, { perSubscription: 1, windowMs: 60_000 })).toMatchObject({ eventId: 'evt_1' })
-        expect(await store.claimWebhookDeliveries(4, { perSubscription: 2, perTenant: 4, maxAttempts: 9 })).toHaveLength(1)
-        const { rows } = await pool.query<{ n: number }>("SELECT indnatts AS n FROM pg_index WHERE indexrelid = 'webhook_deliveries_pending_idx'::regclass")
-        expect(rows[0]!.n).toBe(3)
-        // Played again on a database up to date: nothing to do.
-        await pool.query("DELETE FROM schema_migrations WHERE name = '014_webhooks_fairness.sql'")
-        await store.migrate()
-      } finally {
-        await store.close()
-        await server.query(`DROP DATABASE IF EXISTS "${name}" WITH (FORCE)`).catch(() => undefined)
-        await server.end()
-      }
-    }, 30_000)
+    /** The webhook tables as the catalog has them: columns, indexes and constraints, whatever the order of the columns. */
+    const schemaOf = async (pool: pg.Pool) => ({
+      columns: (
+        await pool.query(
+          "SELECT table_name, column_name, data_type, is_nullable, column_default FROM information_schema.columns WHERE table_schema = current_schema() AND table_name LIKE 'webhook\\_%' ORDER BY table_name, column_name"
+        )
+      ).rows,
+      indexes: (await pool.query("SELECT tablename, indexname, indexdef FROM pg_indexes WHERE schemaname = current_schema() AND tablename LIKE 'webhook\\_%' ORDER BY indexname")).rows,
+      constraints: (
+        await pool.query("SELECT conrelid::regclass::text AS t, conname, pg_get_constraintdef(oid) AS def FROM pg_constraint WHERE conrelid::regclass::text LIKE 'webhook\\_%' ORDER BY 1, 2")
+      ).rows
+    })
+    // 013 as the earlier heads of the branch had it (a database made from them then), the comments left out.
+    const EARLIER_013: Record<string, string> = {
+      '69fb72e (the first head)': `
+        CREATE TABLE webhook_subscriptions (id text PRIMARY KEY, tenant_id text NOT NULL, url text NOT NULL, events text[] NOT NULL, description text,
+          enabled boolean NOT NULL DEFAULT true, secret_enc text NOT NULL, created_at timestamptz NOT NULL, updated_at timestamptz NOT NULL, created_by text);
+        CREATE INDEX webhook_subscriptions_tenant_idx ON webhook_subscriptions (tenant_id, created_at, id);
+        CREATE TABLE webhook_domains (tenant_id text NOT NULL, position integer NOT NULL, domain text NOT NULL, PRIMARY KEY (tenant_id, domain));
+        CREATE TABLE webhook_deliveries (id text PRIMARY KEY, tenant_id text NOT NULL, subscription_id text NOT NULL REFERENCES webhook_subscriptions (id) ON DELETE CASCADE,
+          event_id text NOT NULL, event_type text NOT NULL, body text NOT NULL, status text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'delivered', 'failed')),
+          attempts integer NOT NULL DEFAULT 0, created_at timestamptz NOT NULL, next_attempt_at timestamptz, claim text, last_attempt_at timestamptz, last_status integer,
+          last_error text, delivered_at timestamptz, UNIQUE (subscription_id, event_id));
+        CREATE INDEX webhook_deliveries_due_idx ON webhook_deliveries (next_attempt_at) WHERE status = 'pending';
+        CREATE INDEX webhook_deliveries_log_idx ON webhook_deliveries (subscription_id, created_at DESC, id DESC);
+        CREATE INDEX webhook_deliveries_created_idx ON webhook_deliveries (created_at);
+        CREATE TABLE webhook_state (tenant_id text NOT NULL, subject text NOT NULL, state text NOT NULL, since timestamptz NOT NULL, PRIMARY KEY (tenant_id, subject));`,
+      '316e923 (the first review)': `
+        CREATE TABLE webhook_subscriptions (id text PRIMARY KEY, tenant_id text NOT NULL, url text NOT NULL, events text[] NOT NULL, description text,
+          enabled boolean NOT NULL DEFAULT true, disabled_reason text, secret_enc text NOT NULL, secret_prev_enc text, secret_prev_until timestamptz,
+          failures integer NOT NULL DEFAULT 0, failing_since timestamptz, paused_until timestamptz, created_at timestamptz NOT NULL, updated_at timestamptz NOT NULL, created_by text);
+        CREATE INDEX webhook_subscriptions_tenant_idx ON webhook_subscriptions (tenant_id, created_at, id);
+        CREATE TABLE webhook_domains (tenant_id text NOT NULL, position integer NOT NULL, domain text NOT NULL, PRIMARY KEY (tenant_id, domain));
+        CREATE TABLE webhook_deliveries (id text PRIMARY KEY, tenant_id text NOT NULL, subscription_id text NOT NULL REFERENCES webhook_subscriptions (id) ON DELETE CASCADE,
+          event_id text NOT NULL, event_type text NOT NULL, body text NOT NULL, subject_user text, status text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'delivered', 'failed')),
+          attempts integer NOT NULL DEFAULT 0, created_at timestamptz NOT NULL, next_attempt_at timestamptz, claim text, last_attempt_at timestamptz, last_status integer,
+          last_error text, delivered_at timestamptz, UNIQUE (subscription_id, event_id));
+        CREATE INDEX webhook_deliveries_due_idx ON webhook_deliveries (next_attempt_at) WHERE status = 'pending';
+        CREATE INDEX webhook_deliveries_pending_idx ON webhook_deliveries (subscription_id) WHERE status = 'pending';
+        CREATE INDEX webhook_deliveries_log_idx ON webhook_deliveries (subscription_id, created_at DESC, id DESC);
+        CREATE INDEX webhook_deliveries_created_idx ON webhook_deliveries (created_at);
+        CREATE INDEX webhook_deliveries_subject_idx ON webhook_deliveries (tenant_id, subject_user) WHERE subject_user IS NOT NULL;
+        CREATE TABLE webhook_sends (subscription_id text NOT NULL REFERENCES webhook_subscriptions (id) ON DELETE CASCADE, at timestamptz NOT NULL);
+        CREATE INDEX webhook_sends_idx ON webhook_sends (subscription_id, at);
+        CREATE TABLE webhook_state (tenant_id text NOT NULL, subject text NOT NULL, state text NOT NULL, since timestamptz NOT NULL, PRIMARY KEY (tenant_id, subject));
+        CREATE TABLE webhook_leases (role text PRIMARY KEY, holder text NOT NULL, until timestamptz NOT NULL);`,
+      // The second review's: 013 as it stands, 014 not yet written.
+      '3427359 (the second review)': readFileSync(new URL('../../migrations/013_webhooks.sql', import.meta.url), 'utf8')
+    }
+    for (const [n, [head, sql]] of Object.entries(EARLIER_013).entries())
+      it(`brings a database that played 013 as it stood at ${head} to the schema of one made afresh (third review, n°12; fourth, n°6)`, async () => {
+        const base = new URL(process.env.TEST_DATABASE_URL!)
+        const name = `${decodeURIComponent(base.pathname.slice(1)) || 'postgres'}_migrate_spec_${n}`
+        const own = new URL(base.toString())
+        own.pathname = `/${name}`
+        const server = new pg.Client({ connectionString: base.toString() })
+        await server.connect()
+        await server.query(`DROP DATABASE IF EXISTS "${name}" WITH (FORCE)`)
+        await server.query(`CREATE DATABASE "${name}"`)
+        const store = new PgStore(own.toString())
+        try {
+          await store.migrate()
+          const pool = (store as unknown as { pool: pg.Pool }).pool
+          const fresh = await schemaOf(pool)
+          // The webhook tables as that 013 made them, 014 never played.
+          await pool.query(`
+            DROP TABLE IF EXISTS webhook_leases, webhook_state, webhook_sends, webhook_deliveries, webhook_domains, webhook_subscriptions;
+            ${sql};
+            DELETE FROM schema_migrations WHERE name = '014_webhooks_fairness.sql';
+          `)
+          await store.migrate()
+          expect(await schemaOf(pool)).toEqual(fresh)
+          expect(await store.takeWebhookLease('webhook-state', 'gw_1', 15_000, 1)).toBeTruthy()
+          await store.addWebhookSubscription(sub('acme', 'wh_00000000000000a1'), 20)
+          expect(await store.enqueueWebhookDelivery('acme', 'wh_00000000000000a1', 'evt_1', 'webhook.test', '{}', undefined, 1000, { perSubscription: 1, windowMs: 60_000 })).toMatchObject({ eventId: 'evt_1' })
+          expect(await store.claimWebhookDeliveries(4, { perSubscription: 2, perTenant: 4, maxAttempts: 9 })).toHaveLength(1)
+          // Played again on a database up to date: nothing changes.
+          await pool.query("DELETE FROM schema_migrations WHERE name = '014_webhooks_fairness.sql'")
+          await store.migrate()
+          expect(await schemaOf(pool)).toEqual(fresh)
+        } finally {
+          await store.close()
+          // Without FORCE: a connection of the store still closing is let close (never cut while it ends).
+          for (let i = 0; i < 100; i++) {
+            if (await server.query(`DROP DATABASE IF EXISTS "${name}"`).then(() => true, () => false)) break
+            await new Promise(r => setTimeout(r, 20))
+          }
+          await server.end()
+        }
+      }, 30_000)
   })
 
   describe('PgStore, trunks written together', () => {

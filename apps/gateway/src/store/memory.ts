@@ -524,12 +524,16 @@ export class MemoryStore implements Store {
     const leaseUntil = at?.leaseUntil ?? new Date(t + (caps.leaseMs ?? 60_000)).toISOString()
     const due = (d: MemoryDelivery) => d.status === 'pending' && d.nextAttemptAt !== undefined && Date.parse(d.nextAttemptAt) <= t && d.attempts < caps.maxAttempts
     const byDue = (a: MemoryDelivery, b: MemoryDelivery) => Date.parse(a.nextAttemptAt!) - Date.parse(b.nextAttemptAt!) || (a.id < b.id ? -1 : 1)
-    // The enabled subscriptions not paused that have one due.
+    // The enabled subscriptions not paused that have one due, and how many up to perSubscription.
     const first = new Map<string, MemoryDelivery>()
-    for (const d of this.deliveries.filter(due).sort(byDue)) if (!first.has(d.subscriptionId)) first.set(d.subscriptionId, d)
+    const count = new Map<string, number>()
+    for (const d of this.deliveries.filter(due).sort(byDue)) {
+      if (!first.has(d.subscriptionId)) first.set(d.subscriptionId, d)
+      count.set(d.subscriptionId, Math.min(caps.perSubscription, (count.get(d.subscriptionId) ?? 0) + 1))
+    }
     const ready = this.webhooks
       .filter(w => first.has(w.id) && w.enabled && !(w.pausedUntil && Date.parse(w.pausedUntil) > t))
-      .map(w => ({ id: w.id, tenantId: w.tenantId, dueAt: first.get(w.id)!.nextAttemptAt!, ...(this.claimedAt.has(w.id) ? { claimedAt: this.claimedAt.get(w.id)! } : {}) }))
+      .map(w => ({ id: w.id, tenantId: w.tenantId, dueAt: first.get(w.id)!.nextAttemptAt!, dueCount: count.get(w.id)!, ...(this.claimedAt.has(w.id) ? { claimedAt: this.claimedAt.get(w.id)! } : {}) }))
     // What all Gateways hold: taken, its lease running.
     const held = new Map<string, { tenantId: string; subscriptionId: string; n: number }>()
     for (const d of this.deliveries)
@@ -643,6 +647,7 @@ export class MemoryStore implements Store {
     if (!lease || lease.holder !== change.holder || lease.writeFrom > now || lease.writeUntil <= now) return null
     const k = key(change.tenantId, change.subject)
     const before = this.webhookState.get(k)
+    if (change.known && !before) return null
     // On its own clock, later than what was told (as the database's, to the microsecond, never goes back).
     const at = change.at ?? new Date(Math.max(this.now(), before ? Date.parse(before.since) + 1 : 0)).toISOString()
     if (before && (before.state === change.state || Date.parse(before.since) >= Date.parse(at))) return null

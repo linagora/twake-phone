@@ -239,6 +239,56 @@ interface Network {
   type: 'ipv4' | 'ipv6'
 }
 
+/** The eight 16-bit words of an IPv6 address (isIP 6, no zone), whatever its writing: `::`, a dotted IPv4 tail. */
+const ipv6Words = (address: string): number[] => {
+  let a = address
+  const dotted = /(\d+)\.(\d+)\.(\d+)\.(\d+)$/.exec(a)
+  if (dotted) {
+    const [b0, b1, b2, b3] = dotted.slice(1).map(Number) as [number, number, number, number]
+    a = `${a.slice(0, dotted.index)}${((b0 << 8) | b1).toString(16)}:${((b2 << 8) | b3).toString(16)}`
+  }
+  const [head, tail] = a.split('::') as [string, string | undefined]
+  const h = head ? head.split(':') : []
+  const t = tail ? tail.split(':') : []
+  const words = [...h, ...(tail === undefined ? [] : Array<string>(8 - h.length - t.length).fill('0')), ...t]
+  return words.map(w => parseInt(w, 16))
+}
+
+/** Whether the first `bits` bits of two addresses (their words) are the same. */
+const samePrefix = (a: readonly number[], b: readonly number[], bits: number) => {
+  for (let i = 0; i < 8 && bits > 0; i++, bits -= 16) {
+    const mask = bits >= 16 ? 0xffff : (0xffff << (16 - bits)) & 0xffff
+    if ((a[i]! & mask) !== (b[i]! & mask)) return false
+  }
+  return true
+}
+
+/** The IPv4 address an IPv4-mapped IPv6 one (::ffff:0:0/96) stands for, however written (`::ffff:7f00:1`). */
+const mappedIpv4 = (words: readonly number[]) =>
+  words.slice(0, 5).every(w => w === 0) && words[5] === 0xffff ? `${words[6]! >> 8}.${words[6]! & 0xff}.${words[7]! >> 8}.${words[7]! & 0xff}` : undefined
+
+/** IPv6 ranges that reach IPv4 addresses: mapped (::ffff:0:0/96), compatible (::/96, deprecated) and NAT64. */
+const IPV4_IN_IPV6 = { mapped: ipv6Words('::ffff:0:0'), compatible: ipv6Words('::'), nat64: ipv6Words('64:ff9b::') }
+
+/**
+ * A network opened as the operator means it: one within ::ffff:0:0/96 is the IPv4 network it maps (`::ffff:10.20.0.0/112`
+ * is 10.20.0.0/16, held to the IPv4 floor); one that holds or overlaps IPv4 written in IPv6 otherwise (::ffff:0:0/96
+ * wider, ::/96 but this host's `::` and `::1`, 64:ff9b::/96) is refused: it would open IPv4 past every guard.
+ */
+const openedNetwork = (n: Network, name: string): Network => {
+  if (n.type === 'ipv4') return n
+  const words = ipv6Words(n.net)
+  const overlaps = (range: number[]) => samePrefix(words, range, Math.min(n.prefix, 96))
+  if (overlaps(IPV4_IN_IPV6.mapped)) {
+    if (n.prefix < 96) throw new Error(`${name}: ${n.net}/${n.prefix} holds every IPv4 address (::ffff:0:0/96): write the IPv4 network instead`)
+    return { net: mappedIpv4(words)!, prefix: n.prefix - 96, type: 'ipv4' }
+  }
+  const thisHost = n.prefix === 128 && words.slice(0, 7).every(w => w === 0) && words[7]! <= 1
+  if ((overlaps(IPV4_IN_IPV6.compatible) && !thisHost) || overlaps(IPV4_IN_IPV6.nat64))
+    throw new Error(`${name}: ${n.net}/${n.prefix} reaches IPv4 addresses written in IPv6: write the IPv4 network instead`)
+  return n
+}
+
 /**
  * One network as written: an IPv4 or IPv6 address (no zone, `%eth0`), alone (one host) or with a prefix of 1 to 3
  * digits within its family's length. Anything else, `10.0.0.0/` (an empty prefix), `10.0.0.0/8/30`, `/0x8`, is an
@@ -292,9 +342,13 @@ export class OpenNetworks implements AddressSet {
   constructor(value: string, name = 'WEBHOOK_PRIVATE_NETWORKS') {
     const networks = networksOf(value, name)
     if (!networks.length) throw new Error(`${name}: an organisation without networks (acme=10.20.0.0/16)`)
-    for (const n of networks) {
-      if (n.prefix < MIN_OPEN_PREFIX[n.type])
-        throw new Error(`${name}: ${n.net}/${n.prefix} opens too much (/${MIN_OPEN_PREFIX[n.type]} at the widest in ${n.type === 'ipv6' ? 'IPv6' : 'IPv4'})`)
+    const tooWide = (n: Network, written: Network) =>
+      new Error(`${name}: ${written.net}/${written.prefix} opens too much (/${MIN_OPEN_PREFIX[n.type]} at the widest in ${n.type === 'ipv6' ? 'IPv6' : 'IPv4'})`)
+    for (const written of networks) {
+      if (written.prefix < MIN_OPEN_PREFIX[written.type]) throw tooWide(written, written)
+      // IPv4 written in IPv6 is held to the IPv4 floor.
+      const n = openedNetwork(written, name)
+      if (n.prefix < MIN_OPEN_PREFIX[n.type]) throw tooWide(n, written)
       this.list.addSubnet(n.net, n.prefix, n.type)
       if (guardedRanges.some(g => g.type === n.type && n.prefix >= g.prefix && g.one.check(n.net, n.type))) this.named.addSubnet(n.net, n.prefix, n.type)
       this.entries.push(`${n.net}/${n.prefix}`)
@@ -351,8 +405,6 @@ export const denyNetworks = (value: string | undefined, interfaces: Record<strin
   return list
 }
 
-const MAPPED = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/i
-
 /**
  * Whether a delivery may reach `address`: a public address, or one of the networks the operator opened (`open`);
  * never one it closed (`deny`), even inside what it opened, nor a guarded one (this host, link-local, the clouds'
@@ -361,12 +413,11 @@ const MAPPED = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/i
 export const addressAllowed = (address: string, open?: AddressSet, deny?: AddressSet): boolean => {
   const family = isIP(address)
   if (!family) return false
-  const mapped = family === 6 ? MAPPED.exec(address)?.[1] : undefined
+  // An IPv4-mapped address, dotted or hexadecimal (::ffff:7f00:1): its IPv4 address, guards and all.
+  const mapped = family === 6 ? mappedIpv4(ipv6Words(address)) : undefined
   if (mapped) return addressAllowed(mapped, open, deny)
   const type = family === 6 ? 'ipv6' : 'ipv4'
   if (deny?.check(address, type)) return false
-  // ::ffff:0:0/96 written another way (hexadecimal): refused, its IPv4 part is not read here.
-  if (family === 6 && /^::ffff:/i.test(address)) return !!open?.check(address, 'ipv6')
   if (open?.check(address, type)) return true
   if (guarded[type].check(address, type)) return false
   return !special[type].check(address, type)

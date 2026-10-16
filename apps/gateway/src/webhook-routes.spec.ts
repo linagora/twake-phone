@@ -464,27 +464,53 @@ describe('the events a subscriber is sent', () => {
     expect(Date.now() - started).toBeLessThan(600)
   })
 
-  it('tells nothing of a person erased, nor of one never told, when a Gateway starts telling again (review 10a, third, n°7)', async () => {
+  it('tells nothing of a person erased, here or on another Gateway, nor of one never told, when a Gateway starts telling again (review 10a, third, n°7; fourth, n°8)', async () => {
     const { app, got, push, store } = await setup({ stateLeaseMs: 300 })
+    await store.upsertMapping({ tenantId: 'A', userId: 'bmoreau', extension: '103' })
     await app.inject({ method: 'PUT', url: '/api/v1/webhooks/domains', headers: root, ...json({ domains: ['crm.example.org'] }) })
     await app.inject({ method: 'POST', url: '/api/v1/webhooks', headers: root, ...json({ url: 'https://crm.example.org/in', events: ['presence.changed'] }) })
     const presence = (p: Presence): TelephonyEvent => ({ type: 'presence.changed', timestamp: at, payload: { userId: '', presence: p } })
     push('102', presence({ status: 'busy', source: 'telephony' }))
-    await until('told', () => got.length === 1)
-    // Jean erases his history; another Gateway, which hears more, takes the lease; Alice changes meanwhile (not told:
-    // this Gateway no longer tells).
-    expect((await app.inject({ method: 'DELETE', url: '/api/v1/me/history', headers: as('jdupont') })).statusCode).toBe(200)
+    push('103', presence({ status: 'busy', source: 'telephony' }))
+    await until('told', () => got.length === 2)
+    // Jean erases his history on another Gateway: the store forgets him, this Gateway still remembers his presence.
+    await store.eraseWebhookSubject('A', 'jdupont')
+    // Another Gateway, which hears more, takes the lease; Alice and Bernard change meanwhile (not told: this Gateway
+    // no longer tells).
     expect(await store.takeWebhookLease(WEBHOOK_STATE_ROLE, 'gw_other', 300, 99)).toBeTruthy()
     await sleep(150)
     push('101', presence({ status: 'dnd', source: 'user' }))
+    push('103', presence({ status: 'available', source: 'telephony' }))
     await sleep(50)
-    // It gives the lease back: this Gateway tells again what it knows. Alice, never told: written, not told; Jean,
-    // erased: nothing.
+    // It gives the lease back: this Gateway tells again what it knows. Bernard changed: told. Alice, never told, and
+    // Jean, erased: neither written nor told.
     await store.takeWebhookLease(WEBHOOK_STATE_ROLE, 'gw_other', 0)
-    await until('told again', async () => (await store.listWebhookStates('A', 'presence:')).length > 0, 3_000)
+    await until('Bernard told again', () => got.length === 3, 3_000)
     await sleep(100)
-    expect(await store.listWebhookStates('A', 'presence:')).toEqual([{ subject: 'presence:amartin', state: 'dnd' }])
-    expect(got).toHaveLength(1)
+    expect(JSON.parse(got[2]!.body).presence).toMatchObject({ user: 'bmoreau', status: 'available' })
+    expect(await store.listWebhookStates('A', 'presence:')).toEqual([{ subject: 'presence:bmoreau', state: 'available' }])
+    expect(got).toHaveLength(3)
+  })
+
+  it('forgets the presence of a person who erases their history here: it is never told again (review 10a, third, n°7)', async () => {
+    const { app, got, push, store } = await setup({ stateLeaseMs: 300 })
+    await store.upsertMapping({ tenantId: 'A', userId: 'bmoreau', extension: '103' })
+    await app.inject({ method: 'PUT', url: '/api/v1/webhooks/domains', headers: root, ...json({ domains: ['crm.example.org'] }) })
+    await app.inject({ method: 'POST', url: '/api/v1/webhooks', headers: root, ...json({ url: 'https://crm.example.org/in', events: ['presence.changed'] }) })
+    const presence = (p: Presence): TelephonyEvent => ({ type: 'presence.changed', timestamp: at, payload: { userId: '', presence: p } })
+    push('102', presence({ status: 'busy', source: 'telephony' }))
+    push('103', presence({ status: 'busy', source: 'telephony' }))
+    await until('told', () => got.length === 2)
+    expect((await app.inject({ method: 'DELETE', url: '/api/v1/me/history', headers: as('jdupont') })).statusCode).toBe(200)
+    expect(await store.takeWebhookLease(WEBHOOK_STATE_ROLE, 'gw_other', 300, 99)).toBeTruthy()
+    await sleep(150)
+    push('103', presence({ status: 'available', source: 'telephony' }))
+    await sleep(50)
+    await store.takeWebhookLease(WEBHOOK_STATE_ROLE, 'gw_other', 0)
+    await until('Bernard told again', () => got.length === 3, 3_000)
+    await sleep(100)
+    expect(await store.listWebhookStates('A', 'presence:')).toEqual([{ subject: 'presence:bmoreau', state: 'available' }])
+    expect(got).toHaveLength(3)
   })
 
   it('a trunk that gets worse, then recovers, from what the SIP server says of it', async () => {

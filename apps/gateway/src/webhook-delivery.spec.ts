@@ -190,6 +190,36 @@ describe('the addresses a delivery may reach', () => {
     expect(addressAllowed('127.0.0.1', parseNetworks('127.0.0.1'))).toBe(true)
   })
 
+  it('reads IPv4 written in IPv6 as the IPv4 it is: held to the IPv4 floor and guards, never opened whole (review 10a, fourth, n°4)', () => {
+    // The IPv4-mapped range whole or too wide of it, IPv6 networks that hold it, the compatible and NAT64 ranges.
+    for (const wide of ['::ffff:0:0/96', '::ffff:10.20.0.0/96', '::ffff:0.0.0.0/100', '::ffff:10.0.0.0/103', '::/16', '::/80', '::/96', '::a14:0/112', '64:ff9b::/96', '64::/16'])
+      expect(() => new OpenNetworks(wide), wide).toThrow(/WEBHOOK_PRIVATE_NETWORKS/)
+    // Within it: the IPv4 network it maps.
+    const mapped = new OpenNetworks('::ffff:10.20.0.0/112, ::ffff:a15:0/112')
+    expect(mapped.entries).toEqual(['10.20.0.0/16', '10.21.0.0/16'])
+    for (const address of ['10.20.3.4', '::ffff:10.20.3.4', '::ffff:a14:304', '0:0:0:0:0:ffff:a15:304']) expect(addressAllowed(address, mapped), address).toBe(true)
+    for (const address of ['10.22.3.4', '::ffff:a16:304', '192.168.1.1']) expect(addressAllowed(address, mapped), address).toBe(false)
+    // This host named in IPv6 is still opened by its entry; the loopback mapped is the IPv4 loopback.
+    expect(addressAllowed('::1', new OpenNetworks('::1'))).toBe(true)
+    expect(addressAllowed('127.0.0.1', new OpenNetworks('::ffff:127.0.0.1'))).toBe(true)
+  })
+
+  it('reads a mapped address however it is written before any guard: hexadecimal is IPv4 too (review 10a, fourth, n°4)', () => {
+    const wide = new OpenNetworks('169.0.0.0/8, fd00::/16')
+    // The loopback and the clouds' metadata, written in hexadecimal: refused, unopened or inside a wider network.
+    for (const address of ['::ffff:7f00:1', '0:0:0:0:0:ffff:7f00:1', '::FFFF:7F00:1', '::ffff:a9fe:a9fe', '::ffff:a83f:8110']) {
+      expect(addressAllowed(address), address).toBe(false)
+      expect(addressAllowed(address, wide), address).toBe(false)
+    }
+    // An IPv4-compatible address (::/96, deprecated): never, whatever is open.
+    for (const address of ['::7f00:1', '::127.0.0.1', '::a14:304']) expect(addressAllowed(address, wide), address).toBe(false)
+    // A public IPv4 address mapped, however written: as public as it is.
+    expect(addressAllowed('::ffff:a83f:8111')).toBe(true)
+    expect(addressAllowed('::ffff:168.63.129.17')).toBe(true)
+    // Closed in IPv4: closed mapped too.
+    expect(addressAllowed('::ffff:a83f:8111', undefined, parseNetworks('168.63.129.17'))).toBe(false)
+  })
+
   it('opens networks to one organisation each, a bare list to the default one, whatever the characters of its id (review 10a, second, n°3; third, n°8)', () => {
     const open = parseTenantNetworks('acme=10.20.0.0/16,fd00:1::/64; beta=192.0.2.10 ;acme=10.30.0.1', 'default')
     expect([...open.keys()]).toEqual(['acme', 'beta'])

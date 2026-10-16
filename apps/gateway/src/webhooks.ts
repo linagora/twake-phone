@@ -248,6 +248,8 @@ export class WebhookHub {
   /** The database's clock minus this one's (ms): the signatures' `t` only (the queue is dated by the database). */
   private skew = 0
   private skewRead = false
+  /** How far `skew` may be off at most: half the round trip of the reading it was taken from. */
+  private skewError = 0
   private leads = false
   /** When this Gateway may write the changes of state (this clock reckoned on the database's): the lease's `writeFrom`. */
   private writableAt = Infinity
@@ -255,7 +257,10 @@ export class WebhookHub {
   /** Whether each tenant's events are heard (streams), with the state of its stream now and since when. */
   private readonly streamHealth = new Map<string, { heard: boolean; up: boolean; since: number }>()
   private readonly leadListeners: ((tenants?: readonly string[]) => void | Promise<void>)[] = []
-  /** The tenants whose changes are to be told again (all of them: 'all'), while a round runs. */
+  /**
+   * The tenants whose changes are to be told again (all of them: 'all'): due until a round told them while this
+   * Gateway could write, whatever the timers (a renewal resumes it).
+   */
   private tellPending: Set<string> | 'all' | undefined
   /** The events being queued, and those waiting to be (publish, publishChange): bounded. */
   private publishing = 0
@@ -323,7 +328,8 @@ export class WebhookHub {
 
   /**
    * How many tenants this Gateway hears (streams), and those it hears again since the last renewal: a stream counts
-   * as down, or up again, once it stayed so streamSettleMs. Said in the log when a tenant changes.
+   * as down, or up again, once it stayed so streamSettleMs; one first seen counts as not heard until then (a Gateway
+   * that starts never claims to hear what it did not yet). Said in the log when a tenant changes.
    */
   private hearing(): { heard: number; again: string[] } {
     const streams = this.options.streams?.()
@@ -336,13 +342,13 @@ export class WebhookHub {
     for (const [tenantId, up] of streams) {
       seen.add(tenantId)
       let h = this.streamHealth.get(tenantId)
-      if (!h) this.streamHealth.set(tenantId, (h = { heard: true, up, since: now }))
+      if (!h) this.streamHealth.set(tenantId, (h = { heard: false, up, since: now }))
       if (h.up !== up) Object.assign(h, { up, since: now })
       if (h.heard !== h.up && now - h.since >= settle) {
         h.heard = h.up
         if (h.heard) {
           again.push(tenantId)
-          this.logger.info({ tenantId }, 'webhook changes of state: the events of this tenant are heard again')
+          this.logger.info({ tenantId }, 'webhook changes of state: the events of this tenant are heard')
         } else this.logger.warn({ tenantId }, 'webhook changes of state: the events of this tenant are not heard')
       }
       if (h.heard) heard++
@@ -361,6 +367,7 @@ export class WebhookHub {
     const after = this.now()
     if (after - before > WEBHOOK_CLOCK_ROUND_TRIP_MS && this.skewRead) return
     this.skew = db - (before + after) / 2
+    this.skewError = (after - before) / 2
     this.skewRead = true
   }
 
@@ -387,19 +394,17 @@ export class WebhookHub {
       if (!lease) {
         this.writableAt = Infinity
         clearTimeout(this.writableTimer)
+        this.tellPending = undefined
         return
       }
       this.writableAt = Date.parse(lease.writeFrom)
       if (gained) {
         this.logger.info({ holder: this.holder, heard, from: lease.writeFrom }, 'webhook changes of state told by this Gateway')
         // What it knows is told once it may write (what the previous holder was writing done), apart from the renewal.
-        clearTimeout(this.writableTimer)
-        const wait = this.writableAt - this.clock()
-        if (wait > 0) {
-          this.writableTimer = setTimeout(() => this.tellAgain(), wait)
-          this.writableTimer.unref()
-        } else this.tellAgain()
-      } else if (again.length && this.leading) this.tellAgain(again)
+        this.tellAgain()
+      } else if (again.length) this.tellAgain(again)
+      // Whatever is still due (a timer that came too early, a round cut short), from each renewal: never lost.
+      else this.resumeTelling()
     } catch (err) {
       this.leads = false
       this.writableAt = Infinity
@@ -408,25 +413,56 @@ export class WebhookHub {
   }
 
   /**
-   * Runs the listeners of onLead for `tenants` (all of them when undefined), one round at a time: those asked
-   * meanwhile run in the next round.
+   * Whether the store takes this Gateway's writes now, whatever its reckoning of the database's clock is off by: it
+   * holds the lease, and its write window opened (writeFrom) even if the clock read last was late by all it may be.
    */
+  private mayTell() {
+    return this.leads && this.clock() - this.skewError >= this.writableAt
+  }
+
+  /** Tells again the changes of `tenants` (all of them when undefined): due until done (resumeTelling). */
   private tellAgain(tenants?: readonly string[]) {
     const pending = this.tellPending
     this.tellPending = pending === 'all' || !tenants ? 'all' : new Set([...(pending ?? []), ...tenants])
-    if (this.telling) return
+    this.resumeTelling()
+  }
+
+  /**
+   * Runs the listeners of onLead for what is due to be told again, one round at a time, once this Gateway may write:
+   * until then, waits for its window (a timer, and each renewal); a round that ends while it may no longer write is
+   * due again; dropped only with the lease (taking it again tells all).
+   */
+  private resumeTelling() {
+    if (this.telling || !this.tellPending || this.closed) return
+    if (!this.leads) {
+      this.tellPending = undefined
+      return
+    }
+    clearTimeout(this.writableTimer)
+    const wait = this.writableAt + this.skewError - this.clock()
+    if (wait > 0) {
+      this.writableTimer = setTimeout(() => this.resumeTelling(), Math.min(Math.ceil(wait) + 1, this.stateLeaseMs))
+      this.writableTimer.unref()
+      return
+    }
     this.telling = (async () => {
-      while (this.tellPending) {
+      while (this.tellPending && !this.closed && this.mayTell()) {
         const round = this.tellPending
         this.tellPending = undefined
-        for (const listener of this.leadListeners) {
-          if (this.closed || !this.leading) return
+        for (const listener of this.leadListeners)
           await Promise.resolve()
             .then(() => listener(round === 'all' ? undefined : [...round]))
             .catch((err: unknown) => this.logger.error({ err }, 'webhook changes of state not told again'))
+        // Cut short (the lease's window closed meanwhile): told again in full.
+        if (!this.closed && !this.mayTell()) {
+          const now = this.tellPending
+          this.tellPending = round === 'all' || now === 'all' ? 'all' : new Set([...round, ...(now ?? [])])
         }
       }
-    })().finally(() => (this.telling = undefined))
+    })().finally(() => {
+      this.telling = undefined
+      this.resumeTelling()
+    })
   }
 
   /**
@@ -514,14 +550,22 @@ export class WebhookHub {
    * never goes back in time), with the event `make` gives for what it was before (null: none) at that date, in the
    * same transaction. How many deliveries were queued (none when the store already had this state, or another Gateway
    * took the lease meanwhile); null when the store was not asked: not the leader, no subscription takes `types`, or
-   * too many events waiting (dropped).
+   * too many events waiting (dropped). `known`: told again from what this Gateway remembers, only if the store keeps
+   * something of `subject` (WebhookStateChange.known: one erased meanwhile, by whatever Gateway, is not written back).
    */
-  publishChange(tenantId: string, subject: string, state: string, types: WebhookEventType[], make: (previous: string | undefined, at: string) => PublishedWebhookEvent | null): Promise<number | null> {
+  publishChange(
+    tenantId: string,
+    subject: string,
+    state: string,
+    types: WebhookEventType[],
+    make: (previous: string | undefined, at: string) => PublishedWebhookEvent | null,
+    options: { known?: boolean } = {}
+  ): Promise<number | null> {
     if (!this.leads) return Promise.resolve(null)
     return this.bounded(async () => {
       if (!this.leads || !(await this.wants(tenantId, ...types))) return null
       const out = await this.store.setWebhookState(
-        { tenantId, subject, state, holder: this.holder },
+        { tenantId, subject, state, holder: this.holder, ...(options.known ? { known: true } : {}) },
         (previous, at) => {
           const event = make(previous, at)
           if (!event || !types.includes(event.type)) return null
