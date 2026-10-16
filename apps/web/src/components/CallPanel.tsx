@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type SyntheticEvent } from 'react'
+import { useEffect, useRef, useState, type ReactNode, type SyntheticEvent } from 'react'
 import type { SoftCall } from '@twake/softphone'
 import { formatNumber, toDialTarget } from '@twake/telephony-client'
 import type { ConferenceParticipant } from '@twake/telephony-types'
@@ -155,17 +155,63 @@ const AddParticipantForm = ({ id, run, onClose, onError, making }: { id: string;
 /** A participant of a conference, as the room has them: their number (or name), for the person. */
 const participantLabel = (p: ConferenceParticipant) => (p.number ? formatNumber(p.number) : (p.displayName ?? p.id))
 
-/** The participants of a conference this window made, read every few seconds and after each action on one. */
-const Participants = ({ meetingId, onError }: { meetingId: string; onError: (message: string | null) => void }) => {
+/**
+ * A short chime when someone joins a conference (review 8b, n°2): the room plays none, and a participant nobody sees
+ * coming must at least be heard. Nothing when the browser has no sound for the page (it says so elsewhere).
+ */
+const chime = () => {
+  try {
+    const Ctx = window.AudioContext ?? (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext
+    if (!Ctx) return
+    const ctx = new Ctx()
+    const tone = ctx.createOscillator()
+    const gain = ctx.createGain()
+    tone.frequency.value = 880
+    gain.gain.value = 0.08
+    tone.connect(gain).connect(ctx.destination)
+    tone.start()
+    tone.stop(ctx.currentTime + 0.15)
+    tone.onended = () => void ctx.close().catch(() => undefined)
+  } catch {
+    // No sound: the notice is written all the same.
+  }
+}
+
+/**
+ * The participants of a conference, read every few seconds and after each action on one. Every participant of the
+ * conference sees them (review 8b, n°2); the one who made it (`manage`) also mutes or removes one. Who comes in or
+ * leaves after the first read is told (`onNotice`, the panel's status region) with a chime for an arrival. After an
+ * action whose button goes (a participant muted or removed), the focus goes to the list, not to the top of the page.
+ */
+const Participants = ({ meetingId, manage, onError, onNotice }: { meetingId: string; manage: boolean; onError: (message: string | null) => void; onNotice: (message: string) => void }) => {
   const { t } = useT()
   const { client, me } = useGateway()
   const [people, setPeople] = useState<ConferenceParticipant[] | null>(null)
   const [version, setVersion] = useState(0)
+  const known = useRef<Map<string, string> | null>(null)
+  const list = useRef<HTMLUListElement>(null)
+  const acted = useRef(false)
+  const notice = useRef(onNotice)
+  // eslint-disable-next-line react-hooks/refs -- the latest callback, read by the reads without restarting them
+  notice.current = onNotice
   useEffect(() => {
     let cancelled = false
     const read = () =>
       client.getCallConference(meetingId).then(
-        c => !cancelled && setPeople(c.participants),
+        c => {
+          if (cancelled) return
+          const now = new Map(c.participants.map(p => [p.id, participantLabel(p)] as const))
+          const before = known.current
+          known.current = now
+          if (before) {
+            const joined = [...now].filter(([id]) => !before.has(id)).map(([, label]) => label)
+            const left = [...before].filter(([id]) => !now.has(id)).map(([, label]) => label)
+            for (const who of joined) notice.current(t('conference.joined', { who }))
+            for (const who of left) notice.current(t('conference.left', { who }))
+            if (joined.length) chime()
+          }
+          setPeople(c.participants)
+        },
         () => undefined
       )
     void read()
@@ -174,7 +220,12 @@ const Participants = ({ meetingId, onError }: { meetingId: string; onError: (mes
       cancelled = true
       clearInterval(timer)
     }
-  }, [client, meetingId, version])
+  }, [client, meetingId, version, t])
+  useEffect(() => {
+    if (!acted.current) return
+    acted.current = false
+    if (!document.activeElement || document.activeElement === document.body) list.current?.focus()
+  }, [people])
   const act = (fn: () => Promise<void>) => () => {
     void (async () => {
       onError(null)
@@ -183,13 +234,14 @@ const Participants = ({ meetingId, onError }: { meetingId: string; onError: (mes
       } catch (err) {
         onError(describeConferenceError(err, t))
       } finally {
+        acted.current = true
         setVersion(v => v + 1)
       }
     })()
   }
   if (!people) return <p className="badge">{t('conference.loading')}</p>
   return (
-    <ul className="list participants" aria-label={t('conference.participants')} data-testid="conference-participants">
+    <ul ref={list} tabIndex={-1} className="list participants" aria-label={t('conference.participants')} data-testid="conference-participants">
       {people.map(p => {
         const label = participantLabel(p)
         const self = !!me?.extension && p.number === me.extension
@@ -205,7 +257,7 @@ const Participants = ({ meetingId, onError }: { meetingId: string; onError: (mes
                 </>
               ) : null}
             </span>
-            {!self ? (
+            {manage && !self ? (
               <span className="actions">
                 {!p.muted ? (
                   <button type="button" className="btn" aria-label={t('conference.muteWho', { who: label })} onClick={act(() => client.muteParticipant(meetingId, p.id))}>
@@ -225,20 +277,46 @@ const Participants = ({ meetingId, onError }: { meetingId: string; onError: (mes
 }
 
 /**
- * A call of a conference (step 8b). The window that made it (`conferenceOf`) has the participants, adds more,
- * removes or mutes one, and ends it for everyone; anyone else in it mutes their microphone or leaves. Leaving is
- * hanging up one's own call: the others go on.
+ * A question asked in place (« Terminer pour tous », leaving a conference one made: review 8b, n°7 and n°11): the focus
+ * goes to it when it opens, and back to the button that opened it when it is answered "no".
  */
-const ConferenceCall = ({ call, tones, onError }: { call: SoftCall; tones: string; onError: (message: string | null) => void }) => {
+const Confirm = ({ id, question, children }: { id: string; question: string; children: ReactNode }) => {
+  const text = useRef<HTMLParagraphElement>(null)
+  useEffect(() => text.current?.focus(), [])
+  return (
+    <div className="confirm" role="group" aria-labelledby={id} data-testid="conference-confirm">
+      <p id={id} ref={text} tabIndex={-1}>
+        {question}
+      </p>
+      <div className="actions">{children}</div>
+    </div>
+  )
+}
+
+/**
+ * A call of a conference (step 8b). Everyone in it sees who is there (the room its SIP server named: `conferenceRoom`,
+ * or the one this window made); the window that made it (`conferenceOf`) also adds more, removes or mutes one, and
+ * ends it for everyone; anyone else mutes their microphone or leaves. Leaving is hanging up one's own call: the others
+ * go on. The one who made it is asked first (the others go on at their name), and ending it for all asks too. When the
+ * conference shows in place of the call (the call panel changed under the person), the focus goes to its title.
+ */
+const ConferenceCall = ({ call, tones, onError, onNotice }: { call: SoftCall; tones: string; onError: (message: string | null) => void; onNotice: (message: string) => void }) => {
   const { t } = useT()
   const phone = usePhone()
   const { client } = useGateway()
   const [adding, setAdding] = useState(false)
+  const [asking, setAsking] = useState<'leave' | 'end' | null>(null)
   const addButton = useRef<HTMLButtonElement>(null)
+  const leaveButton = useRef<HTMLButtonElement>(null)
+  const endButton = useRef<HTMLButtonElement>(null)
+  const title = useRef<HTMLParagraphElement>(null)
   const mine = !!call.conferenceOf
-  const meetingId = call.conferenceOf ? phone.rooms[call.conferenceOf] : undefined
-  const inviting = meetingId ? (phone.inviting[meetingId] ?? []) : []
+  const meetingId = call.conferenceOf ? phone.rooms[call.conferenceOf] : call.conferenceRoom
+  const inviting = mine && meetingId ? (phone.inviting[meetingId] ?? []) : []
   const connected = call.state === 'connected' || call.state === 'held'
+  useEffect(() => {
+    if (!document.activeElement || document.activeElement === document.body) title.current?.focus()
+  }, [])
   const guard = (fn: () => Promise<void> | void) => () => {
     void (async () => {
       onError(null)
@@ -253,43 +331,73 @@ const ConferenceCall = ({ call, tones, onError }: { call: SoftCall; tones: strin
     setAdding(false)
     addButton.current?.focus()
   }
+  const closeAsk = () => {
+    const back = asking === 'end' ? endButton : leaveButton
+    setAsking(null)
+    back.current?.focus()
+  }
+  const endForAll = guard(async () => {
+    setAsking(null)
+    if (meetingId) await client.endCallConference(meetingId)
+  })
   return (
     <section className="call call-conference" aria-labelledby={`call-${call.id}`} data-testid="conference">
-      <p id={`call-${call.id}`} className="call-title" role="status">
+      <p id={`call-${call.id}`} ref={title} tabIndex={-1} className="call-title">
         {mine ? t('conference.title') : t('conference.titleWith', { who: who(call, t) })}
       </p>
       {connected && call.connectedAt ? <Timer since={call.connectedAt} /> : null}
       {mine && !meetingId ? <p className="badge">{t('conference.starting')}</p> : null}
-      <div role="status">
-        {inviting.map(n => (
-          <p key={n} className="badge">
-            {t('conference.inviting', { who: formatNumber(n) })}
-          </p>
-        ))}
-      </div>
+      {inviting.map(n => (
+        <p key={n} className="badge">
+          {t('conference.inviting', { who: formatNumber(n) })}
+        </p>
+      ))}
       {tones ? <p className="badge">{t('call.tonesReceived', { tones })}</p> : null}
-      {meetingId ? <Participants meetingId={meetingId} onError={onError} /> : null}
+      {meetingId ? <Participants meetingId={meetingId} manage={mine} onError={onError} onNotice={onNotice} /> : null}
       <div className="actions">
         {connected ? (
           <button type="button" className="btn" aria-pressed={call.muted} onClick={guard(() => call.setMuted(!call.muted))}>
             {call.muted ? t('call.unmute') : t('call.mute')}
           </button>
         ) : null}
-        {meetingId ? (
+        {mine && meetingId ? (
           <button ref={addButton} type="button" className="btn" aria-pressed={adding} aria-controls={`add-${call.id}`} onClick={() => (adding ? closeAdd() : setAdding(true))}>
             {t('call.addParticipant')}
           </button>
         ) : null}
-        <button type="button" className="btn btn-danger" onClick={guard(() => call.hangup())}>
+        <button ref={leaveButton} type="button" className="btn btn-danger" aria-expanded={mine && meetingId ? asking === 'leave' : undefined} onClick={mine && meetingId ? () => setAsking('leave') : guard(() => call.hangup())}>
           {t('conference.leave')}
         </button>
-        {meetingId ? (
-          <button type="button" className="btn btn-danger" onClick={guard(() => client.endCallConference(meetingId))}>
+        {mine && meetingId ? (
+          <button ref={endButton} type="button" className="btn btn-danger" aria-expanded={asking === 'end'} onClick={() => setAsking('end')}>
             {t('conference.end')}
           </button>
         ) : null}
       </div>
-      {adding && meetingId ? <AddParticipantForm id={`add-${call.id}`} making={false} run={n => phone.inviteToConference(meetingId, n)} onClose={closeAdd} onError={onError} /> : null}
+      {asking === 'leave' ? (
+        <Confirm id={`ask-${call.id}`} question={t('conference.leaveConfirm')}>
+          <button type="button" className="btn btn-danger" onClick={endForAll}>
+            {t('conference.end')}
+          </button>
+          <button type="button" className="btn" onClick={guard(() => call.hangup())}>
+            {t('conference.leaveOnly')}
+          </button>
+          <button type="button" className="btn" onClick={closeAsk}>
+            {t('conference.cancel')}
+          </button>
+        </Confirm>
+      ) : null}
+      {asking === 'end' ? (
+        <Confirm id={`ask-${call.id}`} question={t('conference.endConfirm')}>
+          <button type="button" className="btn btn-danger" onClick={endForAll}>
+            {t('conference.endConfirmYes')}
+          </button>
+          <button type="button" className="btn" onClick={closeAsk}>
+            {t('conference.cancel')}
+          </button>
+        </Confirm>
+      ) : null}
+      {adding && mine && meetingId ? <AddParticipantForm id={`add-${call.id}`} making={false} run={n => phone.inviteToConference(meetingId, n)} onClose={closeAdd} onError={onError} /> : null}
     </section>
   )
 }
@@ -373,9 +481,10 @@ const Active = ({ call, tones, original, hasOther, onError }: { call: SoftCall; 
     addButton.current?.focus()
   }
   // A call a room places (step 8) is neither held nor transferred; a call between two people can become a
-  // conference (step 8b), once nothing else is going on.
+  // conference (step 8b), once nothing else is going on and both are on line: never a call either side holds (the
+  // room would bring the other back unheld, review 8b, n°1).
   const room = !!call.room
-  const canAdd = phone.conferenceAvailable && !room && !hasOther && !original
+  const canAdd = phone.conferenceAvailable && !room && !hasOther && !original && call.state === 'connected' && !call.remoteHold
   const title = call.transferring
     ? t('call.transferringWho', { who: who(call, t) })
     : !connected
@@ -469,6 +578,10 @@ export const CallPanel = () => {
   const { t } = useT()
   const { calls, lastEnded, tones } = usePhone()
   const [error, setError] = useState<string | null>(null)
+  // Who came into or left a conference (review 8b, n°2 and n°11): written in a region always there, so it is read out.
+  const [notice, setNotice] = useState<string | null>(null)
+  // Shown while a conference goes on only.
+  const inConference = calls.some(c => c.room === 'conference')
   if (!calls.length && !lastEnded) return null
   // A call answered at once (it takes the place of one of ours, or joins the conference we make) never rings here.
   const ringing = (c: SoftCall) => c.direction === 'inbound' && c.state === 'ringing' && !c.replacedCallId && !c.conferenceOf
@@ -480,15 +593,14 @@ export const CallPanel = () => {
     <div className="calls" data-testid="calls">
       {shown.map(call => {
         if (ringing(call)) return <Incoming key={call.id} call={call} />
-        if (call.room === 'conference') return <ConferenceCall key={call.id} call={call} tones={tones[call.id] ?? ''} onError={setError} />
+        if (call.room === 'conference') return <ConferenceCall key={call.id} call={call} tones={tones[call.id] ?? ''} onError={setError} onNotice={setNotice} />
         const original = call.consultationOf ? ours.find(c => c.id === call.consultationOf) : undefined
         return <Active key={call.id} call={call} tones={tones[call.id] ?? ''} hasOther={ours.length > 1} onError={setError} {...(original ? { original } : {})} />
       })}
-      {lastEnded ? (
-        <p className="call call-ended" role="status">
-          {t(reasonKey(lastEnded), { who: who(lastEnded, t), message: lastEnded.endMessage ?? '' })}
-        </p>
-      ) : null}
+      <div role="status" className="call-status" data-testid="call-status">
+        {lastEnded ? <p className="call call-ended">{t(reasonKey(lastEnded), { who: who(lastEnded, t), message: lastEnded.endMessage ?? '' })}</p> : null}
+        {inConference && notice ? <p className="badge">{notice}</p> : null}
+      </div>
       {error && calls.length ? (
         <p className="alert alert-error" role="alert">
           {error}

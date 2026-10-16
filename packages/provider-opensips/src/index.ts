@@ -1,4 +1,4 @@
-import type { CallParties, MediaProvider, ProviderFactory, RoomCallGrant, RoutedEvent, TelephonyProvider } from '@twake/telephony-provider-sdk'
+import type { CallParties, MediaProvider, ProviderFactory, RoomCallGrant, RoomCallGrantToken, RoutedEvent, TelephonyProvider } from '@twake/telephony-provider-sdk'
 import type { Call, Capabilities, DidRange, Endpoint, ForwardingRules, MediaSession, OriginateRequest, OutboundAssignment, OutboundPolicy, OutboundProfile, Presence, ProviderStatus, RingGroup, Trunk, TrunkStatus, User } from '@twake/telephony-types'
 import type { CallGroups } from './call-groups.js'
 import type { CallRules } from './call-rules.js'
@@ -363,25 +363,47 @@ export class OpensipsProvider implements TelephonyProvider, MediaProvider {
 
   /**
    * A room of Meet may call `number` at the name of `extension`, once, within `ttlSec` seconds (route[meet_source]);
-   * in the place of a call of `number` (`replaces`), or to the window of `extension` that waits for `join` (step 8b).
+   * in the place of a call of `number` (`replaces`), or to the window of `extension` that waits for `join` (step 8b),
+   * a call of the conference `room`. `taken`: the call that took it, as OpenSIPS wrote it (review 8b, n°3).
    */
-  async grantRoomCall(grant: RoomCallGrant): Promise<{ token: string; revoke(): Promise<void> }> {
+  async grantRoomCall(grant: RoomCallGrant): Promise<RoomCallGrantToken> {
     const grants = this.config.dialOutGrants
     if (!grants) throw Object.assign(new Error('The SIP server cannot let a room call'), { statusCode: 501 })
-    const conference = { ...(grant.replaces !== undefined ? { replaces: grant.replaces } : {}), ...(grant.join !== undefined ? { join: grant.join } : {}) }
+    const conference = {
+      ...(grant.replaces !== undefined ? { replaces: grant.replaces } : {}),
+      ...(grant.join !== undefined ? { join: grant.join } : {}),
+      ...(grant.room !== undefined ? { room: grant.room } : {})
+    }
     const token = await grants.grant(grant.extension, grant.number, grant.ttlSec, conference)
-    return { token, revoke: () => grants.revoke(token) }
+    return { token, revoke: () => grants.revoke(token), taken: () => grants.taken(token) }
+  }
+
+  /**
+   * Ends a call OpenSIPS has, by its Call-ID (MI dlg_end_dlg, review 8b, n°3): a BYE to both sides. A call it does not
+   * have (over already) is no error.
+   */
+  async endRoomCall(callId: string): Promise<void> {
+    if (!this.events) throw Object.assign(new Error('The SIP server cannot end a call'), { statusCode: 501 })
+    await this.events.call('dlg_end_dlg', { dialog_id: callId }).catch((err: unknown) => {
+      if ((err as { code?: unknown }).code !== 404) throw err
+    })
   }
 
   /**
    * The call `callId` as OpenSIPS's dialog holds it (MI dlg_list_ctx, step 8b): answered and confirmed (state 4),
    * between two extensions (no trunk, no room in its values), with the extension it reached (`callee`, written at
    * the ringing and by the member of a group who answered) and the tag of the answer (`callee_tag`, written at the
-   * 2xx). Undefined without the MI, for a call it does not have, or one not answered yet.
+   * 2xx). Undefined without the MI, for a call it does not have (No such dialog, 404), or one not answered yet. An MI
+   * that does not answer, or answers another error, is not "no such call" (review 8b, n°10): 503, SIP_SERVER_UNAVAILABLE.
    */
   async callBetweenExtensions(callId: string): Promise<CallParties | 'external' | undefined> {
     if (!this.events || !callId) return undefined
-    const dialog = await this.events.call('dlg_list_ctx', { callid: callId }).then(parseDlgContext, () => undefined)
+    const dialog = await this.events.call('dlg_list_ctx', { callid: callId }).then(parseDlgContext, (err: unknown) => {
+      if ((err as { code?: unknown }).code === 404) return undefined
+      const log = this.config.logger ?? console
+      log.warn(`OpenSIPS: the call ${callId} not read (${err instanceof Error ? err.message : String(err)})`)
+      throw Object.assign(new Error('The SIP server did not say where the call is'), { statusCode: 503, code: 'SIP_SERVER_UNAVAILABLE' })
+    })
     if (!dialog || dialog.callid !== callId || dialog.state !== 4) return undefined
     if (dialog.values.trunk !== undefined || dialog.values.meet !== undefined) return 'external'
     const callee = dialog.values.callee ?? ''

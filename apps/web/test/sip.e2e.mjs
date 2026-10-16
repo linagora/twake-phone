@@ -2599,13 +2599,21 @@ try {
       const items = (await store.listHistory(TENANT, userId, { limit: 10 })).items.filter(e => e.startedAt > after && e.conference)
       return items.length >= count ? items : null
     })
-  await step('step 8b: Alice calls Jean, who answers; she adds Bob (« Ajouter un participant », 103): the room calls her window, answered by itself, then Jean in the place of their call (Replaces, answered by itself); Bob rings from her extension and answers: a conference of three, each hearing the others, neither hold nor transfer', async () => {
+  await step('step 8b: Alice calls Jean, who answers; while Jean holds the call, Alice cannot add anyone (review 8b, n°1); both mute their microphone; she adds Bob (« Ajouter un participant », 103): the room calls her window, answered by itself, then Jean in the place of their call (Replaces, answered by itself), each microphone still muted; Bob rings from her extension and answers: a conference of three, each hearing the others, neither hold nor transfer; Jean and Bob see who is in it, without acting on anyone, and are told who came (review 8b, n°2); Alice removes Bob, whose call ends, and Jean is told he left', async () => {
     conferenceFrom = new Date().toISOString()
     conferenceAcc = await lastId('acc')
     await aliceCallsJean(alice, jean)
     const [original] = await calls(alice.page)
     const [jeans] = await calls(jean.page)
     if (!original?.sipCallId || original.sipCallId !== jeans?.sipCallId) throw new Error(`the Call-ID of the call on both sides: ${original?.sipCallId} ${jeans?.sipCallId}`)
+    // Jean holds the call: the room would take it unheld, his microphone open to it; Alice has nothing to add with.
+    await jean.page.getByRole('button', { name: 'Mettre en attente' }).click()
+    await until('Alice seeing Jean hold the call', async () => ((await calls(alice.page))[0]?.remoteHold ? true : null))
+    expectEqual(await alice.page.getByRole('button', { name: 'Ajouter un participant' }).count(), 0, 'the button to add a participant while Jean holds the call')
+    await jean.page.getByRole('button', { name: 'Reprendre' }).click()
+    await until('Alice seeing Jean resume the call', async () => ((await calls(alice.page))[0]?.remoteHold === false ? true : null))
+    // Each one mutes their microphone: the calls of the conference start so.
+    for (const who of [alice, jean]) await who.page.getByRole('button', { name: 'Couper le micro' }).click()
     await alice.page.getByRole('button', { name: 'Ajouter un participant' }).click()
     await alice.page.getByLabel('Participant à ajouter (poste ou numéro)').fill('103')
     await alice.page.getByRole('button', { name: 'Appeler et ajouter' }).click()
@@ -2614,14 +2622,14 @@ try {
       const c = await calls(alice.page)
       return c.length === 1 && c[0].room === 'conference' && c[0].state === 'connected' ? c : null
     }, { timeout: 30_000 })
-    expectEqual(`${mine.conferenceOf === original.id} ${mine.direction} ${mine.remoteNumber}`, 'true inbound 101', 'Alice\'s call of the conference')
+    expectEqual(`${mine.conferenceOf === original.id} ${mine.direction} ${mine.remoteNumber} ${mine.muted}`, 'true inbound 101 true', 'Alice\'s call of the conference')
     expectEqual((await lastEnded(alice.page))?.endReason, 'conference', 'how Alice\'s call with Jean ended')
     // Jean: the room's call in the place of theirs, from Alice's extension; his call with her ended as a conference.
     const [his] = await until('Jean in the conference', async () => {
       const c = await calls(jean.page)
       return c.length === 1 && c[0].room === 'conference' && c[0].state === 'connected' ? c : null
     }, { timeout: 30_000 })
-    expectEqual(`${his.replacedCallId === jeans.id} ${his.remoteNumber}`, 'true 101', 'Jean\'s call of the conference')
+    expectEqual(`${his.replacedCallId === jeans.id} ${his.remoteNumber} ${his.muted}`, 'true 101 true', 'Jean\'s call of the conference')
     expectEqual((await lastEnded(jean.page))?.endReason, 'conference', 'how Jean\'s call with Alice ended')
     await jean.page.getByText('Conférence avec Alice Martin (101)').waitFor()
     // Bob: rung by the room, at Alice's name, as any call a room places.
@@ -2635,6 +2643,17 @@ try {
     for (const button of ['Retirer 102 de la conférence', 'Retirer 103 de la conférence', 'Terminer pour tous', 'Quitter la conférence']) await alice.page.getByRole('button', { name: button }).waitFor()
     CONFERENCE = await until('the room of the conference, kept for Alice', async () => (await store.listConferences(TENANT, 'amartin')).find(r => /^twake-call-[0-9a-f]{16}$/.test(r.meetingId))?.meetingId ?? null)
     expectEqual((await inConference()).map(p => `${p.kind} ${p.number}`).sort().join(', '), 'phone 101, phone 102, phone 103', 'the room of the conference')
+    // Bob's call names the room of the conference (Twake-Conference): he sees who is in it, as Jean does; neither acts on anyone.
+    const [bobs] = await calls(bob.page)
+    expectEqual(`${bobs?.room} ${bobs?.conferenceRoom === CONFERENCE}`, 'conference true', `Bob's call of the conference ${JSON.stringify(bobs)}`)
+    for (const who of [jean, bob]) {
+      await who.page.getByTestId('conference-participant').nth(2).waitFor({ timeout: 20_000 })
+      expectEqual(await who.page.getByTestId('conference-participant').count(), 3, `the participants ${who.name} sees`)
+      expectEqual(await who.page.getByRole('button', { name: /^Retirer / }).count(), 0, `the buttons to remove a participant on ${who.name}'s page`)
+    }
+    // Whoever is in it is told who came, in a region read out.
+    for (const who of [alice, jean]) await who.page.getByTestId('call-status').getByText('103 a rejoint la conférence.').waitFor({ timeout: 20_000 })
+    for (const who of [alice, jean]) await who.page.getByTestId('conference').getByRole('button', { name: 'Rétablir le micro' }).click()
     // Each one hears the others, through the room.
     await bothHearEachOther(alice, jean)
     await bothHearEachOther(jean, bob)
@@ -2643,11 +2662,22 @@ try {
       expectEqual(await who.page.getByRole('button', { name: 'Mettre en attente' }).count(), 0, `the hold button on ${who.name}'s page`)
       expectEqual(await transferButton(who.page).count(), 0, `the transfer button on ${who.name}'s page`)
     }
+    // Alice removes Bob (« Retirer 103 de la conférence »): his call ends, the conference goes on; whoever is in it is told.
+    await alice.page.getByRole('button', { name: 'Retirer 103 de la conférence' }).click()
+    await until('the end of Bob\'s call', async () => ((await calls(bob.page)).length === 0 ? true : null), { timeout: 20_000 })
+    await bob.page.getByText('La conférence est terminée pour vous.').waitFor()
+    for (const who of [alice, jean]) await who.page.getByTestId('call-status').getByText('103 a quitté la conférence.').waitFor({ timeout: 20_000 })
+    expectEqual(`${(await calls(alice.page)).length} ${(await calls(jean.page)).length}`, '1 1', 'the calls of Alice and Jean once Bob was removed')
   })
-  await step('step 8b: Alice ends the conference for everyone (« Terminer pour tous »): the three calls end, the room and its record go; the history of Alice and Jean says conference, as their Récents do', async () => {
+  await step('step 8b: Alice ends the conference for everyone (« Terminer pour tous », then « Oui, terminer pour tous »): the calls end, the room and its record go; the history of Alice and Jean says conference, as their Récents do', async () => {
+    // Asked first (review 8b, n°7): « Annuler » changes nothing.
     await alice.page.getByRole('button', { name: 'Terminer pour tous' }).click()
+    await alice.page.getByTestId('conference-confirm').getByRole('button', { name: 'Annuler' }).click()
+    expectEqual((await calls(jean.page)).length, 1, 'Jean\'s calls once Alice said no')
+    await alice.page.getByRole('button', { name: 'Terminer pour tous' }).click()
+    await alice.page.getByRole('button', { name: 'Oui, terminer pour tous' }).click()
     for (const who of [alice, jean, bob]) await until(`the end of the conference on ${who.name}'s page`, async () => ((await calls(who.page)).length === 0 ? true : null), { timeout: 20_000 })
-    for (const who of [alice, jean]) await who.page.getByText('Conférence terminée.').waitFor()
+    for (const who of [alice, jean]) await who.page.getByText('La conférence est terminée pour vous.').waitFor()
     expectEqual((await (await asPerson(alice))('GET', `/conferences/${CONFERENCE}`)).statusCode, 404, 'GET /conferences/:id once ended')
     expectEqual(await store.getConference(CONFERENCE), null, 'the record of the conference')
     const [aliceIn] = await conferenceCalls('amartin', conferenceFrom, 1)

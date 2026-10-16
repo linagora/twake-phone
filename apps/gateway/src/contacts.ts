@@ -71,15 +71,15 @@ export class RateLimiter {
   private readonly hits = new Map<string, number[]>()
   constructor(private readonly limit: number, private readonly windowMs: number, private readonly now: () => number = Date.now) {}
 
-  /** True when this event is allowed. */
-  allow(key: string): boolean {
+  /** True when these `count` events (one by default) are allowed; then all of them count, otherwise none. */
+  allow(key: string, count = 1): boolean {
     const t = this.now()
     const recent = (this.hits.get(key) ?? []).filter(h => h > t - this.windowMs)
-    if (recent.length >= this.limit) {
+    if (recent.length + count > this.limit) {
       this.hits.set(key, recent)
       return false
     }
-    recent.push(t)
+    for (let i = 0; i < count; i++) recent.push(t)
     this.hits.set(key, recent)
     return true
   }

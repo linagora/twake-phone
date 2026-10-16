@@ -108,11 +108,14 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(cfg).toContain('$avp(meet_grant) = $hdr(X-Twake-Grant);')
     expect(cfg).toContain('remove_hf("X-Twake-Grant");')
     const source = section('route[meet_source]', 'route[meet_source_loaded]')
-    // Only the characters of a grant and of a number get into the query; anything else is refused before it.
-    expect(source).toContain('if (!($avp(meet_grant) =~ "^[0-9a-f]{32}$") || !($rU =~ "^[+]?[0-9*#]{2,20}$")) {')
+    // Only the characters of a grant, of a number, of a tag and of a Call-ID get into the query; anything else is
+    // refused before it.
+    expect(source).toContain('if (!($avp(meet_grant) =~ "^[0-9a-f]{32}$") || !($rU =~ "^[+]?[0-9*#]{2,20}$") || !($ft =~ "^[A-Za-z0-9._~!%*+-]{1,64}$") || !($ci =~ "^[A-Za-z0-9._~!%*+@:-]{1,200}$")) {')
     expect(source.indexOf('t_reply(403, "Not Granted");')).toBeLessThan(source.indexOf('async(sql_query_one('))
-    // Deleted as it is read: used once, before its expiry, for this person and this number only.
-    expect(source).toContain(`"DELETE FROM dial_out_grants g WHERE g.token = '" + $avp(meet_grant) + "' AND g.extension = '" + $fU + "' AND g.number = '" + $rU + "' AND g.expires_at > now() AND EXISTS (SELECT 1 FROM subscriber s WHERE s.username = g.extension) RETURNING 1, coalesce(g.replaces, ''), coalesce(g.join_token, '')"`)
+    // Marked with the call that takes it as it is read (review 8b, n°3: its From tag and Call-ID, for the Gateway to
+    // compare with its own), kept 10 minutes for that: used once, before its expiry, for this person and number only.
+    expect(source).toContain(`"UPDATE dial_out_grants g SET used_by = '" + $ft + "', used_call = '" + $ci + "', expires_at = now() + interval '10 minutes' WHERE g.token = '" + $avp(meet_grant) + "' AND g.used_by IS NULL AND g.extension = '" + $fU + "' AND g.number = '" + $rU + "' AND g.expires_at > now() AND EXISTS (SELECT 1 FROM subscriber s WHERE s.username = g.extension) RETURNING 1, coalesce(g.replaces, ''), coalesce(g.join_token, ''), coalesce(g.room, '')"`)
+    expect(cfg).not.toContain('DELETE FROM dial_out_grants')
     const loaded = section('route[meet_source_loaded]', 'route[meet_call]')
     expect(loaded).toContain('if ($var(meet_rc) == -2) {')
     expect(loaded.indexOf('append_to_reply("Twake-Call-Refused: not-granted\\r\\n");')).toBeLessThan(loaded.indexOf('route(trunk_out);'))
@@ -124,26 +127,51 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     const { cfg } = render({ MEET_SIP: '192.0.2.20:5080', MEET_SIP_PASSWORD: 'not-a-real-secret-0' })
     const section = (name: string, next: string) => cfg.slice(cfg.indexOf(`\n${name} {`), cfg.indexOf(`\n${next} {`))
     // The direct number of a call from the operator: a burst of them past the cap answered 404 (the CI, step 8a).
-    expect(section('route[trunk_in]', 'route[inbound_number]')).toContain('$avp(did_query) = $var(did_query);\n\tasync(sql_query_one("$var(did_query)", "$avp(did_target);')
+    expect(section('route[trunk_in]', 'route[inbound_number]')).toContain('$avp(did_query) = $var(did_query);\n\troute(read_sent);\n\tasync(sql_query_one("$var(did_query)", "$avp(did_target);')
     const din = section('route[trunk_in_loaded]', 'route[did_fallback]')
     expect(din).toContain('if ($var(did_rc) == -1 && route(read_again)) {\n\t\tsql_query_one("$avp(did_query)", "$avp(did_target);$avp(t_codecs);$avp(fb_target);$avp(fb_kind);$avp(fb_members);$avp(did_assigned)");\n\t\t$var(did_rc) = $rc;\n\t}')
     expect(din.indexOf('route(read_again)')).toBeLessThan(din.indexOf('t_reply(404, "Not Found");'))
     // The trunk of a call to the operator, likewise, before it is told there is none.
-    expect(section('route[trunk_out]', 'route[trunk_out_loaded]')).toContain('$avp(trunk_query) = $var(trunk_query);\n\tasync(sql_query_one("$var(trunk_query)",')
+    expect(section('route[trunk_out]', 'route[trunk_out_loaded]')).toContain('$avp(trunk_query) = $var(trunk_query);\n\troute(read_sent);\n\tasync(sql_query_one("$var(trunk_query)",')
     const tout = section('route[trunk_out_loaded]', 'route[trunk_out_send]')
     expect(tout).toContain('if ($var(trunk_rc) == -1 && route(read_again)) {\n\t\tsql_query_one("$avp(trunk_query)", "$avp(t_setid);')
     expect(tout.indexOf('route(read_again)')).toBeLessThan(tout.indexOf('if ($var(trunk_rc) == -2) {'))
-    // twake_outbound() reserves minutes, a grant is taken once: neither is made twice.
-    expect(section('route[outbound_loaded]', 'route[outbound_rights]')).not.toContain('read_again')
+    // Only a read that failed at once (review 8b, n°5): one that failed after half of RULES_QUERY_TIMEOUT_MS is a slow
+    // database, not made again. The time it went, in milliseconds modulo 1000 s (32-bit integers).
+    expect(section('route[read_sent]', 'route[read_again]')).toContain('$avp(q_sent) = ($Ts % 1000) * 1000 + ($Tsm / 1000);')
+    const again = section('route[read_again]', 'route[read_failed]')
+    expect(again).toContain('$var(q_spent) = ($var(q_now) - $avp(q_sent) + 1000000) % 1000000;')
+    // No arithmetic in a condition (OpenSIPS refuses it): twice the time in a variable of its own.
+    expect(again).toContain('$var(q_twice) = $var(q_spent) * 2;\n\tif ($var(q_twice) >= 1000) {')
+    expect(again.indexOf('if ($avp(q_sent) == NULL) {')).toBeLessThan(again.indexOf('$var(q_now)'))
+    expect(again.indexOf('return(-1);')).toBeLessThan(again.indexOf('return(1);'))
+    expect(render({ RULES_QUERY_TIMEOUT_MS: '600' }).cfg).toContain('if ($var(q_twice) >= 600) {')
+    // twake_outbound() reserves minutes, a grant is taken once: neither is made twice. What twake_outbound() may have
+    // reserved for a call it then refuses goes (review 8b, n°5).
+    const outbound = section('route[outbound_loaded]', 'route[outbound_rights]')
+    expect(outbound).not.toContain('read_again')
+    expect(outbound).toContain('\t\t$var(o_key) = $(ci{s.md5});\n\t\tsql_query("DELETE FROM outbound_reservations WHERE call_key = \'$var(o_key)\'");')
+    expect(outbound.indexOf('DELETE FROM outbound_reservations')).toBeLessThan(outbound.indexOf('t_reply(503, "Call Rules Unavailable");'))
     expect(section('route[meet_source_loaded]', 'route[conference_leg]')).not.toContain('read_again')
     expect(cfg.match(/route\(read_again\)/g)).toHaveLength(2)
+    expect(cfg.match(/route\(read_sent\)/g)).toHaveLength(2)
+  })
+
+  it('sizes the connections of the asynchronous reads (DB_MAX_ASYNC_CONNECTIONS, review 8b, n°5): 8 by default, 1 to 32', () => {
+    expect(render().cfg).toContain('\ndb_max_async_connections=8\n')
+    expect(render({ DB_MAX_ASYNC_CONNECTIONS: '1' }).cfg).toContain('\ndb_max_async_connections=1\n')
+    for (const value of ['0', '33', 'x', '-1']) {
+      const { status, stderr } = render({ DB_MAX_ASYNC_CONNECTIONS: value })
+      expect(status, value).not.toBe(0)
+      expect(stderr).toMatch(/DB_MAX_ASYNC_CONNECTIONS/)
+    }
   })
 
   it("sends a conference's room call (step 8b) where its grant says, as it says, and nowhere else; no phone writes what only this script does", () => {
     const { cfg } = render({ SIP_DOMAIN: 'sip.example.test', MEET_SIP: '192.0.2.20:5080', MEET_SIP_PASSWORD: 'not-a-real-secret-0' })
     const section = (name: string, next: string) => cfg.slice(cfg.indexOf(`\n${name} {`), cfg.indexOf(`\n${next} {`))
     // The grant's conference columns, read with it into AVPs of their own.
-    expect(section('route[meet_source]', 'route[meet_source_loaded]')).toContain('async(sql_query_one("$var(meet_query)", "$avp(meet_known);$avp(meet_replaces);$avp(meet_join)"), meet_source_loaded);')
+    expect(section('route[meet_source]', 'route[meet_source_loaded]')).toContain('async(sql_query_one("$var(meet_query)", "$avp(meet_known);$avp(meet_replaces);$avp(meet_join);$avp(meet_room)"), meet_source_loaded);')
     const loaded = section('route[meet_source_loaded]', 'route[conference_leg]')
     const at = (text: string, within = loaded) => {
       const i = within.indexOf(text)
@@ -155,10 +183,18 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(at('route(conference_leg);')).toBeLessThan(at('route(trunk_out);'))
     expect(at('route(trunk_out);')).toBeLessThan(at('append_hf("Twake-Room: meet\\r\\n");'))
     expect(at('append_hf("Twake-Room: meet\\r\\n");')).toBeLessThan(at('route(rules_next);'))
+    // A call of a conference's room to a third participant says so, and which room (review 8b, n°2).
+    expect(loaded).toContain('if ($avp(meet_room) =~ "^twake-call-[0-9a-f]{16}$") {\n\t\tappend_hf("Twake-Room: conference\\r\\n");\n\t\tappend_hf("Twake-Conference: $avp(meet_room)\\r\\n");\n\t} else\n\t\tappend_hf("Twake-Room: meet\\r\\n");')
     const leg = section('route[conference_leg]', 'route[meet_call]')
     // Never the public network; the header of its grant, written by this script; then the phones of the extension.
     expect(at('t_reply(403, "Not Granted");', leg)).toBeLessThan(at('append_hf("Replaces: $avp(meet_replaces)\\r\\n");', leg))
-    expect(leg).toContain('\telse\n\t\tappend_hf("Twake-Join: $avp(meet_join)\\r\\n");\n\tappend_hf("Twake-Room: conference\\r\\n");')
+    expect(leg).toContain('\t} else\n\t\tappend_hf("Twake-Join: $avp(meet_join)\\r\\n");\n\tappend_hf("Twake-Room: conference\\r\\n");\n\tif ($avp(meet_room) != "")\n\t\tappend_hf("Twake-Conference: $avp(meet_room)\\r\\n");')
+    // The phone takes it in the place of the call or refuses it (420), never rings it (review 8b, n°14).
+    expect(leg).toContain('\t\tappend_hf("Replaces: $avp(meet_replaces)\\r\\n");\n\t\tappend_hf("Require: replaces\\r\\n");')
+    // What the grant says goes into headers only as the Gateway writes it (review 8b, n°15), before any of them.
+    expect(at('$avp(meet_replaces) =~ "^[A-Za-z0-9._~!%*+@:-]{1,200};to-tag=[A-Za-z0-9._~!%*+-]{1,50};from-tag=[A-Za-z0-9._~!%*+-]{1,50}$"', leg)).toBeLessThan(at('append_hf("Replaces:', leg))
+    expect(leg).toContain('$avp(meet_join) =~ "^[0-9a-f]{32}$"')
+    expect(leg).toContain('$avp(meet_room) =~ "^twake-call-[0-9a-f]{16}$"')
     expect(leg).toContain('$acc_extra(via) = "conference";')
     expect(at('if (!lookup("location")) {', leg)).toBeLessThan(at('route(names_next);', leg))
     // No rules, no forward, no group, no trunk, no wake: the very phones of that extension.
@@ -166,6 +202,7 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     // From the phones and the operator, before anything: only this script writes them.
     expect(cfg.match(/\tremove_hf\("Twake-Join"\);/g)).toHaveLength(2)
     expect(cfg.match(/\tremove_hf\("Twake-Room"\);/g)).toHaveLength(2)
+    expect(cfg.match(/\tremove_hf\("Twake-Conference"\);/g)).toHaveLength(2)
     const main = cfg.slice(0, cfg.indexOf('\nroute[meet_source] {'))
     expect(main.indexOf('remove_hf("Twake-Join");')).toBeLessThan(main.indexOf('route(meet_source);'))
     // The tag of the phone that answered stays with the dialog; the events say which call is a conference's.
@@ -340,7 +377,8 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     // the default trunk and the direct numbers on it every 15 s, in a timer of its own, never in a call (an emergency
     // call's fallback when the trunk of the call cannot be read, with its caller's own number). The last two make the
     // direct number's and the trunk's reads again, synchronously, when OpenSIPS dropped them (route[read_again]).
-    expect(cfg.match(/sql_query/g)).toHaveLength(16)
+    // One more withdraws what twake_outbound() reserved for a call it refuses after all (review 8b, n°5).
+    expect(cfg.match(/sql_query/g)).toHaveLength(17)
     expect(cfg.match(/async\(sql_query/g)).toHaveLength(10)
     const timer = cfg.slice(cfg.indexOf('\ntimer_route[default_trunk, 15] {'), cfg.indexOf('\nroute[emergency_failed] {'))
     expect(timer.match(/sql_query(_one)?\(/g)).toHaveLength(2)
@@ -376,8 +414,8 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     // One query, built in one place (the first read adds the caller's name and the group check), read asynchronously.
     expect(cfg.match(/sql_query_one\("\$var\(rules_query\)"/g)).toHaveLength(2)
     expect(cfg.slice(cfg.indexOf('route[rules_next] {'), cfg.indexOf('route[rules_loaded] {'))).toContain('async(sql_query_one("$var(rules_query)", ')
-    // At most 3 connections of their own per process for these reads.
-    expect(cfg).toContain('\ndb_max_async_connections=3\n')
+    // At most DB_MAX_ASYNC_CONNECTIONS connections of their own per process for these reads (8 by default).
+    expect(cfg).toContain('\ndb_max_async_connections=8\n')
     expect(cfg.slice(cfg.indexOf('\nroute {'), cfg.indexOf('\nroute[ring] {'))).toContain('route(rules_next);\n\texit;')
   })
 
@@ -610,7 +648,7 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(failed).toContain('return(1);')
     const probe = section('route[tables_4c_missing]', 'route[group_next]')
     expect(probe).toContain("to_regclass('call_groups') IS NULL OR to_regclass('display_names') IS NULL")
-    expect(cfg).not.toMatch(/\$Tsm|q_start|q4c_retry|q_ms/)
+    expect(failed + probe).not.toMatch(/\$Tsm|q_start|q4c_retry|q_ms|q_sent/)
     expect(section('route[rules_loaded]', 'route[rules_step]')).toContain('if ($var(rules_rc) < 0 && $var(rules_rc) != -2 && route(read_failed)) {\n\t\troute(rules_next);\n\t\texit;\n\t}')
     expect(section('route[ring_loaded]', 'route[ring_now]')).toContain('if ($var(rules_rc) < 0 && $var(rules_rc) != -2 && route(read_failed)) {\n\t\troute(ring);\n\t\texit;\n\t}')
     expect(section('route[names_loaded]', 'route[caller_name]')).toContain('if ($var(names_rc) < 0 && $var(names_rc) != -2 && route(read_failed)) {\n\t\troute(names_next);\n\t\texit;\n\t}')

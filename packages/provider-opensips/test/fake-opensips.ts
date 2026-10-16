@@ -61,7 +61,16 @@ export const fakeOpensips = async () => {
     if (req.method === 'dlg_list') return reply({ result: state.dialogs })
     if (req.method === 'dlg_list_ctx') {
       const dialog = state.dialogContexts.get(String((req.params as unknown as { callid?: unknown }).callid))
+      // 'fail': an MI that answers another error than "no such dialog" (review 8b, n°10).
+      if (dialog === 'fail') return reply({ error: { code: 500, message: 'Internal error' } })
       return reply(dialog ? { result: { Dialog: dialog } } : { error: { code: 404, message: 'No such dialog' } })
+    }
+    if (req.method === 'dlg_end_dlg') {
+      // Ends the dialog of that Call-ID (review 8b, n°3), as OpenSIPS takes a Call-ID for a dialog id.
+      const id = String((req.params as unknown as { dialog_id?: unknown }).dialog_id)
+      if (!state.dialogContexts.has(id)) return reply({ error: { code: 404, message: 'No such dialog' } })
+      state.dialogContexts.delete(id)
+      return reply({ result: 'OK' })
     }
     if (req.method === 'ds_list') return reply({ result: state.dispatcher })
     if (req.method === 'reg_list') return reply({ result: state.registrations })

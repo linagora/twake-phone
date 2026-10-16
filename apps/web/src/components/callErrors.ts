@@ -34,15 +34,19 @@ const CODE_KEY: Partial<Record<CallError['code'], Key>> = {
   'transfer-self': 'call.errorTransferSelf',
   'transfer-refused': 'call.errorTransferRefused',
   'transfer-external': 'call.errorTransferExternal',
-  'room-call': 'call.errorRoomCall'
+  'room-call': 'call.errorRoomCall',
+  'call-held': 'conference.errorHeld',
+  'conference-pending': 'conference.errorInProgress'
 }
 
 /**
  * Why a conference did not begin (`making`: the call was to become one) or a room did not call someone (step 8b), in
- * the person's words: the Gateway's `code`, else a softphone error, else as it came.
+ * the person's words: the Gateway's `code`, else a softphone error, else as it came. An error that came once the
+ * conference was made (`conferenceMade`: the call to the third participant) is that call's, never the conference's.
  */
 export const describeConferenceError = (err: unknown, t: T, { making = false, who = '' }: { making?: boolean; who?: string } = {}): string => {
-  const failed = err as { code?: unknown; status?: unknown } | null
+  const failed = err as { code?: unknown; status?: unknown; conferenceMade?: unknown } | null
+  if (failed?.conferenceMade === true) making = false
   switch (failed?.code) {
     case 'CONFERENCE_EXTERNAL':
       return t('conference.errorExternal')
@@ -54,7 +58,15 @@ export const describeConferenceError = (err: unknown, t: T, { making = false, wh
     case 'DIAL_OUT_LIMIT':
       return t('conference.errorLimit')
     case 'CONFERENCE_UNAVAILABLE':
+    case 'CALL_DIVERTED':
+    case 'SIP_SERVER_UNAVAILABLE':
       return t('conference.errorUnavailable')
+    case 'CONFERENCE_IN_PROGRESS':
+      return t('conference.errorInProgress')
+    case 'CONFERENCE_ABANDONED':
+      return t('conference.errorAbandoned')
+    case 'CONFERENCE_UNSUPPORTED':
+      return t('conference.errorUnsupported')
   }
   if (failed?.status === 501) return t('conference.errorUnavailable')
   if (err instanceof CallError) return describeCallError(err, t)

@@ -235,7 +235,9 @@ export interface OutboundPolicy {
 export interface TelephonyAlert {
   /**
    * `meet`: the access number of the rooms (step 8): the tries of a room's PIN by phone of all callers together
-   * (`param` 'pin-tries'), or the calls to it at the same time (`param` 'meet-calls').
+   * (`param` 'pin-tries'), or the calls to it at the same time (`param` 'meet-calls'); raised by the Gateway (review 8b,
+   * n°3), a room's call whose grant another call took (`call-diverted`: ended), or LiveKit's outbound trunk found
+   * pointed elsewhere than the SIP server (`trunk-changed`: written back, the call not placed).
    */
   kind: 'fraud-warning' | 'fraud-critical' | 'limit' | 'rights' | 'emergency' | 'meet'
   param: string

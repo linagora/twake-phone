@@ -205,11 +205,18 @@ export const SoftphoneProvider = ({ children }: { children: ReactNode }) => {
         if (!call.sipCallId) throw new Error('No Call-ID for this call')
         meetingId = (await client.makeConference(call.sipCallId, join)).meetingId
       } catch (err) {
-        softphone.cancelConference()
+        softphone.cancelConference(join)
         throw err
       }
       setRooms(r => ({ ...r, [call.id]: meetingId }))
-      await inviteToConference(meetingId, number)
+      // The person left the room meanwhile (hung up while it began): nobody else is called at their name (review 8b, n°8).
+      if (!softphone.conferenceCall(call.id)) return
+      // The conference is there: what fails now is the call to the third participant only (review 8b, n°4).
+      try {
+        await inviteToConference(meetingId, number)
+      } catch (err) {
+        throw Object.assign(err instanceof Error ? err : new Error(String(err)), { conferenceMade: true })
+      }
     },
     [client, inviteToConference]
   )
@@ -247,7 +254,7 @@ export const SoftphoneProvider = ({ children }: { children: ReactNode }) => {
   useEffect(() => {
     window.twakephone = {
       state,
-      calls: calls.map(c => ({ id: c.id, sipCallId: c.sipCallId, direction: c.direction, state: c.state, remoteNumber: c.remoteNumber, remoteHold: c.remoteHold, muted: c.muted, renegotiating: c.renegotiating, transferring: c.transferring, ...(c.replacedCallId ? { replacedCallId: c.replacedCallId } : {}), ...(c.consultationOf ? { consultationOf: c.consultationOf } : {}), ...(c.room ? { room: c.room } : {}), ...(c.conferenceOf ? { conferenceOf: c.conferenceOf } : {}) })),
+      calls: calls.map(c => ({ id: c.id, sipCallId: c.sipCallId, direction: c.direction, state: c.state, remoteNumber: c.remoteNumber, remoteHold: c.remoteHold, muted: c.muted, renegotiating: c.renegotiating, transferring: c.transferring, ...(c.replacedCallId ? { replacedCallId: c.replacedCallId } : {}), ...(c.consultationOf ? { consultationOf: c.consultationOf } : {}), ...(c.room ? { room: c.room } : {}), ...(c.conferenceOf ? { conferenceOf: c.conferenceOf } : {}), ...(c.conferenceRoom ? { conferenceRoom: c.conferenceRoom } : {}) })),
       lastEnded: lastEnded ? { id: lastEnded.id, remoteNumber: lastEnded.remoteNumber, endReason: lastEnded.endReason, endStatus: lastEnded.endStatus, ...(lastEnded.endMessage ? { endMessage: lastEnded.endMessage } : {}), ...(lastEnded.endRefusal ? { endRefusal: lastEnded.endRefusal } : {}) } : null,
       tones,
       devices,

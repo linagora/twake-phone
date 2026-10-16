@@ -387,6 +387,26 @@ describe('OpensipsProvider call rules', () => {
     for (const id of ['early', 'untagged', 'self', 'odd', 'nope']) expect(await p.callBetweenExtensions(id), id).toBeUndefined()
     // Without the MI: no such call.
     expect(await make().callBetweenExtensions('c1')).toBeUndefined()
+    // An MI that answers another error, or none at all, cannot say: not "no such call" (review 8b, n°10).
+    sips.state.dialogContexts.set('broken', 'fail')
+    await expect(p.callBetweenExtensions('broken')).rejects.toMatchObject({ statusCode: 503, code: 'SIP_SERVER_UNAVAILABLE' })
+    sips.state.down = true
+    await expect(p.callBetweenExtensions('c1')).rejects.toMatchObject({ statusCode: 503, code: 'SIP_SERVER_UNAVAILABLE' })
+    sips.state.down = false
+  })
+
+  it('ends a call OpenSIPS has by its Call-ID (MI dlg_end_dlg, review 8b, n°3); one it no longer has is no error', async () => {
+    const sips = await fakeOpensips()
+    cleanups.push(sips.close)
+    const p = new OpensipsProvider({ websocketUrl: 'wss://sip.example.test', domain: 'sip.example.test', sipSecretFor: async () => 's', events: { miUrl: sips.url, timeoutMs: 300 }, logger: quiet })
+    cleanups.push(() => p.close())
+    await until('the subscription', () => p.getStatus() === 'CONNECTED')
+    sips.state.dialogContexts.set('diverted@192.0.2.30', { callid: 'diverted@192.0.2.30' })
+    await p.endRoomCall('diverted@192.0.2.30')
+    expect(sips.requests.find(r => r.method === 'dlg_end_dlg')?.params).toEqual({ dialog_id: 'diverted@192.0.2.30' })
+    expect(sips.state.dialogContexts.has('diverted@192.0.2.30')).toBe(false)
+    await p.endRoomCall('diverted@192.0.2.30')
+    await expect(make().endRoomCall('x')).rejects.toMatchObject({ statusCode: 501 })
   })
 
   it("reads the access number of Meet's rooms OpenSIPS was started with, or says it cannot (step 8, review n°12)", async () => {

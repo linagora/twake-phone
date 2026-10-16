@@ -26,12 +26,14 @@ export type EndReason = 'hangup' | 'rejected' | 'busy' | 'no-answer' | 'unavaila
 /**
  * A call a room places (step 8 and 8b, ADR 0018 and 0019), as the SIP server says in ROOM_HEADER (it removes any a
  * phone sends): `meet`, a room of Meet calls; `conference`, the room of a conference calls in the place of a call of
- * ours (Replaces), or the room of the conference we make (JOIN_HEADER, the token our window drew). Neither held nor
- * transferred, and no other call is placed during one: the room is the conference.
+ * ours (Replaces), or the room of the conference we make (JOIN_HEADER, the token our window drew), or the room of a
+ * conference calls us to join it; CONFERENCE_HEADER then names that room. Neither held nor transferred, and no other
+ * call is placed during one: the room is the conference.
  */
 export type RoomKind = 'meet' | 'conference'
 export const ROOM_HEADER = 'Twake-Room'
 export const JOIN_HEADER = 'Twake-Join'
+export const CONFERENCE_HEADER = 'Twake-Conference'
 
 /**
  * Why the SIP server refused a call to the public network (step 6, ADR 0016), as its REFUSED_HEADER says (with 403,
@@ -103,6 +105,8 @@ export type CallErrorCode =
   | 'transfer-failed'
   | 'transfer-no-answer'
   | 'room-call'
+  | 'call-held'
+  | 'conference-pending'
 
 export class CallError extends Error {
   constructor(
@@ -162,6 +166,11 @@ export interface SoftCall {
    * kept quiet meanwhile and ends (endReason `conference`) once its far end has moved to the room.
    */
   readonly conferenceOf?: string
+  /**
+   * The room of the conference this call is in (step 8b), as the SIP server named it (CONFERENCE_HEADER) for a call of
+   * a room that is a conference: the Gateway lets each of its participants read who is there (GET /conferences/:id).
+   */
+  readonly conferenceRoom?: string
   answer(): Promise<void>
   reject(): Promise<void>
   hangup(): Promise<void>
@@ -307,7 +316,9 @@ class WebCall implements SoftCall {
   readonly consultationOf?: string
   readonly room?: RoomKind
   readonly conferenceOf?: string
+  readonly conferenceRoom?: string
   readonly sipCallId: string
+  private readonly startMuted: boolean
   /** This call became a conference (its far end moved to the room, or we did): its end is that, not a hang-up. */
   becameConference = false
 
@@ -329,7 +340,9 @@ class WebCall implements SoftCall {
     if (links.consultationOf) this.consultationOf = links.consultationOf
     if (links.room) this.room = links.room
     if (links.conferenceOf) this.conferenceOf = links.conferenceOf
+    if (links.conferenceRoom) this.conferenceRoom = links.conferenceRoom
     this.sipCallId = links.sipCallId ?? ''
+    this.startMuted = links.startMuted ?? false
     this.remoteNumber = session.remote_identity?.uri?.user ?? ''
     this.remoteName = session.remote_identity?.display_name ?? ''
     // An outgoing session has its peer connection before anyone can listen; an incoming one gets it on answer().
@@ -540,8 +553,12 @@ class WebCall implements SoftCall {
       microphone?.getTracks().forEach(track => track.stop())
       throw new CallError('call-ended', 'Call ended')
     }
+    // The microphone off from its first packet when the call it continues had it off (step 8b): the tracks first,
+    // then JsSIP's own state (which it applies to the tracks it adds afterwards, and reports as muted).
+    if (this.startMuted) microphone?.getAudioTracks().forEach(track => (track.enabled = false))
     this.adopt(microphone)
     this.session.answer(mediaOptions(this.iceServers, microphone))
+    if (this.startMuted) this.session.mute({ audio: true })
   }
 
   /** Decline (603): the caller is told the call was refused, not that the line is busy. */
@@ -744,12 +761,25 @@ interface CallLinks {
   conferenceOf?: string
   /** The SIP Call-ID of its INVITE (JsSIP's request), not one of the links: carried along with them. */
   sipCallId?: string
+  /** The room of its conference (CONFERENCE_HEADER), likewise. */
+  conferenceRoom?: string
+  /**
+   * Answered with the microphone off (step 8b): the call it continues had it off, and moving to the room of a
+   * conference must not open it.
+   */
+  startMuted?: boolean
 }
 
 /** The room a call's INVITE says calls (ROOM_HEADER), if it is one. */
 const roomOf = (request: { getHeader?: (name: string) => string | undefined } | undefined): RoomKind | undefined => {
   const value = request?.getHeader?.(ROOM_HEADER)?.trim().toLowerCase()
   return value === 'meet' || value === 'conference' ? value : undefined
+}
+
+/** The room of a conference a call's INVITE names (CONFERENCE_HEADER): a name the Gateway gave, nothing else. */
+const conferenceRoomOf = (request: { getHeader?: (name: string) => string | undefined } | undefined): string | undefined => {
+  const value = request?.getHeader?.(CONFERENCE_HEADER)?.trim()
+  return value && /^twake-call-[0-9a-f]{16}$/.test(value) ? value : undefined
 }
 
 const restartDelay = (attempt: number) => Math.floor(Math.random() * Math.min(30_000, 500 * 2 ** attempt))
@@ -973,6 +1003,7 @@ export class Softphone {
       const direction = e.originator === 'remote' ? 'inbound' : 'outbound'
       const room = direction === 'inbound' ? roomOf(e.request) : undefined
       const join = direction === 'inbound' ? e.request?.getHeader?.(JOIN_HEADER)?.trim() : undefined
+      const conferenceRoom = room === 'conference' ? conferenceRoomOf(e.request) : undefined
       if (join) {
         // The room of a conference calls the window that asked for it (step 8b), and only that one: answered at once.
         // Any other window of ours, or a token it no longer waits for, says there is no such call: never a refusal
@@ -985,7 +1016,7 @@ export class Softphone {
         }
         clearTimeout(pending!.timer)
         this.pendingJoin = undefined
-        const call = this.wrap(e.session, 'inbound', { room, conferenceOf: of.id, sipCallId })
+        const call = this.wrap(e.session, 'inbound', { room, conferenceOf: of.id, sipCallId, startMuted: of.muted, ...(conferenceRoom ? { conferenceRoom } : {}) })
         this.options.onCallChange?.(call)
         void call.setOutput(this.devices.outputId ?? '')
         setTimeout(() => void call.answer().catch(() => undefined), 0)
@@ -997,7 +1028,8 @@ export class Softphone {
         // conference does so too (step 8b): our call became that conference.
         const { replaces } = this.replacing
         this.replacing = undefined
-        const call = this.wrap(e.session, 'inbound', { replacedCallId: replaces.id, sipCallId, ...(room ? { room } : {}) })
+        // The microphone as it was in the call replaced: a person who had it off keeps it off in the conference.
+        const call = this.wrap(e.session, 'inbound', { replacedCallId: replaces.id, sipCallId, startMuted: replaces.muted, ...(room ? { room } : {}), ...(conferenceRoom ? { conferenceRoom } : {}) })
         this.options.onCallChange?.(call)
         void call.setOutput(this.devices.outputId ?? '')
         // After its newRTCSession, JsSIP still sends the 180: the answer comes right after it.
@@ -1011,7 +1043,7 @@ export class Softphone {
       }
       // Ours: placed by call() (a consultation, when one is being placed during a call) or by JsSIP for a REFER
       // the far end sent us. Every new call is announced, so the app shows it before anything else happens to it.
-      const call = this.wrap(e.session, direction, { sipCallId, ...(direction === 'outbound' ? { consultationOf: this.pendingConsultationOf } : room ? { room } : {}) })
+      const call = this.wrap(e.session, direction, { sipCallId, ...(direction === 'outbound' ? { consultationOf: this.pendingConsultationOf } : room ? { room } : {}), ...(conferenceRoom ? { conferenceRoom } : {}) })
       this.pendingConsultationOf = undefined
       void call.setOutput(this.devices.outputId ?? '')
       if (direction === 'inbound') this.options.onIncoming?.(call)
@@ -1058,15 +1090,17 @@ export class Softphone {
   /**
    * Our call `callId` is to become a conference (step 8b): the token the room's call to this window will carry
    * (JOIN_HEADER), to give the Gateway (POST /calls/:id/conference). That call is answered at once when it comes,
-   * within a minute; the call it continues stays quiet meanwhile (`conferenceOf`). Asking again for another call, or
-   * `cancelConference()`, forgets the token.
+   * within a minute, with our microphone as it is in `callId`; the call it continues stays quiet meanwhile
+   * (`conferenceOf`). Only a call in progress, both ends on line (neither of us holds it), and one conference asked at
+   * a time: another asked meanwhile is refused (`conference-pending`). `cancelConference(token)` forgets it.
    */
   expectConference(callId: string): string {
     const call = this.calls.get(callId)
     if (!call || (call.state !== 'connected' && call.state !== 'held')) throw new CallError('not-established', 'No call in progress')
     if (call.room) throw new CallError('room-call', 'A call of a room is a conference already')
+    if (call.state === 'held' || call.remoteHold) throw new CallError('call-held', 'A call on hold does not become a conference')
     if (this.activeCalls().length >= MAX_CALLS) throw new CallError('too-many-calls', 'Two calls are already in progress')
-    this.cancelConference()
+    if (this.pendingJoin) throw new CallError('conference-pending', 'A conference is already being made')
     const token = randomHex(16)
     const timer = setTimeout(() => {
       if (this.pendingJoin?.token === token) this.pendingJoin = undefined
@@ -1075,10 +1109,19 @@ export class Softphone {
     return token
   }
 
-  /** The conference asked for will not come (the Gateway said no): its room's call is not answered any more. */
-  cancelConference() {
-    if (this.pendingJoin) clearTimeout(this.pendingJoin.timer)
+  /**
+   * The conference asked with `token` will not come (the Gateway said no): its room's call is not answered any more.
+   * Another one asked since is left alone.
+   */
+  cancelConference(token: string) {
+    if (this.pendingJoin?.token !== token) return
+    clearTimeout(this.pendingJoin.timer)
     this.pendingJoin = undefined
+  }
+
+  /** The call of the room of the conference made out of our call `callId`, while it is not over (step 8b). */
+  conferenceCall(callId: string): SoftCall | undefined {
+    return this.activeWebCalls().find(c => c.conferenceOf === callId)
   }
 
   /**
@@ -1201,6 +1244,13 @@ export class Softphone {
     })
     // The far end of an attended transfer replaces the person who consulted us (INVITE with Replaces).
     session.on('replaces', (e: ReferEvent) => {
+      // The room of a conference takes the place of a call in progress only (step 8b): not of one we hold (it would
+      // come back unheld, our microphone open to the room), nor while we are in another call (a consultation): busy
+      // (486), and the conference does not begin.
+      if (roomOf(e.request) === 'conference' && (call.state !== 'connected' || this.activeWebCalls().some(c => c !== call))) {
+        e.reject()
+        return
+      }
       const accept = e.accept as AcceptReferred
       accept((s: RTCSession) => {
         this.replacing = { session: s, replaces: call }

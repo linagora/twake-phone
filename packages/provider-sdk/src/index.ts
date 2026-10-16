@@ -57,9 +57,12 @@ export interface TelephonyProvider {
   /**
    * Lets a room of Meet call `number` at the name of `extension` once, within `ttlSec` seconds (step 8, ADR 0018): the
    * SIP server refuses a room's call it was not told of. `token` goes with the call (ConferenceBridgeProvider's
-   * dialParticipant, `grant`); `revoke` withdraws it when the call never reached the SIP server.
+   * dialParticipant, `grant`); `revoke` withdraws it when the call never reached the SIP server; `taken` says which
+   * call took it (review 8b, n°3).
    */
-  grantRoomCall?(grant: RoomCallGrant): Promise<{ token: string; revoke(): Promise<void> }>
+  grantRoomCall?(grant: RoomCallGrant): Promise<RoomCallGrantToken>
+  /** Ends a call the SIP server has, by its Call-ID (a room's call that took a grant meant for another, review 8b, n°3). */
+  endRoomCall?(callId: string): Promise<void>
   /**
    * A call in progress between two of the tenant's extensions, as the SIP server holds it (step 8b, ADR 0019): its
    * parties (the extensions where it reached, a ring group's member who answered, a forward's target) and the tags
@@ -125,7 +128,7 @@ export interface ConferenceBridgeProvider {
    * `from`: the extension of whoever asked for the call (step 8): the call is theirs, at their name and with their
    * rights; `grant`: the token the SIP server gave for it (TelephonyProvider's grantRoomCall), carried with the call.
    */
-  dialParticipant(meetingId: string, number: string, options?: { from?: string; grant?: string }): Promise<ConferenceParticipant>
+  dialParticipant(meetingId: string, number: string, options?: { from?: string; grant?: string }): Promise<DialedParticipant>
   disconnectParticipant(participantId: string): Promise<void>
   muteParticipant(participantId: string): Promise<void>
 }
@@ -142,7 +145,23 @@ export interface RoomCallGrant {
   ttlSec?: number
   replaces?: string
   join?: string
+  /** The room of the conference the call is for (step 8b): the SIP server names it to the phone it calls. */
+  room?: string
 }
+
+/**
+ * A grant of a room's call (grantRoomCall). `taken`: the call that took it, as the SIP server saw it: the From tag
+ * (LiveKit SIP makes it the id of its call, which dialParticipant returns as `sipCallId`) and the Call-ID; undefined
+ * while no call took it.
+ */
+export interface RoomCallGrantToken {
+  token: string
+  revoke(): Promise<void>
+  taken?(): Promise<{ tag: string; callId: string } | undefined>
+}
+
+/** A participant a room called (dialParticipant): `sipCallId`, the id of that call at the bridge, never shown to anyone. */
+export type DialedParticipant = ConferenceParticipant & { sipCallId?: string }
 
 /** The parties of a call between two extensions, and its dialog (callBetweenExtensions). */
 export interface CallParties {

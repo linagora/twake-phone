@@ -46,7 +46,9 @@ services:
       POSTGRES_DB: twake
       # The image trusts the loopback by default: on the host network that is every process of the machine.
       POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256 --auth-local=scram-sha-256
-    command: ["postgres", "-p", "54320", "-c", "listen_addresses=127.0.0.1"]
+    # OpenSIPS takes up to DB_MAX_ASYNC_CONNECTIONS connections per SIP process (8 x 10 by default) on top of its own and
+    # the Gateway's: more than PostgreSQL's 100 by default.
+    command: ["postgres", "-p", "54320", "-c", "listen_addresses=127.0.0.1", "-c", "max_connections=200"]
     volumes:
       - ../opensips/subscriber.sql:/docker-entrypoint-initdb.d/01-subscriber.sql:ro
       - postgres-data:/var/lib/postgresql/data
@@ -129,6 +131,9 @@ services:
       MEET_CALLS_PER_CALLER:
       MEET_CALLS_ALL:
       MEET_MAX_CALL_SEC:
+      # The database connections of each SIP process for its asynchronous reads (8 by default, 1 to 32): PostgreSQL's
+      # max_connections (above) must hold ten times as many, with the Gateway's.
+      DB_MAX_ASYNC_CONNECTIONS:
     healthcheck:
       # One MI request over UDP (mi_datagram, loopback): healthy once OpenSIPS answers, not once its fifo exists.
       test: ["CMD", "bash", "-c", "exec 3<>/dev/udp/127.0.0.1/8880 && printf '{\"jsonrpc\":\"2.0\",\"method\":\"version\",\"id\":\"health\"}' >&3 && read -r -t 2 -n 1 _ <&3"]
