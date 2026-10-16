@@ -57,9 +57,24 @@ export interface TelephonyProvider {
   /**
    * Lets a room of Meet call `number` at the name of `extension` once, within `ttlSec` seconds (step 8, ADR 0018): the
    * SIP server refuses a room's call it was not told of. `token` goes with the call (ConferenceBridgeProvider's
-   * dialParticipant, `grant`); `revoke` withdraws it when the call never reached the SIP server.
+   * dialParticipant, `grant`); `revoke` withdraws it if no call took it (one taken stays, to be read); `taken` says
+   * which call took it (review 8b, n°3).
    */
-  grantRoomCall?(grant: { extension: string; number: string; ttlSec?: number }): Promise<{ token: string; revoke(): Promise<void> }>
+  grantRoomCall?(grant: RoomCallGrant): Promise<RoomCallGrantToken>
+  /**
+   * Ends a call the SIP server has, by its Call-ID (a room's call that took a grant meant for another, review 8b, n°3),
+   * and says what it was (third review 8b, n°1): `answered` (in progress, a BYE to both sides), `ringing` (not answered
+   * yet, cancelled), undefined if it has no such call (over, never there).
+   */
+  endRoomCall?(callId: string): Promise<'answered' | 'ringing' | undefined>
+  /**
+   * A call in progress between two of the tenant's extensions, as the SIP server holds it (step 8b, ADR 0019): its
+   * parties (the extensions where it reached, a ring group's member who answered, a forward's target) and the tags
+   * of its dialog, which a room's call that takes its place names (Replaces). `external` for an answered call with
+   * the public network or a room (no room's call takes its place: the platform has no B2BUA); undefined when the
+   * SIP server has no such call answered (ringing, over, never there).
+   */
+  callBetweenExtensions?(callId: string): Promise<CallParties | 'external' | undefined>
   /**
    * The access number of Meet's rooms as the SIP server has it (step 8): `number` undefined when its rooms are off
    * there; undefined when it cannot say. The Gateway compares it with its own at its start.
@@ -117,9 +132,51 @@ export interface ConferenceBridgeProvider {
    * `from`: the extension of whoever asked for the call (step 8): the call is theirs, at their name and with their
    * rights; `grant`: the token the SIP server gave for it (TelephonyProvider's grantRoomCall), carried with the call.
    */
-  dialParticipant(meetingId: string, number: string, options?: { from?: string; grant?: string }): Promise<ConferenceParticipant>
+  dialParticipant(meetingId: string, number: string, options?: { from?: string; grant?: string }): Promise<DialedParticipant>
   disconnectParticipant(participantId: string): Promise<void>
   muteParticipant(participantId: string): Promise<void>
+}
+
+/**
+ * What a room's call may do (step 8 and 8b): `extension` calls `number`, once, within `ttlSec` seconds. `replaces`
+ * (step 8b): it takes the place of that call of `number` (`callid;to-tag=…;from-tag=…`, the dialog as `number` sees
+ * it), answered at once by the phone that has it and never sent elsewhere; `join`: it goes to `extension` itself
+ * (`number` is theirs), carries that token (Twake-Join), and only the window that asked for it answers it.
+ */
+export interface RoomCallGrant {
+  extension: string
+  number: string
+  ttlSec?: number
+  replaces?: string
+  join?: string
+  /** The room of the conference the call is for (step 8b): the SIP server names it to the phone it calls. */
+  room?: string
+}
+
+/**
+ * A grant of a room's call (grantRoomCall). `taken`: the call that took it, as the SIP server saw it: the From tag
+ * (LiveKit SIP makes it the id of its call, which dialParticipant returns as `sipCallId`) and the Call-ID; undefined
+ * while no call took it.
+ */
+export interface RoomCallGrantToken {
+  token: string
+  /** Withdraws the grant if no call took it yet; once taken, it stays (`taken` reads it, second review 8b, n°1). */
+  revoke(): Promise<void>
+  taken?(): Promise<{ tag: string; callId: string } | undefined>
+}
+
+/** A participant a room called (dialParticipant): `sipCallId`, the id of that call at the bridge, never shown to anyone. */
+export type DialedParticipant = ConferenceParticipant & { sipCallId?: string }
+
+/** The parties of a call between two extensions, and its dialog (callBetweenExtensions). */
+export interface CallParties {
+  callId: string
+  /** The extension that placed it, and the From tag. */
+  caller: string
+  callerTag: string
+  /** The extension it reached (who answered), and the To tag. */
+  callee: string
+  calleeTag: string
 }
 
 /** Pushes a user's SIP secret where the SIP server checks it. The Gateway generates and keeps the secret. */

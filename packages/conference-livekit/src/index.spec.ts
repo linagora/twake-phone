@@ -218,7 +218,9 @@ describe('dial-out and moderation', () => {
     // The PBX's challenge is answered with its credentials.
     expect(calls.find(c => c.path === 'livekit.SIP/CreateSIPOutboundTrunk')!.body.trunk).toMatchObject({ address: 'pbx:5060', transport: 'SIP_TRANSPORT_UDP', auth_username: 'livekit', auth_password: 'not-a-real-password' })
     expect(p).toMatchObject({ meetingId: 'room', kind: 'phone', number: '+33612345678', muted: false })
-    expect(p.id.startsWith('room:phone-33612345678-')).toBe(true)
+    // Its id carries no number (third review 8b, n°2).
+    expect(p.id).toMatch(/^room:phone-[0-9a-f]{20}$/)
+    expect(p.id).not.toContain('612345678')
   })
 
   it('carries the SIP server\'s grant of the call and bounds its length (review n°1, n°5)', async () => {
@@ -305,6 +307,79 @@ describe('dial-out and moderation', () => {
     expect(mutes[0]!.body).toMatchObject({ track_sid: 'TR1', muted: true })
     expect(splitParticipantId('a:b:c')).toEqual({ room: 'a:b', identity: 'c' })
     expect(() => splitParticipantId('nocolon')).toThrow()
+  })
+
+  it('ends a room for everyone (DeleteRoom, step 8b), a room LiveKit does not have being no error, any other failure one', async () => {
+    const { bridge, calls } = make({})
+    await bridge.deleteRoom('twake-call-0123456789abcdef')
+    expect(calls[0]).toMatchObject({ path: 'livekit.RoomService/DeleteRoom', body: { room: 'twake-call-0123456789abcdef' } })
+    const claims = JSON.parse(Buffer.from(calls[0]!.auth.split('.')[1]!, 'base64url').toString())
+    expect(claims.video).toMatchObject({ roomAdmin: true, room: 'twake-call-0123456789abcdef' })
+    const gone = make({ 'livekit.RoomService/DeleteRoom': new TwirpFailure('requested room does not exist', 404, {}, 'not_found') })
+    await expect(gone.bridge.deleteRoom('r')).resolves.toBeUndefined()
+    const down = make({ 'livekit.RoomService/DeleteRoom': new TwirpFailure('internal', 500, {}, 'internal') })
+    await expect(down.bridge.deleteRoom('r')).rejects.toBeInstanceOf(LiveKitError)
+  })
+
+  it('returns the id LiveKit gave the call (sip_call_id, the From tag of its INVITE: review 8b, n°3), none when LiveKit gives none', async () => {
+    const trunk = { 'livekit.SIP/ListSIPOutboundTrunk': { items: [{ sip_trunk_id: 'O', name: 'twake-meet-out' }] } }
+    const { bridge } = make({ ...trunk, 'livekit.SIP/CreateSIPParticipant': { participant_id: 'PA_1', sip_call_id: 'SCL_aBc123' } })
+    expect(await bridge.dialParticipant('room', '102')).toMatchObject({ number: '102', sipCallId: 'SCL_aBc123' })
+    for (const answer of [{}, { sip_call_id: '' }, { sip_call_id: 42 }]) {
+      const other = make({ ...trunk, 'livekit.SIP/CreateSIPParticipant': answer })
+      expect(await other.bridge.dialParticipant('room', '102')).not.toHaveProperty('sipCallId')
+    }
+  })
+
+  it('tells whether LiveKit\'s outbound trunk still points at the SIP server, as configured; written again at the next call when not (review 8b, n°3)', async () => {
+    const ours = { sip_trunk_id: 'O', name: 'twake-meet-out', address: 'pbx:5060', auth_username: 'livekit' }
+    const auth = { outboundAuth: { username: 'livekit', password: 'not-a-real-password' } }
+    const intact = make({ 'livekit.SIP/ListSIPOutboundTrunk': { items: [ours] } }, auth)
+    expect(await intact.bridge.outboundIntact()).toBe(true)
+    // Asked about its own trunk only.
+    expect(intact.calls.filter(c => c.path === 'livekit.SIP/ListSIPOutboundTrunk').map(c => c.body)).toEqual([{}, { trunk_ids: ['O'] }])
+    for (const changed of [{ ...ours, address: '198.51.100.7:5060' }, { ...ours, auth_username: 'someone-else' }]) {
+      const { bridge, calls } = make({ 'livekit.SIP/ListSIPOutboundTrunk': [{ items: [ours] }, { items: [changed] }, { items: [changed] }] }, auth)
+      expect(await bridge.outboundIntact()).toBe(false)
+      // The next call writes it back over what was found.
+      await bridge.dialParticipant('room', '102')
+      expect(calls.filter(c => c.path === 'livekit.SIP/UpdateSIPOutboundTrunk').map(c => c.body.replace.address)).toEqual(['pbx:5060', 'pbx:5060'])
+    }
+    // A trunk LiveKit no longer has sent nothing elsewhere: written again, the call placed.
+    const gone = make({ 'livekit.SIP/ListSIPOutboundTrunk': [{ items: [ours] }, {}, {}], 'livekit.SIP/CreateSIPOutboundTrunk': { sip_trunk_id: 'O2' } }, auth)
+    expect(await gone.bridge.outboundIntact()).toBe(true)
+    await gone.bridge.dialParticipant('room', '102')
+    expect(gone.calls.find(c => c.path === 'livekit.SIP/CreateSIPParticipant')?.body.sip_trunk_id).toBe('O2')
+  })
+
+  it('lists the number each participant of a room was called at, unmasked, for the Gateway only (review 8b, n°2)', async () => {
+    const { bridge, calls } = make(
+      {
+        'livekit.RoomService/ListParticipants': {
+          participants: [
+            { identity: 'phone-102-a', attributes: { 'twake.kind': 'phone', 'twake.number': '102', 'sip.callIDFull': 'a1b2@192.0.2.30' } },
+            { identity: 'sip-1', attributes: { 'sip.phoneNumber': '+33612345678' } },
+            { identity: 'web-1', attributes: {} }
+          ]
+        }
+      },
+      { numberPrivacy: 'hide' }
+    )
+    expect(await bridge.participantCalls('twake-call-0123456789abcdef')).toEqual([
+      { id: 'twake-call-0123456789abcdef:phone-102-a', number: '102', callId: 'a1b2@192.0.2.30' },
+      { id: 'twake-call-0123456789abcdef:sip-1', number: '+33612345678' },
+      { id: 'twake-call-0123456789abcdef:web-1', number: '' }
+    ])
+    expect(calls[0]).toMatchObject({ path: 'livekit.RoomService/ListParticipants', body: { room: 'twake-call-0123456789abcdef' } })
+  })
+
+  it('tells which of some rooms LiveKit has (ListRooms, step 8b), asking nothing for none', async () => {
+    const { bridge, calls } = make({ 'livekit.RoomService/ListRooms': { rooms: [{ name: 'a' }, { name: 'other' }] } })
+    expect([...(await bridge.openRooms(['a', 'b']))]).toEqual(['a'])
+    expect(calls).toHaveLength(1)
+    expect(calls[0]).toMatchObject({ path: 'livekit.RoomService/ListRooms', body: { names: ['a', 'b'] } })
+    expect((await bridge.openRooms([])).size).toBe(0)
+    expect(calls).toHaveLength(1)
   })
 
   it('scopes the token of room calls to that room', async () => {

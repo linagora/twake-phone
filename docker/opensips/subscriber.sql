@@ -591,6 +591,11 @@ CREATE TABLE IF NOT EXISTS dial_out_grants (
     number VARCHAR(64) NOT NULL,
     expires_at TIMESTAMP WITH TIME ZONE NOT NULL
 );
+ALTER TABLE dial_out_grants ADD COLUMN IF NOT EXISTS replaces VARCHAR(320);
+ALTER TABLE dial_out_grants ADD COLUMN IF NOT EXISTS join_token VARCHAR(64);
+ALTER TABLE dial_out_grants ADD COLUMN IF NOT EXISTS room VARCHAR(64);
+ALTER TABLE dial_out_grants ADD COLUMN IF NOT EXISTS used_by VARCHAR(64);
+ALTER TABLE dial_out_grants ADD COLUMN IF NOT EXISTS used_call VARCHAR(200);
 DELETE FROM dialplan WHERE dpid IN (1, 2, 3, 4);
 INSERT INTO dialplan (dpid, pr, match_op, match_exp, match_flags, subst_exp, repl_exp, disabled, attrs) VALUES
   (1, 10, 1, '^(1[578]|11[2459]|19[167]|116000|116117)$', 0, '^(.*)$', '\1', 0, 'emergency'),

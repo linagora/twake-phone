@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { sweepDialIns } from './conference-sweep.js'
+import { sweepDialIns, webhookKeyFromEnv } from './conference-sweep.js'
 import { MemoryStore } from './store/memory.js'
 
 describe('sweepDialIns', () => {
@@ -35,5 +35,15 @@ describe('sweepDialIns', () => {
     expect(dropped).toEqual(['twake-0123456789abcdef 10', 'twake-00000000000000aa 6', 'abc-defg-hij 10', 'twake-00000000000000cc 10'])
     // The records stay: a short PIN is drawn again at the next read.
     expect((await store.getConference('twake-00000000000000aa'))?.pin).toBe('123456')
+  })
+})
+
+describe('webhookKeyFromEnv', () => {
+  it("takes the key LiveKit signs all its webhooks with, Meet's when it is given (third review 8b, n°3)", () => {
+    const api = { LIVEKIT_API_KEY: 'gateway-key', LIVEKIT_API_SECRET: 'gateway-secret' }
+    expect(webhookKeyFromEnv(api)).toEqual({ webhookKey: 'gateway-key', webhookSecret: 'gateway-secret' })
+    expect(webhookKeyFromEnv({ ...api, LIVEKIT_WEBHOOK_API_KEY: 'meet-key', LIVEKIT_WEBHOOK_API_SECRET: 'meet-secret' })).toEqual({ webhookKey: 'meet-key', webhookSecret: 'meet-secret' })
+    expect(() => webhookKeyFromEnv({ ...api, LIVEKIT_WEBHOOK_API_KEY: 'meet-key' })).toThrow(/go together/)
+    expect(() => webhookKeyFromEnv({ ...api, LIVEKIT_WEBHOOK_API_SECRET: 'meet-secret' })).toThrow(/go together/)
   })
 })

@@ -9,6 +9,12 @@ describe('historyEntryFor', () => {
     expect(e).toMatchObject({ tenantId: 'A', userId: 'alice', answered: true, durationSec: 240 })
   })
 
+  it('says a conference\'s call is one (step 8b), and nothing of it for the others', () => {
+    const call = { id: 'c', direction: 'inbound', state: 'ended', remoteNumber: '101', startedAt: '2026-10-05T10:00:00.000Z', connectedAt: '2026-10-05T10:00:01.000Z' }
+    expect(historyEntryFor('A', 'bob', ended({ ...call, conference: true }))).toMatchObject({ conference: true, remoteNumber: '101' })
+    expect(historyEntryFor('A', 'bob', ended(call))).not.toHaveProperty('conference')
+  })
+
   it('records an unanswered call with no duration', () => {
     const e = historyEntryFor('A', 'alice', ended({ id: 'c', direction: 'inbound', state: 'missed', remoteNumber: '102' }))
     expect(e).toMatchObject({ answered: false, durationSec: 0, state: 'missed' })

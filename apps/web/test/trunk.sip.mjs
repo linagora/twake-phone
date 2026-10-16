@@ -31,6 +31,7 @@ import { execSync } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
 import { createSocket } from 'node:dgram'
 import pg from 'pg'
+import { parseDlgContext } from '../../../packages/provider-opensips/dist/events.js'
 import { EMERGENCY_RESTORED_SEC } from '../../../packages/provider-opensips/dist/outbound.js'
 import { SubscriberProvisioner } from '../../../packages/provider-opensips/dist/subscriber.js'
 import { sipPhone } from './sip-phone.mjs'
@@ -1090,6 +1091,99 @@ try {
     await w302.close()
   })
 
+  await step("step 8b: a conference's room call goes where its grant says, as it says: in the place of a call (Replaces, written by OpenSIPS from the grant, Require: replaces) to the phone that has it, past its forward; to the person who made it (Twake-Join); to a third person, its room named (Twake-Conference); never to the public network; the call that took a grant written in it, a dialog ended by its Call-ID; its CDR and its events say conference; a room's other calls say a room calls; a phone's Twake-Join, Twake-Room or Twake-Conference never passes (review 8b, n°2, n°3, n°14)", async () => {
+    p302.st.asleep = true
+    const w302 = await phone('302', { ws: true })
+    await mi('event_subscribe', ['E_TWAKEPHONE_CALLING', alertAddress, 900])
+    try {
+      // The call between 301 and 302 that becomes a conference: OpenSIPS keeps the tag of the phone that answered.
+      const x = await p301.dial('302')
+      expect('the call answered', x.final.status === 200, x.final.first)
+      const rung = await w302.incoming(i => header(i, 'call-id') === x.callId)
+      const fromTag = /;tag=([^;>\s]+)/.exec(x.local)?.[1]
+      const dialog = parseDlgContext((await mi('dlg_list_ctx', { callid: x.callId })).result)
+      expect('the dialog of the call, as the Gateway reads it', dialog?.state === 4 && dialog.caller === '301' && dialog.callerTag === fromTag && dialog.values.callee === '302' && dialog.values.callee_tag === rung.tag, JSON.stringify(dialog))
+      // 302 forwards everything to 303 meanwhile: never the call that takes the place of its own.
+      await db.query("INSERT INTO call_rules (extension, tenant_id, forward_always) VALUES ('302', $1, '303') ON CONFLICT (extension) DO UPDATE SET forward_always = '303'", [TENANT])
+      const at303 = p303.calls.size
+      const replaces = `${x.callId};to-tag=${rung.tag};from-tag=${fromTag}`
+      const lk = await room('301')
+      const conference = 'twake-call-0123456789abcdef'
+      const movedGrant = await grants.grant('301', '302', 30, { replaces, room: conference })
+      const moved = await lk.dial('302', { extra: [`X-Twake-Grant: ${movedGrant}`] })
+      expect('the room\'s call in the place of the call', moved.final.status === 200, moved.final.first)
+      const replacing = await w302.incoming(i => header(i, 'call-id') === moved.callId)
+      expect('its Replaces, as the grant says', header(replacing.invite, 'replaces') === replaces, header(replacing.invite, 'replaces'))
+      // Taken in the place of the call or refused (420), never rung as a call of its own (review 8b, n°14).
+      expect('Require: replaces', header(replacing.invite, 'require').split(/\s*,\s*/).includes('replaces'), header(replacing.invite, 'require'))
+      // Its room, for the phone to show who is in it (review 8b, n°2).
+      expect('its room', header(replacing.invite, 'twake-conference') === conference, header(replacing.invite, 'twake-conference'))
+      // The call that took the grant (review 8b, n°3): its From tag, the id LiveKit SIP gives its call, and its Call-ID.
+      const taken = await grants.taken(movedGrant)
+      expect('the call that took the grant', taken?.tag === /;tag=([^;>\s]+)/.exec(moved.local)?.[1] && taken.callId === moved.callId, `${JSON.stringify(taken)} ${moved.local}`)
+      expect('a conference\'s call', header(replacing.invite, 'twake-room') === 'conference' && !replacing.invite.headers.has('twake-join') && !replacing.invite.headers.has('x-twake-grant'), JSON.stringify([...replacing.invite.headers.keys()]))
+      expect('not forwarded', p303.calls.size === at303, `${p303.calls.size - at303}`)
+      // The window of the person who made it: the token of the grant, nothing else.
+      const join = randomBytes(16).toString('hex')
+      const joined = await lk.dial('301', { extra: [`X-Twake-Grant: ${await grants.grant('301', '301', 30, { join })}`] })
+      expect('the room\'s call to whoever made the conference', joined.final.status === 200, joined.final.first)
+      const toMaker = await p301.incoming(i => header(i, 'call-id') === joined.callId)
+      expect('its token', header(toMaker.invite, 'twake-join') === join && header(toMaker.invite, 'twake-room') === 'conference' && !toMaker.invite.headers.has('replaces'), JSON.stringify(Object.fromEntries(toMaker.invite.headers)))
+      const calling = await untilAlert('the events of the conference\'s calls', (m, p) => m === 'E_TWAKEPHONE_CALLING' && p.callid === joined.callId)
+      const callingMoved = await untilAlert('the event of the call in the place of the other', (m, p) => m === 'E_TWAKEPHONE_CALLING' && p.callid === moved.callId)
+      expect('the events say conference', calling.conference === '1' && callingMoved.conference === '1' && callingMoved.callee === '302' && callingMoved.caller === '301', JSON.stringify([calling, callingMoved]))
+      // A third person called from the conference's room: shown as such, its room named; nothing to replace.
+      const third = await lk.dial('303', { extra: [`X-Twake-Grant: ${await grants.grant('301', '303', 30, { room: conference })}`] })
+      expect('the room\'s call to a third person', third.final.status === 200, third.final.first)
+      const thirdRung = await p303.incoming(i => header(i, 'call-id') === third.callId)
+      expect('a conference\'s call, its room', header(thirdRung.invite, 'twake-room') === 'conference' && header(thirdRung.invite, 'twake-conference') === conference && !thirdRung.invite.headers.has('replaces') && !thirdRung.invite.headers.has('require') && !thirdRung.invite.headers.has('twake-join'), JSON.stringify(Object.fromEntries(thirdRung.invite.headers)))
+      // How the Gateway ends a call that took a grant not its own (review 8b, n°3): its dialog by its Call-ID, a BYE to
+      // both sides. Answered, its state says so (4): the Gateway reads it a divert (third review 8b, n°1).
+      expect('an answered dialog', parseDlgContext((await mi('dlg_list_ctx', { callid: third.callId })).result)?.state === 4)
+      const ended = await mi('dlg_end_dlg', { dialog_id: third.callId })
+      expect('the dialog ended by its Call-ID', ended.result === 'OK', JSON.stringify(ended))
+      await p303.callState(thirdRung, 'ended', 5_000)
+      await lk.callState(third, 'ended', 5_000)
+      // Still ringing (nobody answers; LiveKit SIP gives up at its own time and says so before the 487): its state says
+      // early (under 4), and ending it cancels it (third review 8b, n°1): the Gateway reads a call nobody answered.
+      p303.st.answerDelayMs = 20_000
+      try {
+        const ringing = lk.dial('303', { extra: [`X-Twake-Grant: ${await grants.grant('301', '303', 30, { room: conference })}`], giveUpMs: 10_000 })
+        const ringingRung = await p303.incoming(i => header(i, 'twake-conference') === conference && header(i, 'call-id') !== third.callId)
+        const early = parseDlgContext((await mi('dlg_list_ctx', { callid: header(ringingRung.invite, 'call-id') })).result)
+        expect('a dialog still ringing', early !== undefined && early.state < 4, JSON.stringify(early))
+        const cancelled = await mi('dlg_end_dlg', { dialog_id: header(ringingRung.invite, 'call-id') })
+        expect('the ringing dialog ended by its Call-ID', cancelled.result === 'OK', JSON.stringify(cancelled))
+        const rang = await ringing
+        expect('the room\'s call cancelled', rang.final?.status === 487, rang.final?.first ?? rang.state)
+      } finally {
+        p303.st.answerDelayMs = 200
+      }
+      // Never a conference's call to the public network: nothing sent.
+      const sent = sentToOperators()
+      const toPublic = await lk.dial('0199000024', { extra: [`X-Twake-Grant: ${await grants.grant('301', '0199000024', 30, { replaces })}`] })
+      expect('a conference\'s call to the public network', toPublic.final.status === 403 && header(toPublic.final, 'twake-call-refused') === 'not-granted', `${toPublic.final.first} ${header(toPublic.final, 'twake-call-refused')}`)
+      expect('calls the operators were sent', sentToOperators() === sent, `${sentToOperators() - sent}`)
+      for (const c of [moved, joined]) expect('the room\'s BYE', (await lk.hangup(c)).status === 200)
+      for (const c of [moved, joined]) await until('the CDR of a conference\'s call', async () => (await db.query('SELECT via FROM acc WHERE callid = $1', [c.callId])).rows[0]?.via === 'conference', 5_000)
+      expect('the BYE of the call', (await p301.hangup(x)).status === 200)
+      await db.query("DELETE FROM call_rules WHERE extension = '302'")
+      // A room's call of step 8 says a room calls; neither a phone nor LiveKit SIP writes these headers.
+      const plain = await lk.dial('302', { extra: [`X-Twake-Grant: ${await grants.grant('301', '302')}`, `Twake-Join: ${join}`, 'Twake-Room: conference'] })
+      const plainRung = await w302.incoming(i => header(i, 'call-id') === plain.callId)
+      expect('a room of Meet calls', header(plainRung.invite, 'twake-room') === 'meet' && !plainRung.invite.headers.has('twake-join') && (plainRung.invite.headers.get('twake-room') ?? []).length === 1, JSON.stringify(Object.fromEntries(plainRung.invite.headers)))
+      await lk.hangup(plain)
+      const spoofed = await p303.dial('302', { extra: [`Twake-Join: ${join}`, 'Twake-Room: conference', `Twake-Conference: ${conference}`] })
+      const spoofedRung = await w302.incoming(i => header(i, 'call-id') === spoofed.callId)
+      expect('a phone\'s Twake-Join, Twake-Room and Twake-Conference', !spoofedRung.invite.headers.has('twake-join') && !spoofedRung.invite.headers.has('twake-room') && !spoofedRung.invite.headers.has('twake-conference'), JSON.stringify([...spoofedRung.invite.headers.keys()]))
+      await p303.hangup(spoofed)
+    } finally {
+      await db.query("DELETE FROM call_rules WHERE extension = '302'")
+      await mi('event_subscribe', ['E_TWAKEPHONE_CALLING', alertAddress, 0]).catch(() => undefined)
+      await w302.close()
+    }
+  })
+
   await step('step 8: LiveKit SIP draws its o= session id and version as any 64-bit number: a browser gets them below 2^63 (RFC 8829; Firefox refuses an offer otherwise), its codecs kept', async () => {
     p302.st.asleep = true
     const w302 = await phone('302', { ws: true })
@@ -1243,6 +1337,69 @@ try {
     await ringing
     await setOutbound({}, PROFILES, [])
   })
+
+  await step('review 8b, n°5: past DB_MAX_ASYNC_CONNECTIONS (OpenSIPS started again with 1 a moment): calls from the operator at once, their direct number read again when the read failed at once, all ring; a read that failed late (past its time) is not made again (second review 8b, n°9); calls to the public network at once, those refused for it (503, policy-unavailable) keep no minutes reserved', async () => {
+    if (!RESTART) {
+      console.log('     (skipped: OPENSIPS_RESTART is not set)')
+      return
+    }
+    const restart = async max => {
+      execSync(RESTART, { stdio: 'inherit', shell: '/bin/sh', env: { ...process.env, DB_MAX_ASYNC_CONNECTIONS: max } })
+      await until('OpenSIPS back (its MI)', () => mi('version').then(() => true, () => false), 60_000)
+      for (const p of [p301, p303, p115]) expect(`registration of ${p.user} again`, (await p.register()) === 200)
+    }
+    const reservedFor = async callId => Number((await db.query('SELECT seconds FROM outbound_reservations WHERE call_key = md5($1)', [callId])).rows[0]?.seconds ?? 0)
+    // A table the read takes locked a moment (350 ms, well under RULES_QUERY_TIMEOUT_MS): the calls sent at once wait
+    // together, one read in flight per process at most, the others past it.
+    const lockedWhile = async (table, fn, ms = 350) => {
+      const locker = new pg.Client({ connectionString: DB_URL })
+      await locker.connect()
+      try {
+        await locker.query('BEGIN')
+        await locker.query(`LOCK TABLE ${table} IN ACCESS EXCLUSIVE MODE`)
+        const pending = fn()
+        await sleep(ms)
+        await locker.query('ROLLBACK')
+        return await pending
+      } finally {
+        await locker.end()
+      }
+    }
+    await setOutbound({}, PROFILES, [])
+    await restart('1')
+    try {
+      // Four calls from the operator to 301's direct number: two SIP processes on the trunk's socket, one connection each.
+      const rang = await lockedWhile('dids', () => Promise.all([0, 1, 2, 3].map(async () => (await A.call('+33199000301')))))
+      for (const placed of rang) {
+        const answered = await placed.final
+        expect('a call from the operator past the connections: read again, answered', answered.status === 200, answered.first)
+        await A.request(placed, 'BYE')
+      }
+      // The table locked longer than RULES_QUERY_TIMEOUT_MS (1000 ms by default): the read fails past its time, late,
+      // and is not made again (second review 8b, n°9: the database is slow, not full; read again, it would answer once
+      // the lock goes, 600 ms later). The call is refused as one whose number is not read (404).
+      const late = await lockedWhile('dids', () => A.call('+33199000301'), 1600)
+      const lateFinal = await late.final
+      if (lateFinal.status === 200) await A.request(late, 'BYE')
+      expect('a call from the operator whose read failed late: not read again, refused', lateFinal.status === 404, lateFinal.first)
+      // Four calls to the public network, of three people: what twake_outbound() reserved for one refused goes with it.
+      const callers = [p301, p301, p303, p115]
+      const placed = await lockedWhile('outbound_settings', () => Promise.all(callers.map((p, i) => p.dial(`019900009${i}`))))
+      let refusedCalls = 0
+      for (const [i, call] of placed.entries()) {
+        if (call.final.status === 200) {
+          await hangupOut(callers[i], call)
+          continue
+        }
+        expect('a call to the public network: answered or refused for its rules unread', call.final.status === 503 && header(call.final, 'twake-call-refused') === 'policy-unavailable', `${call.final.first} ${header(call.final, 'twake-call-refused')}`)
+        expect('no minutes reserved for the call refused', (await reservedFor(call.callId)) === 0, `${await reservedFor(call.callId)} s`)
+        refusedCalls++
+      }
+      expect('calls past the one connection of their process (refused, their reservation withdrawn)', refusedCalls >= 1, `${refusedCalls}`)
+    } finally {
+      await restart('8')
+    }
+  })
 } finally {
   for (const p of phones) await p.close().catch(() => undefined)
   for (const e of ALERT_EVENTS) await mi('event_subscribe', [e, alertAddress, 0]).catch(() => undefined)
@@ -1256,7 +1413,7 @@ try {
     .then(() => mi('fraud_reload'))
     .catch(err => console.log(`outbound rules not removed: ${err.message}`))
   await db.query("DELETE FROM call_groups WHERE number IN ('3900', '3901', '3902')").catch(() => undefined)
-  await db.query("DELETE FROM call_rules WHERE extension = '303'").catch(() => undefined)
+  await db.query("DELETE FROM call_rules WHERE extension IN ('302', '303')").catch(() => undefined)
   await db.query('DELETE FROM dial_out_grants WHERE tenant_id = $1', [TENANT]).catch(() => undefined)
   await db.query('DELETE FROM outbound_usage').catch(() => undefined)
   await tables.set([], []).catch(err => console.log(`trunks not removed: ${err.message}`))

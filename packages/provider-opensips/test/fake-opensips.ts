@@ -18,6 +18,8 @@ export const fakeOpensips = async () => {
     upTime: '600 [sec]',
     dump: { Domains: [{ name: 'location', hash_size: 512, AORs: [] as unknown[] }] },
     dialogs: { Dialogs: [] as unknown[] },
+    /** What MI dlg_list_ctx answers for a Call-ID (step 8b): the dialog, with its context; 404 for any other. */
+    dialogContexts: new Map<string, unknown>(),
     /** What MI ds_list and reg_list answer (step 7): the servers of the trunks, their registrations. */
     dispatcher: { PARTITIONS: [{ name: 'default', SETS: [] as unknown[] }] },
     registrations: { Records: [] as unknown[] },
@@ -57,6 +59,19 @@ export const fakeOpensips = async () => {
     if (req.method === 'uptime') return reply({ result: { Now: 'Wed Oct 14 18:10:00 2026', 'Up since': state.upSince, 'Up time': state.upTime } })
     if (req.method === 'ul_dump') return reply({ result: state.dump })
     if (req.method === 'dlg_list') return reply({ result: state.dialogs })
+    if (req.method === 'dlg_list_ctx') {
+      const dialog = state.dialogContexts.get(String((req.params as unknown as { callid?: unknown }).callid))
+      // 'fail': an MI that answers another error than "no such dialog" (review 8b, n°10).
+      if (dialog === 'fail') return reply({ error: { code: 500, message: 'Internal error' } })
+      return reply(dialog ? { result: { Dialog: dialog } } : { error: { code: 404, message: 'No such dialog' } })
+    }
+    if (req.method === 'dlg_end_dlg') {
+      // Ends the dialog of that Call-ID (review 8b, n°3), as OpenSIPS takes a Call-ID for a dialog id.
+      const id = String((req.params as unknown as { dialog_id?: unknown }).dialog_id)
+      if (!state.dialogContexts.has(id)) return reply({ error: { code: 404, message: 'No such dialog' } })
+      state.dialogContexts.delete(id)
+      return reply({ result: 'OK' })
+    }
     if (req.method === 'ds_list') return reply({ result: state.dispatcher })
     if (req.method === 'reg_list') return reply({ result: state.registrations })
     if (req.method === 'shv_get' && state.shv) return reply({ result: { VARs: state.shv } })

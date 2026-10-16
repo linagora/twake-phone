@@ -33,9 +33,16 @@ tcp_workers=4
 # A browser's WebSocket stays open as long as its registration (tcp_persistent_flag below).
 tcp_connection_lifetime=3605
 # Each SIP process opens a database connection per asynchronous read in flight (the call rules, below) and keeps it
-# for the next ones: at most 3 per process (6 processes, 18 connections to the database the Gateway uses too). Past
-# that, a read runs synchronously in the process, bounded by RULES_QUERY_TIMEOUT_MS like the others.
-db_max_async_connections=3
+# for the next ones: at most DB_MAX_ASYNC_CONNECTIONS per process (8 by default). The SIP processes are udp_workers
+# for each UDP socket (the phones', the trunk's, LiveKit SIP's: 6) and tcp_workers (4): 10, so 80 connections at most,
+# with about one more per process for the rest (registrations, dialogs, CDRs) and the Gateway's: the database's
+# max_connections must hold them all (200 on this stack; docker/README.md). Past that number, OpenSIPS 3.6 runs the read
+# synchronously but drops its result: the read fails (-1) at once, its row never read. The reads a call cannot go
+# without (the direct number of a call from the operator, the trunk of a call to it) are made again then, synchronously
+# (route[read_again]), when the failure came at once (a read past its time, RULES_QUERY_TIMEOUT_MS, is not made again);
+# the rules and the ring groups are read again once as any failed read (route[read_failed]). twake_outbound() and a
+# room's grant change what they read: never made twice (a reservation made for nothing is withdrawn, route[outbound_loaded]).
+db_max_async_connections=${DB_MAX_ASYNC_CONNECTIONS}
 
 auto_aliases=no
 # The SIP domain is "us" on our ports only: on a local stack it is also the browsers' address (127.0.0.1), and a
@@ -686,10 +693,15 @@ route {
 	}
 	consume_credentials();
 	# Who calls is told by this script only (the From's display, route[caller_name]): no identity a phone asserts
-	# passes on.
+	# passes on. Nor that a room calls (Twake-Room), for which window (Twake-Join, step 8b) or from which conference
+	# (Twake-Conference, review 8b, n°2): this script says it of the room's calls it let through
+	# (route[meet_source_loaded]), never a phone nor LiveKit SIP.
 	remove_hf("P-Asserted-Identity");
 	remove_hf("P-Preferred-Identity");
 	remove_hf("Remote-Party-ID");
+	remove_hf("Twake-Room");
+	remove_hf("Twake-Join");
+	remove_hf("Twake-Conference");
 
 	if ($rU == NULL) {
 		send_reply(484, "Address Incomplete");
@@ -852,19 +864,25 @@ route {
 #   MEET_MAX_CALL_SEC at most ($shv(meet_max_sec)), then BYE to both sides.
 # The media through rtpengine, plain RTP on LiveKit SIP's side (route[rtp_flags]).
 
-# A room's call: its grant taken (deleted, so used once), for whoever its From names, one of our accounts, and the
-# number it calls as the Gateway gave it to LiveKit (the Request-URI), read without holding this process. Only the
-# characters of a grant (32 hexadecimal) and of a number get into the query.
+# A room's call: its grant taken (used once), for whoever its From names, one of our accounts, and the number it calls
+# as the Gateway gave it to LiveKit (the Request-URI), read without holding this process. Only the characters of a
+# grant (32 hexadecimal), of a number, of a tag and of a Call-ID get into the query. The grant is not deleted but marked
+# with the call that took it (review 8b, n°3): the From tag LiveKit SIP writes is the id of its call, which LiveKit gives
+# the Gateway (CreateSIPParticipant's sip_call_id). The Gateway compares the two once the call is through: a grant taken
+# by another call (someone holding a key of LiveKit replays it from a room of theirs while the Gateway's own call goes
+# where they sent LiveKit's trunk) is a call diverted, which it ends (the room, and this dialog by its Call-ID). Kept 10
+# minutes for that, then the Gateway's next grant deletes it. With the grant, what it says of a conference (step 8b,
+# ADR 0019): the call it takes the place of (`replaces`), the window it is for (`join_token`), its room (`room`).
 route[meet_source] {
 	$avp(meet_pstn) = $var(pstn);
-	if (!($avp(meet_grant) =~ "^[0-9a-f]{32}$") || !($rU =~ "^[+]?[0-9*#]{2,20}$")) {
+	if (!($avp(meet_grant) =~ "^[0-9a-f]{32}$") || !($rU =~ "^[+]?[0-9*#]{2,20}$") || !($ft =~ "^[A-Za-z0-9._~!%*+-]{1,64}$") || !($ci =~ "^[A-Za-z0-9._~!%*+@:-]{1,200}$")) {
 		xlog("L_NOTICE", "meet: call $ci from $avp(caller) to $rU refused, without a grant\n");
 		append_to_reply("Twake-Call-Refused: not-granted\r\n");
 		t_reply(403, "Not Granted");
 		exit;
 	}
-	$var(meet_query) = "DELETE FROM dial_out_grants g WHERE g.token = '" + $avp(meet_grant) + "' AND g.extension = '" + $fU + "' AND g.number = '" + $rU + "' AND g.expires_at > now() AND EXISTS (SELECT 1 FROM subscriber s WHERE s.username = g.extension) RETURNING 1";
-	async(sql_query_one("$var(meet_query)", "$avp(meet_known)"), meet_source_loaded);
+	$var(meet_query) = "UPDATE dial_out_grants g SET used_by = '" + $ft + "', used_call = '" + $ci + "', expires_at = now() + interval '10 minutes' WHERE g.token = '" + $avp(meet_grant) + "' AND g.used_by IS NULL AND g.extension = '" + $fU + "' AND g.number = '" + $rU + "' AND g.expires_at > now() AND EXISTS (SELECT 1 FROM subscriber s WHERE s.username = g.extension) RETURNING 1, coalesce(g.replaces, ''), coalesce(g.join_token, ''), coalesce(g.room, '')";
+	async(sql_query_one("$var(meet_query)", "$avp(meet_known);$avp(meet_replaces);$avp(meet_join);$avp(meet_room)"), meet_source_loaded);
 }
 
 route[meet_source_loaded] {
@@ -884,11 +902,65 @@ route[meet_source_loaded] {
 		t_reply(503, "Service Unavailable");
 		exit;
 	}
+	if (($avp(meet_replaces) != NULL && $avp(meet_replaces) != "") || ($avp(meet_join) != NULL && $avp(meet_join) != "")) {
+		route(conference_leg);
+		exit;
+	}
 	if ($avp(meet_pstn) == 1) {
 		route(trunk_out);
 		exit;
 	}
+	# The callee's phone knows a room calls (no hold nor transfer there: the room's calls are not transferred). The
+	# room of a conference (review 8b, n°2) says so, and which: whoever answers sees who is in it. A call of the
+	# conference as the others' are (second review 8b, n°8): its CDR says `via` conference, its events `conference`
+	# (its callee's: the Récents of the third participant say Conférence, as their window does).
+	if ($avp(meet_room) =~ "^twake-call-[0-9a-f]{16}$") {
+		append_hf("Twake-Room: conference\r\n");
+		append_hf("Twake-Conference: $avp(meet_room)\r\n");
+		$avp(conference) = 1;
+		$acc_extra(via) = "conference";
+	} else
+		append_hf("Twake-Room: meet\r\n");
 	route(rules_next);
+	exit;
+}
+
+# A room's call of a conference (step 8b, ADR 0019), as its grant says: in the place of a call of the extension it
+# calls (Replaces, the dialog the Gateway read from this proxy: its phone that has the call answers at once and ends
+# that call), or to the person who makes the conference (Twake-Join, the token their window drew: only that window
+# answers). To the phones of that extension and nowhere else: no rules (a forward, a "do not disturb"), no ring group,
+# never the public network. Its CDR says `via` conference; its events, `conference`.
+route[conference_leg] {
+	if ($avp(meet_pstn) == 1) {
+		xlog("L_NOTICE", "meet: conference call $ci from $avp(caller) to $rU refused: not an extension\n");
+		append_to_reply("Twake-Call-Refused: not-granted\r\n");
+		t_reply(403, "Not Granted");
+		exit;
+	}
+	# What the grant says goes into headers of our own: only as the Gateway writes it (review 8b, n°15).
+	if (($avp(meet_replaces) != "" && !($avp(meet_replaces) =~ "^[A-Za-z0-9._~!%*+@:-]{1,200};to-tag=[A-Za-z0-9._~!%*+-]{1,50};from-tag=[A-Za-z0-9._~!%*+-]{1,50}$")) || ($avp(meet_join) != "" && !($avp(meet_join) =~ "^[0-9a-f]{32}$")) || ($avp(meet_room) != "" && !($avp(meet_room) =~ "^twake-call-[0-9a-f]{16}$"))) {
+		xlog("L_WARN", "meet: conference call $ci from $avp(caller) to $rU refused: its grant is not as the Gateway writes one\n");
+		t_reply(500, "Server Internal Error");
+		exit;
+	}
+	# The phone must take it in the place of the call, or refuse it (RFC 3891, 420): never ring it as a new call.
+	if ($avp(meet_replaces) != "") {
+		append_hf("Replaces: $avp(meet_replaces)\r\n");
+		append_hf("Require: replaces\r\n");
+	} else
+		append_hf("Twake-Join: $avp(meet_join)\r\n");
+	append_hf("Twake-Room: conference\r\n");
+	if ($avp(meet_room) != "")
+		append_hf("Twake-Conference: $avp(meet_room)\r\n");
+	$avp(conference) = 1;
+	$acc_extra(via) = "conference";
+	if (!lookup("location")) {
+		route(account_missed);
+		route(calling);
+		t_reply(404, "Not Found");
+		exit;
+	}
+	route(names_next);
 	exit;
 }
 
@@ -1070,7 +1142,10 @@ route[trunk_out] {
 	$var(called) = "";
 	if ($avp(callee) =~ "^\+?[0-9]{2,16}$")
 		$var(called) = $avp(callee);
+	$(avp(trunk_query)[*]) = NULL;
 	$var(trunk_query) = "SELECT t.setid, t.domain, t.number_format, t.assert_identity, t.auth_username, t.auth_password, t.auth_realm, t.codec_flags, coalesce(d.number, t.default_number) AS presented, t.allowed, t.countries, (SELECT CASE WHEN i.suffix_digits > 0 THEN right('" + $var(called) + "', i.suffix_digits) ELSE i.target END FROM dids i WHERE length(i.first_number) = length('" + $var(called) + "') AND '" + $var(called) + "' BETWEEN i.first_number AND i.last_number ORDER BY i.suffix_digits LIMIT 1) AS internal FROM trunks t LEFT JOIN LATERAL (SELECT CASE WHEN x.suffix_digits > 0 THEN left(x.first_number, length(x.first_number) - x.suffix_digits) || '" + $var(ext) + "' ELSE x.first_number END AS number FROM dids x WHERE x.trunk_id = t.id AND ((x.suffix_digits = 0 AND x.target = '" + $var(ext) + "') OR (x.suffix_digits = length('" + $var(ext) + "') AND left(x.first_number, length(x.first_number) - x.suffix_digits) || '" + $var(ext) + "' BETWEEN x.first_number AND x.last_number)) ORDER BY x.suffix_digits, x.first_number LIMIT 1) d ON true ORDER BY (d.number IS NULL), t.position LIMIT 1";
+	$avp(trunk_query) = $var(trunk_query);
+	route(read_sent);
 	async(sql_query_one("$var(trunk_query)", "$avp(t_setid);$avp(t_domain);$avp(t_format);$avp(t_pai);$avp(t_user);$avp(t_pass);$avp(t_realm);$avp(t_codecs);$avp(t_presented);$avp(t_allowed);$avp(t_countries);$avp(t_internal)"), trunk_out_loaded);
 }
 
@@ -1154,6 +1229,10 @@ route[trunk_out_loaded] {
 	if (t_was_cancelled()) {
 		t_reply(487, "Request Terminated");
 		exit;
+	}
+	if ($var(trunk_rc) == -1 && route(read_again)) {
+		sql_query_one("$avp(trunk_query)", "$avp(t_setid);$avp(t_domain);$avp(t_format);$avp(t_pai);$avp(t_user);$avp(t_pass);$avp(t_realm);$avp(t_codecs);$avp(t_presented);$avp(t_allowed);$avp(t_countries);$avp(t_internal)");
+		$var(trunk_rc) = $rc;
 	}
 	if ($var(trunk_rc) == -2) {
 		# No trunk at all: the caller is told to call an emergency number from another phone.
@@ -1373,6 +1452,10 @@ route[outbound_loaded] {
 	}
 	if ($var(outbound_rc) < 0 || $avp(o_verdict) == NULL) {
 		xlog("L_WARN", "call $ci: the rules of the calls to the public network not read ($var(outbound_rc)): refused\n");
+		# twake_outbound() may have run all the same (OpenSIPS past db_max_async_connections runs it, then drops what
+		# it said): what it reserved for this call goes, or it would count against the caller's minutes for nothing.
+		$var(o_key) = $(ci{s.md5});
+		sql_query("DELETE FROM outbound_reservations WHERE call_key = '$var(o_key)'");
 		append_to_reply("Twake-Call-Refused: policy-unavailable\r\n");
 		t_reply(503, "Call Rules Unavailable");
 		exit;
@@ -1686,6 +1769,9 @@ route[trunk_in] {
 	remove_hf("P-Asserted-Identity");
 	remove_hf("P-Preferred-Identity");
 	remove_hf("Remote-Party-ID");
+	remove_hf("Twake-Room");
+	remove_hf("Twake-Join");
+	remove_hf("Twake-Conference");
 	$var(n1) = "";
 	$var(n2) = "";
 	if (route(inbound_number, $rU))
@@ -1739,6 +1825,8 @@ route[trunk_in] {
 	$var(dnd_sql) = "SELECT 1 FROM call_rules r WHERE r.extension = ";
 	$var(dnd_now) = " AND r.dnd AND (r.dnd_until IS NULL OR r.dnd_until > now())";
 	$var(did_query) = "SELECT x.target, x.codecs, x.fb, CASE WHEN EXISTS (SELECT 1 FROM subscriber s WHERE s.username = x.fb) THEN CASE WHEN EXISTS (" + $var(dnd_sql) + "x.fb" + $var(dnd_now) + ") THEN '' ELSE 'extension' END WHEN EXISTS (SELECT 1 FROM call_groups g WHERE g.number = x.fb) THEN 'group' ELSE '' END, coalesce((SELECT string_agg(m.ext, '|' ORDER BY m.pos) FROM call_groups g CROSS JOIN LATERAL unnest(g.members) WITH ORDINALITY AS m(ext, pos) WHERE g.number = x.fb AND m.ext ~ '^[A-Za-z0-9._+-]{1,64}$' AND NOT EXISTS (" + $var(dnd_sql) + "m.ext" + $var(dnd_now) + ")), ''), CASE WHEN EXISTS (SELECT 1 FROM subscriber s WHERE s.username = x.target) OR EXISTS (SELECT 1 FROM call_groups g WHERE g.number = x.target) THEN 1 ELSE 0 END FROM (SELECT CASE WHEN d.suffix_digits > 0 THEN right(n.num, d.suffix_digits) ELSE d.target END AS target, t.codec_flags AS codecs, coalesce(nullif(d.fallback, ''), t.fallback) AS fb FROM (VALUES (CASE WHEN EXISTS (SELECT 1 FROM trunks b WHERE b.reg_aor <> '' AND b.auth_username = '" + $var(ru_user) + "') THEN 3 ELSE 1 END, '" + $var(n1) + "'), (2, '" + $var(n2) + "')) AS n(o, num) JOIN dids d ON length(d.first_number) = length(n.num) AND n.num BETWEEN d.first_number AND d.last_number JOIN trunks t ON t.id = d.trunk_id ORDER BY n.o, d.suffix_digits LIMIT 1) x";
+	$avp(did_query) = $var(did_query);
+	route(read_sent);
 	async(sql_query_one("$var(did_query)", "$avp(did_target);$avp(t_codecs);$avp(fb_target);$avp(fb_kind);$avp(fb_members);$avp(did_assigned)"), trunk_in_loaded);
 }
 
@@ -1762,6 +1850,10 @@ route[trunk_in_loaded] {
 	if (t_was_cancelled()) {
 		t_reply(487, "Request Terminated");
 		exit;
+	}
+	if ($var(did_rc) == -1 && route(read_again)) {
+		sql_query_one("$avp(did_query)", "$avp(did_target);$avp(t_codecs);$avp(fb_target);$avp(fb_kind);$avp(fb_members);$avp(did_assigned)");
+		$var(did_rc) = $rc;
 	}
 	if ($var(did_rc) < 0 && $var(did_rc) != -2)
 		xlog("L_WARN", "call $ci: direct numbers not read ($var(did_rc))\n");
@@ -2036,6 +2128,12 @@ route[caller_name] {
 		$var(caller_name) = "Meet";
 		if ($avp(names_read) == 1 && $avp(n_caller) != NULL && $avp(n_caller) != "")
 			$var(caller_name) = "Meet (" + $avp(n_caller) + ")";
+		# A conference's call (step 8b): the person who made it, as the directory names them (the app says the rest).
+		if ($avp(conference) != NULL) {
+			$var(caller_name) = "";
+			if ($avp(names_read) == 1 && $avp(n_caller) != NULL)
+				$var(caller_name) = $avp(n_caller);
+		}
 		uac_replace_from("$var(caller_name)", "");
 		return(1);
 	}
@@ -2052,6 +2150,34 @@ route[caller_name] {
 route[tables_4c] {
 	if ($shv(no4c_until) > $Ts)
 		return(-1);
+	return(1);
+}
+
+# A read the call cannot go without (route[trunk_in], route[trunk_out]) that failed (-1): 1 to make it again, once,
+# synchronously. Past db_max_async_connections in this process, OpenSIPS 3.6 ran it but dropped its row (a burst of
+# calls from the operator: the direct number of one of them not found, 404); a database that fails it costs one
+# RULES_QUERY_TIMEOUT_MS more. Only for a SELECT: what it reads, it does not change.
+# When an asynchronous read went (route[read_sent]): milliseconds, modulo 1000 s (an OpenSIPS integer has 32 bits).
+route[read_sent] {
+	$avp(q_sent) = ($Ts % 1000) * 1000 + ($Tsm / 1000);
+}
+
+# A read that failed (-1) is made again, synchronously, when it failed at once: OpenSIPS past db_max_async_connections
+# (or a connection refused). One that failed after half of RULES_QUERY_TIMEOUT_MS or more is a slow database: not made
+# again, never holding this process twice as long.
+route[read_again] {
+	if ($avp(q_sent) == NULL) {
+		xlog("L_WARN", "call $ci: a read failed, when it went unknown: not made again\n");
+		return(-1);
+	}
+	$var(q_now) = ($Ts % 1000) * 1000 + ($Tsm / 1000);
+	$var(q_spent) = ($var(q_now) - $avp(q_sent) + 1000000) % 1000000;
+	$var(q_twice) = $var(q_spent) * 2;
+	if ($var(q_twice) >= ${RULES_QUERY_TIMEOUT_MS}) {
+		xlog("L_WARN", "call $ci: a read failed after $var(q_spent) ms: not made again\n");
+		return(-1);
+	}
+	xlog("L_NOTICE", "call $ci: a read failed at once (-1, past db_max_async_connections or the database): made again\n");
 	return(1);
 }
 
@@ -3363,6 +3489,8 @@ onreply_route[rtp] {
 			raise_event("E_TWAKEPHONE_RINGING", $avp(ev_attr), $avp(ev_val));
 		} else if ($rs == 200 && $avp(answered) == NULL) {
 			$avp(answered) = 1;
+			# The tag of the phone that answered: a room's call that takes the place of this one names it (step 8b).
+			$dlg_val(callee_tag) = $tt;
 			# The member who answered a ring group is the callee from now on: in the CDR, in the dialog (an INVITE
 			# with Replaces for this call goes to them), in the events.
 			if ($var(member) != "") {
@@ -3422,6 +3550,11 @@ route[event_attrs] {
 	$avp(ev_val) = $avp(caller);
 	$avp(ev_attr) = "callid";
 	$avp(ev_val) = $ci;
+	# A room's call of a conference (step 8b): its callee's only (route[conference_leg]).
+	if ($avp(conference) != NULL) {
+		$avp(ev_attr) = "conference";
+		$avp(ev_val) = "1";
+	}
 }
 
 # The event the Gateway raises itself through the MI (`raise_event`) after each subscription to the events, and gets

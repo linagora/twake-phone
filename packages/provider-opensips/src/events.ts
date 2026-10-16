@@ -254,12 +254,12 @@ export class OpensipsEvents {
   }
 
   /** One MI request (JSON-RPC 2.0 over UDP); rejects on an error reply, on a timeout, and after `stop()`. */
-  call<T = unknown>(method: string, params: unknown[] = []): Promise<T> {
+  call<T = unknown>(method: string, params: unknown[] | Record<string, unknown> = []): Promise<T> {
     if (this.stopped) return Promise.reject(new Error('OpenSIPS events not started'))
     return this.request<T>(method, params)
   }
 
-  private request<T>(method: string, params: unknown[], timeoutMs = this.options.timeoutMs ?? 2_000): Promise<T> {
+  private request<T>(method: string, params: unknown[] | Record<string, unknown>, timeoutMs = this.options.timeoutMs ?? 2_000): Promise<T> {
     const socket = this.socket
     if (!socket) return Promise.reject(new Error('OpenSIPS events not started'))
     // Unpredictable ids: a reply cannot be forged without seeing the request.
@@ -495,6 +495,23 @@ export const parseUlDump = (result: unknown, nowMs = Date.now()): { aor: string;
         : []
     )
   )
+}
+
+/**
+ * One dialog as `dlg_list_ctx` with its Call-ID reports it (step 8b): its state, the user of its From, the caller's tag
+ * and the values the script keeps in it (`$dlg_val`, strings; numbers as their digits). Undefined for anything else.
+ */
+export const parseDlgContext = (result: unknown): { callid: string; state: number; caller: string; callerTag: string; values: Record<string, string> } | undefined => {
+  const d = (result as { Dialog?: { callid?: unknown; state?: unknown; from_uri?: unknown; caller_tag?: unknown; context?: { values?: unknown } } } | null)?.Dialog
+  if (!d || typeof d.callid !== 'string' || typeof d.state !== 'number') return undefined
+  const values: Record<string, string> = {}
+  for (const item of Array.isArray(d.context?.values) ? d.context.values : []) {
+    if (!item || typeof item !== 'object') continue
+    for (const [name, value] of Object.entries(item as Record<string, unknown>)) if (typeof value === 'string' || typeof value === 'number') values[name] = String(value)
+  }
+  const uri = typeof d.from_uri === 'string' ? d.from_uri.replace(/^<|>$/g, '') : ''
+  const caller = /^(?:sips?:)?([^@;>]+)@/.exec(uri)?.[1] ?? ''
+  return { callid: d.callid, state: d.state, caller, callerTag: typeof d.caller_tag === 'string' ? d.caller_tag : '', values }
 }
 
 /**

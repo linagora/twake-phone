@@ -189,7 +189,11 @@ const listenDtmf = address => {
 }
 const DTMF_EVENTS = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '*', '#']
 
-const [APP_PORT, OIDC_PORT, GATEWAY_PORT, RELAY_PORT] = await Promise.all([freePort(), freePort(), freePort(), freePort()])
+const [APP_PORT, OIDC_PORT, RELAY_PORT] = await Promise.all([freePort(), freePort(), freePort()])
+// Where the stack's LiveKit sends its webhooks (docker-compose.sip.yml, LIVEKIT_WEBHOOK_URL; second review 8b, n°3): a
+// port known before the stack starts, not drawn like the others. Taken, the run stops at once and says so (third
+// review 8b, n°7): GATEWAY_PORT moves it, LIVEKIT_WEBHOOK_URL of the stack along with it.
+const GATEWAY_PORT = Number(process.env.GATEWAY_PORT ?? 18080)
 const appOrigin = `http://127.0.0.1:${APP_PORT}`
 const gatewayUrl = `http://127.0.0.1:${GATEWAY_PORT}`
 const wss = new URL(SIP_WSS_URL)
@@ -260,8 +264,16 @@ let activeBridge = bridge
 const conference = { bridge: () => activeBridge, accessNumber: MEET_NUMBER, webhookKey: LIVEKIT_API_KEY, webhookSecret: LIVEKIT_API_SECRET }
 // A call with the public network whose person has no window left is ended after 3 s here (30 s by default).
 const gateway = await buildApp(registry, { auth, store, contacts, directorySync, push, secretsKey: key, admin: { adminRole: 'twakephone-admin', adminUsers: new Set() }, conference })
+// LiveKit's webhooks as the Gateway answered them: signed with its key, each one 204.
+const livekitWebhooks = []
+gateway.addHook('onResponse', async (req, reply) => {
+  if (req.url === '/api/v1/webhooks/livekit') livekitWebhooks.push(reply.statusCode)
+})
 registry.startAll()
-await gateway.listen({ host: '127.0.0.1', port: GATEWAY_PORT })
+await gateway.listen({ host: '127.0.0.1', port: GATEWAY_PORT }).catch(err => {
+  if (err?.code !== 'EADDRINUSE') throw err
+  throw new Error(`port ${GATEWAY_PORT} (GATEWAY_PORT) is taken: free it, or set GATEWAY_PORT and the stack's LIVEKIT_WEBHOOK_URL to another one`)
+})
 const web = await serveApp({
   dir: fileURLToPath(new URL('../dist/', import.meta.url)),
   port: APP_PORT,
@@ -2344,11 +2356,13 @@ try {
     const res = await (await asPerson(alice))('GET', `/conferences/${ROOM}`)
     return res.statusCode === 200 ? res.json().participants : []
   }
+  // Once a second: these reads are Alice's, counted with her window's (60 a minute, CONFERENCE_READ_LIMIT). Four a
+  // second left her conference of step 8b, a few seconds later, nothing to read its participants with (429).
   const roomHas = (count, what) =>
     until(what, async () => {
       const people = await inRoom()
       return people.length === count ? people : null
-    }, { timeout: 20_000 })
+    }, { timeout: 20_000, every: 1_000 })
   const connected = (page, what) => until(what, async () => ((await calls(page))[0]?.state === 'connected' ? true : null), { timeout: 20_000 })
   // LiveKit SIP answers, then asks for the PIN (a recorded prompt): the digits are typed once it has begun.
   const PROMPT_MS = 3_000
@@ -2582,6 +2596,138 @@ try {
     await roomHas(0, 'an empty room')
     expectEqual((await api('DELETE', `/conferences/${ROOM}`)).statusCode, 204, 'DELETE /conferences/:id')
     expectEqual((await api('DELETE', '/admin/dids/meet')).statusCode, 204, 'DELETE /admin/dids/meet')
+  })
+  // Step 8b (ADR 0019): « Ajouter un participant ». A call between two extensions becomes a conference in a room of
+  // its own: the room calls Alice's window (its token), then Jean in the place of their call (Replaces), then Bob.
+  let CONFERENCE
+  let conferenceFrom
+  let conferenceAcc
+  /** The participants of the conference, as Alice reads them (none once LiveKit no longer has the room). */
+  const inConference = async () => {
+    const res = await (await asPerson(alice))('GET', `/conferences/${CONFERENCE}`)
+    return res.statusCode === 200 ? res.json().participants : []
+  }
+  /** The person's newest calls of the history that are a conference, once there are `count` since `after`. */
+  const conferenceCalls = (userId, after, count) =>
+    until(`${count} conference calls in the history of ${userId}`, async () => {
+      const items = (await store.listHistory(TENANT, userId, { limit: 10 })).items.filter(e => e.startedAt > after && e.conference)
+      return items.length >= count ? items : null
+    })
+  await step('step 8b: Alice calls Jean, who answers; while Jean holds the call, Alice cannot add anyone (review 8b, n°1); both mute their microphone; she adds Bob (« Ajouter un participant », 103): the room calls her window, answered by itself, then Jean in the place of their call (Replaces, answered by itself), each microphone still muted; Bob rings from her extension and answers: a conference of three, each hearing the others, neither hold nor transfer; Jean and Bob see who is in it, without acting on anyone, and are told who came (review 8b, n°2); Alice removes Bob, whose call ends, and Jean is told he left', async () => {
+    conferenceFrom = new Date().toISOString()
+    conferenceAcc = await lastId('acc')
+    await aliceCallsJean(alice, jean)
+    const [original] = await calls(alice.page)
+    const [jeans] = await calls(jean.page)
+    if (!original?.sipCallId || original.sipCallId !== jeans?.sipCallId) throw new Error(`the Call-ID of the call on both sides: ${original?.sipCallId} ${jeans?.sipCallId}`)
+    // Jean holds the call: the room would take it unheld, his microphone open to it; Alice has nothing to add with.
+    await jean.page.getByRole('button', { name: 'Mettre en attente' }).click()
+    await until('Alice seeing Jean hold the call', async () => ((await calls(alice.page))[0]?.remoteHold ? true : null))
+    expectEqual(await alice.page.getByRole('button', { name: 'Ajouter un participant' }).count(), 0, 'the button to add a participant while Jean holds the call')
+    await jean.page.getByRole('button', { name: 'Reprendre' }).click()
+    await until('Alice seeing Jean resume the call', async () => ((await calls(alice.page))[0]?.remoteHold === false ? true : null))
+    // Each one mutes their microphone: the calls of the conference start so.
+    for (const who of [alice, jean]) await who.page.getByRole('button', { name: 'Couper le micro' }).click()
+    await alice.page.getByRole('button', { name: 'Ajouter un participant' }).click()
+    await alice.page.getByLabel('Participant à ajouter (poste ou numéro)').fill('103')
+    await alice.page.getByRole('button', { name: 'Appeler et ajouter' }).click()
+    // Alice: the room's call to her window only, her call with Jean ended as a conference.
+    const [mine] = await until('Alice in the conference', async () => {
+      const c = await calls(alice.page)
+      return c.length === 1 && c[0].room === 'conference' && c[0].state === 'connected' ? c : null
+    }, { timeout: 30_000 })
+    expectEqual(`${mine.conferenceOf === original.id} ${mine.direction} ${mine.remoteNumber} ${mine.muted}`, 'true inbound 101 true', 'Alice\'s call of the conference')
+    expectEqual((await lastEnded(alice.page))?.endReason, 'conference', 'how Alice\'s call with Jean ended')
+    // Jean: the room's call in the place of theirs, from Alice's extension; his call with her ended as a conference.
+    const [his] = await until('Jean in the conference', async () => {
+      const c = await calls(jean.page)
+      return c.length === 1 && c[0].room === 'conference' && c[0].state === 'connected' ? c : null
+    }, { timeout: 30_000 })
+    expectEqual(`${his.replacedCallId === jeans.id} ${his.remoteNumber} ${his.muted}`, 'true 101 true', 'Jean\'s call of the conference')
+    expectEqual((await lastEnded(jean.page))?.endReason, 'conference', 'how Jean\'s call with Alice ended')
+    await jean.page.getByText('Conférence avec Alice Martin (101)').waitFor()
+    // Bob: rung by the room, at Alice's name, as any call a room places.
+    const ringing = bob.page.getByTestId('incoming-call')
+    await ringing.waitFor({ timeout: 30_000 })
+    expectEqual((await calls(bob.page))[0]?.remoteNumber, '101', 'who calls Bob')
+    await ringing.getByRole('button', { name: 'Répondre' }).click()
+    await alice.page.getByTestId('conference-participant').nth(2).waitFor({ timeout: 20_000 })
+    const shown = await alice.page.getByTestId('conference-participant').allTextContents()
+    expectEqual(shown.length, 3, `the participants Alice sees: ${JSON.stringify(shown)}`)
+    for (const button of ['Retirer 102 de la conférence', 'Retirer 103 de la conférence', 'Terminer pour tous', 'Quitter la conférence']) await alice.page.getByRole('button', { name: button }).waitFor()
+    CONFERENCE = await until('the room of the conference, kept for Alice', async () => (await store.listConferences(TENANT, 'amartin')).find(r => /^twake-call-[0-9a-f]{16}$/.test(r.meetingId))?.meetingId ?? null)
+    expectEqual((await inConference()).map(p => `${p.kind} ${p.number}`).sort().join(', '), 'phone 101, phone 102, phone 103', 'the room of the conference')
+    // Bob's call names the room of the conference (Twake-Conference): he sees who is in it, as Jean does; neither acts on anyone.
+    const [bobs] = await calls(bob.page)
+    expectEqual(`${bobs?.room} ${bobs?.conferenceRoom === CONFERENCE}`, 'conference true', `Bob's call of the conference ${JSON.stringify(bobs)}`)
+    for (const who of [jean, bob]) {
+      await who.page.getByTestId('conference-participant').nth(2).waitFor({ timeout: 20_000 })
+      expectEqual(await who.page.getByTestId('conference-participant').count(), 3, `the participants ${who.name} sees`)
+      expectEqual(await who.page.getByRole('button', { name: /^Retirer / }).count(), 0, `the buttons to remove a participant on ${who.name}'s page`)
+    }
+    // Whoever is in it is told who came, in a region read out.
+    for (const who of [alice, jean]) await who.page.getByTestId('call-status').getByText('103 a rejoint la conférence.').waitFor({ timeout: 20_000 })
+    for (const who of [alice, jean]) await who.page.getByTestId('conference').getByRole('button', { name: 'Rétablir le micro' }).click()
+    // Each one hears the others, through the room.
+    await bothHearEachOther(alice, jean)
+    await bothHearEachOther(jean, bob)
+    // A call of a room is neither held nor transferred; nobody places another call meanwhile.
+    for (const who of [alice, jean, bob]) {
+      expectEqual(await who.page.getByRole('button', { name: 'Mettre en attente' }).count(), 0, `the hold button on ${who.name}'s page`)
+      expectEqual(await transferButton(who.page).count(), 0, `the transfer button on ${who.name}'s page`)
+    }
+    // Alice removes Bob (« Retirer 103 de la conférence »): his call ends, the conference goes on; whoever is in it is told.
+    await alice.page.getByRole('button', { name: 'Retirer 103 de la conférence' }).click()
+    await until('the end of Bob\'s call', async () => ((await calls(bob.page)).length === 0 ? true : null), { timeout: 20_000 })
+    await bob.page.getByText('La conférence est terminée pour vous.').waitFor()
+    for (const who of [alice, jean]) await who.page.getByTestId('call-status').getByText('103 a quitté la conférence.').waitFor({ timeout: 20_000 })
+    expectEqual(`${(await calls(alice.page)).length} ${(await calls(jean.page)).length}`, '1 1', 'the calls of Alice and Jean once Bob was removed')
+  })
+  await step('step 8b: Alice ends the conference for everyone (« Terminer pour tous », then « Oui, terminer pour tous »): the calls end, the room and its record go; the history of Alice and Jean says conference, as their Récents do', async () => {
+    // Asked first (review 8b, n°7): « Annuler » changes nothing.
+    await alice.page.getByRole('button', { name: 'Terminer pour tous' }).click()
+    await alice.page.getByTestId('conference-confirm').getByRole('button', { name: 'Annuler' }).click()
+    expectEqual((await calls(jean.page)).length, 1, 'Jean\'s calls once Alice said no')
+    await alice.page.getByRole('button', { name: 'Terminer pour tous' }).click()
+    await alice.page.getByRole('button', { name: 'Oui, terminer pour tous' }).click()
+    for (const who of [alice, jean, bob]) await until(`the end of the conference on ${who.name}'s page`, async () => ((await calls(who.page)).length === 0 ? true : null), { timeout: 20_000 })
+    for (const who of [alice, jean]) await who.page.getByText('La conférence est terminée pour vous.').waitFor()
+    expectEqual((await (await asPerson(alice))('GET', `/conferences/${CONFERENCE}`)).statusCode, 404, 'GET /conferences/:id once ended')
+    expectEqual(await store.getConference(CONFERENCE), null, 'the record of the conference')
+    const [aliceIn] = await conferenceCalls('amartin', conferenceFrom, 1)
+    // The room called her at her own name: a call of hers, to herself (Récents reads « Votre conférence »).
+    expectEqual(`${aliceIn.remoteNumber} ${aliceIn.direction}`, '101 outbound', 'Alice\'s history: the room called her at her name')
+    const [jeanIn] = await conferenceCalls('jdupont', conferenceFrom, 1)
+    expectEqual(`${jeanIn.remoteNumber} ${jeanIn.direction}`, '101 inbound', 'Jean\'s history: the room called him at Alice\'s name')
+    if (!(await recents(alice.page, 1)).includes('Votre conférence: Conférence')) throw new Error(`Alice's Récents: ${JSON.stringify(await recents(alice.page, 1))}`)
+    if (!(await recents(jean.page, 1)).some(l => l.endsWith(': Conférence'))) throw new Error(`Jean's Récents: ${JSON.stringify(await recents(jean.page, 1))}`)
+    // Bob, the third participant, likewise (second review 8b, n°8): a call of the conference, at Alice's name.
+    const [bobIn] = await conferenceCalls('bdurand', conferenceFrom, 1)
+    expectEqual(`${bobIn.remoteNumber} ${bobIn.direction}`, '101 inbound', 'Bob\'s history: the room called him at Alice\'s name')
+    if (!(await recents(bob.page, 1)).some(l => l.endsWith(': Conférence'))) throw new Error(`Bob's Récents: ${JSON.stringify(await recents(bob.page, 1))}`)
+    const cdrs = await until('the CDRs of the conference\'s calls', async () => {
+      const { rows } = await db.query("SELECT callee FROM acc WHERE via = 'conference' AND id > $1 ORDER BY id", [conferenceAcc])
+      return rows.length >= 3 ? rows.map(r => r.callee).sort() : null
+    })
+    expectEqual(cdrs.join(' '), '101 102 103', 'the CDRs of the conference\'s calls (via conference)')
+    // LiveKit told the Gateway (its webhooks, second review 8b, n°3), each time with a signature it took.
+    await until('LiveKit\'s webhooks at the Gateway', async () => (livekitWebhooks.includes(204) ? true : null))
+    expectEqual(livekitWebhooks.filter(s => s !== 204).join(' '), '', 'the webhooks of LiveKit the Gateway refused')
+  })
+  await step('step 8b: a call with the operator cannot become a conference: Alice is told why (CONFERENCE_EXTERNAL), nobody is called, her call goes on', async () => {
+    await dial(alice.page, '06 39 98 00 06')
+    const { call, at } = await invitedAtOperator(invite => invite.uri === 'sip:+33639980006@operator.example')
+    await alice.page.getByText('En communication avec +33 6 39 98 00 06').waitFor()
+    await alice.page.getByRole('button', { name: 'Ajouter un participant' }).click()
+    await alice.page.getByLabel('Participant à ajouter (poste ou numéro)').fill('103')
+    await alice.page.getByRole('button', { name: 'Appeler et ajouter' }).click()
+    await alice.page.getByRole('alert').filter({ hasText: 'Seul un appel entre deux postes peut devenir une conférence' }).waitFor()
+    await sleep(1_000)
+    expectEqual((await calls(bob.page)).length, 0, 'calls on Bob\'s page')
+    const [still] = await calls(alice.page)
+    expectEqual(`${still?.state} ${still?.room ?? '-'}`, 'connected -', 'Alice\'s call with the operator')
+    await alice.page.getByRole('button', { name: 'Raccrocher' }).click()
+    await at.callState(call, 'ended')
   })
   await step('a registration left on a dead connection (the first one, Alice) with a no-answer forward: Bob rings at once, not after the delay', async () => {
     await setForwarding(alice, { noAnswer: '103', delay: '20' })

@@ -1,4 +1,4 @@
-import type { MediaProvider, ProviderFactory, RoutedEvent, TelephonyProvider } from '@twake/telephony-provider-sdk'
+import type { CallParties, MediaProvider, ProviderFactory, RoomCallGrant, RoomCallGrantToken, RoutedEvent, TelephonyProvider } from '@twake/telephony-provider-sdk'
 import type { Call, Capabilities, DidRange, Endpoint, ForwardingRules, MediaSession, OriginateRequest, OutboundAssignment, OutboundPolicy, OutboundProfile, Presence, ProviderStatus, RingGroup, Trunk, TrunkStatus, User } from '@twake/telephony-types'
 import type { CallGroups } from './call-groups.js'
 import type { CallRules } from './call-rules.js'
@@ -6,17 +6,17 @@ import type { PushTargets } from './push-targets.js'
 import type { DialOutGrants } from './dial-out-grants.js'
 import type { OutboundTables } from './outbound.js'
 import { trunkStatusFrom, type TrunkTables } from './trunks.js'
-import { OpensipsEvents, parseDlgList, parseUlDump, type EventsLogger } from './events.js'
+import { OpensipsEvents, parseDlgContext, parseDlgList, parseUlDump, type EventsLogger } from './events.js'
 import { AsyncQueue } from './queue.js'
 import { CallTracker } from './tracker.js'
 
 export { SubscriberProvisioner, digestHashes, SUBSCRIBER_SCHEMA, SUBSCRIBER_SQL, EXTRA_COLUMNS, SUBSCRIBER_TABLE_VERSION, ACC_TABLE_VERSION, MISSED_CALLS_TABLE_VERSION, type SubscriberProvisionerOptions, type Queryable } from './subscriber.js'
-export { OpensipsEvents, parseDlgList, parseUlDump, parseUdpUrl, type EventsLogger, type OpensipsEventsOptions, type RegisteredContact } from './events.js'
+export { OpensipsEvents, parseDlgContext, parseDlgList, parseUlDump, parseUdpUrl, type EventsLogger, type OpensipsEventsOptions, type RegisteredContact } from './events.js'
 export { CallTracker, alertOf, userOf, isExternalParty, EMERGENCY_BURST, EMERGENCY_BURST_WINDOW_MS, type ContactRegistration, type TelephonyPresence } from './tracker.js'
 export { CallRules, CALL_RULES_SCHEMA, DND_MESSAGE_MAX, NOANSWER_DELAY, type CallRulesOptions, type DndRule, type ExtensionHolder } from './call-rules.js'
 export { CallGroups, CALL_GROUPS_SCHEMA, DISPLAY_NAMES_SCHEMA, GROUP_MEMBERS_MAX, NAME_MAX, sipDisplayName, type CallGroupsOptions } from './call-groups.js'
 export { PushTargets, PUSH_TARGETS_SCHEMA, type PushTargetsOptions } from './push-targets.js'
-export { DialOutGrants, DIAL_OUT_GRANTS_SCHEMA, GRANT_HEADER, GRANT_TTL_SEC, type DialOutGrantsOptions } from './dial-out-grants.js'
+export { DialOutGrants, DIAL_OUT_GRANTS_SCHEMA, GRANT_HEADER, GRANT_TTL_SEC, JOIN_HEADER, JOIN_TOKEN, REPLACES, type DialOutGrantsOptions } from './dial-out-grants.js'
 export { AsyncQueue } from './queue.js'
 export { TrunkTables, TRUNK_SCHEMA, TRUNK_SQL, DEFAULT_TRUNK_SOCKET, SOURCES_SET, DISPATCHER_TABLE_VERSION, DIALPLAN_TABLE_VERSION, REGISTRANT_TABLE_VERSION, codecFlags, projectTrunks, trunkSecret, trunkStatusFrom, type TrunkTablesOptions } from './trunks.js'
 export { OutboundTables, OUTBOUND_SCHEMA, ACC_EXTERNAL_SQL, FRAUD_PROFILE, FRAUD_RULE_INTERNATIONAL, FRAUD_RULE_NATIONAL, FRAUD_TABLE_VERSION, FRAUD_OVERSEAS_PREFIXES, DR_TABLE_VERSIONS, DIALOG_TABLE_VERSION, OUTBOUND_TIME_ZONE, CAP_MAX, PROFILE_ID, fraudRow, projectOutbound, type OutboundTablesOptions } from './outbound.js'
@@ -125,6 +125,10 @@ export interface OpensipsConfig {
 const START_RETRY_MS = [1_000, 2_000, 5_000, 10_000, 30_000]
 /** setTimeout's longest delay (about 24 days): a later end is waited for in several steps. */
 const MAX_TIMER_MS = 2 ** 31 - 1
+
+/** One of our extensions, as a dialog names it; a tag that a Replaces header carries as it is (REPLACES). */
+const EXTENSION = /^[0-9]{2,20}$/
+const TAG = /^[A-Za-z0-9._~!%*+-]{1,50}$/
 
 const noExtension = () => Object.assign(new Error('No extension is assigned to this user'), { statusCode: 404 })
 
@@ -357,12 +361,64 @@ export class OpensipsProvider implements TelephonyProvider, MediaProvider {
     return Number(on) === 1 && typeof number === 'string' ? { number } : {}
   }
 
-  /** A room of Meet may call `number` at the name of `extension`, once, within `ttlSec` seconds (route[meet_source]). */
-  async grantRoomCall(grant: { extension: string; number: string; ttlSec?: number }): Promise<{ token: string; revoke(): Promise<void> }> {
+  /**
+   * A room of Meet may call `number` at the name of `extension`, once, within `ttlSec` seconds (route[meet_source]);
+   * in the place of a call of `number` (`replaces`), or to the window of `extension` that waits for `join` (step 8b),
+   * a call of the conference `room`. `taken`: the call that took it, as OpenSIPS wrote it (review 8b, n°3).
+   */
+  async grantRoomCall(grant: RoomCallGrant): Promise<RoomCallGrantToken> {
     const grants = this.config.dialOutGrants
     if (!grants) throw Object.assign(new Error('The SIP server cannot let a room call'), { statusCode: 501 })
-    const token = await grants.grant(grant.extension, grant.number, grant.ttlSec)
-    return { token, revoke: () => grants.revoke(token) }
+    const conference = {
+      ...(grant.replaces !== undefined ? { replaces: grant.replaces } : {}),
+      ...(grant.join !== undefined ? { join: grant.join } : {}),
+      ...(grant.room !== undefined ? { room: grant.room } : {})
+    }
+    const token = await grants.grant(grant.extension, grant.number, grant.ttlSec, conference)
+    return { token, revoke: () => grants.revoke(token), taken: () => grants.taken(token) }
+  }
+
+  /**
+   * Ends a call OpenSIPS has, by its Call-ID (MI dlg_end_dlg, review 8b, n°3): a BYE to both sides, a CANCEL if it
+   * still rings; first read (dlg_list_ctx), to say which (third review 8b, n°1): `answered` for a confirmed dialog
+   * (state 4), `ringing` for one not yet (unconfirmed, early, or its 200 not acknowledged). Undefined for a call it does
+   * not have (404: over already, failed, never there).
+   */
+  async endRoomCall(callId: string): Promise<'answered' | 'ringing' | undefined> {
+    const events = this.events
+    if (!events) throw Object.assign(new Error('The SIP server cannot end a call'), { statusCode: 501 })
+    const none = (err: unknown) => {
+      if ((err as { code?: unknown }).code !== 404) throw err
+      return undefined
+    }
+    const dialog = await events.call('dlg_list_ctx', { callid: callId }).then(parseDlgContext, none)
+    if (!dialog || dialog.callid !== callId) return undefined
+    const ended = await events.call('dlg_end_dlg', { dialog_id: callId }).then(() => true, none)
+    if (!ended) return undefined
+    return dialog.state === 4 ? 'answered' : 'ringing'
+  }
+
+  /**
+   * The call `callId` as OpenSIPS's dialog holds it (MI dlg_list_ctx, step 8b): answered and confirmed (state 4),
+   * between two extensions (no trunk, no room in its values), with the extension it reached (`callee`, written at
+   * the ringing and by the member of a group who answered) and the tag of the answer (`callee_tag`, written at the
+   * 2xx). Undefined without the MI, for a call it does not have (No such dialog, 404), or one not answered yet. An MI
+   * that does not answer, or answers another error, is not "no such call" (review 8b, n°10): 503, SIP_SERVER_UNAVAILABLE.
+   */
+  async callBetweenExtensions(callId: string): Promise<CallParties | 'external' | undefined> {
+    if (!this.events || !callId) return undefined
+    const dialog = await this.events.call('dlg_list_ctx', { callid: callId }).then(parseDlgContext, (err: unknown) => {
+      if ((err as { code?: unknown }).code === 404) return undefined
+      const log = this.config.logger ?? console
+      log.warn(`OpenSIPS: the call ${callId} not read (${err instanceof Error ? err.message : String(err)})`)
+      throw Object.assign(new Error('The SIP server did not say where the call is'), { statusCode: 503, code: 'SIP_SERVER_UNAVAILABLE' })
+    })
+    if (!dialog || dialog.callid !== callId || dialog.state !== 4) return undefined
+    if (dialog.values.trunk !== undefined || dialog.values.meet !== undefined) return 'external'
+    const callee = dialog.values.callee ?? ''
+    const calleeTag = dialog.values.callee_tag ?? ''
+    if (!EXTENSION.test(dialog.caller) || !EXTENSION.test(callee) || dialog.caller === callee || !TAG.test(dialog.callerTag) || !TAG.test(calleeTag)) return undefined
+    return { callId, caller: dialog.caller, callerTag: dialog.callerTag, callee, calleeTag }
   }
 
   /**

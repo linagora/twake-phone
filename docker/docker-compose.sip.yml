@@ -24,7 +24,9 @@ services:
       POSTGRES_USER: twake
       POSTGRES_PASSWORD: twake
       POSTGRES_DB: twake
-    command: ["postgres", "-p", "54320", "-c", "listen_addresses=127.0.0.1"]
+    # OpenSIPS takes up to DB_MAX_ASYNC_CONNECTIONS connections per SIP process (8 x 10) on top of its own and the
+    # Gateway's: more than PostgreSQL's 100 by default (review 8b, n°5).
+    command: ["postgres", "-p", "54320", "-c", "listen_addresses=127.0.0.1", "-c", "max_connections=200"]
     # OpenSIPS checks its `subscriber` table at startup: created with the database, filled by the Gateway.
     volumes:
       - ./opensips/subscriber.sql:/docker-entrypoint-initdb.d/01-subscriber.sql:ro
@@ -83,6 +85,13 @@ services:
           address: 127.0.0.1:6379
         keys:
           ${LIVEKIT_API_KEY:-twake-dev}: ${LIVEKIT_API_SECRET:-twake-dev-only-livekit-secret-0123456789}
+        # Its webhooks to the Gateway (second review 8b, n°3: a room ended, its owner gone from a conference), signed
+        # with the Gateway's key: where the e2e listens (GATEWAY_PORT, 18080 by default), a Gateway of this host else.
+        # The e2e stops at once when that port is taken; moved, both GATEWAY_PORT and LIVEKIT_WEBHOOK_URL change.
+        webhook:
+          api_key: ${LIVEKIT_API_KEY:-twake-dev}
+          urls:
+            - ${LIVEKIT_WEBHOOK_URL:-http://127.0.0.1:18080/api/v1/webhooks/livekit}
         # warn: at info, the server writes each CreateSIPDispatchRule whole, the PIN of the room in it (ADR 0018).
         logging:
           level: warn
@@ -172,6 +181,9 @@ services:
       MEET_CALLS_PER_CALLER: ${MEET_CALLS_PER_CALLER:-2}
       MEET_CALLS_ALL: ${MEET_CALLS_ALL:-100}
       MEET_MAX_CALL_SEC: ${MEET_MAX_CALL_SEC:-7200}
+      # The database connections of each SIP process for its asynchronous reads (1 to 32): PostgreSQL's max_connections
+      # must hold ten times as many and more (above). trunk.sip.mjs lowers it a moment to play what happens past them.
+      DB_MAX_ASYNC_CONNECTIONS: ${DB_MAX_ASYNC_CONNECTIONS:-8}
     network_mode: host
     healthcheck:
       test: ["CMD-SHELL", "test -p /tmp/opensips_fifo"]

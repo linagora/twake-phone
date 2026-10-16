@@ -305,11 +305,14 @@ export class LiveKitConferenceBridge implements ConferenceBridgeProvider {
     if (!/^\+?[0-9*#]{2,20}$/.test(number)) throw Object.assign(new Error('Invalid phone number'), { statusCode: 400 })
     if (options.from !== undefined && !/^[A-Za-z0-9._+-]{1,64}$/.test(options.from)) throw Object.assign(new Error('Invalid caller'), { statusCode: 400 })
     if (options.grant !== undefined && !/^[0-9a-f]{32}$/.test(options.grant)) throw Object.assign(new Error('Invalid grant'), { statusCode: 400 })
-    const identity = `phone-${number.replace(/\D/g, '')}-${this.random(2 ** 40).toString(16).padStart(10, '0')}`
+    // Drawn at random, without the number (third review 8b, n°2): the id of the participant is shown to everyone in a
+    // conference's room, whose numbers of the public network are masked; the number is in the attributes.
+    const identity = `phone-${[0, 1].map(() => this.random(2 ** 40).toString(16).padStart(10, '0')).join('')}`
     const ringingSec = this.config.ringingTimeoutSec ?? 30
+    let answered: { sip_call_id?: unknown } | undefined
     try {
-      await this.withTrunk('out', trunk =>
-        this.api.call(
+      answered = await this.withTrunk('out', trunk =>
+        this.api.call<{ sip_call_id?: unknown } | undefined>(
           'livekit.SIP',
           'CreateSIPParticipant',
           {
@@ -333,7 +336,44 @@ export class LiveKitConferenceBridge implements ConferenceBridgeProvider {
       if (!failure) throw err
       throw Object.assign(new Error(`The call to ${number} did not go through (${failure.sipStatus} ${failure.sipReason})`), { statusCode: 409, code: 'DIAL_FAILED', ...failure })
     }
-    return this.toParticipant(meetingId, { identity, name: this.display(number), attributes: { 'twake.kind': 'phone', 'twake.number': number } })
+    // The id LiveKit gave the call (`SCL_…`): LiveKit SIP writes it as the From tag of its INVITE, which the PBX keeps
+    // with the grant the call took (review 8b, n°3).
+    const sipCallId = typeof answered?.sip_call_id === 'string' && answered.sip_call_id ? answered.sip_call_id : undefined
+    return { ...this.toParticipant(meetingId, { identity, name: this.display(number), attributes: { 'twake.kind': 'phone', 'twake.number': number } }), ...(sipCallId ? { sipCallId } : {}) }
+  }
+
+  /**
+   * Whether LiveKit's outbound trunk still sends the rooms' calls where the configuration says (review 8b, n°3): its
+   * address and its user. Someone holding a key of the LiveKit server can point it elsewhere; then it is written again
+   * at the next call (false here, for the caller to refuse this one and say so). A trunk LiveKit no longer has is
+   * written again too (true: nothing was sent elsewhere).
+   */
+  async outboundIntact(): Promise<boolean> {
+    const trunk = await this.ensureOutbound()
+    const list = await this.api.call<{ items?: { sip_trunk_id: string; address?: string; auth_username?: string }[] }>('livekit.SIP', 'ListSIPOutboundTrunk', { trunk_ids: [trunk] })
+    const found = (list.items ?? []).find(t => t.sip_trunk_id === trunk)
+    if (!found) {
+      if (this.outboundTrunkId) this.outboundTrunkId = undefined
+      return true
+    }
+    const user = this.config.outboundAuth?.username
+    if (found.address === this.config.outboundAddress && (user === undefined || found.auth_username === user)) return true
+    this.outboundTrunkId = undefined
+    return false
+  }
+
+  /**
+   * Each participant of the room as its call is: its id, the number it was called at as the Gateway gave it (never
+   * masked: who is in it, for the Gateway only; '' for one without a number, a web participant), and the SIP Call-ID
+   * of its call (`sip.callIDFull`, as LiveKit SIP v1.17.0 writes it), by which the SIP server's events say whose phone
+   * it rang and who answered it (a member of a group, a forward's target: second review 8b, n°4).
+   */
+  async participantCalls(meetingId: string): Promise<ParticipantCall[]> {
+    const res = await this.api.call<{ participants?: LkParticipant[] }>('livekit.RoomService', 'ListParticipants', { room: meetingId })
+    return (res.participants ?? []).map(p => {
+      const callId = p.attributes?.['sip.callIDFull']
+      return { id: participantId(meetingId, p.identity), number: p.attributes?.['twake.number'] ?? p.attributes?.['sip.phoneNumber'] ?? '', ...(callId ? { callId } : {}) }
+    })
   }
 
   disconnectParticipant: ConferenceBridgeProvider['disconnectParticipant'] = async id => {
@@ -346,6 +386,26 @@ export class LiveKitConferenceBridge implements ConferenceBridgeProvider {
     const p = await this.api.call<{ tracks?: { sid: string; type?: string | number; muted?: boolean }[] }>('livekit.RoomService', 'GetParticipant', { room, identity })
     const audio = (p.tracks ?? []).filter(t => (t.type === 'AUDIO' || t.type === 0) && !t.muted)
     for (const t of audio) await this.api.call('livekit.RoomService', 'MutePublishedTrack', { room, identity, track_sid: t.sid, muted: true })
+  }
+
+  /**
+   * Ends the room for everyone in it (RoomService DeleteRoom, step 8b): LiveKit SIP hangs up each of its calls there.
+   * A room LiveKit does not have (never joined, or closed already) is no error.
+   */
+  async deleteRoom(meetingId: string): Promise<void> {
+    try {
+      await this.api.call('livekit.RoomService', 'DeleteRoom', { room: meetingId })
+    } catch (err) {
+      if (err instanceof LiveKitError && (err.status === 404 || err.twirpCode === 'not_found')) return
+      throw err
+    }
+  }
+
+  /** Which of these rooms LiveKit has now (RoomService ListRooms, step 8b): the others ended, or never began. */
+  async openRooms(names: string[]): Promise<Set<string>> {
+    if (!names.length) return new Set()
+    const res = await this.api.call<{ rooms?: { name?: string }[] }>('livekit.RoomService', 'ListRooms', { names })
+    return new Set((res.rooms ?? []).flatMap(r => (r.name && names.includes(r.name) ? [r.name] : [])))
   }
 
   /** Participants currently in the room (web and phone), numbers filtered by the privacy setting. */
@@ -395,6 +455,13 @@ const dialFailure = (err: LiveKitError): DialFailure | undefined => {
   if (m) return { sipStatus: Number(m[1]), sipReason: (m[2] ?? '').trim() }
   if (err.twirpCode === 'canceled' || err.twirpCode === 'deadline_exceeded' || /timed out/i.test(err.message)) return { sipStatus: 480, sipReason: 'No Answer' }
   return undefined
+}
+
+/** A participant of a room as its call is (participantCalls). */
+export interface ParticipantCall {
+  id: string
+  number: string
+  callId?: string
 }
 
 interface LkParticipant {

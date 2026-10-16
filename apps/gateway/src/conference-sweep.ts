@@ -3,6 +3,26 @@ import { PIN_DIGITS } from '@twake/conference-livekit'
 /** The name the Gateway gives a room without Meet (POST /conferences with `create`). */
 export const GATEWAY_ROOM = /^twake-[0-9a-f]{16}$/
 
+/**
+ * The name the Gateway gives the room of a call that becomes a conference (step 8b, POST /calls/:id/conference), with
+ * or without Meet: never Meet's, never a dispatch rule (nobody dials into it), nobody's but its call's.
+ */
+export const CALL_ROOM = /^twake-call-[0-9a-f]{16}$/
+
+/**
+ * The key and secret that sign LiveKit's webhooks (step 8b). LiveKit signs every one of its `webhook.urls` with one
+ * `webhook.api_key` (third review 8b, n°3): when Meet's URL is there too, that key may be Meet's, not the Gateway's.
+ * LIVEKIT_WEBHOOK_API_KEY and LIVEKIT_WEBHOOK_API_SECRET (both or neither) give it; else the Gateway's own API key.
+ */
+export function webhookKeyFromEnv(env: Record<string, string | undefined>): { webhookKey: string; webhookSecret: string } {
+  const key = env.LIVEKIT_WEBHOOK_API_KEY
+  const secret = env.LIVEKIT_WEBHOOK_API_SECRET
+  if (Boolean(key) !== Boolean(secret)) throw new Error('LIVEKIT_WEBHOOK_API_KEY and LIVEKIT_WEBHOOK_API_SECRET go together')
+  if (key && secret) return { webhookKey: key, webhookSecret: secret }
+  if (!env.LIVEKIT_API_KEY || !env.LIVEKIT_API_SECRET) throw new Error('LIVEKIT_API_KEY and LIVEKIT_API_SECRET are needed')
+  return { webhookKey: env.LIVEKIT_API_KEY, webhookSecret: env.LIVEKIT_API_SECRET }
+}
+
 /** What the sweep needs of the LiveKit bridge: the Gateway's dispatch rules, and deleting those of a room with a PIN. */
 export interface SweptBridge {
   listDialIns(): Promise<{ meetingId: string; pin: string }[]>

@@ -344,9 +344,77 @@ describe('OpensipsProvider call rules', () => {
     const grant = await p.grantRoomCall({ extension: '101', number: '+33612345678' })
     expect(grant.token).toBe('ab'.repeat(16))
     await grant.revoke()
-    expect(given).toEqual([['grant', '101', '+33612345678', undefined], ['revoke', 'ab'.repeat(16)]])
+    expect(given).toEqual([['grant', '101', '+33612345678', undefined, {}], ['revoke', 'ab'.repeat(16)]])
+    // A conference's (step 8b): what the grant says of it goes to the table.
+    await p.grantRoomCall({ extension: '101', number: '102', replaces: 'c1;to-tag=b;from-tag=a' })
+    await p.grantRoomCall({ extension: '101', number: '101', join: 'cd'.repeat(16) })
+    expect(given.slice(2)).toEqual([
+      ['grant', '101', '102', undefined, { replaces: 'c1;to-tag=b;from-tag=a' }],
+      ['grant', '101', '101', undefined, { join: 'cd'.repeat(16) }]
+    ])
     // Without the table: no room calls anybody.
     await expect(make().grantRoomCall({ extension: '101', number: '102' })).rejects.toMatchObject({ statusCode: 501 })
+  })
+
+  it('reads a call between two extensions from its dialog in OpenSIPS (MI dlg_list_ctx, step 8b): answered, its parties and tags; a call with the operator or a room is external; anything else is no such call', async () => {
+    const sips = await fakeOpensips()
+    cleanups.push(sips.close)
+    const p = new OpensipsProvider({ websocketUrl: 'wss://sip.example.test', domain: 'sip.example.test', sipSecretFor: async () => 's', events: { miUrl: sips.url, timeoutMs: 300 }, logger: quiet })
+    cleanups.push(() => p.close())
+    await until('the subscription', () => p.getStatus() === 'CONNECTED')
+    const dialog = (callid: string, over: Record<string, unknown> = {}, values: Record<string, unknown>[] = [{ callee: '103' }, { dialled: '102' }, { callee_tag: 'tag-b' }]) => ({
+      callid,
+      state: 4,
+      from_uri: 'sip:101@sip.example.test',
+      to_uri: 'sip:102@sip.example.test',
+      caller_tag: 'tag-a',
+      CALLEES: [{ callee_tag: 'tag-b' }, { callee_tag: 'tag-c' }],
+      context: { values },
+      ...over
+    })
+    sips.state.dialogContexts.set('c1', dialog('c1'))
+    // Forwarded from 102 to 103: the extension it reached, and the tag of the phone that answered.
+    expect(await p.callBetweenExtensions('c1')).toEqual({ callId: 'c1', caller: '101', callerTag: 'tag-a', callee: '103', calleeTag: 'tag-b' })
+    expect(sips.requests.find(r => r.method === 'dlg_list_ctx')?.params).toEqual({ callid: 'c1' })
+    sips.state.dialogContexts.set('trunk', dialog('trunk', {}, [{ callee: '103' }, { callee_tag: 'b' }, { trunk: 'caller' }]))
+    sips.state.dialogContexts.set('room', dialog('room', {}, [{ callee: '103' }, { callee_tag: 'b' }, { meet: 'caller' }]))
+    expect([await p.callBetweenExtensions('trunk'), await p.callBetweenExtensions('room')]).toEqual(['external', 'external'])
+    // Ringing; answered before OpenSIPS kept the tag of the answer; to oneself; a name no extension has; unknown.
+    sips.state.dialogContexts.set('early', dialog('early', { state: 2 }))
+    sips.state.dialogContexts.set('untagged', dialog('untagged', {}, [{ callee: '103' }]))
+    sips.state.dialogContexts.set('self', dialog('self', { from_uri: 'sip:103@sip.example.test' }))
+    sips.state.dialogContexts.set('odd', dialog('odd', { from_uri: '<sip:alice;x@sip.example.test>' }))
+    for (const id of ['early', 'untagged', 'self', 'odd', 'nope']) expect(await p.callBetweenExtensions(id), id).toBeUndefined()
+    // Without the MI: no such call.
+    expect(await make().callBetweenExtensions('c1')).toBeUndefined()
+    // An MI that answers another error, or none at all, cannot say: not "no such call" (review 8b, n°10).
+    sips.state.dialogContexts.set('broken', 'fail')
+    await expect(p.callBetweenExtensions('broken')).rejects.toMatchObject({ statusCode: 503, code: 'SIP_SERVER_UNAVAILABLE' })
+    sips.state.down = true
+    await expect(p.callBetweenExtensions('c1')).rejects.toMatchObject({ statusCode: 503, code: 'SIP_SERVER_UNAVAILABLE' })
+    sips.state.down = false
+  })
+
+  it('ends a call OpenSIPS has by its Call-ID (MI dlg_end_dlg, review 8b, n°3), saying whether it was answered or still ringing (third review 8b, n°1); one it no longer has is no error, and said (second review 8b, n°1)', async () => {
+    const sips = await fakeOpensips()
+    cleanups.push(sips.close)
+    const p = new OpensipsProvider({ websocketUrl: 'wss://sip.example.test', domain: 'sip.example.test', sipSecretFor: async () => 's', events: { miUrl: sips.url, timeoutMs: 300 }, logger: quiet })
+    cleanups.push(() => p.close())
+    await until('the subscription', () => p.getStatus() === 'CONNECTED')
+    sips.state.dialogContexts.set('diverted@192.0.2.30', { callid: 'diverted@192.0.2.30', state: 4, caller_tag: 'x', from_uri: 'sip:101@sip.example.test', context: { values: [] } })
+    expect(await p.endRoomCall('diverted@192.0.2.30')).toBe('answered')
+    expect(sips.requests.find(r => r.method === 'dlg_list_ctx')?.params).toEqual({ callid: 'diverted@192.0.2.30' })
+    expect(sips.requests.find(r => r.method === 'dlg_end_dlg')?.params).toEqual({ dialog_id: 'diverted@192.0.2.30' })
+    expect(sips.state.dialogContexts.has('diverted@192.0.2.30')).toBe(false)
+    expect(await p.endRoomCall('diverted@192.0.2.30')).toBeUndefined()
+    // Still ringing (early, 2): cancelled, and said so.
+    sips.state.dialogContexts.set('early@192.0.2.30', { callid: 'early@192.0.2.30', state: 2, caller_tag: 'x', from_uri: 'sip:101@sip.example.test', context: { values: [] } })
+    expect(await p.endRoomCall('early@192.0.2.30')).toBe('ringing')
+    expect(sips.state.dialogContexts.has('early@192.0.2.30')).toBe(false)
+    // An MI that answers another error than "no such dialog" is no answer.
+    sips.state.dialogContexts.set('broken@192.0.2.30', 'fail')
+    await expect(p.endRoomCall('broken@192.0.2.30')).rejects.toBeTruthy()
+    await expect(make().endRoomCall('x')).rejects.toMatchObject({ statusCode: 501 })
   })
 
   it("reads the access number of Meet's rooms OpenSIPS was started with, or says it cannot (step 8, review n°12)", async () => {

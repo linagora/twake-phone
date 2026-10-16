@@ -33,6 +33,12 @@ interface TrackedCall {
    */
   woken?: Set<string>
   connectedAt?: string
+  /**
+   * A room's call that takes the place of a call of the callee's, in a conference (step 8b, ADR 0019; the event's
+   * `conference`): the callee's only. The caller, whoever made the conference, places it through the room and is
+   * neither told of it nor busy with it (their own is the call of the room to them).
+   */
+  conference?: boolean
 }
 
 /** What the SIP server knows of an extension: registered or not, in a call or not. */
@@ -304,9 +310,9 @@ export class CallTracker {
         const caller = userOf(str(p.caller))
         const callee = userOf(str(p.callee))
         if (!id || !caller || !callee || this.calls.has(id) || this.ended.has(id)) return
-        const call = this.start(id, caller, callee, now, userOf(str(p.dialled)) || undefined)
+        const call = this.start(id, caller, callee, now, userOf(str(p.dialled)) || undefined, str(p.conference) === '1')
         if (str(p.group)) call.group = { ringing: new Set(), told: false }
-        this.tell(call, caller, 'call.created', 'new')
+        if (!call.conference) this.tell(call, caller, 'call.created', 'new')
         break
       }
       case 'E_TWAKEPHONE_FORWARDED': {
@@ -529,7 +535,7 @@ export class CallTracker {
       call.group = { ringing: new Set(), told: false }
       return call
     }
-    return this.start(id, caller, callee, startedAt, dialled)
+    return this.start(id, caller, callee, startedAt, dialled, str(p.conference) === '1')
   }
 
   /** A member's phone rings for a group call: it is busy with it, and told; the caller hears it rings once. */
@@ -586,10 +592,10 @@ export class CallTracker {
     call.rang = false
   }
 
-  private start(id: string, caller: string, callee: string, startedAt: string, dialled = callee): TrackedCall {
-    const call: TrackedCall = { id, caller, callee, dialled, startedAt, rang: false }
+  private start(id: string, caller: string, callee: string, startedAt: string, dialled = callee, conference = false): TrackedCall {
+    const call: TrackedCall = { id, caller, callee, dialled, startedAt, rang: false, ...(conference ? { conference } : {}) }
     this.calls.set(id, call)
-    this.count(caller, 1)
+    if (!conference) this.count(caller, 1)
     return call
   }
 
@@ -608,8 +614,10 @@ export class CallTracker {
   }
 
   private toCall(c: TrackedCall, viewer: string, state: CallState, endedAt?: string): Call {
+    // A conference's call is the callee's, from whoever made it: their own (they are its callee) is the one they made.
     const outbound = viewer === c.caller
     return {
+      ...(c.conference ? { conference: true } : {}),
       id: c.id,
       direction: outbound ? 'outbound' : 'inbound',
       state,
@@ -625,7 +633,7 @@ export class CallTracker {
   }
 
   private tellBoth(c: TrackedCall, type: 'call.created' | 'call.ringing' | 'call.connected', state: CallState) {
-    for (const ext of c.caller === c.callee ? [c.caller] : [c.caller, c.callee]) this.tell(c, ext, type, state)
+    for (const ext of c.conference || c.caller === c.callee ? [c.callee] : [c.caller, c.callee]) this.tell(c, ext, type, state)
   }
 
   /**
@@ -634,13 +642,13 @@ export class CallTracker {
    */
   private end(c: TrackedCall, endedAt: string, callerState: CallState, calleeState: CallState, tombstone = true) {
     this.calls.delete(c.id)
-    this.count(c.caller, -1)
+    if (!c.conference) this.count(c.caller, -1)
     if (c.rang) this.count(c.callee, -1)
     // The members of a group whose phone rang and nobody answered: a missed call for each; and so for those woken.
     const rang = [...(c.group?.ringing ?? [])]
     for (const m of rang) this.count(m, -1)
     c.group?.ringing.clear()
-    const callee = c.callee !== c.caller && (c.rang || !!c.woken?.has(c.callee))
+    const callee = (c.conference || c.callee !== c.caller) && (c.rang || !!c.woken?.has(c.callee))
     const members = [...new Set([...rang, ...[...(c.woken ?? [])].filter(m => m !== c.callee && m !== c.caller)])]
     if (tombstone) {
       this.ended.add(c.id)
@@ -648,7 +656,7 @@ export class CallTracker {
     }
     const timestamp = this.now()
     const event = (ext: string, state: CallState): TelephonyEvent => ({ type: state === 'failed' ? 'call.failed' : 'call.ended', timestamp, payload: { call: this.toCall(c, ext, state, endedAt) } })
-    this.emit(c.caller, event(c.caller, callerState))
+    if (!c.conference) this.emit(c.caller, event(c.caller, callerState))
     if (callee) this.emit(c.callee, event(c.callee, calleeState))
     for (const m of members) this.emit(m, event(m, 'missed'))
   }

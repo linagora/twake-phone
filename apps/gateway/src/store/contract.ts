@@ -80,6 +80,18 @@ export const storeContract = (name: string, make: () => Promise<Store>) =>
       await s.close()
     })
 
+    it('keeps whether a call was a conference\'s (step 8b), and only then says so', async () => {
+      const s = await make()
+      await s.addHistory(entry({ callId: 'conf', conference: true, direction: 'inbound', remoteNumber: '101' }))
+      await s.addHistory(entry({ callId: 'plain', startedAt: '2026-10-05T09:00:00.000Z' }))
+      const { items } = await s.listHistory('A', 'alice')
+      expect(items.map(e => [e.callId, e.conference])).toEqual([
+        ['conf', true],
+        ['plain', undefined]
+      ])
+      await s.close()
+    })
+
     it('is idempotent on the call id', async () => {
       const s = await make()
       await s.addHistory(entry({}))
@@ -182,6 +194,12 @@ export const storeContract = (name: string, make: () => Promise<Store>) =>
       await s.claimConference({ meetingId: 'second', createdAt: base.createdAt, tenantId: 'A', ownerUserId: 'bob' })
       await s.claimConference({ meetingId: 'third', createdAt: base.createdAt, tenantId: 'B', ownerUserId: 'alice' })
       expect([await s.countConferences('A'), await s.countConferences('A', 'alice'), await s.countConferences('A', 'carol'), await s.countConferences('B')]).toEqual([2, 1, 0, 1])
+      // Listed per owner in their tenant, oldest first (step 8b: the Gateway closes the calls' rooms LiveKit ended).
+      await s.claimConference({ meetingId: 'fourth', createdAt: '2026-01-01T00:00:00.000Z', tenantId: 'A', ownerUserId: 'alice' })
+      expect((await s.listConferences('A', 'alice')).map(c => c.meetingId)).toEqual(['fourth', 'abc-defg'])
+      expect(await s.listConferences('A', 'carol')).toEqual([])
+      expect((await s.listConferences('B', 'alice')).map(c => c.meetingId)).toEqual(['third'])
+      await s.deleteConference('fourth')
       await s.deleteConference('abc-defg')
       expect(await s.getConference('abc-defg')).toBeNull()
       await s.close()

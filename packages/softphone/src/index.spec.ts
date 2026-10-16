@@ -721,6 +721,261 @@ describe('Softphone', () => {
     expect(ringer.disposed).toBe(true)
   })
 
+  it("names each call by its INVITE's Call-ID as well (sipCallId: what the SIP server and the Gateway call it, step 8b), not by JsSIP's id", async () => {
+    const { phone, ua } = await setup()
+    ua().call.mockImplementationOnce((_target: string) => {
+      const s = new FakeSession('outgoing')
+      ua().lastCall = s
+      ua().emit('newRTCSession', { originator: 'local', session: s, request: { call_id: 'out-1@192.0.2.1' } })
+      return s as never
+    })
+    const placed = await phone.call('102')
+    expect(placed.sipCallId).toBe('out-1@192.0.2.1')
+    expect(placed.id).not.toBe(placed.sipCallId)
+    ua().lastCall!.emit('ended', { originator: 'remote', cause: 'Terminated' })
+    const s = new FakeSession('incoming')
+    ua().emit('newRTCSession', { originator: 'remote', session: s, request: { call_id: 'in-1@192.0.2.2', getHeader: () => undefined } })
+    expect(phone.activeCalls()[0]!.sipCallId).toBe('in-1@192.0.2.2')
+  })
+
+  it('answers the room of the conference it asked for (step 8b), in this window only, keeps the call quiet meanwhile, and ends it as a conference once its far end moved', async () => {
+    const { phone, ua, ringer, incoming } = await setup()
+    const its = audios.length
+    const call = await phone.call('102')
+    const s = ua().lastCall!
+    s.emit('accepted', { originator: 'remote' })
+    expect(() => phone.expectConference('nope')).toThrow(expect.objectContaining({ code: 'not-established' }))
+    const token = phone.expectConference(call.id)
+    expect(token).toMatch(/^[0-9a-f]{32}$/)
+    const invite = (headers: Record<string, string | undefined>) => {
+      const session = new FakeSession('incoming')
+      ua().emit('newRTCSession', { originator: 'remote', session, request: { getHeader: (name: string) => headers[name] } })
+      return session
+    }
+    // Another token, or one without the room's word: no such call (481, never a refusal that would end the others).
+    for (const headers of [{ 'Twake-Join': 'f'.repeat(32), 'Twake-Room': 'conference' }, { 'Twake-Join': token }, { 'Twake-Join': token, 'Twake-Room': 'meet' }]) {
+      const other = invite(headers)
+      expect(other.terminate, JSON.stringify(headers)).toHaveBeenCalledWith({ status_code: 481, reason_phrase: 'Call Does Not Exist' })
+    }
+    const room = invite({ 'Twake-Join': token, 'Twake-Room': 'conference' })
+    expect(room.terminate).not.toHaveBeenCalled()
+    await new Promise(r => setTimeout(r, 5))
+    expect(room.answer).toHaveBeenCalled()
+    expect(ringer.start).not.toHaveBeenCalled()
+    expect(incoming).toHaveLength(0)
+    const joined = phone.activeCalls().find(c => c.conferenceOf === call.id)!
+    expect(joined.room).toBe('conference')
+    // Through: the call goes quiet (our microphone and its far end's voice), the room carries both now.
+    room.emit('accepted', { originator: 'local' })
+    expect(s.mute).toHaveBeenCalledWith({ audio: true })
+    expect((audios[its] as unknown as { muted?: boolean }).muted).toBe(true)
+    s.emit('ended', { originator: 'remote', cause: 'Terminated' })
+    expect(call.endReason).toBe('conference')
+    // Used: the token answers nothing more.
+    expect(invite({ 'Twake-Join': token, 'Twake-Room': 'conference' }).terminate).toHaveBeenCalledWith({ status_code: 481, reason_phrase: 'Call Does Not Exist' })
+    expect(joined.state).toBe('connected')
+  })
+
+  it('takes the call back as it was when the room of the conference ends before its far end moved, or forgets it when asked (step 8b)', async () => {
+    const { phone, ua } = await setup()
+    const its = audios.length
+    const call = await phone.call('102')
+    const s = ua().lastCall!
+    s.emit('accepted', { originator: 'remote' })
+    const room = new FakeSession('incoming')
+    const token = phone.expectConference(call.id)
+    ua().emit('newRTCSession', { originator: 'remote', session: room, request: { getHeader: (name: string) => ({ 'Twake-Join': token, 'Twake-Room': 'conference' })[name] } })
+    room.emit('accepted', { originator: 'local' })
+    expect(call.muted).toBe(true)
+    room.emit('ended', { originator: 'remote', cause: 'Terminated' })
+    expect(s.unmute).toHaveBeenCalledWith({ audio: true })
+    expect(call.muted).toBe(false)
+    expect((audios[its] as unknown as { muted?: boolean }).muted).toBe(false)
+    // Asked again, then given up (the Gateway said no): its room's call is not answered.
+    const again = phone.expectConference(call.id)
+    // One conference asked at a time (review 8b, n°6): another meanwhile is refused, and forgetting another token
+    // leaves this one waiting.
+    expect(() => phone.expectConference(call.id)).toThrow(expect.objectContaining({ code: 'conference-pending' }))
+    phone.cancelConference('0'.repeat(32))
+    phone.cancelConference(again)
+    const late = new FakeSession('incoming')
+    ua().emit('newRTCSession', { originator: 'remote', session: late, request: { getHeader: (name: string) => ({ 'Twake-Join': again, 'Twake-Room': 'conference' })[name] } })
+    expect(late.terminate).toHaveBeenCalledWith({ status_code: 481, reason_phrase: 'Call Does Not Exist' })
+    // Its room's call answered, then the Gateway fails before the far end moves (it stopped meanwhile, third review
+    // 8b, n°5): forgetting the token hangs that call up, and ours is back as it was.
+    const third = phone.expectConference(call.id)
+    const left = new FakeSession('incoming')
+    ua().emit('newRTCSession', { originator: 'remote', session: left, request: { getHeader: (name: string) => ({ 'Twake-Join': third, 'Twake-Room': 'conference' })[name] } })
+    left.emit('accepted', { originator: 'local' })
+    expect(call.muted).toBe(true)
+    phone.cancelConference(third)
+    expect(left.terminate).toHaveBeenCalled()
+    left.emit('ended', { originator: 'local', cause: 'Terminated' })
+    expect(call.muted).toBe(false)
+    expect(phone.conferenceCall(call.id)).toBeUndefined()
+    s.emit('ended', { originator: 'remote', cause: 'Terminated' })
+    expect(call.endReason).toBe('hangup')
+  })
+
+  it("ends our call as a conference when the room of the far end's conference takes its place (Replaces, step 8b)", async () => {
+    const { phone, ua } = await setup()
+    const call = await phone.call('102')
+    const s = ua().lastCall!
+    s.emit('accepted', { originator: 'remote' })
+    const replacing = new FakeSession('incoming')
+    const request = { getHeader: (name: string) => (name === 'Twake-Room' ? 'conference' : undefined) }
+    s.emit('replaces', { request, accept: (init: (s: unknown) => void) => { init(replacing); ua().emit('newRTCSession', { originator: 'remote', session: replacing, request }) }, reject: vi.fn() })
+    await new Promise(r => setTimeout(r, 5))
+    expect(replacing.answer).toHaveBeenCalled()
+    const room = phone.activeCalls().find(c => c.replacedCallId === call.id)!
+    expect(room.room).toBe('conference')
+    replacing.emit('accepted', { originator: 'local' })
+    // JsSIP ends the call it replaced once the new one is confirmed.
+    s.emit('ended', { originator: 'local', cause: 'Terminated' })
+    expect(call.endReason).toBe('conference')
+  })
+
+  it("refuses the room of the far end's conference in the place of a call we hold, or while we are in another call (486, review 8b, n°1); otherwise keeps our microphone off when it was", async () => {
+    const { phone, ua } = await setup()
+    const conferenceRequest = { getHeader: (name: string) => ({ 'Twake-Room': 'conference', 'Twake-Conference': 'twake-call-0123456789abcdef' })[name] }
+    const offer = (session: FakeSession) => {
+      const replacing = new FakeSession('incoming')
+      const reject = vi.fn()
+      session.emit('replaces', { request: conferenceRequest, accept: (init: (s: unknown) => void) => { init(replacing); ua().emit('newRTCSession', { originator: 'remote', session: replacing, request: conferenceRequest }) }, reject })
+      return { replacing, reject }
+    }
+    const call = await phone.call('102')
+    const s = ua().lastCall!
+    s.emit('accepted', { originator: 'remote' })
+    // Held by us: the room would bring it back unheld, our microphone open.
+    const holding = call.hold()
+    s.reofferDone!()
+    s.emit('hold', { originator: 'local' })
+    await holding
+    const held = offer(s)
+    expect(held.reject).toHaveBeenCalled()
+    await new Promise(r => setTimeout(r, 5))
+    expect(held.replacing.answer).not.toHaveBeenCalled()
+    expect(phone.activeCalls()).toHaveLength(1)
+    // Consulting someone (the call on hold, another in progress): busy as well, whichever of the two it replaces.
+    await phone.call('103')
+    const consultation = ua().lastCall!
+    consultation.emit('accepted', { originator: 'remote' })
+    expect(offer(consultation).reject).toHaveBeenCalled()
+    expect(offer(s).reject).toHaveBeenCalled()
+    // The consultation over, the softphone takes the call back by itself.
+    consultation.emit('ended', { originator: 'remote', cause: 'Terminated' })
+    s.reofferDone!()
+    s.emit('unhold', { originator: 'local' })
+    expect(call.state).toBe('connected')
+    // In progress, our microphone off: the room's call is answered with it off, and says so.
+    call.setMuted(true)
+    const muted = offer(s)
+    expect(muted.reject).not.toHaveBeenCalled()
+    await new Promise(r => setTimeout(r, 5))
+    expect(muted.replacing.answer).toHaveBeenCalled()
+    expect(muted.replacing.mute).toHaveBeenCalledWith({ audio: true })
+    const room = phone.activeCalls().find(c => c.replacedCallId === call.id)!
+    expect(room.muted).toBe(true)
+    expect(room.conferenceRoom).toBe('twake-call-0123456789abcdef')
+  })
+
+  it("answers the room of our own conference with our microphone off when it was, and asks for none of a call on hold, by either side (review 8b, n°1)", async () => {
+    const { phone, ua } = await setup()
+    const call = await phone.call('102')
+    const s = ua().lastCall!
+    s.emit('accepted', { originator: 'remote' })
+    s.emit('hold', { originator: 'remote' })
+    expect(() => phone.expectConference(call.id)).toThrow(expect.objectContaining({ code: 'call-held' }))
+    s.emit('unhold', { originator: 'remote' })
+    call.setMuted(true)
+    const token = phone.expectConference(call.id)
+    const room = new FakeSession('incoming')
+    ua().emit('newRTCSession', { originator: 'remote', session: room, request: { getHeader: (name: string) => ({ 'Twake-Join': token, 'Twake-Room': 'conference', 'Twake-Conference': 'not a room' })[name] } })
+    await new Promise(r => setTimeout(r, 5))
+    expect(room.answer).toHaveBeenCalled()
+    expect(room.mute).toHaveBeenCalledWith({ audio: true })
+    const joined = phone.conferenceCall(call.id)!
+    expect(joined.muted).toBe(true)
+    // A name the Gateway never gives is no room.
+    expect(joined.conferenceRoom).toBeUndefined()
+    room.emit('ended', { originator: 'remote', cause: 'Terminated' })
+    expect(phone.conferenceCall(call.id)).toBeUndefined()
+  })
+
+  it("refuses the room of the far end's conference in the place of a call the far end holds (486, second review 8b, n°2): in it, our microphone did not go", async () => {
+    const { phone, ua } = await setup()
+    const conferenceRequest = { getHeader: (name: string) => (name === 'Twake-Room' ? 'conference' : undefined) }
+    const call = await phone.call('102')
+    const s = ua().lastCall!
+    s.emit('accepted', { originator: 'remote' })
+    s.emit('hold', { originator: 'remote' })
+    expect(call.remoteHold).toBe(true)
+    expect(call.state).toBe('connected')
+    const replacing = new FakeSession('incoming')
+    const reject = vi.fn()
+    s.emit('replaces', { request: conferenceRequest, accept: (init: (x: unknown) => void) => { init(replacing); ua().emit('newRTCSession', { originator: 'remote', session: replacing, request: conferenceRequest }) }, reject })
+    expect(reject).toHaveBeenCalled()
+    await new Promise(r => setTimeout(r, 5))
+    expect(replacing.answer).not.toHaveBeenCalled()
+    expect(phone.activeCalls()).toEqual([call])
+  })
+
+  it('neither holds nor transfers a call while it becomes a conference, and refuses its room once the call is no longer on line both ways (481, second review 8b, n°2)', async () => {
+    const { phone, ua } = await setup()
+    const call = await phone.call('102')
+    const s = ua().lastCall!
+    s.emit('accepted', { originator: 'remote' })
+    const token = phone.expectConference(call.id)
+    expect(call.conferencing).toBe(true)
+    await expect(call.hold()).rejects.toMatchObject({ code: 'conference-pending' })
+    await expect(call.transfer('103')).rejects.toMatchObject({ code: 'conference-pending' })
+    // A consultation would hold it first: refused too.
+    await expect(phone.call('103')).rejects.toMatchObject({ code: 'conference-pending' })
+    expect(s.hold).not.toHaveBeenCalled()
+    expect(s.refer).not.toHaveBeenCalled()
+    // The far end holds it meanwhile: the room's call is refused, the conference does not begin.
+    s.emit('hold', { originator: 'remote' })
+    const room = new FakeSession('incoming')
+    ua().emit('newRTCSession', { originator: 'remote', session: room, request: { getHeader: (name: string) => ({ 'Twake-Join': token, 'Twake-Room': 'conference' })[name] } })
+    expect(room.terminate).toHaveBeenCalledWith({ status_code: 481, reason_phrase: 'Call Does Not Exist' })
+    await new Promise(r => setTimeout(r, 5))
+    expect(room.answer).not.toHaveBeenCalled()
+    expect(phone.conferenceCall(call.id)).toBeUndefined()
+    // Given up: the call is held and transferred again as any.
+    expect(call.conferencing).toBe(false)
+    s.emit('unhold', { originator: 'remote' })
+    const again = phone.expectConference(call.id)
+    phone.cancelConference(again)
+    expect(call.conferencing).toBe(false)
+    const holding = call.hold()
+    s.reofferDone!()
+    s.emit('hold', { originator: 'local' })
+    await holding
+    expect(call.state).toBe('held')
+  })
+
+  it('neither holds nor transfers a call a room places, nor calls anyone during it (step 8b)', async () => {
+    const { phone, ua, incoming } = await setup()
+    const s = new FakeSession('incoming')
+    ua().emit('newRTCSession', { originator: 'remote', session: s, request: { getHeader: (name: string) => (name === 'Twake-Room' ? 'meet' : undefined) } })
+    const call = incoming[0]!
+    expect(call.room).toBe('meet')
+    await call.answer()
+    s.emit('accepted', { originator: 'local' })
+    await expect(call.hold()).rejects.toMatchObject({ code: 'room-call' })
+    await expect(call.transfer('103')).rejects.toMatchObject({ code: 'room-call' })
+    await expect(phone.call('103')).rejects.toMatchObject({ code: 'room-call' })
+    expect(() => phone.expectConference(call.id)).toThrow(expect.objectContaining({ code: 'room-call' }))
+    expect(s.hold).not.toHaveBeenCalled()
+    expect(s.refer).not.toHaveBeenCalled()
+    // A plain call says no room.
+    const plain = new FakeSession('incoming')
+    s.emit('ended', { originator: 'remote', cause: 'Terminated' })
+    ua().emit('newRTCSession', { originator: 'remote', session: plain, request: { getHeader: () => undefined } })
+    expect(incoming[1]!.room).toBeUndefined()
+  })
+
   it('does not ring for an INVITE with Replaces, answered at once', async () => {
     const { phone, ua, ringer } = await setup()
     await phone.call('102')

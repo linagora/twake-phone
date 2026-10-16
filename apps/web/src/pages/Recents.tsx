@@ -8,13 +8,21 @@ import { Reloader } from '../reload.js'
 /** How long the history waits for the event stream before it is read without it. */
 const WITHOUT_STREAM_MS = 3_000
 
-/** Missed (the phone rang, nobody took it), declined (the user refused it), or simply in or out. */
+/** Missed (the phone rang, nobody took it), declined (the user refused it), a conference (step 8b), or simply in or out. */
 const recentLabel = (it: HistoryItem, t: (key: Key) => string) =>
-  it.missed ? t('recents.missed') : it.direction === 'inbound' && it.state === 'rejected' ? t('recents.declined') : it.direction === 'inbound' ? t('recents.inbound') : t('recents.outbound')
+  it.missed
+    ? t('recents.missed')
+    : it.direction === 'inbound' && it.state === 'rejected'
+      ? t('recents.declined')
+      : it.conference
+        ? t('recents.conference')
+        : it.direction === 'inbound'
+          ? t('recents.inbound')
+          : t('recents.outbound')
 
 export const Recents = () => {
   const { t, lang } = useT()
-  const { client, onEvent, onConnected } = useGateway()
+  const { client, me, onEvent, onConnected } = useGateway()
   const [items, setItems] = useState<HistoryItem[] | null>(null)
   const [error, setError] = useState(false)
   // Read when the event stream is established (at once when it already is: the ends told while it was closed were
@@ -58,7 +66,8 @@ export const Recents = () => {
           {items.map(it => (
             <li key={it.id}>
               <span>
-                <strong>{it.remoteNumber === 'anonymous' ? t('call.hiddenNumber') : formatNumber(it.remoteNumber)}</strong>
+                {/* One's own conference: the room called oneself in it (its number is one's own). */}
+                <strong>{it.conference && it.remoteNumber === me?.extension ? t('recents.conferenceMine') : it.remoteNumber === 'anonymous' ? t('call.hiddenNumber') : formatNumber(it.remoteNumber)}</strong>
                 <br />
                 <span className={`badge${it.missed ? ' missed' : ''}`}>{recentLabel(it, t)}</span>
               </span>

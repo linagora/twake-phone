@@ -1,7 +1,7 @@
 import { LiveKitConferenceBridge, MeetApi } from '@twake/conference-livekit'
 import { buildApp } from './app.js'
 import { authenticatorFromEnv } from './auth.js'
-import { sweepDialIns } from './conference-sweep.js'
+import { sweepDialIns, webhookKeyFromEnv } from './conference-sweep.js'
 import { parseKey } from './crypto.js'
 import { StoreDirectory, accessNumberInUse, meetAccessMismatch, reservedInUse, seedUserMap } from './directory.js'
 import { DirectorySync, parseInterval } from './directory-sync.js'
@@ -121,7 +121,7 @@ const conference = conferenceOn && accessNumber
         )
       }
       prepare()
-      return { bridge: () => bridge, ...(meet ? { meet } : {}), accessNumber, webhookKey: env.LIVEKIT_API_KEY!, webhookSecret: env.LIVEKIT_API_SECRET! }
+      return { bridge: () => bridge, ...(meet ? { meet } : {}), accessNumber, ...webhookKeyFromEnv(env) }
     })()
   : undefined
 
