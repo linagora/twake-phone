@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { HistoryEntry, Store } from './types.js'
+import { EMPTY_OUTBOUND, outboundVersion } from '../outbound.js'
 
 const entry = (over: Partial<HistoryEntry>): HistoryEntry => ({
   tenantId: 'A', userId: 'alice', callId: 'c1', direction: 'outbound', remoteNumber: '+33612345678',
@@ -222,6 +223,27 @@ export const storeContract = (name: string, make: () => Promise<Store>) =>
       await s.close()
     })
 
+    it('replaces the outbound rules only if they are still the version they were read at, two writers at once included (review 7 bis, n°2)', async () => {
+      const s = await make()
+      const empty = outboundVersion(EMPTY_OUTBOUND)
+      const one = { tenantId: 'C', policy: { caps: { concurrent: 1 } }, profiles: [], assignments: [] }
+      const two = { tenantId: 'C', policy: { caps: { concurrent: 2 } }, profiles: [], assignments: [] }
+      // Two changes made from the same version (nothing kept yet), at once: one is kept, the other refused.
+      const results = await Promise.allSettled([s.setOutbound(one, empty), s.setOutbound(two, empty)])
+      expect(results.filter(r => r.status === 'fulfilled')).toHaveLength(1)
+      expect(results.find(r => r.status === 'rejected')).toMatchObject({ reason: { statusCode: 409, code: 'OUTBOUND_STALE' } })
+      const kept = (await s.getOutbound('C'))!
+      const version = outboundVersion(kept)
+      // Then from the version kept: twice at once again, one of them.
+      const again = await Promise.allSettled([s.setOutbound({ ...one, policy: { caps: { concurrent: 4 } } }, version), s.setOutbound({ ...two, policy: { caps: { concurrent: 5 } } }, version)])
+      expect(again.filter(r => r.status === 'fulfilled')).toHaveLength(1)
+      expect(await s.setOutbound(one, 'not-the-version').catch((err: unknown) => err)).toMatchObject({ code: 'OUTBOUND_STALE' })
+      // Without a version: replaced, whatever it is.
+      await s.setOutbound(one)
+      expect((await s.getOutbound('C'))?.policy).toEqual({ caps: { concurrent: 1 } })
+      await s.close()
+    })
+
     it('keeps one alert while it repeats (count, last time, first and last words), a new one after an hour of silence, per tenant, the latest repeated first (review 6b, n°7; second review, n°8)', async () => {
       const s = await make()
       const alert = { kind: 'limit' as const, param: 'concurrent', scope: 'user' as const, extension: '101', number: '+33199000201' }
@@ -274,17 +296,17 @@ export const storeContract = (name: string, make: () => Promise<Store>) =>
       expect(seen).not.toHaveProperty('acknowledgedAt')
       // Repeated after the administrator saw it: not acknowledged, the repeat stays in view (review 7, n°2).
       await s.addAlert({ tenantId: 'A', at: '2026-10-16T10:05:00.000Z', alert })
-      const stale = await s.acknowledgeAlert('A', seen!.id, 'root', '2026-10-16T10:06:00.000Z', seen!.lastAt)
+      const stale = await s.acknowledgeAlert('A', seen!.id, 'root', '2026-10-16T10:06:00.000Z', seen!.lastAt, seen!.count)
       expect(stale).toMatchObject({ id: seen!.id, count: 2, lastAt: '2026-10-16T10:05:00.000Z' })
       expect(stale).not.toHaveProperty('acknowledgedAt')
       const [open] = await s.listAlerts('A', { state: 'open' })
       // Another tenant, an id of none, an id that is no number: nothing.
-      expect(await s.acknowledgeAlert('B', open!.id, 'root', '2026-10-16T10:06:00.000Z', open!.lastAt)).toBeNull()
-      expect(await s.acknowledgeAlert('A', '999999', 'root', '2026-10-16T10:06:00.000Z', open!.lastAt)).toBeNull()
-      expect(await s.acknowledgeAlert('A', 'x1', 'root', '2026-10-16T10:06:00.000Z', open!.lastAt)).toBeNull()
-      expect(await s.acknowledgeAlert('A', open!.id, 'root', '2026-10-16T10:06:00.000Z', open!.lastAt)).toMatchObject({ id: open!.id, count: 2, acknowledgedAt: '2026-10-16T10:06:00.000Z', acknowledgedBy: 'root' })
+      expect(await s.acknowledgeAlert('B', open!.id, 'root', '2026-10-16T10:06:00.000Z', open!.lastAt, open!.count)).toBeNull()
+      expect(await s.acknowledgeAlert('A', '999999', 'root', '2026-10-16T10:06:00.000Z', open!.lastAt, open!.count)).toBeNull()
+      expect(await s.acknowledgeAlert('A', 'x1', 'root', '2026-10-16T10:06:00.000Z', open!.lastAt, open!.count)).toBeNull()
+      expect(await s.acknowledgeAlert('A', open!.id, 'root', '2026-10-16T10:06:00.000Z', open!.lastAt, open!.count)).toMatchObject({ id: open!.id, count: 2, acknowledgedAt: '2026-10-16T10:06:00.000Z', acknowledgedBy: 'root' })
       // Acknowledged again by someone else: the first acknowledgement stays.
-      expect(await s.acknowledgeAlert('A', open!.id, 'other', '2026-10-16T10:07:00.000Z', open!.lastAt)).toMatchObject({ acknowledgedAt: '2026-10-16T10:06:00.000Z', acknowledgedBy: 'root' })
+      expect(await s.acknowledgeAlert('A', open!.id, 'other', '2026-10-16T10:07:00.000Z', open!.lastAt, open!.count)).toMatchObject({ acknowledgedAt: '2026-10-16T10:06:00.000Z', acknowledgedBy: 'root' })
       // Within the hour, the same alert again: a new one, not counted in the acknowledged one.
       await s.addAlert({ tenantId: 'A', at: '2026-10-16T10:10:00.000Z', alert })
       await s.addAlert({ tenantId: 'A', at: '2026-10-16T10:11:00.000Z', alert })
@@ -296,6 +318,23 @@ export const storeContract = (name: string, make: () => Promise<Store>) =>
       expect((await s.listAlerts('A', { state: 'open' })).map(a => a.id)).toEqual([all[0]!.id])
       expect((await s.listAlerts('A', { state: 'acknowledged' })).map(a => a.id)).toEqual([open!.id])
       expect(await s.listAlerts('B', { state: 'open' })).toEqual([])
+      await s.close()
+    })
+
+    it('acknowledges an alert only as many times repeated as seen, its last time unchanged by a repeat (review 7 bis, n°3)', async () => {
+      const s = await make()
+      const alert = { kind: 'limit' as const, param: 'dailyCalls', scope: 'user' as const, extension: '101', number: '+33199000201' }
+      await s.addAlert({ tenantId: 'A', at: '2026-10-16T10:00:00.000Z', alert })
+      const [seen] = await s.listAlerts('A')
+      // Two repeats the screen never showed: one at the same instant, one dated before (the last time stays).
+      await s.addAlert({ tenantId: 'A', at: '2026-10-16T10:00:00.000Z', alert })
+      await s.addAlert({ tenantId: 'A', at: '2026-10-16T09:59:59.000Z', alert })
+      const [now] = await s.listAlerts('A')
+      expect(now).toMatchObject({ id: seen!.id, count: 3, lastAt: seen!.lastAt })
+      const refused = await s.acknowledgeAlert('A', seen!.id, 'root', '2026-10-16T10:06:00.000Z', seen!.lastAt, seen!.count)
+      expect(refused).toMatchObject({ count: 3 })
+      expect(refused).not.toHaveProperty('acknowledgedAt')
+      expect(await s.acknowledgeAlert('A', now!.id, 'root', '2026-10-16T10:06:00.000Z', now!.lastAt, now!.count)).toMatchObject({ count: 3, acknowledgedBy: 'root' })
       await s.close()
     })
 

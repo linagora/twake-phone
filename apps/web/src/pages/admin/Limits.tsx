@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState, type FormEvent } from 'react'
-import { FRAUD_PARAMS, type FraudRule, type OutboundSettings } from '@twake/telephony-client'
+import { FRAUD_PARAMS, OUTBOUND_CAPS, type FraudRule, type OutboundSettings } from '@twake/telephony-client'
 import { CapFields } from '../../admin/CapFields.js'
 import { FieldError, NoteLine, useLatest, ProblemSummary, Section, useFocusLater, useProblem, type Note } from '../../admin/ui.js'
 import { LIMITS_FIELDS, capsForm, checkCaps, checkFraud, fraudForm, limitsRefusal, refusalCode, type CapsForm, type FraudForm, type FraudParam, type LimitsField, type Problem, type ThresholdForm } from '../../admin/validate.js'
@@ -17,6 +17,20 @@ interface LimitsForm {
   international: FraudForm
 }
 const limitsForm = (s: OutboundSettings): LimitsForm => ({ tenant: capsForm(s.policy.caps), user: capsForm(s.policy.userCaps), national: fraudForm(s.policy.fraud?.national), international: fraudForm(s.policy.fraud?.international) })
+
+const PARTS = [
+  ['tenant', 'admin.limits.tenant'],
+  ['user', 'admin.limits.user'],
+  ['national', 'admin.fraud.national'],
+  ['international', 'admin.fraud.international']
+] as const
+/** The caps and thresholds that are not the same in `before` and `now`: the part's legend, and their name. */
+const changedOf = (before: LimitsForm, now: LimitsForm) =>
+  PARTS.flatMap(([part, legend]) =>
+    (part === 'tenant' || part === 'user' ? OUTBOUND_CAPS : FRAUD_PARAMS)
+      .filter(k => JSON.stringify((before[part] as Record<string, unknown>)[k]) !== JSON.stringify((now[part] as Record<string, unknown>)[k]))
+      .map(k => ({ legend, name: (part === 'tenant' || part === 'user' ? `admin.cap.${k}` : `admin.fraud.${k}`) as Key }))
+  )
 
 /** The problems of one part of the form (`tenant`, `national`…), by cap or threshold. */
 const partOf = (problems: Partial<Record<LimitsField, Problem>>, part: string) =>
@@ -152,10 +166,23 @@ export const Limits = () => {
       show(await client.setOutbound({ policy, profiles: settings.profiles, assignments: settings.assignments, version: settings.version }))
       setNote({ kind: 'ok', text: t('admin.limits.saved') })
     } catch (err) {
-      // Changed meanwhile: what it is now is shown again, to be checked before saving (the note says so).
+      // Changed meanwhile: what was typed stays, the setting is read again (the next save made from it), and what the
+      // other administrator changed among the caps and thresholds is named, to be checked (review 7 bis, n°6).
       if (refusalCode(err) === 'OUTBOUND_STALE') {
         setProblems({})
-        read()
+        const now = await client.getOutbound().catch(() => null)
+        if (!now) {
+          read()
+          setNote({ kind: 'error', text: say(limitsRefusal(err).problem)! })
+          return
+        }
+        const changed = changedOf(limitsForm(settings), limitsForm(now))
+        setSettings(now)
+        setNote({
+          kind: 'error',
+          text: changed.length ? t('admin.limits.changed', { fields: changed.map(c => `${t(c.legend)} : ${t(c.name)}`).join(' ; ') }) : t('admin.limits.changedElsewhere')
+        })
+        return
       }
       const refusal = limitsRefusal(err)
       if (refusal.field === 'form') setNote({ kind: 'error', text: say(refusal.problem)! })

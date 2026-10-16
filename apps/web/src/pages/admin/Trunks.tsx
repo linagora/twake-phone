@@ -3,7 +3,7 @@ import { TRUNK_CODECS, TRUNK_OUTBOUND_CLASSES, type Trunk, type TrunkNumberForma
 import { TargetList } from '../../admin/TargetList.js'
 import { targetLabel, useTargets } from '../../admin/targets.js'
 import { CheckBox, CheckGroup, ConfirmDelete, NoteLine, ProblemSummary, Section, SelectField, TextField, useFocusLater, useProblem, useRefresh, type Note } from '../../admin/ui.js'
-import { TRUNK_FIELDS, checkTrunk, emptyTrunk, trunkForm, trunkRefusal, type Problems, type TrunkField, type TrunkForm } from '../../admin/validate.js'
+import { TRUNK_FIELDS, checkTrunk, emptyTrunk, refusalStatus, trunkForm, trunkRefusal, type Problems, type TrunkField, type TrunkForm } from '../../admin/validate.js'
 import { useGateway } from '../../gateway.js'
 import type { Key } from '../../i18n/index.js'
 import { useT } from '../../i18n/useT.js'
@@ -104,6 +104,8 @@ export const Trunks = () => {
       void readStatus()
     } catch (err) {
       const refusal = trunkRefusal(err)
+      // Gone meanwhile (another administrator removed it): the list shown is read again.
+      if (refusalStatus(err) === 404) load()
       if (refusal.field === 'form') setNote({ kind: 'error', text: say(refusal.problem)! })
       else {
         const next = { [refusal.field]: refusal.problem }

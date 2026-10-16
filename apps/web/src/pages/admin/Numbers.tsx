@@ -3,7 +3,7 @@ import type { DidRange, Trunk } from '@twake/telephony-client'
 import { TargetList } from '../../admin/TargetList.js'
 import { targetLabel, useTargets } from '../../admin/targets.js'
 import { ConfirmDelete, NoteLine, ProblemSummary, Section, SelectField, TextField, useFocusLater, useProblem, type Note } from '../../admin/ui.js'
-import { DID_FIELDS, checkDid, didForm, didRefusal, emptyDid, type DidField, type DidForm, type Problems } from '../../admin/validate.js'
+import { DID_FIELDS, checkDid, didForm, didRefusal, emptyDid, refusalStatus, type DidField, type DidForm, type Problems } from '../../admin/validate.js'
 import { useGateway } from '../../gateway.js'
 import { useT } from '../../i18n/useT.js'
 
@@ -68,6 +68,8 @@ export const Numbers = () => {
       load()
     } catch (err) {
       const refusal = didRefusal(err)
+      // Gone meanwhile (another administrator removed it): the list shown is read again.
+      if (refusalStatus(err) === 404) load()
       if (refusal.field === 'form') setNote({ kind: 'error', text: say(refusal.problem)! })
       else {
         const next = { [refusal.field]: refusal.problem }

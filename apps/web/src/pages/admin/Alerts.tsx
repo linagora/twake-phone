@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react'
 import { FRAUD_PARAMS, OUTBOUND_CAPS, TRUNK_OUTBOUND_CLASSES, type AdminAlert, type AdminUser, type AlertFilter } from '@twake/telephony-client'
-import { NoteLine, Section, SelectField, useLatest, useProblem, useRefresh, type Note } from '../../admin/ui.js'
+import { CheckBox, NoteLine, Section, SelectField, useLatest, useProblem, useRefresh, type Note } from '../../admin/ui.js'
 import { refusalCode, refusalOf, refusalStatus } from '../../admin/validate.js'
 import { useGateway } from '../../gateway.js'
 import type { Key } from '../../i18n/index.js'
@@ -43,7 +43,16 @@ export const Alerts = () => {
   const [focusAt, setFocusAt] = useState<number | null>(null)
   // More than the first page shown: not read again on its own (the rows would move under the reader).
   const [extended, setExtended] = useState(false)
+  // Read again on its own unless asked not to (RGAA 13.8, review 7 bis n°5).
+  const [auto, setAuto] = useState(true)
   const words = useLatest(say)
+  // Each read is numbered: only the answer of the last one asked is shown, a page, a filter or a read of the screen
+  // answered late never replaces what was asked after it (review 7 bis, n°4).
+  const reads = useRef(0)
+  // A read, a page or an acknowledgement asked by the administrator going on: the screen reads nothing on its own.
+  const asked = useRef(0)
+  // The list and its buttons: while the focus is there, nothing moves under it.
+  const list = useRef<HTMLDivElement | null>(null)
 
   const query = useCallback(
     (f: typeof filter, before?: string): AlertFilter => ({
@@ -58,23 +67,40 @@ export const Alerts = () => {
   // The first page of `f`. It depends on nothing the language changes: a change of language reads nothing again, and
   // never puts back the first filter while the lists show another one (review 7 n°13).
   const read = useCallback(
-    (f: typeof filter) =>
-      client.listAlerts(query(f)).then(
+    (f: typeof filter) => {
+      const mine = ++reads.current
+      return client.listAlerts(query(f)).then(
         r => {
+          if (mine !== reads.current) return
           setItems(r.items)
           setNext(r.next)
           setShown(f)
           setExtended(false)
         },
-        (err: unknown) => setNote({ kind: 'error', text: words.current(refusalOf(err, () => undefined).problem)! })
-      ),
+        (err: unknown) => {
+          if (mine === reads.current) setNote({ kind: 'error', text: words.current(refusalOf(err, () => undefined).problem)! })
+        }
+      )
+    },
     [client, query, words]
   )
   useEffect(() => {
     void read(INITIAL)
   }, [read])
   const again = () => read(shown)
-  useRefresh(again, ALERTS_REFRESH_MS, items !== null && !extended)
+  /** What the administrator asked: the screen reads nothing on its own meanwhile, and its answer comes first. */
+  const asking = <T,>(run: () => Promise<T>) => {
+    asked.current++
+    setBusy(true)
+    return run().finally(() => {
+      asked.current--
+      setBusy(false)
+    })
+  }
+  // On its own: not while something asked goes on, nor while the focus is in the list (a row, its button), which
+  // would move or go under it (review 7 bis, n°5).
+  const onItsOwn = () => (asked.current > 0 || list.current?.contains(document.activeElement) ? Promise.resolve() : again())
+  useRefresh(onItsOwn, ALERTS_REFRESH_MS, auto && items !== null && !extended)
   useEffect(() => {
     client.listAdminUsers().then(
       r => setUsers(r.items),
@@ -88,41 +114,47 @@ export const Alerts = () => {
   const apply = (e: FormEvent) => {
     e.preventDefault()
     setNote(null)
-    setBusy(true)
-    void read(filter).finally(() => setBusy(false))
+    void asking(() => read(filter))
   }
 
   const refresh = () => {
     setNote(null)
-    setBusy(true)
-    void again().finally(() => setBusy(false))
+    void asking(again)
   }
 
   const more = () => {
     if (!next || !items) return
-    setBusy(true)
     const from = items.length
-    client
-      .listAlerts(query(shown, next))
-      .then(
+    const mine = ++reads.current
+    void asking(() =>
+      client.listAlerts(query(shown, next)).then(
         r => {
-          setItems([...items, ...r.items])
+          // Another read asked since (a filter, the first page again): this page is not of what is shown.
+          if (mine !== reads.current) return
+          setItems(list => [...(list ?? []), ...r.items])
           setNext(r.next)
           setExtended(true)
           // The focus goes to the first alert of the new page (the button may disappear with the last one).
           setFocusAt(from)
         },
-        (err: unknown) => setNote({ kind: 'error', text: say(refusalOf(err, () => undefined).problem)! })
+        (err: unknown) => {
+          if (mine === reads.current) setNote({ kind: 'error', text: say(refusalOf(err, () => undefined).problem)! })
+        }
       )
-      .finally(() => setBusy(false))
+    )
   }
 
-  const acknowledge = async (alert: AdminAlert) => {
+  const acknowledge = (alert: AdminAlert) => {
     setNote(null)
-    setBusy(true)
+    return asking(() => acknowledging(alert))
+  }
+  const acknowledging = async (alert: AdminAlert) => {
+    // A read of the screen going on was asked before: its answer would put the row back.
+    reads.current++
     try {
-      // As it was seen: refused when it repeated since (the repeat is shown, to be looked at first).
-      const done = await client.acknowledgeAlert(alert.id, alert.lastAt)
+      // As it was seen, its last time and how many times: refused when it repeated since (the repeat is shown, to be
+      // looked at first), even within the same millisecond (review 7 bis, n°3).
+      const done = await client.acknowledgeAlert(alert.id, alert.lastAt, alert.count)
       setItems(list => (list ?? []).flatMap(a => (a.id !== alert.id ? [a] : shown.state === 'open' ? [] : [done])))
       // The row may go, its button with it: the focus goes to what is said.
       setNote({ kind: 'ok', text: t('admin.alert.acknowledged'), focus: true })
@@ -132,8 +164,6 @@ export const Alerts = () => {
       const gone = refusalStatus(err) === 404
       if (changed || gone) await read(shown)
       setNote({ kind: 'error', text: gone ? t('admin.alert.gone') : say(refusalOf(err, () => undefined).problem)!, focus: true })
-    } finally {
-      setBusy(false)
     }
   }
 
@@ -169,7 +199,7 @@ export const Alerts = () => {
         </div>
       </form>
       {items === null ? null : items.length ? (
-        <div className="table-scroll" role="region" tabIndex={0} aria-label={t('admin.alert.list')}>
+        <div className="table-scroll" role="region" tabIndex={0} aria-label={t('admin.alert.list')} ref={list}>
           <table className="admin-table">
             <caption className="sr-only">{t('admin.alert.list')}</caption>
             <thead>
@@ -223,6 +253,7 @@ export const Alerts = () => {
           {t('admin.alert.refresh')}
         </button>
       </p>
+      <CheckBox id="alerts-auto" label={t('admin.alert.auto', { seconds: ALERTS_REFRESH_MS / 1000 })} hint={t('admin.alert.autoHint')} checked={auto} onChange={setAuto} />
       <NoteLine note={note} />
     </Section>
   )

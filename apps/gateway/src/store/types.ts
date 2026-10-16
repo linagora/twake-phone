@@ -262,19 +262,23 @@ export interface Store {
 
   /** The outbound rules of a tenant; null when none was ever set. */
   getOutbound(tenantId: string): Promise<OutboundRecord | null>
-  /** Replaces them whole. */
-  setOutbound(record: OutboundRecord): Promise<void>
+  /**
+   * Replaces them whole. With `expected`, only if what is kept is still that version (outboundVersion; none kept: the
+   * version of EMPTY_OUTBOUND), checked and written at once, whatever process writes too: 409 OUTBOUND_STALE otherwise.
+   */
+  setOutbound(record: OutboundRecord, expected?: string): Promise<void>
   /** Keeps an alert: a repeat of an open one (same alertKey, within ALERT_DEDUP_MS of its last, not acknowledged) counts in it. */
   addAlert(record: AlertRecord): Promise<void>
   /** The alerts of a tenant, the latest repeated first, `limit` at most (clamped as a page). */
   listAlerts(tenantId: string, query?: AlertQuery): Promise<StoredAlert[]>
   /**
    * Marks an alert of the tenant acknowledged, by `by` at `at` (ISO), if it is still as the administrator saw it: its
-   * last repeat at `seen` (ISO). Repeated since, it stays open (returned without `acknowledgedAt`: they look again).
+   * last repeat at `seen` (ISO) and `count` repeats. Repeated since (even within the same millisecond, or a repeat
+   * dated before the last one), it stays open (returned without `acknowledgedAt`: they look again).
    * Its repeats open a new one once it is acknowledged. The alert as kept then (the first acknowledgement stays),
    * null when the tenant has none of that id.
    */
-  acknowledgeAlert(tenantId: string, id: string, by: string, at: string, seen: string): Promise<StoredAlert | null>
+  acknowledgeAlert(tenantId: string, id: string, by: string, at: string, seen: string, count: number): Promise<StoredAlert | null>
   /** Removes the alerts of every tenant whose last repeat is before `before` (ISO); how many. */
   purgeAlerts(before: string): Promise<number>
 

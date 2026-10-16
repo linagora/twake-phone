@@ -18,7 +18,7 @@ import { ENDED_TTL_SEC, MISSED_TTL_SEC, type PushMessage, type WebPush } from '.
 import type { ProviderRegistry } from './registry.js'
 import { securityHeadersFor, type SecurityOptions } from './security.js'
 import { MAX_DIDS, MAX_TRUNKS, TRUNK_ID, defaultTrunk, parseDid, parseTrunk, providerTrunks, publicDid, publicTrunk, trunkRecord } from './trunks.js'
-import { EMPTY_OUTBOUND, PROFILE_ID, outboundVersion, parseOutbound, type Outbound } from './outbound.js'
+import { EMPTY_OUTBOUND, PROFILE_ID, outboundVersion, parseOutbound, staleOutbound, type Outbound } from './outbound.js'
 import { MemoryStore } from './store/memory.js'
 import { ALERT_RETENTION_DAYS, clampLimit, isMissed, type HistoryEntry, type HistoryQuery, type Store, type StoredAlert, type TrunkRecord, type UserPresenceRecord } from './store/types.js'
 
@@ -1092,6 +1092,8 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
           await changeTrunks(user.tenantId, apply, next, dids, () => store.upsertTrunks([...unmarked, record]))
           return { record, created: !current }
         })
+        // The state read before the change is no longer theirs: the screen reads it again at once.
+        trunkStatus.delete(user.tenantId)
         return reply.code(created ? 201 : 200).send(publicTrunk(record))
       })
       v1.delete<{ Params: { id: string } }>('/admin/trunks/:id', async (req, reply) => {
@@ -1107,6 +1109,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
           const dids = (await store.listDids(user.tenantId)).filter(d => d.trunkId !== req.params.id).map(publicDid)
           await changeTrunks(user.tenantId, apply, records.filter(t => t.id !== req.params.id), dids, () => store.deleteTrunk(user.tenantId, req.params.id))
         })
+        trunkStatus.delete(user.tenantId)
         return reply.code(204).send()
       })
       v1.get('/admin/dids', async req => {
@@ -1149,10 +1152,13 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         if (!provider.setOutboundPolicy) throw Object.assign(new Error('Outbound rules are not available on this platform'), { statusCode: 501 })
         return provider.setOutboundPolicy.bind(provider)
       }
-      const changeOutbound = async (tenantId: string, apply: ReturnType<typeof outboundOf>, next: Outbound) => {
-        const before = await outboundFor(tenantId)
+      // `expected`: the version the change was made from; kept only if the store still holds it (checked as it writes).
+      const changeOutbound = async (tenantId: string, apply: ReturnType<typeof outboundOf>, next: Outbound, expected?: string) => {
+        // Undone: the provider is handed what the store holds then (what it had, or what another change kept meanwhile).
         const undo = (err: unknown) =>
-          apply(before.policy, before.profiles, before.assignments).then(
+          outboundFor(tenantId)
+            .then(kept => apply(kept.policy, kept.profiles, kept.assignments))
+            .then(
             () => {
               throw err
             },
@@ -1162,7 +1168,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
             }
           )
         await apply(next.policy, next.profiles, next.assignments).catch(undo)
-        await store.setOutbound({ tenantId, ...next }).catch(undo)
+        await store.setOutbound({ tenantId, ...next }, expected).catch(undo)
       }
       // What holds when an administrator says nothing (ADR 0017): shown with what they said.
       // `version`: what to send back with a change, so that it is refused if the setting changed since (OUTBOUND_STALE).
@@ -1181,9 +1187,10 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         const version = (req.body as { version?: unknown }).version
         if (version !== undefined && typeof version !== 'string') throw Object.assign(new Error('version: the version of GET /admin/outbound'), { statusCode: 400, code: 'OUTBOUND_INVALID' })
         await inTurn(user.tenantId, async () => {
-          if (version !== undefined && outboundVersion(await outboundFor(user.tenantId)) !== version)
-            throw Object.assign(new Error('The outbound rules changed since they were read: read them again'), { statusCode: 409, code: 'OUTBOUND_STALE' })
-          await changeOutbound(user.tenantId, apply, next)
+          // Checked first (nothing handed to the provider for nothing), then again by the store as it writes: the turn
+          // of this process ends after turnMaxMs, and another Gateway may write too (review 7 bis, n°2).
+          if (version !== undefined && outboundVersion(await outboundFor(user.tenantId)) !== version) throw staleOutbound()
+          await changeOutbound(user.tenantId, apply, next, version)
         })
         return outboundView(next)
       })
@@ -1199,8 +1206,10 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
           const current = await outboundFor(user.tenantId)
           const assignments = current.assignments.filter(a => a.userId !== userId)
           const next = parseOutbound({ ...current, assignments: profileId ? [...assignments, { userId, profileId }] : assignments })
-          await changeOutbound(user.tenantId, apply, next)
-          return { userId, profileId: profileId ?? null, version: outboundVersion(next) }
+          await changeOutbound(user.tenantId, apply, next, outboundVersion(current))
+          // The whole setting as it is now, with its version (review 7 bis, n°1): a screen shows all of it, never a
+          // version of the server grafted onto what it read before.
+          return { userId, profileId: profileId ?? null, ...outboundView(next) }
         })
       })
       // The people who hold an extension (step 7), by user id: whom a rights profile is given to, where a direct
@@ -1238,10 +1247,13 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
       // is never acknowledged unseen.
       v1.post<{ Params: { id: string } }>('/admin/alerts/:id/acknowledge', async req => {
         const user = await administrator(req)
-        const seen = (req.body as { lastAt?: unknown } | undefined)?.lastAt
+        const body = req.body as { lastAt?: unknown; count?: unknown } | undefined
+        const seen = body?.lastAt
         if (typeof seen !== 'string' || !/^\d{4}-\d{2}-\d{2}T[0-9:.]+Z$/.test(seen) || Number.isNaN(Date.parse(seen)))
           throw Object.assign(new Error('lastAt: the lastAt of the alert as listed'), { statusCode: 400, code: 'ALERT_INVALID' })
-        const alert = await store.acknowledgeAlert(user.tenantId, req.params.id, user.id, new Date().toISOString(), new Date(seen).toISOString())
+        const count = body?.count
+        if (!Number.isInteger(count) || (count as number) < 1) throw Object.assign(new Error('count: the count of the alert as listed'), { statusCode: 400, code: 'ALERT_INVALID' })
+        const alert = await store.acknowledgeAlert(user.tenantId, req.params.id, user.id, new Date().toISOString(), new Date(seen).toISOString(), count as number)
         if (!alert) throw notFound('alert')
         if (!alert.acknowledgedAt) throw Object.assign(new Error('The alert repeated since it was listed: list it again'), { statusCode: 409, code: 'ALERT_CHANGED' })
         return publicAlert(alert)

@@ -225,7 +225,7 @@ describe('the administration screens (step 7)', () => {
     expect(text()).toContain('101 (Alice)')
     click([...host.querySelectorAll('button')].find(b => b.textContent === 'Acquitter'))
     await flush()
-    expect(acknowledgeAlert).toHaveBeenCalledWith('7', '2026-10-16T08:05:00.000Z')
+    expect(acknowledgeAlert).toHaveBeenCalledWith('7', '2026-10-16T08:05:00.000Z', 3)
     expect(text()).toContain('Aucune alerte.')
     expect(text()).toContain('Alerte acquittée.')
   })
@@ -327,23 +327,30 @@ describe('the administration screens (step 7)', () => {
     expect(setTrunk).toHaveBeenCalledWith('operator', expect.objectContaining({ auth: 'ip', password: null }))
   })
 
-  it('sends the rights with the version read, and reads them again when another administrator changed them (review 7 n°1, 11)', async () => {
-    const getOutbound = vi.fn(async () => outbound())
-    const setUserProfile = vi.fn(async () => ({ userId: 'alice', profileId: 'national', version: 'v2' }))
+  it("shows the whole setting an assignment made, another administrator's change included, and sends that with its version (review 7 n°1, 11; review 7 bis n°1)", async () => {
+    // Bob has "national" when the page opens; another administrator then takes it from him.
+    const getOutbound = vi.fn(async () => outbound({ assignments: [{ userId: 'bob', profileId: 'national' }] }))
+    const setUserProfile = vi.fn(async () => ({ userId: 'alice', profileId: 'national', ...outbound({ version: 'v2', assignments: [{ userId: 'alice', profileId: 'national' }] }) }))
     const setOutbound = vi.fn(async (): Promise<OutboundSettings> => {
       throw refused(409, 'OUTBOUND_STALE', 'the outbound setting changed since it was read')
     })
-    admin({ getOutbound, setUserProfile, setOutbound })
+    const listAdminUsers = vi.fn(async () => ({ items: [{ userId: 'alice', extension: '101', displayName: 'Alice' }, { userId: 'bob', extension: '102', displayName: 'Bob' }] }))
+    admin({ getOutbound, setUserProfile, setOutbound, listAdminUsers })
     await render('/admin/rights', <Rights />)
     // The default profile, when none: what the trunks allow; a person without a profile: the default one.
     expect(($('#rights-default') as HTMLSelectElement).options[0]!.textContent).toBe('Aucun : ce que le trunk permet')
     const ofAlice = $('select[aria-label="Profil de Alice"]') as HTMLSelectElement
+    const ofBob = () => $('select[aria-label="Profil de Bob"]') as HTMLSelectElement
     expect(ofAlice.options[0]!.textContent).toBe('Profil par défaut')
+    expect(ofBob().value).toBe('national')
     choose(ofAlice, 'national')
     click($('[aria-label="Appliquer le profil de Alice"]'))
     await flush()
     expect(setUserProfile).toHaveBeenCalledWith('alice', 'national')
-    // The next whole change goes with the version that assignment made.
+    // The page shows the setting that assignment made: Bob has no profile any more, and it says the setting changed.
+    expect(ofBob().value).toBe('')
+    expect(text()).toContain('Profil de Alice enregistré. Un autre administrateur avait modifié ces réglages entre-temps')
+    // The next whole change is made from that setting and goes with its version: Bob's change stays.
     getOutbound.mockResolvedValueOnce(outbound({ version: 'v3', profiles: [...outbound().profiles, { id: 'world', allowed: ['fixed', 'mobile', 'international'] }], assignments: [{ userId: 'alice', profileId: 'world' }] }))
     choose($('#rights-default'), 'national')
     await submit($('#rights-default')!.closest('form'))
@@ -371,7 +378,7 @@ describe('the administration screens (step 7)', () => {
     expect(text()).toContain('32 profils au plus')
   })
 
-  it('sends the caps with the version read, and shows them again as they are now when changed meanwhile (review 7 n°1)', async () => {
+  it('sends the caps with the version read; changed meanwhile, keeps what was typed and names what changed (review 7 n°1; review 7 bis n°6)', async () => {
     const getOutbound = vi.fn(async () => outbound({ policy: { caps: { concurrent: 5 } } }))
     const setOutbound = vi.fn(async (): Promise<OutboundSettings> => {
       throw refused(409, 'OUTBOUND_STALE', 'the outbound setting changed since it was read')
@@ -384,12 +391,24 @@ describe('the administration screens (step 7)', () => {
     await submit($('form'))
     await flush()
     expect(setOutbound).toHaveBeenCalledWith({ policy: { caps: { concurrent: 7 } }, profiles: outbound().profiles, assignments: [], version: 'v1' })
-    expect($('[role="alert"]')?.textContent).toContain('Un autre administrateur a modifié ces réglages')
-    // The cap the other administrator set, to check before saving again (with the version now read).
-    expect(($('#limits-tenant-concurrent') as HTMLInputElement).value).toBe('3')
-    setOutbound.mockResolvedValueOnce(outbound({ version: 'v3' }))
+    const said = $('[role="alert"]')?.textContent
+    expect(said).toContain('Un autre administrateur a modifié ces réglages')
+    // What the other administrator changed is named, nothing else.
+    expect(said).toContain("il a changé : Plafonds de l'organisation : Appels simultanés.")
+    expect(said).not.toContain('Minutes par jour')
+    // What was typed stays; saved again, it goes with the version now read, and what was changed elsewhere stays.
+    expect(($('#limits-tenant-concurrent') as HTMLInputElement).value).toBe('7')
+    setOutbound.mockResolvedValueOnce(outbound({ version: 'v3', policy: { caps: { concurrent: 7 } }, assignments: [{ userId: 'alice', profileId: 'national' }] }))
     await submit($('form'))
-    expect(setOutbound).toHaveBeenLastCalledWith({ policy: { caps: { concurrent: 3 } }, profiles: outbound().profiles, assignments: [{ userId: 'alice', profileId: 'national' }], version: 'v2' })
+    expect(setOutbound).toHaveBeenLastCalledWith({ policy: { caps: { concurrent: 7 } }, profiles: outbound().profiles, assignments: [{ userId: 'alice', profileId: 'national' }], version: 'v2' })
+    // Changed meanwhile elsewhere only (who has which profile): said so, what was typed kept.
+    setOutbound.mockRejectedValueOnce(refused(409, 'OUTBOUND_STALE', 'the outbound setting changed since it was read'))
+    getOutbound.mockResolvedValueOnce(outbound({ version: 'v4', policy: { caps: { concurrent: 7 } }, assignments: [] }))
+    type($('#limits-tenant-concurrent'), '8')
+    await submit($('form'))
+    await flush()
+    expect($('[role="alert"]')?.textContent).toContain('pas les plafonds ni les seuils')
+    expect(($('#limits-tenant-concurrent') as HTMLInputElement).value).toBe('8')
   })
 
   const seen: AdminAlert = { id: '7', kind: 'fraud-critical', param: 'callsPerMinute', scope: 'user', value: 8, threshold: 6, extension: '101', number: '+33612345678', at: '2026-10-16T08:00:00.000Z', lastAt: '2026-10-16T08:05:00.000Z', count: 3, first: { value: 7 } }
@@ -404,7 +423,7 @@ describe('the administration screens (step 7)', () => {
     listAlerts.mockResolvedValueOnce({ items: [{ ...seen, count: 4, lastAt: '2026-10-16T08:06:00.000Z' }] })
     click(button(host, 'Acquitter'))
     await flush()
-    expect(acknowledgeAlert).toHaveBeenCalledWith('7', '2026-10-16T08:05:00.000Z')
+    expect(acknowledgeAlert).toHaveBeenCalledWith('7', '2026-10-16T08:05:00.000Z', 3)
     expect(listAlerts).toHaveBeenCalledTimes(2)
     expect(text()).toContain('4 fois depuis')
     expect(document.activeElement?.getAttribute('role')).toBe('alert')
@@ -413,7 +432,7 @@ describe('the administration screens (step 7)', () => {
     acknowledgeAlert.mockResolvedValueOnce({ ...seen, count: 4, lastAt: '2026-10-16T08:06:00.000Z', acknowledgedAt: '2026-10-16T09:00:00.000Z', acknowledgedBy: 'alice' })
     click(button(host, 'Acquitter'))
     await flush()
-    expect(acknowledgeAlert).toHaveBeenLastCalledWith('7', '2026-10-16T08:06:00.000Z')
+    expect(acknowledgeAlert).toHaveBeenLastCalledWith('7', '2026-10-16T08:06:00.000Z', 4)
     expect(text()).toContain('Aucune alerte.')
     expect(document.activeElement?.getAttribute('role')).toBe('status')
     expect(document.activeElement?.textContent).toBe('Alerte acquittée.')
@@ -488,6 +507,115 @@ describe('the administration screens (step 7)', () => {
     } finally {
       vi.useRealTimers()
     }
+  })
+
+  it('shows only the answer of the last read asked: a read on its own answered late never replaces a filter or a page asked since (review 7 bis, n°4)', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    try {
+      const answers: ((v: unknown) => void)[] = []
+      const listAlerts = vi.fn(() => new Promise(resolve => answers.push(resolve)))
+      admin({ listAlerts })
+      const wait = (ms: number) => act(async () => void (await vi.advanceTimersByTimeAsync(ms)))
+      const send = (form: Element | null | undefined) => act(async () => void (form as HTMLFormElement).requestSubmit())
+      const rows = () => host.querySelectorAll('tbody tr').length
+      await act(async () =>
+        root.render(
+          <I18nProvider>
+            <MemoryRouter initialEntries={['/admin/alerts']}>
+              <Alerts />
+            </MemoryRouter>
+          </I18nProvider>
+        )
+      )
+      answers[0]!({ items: [seen], next: 'cursor' })
+      await wait(0)
+      // Read again on its own, answered late: another filter asked and answered meanwhile stays shown.
+      await wait(ALERTS_REFRESH_MS + 10)
+      expect(listAlerts).toHaveBeenCalledTimes(2)
+      choose($('#alerts-state'), 'acknowledged')
+      await send($('#alerts-state')!.closest('form'))
+      expect(listAlerts).toHaveBeenCalledTimes(3)
+      answers[2]!({ items: [{ ...seen, id: '5', acknowledgedAt: '2026-10-16T09:00:00.000Z', acknowledgedBy: 'alice' }] })
+      await wait(0)
+      answers[1]!({ items: [seen], next: 'cursor' })
+      await wait(0)
+      expect(text()).toContain('par Alice')
+      expect(button(host, 'Acquitter')).toBeUndefined()
+      // The next page asked while the first is read again on its own: the late first page does not take it away.
+      choose($('#alerts-state'), 'open')
+      await send($('#alerts-state')!.closest('form'))
+      answers[3]!({ items: [seen], next: 'cursor' })
+      await wait(0)
+      await wait(ALERTS_REFRESH_MS + 10)
+      expect(listAlerts).toHaveBeenCalledTimes(5)
+      click(button(host, "Afficher plus d'alertes"))
+      expect(listAlerts).toHaveBeenCalledTimes(6)
+      answers[5]!({ items: [{ ...seen, id: '6' }] })
+      await wait(0)
+      expect(rows()).toBe(2)
+      answers[4]!({ items: [seen], next: 'cursor' })
+      await wait(0)
+      expect(rows()).toBe(2)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('reads nothing on its own while the focus is in the list, nor once asked not to (review 7 bis, n°5)', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    try {
+      const listAlerts = vi.fn(async () => ({ items: [seen] }))
+      admin({ listAlerts })
+      const wait = (ms: number) => act(async () => void (await vi.advanceTimersByTimeAsync(ms)))
+      await act(async () =>
+        root.render(
+          <I18nProvider>
+            <MemoryRouter initialEntries={['/admin/alerts']}>
+              <Alerts />
+            </MemoryRouter>
+          </I18nProvider>
+        )
+      )
+      await wait(0)
+      expect(listAlerts).toHaveBeenCalledTimes(1)
+      // The focus on the button of a row: nothing moves under it, however long.
+      act(() => button(host, 'Acquitter')!.focus())
+      await wait(ALERTS_REFRESH_MS * 3)
+      expect(listAlerts).toHaveBeenCalledTimes(1)
+      act(() => (document.activeElement as HTMLElement).blur())
+      await wait(ALERTS_REFRESH_MS + 10)
+      expect(listAlerts).toHaveBeenCalledTimes(2)
+      // Asked not to: nothing more until asked again.
+      const auto = () => $('#alerts-auto') as HTMLInputElement
+      expect(auto().checked).toBe(true)
+      expect(auto().closest('label')?.textContent).toContain('Relire la liste toutes les 30 secondes')
+      click(auto())
+      expect(auto().checked).toBe(false)
+      await wait(ALERTS_REFRESH_MS * 3)
+      expect(listAlerts).toHaveBeenCalledTimes(2)
+      click(auto())
+      await wait(ALERTS_REFRESH_MS + 10)
+      expect(listAlerts).toHaveBeenCalledTimes(3)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('says a group removed meanwhile is gone rather than the platform unable, and reads the list again (review 7 bis, n°11)', async () => {
+    const listGroups = vi.fn(async () => ({ items: [{ number: '200', name: 'Accueil', members: ['101'] }] }))
+    // As the client says it: no code, the words of the Gateway.
+    const setGroup = vi.fn(async () => Promise.reject(Object.assign(new Error('Gateway 404'), { status: 404, detail: 'No such group' })))
+    admin({ listGroups, setGroup })
+    await render('/admin/groups', <RingGroups />)
+    click($('[aria-label="Modifier le groupe 200"]'))
+    await flush()
+    listGroups.mockResolvedValueOnce({ items: [] })
+    await submit($('form'))
+    await flush()
+    expect(setGroup).toHaveBeenCalled()
+    expect(listGroups).toHaveBeenCalledTimes(2)
+    expect($('[role="alert"]')?.textContent).toContain("Cet élément n'existe plus")
+    expect(text()).not.toContain('ne permet pas cette action')
   })
 
   it('checks a ring group before sending, the problems next to their fields, and puts the refusals of the Gateway there (review 7 n°7)', async () => {

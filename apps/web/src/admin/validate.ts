@@ -58,13 +58,21 @@ const hostPort = (value: string) => {
 export const splitList = (text: string) => text.split(/[\s,;]+/).filter(Boolean)
 
 /**
+ * Where the 0 of the national form is dialled from abroad too: Italy, San Marino, the Vatican (`+39 06…`). A « (0) »
+ * there is part of the number.
+ */
+const ZERO_KEPT = /^\s*(?:\+|00)\s*(?:39|378|379)/
+
+/**
  * A number as an administrator may type it (`01 99 00 01 00`, `+33 1 99…`, `0033…`, `+33 (0)1 99…`), in E.164 when it
  * reads as one; otherwise what was typed, without its spaces (the check says what is wrong). The « (0) » after a
- * country code is the trunk prefix of the national form: never dialled from abroad, so left out.
+ * country code is the trunk prefix of the national form: never dialled from abroad, so left out, except where it is
+ * dialled (ZERO_KEPT). A 0 typed without brackets stays: refused for France (+330…) by the check; for other countries
+ * (`+44 020…`) the check cannot tell, what their operator accepts decides (the pilot is French).
  */
 export const normaliseNumber = (text: string): string => {
   const international = /^\s*(\+|00)/.test(text)
-  const compact = (international ? text.replace(/\(\s*0\s*\)/g, '') : text).replace(/[\s.()-]/g, '')
+  const compact = (international && !ZERO_KEPT.test(text) ? text.replace(/\(\s*0\s*\)/g, '') : text).replace(/[\s.()-]/g, '')
   if (/^00[1-9]/.test(compact)) return `+${compact.slice(2)}`
   if (/^0[1-9][0-9]{8}$/.test(compact)) return `+33${compact.slice(1)}`
   return compact
@@ -451,6 +459,9 @@ export const refusalOf = <F extends string>(err: unknown, fields: (gatewayField:
     if (found) return found
   }
   if (status === 403) return { field: 'form', problem: p('admin.err.forbidden') }
+  // Not found: what was changed or removed no longer exists (another administrator removed it; the page reads its
+  // list again), unless it is the platform that has none for this organisation (review 7 bis, n°11).
+  if (status === 404 && !/^No provider/.test(detail)) return { field: 'form', problem: p('admin.err.gone') }
   if (status === 404 || status === 501) return { field: 'form', problem: p('admin.err.unavailable') }
   if (status === 503 && code === 'SYNC_RUNNING') return { field: 'form', problem: p('admin.groupSyncRunning') }
   if (status === 400 || status === 409) return { field: 'form', problem: p('admin.err.refused') }

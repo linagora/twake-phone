@@ -308,6 +308,7 @@
   "admin.err.didLimit": "Le nombre maximal de plages de numéros directs est atteint.",
   "admin.err.profileLimit": "{max} profils au plus : supprimez-en un avant d'en créer un autre.",
   "admin.err.stale": "Un autre administrateur a modifié ces réglages depuis l'ouverture de la page : rien n'a été enregistré, et ce qu'ils sont maintenant vient d'être relu. Vérifiez puis recommencez.",
+  "admin.err.gone": "Cet élément n'existe plus : un autre administrateur l'a sans doute supprimé. La liste vient d'être relue.",
   "admin.err.targetUnknown": "Ce numéro n'est ni un poste attribué ni un groupe d'appel de votre organisation.",
   "admin.class.fixed": "Fixes en métropole",
   "admin.class.mobile": "Mobiles",
@@ -487,6 +488,7 @@
   "admin.rights.apply": "Appliquer",
   "admin.rights.applyFor": "Appliquer le profil de {name}",
   "admin.rights.assigned": "Profil de {name} enregistré.",
+  "admin.rights.changedMeanwhile": "Un autre administrateur avait modifié ces réglages entre-temps : la page montre maintenant ce qu'ils sont.",
   "admin.rights.err.id": "L'identifiant : lettres minuscules, chiffres et tirets, 32 au plus, sans tiret au début.",
   "admin.rights.err.idTaken": "Un profil a déjà cet identifiant : modifiez-le depuis la liste.",
   "admin.rights.err.name": "Le nom tient sur une ligne, 64 caractères au plus.",
@@ -507,6 +509,8 @@
   "admin.limits.userHint": "Pour chaque personne qui n'a pas de profil, ou dont le profil n'en fixe pas.",
   "admin.limits.save": "Enregistrer les plafonds et les seuils",
   "admin.limits.saved": "Plafonds et seuils enregistrés.",
+  "admin.limits.changed": "Un autre administrateur a modifié ces réglages depuis l'ouverture de la page : rien n'a été enregistré. Votre saisie est gardée ; il a changé : {fields}. Vérifiez ces valeurs, puis enregistrez de nouveau.",
+  "admin.limits.changedElsewhere": "Un autre administrateur a modifié ces réglages depuis l'ouverture de la page (pas les plafonds ni les seuils) : rien n'a été enregistré. Votre saisie est gardée : enregistrez de nouveau.",
   "admin.limits.err.cap": "Un nombre entier de 1 à {max}.",
   "admin.limits.err.threshold": "Des nombres entiers de 0 (aucun) à {max}.",
   "admin.limits.err.thresholdOrder": "Le seuil d'alerte ne dépasse pas le seuil critique.",
@@ -558,5 +562,7 @@
   "admin.alert.gone": "Cette alerte n'existe plus (supprimée au bout de sa durée de conservation) : la liste vient d'être relue.",
   "admin.alert.acknowledgedBy": "Acquittée le {date} par {by}",
   "admin.alert.more": "Afficher plus d'alertes",
-  "admin.alert.refresh": "Relire les alertes"
+  "admin.alert.refresh": "Relire les alertes",
+  "admin.alert.auto": "Relire la liste toutes les {seconds} secondes",
+  "admin.alert.autoHint": "Jamais tant que le focus est dans la liste, ni une fois plus d'une page affichée."
 }

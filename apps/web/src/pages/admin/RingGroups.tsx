@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState, type FormEvent } from 'react'
 import type { RingGroup } from '@twake/telephony-client'
 import { ConfirmDelete, NoteLine, ProblemSummary, Section, TextField, useFocusLater, useProblem, type Note } from '../../admin/ui.js'
-import { GROUP_FIELDS, checkGroup, emptyGroup, groupRefusal, refusalOf, type GroupField, type GroupForm, type Problems } from '../../admin/validate.js'
+import { GROUP_FIELDS, checkGroup, emptyGroup, groupRefusal, refusalOf, refusalStatus, type GroupField, type GroupForm, type Problems } from '../../admin/validate.js'
 import { useGateway } from '../../gateway.js'
 import { useT } from '../../i18n/useT.js'
 
@@ -64,6 +64,8 @@ export const RingGroups = () => {
       load()
     } catch (err) {
       const refusal = groupRefusal(err)
+      // Gone meanwhile (another administrator removed it): the list shown is read again.
+      if (refusalStatus(err) === 404) load()
       if (refusal.field === 'form') setNote({ kind: 'error', text: say(refusal.problem)! })
       else {
         const next = { [refusal.field]: refusal.problem }

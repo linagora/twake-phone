@@ -1,6 +1,7 @@
 import { readdir, readFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import pg from 'pg'
+import { EMPTY_OUTBOUND, outboundVersion, staleOutbound } from '../outbound.js'
 import { ALERT_DEDUP_MS, alertKey, clampLimit, type AlertQuery, type AlertRecord, type StoredAlert, type ConferenceRecord, type DidRecord, type OutboundRecord, type HistoryEntry, type HistoryPage, type HistoryQuery, type MappingSource, type ProviderRecord, type PushSaveResult, type PushSubscriptionRecord, type Store, type TrunkRecord, type UserMapping, type UserPresenceRecord, type VapidKeysRecord } from './types.js'
 
 const MIGRATIONS = fileURLToPath(new URL('../../migrations/', import.meta.url))
@@ -378,12 +379,34 @@ export class PgStore implements Store {
     return r ? { tenantId: r.tenant_id, policy: r.policy, profiles: r.profiles, assignments: r.assignments } : null
   }
 
-  async setOutbound(o: OutboundRecord) {
-    await this.pool.query(
-      `INSERT INTO outbound_policies (tenant_id, policy, profiles, assignments) VALUES ($1, $2, $3, $4)
-       ON CONFLICT (tenant_id) DO UPDATE SET policy = EXCLUDED.policy, profiles = EXCLUDED.profiles, assignments = EXCLUDED.assignments, updated_at = now()`,
-      [o.tenantId, JSON.stringify(o.policy), JSON.stringify(o.profiles), JSON.stringify(o.assignments)]
-    )
+  async setOutbound(o: OutboundRecord, expected?: string) {
+    const write = (q: pg.Pool | pg.PoolClient) =>
+      q.query(
+        `INSERT INTO outbound_policies (tenant_id, policy, profiles, assignments) VALUES ($1, $2, $3, $4)
+         ON CONFLICT (tenant_id) DO UPDATE SET policy = EXCLUDED.policy, profiles = EXCLUDED.profiles, assignments = EXCLUDED.assignments, updated_at = now()`,
+        [o.tenantId, JSON.stringify(o.policy), JSON.stringify(o.profiles), JSON.stringify(o.assignments)]
+      )
+    if (expected === undefined) {
+      await write(this.pool)
+      return
+    }
+    // Checked and written in one transaction, one writer of the tenant's rules at a time in the whole database (a
+    // lock that holds whatever process writes, and when there is no row yet): never two changes made from one version.
+    const client = await this.pool.connect()
+    try {
+      await client.query('BEGIN')
+      await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [`outbound_policies|${o.tenantId}`])
+      const { rows } = await client.query<OutboundRow>('SELECT tenant_id, policy, profiles, assignments FROM outbound_policies WHERE tenant_id = $1', [o.tenantId])
+      const r = rows[0]
+      if (outboundVersion(r ? { policy: r.policy, profiles: r.profiles, assignments: r.assignments } : EMPTY_OUTBOUND) !== expected) throw staleOutbound()
+      await write(client)
+      await client.query('COMMIT')
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => undefined)
+      throw err
+    } finally {
+      client.release()
+    }
   }
 
   async addAlert(a: AlertRecord) {
@@ -421,16 +444,17 @@ export class PgStore implements Store {
     return rows.map(alertOf)
   }
 
-  async acknowledgeAlert(tenantId: string, id: string, by: string, at: string, seen: string) {
+  async acknowledgeAlert(tenantId: string, id: string, by: string, at: string, seen: string, count: number) {
     if (!/^[1-9][0-9]{0,17}$/.test(id)) return null
     // The first acknowledgement stays: who did it, and when. Only as it was seen: a repeat counted since (its row
-    // locked by this update, or updated before it) leaves it open. Times to the millisecond, as they are shown.
+    // locked by this update, or updated before it) leaves it open. Times to the millisecond, as they are shown; the
+    // count too, which a repeat always raises (its time may stay: the same millisecond, or one dated before).
     const { rows } = await this.pool.query<AlertRow>(
       `UPDATE telephony_alerts SET
-         acknowledged_at = coalesce(acknowledged_at, CASE WHEN date_trunc('milliseconds', last_at) = $5::timestamptz THEN $3::timestamptz END),
-         acknowledged_by = coalesce(acknowledged_by, CASE WHEN date_trunc('milliseconds', last_at) = $5::timestamptz THEN $4 END)
+         acknowledged_at = coalesce(acknowledged_at, CASE WHEN date_trunc('milliseconds', last_at) = $5::timestamptz AND count = $6 THEN $3::timestamptz END),
+         acknowledged_by = coalesce(acknowledged_by, CASE WHEN date_trunc('milliseconds', last_at) = $5::timestamptz AND count = $6 THEN $4 END)
        WHERE tenant_id = $1 AND id = $2::bigint RETURNING ${ALERT_COLUMNS}`,
-      [tenantId, id, at, by, seen]
+      [tenantId, id, at, by, seen, count]
     )
     return rows[0] ? alertOf(rows[0]) : null
   }

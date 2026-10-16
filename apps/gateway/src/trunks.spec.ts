@@ -362,6 +362,17 @@ describe('trunk routes', () => {
     // Another tenant has its own state.
     expect((await app.inject({ url: '/api/v1/admin/trunks/status', headers: as('root', 'twakephone-admin', 'B') })).statusCode).toBe(200)
     expect(reads).toBe(2)
+    // A trunk saved, or removed, within the window: the next screen reads the state again (review 7 bis, n°7).
+    expect((await app.inject({ method: 'PUT', url: '/api/v1/admin/trunks/operator', headers: admin, payload: trunk })).statusCode).toBe(201)
+    await app.inject({ url: '/api/v1/admin/trunks/status', headers: admin })
+    expect(reads).toBe(3)
+    expect((await app.inject({ method: 'DELETE', url: '/api/v1/admin/trunks/operator', headers: admin })).statusCode).toBe(204)
+    await app.inject({ url: '/api/v1/admin/trunks/status', headers: admin })
+    expect(reads).toBe(4)
+    // Saving one, refused: nothing changed, the state read stays.
+    expect((await app.inject({ method: 'PUT', url: '/api/v1/admin/trunks/operator', headers: admin, payload: { ...trunk, domain: '' } })).statusCode).toBe(400)
+    await app.inject({ url: '/api/v1/admin/trunks/status', headers: admin })
+    expect(reads).toBe(4)
 
     const { app: failing, admin: root } = await setup({ logged, statusCacheMs: 0, status: async () => (fail ? Promise.reject(new Error('MI timeout')) : []) })
     fail = true

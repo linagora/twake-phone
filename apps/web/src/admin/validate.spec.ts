@@ -62,6 +62,16 @@ describe('the trunk form (step 7)', () => {
     expect(checkDid({ ...emptyDid('operator'), id: 'x', first: '+330199000101', target: '101' }, { isNew: true, trunks: [{ id: 'operator' }], others: [] }).problems.first?.key).toBe('admin.did.err.number')
   })
 
+  it('keeps the « (0) » where the 0 is dialled from abroad: Italy, San Marino, the Vatican (review 7 bis, n°9)', () => {
+    expect(normaliseNumber('+39 (0)6 1234 5678')).toBe('+390612345678')
+    expect(normaliseNumber('0039 (0)6 1234 5678')).toBe('+390612345678')
+    expect(normaliseNumber('+378 (0)549 123456')).toBe('+3780549123456')
+    expect(normaliseNumber('+379 (0)6 6988 1234')).toBe('+3790669881234')
+    // Only those: the Netherlands (+31) and the United Kingdom leave it out.
+    expect(normaliseNumber('+31 (0)20 123 4567')).toBe('+31201234567')
+    expect(normaliseNumber('+44 (0)20 7946 0123')).toBe('+442079460123')
+  })
+
   it('says what is wrong with an empty form, as the Gateway would, field by field', () => {
     const { input, problems } = checkTrunk(emptyTrunk(), { ids: [] })
     expect(input).toBeUndefined()
@@ -232,6 +242,15 @@ describe('the ring group form (review 7 n°7)', () => {
     expect(groupRefusal(refused(400, 'GROUP_NAME', 'x')).field).toBe('name')
     expect(groupRefusal(refused(400, 'GROUP_MEMBER_NOT_EXTENSION', 'x'))).toEqual({ field: 'members', problem: { key: 'admin.groupMemberNotExtension' } })
     expect(groupRefusal(refused(503, 'SYNC_RUNNING', 'x'))).toEqual({ field: 'form', problem: { key: 'admin.groupSyncRunning' } })
+  })
+
+  it('says a group, a trunk or a range removed meanwhile is gone, not that the platform cannot (review 7 bis, n°11)', () => {
+    expect(groupRefusal(refused(404, '', 'No such group'))).toEqual({ field: 'form', problem: { key: 'admin.err.gone' } })
+    expect(trunkRefusal(refused(404, '', 'No such trunk'))).toEqual({ field: 'form', problem: { key: 'admin.err.gone' } })
+    expect(didRefusal(refused(404, '', 'No such range'))).toEqual({ field: 'form', problem: { key: 'admin.err.gone' } })
+    // No SIP server for the organisation, and a platform without the feature: that is the platform.
+    expect(groupRefusal(refused(404, '', 'No provider for tenant'))).toEqual({ field: 'form', problem: { key: 'admin.err.unavailable' } })
+    expect(trunkRefusal(refused(501, '', 'Trunks are not available on this platform'))).toEqual({ field: 'form', problem: { key: 'admin.err.unavailable' } })
   })
 })
 

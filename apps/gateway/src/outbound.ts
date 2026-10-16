@@ -144,6 +144,9 @@ const canonical = (v: unknown): string =>
  * when the setting changed since (409 OUTBOUND_STALE): a screen opened earlier never undoes what another administrator
  * did meanwhile (a right withdrawn from a compromised account, a cap lowered).
  */
+/** The refusal of a change made to a setting that is no longer the one read. */
+export const staleOutbound = () => Object.assign(new Error('The outbound rules changed since they were read: read them again'), { statusCode: 409, code: 'OUTBOUND_STALE' })
+
 export const outboundVersion = (o: Outbound): string => createHash('sha256').update(canonical({ policy: o.policy, profiles: o.profiles, assignments: o.assignments })).digest('base64url').slice(0, 22)
 
 /** Nothing set: no profile (what the trunks call), the default caps and thresholds. */

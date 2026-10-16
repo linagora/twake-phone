@@ -308,6 +308,7 @@
   "admin.err.didLimit": "The maximum number of direct number ranges is reached.",
   "admin.err.profileLimit": "{max} profiles at most: delete one before creating another.",
   "admin.err.stale": "Another administrator changed these settings since this page was opened: nothing was saved, and what they are now has just been read again. Check them, then try again.",
+  "admin.err.gone": "This item no longer exists: another administrator probably deleted it. The list has just been read again.",
   "admin.err.targetUnknown": "This number is neither an assigned extension nor a ring group of your organisation.",
   "admin.class.fixed": "Mainland landlines",
   "admin.class.mobile": "Mobiles",
@@ -487,6 +488,7 @@
   "admin.rights.apply": "Apply",
   "admin.rights.applyFor": "Apply the profile of {name}",
   "admin.rights.assigned": "Profile of {name} saved.",
+  "admin.rights.changedMeanwhile": "Another administrator had changed these settings meanwhile: the page now shows what they are.",
   "admin.rights.err.id": "The identifier: lower case letters, digits and dashes, 32 at most, not starting with a dash.",
   "admin.rights.err.idTaken": "A profile already has this identifier: edit it from the list.",
   "admin.rights.err.name": "The name fits on one line, 64 characters at most.",
@@ -507,6 +509,8 @@
   "admin.limits.userHint": "For each person without a profile, or whose profile sets none.",
   "admin.limits.save": "Save caps and thresholds",
   "admin.limits.saved": "Caps and thresholds saved.",
+  "admin.limits.changed": "Another administrator changed these settings since this page was opened: nothing was saved. What you typed is kept; they changed: {fields}. Check these values, then save again.",
+  "admin.limits.changedElsewhere": "Another administrator changed these settings since this page was opened (neither the caps nor the thresholds): nothing was saved. What you typed is kept: save again.",
   "admin.limits.err.cap": "A whole number from 1 to {max}.",
   "admin.limits.err.threshold": "Whole numbers from 0 (none) to {max}.",
   "admin.limits.err.thresholdOrder": "The warning threshold does not exceed the critical one.",
@@ -558,5 +562,7 @@
   "admin.alert.gone": "This alert no longer exists (removed at the end of its retention period): the list has just been read again.",
   "admin.alert.acknowledgedBy": "Acknowledged on {date} by {by}",
   "admin.alert.more": "Show more alerts",
-  "admin.alert.refresh": "Read the alerts again"
+  "admin.alert.refresh": "Read the alerts again",
+  "admin.alert.auto": "Read the list again every {seconds} seconds",
+  "admin.alert.autoHint": "Never while the focus is in the list, nor once more than one page is shown."
 }

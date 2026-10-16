@@ -288,17 +288,21 @@ export class TelephonyClient {
   }
 
   /**
-   * Replaces them whole (profiles, policy, assignments). With the `version` read, refused (409 OUTBOUND_STALE) when
-   * another administrator changed them since: read them again before writing.
+   * Replaces them whole (profiles, policy, assignments), made from the `version` read: refused (409 OUTBOUND_STALE)
+   * when another administrator changed them since, read them again before writing. Always with it: the Gateway takes
+   * a change without one (a script that replaces whatever there is), an app never sends one.
    */
-  setOutbound(settings: Pick<OutboundSettings, 'policy' | 'profiles' | 'assignments'> & { version?: string }) {
+  setOutbound(settings: Pick<OutboundSettings, 'policy' | 'profiles' | 'assignments' | 'version'>) {
     const { policy, profiles, assignments, version } = settings
-    return this.request<OutboundSettings>('/admin/outbound', { method: 'PUT', body: JSON.stringify({ policy, profiles, assignments, ...(version ? { version } : {}) }) })
+    return this.request<OutboundSettings>('/admin/outbound', { method: 'PUT', body: JSON.stringify({ policy, profiles, assignments, version }) })
   }
 
-  /** Gives one person a profile, or the default one (`null`); says the version of the setting it makes. */
+  /**
+   * Gives one person a profile, or the default one (`null`); answers the whole setting it makes, with its version
+   * (another administrator's changes included): show that, never this version with what was read before.
+   */
   setUserProfile(userId: string, profileId: string | null) {
-    return this.request<{ userId: string; profileId: string | null; version: string }>(`/admin/outbound/users/${encodeURIComponent(userId)}`, { method: 'PUT', body: JSON.stringify({ profileId }) })
+    return this.request<{ userId: string; profileId: string | null } & OutboundSettings>(`/admin/outbound/users/${encodeURIComponent(userId)}`, { method: 'PUT', body: JSON.stringify({ profileId }) })
   }
 
   /** A page of alerts, the latest repeated first (`next`: the `before` of the next page). */
@@ -310,11 +314,11 @@ export class TelephonyClient {
   }
 
   /**
-   * Acknowledges an alert as it was seen (`lastAt`, its last repeat shown): refused (409 ALERT_CHANGED) when it
-   * repeated since, so that a repeat nobody saw is never acknowledged.
+   * Acknowledges an alert as it was seen (`lastAt` and `count`, its last repeat and how many shown): refused (409
+   * ALERT_CHANGED) when it repeated since, so that a repeat nobody saw is never acknowledged.
    */
-  acknowledgeAlert(id: string, lastAt: string) {
-    return this.request<AdminAlert>(`/admin/alerts/${encodeURIComponent(id)}/acknowledge`, { method: 'POST', body: JSON.stringify({ lastAt }) })
+  acknowledgeAlert(id: string, lastAt: string, count: number) {
+    return this.request<AdminAlert>(`/admin/alerts/${encodeURIComponent(id)}/acknowledge`, { method: 'POST', body: JSON.stringify({ lastAt, count }) })
   }
 
   getMediaSession() {

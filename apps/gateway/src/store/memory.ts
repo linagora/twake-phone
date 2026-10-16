@@ -1,4 +1,5 @@
 import { clampLimit, isDeclined, isMissed, type HistoryEntry, type HistoryPage, type HistoryQuery, type ConferenceRecord, type AlertRecord, type AlertQuery, type DidRecord, type OutboundRecord, ALERT_DEDUP_MS, alertKey, type ProviderRecord, type StoredAlert, type PushSaveResult, type PushSubscriptionRecord, type Store, type TrunkRecord, type UserMapping, type UserPresenceRecord, type VapidKeysRecord } from './types.js'
+import { EMPTY_OUTBOUND, outboundVersion, staleOutbound } from '../outbound.js'
 
 const key = (...parts: string[]) => parts.join('\u0000')
 
@@ -240,7 +241,8 @@ export class MemoryStore implements Store {
     return r ? structuredClone(r) : null
   }
 
-  async setOutbound(record: OutboundRecord) {
+  async setOutbound(record: OutboundRecord, expected?: string) {
+    if (expected !== undefined && outboundVersion(this.outbound.get(record.tenantId) ?? EMPTY_OUTBOUND) !== expected) throw staleOutbound()
     this.outbound.set(record.tenantId, structuredClone(record))
   }
 
@@ -268,10 +270,10 @@ export class MemoryStore implements Store {
       .map(a => structuredClone(a))
   }
 
-  async acknowledgeAlert(tenantId: string, id: string, by: string, at: string, seen: string) {
+  async acknowledgeAlert(tenantId: string, id: string, by: string, at: string, seen: string, count: number) {
     const alert = this.alerts.find(a => a.tenantId === tenantId && a.id === id)
     if (!alert) return null
-    if (!alert.acknowledgedAt && Date.parse(alert.lastAt) === Date.parse(seen)) Object.assign(alert, { acknowledgedAt: at, acknowledgedBy: by })
+    if (!alert.acknowledgedAt && Date.parse(alert.lastAt) === Date.parse(seen) && alert.count === count) Object.assign(alert, { acknowledgedAt: at, acknowledgedBy: by })
     return structuredClone(alert)
   }
 

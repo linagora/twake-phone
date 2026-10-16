@@ -89,7 +89,7 @@ describe('the fallback (FR-C8, review 6b, n°1)', () => {
 
 describe('outbound routes', () => {
   type Handed = [OutboundPolicy, OutboundProfile[], OutboundAssignment[]]
-  const setup = async (opts: { store?: MemoryStore; without?: boolean; noSecretsKey?: boolean; events?: RoutedEvent[]; beforeStart?: (app: Awaited<ReturnType<typeof buildApp>>) => void } = {}) => {
+  const setup = async (opts: { store?: MemoryStore; without?: boolean; noSecretsKey?: boolean; events?: RoutedEvent[]; beforeStart?: (app: Awaited<ReturnType<typeof buildApp>>) => void; turnMaxMs?: number; slow?: () => Promise<void> } = {}) => {
     process.env.AUTH_MODE = 'dev'
     const store = opts.store ?? new MemoryStore()
     await store.upsertMapping({ tenantId: 'A', userId: 'alice', extension: '101' })
@@ -106,6 +106,7 @@ describe('outbound routes', () => {
         ? {}
         : {
             setOutboundPolicy: async (...args: Handed) => {
+              await opts.slow?.()
               handed.push(args)
               const fail = control.fail
               control.fail = undefined
@@ -122,7 +123,7 @@ describe('outbound routes', () => {
       published.push(event)
       publish(tenantId, userId, event)
     }
-    const app = await buildApp(registry, { store, bus, directory: new StoreDirectory(store), tickets: new TicketStore(), admin: { adminRole: 'twakephone-admin', adminUsers: new Set() }, ...(opts.noSecretsKey ? {} : { secretsKey: randomBytes(32) }) })
+    const app = await buildApp(registry, { store, bus, directory: new StoreDirectory(store), tickets: new TicketStore(), admin: { adminRole: 'twakephone-admin', adminUsers: new Set() }, ...(opts.noSecretsKey ? {} : { secretsKey: randomBytes(32) }), ...(opts.turnMaxMs ? { turnMaxMs: opts.turnMaxMs } : {}) })
     opts.beforeStart?.(app)
     registry.startAll()
     const as = (user: string, roles?: string, tenant = 'A') => ({ 'x-dev-user': user, 'x-dev-tenant': tenant, ...(roles ? { 'x-dev-roles': roles } : {}) })
@@ -144,7 +145,16 @@ describe('outbound routes', () => {
     expect(handed.at(-1)).toEqual([{ defaultProfile: 'internal', caps: { concurrent: 4 } }, [expect.objectContaining({ id: 'national', allowed: ['fixed', 'mobile'] }), { id: 'internal', allowed: [] }], [{ userId: 'alice', profileId: 'national' }]])
     expect((await store.getOutbound('A'))?.assignments).toEqual([{ userId: 'alice', profileId: 'national' }])
     // One person's profile, or back to the default one.
-    expect((await app.inject({ method: 'PUT', url: '/api/v1/admin/outbound/users/bob', headers: admin, payload: { profileId: 'national' } })).json()).toEqual({ userId: 'bob', profileId: 'national', version: expect.any(String) })
+    // The whole setting as it is now comes back, with its version (review 7 bis, n°1).
+    expect((await app.inject({ method: 'PUT', url: '/api/v1/admin/outbound/users/bob', headers: admin, payload: { profileId: 'national' } })).json()).toEqual({
+      userId: 'bob',
+      profileId: 'national',
+      policy: { defaultProfile: 'internal', caps: { concurrent: 4 } },
+      profiles: [expect.objectContaining({ id: 'national' }), { id: 'internal', allowed: [] }],
+      assignments: [{ userId: 'alice', profileId: 'national' }, { userId: 'bob', profileId: 'national' }],
+      version: expect.any(String),
+      defaults: expect.objectContaining({ caps: expect.any(Object) })
+    })
     expect(handed.at(-1)![2]).toEqual([{ userId: 'alice', profileId: 'national' }, { userId: 'bob', profileId: 'national' }])
     expect((await app.inject({ method: 'PUT', url: '/api/v1/admin/outbound/users/alice', headers: admin, payload: { profileId: null } })).statusCode).toBe(200)
     expect((await store.getOutbound('A'))?.assignments).toEqual([{ userId: 'bob', profileId: 'national' }])
@@ -180,6 +190,56 @@ describe('outbound routes', () => {
     expect((await app.inject({ method: 'PUT', url: '/api/v1/admin/outbound', headers: admin, payload: { ...now, policy: { caps: { concurrent: 3 } }, version: put.json().version } })).statusCode).toBe(409)
     expect((await app.inject({ method: 'PUT', url: '/api/v1/admin/outbound', headers: admin, payload: { ...now, policy: { caps: { concurrent: 3 } } } })).statusCode).toBe(200)
     expect((await app.inject({ method: 'PUT', url: '/api/v1/admin/outbound', headers: admin, payload: { profiles, version: 7 } })).statusCode).toBe(400)
+  })
+
+  it("never undoes another administrator's change after an assignment: the screen gets the whole setting it made (review 7 bis, n°1)", async () => {
+    const { app, admin, store } = await setup()
+    const read = async () => (await app.inject({ url: '/api/v1/admin/outbound', headers: admin })).json()
+    await app.inject({ method: 'PUT', url: '/api/v1/admin/outbound', headers: admin, payload: { profiles, assignments: [{ userId: 'bob', profileId: 'national' }] } })
+    // A reads; B withdraws "national" from Bob; A gives Alice a profile, then saves the default profile.
+    const a = await read()
+    const b = await read()
+    expect((await app.inject({ method: 'PUT', url: '/api/v1/admin/outbound', headers: admin, payload: { ...b, assignments: [{ userId: 'bob', profileId: 'internal' }] } })).statusCode).toBe(200)
+    const assigned = (await app.inject({ method: 'PUT', url: '/api/v1/admin/outbound/users/alice', headers: admin, payload: { profileId: 'national' } })).json()
+    // What A's screen shows now is the whole setting, Bob's change included, with the version of exactly that.
+    expect(assigned.assignments).toEqual([{ userId: 'bob', profileId: 'internal' }, { userId: 'alice', profileId: 'national' }])
+    const { userId: _u, profileId: _p, ...view } = assigned
+    expect(view).toEqual(await read())
+    // What A read before, sent with its own version: refused. What the assignment gave, sent: kept, Bob untouched.
+    expect((await app.inject({ method: 'PUT', url: '/api/v1/admin/outbound', headers: admin, payload: { ...a, policy: { defaultProfile: 'national' } } })).statusCode).toBe(409)
+    const saved = await app.inject({ method: 'PUT', url: '/api/v1/admin/outbound', headers: admin, payload: { ...assigned, policy: { defaultProfile: 'national' } } })
+    expect(saved.statusCode).toBe(200)
+    expect((await store.getOutbound('A'))?.assignments).toEqual([{ userId: 'bob', profileId: 'internal' }, { userId: 'alice', profileId: 'national' }])
+  })
+
+  it('refuses the second of two changes made from the same version, even once the turn of the first one has ended (review 7 bis, n°2)', async () => {
+    const store = new MemoryStore()
+    // A provider slow to take the first change: longer than the turn of a tenant lasts.
+    let release: (() => void) | undefined
+    let hold = false
+    const { app, admin, handed } = await setup({
+      store,
+      turnMaxMs: 50,
+      slow: () => {
+        if (!hold) return Promise.resolve()
+        hold = false
+        return new Promise<void>(resolve => (release = resolve))
+      }
+    })
+    const { version } = (await app.inject({ url: '/api/v1/admin/outbound', headers: admin })).json()
+    hold = true
+    const first = app.inject({ method: 'PUT', url: '/api/v1/admin/outbound', headers: admin, payload: { profiles, policy: { caps: { concurrent: 1 } }, version } })
+    await settle(() => release !== undefined)
+    // The second one, made from the same version, goes once the turn of the first has run out: kept.
+    const second = await app.inject({ method: 'PUT', url: '/api/v1/admin/outbound', headers: admin, payload: { profiles, policy: { caps: { concurrent: 2 } }, version } })
+    expect(second.statusCode).toBe(200)
+    release!()
+    // The first one, then: refused as the store writes, and the provider handed back what the store keeps.
+    const res = await first
+    expect(res.statusCode).toBe(409)
+    expect(res.json()).toMatchObject({ code: 'OUTBOUND_STALE' })
+    expect((await store.getOutbound('A'))?.policy).toEqual({ caps: { concurrent: 2 } })
+    expect(handed.at(-1)![0]).toEqual({ caps: { concurrent: 2 } })
   })
 
   it('says how many profiles at most, with its own code (review 7, n°14)', async () => {
@@ -302,26 +362,36 @@ describe('outbound routes', () => {
     await settle(async () => (await store.listAlerts('A')).length === 1)
     const [seen] = (await app.inject({ url: '/api/v1/admin/alerts', headers: admin })).json().items
     expect(seen).not.toHaveProperty('acknowledgedAt')
-    const ack = (id: string, lastAt: unknown, headers = admin) => app.inject({ method: 'POST', url: `/api/v1/admin/alerts/${id}/acknowledge`, headers, payload: lastAt === undefined ? {} : { lastAt } })
-    expect((await ack(seen.id, seen.lastAt, as('bob'))).statusCode).toBe(403)
+    // As listed: its last time and how many times (review 7 bis, n°3).
+    const ack = (id: string, lastAt: unknown, count: unknown, headers = admin) =>
+      app.inject({ method: 'POST', url: `/api/v1/admin/alerts/${id}/acknowledge`, headers, payload: { ...(lastAt === undefined ? {} : { lastAt }), ...(count === undefined ? {} : { count }) } })
+    expect((await ack(seen.id, seen.lastAt, seen.count, as('bob'))).statusCode).toBe(403)
     // Repeated between the list and the click (review 7, n°2): 409, still open, the repeat in view.
     await store.addAlert({ tenantId: 'A', at: '2026-10-16T10:01:00.000Z', alert: rights })
-    const changed = await ack(seen.id, seen.lastAt)
+    const changed = await ack(seen.id, seen.lastAt, seen.count)
     expect(changed.statusCode).toBe(409)
     expect(changed.json()).toMatchObject({ code: 'ALERT_CHANGED' })
     const [open] = (await app.inject({ url: '/api/v1/admin/alerts?state=open', headers: admin })).json().items
     expect(open).toMatchObject({ id: seen.id, count: 2, lastAt: '2026-10-16T10:01:00.000Z' })
     // What was seen is said, as listed.
     for (const bad of [undefined, 12, 'yesterday', '2026-10-16'])
-      expect((await ack(open.id, bad)).json(), String(bad)).toMatchObject({ statusCode: 400, code: 'ALERT_INVALID' })
+      expect((await ack(open.id, bad, open.count)).json(), String(bad)).toMatchObject({ statusCode: 400, code: 'ALERT_INVALID' })
+    for (const bad of [undefined, 0, 1.5, '2'])
+      expect((await ack(open.id, open.lastAt, bad)).json(), String(bad)).toMatchObject({ statusCode: 400, code: 'ALERT_INVALID' })
+    // Seen once, repeated since at the very same instant: its last time unchanged, still refused.
+    await store.addAlert({ tenantId: 'A', at: '2026-10-16T10:01:00.000Z', alert: rights })
+    expect((await ack(open.id, open.lastAt, open.count)).statusCode).toBe(409)
+    const [same] = (await app.inject({ url: '/api/v1/admin/alerts?state=open', headers: admin })).json().items
+    expect(same).toMatchObject({ id: open.id, count: 3, lastAt: open.lastAt })
+    open.count = same.count
     // Another tenant's administrator, an id of none, an id that is no number: not found.
-    expect((await ack(open.id, open.lastAt, as('root', 'twakephone-admin', 'B'))).statusCode).toBe(404)
-    for (const id of ['999999', 'abc', '1%3B']) expect((await ack(id, open.lastAt)).statusCode, id).toBe(404)
-    const acked = await ack(open.id, open.lastAt)
+    expect((await ack(open.id, open.lastAt, open.count, as('root', 'twakephone-admin', 'B'))).statusCode).toBe(404)
+    for (const id of ['999999', 'abc', '1%3B']) expect((await ack(id, open.lastAt, open.count)).statusCode, id).toBe(404)
+    const acked = await ack(open.id, open.lastAt, open.count)
     expect(acked.statusCode).toBe(200)
     expect(acked.json()).toMatchObject({ id: open.id, kind: 'rights', acknowledgedBy: 'root', acknowledgedAt: expect.stringMatching(/^\d{4}-/) })
     // Twice: the same, the first acknowledgement kept.
-    expect((await ack(open.id, open.lastAt, as('carol', 'twakephone-admin'))).json().acknowledgedBy).toBe('root')
+    expect((await ack(open.id, open.lastAt, open.count, as('carol', 'twakephone-admin'))).json().acknowledgedBy).toBe('root')
     await store.addAlert({ tenantId: 'A', at: '2026-10-16T10:05:00.000Z', alert: rights })
     const states = async (q: string) => (await app.inject({ url: `/api/v1/admin/alerts${q}`, headers: admin })).json().items.map((a: { id: string; acknowledgedBy?: string }) => a.acknowledgedBy ?? 'open')
     expect(await states('')).toEqual(['open', 'root'])

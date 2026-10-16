@@ -10,6 +10,18 @@ import { useT } from '../../i18n/useT.js'
 const statusOf = (err: unknown) => (err as { status?: unknown } | null)?.status
 const NONE = ''
 
+type Setting = Pick<OutboundSettings, 'policy' | 'profiles' | 'assignments'>
+/** Whether `now` differs from `before` in more than the profile of `userId`: someone else changed the setting. */
+const changedBesides = (before: Setting, now: Setting, userId: string) => {
+  const rest = (s: Setting) =>
+    JSON.stringify({
+      policy: s.policy,
+      profiles: s.profiles,
+      assignments: s.assignments.filter(a => a.userId !== userId).sort((a, b) => a.userId.localeCompare(b.userId))
+    })
+  return rest(before) !== rest(now)
+}
+
 /**
  * The rights profiles (step 7, FR-D6; FR-H3): what their holders may call on the public network and their caps, the
  * profile of those given none, and who has which. Saved whole (PUT /admin/outbound), one person at a time for the
@@ -38,6 +50,21 @@ export const Rights = () => {
     setDefaultProfile(s.policy.defaultProfile ?? NONE)
     setChosen(Object.fromEntries(s.assignments.map(a => [a.userId, a.profileId])))
   }, [])
+  /**
+   * Shows the setting as the Gateway now has it, keeping what is being chosen and not applied yet: a list moved by
+   * hand stays as it is, the others show what is now.
+   */
+  const adopt = (next: OutboundSettings) => {
+    const before = settings
+    const had = (userId: string) => before?.assignments.find(a => a.userId === userId)?.profileId ?? NONE
+    setSettings(next)
+    setDefaultProfile(d => (d === (before?.policy.defaultProfile ?? NONE) ? (next.policy.defaultProfile ?? NONE) : d))
+    setChosen(c => {
+      const now: Record<string, string> = Object.fromEntries(next.assignments.map(a => [a.userId, a.profileId]))
+      for (const [userId, value] of Object.entries(c)) if (value !== had(userId)) now[userId] = value
+      return now
+    })
+  }
   const load = useCallback(() => {
     client.getOutbound().then(show, (err: unknown) => {
       if (statusOf(err) === 501 || statusOf(err) === 404) setUnavailable(true)
@@ -154,10 +181,13 @@ export const Rights = () => {
     setBusy(true)
     const profileId = chosen[user.userId] || null
     try {
-      const { version } = await client.setUserProfile(user.userId, profileId)
-      // The setting as it is now: this change made, and its version (the next whole change is sent with it).
-      setSettings(s => (s ? { ...s, version, assignments: [...s.assignments.filter(a => a.userId !== user.userId), ...(profileId ? [{ userId: user.userId, profileId }] : [])] } : s))
-      setPeopleNote({ kind: 'ok', text: t('admin.rights.assigned', { name: user.displayName ?? user.userId }) })
+      const { userId: _user, profileId: _profile, ...now } = await client.setUserProfile(user.userId, profileId)
+      // The whole setting as it is now, with its version: what another administrator changed meanwhile shown too, and
+      // the next whole change made from it, never from what was read before (review 7 bis, n°1).
+      const meanwhile = settings !== null && changedBesides(settings, now, user.userId)
+      adopt(now)
+      const name = user.displayName ?? user.userId
+      setPeopleNote({ kind: 'ok', text: meanwhile ? `${t('admin.rights.assigned', { name })} ${t('admin.rights.changedMeanwhile')}` : t('admin.rights.assigned', { name }) })
     } catch (err) {
       setPeopleNote({ kind: 'error', text: say(refusalOf(err, () => undefined).problem)! })
     } finally {
