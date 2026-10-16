@@ -2351,11 +2351,13 @@ try {
     const res = await (await asPerson(alice))('GET', `/conferences/${ROOM}`)
     return res.statusCode === 200 ? res.json().participants : []
   }
+  // Once a second: these reads are Alice's, counted with her window's (60 a minute, CONFERENCE_READ_LIMIT). Four a
+  // second left her conference of step 8b, a few seconds later, nothing to read its participants with (429).
   const roomHas = (count, what) =>
     until(what, async () => {
       const people = await inRoom()
       return people.length === count ? people : null
-    }, { timeout: 20_000 })
+    }, { timeout: 20_000, every: 1_000 })
   const connected = (page, what) => until(what, async () => ((await calls(page))[0]?.state === 'connected' ? true : null), { timeout: 20_000 })
   // LiveKit SIP answers, then asks for the PIN (a recorded prompt): the digits are typed once it has begun.
   const PROMPT_MS = 3_000
