@@ -1126,11 +1126,13 @@ try {
   })
 
   await step(`review 8a, n°2: the calls to the access number, each one try of a room's PIN, are bounded: ${MEET_PIN_TRIES} per caller in 10 minutes, then refused (403, pin-tries) before LiveKit SIP; ${MEET_PIN_TRIES_ALL} for all callers together`, async () => {
+    // What LiveKit SIP does with each does not matter here (with no rule of a room it may ring, then never answer):
+    // a call OpenSIPS let through has no refusal of its own within 3 s, and is cancelled then.
     const tried = async (p, n) => {
       for (let i = 0; i < n; i++) {
-        const call = await p.dial(MEET_NUMBER)
-        expect(`call ${i + 1} of ${p.user}, to LiveKit SIP`, call.final.status !== 403 || header(call.final, 'twake-call-refused') !== 'pin-tries', call.final.first)
-        if (call.final.status === 200) await p.hangup(call)
+        const call = await p.dial(MEET_NUMBER, { giveUpMs: 3_000 })
+        expect(`call ${i + 1} of ${p.user}, to LiveKit SIP`, !call.final || call.final.status !== 403 || header(call.final, 'twake-call-refused') !== 'pin-tries', call.final?.first)
+        if (call.final?.status === 200) await p.hangup(call)
       }
     }
     const tooMany = (what, call) => expect(what, call.final.status === 403 && header(call.final, 'twake-call-refused') === 'pin-tries', `${call.final.first} ${header(call.final, 'twake-call-refused')}`)
