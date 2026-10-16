@@ -141,6 +141,13 @@ export interface OutboundRecord {
   profiles: OutboundProfile[]
   assignments: OutboundAssignment[]
 }
+/** The rules of a record, without its tenant. */
+export type OutboundRules = Omit<OutboundRecord, 'tenantId'>
+/**
+ * Hands rules to the SIP server: the new ones (`undo` false), or, once they could not be kept, those kept before
+ * (`undo` true).
+ */
+export type OutboundHand = (rules: OutboundRules, undo: boolean) => Promise<void>
 
 /** What the SIP server raised for the administrators (step 6b): when, and what. */
 export interface AlertRecord {
@@ -263,10 +270,15 @@ export interface Store {
   /** The outbound rules of a tenant; null when none was ever set. */
   getOutbound(tenantId: string): Promise<OutboundRecord | null>
   /**
-   * Replaces them whole. With `expected`, only if what is kept is still that version (outboundVersion; none kept: the
-   * version of EMPTY_OUTBOUND), checked and written at once, whatever process writes too: 409 OUTBOUND_STALE otherwise.
+   * Replaces them whole, one writer of the tenant's rules at a time whatever process writes (with a version or not).
+   * With `expected`, only if what is kept is still that version (outboundVersion; none kept: the version of
+   * EMPTY_OUTBOUND): 409 OUTBOUND_STALE otherwise, and nothing handed. `hand`, in the same turn, after the check and
+   * before the write: the new rules; when it fails, or the write does, the rules kept before (then the error).
+   * The SIP server is thus only ever handed what the store keeps, in the order it keeps it.
    */
-  setOutbound(record: OutboundRecord, expected?: string): Promise<void>
+  setOutbound(record: OutboundRecord, expected?: string, hand?: OutboundHand): Promise<void>
+  /** Runs `run` with the rules kept (EMPTY_OUTBOUND when none), in the same turn as setOutbound: none written meanwhile. */
+  holdOutbound(tenantId: string, run: (kept: OutboundRules) => Promise<void>): Promise<void>
   /** Keeps an alert: a repeat of an open one (same alertKey, within ALERT_DEDUP_MS of its last, not acknowledged) counts in it. */
   addAlert(record: AlertRecord): Promise<void>
   /** The alerts of a tenant, the latest repeated first, `limit` at most (clamped as a page). */

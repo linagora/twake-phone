@@ -40,7 +40,9 @@ export const Alerts = () => {
   const [busy, setBusy] = useState(false)
   const [note, setNote] = useState<Note>(null)
   const firstNew = useRef<HTMLTableRowElement | null>(null)
-  const [focusAt, setFocusAt] = useState<number | null>(null)
+  // The row to take the focus once shown: given once, when asked (a new page), never again as the rows change
+  // (review 7 ter, n°7). An object, so that the same index asked again is asked.
+  const [focusAt, setFocusAt] = useState<{ at: number } | null>(null)
   // More than the first page shown: not read again on its own (the rows would move under the reader).
   const [extended, setExtended] = useState(false)
   // Read again on its own unless asked not to (RGAA 13.8, review 7 bis n°5).
@@ -67,11 +69,13 @@ export const Alerts = () => {
   // The first page of `f`. It depends on nothing the language changes: a change of language reads nothing again, and
   // never puts back the first filter while the lists show another one (review 7 n°13).
   const read = useCallback(
-    (f: typeof filter) => {
+    (f: typeof filter, onItsOwn = false) => {
       const mine = ++reads.current
       return client.listAlerts(query(f)).then(
         r => {
           if (mine !== reads.current) return
+          // Read on its own, and the focus went into the list meanwhile: nothing moves under it (review 7 ter, n°8).
+          if (onItsOwn && list.current?.contains(document.activeElement)) return
           setItems(r.items)
           setNext(r.next)
           setShown(f)
@@ -99,7 +103,7 @@ export const Alerts = () => {
   }
   // On its own: not while something asked goes on, nor while the focus is in the list (a row, its button), which
   // would move or go under it (review 7 bis, n°5).
-  const onItsOwn = () => (asked.current > 0 || list.current?.contains(document.activeElement) ? Promise.resolve() : again())
+  const onItsOwn = () => (asked.current > 0 || list.current?.contains(document.activeElement) ? Promise.resolve() : read(shown, true))
   useRefresh(onItsOwn, ALERTS_REFRESH_MS, auto && items !== null && !extended)
   useEffect(() => {
     client.listAdminUsers().then(
@@ -109,7 +113,7 @@ export const Alerts = () => {
   }, [client])
   useEffect(() => {
     if (focusAt !== null) firstNew.current?.focus()
-  }, [focusAt, items])
+  }, [focusAt])
 
   const apply = (e: FormEvent) => {
     e.preventDefault()
@@ -135,7 +139,7 @@ export const Alerts = () => {
           setNext(r.next)
           setExtended(true)
           // The focus goes to the first alert of the new page (the button may disappear with the last one).
-          setFocusAt(from)
+          setFocusAt({ at: from })
         },
         (err: unknown) => {
           if (mine === reads.current) setNote({ kind: 'error', text: say(refusalOf(err, () => undefined).problem)! })
@@ -215,7 +219,7 @@ export const Alerts = () => {
             </thead>
             <tbody>
               {items.map((a, i) => (
-                <tr key={a.id} ref={i === focusAt ? firstNew : undefined} tabIndex={i === focusAt ? -1 : undefined}>
+                <tr key={a.id} ref={i === focusAt?.at ? firstNew : undefined} tabIndex={i === focusAt?.at ? -1 : undefined}>
                   <td>
                     <time dateTime={a.lastAt}>{when.format(new Date(a.lastAt))}</time>
                   </td>

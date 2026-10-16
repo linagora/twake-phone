@@ -244,6 +244,63 @@ export const storeContract = (name: string, make: () => Promise<Store>) =>
       await s.close()
     })
 
+    it('hands the SIP server a change only once checked, in the turn of the rules, and hands back what is kept when it fails (review 7 ter, n°5, 9)', async () => {
+      const s = await make()
+      const handed: [unknown, boolean][] = []
+      const hand = (fail = false) => async (rules: { policy: unknown }, undo: boolean) => {
+        handed.push([rules.policy, undo])
+        if (fail && !undo) throw new Error('OpenSIPS did not reload')
+      }
+      const one = { tenantId: 'D', policy: { caps: { concurrent: 1 } }, profiles: [], assignments: [] }
+      const two = { tenantId: 'D', policy: { caps: { concurrent: 2 } }, profiles: [], assignments: [] }
+      const empty = outboundVersion(EMPTY_OUTBOUND)
+      // Two at once from one version: the refused one is never handed.
+      const results = await Promise.allSettled([s.setOutbound(one, empty, hand()), s.setOutbound(two, empty, hand())])
+      expect(results.filter(r => r.status === 'fulfilled')).toHaveLength(1)
+      expect(handed).toHaveLength(1)
+      expect(handed[0]![0]).toEqual((await s.getOutbound('D'))!.policy)
+      const kept = (await s.getOutbound('D'))!.policy
+      // The SIP server refusing: nothing kept, it gets back what is.
+      handed.length = 0
+      const refused = await s.setOutbound({ ...one, policy: { caps: { concurrent: 9 } } }, undefined, hand(true)).catch((err: unknown) => err)
+      expect(refused).toMatchObject({ message: 'OpenSIPS did not reload' })
+      expect(handed).toEqual([
+        [{ caps: { concurrent: 9 } }, false],
+        [kept, true]
+      ])
+      expect((await s.getOutbound('D'))!.policy).toEqual(kept)
+      // A script (no version) waits for the turn too: a change made meanwhile from what was read before is refused.
+      const before = outboundVersion((await s.getOutbound('D'))!)
+      let release: () => void = () => undefined
+      const slow = async () => new Promise<void>(resolve => (release = resolve))
+      const script = s.setOutbound({ ...one, policy: { caps: { concurrent: 7 } } }, undefined, slow)
+      await new Promise(resolve => setTimeout(resolve, 50))
+      const screen = s.setOutbound({ ...one, policy: { caps: { concurrent: 8 } } }, before)
+      await new Promise(resolve => setTimeout(resolve, 50))
+      release()
+      await script
+      expect(await screen.catch((err: unknown) => err)).toMatchObject({ code: 'OUTBOUND_STALE' })
+      expect((await s.getOutbound('D'))!.policy).toEqual({ caps: { concurrent: 7 } })
+      // What is kept, held: none written meanwhile.
+      let seen: unknown
+      let hold: () => void = () => undefined
+      const held = s.holdOutbound('D', async rules => {
+        seen = rules.policy
+        await new Promise<void>(resolve => (hold = resolve))
+      })
+      await new Promise(resolve => setTimeout(resolve, 50))
+      let written = false
+      const writing = s.setOutbound(one).then(() => (written = true))
+      await new Promise(resolve => setTimeout(resolve, 50))
+      expect(written).toBe(false)
+      hold()
+      await held
+      await writing
+      expect(seen).toEqual({ caps: { concurrent: 7 } })
+      expect(written).toBe(true)
+      await s.close()
+    })
+
     it('keeps one alert while it repeats (count, last time, first and last words), a new one after an hour of silence, per tenant, the latest repeated first (review 6b, n°7; second review, n°8)', async () => {
       const s = await make()
       const alert = { kind: 'limit' as const, param: 'concurrent', scope: 'user' as const, extension: '101', number: '+33199000201' }

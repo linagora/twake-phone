@@ -346,10 +346,10 @@ describe('the administration screens (step 7)', () => {
     choose(ofAlice, 'national')
     click($('[aria-label="Appliquer le profil de Alice"]'))
     await flush()
-    expect(setUserProfile).toHaveBeenCalledWith('alice', 'national')
-    // The page shows the setting that assignment made: Bob has no profile any more, and it says the setting changed.
+    expect(setUserProfile).toHaveBeenCalledWith('alice', 'national', 'v1')
+    // The page shows the setting that assignment made: Bob has no profile any more.
     expect(ofBob().value).toBe('')
-    expect(text()).toContain('Profil de Alice enregistré. Un autre administrateur avait modifié ces réglages entre-temps')
+    expect(text()).toContain('Profil de Alice enregistré.')
     // The next whole change is made from that setting and goes with its version: Bob's change stays.
     getOutbound.mockResolvedValueOnce(outbound({ version: 'v3', profiles: [...outbound().profiles, { id: 'world', allowed: ['fixed', 'mobile', 'international'] }], assignments: [{ userId: 'alice', profileId: 'world' }] }))
     choose($('#rights-default'), 'national')
@@ -368,6 +368,95 @@ describe('the administration screens (step 7)', () => {
     expect(setOutbound).toHaveBeenLastCalledWith(expect.objectContaining({ policy: { defaultProfile: 'world' }, version: 'v3' }))
   })
 
+  const world = { id: 'world', name: 'Monde', allowed: ['fixed', 'mobile', 'international'] } as OutboundSettings['profiles'][number]
+  const withWorld = (over: Partial<OutboundSettings> = {}) => outbound({ profiles: [...outbound().profiles, world], ...over })
+  /** World as B left it: without international calls. */
+  const restricted = { ...world, allowed: ['fixed', 'mobile'] } as OutboundSettings['profiles'][number]
+
+  it('shows the profile being changed as an assignment left it, and sends what is typed on that one, with its version (review 7 ter, n°1)', async () => {
+    const setUserProfile = vi.fn(async () => ({ userId: 'alice', profileId: 'national', ...withWorld({ version: 'v2', profiles: [outbound().profiles[0]!, restricted], assignments: [{ userId: 'alice', profileId: 'national' }] }) }))
+    const setOutbound = vi.fn(async () => withWorld({ version: 'v3' }))
+    admin({ getOutbound: vi.fn(async () => withWorld()), setUserProfile, setOutbound })
+    await render('/admin/rights', <Rights />)
+    // A opens "world", types a name; B meanwhile takes international calls from it; A gives Alice a profile.
+    click($('[aria-label="Modifier le profil world"]'))
+    await flush()
+    expect(($('#profile-allowed-international') as HTMLInputElement).checked).toBe(true)
+    type($('#profile-name'), 'Monde entier')
+    choose($('select[aria-label="Profil de Alice"]'), 'national')
+    click($('[aria-label="Appliquer le profil de Alice"]'))
+    await flush()
+    // The form shows "world" as it is now, and says what was typed is gone.
+    expect(($('#profile-allowed-international') as HTMLInputElement).checked).toBe(false)
+    expect(($('#profile-name') as HTMLInputElement).value).toBe('Monde')
+    expect(text()).toContain('Le profil world a été modifié par un autre administrateur pendant que vous le modifiiez')
+    // Renamed again and saved: international stays out, with the version the assignment gave.
+    type($('#profile-name'), 'Monde entier')
+    await submit($('#profile-name')!.closest('form'))
+    await flush()
+    expect(setOutbound).toHaveBeenCalledWith(expect.objectContaining({ version: 'v2', profiles: [outbound().profiles[0], { ...restricted, name: 'Monde entier' }] }))
+  })
+
+  it('after a refusal for a setting changed meanwhile, shows the profile being changed as it is now, never sends it as it was (review 7 ter, n°1)', async () => {
+    const getOutbound = vi.fn(async () => withWorld())
+    const setOutbound = vi.fn(async (): Promise<OutboundSettings> => {
+      throw refused(409, 'OUTBOUND_STALE', 'the outbound setting changed since it was read')
+    })
+    admin({ getOutbound, setOutbound })
+    await render('/admin/rights', <Rights />)
+    click($('[aria-label="Modifier le profil world"]'))
+    await flush()
+    type($('#profile-name'), 'Monde entier')
+    getOutbound.mockResolvedValueOnce(withWorld({ version: 'v2', profiles: [outbound().profiles[0]!, restricted] }))
+    await submit($('#profile-name')!.closest('form'))
+    await flush()
+    expect(setOutbound).toHaveBeenCalledWith(expect.objectContaining({ version: 'v1', profiles: [outbound().profiles[0], { ...world, name: 'Monde entier' }] }))
+    expect(($('#profile-allowed-international') as HTMLInputElement).checked).toBe(false)
+    expect(($('#profile-name') as HTMLInputElement).value).toBe('Monde')
+    // Sent again: what it is now, with the version now read.
+    setOutbound.mockResolvedValueOnce(withWorld({ version: 'v3', profiles: [outbound().profiles[0]!, restricted] }))
+    await submit($('#profile-name')!.closest('form'))
+    await flush()
+    expect(setOutbound).toHaveBeenLastCalledWith(expect.objectContaining({ version: 'v2', profiles: [outbound().profiles[0], restricted] }))
+    expect(text()).toContain('Profil world enregistré.')
+  })
+
+  it('says a profile being changed was deleted meanwhile, and never that it was saved (review 7 ter, n°6)', async () => {
+    const getOutbound = vi.fn(async () => withWorld())
+    const setOutbound = vi.fn(async (): Promise<OutboundSettings> => {
+      throw refused(409, 'OUTBOUND_STALE', 'the outbound setting changed since it was read')
+    })
+    admin({ getOutbound, setOutbound })
+    await render('/admin/rights', <Rights />)
+    click($('[aria-label="Modifier le profil world"]'))
+    await flush()
+    type($('#profile-name'), 'Monde entier')
+    getOutbound.mockResolvedValueOnce(outbound({ version: 'v2' }))
+    await submit($('#profile-name')!.closest('form'))
+    await flush()
+    expect($('[role="alert"]')?.textContent).toContain('Le profil world que vous modifiiez a été supprimé par un autre administrateur')
+    expect(text()).not.toContain('Profil world enregistré')
+    // The form is a new profile's again.
+    expect(($('#profile-id') as HTMLInputElement).disabled).toBe(false)
+    expect(($('#profile-id') as HTMLInputElement).value).toBe('')
+    expect(setOutbound).toHaveBeenCalledTimes(1)
+  })
+
+  it("gives a person a profile from the version shown; changed since, refused and the page read again (review 7 ter, n°3)", async () => {
+    const getOutbound = vi.fn(async () => outbound())
+    const setUserProfile = vi.fn(async () => Promise.reject(refused(409, 'OUTBOUND_STALE', 'the outbound setting changed since it was read')))
+    admin({ getOutbound, setUserProfile })
+    await render('/admin/rights', <Rights />)
+    getOutbound.mockResolvedValueOnce(outbound({ version: 'v2', assignments: [{ userId: 'alice', profileId: 'national' }] }))
+    choose($('select[aria-label="Profil de Alice"]'), 'national')
+    click($('[aria-label="Appliquer le profil de Alice"]'))
+    await flush()
+    expect(setUserProfile).toHaveBeenCalledWith('alice', 'national', 'v1')
+    expect(getOutbound).toHaveBeenCalledTimes(2)
+    expect(text()).toContain('Un autre administrateur a modifié ces réglages')
+    expect(($('select[aria-label="Profil de Alice"]') as HTMLSelectElement).value).toBe('national')
+  })
+
   it('refuses a profile too many before sending (review 7 n°14)', async () => {
     const setOutbound = vi.fn()
     admin({ getOutbound: vi.fn(async () => outbound({ profiles: Array.from({ length: 32 }, (_, i) => ({ id: `p${i}`, allowed: [] })) })), setOutbound })
@@ -378,37 +467,33 @@ describe('the administration screens (step 7)', () => {
     expect(text()).toContain('32 profils au plus')
   })
 
-  it('sends the caps with the version read; changed meanwhile, keeps what was typed and names what changed (review 7 n°1; review 7 bis n°6)', async () => {
-    const getOutbound = vi.fn(async () => outbound({ policy: { caps: { concurrent: 5 } } }))
+  it('sends the caps with the version read; changed meanwhile, shows them as they are now and says what was typed, never sending it (review 7 n°1; review 7 ter n°2)', async () => {
+    // A opens the page: 10 calls at once for the organisation.
+    const getOutbound = vi.fn(async () => outbound({ policy: { caps: { concurrent: 10 } } }))
     const setOutbound = vi.fn(async (): Promise<OutboundSettings> => {
       throw refused(409, 'OUTBOUND_STALE', 'the outbound setting changed since it was read')
     })
     admin({ getOutbound, setOutbound })
     await render('/admin/limits', <Limits />)
-    expect(($('#limits-tenant-concurrent') as HTMLInputElement).value).toBe('5')
-    getOutbound.mockResolvedValueOnce(outbound({ version: 'v2', policy: { caps: { concurrent: 3 } }, assignments: [{ userId: 'alice', profileId: 'national' }] }))
-    type($('#limits-tenant-concurrent'), '7')
+    expect(($('#limits-tenant-concurrent') as HTMLInputElement).value).toBe('10')
+    // B lowers it to 2 during an incident; A, who did not see it, sets the daily calls of those without a profile.
+    getOutbound.mockResolvedValueOnce(outbound({ version: 'v2', policy: { caps: { concurrent: 2 } }, assignments: [{ userId: 'alice', profileId: 'national' }] }))
+    choose($('#limits-user-dailyCalls-mode'), 'value')
+    type($('#limits-user-dailyCalls'), '50')
     await submit($('form'))
     await flush()
-    expect(setOutbound).toHaveBeenCalledWith({ policy: { caps: { concurrent: 7 } }, profiles: outbound().profiles, assignments: [], version: 'v1' })
+    expect(setOutbound).toHaveBeenCalledWith({ policy: { caps: { concurrent: 10 }, userCaps: { dailyCalls: 50 } }, profiles: outbound().profiles, assignments: [], version: 'v1' })
     const said = $('[role="alert"]')?.textContent
     expect(said).toContain('Un autre administrateur a modifié ces réglages')
-    // What the other administrator changed is named, nothing else.
-    expect(said).toContain("il a changé : Plafonds de l'organisation : Appels simultanés.")
-    expect(said).not.toContain('Minutes par jour')
-    // What was typed stays; saved again, it goes with the version now read, and what was changed elsewhere stays.
-    expect(($('#limits-tenant-concurrent') as HTMLInputElement).value).toBe('7')
-    setOutbound.mockResolvedValueOnce(outbound({ version: 'v3', policy: { caps: { concurrent: 7 } }, assignments: [{ userId: 'alice', profileId: 'national' }] }))
+    expect(said).toContain('Vous aviez saisi : Plafonds des personnes sans profil : Appels par jour = 50.')
+    // The form is the setting as it is now, B's cap included; nothing typed before goes with the new version.
+    expect(($('#limits-tenant-concurrent') as HTMLInputElement).value).toBe('2')
+    expect(($('#limits-user-dailyCalls-mode') as HTMLSelectElement).value).toBe('default')
+    setOutbound.mockResolvedValueOnce(outbound({ version: 'v3', policy: { caps: { concurrent: 2 }, userCaps: { dailyCalls: 50 } } }))
+    choose($('#limits-user-dailyCalls-mode'), 'value')
+    type($('#limits-user-dailyCalls'), '50')
     await submit($('form'))
-    expect(setOutbound).toHaveBeenLastCalledWith({ policy: { caps: { concurrent: 7 } }, profiles: outbound().profiles, assignments: [{ userId: 'alice', profileId: 'national' }], version: 'v2' })
-    // Changed meanwhile elsewhere only (who has which profile): said so, what was typed kept.
-    setOutbound.mockRejectedValueOnce(refused(409, 'OUTBOUND_STALE', 'the outbound setting changed since it was read'))
-    getOutbound.mockResolvedValueOnce(outbound({ version: 'v4', policy: { caps: { concurrent: 7 } }, assignments: [] }))
-    type($('#limits-tenant-concurrent'), '8')
-    await submit($('form'))
-    await flush()
-    expect($('[role="alert"]')?.textContent).toContain('pas les plafonds ni les seuils')
-    expect(($('#limits-tenant-concurrent') as HTMLInputElement).value).toBe('8')
+    expect(setOutbound).toHaveBeenLastCalledWith({ policy: { caps: { concurrent: 2 }, userCaps: { dailyCalls: 50 } }, profiles: outbound().profiles, assignments: [{ userId: 'alice', profileId: 'national' }], version: 'v2' })
   })
 
   const seen: AdminAlert = { id: '7', kind: 'fraud-critical', param: 'callsPerMinute', scope: 'user', value: 8, threshold: 6, extension: '101', number: '+33612345678', at: '2026-10-16T08:00:00.000Z', lastAt: '2026-10-16T08:05:00.000Z', count: 3, first: { value: 7 } }
@@ -616,6 +701,53 @@ describe('the administration screens (step 7)', () => {
     expect(listGroups).toHaveBeenCalledTimes(2)
     expect($('[role="alert"]')?.textContent).toContain("Cet élément n'existe plus")
     expect(text()).not.toContain('ne permet pas cette action')
+  })
+
+  it('puts the focus on what is said after an acknowledgement, more pages shown too (review 7 ter, n°7)', async () => {
+    const page2 = Array.from({ length: 3 }, (_, i) => ({ ...seen, id: String(20 + i) }))
+    const listAlerts = vi.fn(async (filter: { before?: string }) => (filter.before ? { items: page2 } : { items: [seen], next: 'cursor' }))
+    const acknowledgeAlert = vi.fn(async () => ({ ...seen, acknowledgedAt: '2026-10-16T09:00:00.000Z', acknowledgedBy: 'alice' }))
+    admin({ listAlerts, acknowledgeAlert })
+    await render('/admin/alerts', <Alerts />)
+    click(button(host, "Afficher plus d'alertes"))
+    await flush()
+    expect(document.activeElement?.tagName).toBe('TR')
+    click(button(host, 'Acquitter'))
+    await flush()
+    expect(acknowledgeAlert).toHaveBeenCalledWith('7', seen.lastAt, seen.count)
+    expect(document.activeElement?.getAttribute('role')).toBe('status')
+  })
+
+  it('drops a read made on its own when the focus went into the list meanwhile (review 7 ter, n°8)', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    try {
+      const answers: ((v: unknown) => void)[] = []
+      const listAlerts = vi.fn(() => new Promise(resolve => answers.push(resolve)))
+      admin({ listAlerts })
+      const wait = (ms: number) => act(async () => void (await vi.advanceTimersByTimeAsync(ms)))
+      await act(async () =>
+        root.render(
+          <I18nProvider>
+            <MemoryRouter initialEntries={['/admin/alerts']}>
+              <Alerts />
+            </MemoryRouter>
+          </I18nProvider>
+        )
+      )
+      answers[0]!({ items: [seen] })
+      await wait(0)
+      await wait(ALERTS_REFRESH_MS + 10)
+      expect(listAlerts).toHaveBeenCalledTimes(2)
+      // The focus goes to the button of the row while the read goes on: its answer would take the row away.
+      const ack = button(host, 'Acquitter')!
+      act(() => ack.focus())
+      answers[1]!({ items: [] })
+      await wait(0)
+      expect(button(host, 'Acquitter')).toBe(ack)
+      expect(document.activeElement).toBe(ack)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('checks a ring group before sending, the problems next to their fields, and puts the refusals of the Gateway there (review 7 n°7)', async () => {

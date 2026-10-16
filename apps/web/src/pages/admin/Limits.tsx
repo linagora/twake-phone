@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState, type FormEvent } from 'react'
 import { FRAUD_PARAMS, OUTBOUND_CAPS, type FraudRule, type OutboundSettings } from '@twake/telephony-client'
 import { CapFields } from '../../admin/CapFields.js'
 import { FieldError, NoteLine, useLatest, ProblemSummary, Section, useFocusLater, useProblem, type Note } from '../../admin/ui.js'
-import { LIMITS_FIELDS, capsForm, checkCaps, checkFraud, fraudForm, limitsRefusal, refusalCode, type CapsForm, type FraudForm, type FraudParam, type LimitsField, type Problem, type ThresholdForm } from '../../admin/validate.js'
+import { LIMITS_FIELDS, capsForm, checkCaps, checkFraud, fraudForm, limitsRefusal, refusalCode, sameValue, type CapForm, type CapsForm, type FraudForm, type FraudParam, type LimitsField, type Problem, type ThresholdForm } from '../../admin/validate.js'
 import { useGateway } from '../../gateway.js'
 import type { Key } from '../../i18n/index.js'
 import { useT } from '../../i18n/useT.js'
@@ -24,12 +24,13 @@ const PARTS = [
   ['national', 'admin.fraud.national'],
   ['international', 'admin.fraud.international']
 ] as const
-/** The caps and thresholds that are not the same in `before` and `now`: the part's legend, and their name. */
-const changedOf = (before: LimitsForm, now: LimitsForm) =>
-  PARTS.flatMap(([part, legend]) =>
-    (part === 'tenant' || part === 'user' ? OUTBOUND_CAPS : FRAUD_PARAMS)
-      .filter(k => JSON.stringify((before[part] as Record<string, unknown>)[k]) !== JSON.stringify((now[part] as Record<string, unknown>)[k]))
-      .map(k => ({ legend, name: (part === 'tenant' || part === 'user' ? `admin.cap.${k}` : `admin.fraud.${k}`) as Key }))
+type Typed = { legend: Key; name: Key } & ({ cap: CapForm } | { threshold: ThresholdForm })
+/** The caps and thresholds typed in `typed` that are not those of `read`: where, and what was typed. */
+const typedOf = (read: LimitsForm, typed: LimitsForm): Typed[] =>
+  PARTS.flatMap(([part, legend]): Typed[] =>
+    part === 'tenant' || part === 'user'
+      ? OUTBOUND_CAPS.filter(k => !sameValue(read[part][k], typed[part][k])).map(k => ({ legend, name: `admin.cap.${k}` as Key, cap: typed[part][k] }))
+      : FRAUD_PARAMS.filter(k => !sameValue(read[part][k], typed[part][k])).map(k => ({ legend, name: `admin.fraud.${k}` as Key, threshold: typed[part][k] }))
   )
 
 /** The problems of one part of the form (`tenant`, `national`…), by cap or threshold. */
@@ -131,6 +132,9 @@ export const Limits = () => {
     })
   }, [client, show, words])
   useEffect(read, [read])
+  /** What was typed for a cap, or for a threshold, in words. */
+  const capText = (c: CapForm) => (c.mode === 'value' ? c.value : t(c.mode === 'none' ? 'admin.cap.none' : 'admin.limits.typedDefault'))
+  const thresholdText = (x: ThresholdForm) => (x.mode === 'custom' ? `${t('admin.fraud.warning')} ${x.warning || '—'}, ${t('admin.fraud.critical')} ${x.critical || '—'}` : t('admin.limits.typedDefault'))
 
   const save = async (e: FormEvent) => {
     e.preventDefault()
@@ -166,22 +170,14 @@ export const Limits = () => {
       show(await client.setOutbound({ policy, profiles: settings.profiles, assignments: settings.assignments, version: settings.version }))
       setNote({ kind: 'ok', text: t('admin.limits.saved') })
     } catch (err) {
-      // Changed meanwhile: what was typed stays, the setting is read again (the next save made from it), and what the
-      // other administrator changed among the caps and thresholds is named, to be checked (review 7 bis, n°6).
+      // Changed meanwhile: the form shows the setting as it is now (the next save made from it, nothing typed before
+      // sent with its version), and says what was typed, to be done again if still wanted (review 7 ter, n°2).
       if (refusalCode(err) === 'OUTBOUND_STALE') {
         setProblems({})
-        const now = await client.getOutbound().catch(() => null)
-        if (!now) {
-          read()
-          setNote({ kind: 'error', text: say(limitsRefusal(err).problem)! })
-          return
-        }
-        const changed = changedOf(limitsForm(settings), limitsForm(now))
-        setSettings(now)
-        setNote({
-          kind: 'error',
-          text: changed.length ? t('admin.limits.changed', { fields: changed.map(c => `${t(c.legend)} : ${t(c.name)}`).join(' ; ') }) : t('admin.limits.changedElsewhere')
-        })
+        const typed = typedOf(limitsForm(settings), form)
+        read()
+        const said = typed.map(x => `${t(x.legend)} : ${t(x.name)} = ${'cap' in x ? capText(x.cap) : thresholdText(x.threshold)}`).join(' ; ')
+        setNote({ kind: 'error', text: said ? t('admin.limits.stale', { typed: said }) : say(limitsRefusal(err).problem)! })
         return
       }
       const refusal = limitsRefusal(err)

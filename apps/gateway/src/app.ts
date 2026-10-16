@@ -517,10 +517,8 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
     for (let attempt = 0; !closing; attempt++) {
       try {
         if (!(await provider.getCapabilities()).outboundPolicy) return
-        await inTurn(tenantId, async () => {
-          const o = await outboundFor(tenantId)
-          await provider.setOutboundPolicy!(o.policy, o.profiles, o.assignments)
-        })
+        // In the store's turn for these rules: a change another Gateway makes meanwhile is handed after this one.
+        await inTurn(tenantId, () => store.holdOutbound(tenantId, o => provider.setOutboundPolicy!(o.policy, o.profiles, o.assignments)))
         return
       } catch (err) {
         if (closing) return
@@ -1146,30 +1144,22 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
       })
 
       // The rules of the calls to the public network (capability `outboundPolicy`, ADR 0017): administrators only, one
-      // change at a time per tenant, applied as the trunks are: the provider first, then the store; either failing,
-      // the provider is handed back what it had. Emergency calls are outside all of it.
+      // change at a time per tenant, in the store's turn for them (whatever Gateway writes): the version checked, then
+      // the provider handed the change, then the store keeps it; the provider failing, or the store, the provider is
+      // handed back what the store keeps. A change refused never reaches the provider (review 7 ter, n°9). Emergency
+      // calls are outside all of it.
       const outboundOf = (provider: TelephonyProvider) => {
         if (!provider.setOutboundPolicy) throw Object.assign(new Error('Outbound rules are not available on this platform'), { statusCode: 501 })
         return provider.setOutboundPolicy.bind(provider)
       }
       // `expected`: the version the change was made from; kept only if the store still holds it (checked as it writes).
-      const changeOutbound = async (tenantId: string, apply: ReturnType<typeof outboundOf>, next: Outbound, expected?: string) => {
-        // Undone: the provider is handed what the store holds then (what it had, or what another change kept meanwhile).
-        const undo = (err: unknown) =>
-          outboundFor(tenantId)
-            .then(kept => apply(kept.policy, kept.profiles, kept.assignments))
-            .then(
-            () => {
-              throw err
-            },
-            (undoErr: unknown) => {
-              app.log.error({ err: undoErr, tenantId }, 'outbound rules: the previous ones could not be handed back to the provider')
-              throw err
-            }
-          )
-        await apply(next.policy, next.profiles, next.assignments).catch(undo)
-        await store.setOutbound({ tenantId, ...next }, expected).catch(undo)
-      }
+      const changeOutbound = (tenantId: string, apply: ReturnType<typeof outboundOf>, next: Outbound, expected?: string) =>
+        store.setOutbound({ tenantId, ...next }, expected, (rules, undo) =>
+          apply(rules.policy, rules.profiles, rules.assignments).catch((err: unknown) => {
+            if (undo) app.log.error({ err, tenantId }, 'outbound rules: the previous ones could not be handed back to the provider')
+            throw err
+          })
+        )
       // What holds when an administrator says nothing (ADR 0017): shown with what they said.
       // `version`: what to send back with a change, so that it is refused if the setting changed since (OUTBOUND_STALE).
       const outboundView = (o: Outbound) => ({ ...o, version: outboundVersion(o), defaults: { fraud: FRAUD_DEFAULTS, caps: OUTBOUND_CAP_DEFAULTS } })
@@ -1199,11 +1189,16 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         const user = await administrator(req)
         const apply = outboundOf(registry.forTenant(user.tenantId))
         const userId = req.params.userId
-        const body = req.body as { profileId?: unknown } | undefined
+        const body = req.body as { profileId?: unknown; version?: unknown } | undefined
         const profileId = body?.profileId
         if (profileId !== null && (typeof profileId !== 'string' || !PROFILE_ID.test(profileId))) throw Object.assign(new Error('profileId: one of the profiles, or null'), { statusCode: 400, code: 'OUTBOUND_INVALID' })
+        // The version the screen shows (the app always sends it): refused if the setting changed since, this person's
+        // profile included (review 7 ter, n°3). A script sends none.
+        const version = body?.version
+        if (version !== undefined && typeof version !== 'string') throw Object.assign(new Error('version: the version of GET /admin/outbound'), { statusCode: 400, code: 'OUTBOUND_INVALID' })
         return inTurn(user.tenantId, async () => {
           const current = await outboundFor(user.tenantId)
+          if (version !== undefined && outboundVersion(current) !== version) throw staleOutbound()
           const assignments = current.assignments.filter(a => a.userId !== userId)
           const next = parseOutbound({ ...current, assignments: profileId ? [...assignments, { userId, profileId }] : assignments })
           await changeOutbound(user.tenantId, apply, next, outboundVersion(current))

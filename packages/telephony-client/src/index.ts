@@ -298,11 +298,12 @@ export class TelephonyClient {
   }
 
   /**
-   * Gives one person a profile, or the default one (`null`); answers the whole setting it makes, with its version
-   * (another administrator's changes included): show that, never this version with what was read before.
+   * Gives one person a profile, or the default one (`null`), from the `version` read: refused (409 OUTBOUND_STALE)
+   * when the setting changed since, this person's profile included. Answers the whole setting it makes, with its
+   * version: show that, never this version with what was read before.
    */
-  setUserProfile(userId: string, profileId: string | null) {
-    return this.request<{ userId: string; profileId: string | null } & OutboundSettings>(`/admin/outbound/users/${encodeURIComponent(userId)}`, { method: 'PUT', body: JSON.stringify({ profileId }) })
+  setUserProfile(userId: string, profileId: string | null, version: string) {
+    return this.request<{ userId: string; profileId: string | null } & OutboundSettings>(`/admin/outbound/users/${encodeURIComponent(userId)}`, { method: 'PUT', body: JSON.stringify({ profileId, version }) })
   }
 
   /** A page of alerts, the latest repeated first (`next`: the `before` of the next page). */

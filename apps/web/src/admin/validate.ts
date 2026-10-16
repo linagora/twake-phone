@@ -442,6 +442,19 @@ const GENERAL: Record<string, Key> = {
 /** The words of GENERAL that name a number. */
 const GENERAL_PARAMS: Record<string, Record<string, number>> = { PROFILE_LIMIT: { max: MAX_PROFILES } }
 
+/** A value written with its keys in order (a profile from the Gateway may list them in any order): to compare. */
+const canonical = (v: unknown): string =>
+  Array.isArray(v)
+    ? `[${v.map(canonical).join(',')}]`
+    : v !== null && typeof v === 'object'
+      ? `{${Object.keys(v)
+          .sort()
+          .map(k => `${JSON.stringify(k)}:${canonical((v as Record<string, unknown>)[k])}`)
+          .join(',')}}`
+      : String(JSON.stringify(v))
+/** Whether two values say the same, whatever the order of their keys. */
+export const sameValue = (a: unknown, b: unknown) => canonical(a) === canonical(b)
+
 /** The code of a refusal of the Gateway (`OUTBOUND_STALE`, `ALERT_CHANGED`…), or its status (404) when it has none. */
 export const refusalCode = (err: unknown) => refusalParts(err).code
 export const refusalStatus = (err: unknown) => refusalParts(err).status

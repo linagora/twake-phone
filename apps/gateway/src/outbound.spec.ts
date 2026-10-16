@@ -212,7 +212,7 @@ describe('outbound routes', () => {
     expect((await store.getOutbound('A'))?.assignments).toEqual([{ userId: 'bob', profileId: 'internal' }, { userId: 'alice', profileId: 'national' }])
   })
 
-  it('refuses the second of two changes made from the same version, even once the turn of the first one has ended (review 7 bis, n°2)', async () => {
+  it('refuses the second of two changes made from the same version, even once the turn of the first one has ended, and never hands it to the provider (review 7 bis, n°2; review 7 ter, n°9)', async () => {
     const store = new MemoryStore()
     // A provider slow to take the first change: longer than the turn of a tenant lasts.
     let release: (() => void) | undefined
@@ -230,16 +230,37 @@ describe('outbound routes', () => {
     hold = true
     const first = app.inject({ method: 'PUT', url: '/api/v1/admin/outbound', headers: admin, payload: { profiles, policy: { caps: { concurrent: 1 } }, version } })
     await settle(() => release !== undefined)
-    // The second one, made from the same version, goes once the turn of the first has run out: kept.
-    const second = await app.inject({ method: 'PUT', url: '/api/v1/admin/outbound', headers: admin, payload: { profiles, policy: { caps: { concurrent: 2 } }, version } })
-    expect(second.statusCode).toBe(200)
+    // The second one, made from the same version, goes once the turn of this process has run out: it waits for the
+    // store's turn, held by the first one while the provider takes it.
+    const second = app.inject({ method: 'PUT', url: '/api/v1/admin/outbound', headers: admin, payload: { profiles, policy: { caps: { concurrent: 2 } }, version } })
+    await new Promise(resolve => setTimeout(resolve, 150))
+    const before = handed.length
     release!()
-    // The first one, then: refused as the store writes, and the provider handed back what the store keeps.
-    const res = await first
+    expect((await first).statusCode).toBe(200)
+    // Then refused: the setting is no longer the one it was made from, and the provider never saw it.
+    const res = await second
     expect(res.statusCode).toBe(409)
     expect(res.json()).toMatchObject({ code: 'OUTBOUND_STALE' })
-    expect((await store.getOutbound('A'))?.policy).toEqual({ caps: { concurrent: 2 } })
-    expect(handed.at(-1)![0]).toEqual({ caps: { concurrent: 2 } })
+    expect((await store.getOutbound('A'))?.policy).toEqual({ caps: { concurrent: 1 } })
+    expect(handed.slice(before).map(h => h[0])).toEqual([{ caps: { concurrent: 1 } }])
+    expect(handed.some(h => h[0].caps?.concurrent === 2)).toBe(false)
+  })
+
+  it('gives a person a profile only from the version the screen shows; a script may send none (review 7 ter, n°3)', async () => {
+    const { app, admin, store } = await setup()
+    const read = async () => (await app.inject({ url: '/api/v1/admin/outbound', headers: admin })).json()
+    await app.inject({ method: 'PUT', url: '/api/v1/admin/outbound', headers: admin, payload: { profiles } })
+    const seen = await read()
+    // Another administrator restricts Bob meanwhile; the page opened before cannot give him another profile.
+    const restricted = await app.inject({ method: 'PUT', url: '/api/v1/admin/outbound/users/bob', headers: admin, payload: { profileId: 'internal', version: seen.version } })
+    expect(restricted.statusCode).toBe(200)
+    const late = await app.inject({ method: 'PUT', url: '/api/v1/admin/outbound/users/bob', headers: admin, payload: { profileId: 'national', version: seen.version } })
+    expect(late.statusCode).toBe(409)
+    expect(late.json()).toMatchObject({ code: 'OUTBOUND_STALE' })
+    expect((await store.getOutbound('A'))?.assignments).toEqual([{ userId: 'bob', profileId: 'internal' }])
+    expect((await app.inject({ method: 'PUT', url: '/api/v1/admin/outbound/users/bob', headers: admin, payload: { profileId: 'national', version: 7 } })).statusCode).toBe(400)
+    expect((await app.inject({ method: 'PUT', url: '/api/v1/admin/outbound/users/bob', headers: admin, payload: { profileId: 'national', version: restricted.json().version } })).statusCode).toBe(200)
+    expect((await app.inject({ method: 'PUT', url: '/api/v1/admin/outbound/users/bob', headers: admin, payload: { profileId: null } })).statusCode).toBe(200)
   })
 
   it('says how many profiles at most, with its own code (review 7, n°14)', async () => {

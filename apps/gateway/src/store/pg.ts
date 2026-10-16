@@ -2,7 +2,7 @@ import { readdir, readFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import pg from 'pg'
 import { EMPTY_OUTBOUND, outboundVersion, staleOutbound } from '../outbound.js'
-import { ALERT_DEDUP_MS, alertKey, clampLimit, type AlertQuery, type AlertRecord, type StoredAlert, type ConferenceRecord, type DidRecord, type OutboundRecord, type HistoryEntry, type HistoryPage, type HistoryQuery, type MappingSource, type ProviderRecord, type PushSaveResult, type PushSubscriptionRecord, type Store, type TrunkRecord, type UserMapping, type UserPresenceRecord, type VapidKeysRecord } from './types.js'
+import { ALERT_DEDUP_MS, alertKey, clampLimit, type AlertQuery, type AlertRecord, type StoredAlert, type ConferenceRecord, type DidRecord, type OutboundHand, type OutboundRecord, type OutboundRules, type HistoryEntry, type HistoryPage, type HistoryQuery, type MappingSource, type ProviderRecord, type PushSaveResult, type PushSubscriptionRecord, type Store, type TrunkRecord, type UserMapping, type UserPresenceRecord, type VapidKeysRecord } from './types.js'
 
 const MIGRATIONS = fileURLToPath(new URL('../../migrations/', import.meta.url))
 
@@ -379,27 +379,20 @@ export class PgStore implements Store {
     return r ? { tenantId: r.tenant_id, policy: r.policy, profiles: r.profiles, assignments: r.assignments } : null
   }
 
-  async setOutbound(o: OutboundRecord, expected?: string) {
-    const write = (q: pg.Pool | pg.PoolClient) =>
-      q.query(
-        `INSERT INTO outbound_policies (tenant_id, policy, profiles, assignments) VALUES ($1, $2, $3, $4)
-         ON CONFLICT (tenant_id) DO UPDATE SET policy = EXCLUDED.policy, profiles = EXCLUDED.profiles, assignments = EXCLUDED.assignments, updated_at = now()`,
-        [o.tenantId, JSON.stringify(o.policy), JSON.stringify(o.profiles), JSON.stringify(o.assignments)]
-      )
-    if (expected === undefined) {
-      await write(this.pool)
-      return
-    }
-    // Checked and written in one transaction, one writer of the tenant's rules at a time in the whole database (a
-    // lock that holds whatever process writes, and when there is no row yet): never two changes made from one version.
+  /**
+   * Runs `run` in a transaction that holds the tenant's outbound lock, with the rules kept: one writer of the tenant's
+   * rules at a time in the whole database (a lock that holds whatever process writes, with a version or not, and
+   * when there is no row yet). The SIP server is handed rules within it: no long wait of its own (its queries and
+   * its reload have their own bounds), and none of its tables is locked here.
+   */
+  private async inOutboundTurn(tenantId: string, run: (client: pg.PoolClient, kept: OutboundRules) => Promise<void>) {
     const client = await this.pool.connect()
     try {
       await client.query('BEGIN')
-      await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [`outbound_policies|${o.tenantId}`])
-      const { rows } = await client.query<OutboundRow>('SELECT tenant_id, policy, profiles, assignments FROM outbound_policies WHERE tenant_id = $1', [o.tenantId])
+      await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [`outbound_policies|${tenantId}`])
+      const { rows } = await client.query<OutboundRow>('SELECT tenant_id, policy, profiles, assignments FROM outbound_policies WHERE tenant_id = $1', [tenantId])
       const r = rows[0]
-      if (outboundVersion(r ? { policy: r.policy, profiles: r.profiles, assignments: r.assignments } : EMPTY_OUTBOUND) !== expected) throw staleOutbound()
-      await write(client)
+      await run(client, r ? { policy: r.policy, profiles: r.profiles, assignments: r.assignments } : EMPTY_OUTBOUND)
       await client.query('COMMIT')
     } catch (err) {
       await client.query('ROLLBACK').catch(() => undefined)
@@ -407,6 +400,37 @@ export class PgStore implements Store {
     } finally {
       client.release()
     }
+  }
+
+  async setOutbound(o: OutboundRecord, expected?: string, hand?: OutboundHand) {
+    const { tenantId: _t, ...rules } = o
+    // Written, then not committed: the SIP server gets back what was kept (the lock is gone by then; rare).
+    let written: OutboundRules | undefined
+    try {
+      await this.inOutboundTurn(o.tenantId, async (client, kept) => {
+        if (expected !== undefined && outboundVersion(kept) !== expected) throw staleOutbound()
+        try {
+          await hand?.(rules, false)
+          await client.query(
+            `INSERT INTO outbound_policies (tenant_id, policy, profiles, assignments) VALUES ($1, $2, $3, $4)
+             ON CONFLICT (tenant_id) DO UPDATE SET policy = EXCLUDED.policy, profiles = EXCLUDED.profiles, assignments = EXCLUDED.assignments, updated_at = now()`,
+            [o.tenantId, JSON.stringify(o.policy), JSON.stringify(o.profiles), JSON.stringify(o.assignments)]
+          )
+        } catch (err) {
+          // Handed, then not kept (the SIP server refused, or the write failed): it gets back what is kept, in the turn.
+          if (hand) await hand(kept, true).catch(() => undefined)
+          throw err
+        }
+        written = kept
+      })
+    } catch (err) {
+      if (hand && written) await hand(written, true).catch(() => undefined)
+      throw err
+    }
+  }
+
+  async holdOutbound(tenantId: string, run: (kept: OutboundRules) => Promise<void>) {
+    await this.inOutboundTurn(tenantId, (_client, kept) => run(kept))
   }
 
   async addAlert(a: AlertRecord) {

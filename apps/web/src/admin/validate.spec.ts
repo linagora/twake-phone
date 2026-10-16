@@ -26,6 +26,7 @@ import {
   profileRefusal,
   refusedField,
   reservedSuffixes,
+  sameValue,
   trunkForm,
   trunkRefusal,
   type TrunkForm
@@ -242,6 +243,13 @@ describe('the ring group form (review 7 n°7)', () => {
     expect(groupRefusal(refused(400, 'GROUP_NAME', 'x')).field).toBe('name')
     expect(groupRefusal(refused(400, 'GROUP_MEMBER_NOT_EXTENSION', 'x'))).toEqual({ field: 'members', problem: { key: 'admin.groupMemberNotExtension' } })
     expect(groupRefusal(refused(503, 'SYNC_RUNNING', 'x'))).toEqual({ field: 'form', problem: { key: 'admin.groupSyncRunning' } })
+  })
+
+  it('compares values whatever the order of their keys, as PostgreSQL and the Gateway write them (review 7 ter, n°4)', () => {
+    expect(sameValue({ id: 'world', caps: { dailyCalls: 5, concurrent: 2 }, name: 'Monde', allowed: ['fixed'] }, { id: 'world', name: 'Monde', allowed: ['fixed'], caps: { concurrent: 2, dailyCalls: 5 } })).toBe(true)
+    expect(sameValue({ allowed: ['fixed', 'mobile'] }, { allowed: ['mobile', 'fixed'] })).toBe(false)
+    expect(sameValue({ caps: { concurrent: null } }, { caps: {} })).toBe(false)
+    expect(sameValue({ name: 'Monde' }, { name: 'Monde entier' })).toBe(false)
   })
 
   it('says a group, a trunk or a range removed meanwhile is gone, not that the platform cannot (review 7 bis, n°11)', () => {
