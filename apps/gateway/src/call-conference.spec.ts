@@ -23,17 +23,20 @@ const JOIN = '0123456789abcdef'.repeat(2)
  * `trunkAt`: where LiveKit's outbound trunk sends the calls; `leaveFor`: that number's participant has left the room
  * when it is read. Second review 8b, n°1: `failTaken`, the grant of the call that fails (`failFor`) was taken by
  * LiveKit's own call (`own`, which failed: the SIP server has it no more) or by another one, still in progress
- * (`another`: replayed, then the Gateway's call refused 486 by whoever replayed it); `untakenFor`, LiveKit placed
+ * (`another`: replayed and answered, then the Gateway's call refused 486 by whoever replayed it), or by LiveKit's own
+ * still ringing at the SIP server (`ringing`: given up at LiveKit's ringing delay, 480, its 487s on their way; third
+ * review 8b, n°1); `takenFails` and `miFails`, the grant then cannot be read, or the SIP server's MI cannot end a
+ * call (third review 8b, n°4); `untakenFor`, LiveKit placed
  * that call but no call took its grant; `trunkMovesAt`, the trunk sends elsewhere once that number is called. The
  * fake SIP server withdraws a grant only if no call took it, and ends only a call it has (`ended`). Each participant
  * has the Call-ID of its call (`sip.callIDFull`); the room's call to the group 600 is answered by Carol (104), whom
  * the SIP server tells of it (second review 8b, n°4). Dave (105) holds an extension and is in none.
  */
-const setup = async ({ failFor, failTaken, divertFor, untakenFor, leaveFor, trunkAt = 'pbx:5060', trunkMovesAt, dialOutLimiter, conferenceCaps, ownerCheckMs }: { failFor?: string; failTaken?: 'own' | 'another'; divertFor?: string; untakenFor?: string; leaveFor?: string; trunkAt?: string; trunkMovesAt?: string; dialOutLimiter?: RateLimiter; conferenceCaps?: { perPerson?: number }; ownerCheckMs?: number } = {}) => {
+const setup = async ({ failFor, failTaken, divertFor, untakenFor, leaveFor, trunkAt = 'pbx:5060', trunkMovesAt, dialOutLimiter, conferenceCaps, ownerCheckMs, takenFails, miFails }: { takenFails?: boolean; miFails?: boolean; failFor?: string; failTaken?: 'own' | 'another' | 'ringing'; divertFor?: string; untakenFor?: string; leaveFor?: string; trunkAt?: string; trunkMovesAt?: string; dialOutLimiter?: RateLimiter; conferenceCaps?: { perPerson?: number }; ownerCheckMs?: number } = {}) => {
   const grants: (RoomCallGrant & { token: string; revoked: boolean; taken?: { tag: string; callId: string } })[] = []
   const ended: string[] = []
   // The calls the SIP server has (in progress).
-  const alive = new Set<string>(['diverted@192.0.2.66'])
+  const alive = new Map<string, 'answered' | 'ringing'>([['diverted@192.0.2.66', 'answered']])
   let trunk = trunkAt
   const parties: Record<string, CallParties | 'external' | 'broken'> = {
     c1: { callId: 'c1', caller: '101', callerTag: 'a-tag', callee: '102', calleeTag: 'b-tag' },
@@ -60,7 +63,14 @@ const setup = async ({ failFor, failTaken, divertFor, untakenFor, leaveFor, trun
         grantRoomCall: async (g: RoomCallGrant) => {
           const kept: (typeof grants)[number] = { ...g, token: String(grants.length).padStart(32, 'c'), revoked: false }
           grants.push(kept)
-          return { token: kept.token, revoke: async () => void (kept.revoked ||= !kept.taken), taken: async () => (kept.revoked ? undefined : kept.taken) }
+          return {
+            token: kept.token,
+            revoke: async () => void (kept.revoked ||= !kept.taken),
+            taken: async () => {
+              if (takenFails) throw new Error('database unavailable')
+              return kept.revoked ? undefined : kept.taken
+            }
+          }
         },
         callBetweenExtensions: async (id: string) => {
           const p = parties[id]
@@ -68,9 +78,12 @@ const setup = async ({ failFor, failTaken, divertFor, untakenFor, leaveFor, trun
           return p
         },
         endRoomCall: async (id: string) => {
-          if (!alive.delete(id)) return false
+          if (miFails) throw Object.assign(new Error('OpenSIPS did not answer'), { code: 'ETIMEDOUT' })
+          const state = alive.get(id)
+          if (!state) return undefined
+          alive.delete(id)
           ended.push(id)
-          return true
+          return state
         },
         close: async () => {}
       }) as unknown as TelephonyProvider
@@ -78,6 +91,9 @@ const setup = async ({ failFor, failTaken, divertFor, untakenFor, leaveFor, trun
   const lk: string[] = []
   const rooms = new Map<string, { identity: string; attributes: Record<string, string> }[]>()
   let calls = 0
+  const joinsLater: { identity: string; attributes: Record<string, string> }[] = []
+  // What the bridge draws (identities): each its own.
+  let drawn = 0
   const fetch: Fetch = async (url, init) => {
     const path = new URL(url).pathname.replace('/twirp/', '')
     const body = JSON.parse(init.body ?? '{}')
@@ -88,11 +104,16 @@ const setup = async ({ failFor, failTaken, divertFor, untakenFor, leaveFor, trun
       if (body.sip_call_to === trunkMovesAt) trunk = '198.51.100.7:5060'
       const sipCallId = `SCL_${++calls}`
       const grant = grants.find(g => g.token === body.headers?.['X-Twake-Grant'])
-      if (body.sip_call_to === failFor && grant && failTaken) grant.taken = failTaken === 'own' ? { tag: sipCallId, callId: `${sipCallId}@192.0.2.30` } : { tag: 'SCL_someone-else', callId: 'diverted@192.0.2.66' }
+      if (body.sip_call_to === failFor && grant && failTaken) grant.taken = failTaken === 'another' ? { tag: 'SCL_someone-else', callId: 'diverted@192.0.2.66' } : { tag: sipCallId, callId: `${sipCallId}@192.0.2.30` }
+      if (body.sip_call_to === failFor && failTaken === 'another') alive.set('diverted@192.0.2.66', 'answered')
+      if (body.sip_call_to === failFor && failTaken === 'ringing') {
+        alive.set(`${sipCallId}@192.0.2.30`, 'ringing')
+        return { ok: false, status: 400, text: async () => JSON.stringify({ code: 'canceled', msg: 'sip status: 480: Temporarily Unavailable', meta: { sip_status_code: '480', sip_status: 'Temporarily Unavailable' } }) }
+      }
       if (body.sip_call_to === failFor) return { ok: false, status: 400, text: async () => JSON.stringify({ code: 'unavailable', msg: 'sip status: 486: Busy Here', meta: { sip_status_code: '486', sip_status: 'Busy Here' } }) }
       // The SIP server takes the grant with the call that carries it: LiveKit's own, or another one.
       if (grant && body.sip_call_to !== untakenFor) grant.taken = body.sip_call_to === divertFor ? { tag: 'SCL_someone-else', callId: 'diverted@192.0.2.66' } : { tag: sipCallId, callId: `${sipCallId}@192.0.2.30` }
-      if (body.sip_call_to !== divertFor && body.sip_call_to !== untakenFor) alive.add(`${sipCallId}@192.0.2.30`)
+      if (body.sip_call_to !== divertFor && body.sip_call_to !== untakenFor) alive.set(`${sipCallId}@192.0.2.30`, 'answered')
       const room = rooms.get(body.room_name) ?? []
       const callIdFull = body.sip_call_to === '600' ? 'grp@192.0.2.30' : `${sipCallId}@192.0.2.30`
       if (body.sip_call_to !== leaveFor) room.push({ identity: body.participant_identity, attributes: { ...body.participant_attributes, 'sip.callIDFull': callIdFull } })
@@ -100,6 +121,12 @@ const setup = async ({ failFor, failTaken, divertFor, untakenFor, leaveFor, trun
       return { ok: true, status: 200, text: async () => JSON.stringify({ participant_identity: body.participant_identity, room_name: body.room_name, sip_call_id: sipCallId }) }
     }
     if (path === 'livekit.RoomService/DeleteRoom') rooms.delete(body.room)
+    // Someone who comes in just after this read (`joinsLater`), seen by the next one.
+    if (path === 'livekit.RoomService/ListParticipants' && joinsLater.length) {
+      const now = [...(rooms.get(body.room) ?? [])]
+      rooms.get(body.room)?.push(...joinsLater.splice(0))
+      return { ok: true, status: 200, text: async () => JSON.stringify({ participants: now }) }
+    }
     const out: Record<string, unknown> = {
       'livekit.SIP/ListSIPOutboundTrunk': { items: [{ sip_trunk_id: 'O', name: 'twake-meet-out', address: trunk }] },
       'livekit.RoomService/ListRooms': { rooms: [...rooms.keys()].filter(r => (body.names ?? []).includes(r)).map(name => ({ name })) },
@@ -107,7 +134,7 @@ const setup = async ({ failFor, failTaken, divertFor, untakenFor, leaveFor, trun
     }
     return { ok: true, status: 200, text: async () => JSON.stringify(out[path] ?? {}) }
   }
-  const bridge = new LiveKitConferenceBridge({ url: 'http://lk', apiKey: 'k', apiSecret: 's', dialInNumbers: [], inboundAddresses: ['192.0.2.30'], outboundAddress: 'pbx:5060', fetch }, max => Math.floor(max / 3))
+  const bridge = new LiveKitConferenceBridge({ url: 'http://lk', apiKey: 'k', apiSecret: 's', dialInNumbers: [], inboundAddresses: ['192.0.2.30'], outboundAddress: 'pbx:5060', fetch }, max => (drawn += 7919) % max)
   const store = new MemoryStore()
   await store.upsertMapping({ tenantId: 'dev', userId: 'alice', extension: '101' })
   await store.upsertMapping({ tenantId: 'dev', userId: 'bob', extension: '102' })
@@ -132,7 +159,7 @@ const setup = async ({ failFor, failTaken, divertFor, untakenFor, leaveFor, trun
     const token = signToken('k', 's', { sha256: createHash('sha256').update(body).digest('base64') })
     return app.inject({ method: 'POST', url: '/api/v1/webhooks/livekit', headers: { 'content-type': 'application/webhook+json', authorization: token }, payload: body })
   }
-  return { app, as, conference, grants, ended, lk, dialled, rooms, store, webhook }
+  return { app, as, conference, grants, ended, lk, dialled, rooms, store, webhook, joinsLater }
 }
 
 describe('a call becomes a conference (POST /calls/:id/conference, step 8b)', () => {
@@ -277,6 +304,11 @@ describe('a call becomes a conference (POST /calls/:id/conference, step 8b)', ()
     expect(rooms.size).toBe(0)
     expect(await store.countConferences('dev')).toBe(0)
     expect((await store.listAlerts('dev', { limit: 10 })).map(a => [a.alert.param, a.alert.extension, a.alert.number])).toEqual([['call-diverted', '101', '102']])
+    // Again: the same answer, one alert that counts both (third review 8b, n°1: the store's, as for all alerts).
+    const again = await conference('c2')
+    expect(again.json().code, again.body).toBe('CALL_DIVERTED')
+    expect(ended).toEqual(['diverted@192.0.2.66', 'diverted@192.0.2.66'])
+    expect((await store.listAlerts('dev', { limit: 10 })).map(a => a.count)).toEqual([2])
     // A third participant likewise.
     const later = await setup({ failFor: '104', failTaken: 'another' })
     const room = (await later.conference('c1')).json().meetingId
@@ -294,6 +326,37 @@ describe('a call becomes a conference (POST /calls/:id/conference, step 8b)', ()
     expect(res.json()).toMatchObject({ code: 'DIAL_FAILED', sipStatus: 486 })
     expect(ended).toEqual([])
     expect(await store.listAlerts('dev', { limit: 10 })).toEqual([])
+  })
+
+  it("says DIAL_FAILED when nobody answered: LiveKit's own call, still ringing at the SIP server, is ended quietly (third review 8b, n°1), for the call in the place of the other's as for a third participant", async () => {
+    const { conference, ended, store } = await setup({ failFor: '102', failTaken: 'ringing' })
+    const res = await conference('c1')
+    expect(res.statusCode, res.body).toBe(409)
+    expect(res.json()).toMatchObject({ code: 'DIAL_FAILED', sipStatus: 480 })
+    expect(ended).toEqual(['SCL_2@192.0.2.30'])
+    expect(await store.listAlerts('dev', { limit: 10 })).toEqual([])
+    const later = await setup({ failFor: '104', failTaken: 'ringing' })
+    const room = (await later.conference('c1')).json().meetingId
+    const dial = await later.app.inject({ method: 'POST', url: `/api/v1/conferences/${room}/participants`, headers: later.as('alice'), payload: { number: '104' } })
+    expect(dial.statusCode, dial.body).toBe(409)
+    expect(dial.json()).toMatchObject({ code: 'DIAL_FAILED', sipStatus: 480 })
+    expect(later.ended).toEqual(['SCL_3@192.0.2.30'])
+    expect(await later.store.listAlerts('dev', { limit: 10 })).toEqual([])
+  })
+
+  it('tells the administrators when the grant cannot be read after a failure, and leaves a failure a failure when the SIP server cannot end the call that took it (third review 8b, n°4)', async () => {
+    const unread = await setup({ failFor: '102', failTaken: 'another', takenFails: true })
+    expect((await unread.conference('c1')).json().code).toBe('CALL_DIVERTED')
+    expect((await unread.store.listAlerts('dev', { limit: 10 })).map(a => a.alert.param)).toEqual(['call-diverted'])
+    const noMi = await setup({ failFor: '102', failTaken: 'ringing', miFails: true })
+    const failed = await noMi.conference('c1')
+    expect(failed.statusCode, failed.body).toBe(409)
+    expect(failed.json().code).toBe('DIAL_FAILED')
+    expect(await noMi.store.listAlerts('dev', { limit: 10 })).toEqual([])
+    // After a success, another call that took the grant is told all the same.
+    const divertedNoMi = await setup({ divertFor: '102', miFails: true })
+    expect((await divertedNoMi.conference('c1')).json().code).toBe('CALL_DIVERTED')
+    expect((await divertedNoMi.store.listAlerts('dev', { limit: 10 })).map(a => a.alert.param)).toEqual(['call-diverted'])
   })
 
   it('withdraws the grant no call took though LiveKit placed its call (second review 8b, n°1): diverted, nothing left to replay', async () => {
@@ -350,7 +413,7 @@ describe('a call becomes a conference (POST /calls/:id/conference, step 8b)', ()
   })
 
   it("lets whoever the room's call reached through a group read who is in it (second review 8b, n°4), nobody it did not reach; a group's number is nobody from outside", async () => {
-    const { conference, app, as, webhook, lk, store } = await setup()
+    const { conference, app, as, webhook, lk, store, rooms } = await setup()
     const room = (await conference('c1')).json().meetingId
     expect((await app.inject({ method: 'POST', url: `/api/v1/conferences/${room}/participants`, headers: as('alice'), payload: { number: '600' } })).statusCode).toBe(201)
     // Carol answered the group's call: the SIP server told her of it.
@@ -359,18 +422,25 @@ describe('a call becomes a conference (POST /calls/:id/conference, step 8b)', ()
     expect(read.json().participants.map((p: { number: string }) => p.number)).toEqual(['101', '102', '600'])
     expect((await app.inject({ method: 'GET', url: `/api/v1/conferences/${room}`, headers: as('dave') })).statusCode).toBe(403)
     // Alice leaves: Carol is of the tenant, the room goes on.
+    rooms.set(room, rooms.get(room)!.filter(p => p.attributes['twake.number'] !== '101'))
     await webhook({ event: 'participant_left', room: { name: room }, participant: { identity: 'phone-101-x', attributes: { 'twake.number': '101' } } })
     expect(lk.filter(l => l.startsWith('livekit.RoomService/DeleteRoom'))).toEqual([])
     expect(await store.getConference(room)).not.toBeNull()
   })
 
   it("shows the number of someone from outside whole to the room's owner only, masked to the others in it (second review 8b, n°6)", async () => {
-    const { conference, app, as } = await setup()
+    const { conference, app, as, joinsLater } = await setup()
     const room = (await conference('c1')).json().meetingId
     expect((await app.inject({ method: 'POST', url: `/api/v1/conferences/${room}/participants`, headers: as('alice'), payload: { number: '0199000024' } })).statusCode).toBe(201)
-    const numbers = async (user: string) => (await app.inject({ method: 'GET', url: `/api/v1/conferences/${room}`, headers: as(user) })).json().participants.map((p: { number: string }) => p.number)
+    const read = async (user: string) => (await app.inject({ method: 'GET', url: `/api/v1/conferences/${room}`, headers: as(user) })).body
+    const numbers = async (user: string) => JSON.parse(await read(user)).participants.map((p: { number: string }) => p.number)
     expect(await numbers('alice')).toEqual(['101', '102', '0199000024'])
     expect(await numbers('bob')).toEqual(['101', '102', '019*****24'])
+    // Nowhere in what Bob reads, its ids included (third review 8b, n°2).
+    expect(await read('bob')).not.toContain('99000024')
+    // Someone come in between the two reads of LiveKit, not proved of the tenant: masked too.
+    joinsLater.push({ identity: 'phone-0123456789abcdef0123', attributes: { 'twake.kind': 'phone', 'twake.number': '0199000077', 'sip.callIDFull': 'late@192.0.2.30' } })
+    expect(await numbers('bob')).toEqual(['101', '102', '019*****24', '019*****77'])
   })
 
   it('ends the room its owner left with someone from outside in it without waiting for LiveKit to say so (second review 8b, n°3)', async () => {
@@ -389,12 +459,14 @@ describe('a call becomes a conference (POST /calls/:id/conference, step 8b)', ()
   })
 
   it("lets LiveKit end a call's room (webhook room_finished: its record goes), and ends the room its owner left with someone from outside in it (review 8b, n°7, n°12)", async () => {
-    const { conference, store, webhook, lk, app, as } = await setup()
+    const { conference, store, webhook, lk, app, as, rooms } = await setup()
+    const leaves = (room: string, number: string) => rooms.set(room, rooms.get(room)!.filter(p => p.attributes['twake.number'] !== number))
     const first = (await conference('c1')).json().meetingId
     expect((await webhook({ event: 'room_finished', room: { name: first } })).statusCode).toBe(204)
     expect(await store.getConference(first)).toBeNull()
     // Alice leaves a conference of extensions only: it goes on.
     const second = (await conference('c2')).json().meetingId
+    leaves(second, '101')
     expect((await webhook({ event: 'participant_left', room: { name: second }, participant: { identity: 'phone-101-x', attributes: { 'twake.number': '101' } } })).statusCode).toBe(204)
     expect(await store.getConference(second)).not.toBeNull()
     expect(lk.filter(l => l.startsWith('livekit.RoomService/DeleteRoom'))).toEqual([])
@@ -402,6 +474,12 @@ describe('a call becomes a conference (POST /calls/:id/conference, step 8b)', ()
     expect((await app.inject({ method: 'POST', url: `/api/v1/conferences/${second}/participants`, headers: as('alice'), payload: { number: '0199000024' } })).statusCode).toBe(201)
     await webhook({ event: 'participant_left', room: { name: second }, participant: { identity: 'phone-102-x', attributes: { 'twake.number': '102' } } })
     expect(await store.getConference(second)).not.toBeNull()
+    // Her departure said while she is still in it (a webhook played again, another call of the room to her extension):
+    // LiveKit is read again, nothing ends (third review 8b, n°6).
+    const third = (await conference('c1')).json().meetingId
+    expect((await app.inject({ method: 'POST', url: `/api/v1/conferences/${third}/participants`, headers: as('alice'), payload: { number: '0199000025' } })).statusCode).toBe(201)
+    await webhook({ event: 'participant_left', room: { name: third }, participant: { identity: 'phone-101-x', attributes: { 'twake.number': '101' } } })
+    expect(await store.getConference(third)).not.toBeNull()
     await webhook({ event: 'participant_left', room: { name: second }, participant: { identity: 'phone-101-x', attributes: { 'twake.number': '101' } } })
     expect(lk.filter(l => l.startsWith('livekit.RoomService/DeleteRoom'))).toEqual([`livekit.RoomService/DeleteRoom {"room":"${second}"}`])
     expect(await store.getConference(second)).toBeNull()

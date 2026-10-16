@@ -801,6 +801,18 @@ describe('Softphone', () => {
     const late = new FakeSession('incoming')
     ua().emit('newRTCSession', { originator: 'remote', session: late, request: { getHeader: (name: string) => ({ 'Twake-Join': again, 'Twake-Room': 'conference' })[name] } })
     expect(late.terminate).toHaveBeenCalledWith({ status_code: 481, reason_phrase: 'Call Does Not Exist' })
+    // Its room's call answered, then the Gateway fails before the far end moves (it stopped meanwhile, third review
+    // 8b, n°5): forgetting the token hangs that call up, and ours is back as it was.
+    const third = phone.expectConference(call.id)
+    const left = new FakeSession('incoming')
+    ua().emit('newRTCSession', { originator: 'remote', session: left, request: { getHeader: (name: string) => ({ 'Twake-Join': third, 'Twake-Room': 'conference' })[name] } })
+    left.emit('accepted', { originator: 'local' })
+    expect(call.muted).toBe(true)
+    phone.cancelConference(third)
+    expect(left.terminate).toHaveBeenCalled()
+    left.emit('ended', { originator: 'local', cause: 'Terminated' })
+    expect(call.muted).toBe(false)
+    expect(phone.conferenceCall(call.id)).toBeUndefined()
     s.emit('ended', { originator: 'remote', cause: 'Terminated' })
     expect(call.endReason).toBe('hangup')
   })

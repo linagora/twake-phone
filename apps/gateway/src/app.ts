@@ -1488,11 +1488,13 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         if (CALL_ROOM.test(record.meetingId)) {
           const participants = await viaLiveKit(() => bridge.listParticipants(record.meetingId))
           if (!calls) return { meetingId: record.meetingId, participants }
-          const outside = new Set<string>()
-          for (const p of calls) if (!(await insider(record, p))) outside.add(p.id)
+          // Shown whole only when proved of the tenant by the read of the calls: one come in since is masked too (third
+          // review 8b, n°2). Its id carries no number (an identity drawn at random, conference-livekit).
+          const inside = new Set<string>()
+          for (const p of calls) if (await insider(record, p)) inside.add(p.id)
           return {
             meetingId: record.meetingId,
-            participants: participants.map(p => (outside.has(p.id) && p.number ? { ...p, number: maskNumber(p.number), ...(p.displayName ? { displayName: maskNumber(p.number) } : {}) } : p))
+            participants: participants.map(p => (!inside.has(p.id) && p.number ? { ...p, number: maskNumber(p.number), ...(p.displayName ? { displayName: maskNumber(p.number) } : {}) } : p))
           }
         }
         // The PIN shown lets in: the room's rule is made again if LiveKit lost it.
@@ -1520,7 +1522,10 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
       const dialOuts = options.dialOutLimiter ?? new RateLimiter(10, 60_000)
       const tooManyDialOuts = { statusCode: 429, code: 'DIAL_OUT_LIMIT', error: 'Too Many Requests', message: 'Too many calls placed by your rooms: wait a minute' }
       const divertedReply = { statusCode: 502, code: 'CALL_DIVERTED', error: 'Bad Gateway', message: "A room's call did not go where it was sent: the administrators are told" }
-      /** For the administrators (alert `meet`, `param` call-diverted or trunk-changed): kept and logged, as the SIP server's. */
+      /**
+       * For the administrators (alert `meet`, `param` call-diverted or trunk-changed): kept and logged, as the SIP
+       * server's. Its repeats for the same extension count in one alert (the store's alertKey, ALERT_DEDUP_MS).
+       */
       const roomAlert = async (tenantId: string, param: 'call-diverted' | 'trunk-changed', extension: string, number?: string) => {
         app.log.error({ tenantId, alert: { kind: 'meet', param, ...(pseudonym ? { ext: pseudonym(tenantId, extension) } : {}) } }, `telephony alert: meet ${param}`)
         await store.addAlert({ tenantId, at: new Date().toISOString(), alert: { kind: 'meet', param, extension, ...(number ? { number } : {}) } }).catch(err => app.log.error({ err, tenantId }, 'could not record the alert'))
@@ -1541,9 +1546,13 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
        * from the SIP server, which keeps its From tag, the id LiveKit SIP gives its call (`placed.sipCallId`). Diverted
        * (true: that call ended at the SIP server, the administrators told) when another call took it (replayed from
        * someone else's room), or when LiveKit placed a call that took none. When LiveKit's call failed (`placed`
-       * undefined), the one that took the grant is LiveKit's own if the SIP server no longer has it; one still there
-       * is another's (whoever replayed the grant then refused the Gateway's call, 486). A provider that cannot say (no
-       * `taken`) is taken at its word; a grant that cannot be read is no call of the Gateway's.
+       * undefined), the call that took the grant is ended wherever it is, and is a diversion only if it was answered
+       * (third review 8b, n°1): whoever replayed the grant, then refused the Gateway's call (486). One still ringing is
+       * ended quietly: LiveKit's own, given up at its ringing delay (it cancels and says so at once, the 487s still on
+       * their way), or a replayed one nobody answered yet; the failure is a failure. A provider that cannot say (no
+       * `taken`) is taken at its word. Read twice (third review 8b, n°4): a grant that still cannot be read is told,
+       * whatever LiveKit said; an SIP server that cannot end the call nor say what it was leaves a failure a failure
+       * (logged), and after a success the diversion is told all the same.
        */
       const settle = async (provider: TelephonyProvider, tenantId: string, grant: RoomCallGrantToken, placed: DialedParticipant | undefined, extension: string, number: string) => {
         const withdraw = () => grant.revoke().catch((err: unknown) => app.log.warn({ err }, 'the grant of a room call not withdrawn'))
@@ -1553,12 +1562,12 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
           return false
         }
         await withdraw()
+        const read = grant.taken.bind(grant)
         let taken: { tag: string; callId: string } | undefined
         try {
-          taken = await grant.taken()
+          taken = await read().catch(() => read())
         } catch (err) {
-          app.log.error({ err, tenantId }, 'the call that took the grant of a room call could not be read')
-          if (!placed) return false
+          app.log.error({ err, tenantId }, 'the call that took the grant of a room call could not be read: told')
           await roomAlert(tenantId, 'call-diverted', extension, number)
           return true
         }
@@ -1568,13 +1577,17 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
           return true
         }
         if (placed?.sipCallId && taken.tag === placed.sipCallId) return false
-        const ended = provider.endRoomCall
-          ? await provider.endRoomCall(taken.callId).catch((err: unknown) => {
-              app.log.error({ err }, 'a diverted call of a room not ended at the SIP server')
-              return undefined
-            })
-          : undefined
-        if (!placed && ended === false) return false
+        const { callId } = taken
+        const endRoomCall = provider.endRoomCall?.bind(provider)
+        const ended = endRoomCall
+          ? await endRoomCall(callId)
+              .catch(() => endRoomCall(callId))
+              .catch((err: unknown) => {
+                app.log.error({ err, tenantId }, 'the call that took the grant of a room call not ended at the SIP server, nor said')
+                return 'unknown' as const
+              })
+          : ('unknown' as const)
+        if (!placed) return ended === 'answered' ? (await roomAlert(tenantId, 'call-diverted', extension, number), true) : false
         await roomAlert(tenantId, 'call-diverted', extension, number)
         return true
       }
@@ -1715,14 +1728,15 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
 
       /**
        * Ends the room its owner is no longer in while someone from outside is (review 8b, n°7; insider, second review
-       * 8b, n°4): that call goes at the owner's name and on their caps, with nobody left to end it. `left`: LiveKit
-       * said the owner left (its webhook), so a call of theirs still listed is going. Whether the room ended.
+       * 8b, n°4): that call goes at the owner's name and on their caps, with nobody left to end it. Read from LiveKit
+       * each time, LiveKit's webhook included (third review 8b, n°6): a webhook played again, or another call of the room
+       * to the owner's extension that ends, ends nothing while the owner is still in it. Whether the room ended.
        */
-      const endIfOwnerGone = async (bridge: LiveKitConferenceBridge, record: { tenantId: string; meetingId: string; ownerUserId: string }, left = false) => {
+      const endIfOwnerGone = async (bridge: LiveKitConferenceBridge, record: { tenantId: string; meetingId: string; ownerUserId: string }) => {
         const owner = await store.getMappingByUser(record.tenantId, record.ownerUserId)
         if (!owner?.extension) return false
         const now = await viaLiveKit(() => bridge.participantCalls(record.meetingId))
-        if (!left && now.some(p => p.number === owner.extension)) return false
+        if (now.some(p => p.number === owner.extension)) return false
         let outsider = false
         for (const p of now) {
           if (p.number === owner.extension) continue
@@ -1774,7 +1788,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         // the owner's name and on their caps, with nobody left to end it. The room ends.
         if (record && bridge && body.event === 'participant_left' && CALL_ROOM.test(record.meetingId)) {
           const owner = await store.getMappingByUser(record.tenantId, record.ownerUserId)
-          if (owner?.extension && (body as { participant?: { attributes?: Record<string, string> } }).participant?.attributes?.['twake.number'] === owner.extension) await endIfOwnerGone(bridge, record, true)
+          if (owner?.extension && (body as { participant?: { attributes?: Record<string, string> } }).participant?.attributes?.['twake.number'] === owner.extension) await endIfOwnerGone(bridge, record)
         }
         const event = record && bridge ? bridge.fromWebhook(body) : undefined
         if (record && event) bus.publish(record.tenantId, record.ownerUserId, event)

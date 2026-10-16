@@ -380,18 +380,22 @@ export class OpensipsProvider implements TelephonyProvider, MediaProvider {
 
   /**
    * Ends a call OpenSIPS has, by its Call-ID (MI dlg_end_dlg, review 8b, n°3): a BYE to both sides, a CANCEL if it
-   * still rings. False for a call it does not have (404: over already, failed, never there; OpenSIPS 3.6.9 looks among
-   * the dialogs not ended only).
+   * still rings; first read (dlg_list_ctx), to say which (third review 8b, n°1): `answered` for a confirmed dialog
+   * (state 4), `ringing` for one not yet (unconfirmed, early, or its 200 not acknowledged). Undefined for a call it does
+   * not have (404: over already, failed, never there).
    */
-  async endRoomCall(callId: string): Promise<boolean> {
-    if (!this.events) throw Object.assign(new Error('The SIP server cannot end a call'), { statusCode: 501 })
-    return this.events.call('dlg_end_dlg', { dialog_id: callId }).then(
-      () => true,
-      (err: unknown) => {
-        if ((err as { code?: unknown }).code !== 404) throw err
-        return false
-      }
-    )
+  async endRoomCall(callId: string): Promise<'answered' | 'ringing' | undefined> {
+    const events = this.events
+    if (!events) throw Object.assign(new Error('The SIP server cannot end a call'), { statusCode: 501 })
+    const none = (err: unknown) => {
+      if ((err as { code?: unknown }).code !== 404) throw err
+      return undefined
+    }
+    const dialog = await events.call('dlg_list_ctx', { callid: callId }).then(parseDlgContext, none)
+    if (!dialog || dialog.callid !== callId) return undefined
+    const ended = await events.call('dlg_end_dlg', { dialog_id: callId }).then(() => true, none)
+    if (!ended) return undefined
+    return dialog.state === 4 ? 'answered' : 'ringing'
   }
 
   /**

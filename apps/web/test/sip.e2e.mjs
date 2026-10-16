@@ -190,7 +190,9 @@ const listenDtmf = address => {
 const DTMF_EVENTS = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '*', '#']
 
 const [APP_PORT, OIDC_PORT, RELAY_PORT] = await Promise.all([freePort(), freePort(), freePort()])
-// Where the stack's LiveKit sends its webhooks (docker-compose.sip.yml, LIVEKIT_WEBHOOK_URL; second review 8b, n°3).
+// Where the stack's LiveKit sends its webhooks (docker-compose.sip.yml, LIVEKIT_WEBHOOK_URL; second review 8b, n°3): a
+// port known before the stack starts, not drawn like the others. Taken, the run stops at once and says so (third
+// review 8b, n°7): GATEWAY_PORT moves it, LIVEKIT_WEBHOOK_URL of the stack along with it.
 const GATEWAY_PORT = Number(process.env.GATEWAY_PORT ?? 18080)
 const appOrigin = `http://127.0.0.1:${APP_PORT}`
 const gatewayUrl = `http://127.0.0.1:${GATEWAY_PORT}`
@@ -268,7 +270,10 @@ gateway.addHook('onResponse', async (req, reply) => {
   if (req.url === '/api/v1/webhooks/livekit') livekitWebhooks.push(reply.statusCode)
 })
 registry.startAll()
-await gateway.listen({ host: '127.0.0.1', port: GATEWAY_PORT })
+await gateway.listen({ host: '127.0.0.1', port: GATEWAY_PORT }).catch(err => {
+  if (err?.code !== 'EADDRINUSE') throw err
+  throw new Error(`port ${GATEWAY_PORT} (GATEWAY_PORT) is taken: free it, or set GATEWAY_PORT and the stack's LIVEKIT_WEBHOOK_URL to another one`)
+})
 const web = await serveApp({
   dir: fileURLToPath(new URL('../dist/', import.meta.url)),
   port: APP_PORT,

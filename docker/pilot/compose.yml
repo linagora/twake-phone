@@ -222,6 +222,9 @@ services:
       LIVEKIT_URL:
       LIVEKIT_API_KEY:
       LIVEKIT_API_SECRET:
+      # The key LiveKit signs its webhooks with, when it is not the one above (Meet's: one key for all its webhook.urls).
+      LIVEKIT_WEBHOOK_API_KEY:
+      LIVEKIT_WEBHOOK_API_SECRET:
       MEET_NUMBER:
       MEET_DIALIN_NUMBERS:
       MEET_INBOUND_ADDRESSES:

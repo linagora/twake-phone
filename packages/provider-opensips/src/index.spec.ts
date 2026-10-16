@@ -395,17 +395,25 @@ describe('OpensipsProvider call rules', () => {
     sips.state.down = false
   })
 
-  it('ends a call OpenSIPS has by its Call-ID (MI dlg_end_dlg, review 8b, n°3); one it no longer has is no error, and said (second review 8b, n°1)', async () => {
+  it('ends a call OpenSIPS has by its Call-ID (MI dlg_end_dlg, review 8b, n°3), saying whether it was answered or still ringing (third review 8b, n°1); one it no longer has is no error, and said (second review 8b, n°1)', async () => {
     const sips = await fakeOpensips()
     cleanups.push(sips.close)
     const p = new OpensipsProvider({ websocketUrl: 'wss://sip.example.test', domain: 'sip.example.test', sipSecretFor: async () => 's', events: { miUrl: sips.url, timeoutMs: 300 }, logger: quiet })
     cleanups.push(() => p.close())
     await until('the subscription', () => p.getStatus() === 'CONNECTED')
-    sips.state.dialogContexts.set('diverted@192.0.2.30', { callid: 'diverted@192.0.2.30' })
-    expect(await p.endRoomCall('diverted@192.0.2.30')).toBe(true)
+    sips.state.dialogContexts.set('diverted@192.0.2.30', { callid: 'diverted@192.0.2.30', state: 4, caller_tag: 'x', from_uri: 'sip:101@sip.example.test', context: { values: [] } })
+    expect(await p.endRoomCall('diverted@192.0.2.30')).toBe('answered')
+    expect(sips.requests.find(r => r.method === 'dlg_list_ctx')?.params).toEqual({ callid: 'diverted@192.0.2.30' })
     expect(sips.requests.find(r => r.method === 'dlg_end_dlg')?.params).toEqual({ dialog_id: 'diverted@192.0.2.30' })
     expect(sips.state.dialogContexts.has('diverted@192.0.2.30')).toBe(false)
-    expect(await p.endRoomCall('diverted@192.0.2.30')).toBe(false)
+    expect(await p.endRoomCall('diverted@192.0.2.30')).toBeUndefined()
+    // Still ringing (early, 2): cancelled, and said so.
+    sips.state.dialogContexts.set('early@192.0.2.30', { callid: 'early@192.0.2.30', state: 2, caller_tag: 'x', from_uri: 'sip:101@sip.example.test', context: { values: [] } })
+    expect(await p.endRoomCall('early@192.0.2.30')).toBe('ringing')
+    expect(sips.state.dialogContexts.has('early@192.0.2.30')).toBe(false)
+    // An MI that answers another error than "no such dialog" is no answer.
+    sips.state.dialogContexts.set('broken@192.0.2.30', 'fail')
+    await expect(p.endRoomCall('broken@192.0.2.30')).rejects.toBeTruthy()
     await expect(make().endRoomCall('x')).rejects.toMatchObject({ statusCode: 501 })
   })
 

@@ -205,6 +205,8 @@ export const SoftphoneProvider = ({ children }: { children: ReactNode }) => {
         if (!call.sipCallId) throw new Error('No Call-ID for this call')
         meetingId = (await client.makeConference(call.sipCallId, join)).meetingId
       } catch (err) {
+        // Not waited for any more, and its room's call hung up if it was answered (the Gateway stopped between the two
+        // calls of the room, third review 8b, n°5): our call is back as it was.
         softphone.cancelConference(join)
         // Ended meanwhile (the room's call refused 481, second review 8b, n°9): the error does not say it goes on.
         if (err && typeof err === 'object' && call.state === 'ended') Object.assign(err, { callOver: true })

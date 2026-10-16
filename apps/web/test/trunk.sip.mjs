@@ -1137,11 +1137,28 @@ try {
       expect('the room\'s call to a third person', third.final.status === 200, third.final.first)
       const thirdRung = await p303.incoming(i => header(i, 'call-id') === third.callId)
       expect('a conference\'s call, its room', header(thirdRung.invite, 'twake-room') === 'conference' && header(thirdRung.invite, 'twake-conference') === conference && !thirdRung.invite.headers.has('replaces') && !thirdRung.invite.headers.has('require') && !thirdRung.invite.headers.has('twake-join'), JSON.stringify(Object.fromEntries(thirdRung.invite.headers)))
-      // How the Gateway ends a call that took a grant not its own (review 8b, n°3): its dialog by its Call-ID, a BYE to both sides.
+      // How the Gateway ends a call that took a grant not its own (review 8b, n°3): its dialog by its Call-ID, a BYE to
+      // both sides. Answered, its state says so (4): the Gateway reads it a divert (third review 8b, n°1).
+      expect('an answered dialog', parseDlgContext((await mi('dlg_list_ctx', { callid: third.callId })).result)?.state === 4)
       const ended = await mi('dlg_end_dlg', { dialog_id: third.callId })
       expect('the dialog ended by its Call-ID', ended.result === 'OK', JSON.stringify(ended))
       await p303.callState(thirdRung, 'ended', 5_000)
       await lk.callState(third, 'ended', 5_000)
+      // Still ringing (nobody answers; LiveKit SIP gives up at its own time and says so before the 487): its state says
+      // early (under 4), and ending it cancels it (third review 8b, n°1): the Gateway reads a call nobody answered.
+      p303.st.answerDelayMs = 20_000
+      try {
+        const ringing = lk.dial('303', { extra: [`X-Twake-Grant: ${await grants.grant('301', '303', 30, { room: conference })}`], giveUpMs: 10_000 })
+        const ringingRung = await p303.incoming(i => header(i, 'twake-conference') === conference && header(i, 'call-id') !== third.callId)
+        const early = parseDlgContext((await mi('dlg_list_ctx', { callid: header(ringingRung.invite, 'call-id') })).result)
+        expect('a dialog still ringing', early !== undefined && early.state < 4, JSON.stringify(early))
+        const cancelled = await mi('dlg_end_dlg', { dialog_id: header(ringingRung.invite, 'call-id') })
+        expect('the ringing dialog ended by its Call-ID', cancelled.result === 'OK', JSON.stringify(cancelled))
+        const rang = await ringing
+        expect('the room\'s call cancelled', rang.final?.status === 487, rang.final?.first ?? rang.state)
+      } finally {
+        p303.st.answerDelayMs = 200
+      }
       // Never a conference's call to the public network: nothing sent.
       const sent = sentToOperators()
       const toPublic = await lk.dial('0199000024', { extra: [`X-Twake-Grant: ${await grants.grant('301', '0199000024', 30, { replaces })}`] })

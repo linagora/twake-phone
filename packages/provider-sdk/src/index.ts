@@ -62,10 +62,11 @@ export interface TelephonyProvider {
    */
   grantRoomCall?(grant: RoomCallGrant): Promise<RoomCallGrantToken>
   /**
-   * Ends a call the SIP server has, by its Call-ID (a room's call that took a grant meant for another, review 8b, n°3):
-   * true if it had it (still ringing or in progress), false if it has no such call (over, never there).
+   * Ends a call the SIP server has, by its Call-ID (a room's call that took a grant meant for another, review 8b, n°3),
+   * and says what it was (third review 8b, n°1): `answered` (in progress, a BYE to both sides), `ringing` (not answered
+   * yet, cancelled), undefined if it has no such call (over, never there).
    */
-  endRoomCall?(callId: string): Promise<boolean>
+  endRoomCall?(callId: string): Promise<'answered' | 'ringing' | undefined>
   /**
    * A call in progress between two of the tenant's extensions, as the SIP server holds it (step 8b, ADR 0019): its
    * parties (the extensions where it reached, a ring group's member who answered, a forward's target) and the tags

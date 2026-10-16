@@ -829,6 +829,8 @@ export class Softphone {
   private pendingConsultationOf?: string
   /** The conference asked for one of our calls (step 8b): the token its room's call carries (JOIN_HEADER), for a while. */
   private pendingJoin?: { token: string; of: string; timer: ReturnType<typeof setTimeout> }
+  /** The room's calls answered for a token, while they last: what `cancelConference` hangs up. */
+  private readonly joinedBy = new Map<string, WebCall>()
   /** The conference asked (or none): its call says it is becoming one (`conferencing`). */
   private setPendingJoin(next?: { token: string; of: string; timer: ReturnType<typeof setTimeout> }) {
     const before = this.pendingJoin
@@ -1047,6 +1049,7 @@ export class Softphone {
         }
         this.setPendingJoin(undefined)
         const call = this.wrap(e.session, 'inbound', { room, conferenceOf: of.id, sipCallId, startMuted: of.muted, ...(conferenceRoom ? { conferenceRoom } : {}) })
+        this.joinedBy.set(join, call)
         this.options.onCallChange?.(call)
         void call.setOutput(this.devices.outputId ?? '')
         setTimeout(() => void call.answer().catch(() => undefined), 0)
@@ -1140,12 +1143,17 @@ export class Softphone {
   }
 
   /**
-   * The conference asked with `token` will not come (the Gateway said no): its room's call is not answered any more.
-   * Another one asked since is left alone.
+   * The conference asked with `token` will not come (the Gateway said no, or stopped while making it): its room's call
+   * is not answered any more, and hung up when it was (third review 8b, n°5) while our call is still there, its far end
+   * not moved to the room: that call is back as it was, not quiet with only us in the room. Another one asked since is
+   * left alone.
    */
   cancelConference(token: string) {
-    if (this.pendingJoin?.token !== token) return
-    this.setPendingJoin(undefined)
+    if (this.pendingJoin?.token === token) this.setPendingJoin(undefined)
+    const room = this.joinedBy.get(token)
+    this.joinedBy.delete(token)
+    const original = room?.conferenceOf ? this.calls.get(room.conferenceOf) : undefined
+    if (room && room.state !== 'ended' && original && original.state !== 'ended') void room.hangup().catch(() => undefined)
   }
 
   /** The call of the room of the conference made out of our call `callId`, while it is not over (step 8b). */
@@ -1243,6 +1251,7 @@ export class Softphone {
         this.options.onCallChange?.(c)
         if (c.direction === 'inbound') this.updateRinger()
         if (c.state === 'ended') this.consultationOver(c)
+        if (c.state === 'ended' && c.conferenceOf) for (const [token, room] of this.joinedBy) if (room === c) this.joinedBy.delete(token)
         if (c.conferenceOf || (c.replacedCallId && c.room === 'conference')) this.conferenceMoved(c)
         if (c.state === 'ended' && this.restartWhenIdle && !this.activeCalls().length) {
           this.restartWhenIdle = false

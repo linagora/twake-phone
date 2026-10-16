@@ -305,7 +305,9 @@ export class LiveKitConferenceBridge implements ConferenceBridgeProvider {
     if (!/^\+?[0-9*#]{2,20}$/.test(number)) throw Object.assign(new Error('Invalid phone number'), { statusCode: 400 })
     if (options.from !== undefined && !/^[A-Za-z0-9._+-]{1,64}$/.test(options.from)) throw Object.assign(new Error('Invalid caller'), { statusCode: 400 })
     if (options.grant !== undefined && !/^[0-9a-f]{32}$/.test(options.grant)) throw Object.assign(new Error('Invalid grant'), { statusCode: 400 })
-    const identity = `phone-${number.replace(/\D/g, '')}-${this.random(2 ** 40).toString(16).padStart(10, '0')}`
+    // Drawn at random, without the number (third review 8b, n°2): the id of the participant is shown to everyone in a
+    // conference's room, whose numbers of the public network are masked; the number is in the attributes.
+    const identity = `phone-${[0, 1].map(() => this.random(2 ** 40).toString(16).padStart(10, '0')).join('')}`
     const ringingSec = this.config.ringingTimeoutSec ?? 30
     let answered: { sip_call_id?: unknown } | undefined
     try {

@@ -218,7 +218,9 @@ describe('dial-out and moderation', () => {
     // The PBX's challenge is answered with its credentials.
     expect(calls.find(c => c.path === 'livekit.SIP/CreateSIPOutboundTrunk')!.body.trunk).toMatchObject({ address: 'pbx:5060', transport: 'SIP_TRANSPORT_UDP', auth_username: 'livekit', auth_password: 'not-a-real-password' })
     expect(p).toMatchObject({ meetingId: 'room', kind: 'phone', number: '+33612345678', muted: false })
-    expect(p.id.startsWith('room:phone-33612345678-')).toBe(true)
+    // Its id carries no number (third review 8b, n°2).
+    expect(p.id).toMatch(/^room:phone-[0-9a-f]{20}$/)
+    expect(p.id).not.toContain('612345678')
   })
 
   it('carries the SIP server\'s grant of the call and bounds its length (review n°1, n°5)', async () => {
