@@ -9,6 +9,8 @@ const gateway = (code: string) => Object.assign(new Error(code), { code })
 describe('describeConferenceError', () => {
   it('tells a conference that did not begin from a third participant who could not be reached once it had (review 8b, n°4)', () => {
     expect(describeConferenceError(gateway('DIAL_FAILED'), t, { making: true, who: '103' })).toBe('conference.errorNotStarted')
+    // Its call ended meanwhile (481, second review 8b, n°9): not « the call goes on ».
+    expect(describeConferenceError(Object.assign(gateway('DIAL_FAILED'), { callOver: true }), t, { making: true, who: '103' })).toBe('conference.errorCallOver')
     // The conference was made, the call to the third participant failed: that call's error, the conference goes on.
     const third = Object.assign(gateway('DIAL_FAILED'), { conferenceMade: true })
     expect(describeConferenceError(third, t, { making: true, who: '103' })).toBe('conference.errorDialFailed {"who":"103"}')

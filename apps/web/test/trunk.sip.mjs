@@ -1321,7 +1321,7 @@ try {
     await setOutbound({}, PROFILES, [])
   })
 
-  await step('review 8b, n°5: past DB_MAX_ASYNC_CONNECTIONS (OpenSIPS started again with 1 a moment): calls from the operator at once, their direct number read again when the read failed at once, all ring; calls to the public network at once, those refused for it (503, policy-unavailable) keep no minutes reserved', async () => {
+  await step('review 8b, n°5: past DB_MAX_ASYNC_CONNECTIONS (OpenSIPS started again with 1 a moment): calls from the operator at once, their direct number read again when the read failed at once, all ring; a read that failed late (past its time) is not made again (second review 8b, n°9); calls to the public network at once, those refused for it (503, policy-unavailable) keep no minutes reserved', async () => {
     if (!RESTART) {
       console.log('     (skipped: OPENSIPS_RESTART is not set)')
       return
@@ -1334,14 +1334,14 @@ try {
     const reservedFor = async callId => Number((await db.query('SELECT seconds FROM outbound_reservations WHERE call_key = md5($1)', [callId])).rows[0]?.seconds ?? 0)
     // A table the read takes locked a moment (350 ms, well under RULES_QUERY_TIMEOUT_MS): the calls sent at once wait
     // together, one read in flight per process at most, the others past it.
-    const lockedWhile = async (table, fn) => {
+    const lockedWhile = async (table, fn, ms = 350) => {
       const locker = new pg.Client({ connectionString: DB_URL })
       await locker.connect()
       try {
         await locker.query('BEGIN')
         await locker.query(`LOCK TABLE ${table} IN ACCESS EXCLUSIVE MODE`)
         const pending = fn()
-        await sleep(350)
+        await sleep(ms)
         await locker.query('ROLLBACK')
         return await pending
       } finally {
@@ -1358,6 +1358,13 @@ try {
         expect('a call from the operator past the connections: read again, answered', answered.status === 200, answered.first)
         await A.request(placed, 'BYE')
       }
+      // The table locked longer than RULES_QUERY_TIMEOUT_MS (1000 ms by default): the read fails past its time, late,
+      // and is not made again (second review 8b, n°9: the database is slow, not full; read again, it would answer once
+      // the lock goes, 600 ms later). The call is refused as one whose number is not read (404).
+      const late = await lockedWhile('dids', () => A.call('+33199000301'), 1600)
+      const lateFinal = await late.final
+      if (lateFinal.status === 200) await A.request(late, 'BYE')
+      expect('a call from the operator whose read failed late: not read again, refused', lateFinal.status === 404, lateFinal.first)
       // Four calls to the public network, of three people: what twake_outbound() reserved for one refused goes with it.
       const callers = [p301, p301, p303, p115]
       const placed = await lockedWhile('outbound_settings', () => Promise.all(callers.map((p, i) => p.dial(`019900009${i}`))))

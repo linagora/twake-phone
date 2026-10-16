@@ -4,7 +4,7 @@ import cors from '@fastify/cors'
 import websocket from '@fastify/websocket'
 import swagger from '@fastify/swagger'
 import swaggerUi from '@fastify/swagger-ui'
-import { LiveKitError, PIN_DIGITS, splitParticipantId, verifyWebhook, type LiveKitConferenceBridge, type MeetApi, type MeetRoom } from '@twake/conference-livekit'
+import { LiveKitError, PIN_DIGITS, maskNumber, splitParticipantId, verifyWebhook, type LiveKitConferenceBridge, type MeetApi, type MeetRoom, type ParticipantCall } from '@twake/conference-livekit'
 import { REPLACES } from '@twake/provider-opensips'
 import type { DialedParticipant, MediaProvider, RoomCallGrantToken, TelephonyProvider } from '@twake/telephony-provider-sdk'
 import { EXTENSION_FORMAT, FRAUD_DEFAULTS, OUTBOUND_CAP_DEFAULTS, isReservedNumber, type CallDirection, type DidRange, type Endpoint, type ForwardingRules, type Presence, type PresenceStatus, type RingGroup, type TelephonyEvent, type User } from '@twake/telephony-types'
@@ -117,6 +117,11 @@ export interface BuildOptions {
   conferenceCaps?: { perPerson?: number; perTenant?: number }
   /** Reads of a room per person (GET /conferences/:id: LiveKit asked; tests inject a tighter one). Default: 60 a minute. */
   conferenceReadLimiter?: RateLimiter
+  /**
+   * How often the Gateway looks whether the owner of a call's room it made is still in it (second review 8b, n°3),
+   * without waiting for LiveKit's webhook. Default: 15 s.
+   */
+  conferenceOwnerCheckMs?: number
   /**
    * How long someone found without an extension keeps their browsers' subscriptions: removed at the first
    * reconciliation after that (a mapping missing a moment loses nothing). Default: an hour.
@@ -1339,7 +1344,9 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
       // `closing`: only to close it. Without Meet, a room the Gateway did not name (claimed by its name before the
       // Gateway named them, maybe one of Meet's) looks like a missing one, except to be closed (second review n°6).
       // `reading`: the room of a call (step 8b) is read by everyone its room called at their extension, not only by its
-      // owner (review 8b, n°2): whoever is in a conference sees who else is.
+      // owner (review 8b, n°2): whoever is in a conference sees who else is. Also whoever its call reached otherwise (a
+      // member of a group, a forward's target, a direct number: second review 8b, n°4), told of that call by the SIP
+      // server's events (callOwners, by the Call-ID LiveKit SIP gives each participant): rung by it, or answering it.
       const owned = async (req: FastifyRequest, meetingId: string, { closing = false, reading = false } = {}) => {
         if (!MEETING_ID.test(meetingId)) throw bad('invalid meeting id')
         const ctx = await bridgeFor(req)
@@ -1356,11 +1363,29 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
           room = await meetRoomFor(ctx.email, { id: record.meetingId })
           if (!room) throw Object.assign(new Error('Room not found, or not accessible to you'), { statusCode: 404 })
         }
+        let calls: ParticipantCall[] | undefined
         if (record.ownerUserId !== ctx.user.id) {
-          const member = reading && callRoom && !!ctx.user.extension && (await viaLiveKit(() => ctx.bridge.participantNumbers(record.meetingId))).includes(ctx.user.extension)
+          let member = false
+          if (reading && callRoom) {
+            const me = ownerKey(ctx.user.tenantId, ctx.user.id)
+            calls = await viaLiveKit(() => ctx.bridge.participantCalls(record.meetingId))
+            member = calls.some(p => (!!ctx.user.extension && p.number === ctx.user.extension) || (!!p.callId && !!callOwners.get(p.callId)?.has(me)))
+          }
           if (!member) throw Object.assign(new Error('Only the owner of the meeting can do this'), { statusCode: 403 })
         }
-        return { ...ctx, record, room }
+        return { ...ctx, record, room, calls }
+      }
+      /**
+       * Whether a participant of a call's room is someone of the tenant other than its owner (second review 8b, n°4):
+       * the SIP server told one of them of its call (rung by it, a member of a group or a forward's target among them),
+       * or it was called at an extension of the tenant (the owner's own call, or a call whose events the Gateway lost
+       * when it started again). Else from outside: a number of the public network (its events are the owner's, who
+       * placed it), or a web participant.
+       */
+      const insider = async (record: { tenantId: string; ownerUserId: string }, p: ParticipantCall) => {
+        const theirs = ownerKey(record.tenantId, record.ownerUserId)
+        if ([...(p.callId ? (callOwners.get(p.callId) ?? []) : [])].some(k => k !== theirs && k.startsWith(`${record.tenantId}\u0000`))) return true
+        return !!p.number && !!(await store.getMappingByExtension(record.tenantId, p.number))
       }
       /**
        * The room's rule with the PIN shown, made again if LiveKit lost it. A PIN shorter than PIN_DIGITS (a room opened
@@ -1452,14 +1477,24 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
 
       const roomReads = options.conferenceReadLimiter ?? new RateLimiter(60, 60_000)
       v1.get<{ Params: { id: string } }>('/conferences/:id', async (req, reply) => {
-        const { bridge, record, room, user } = await owned(req, req.params.id, { reading: true })
+        const { bridge, record, room, user, calls } = await owned(req, req.params.id, { reading: true })
         if (!roomReads.allow(ownerKey(user.tenantId, user.id))) return reply.code(429).send({ statusCode: 429, code: 'CONFERENCE_READ_LIMIT', error: 'Too Many Requests', message: 'Too many reads of your rooms: wait a minute' })
         if (room) {
           // The PIN and number are Meet's, read back each time so a rotation shows up here.
           return { meetingId: record.meetingId, slug: room.slug, ...(room.url ? { url: room.url } : {}), dialIn: meetDialIn(room), participants: await viaLiveKit(() => bridge.listParticipants(record.meetingId)) }
         }
-        // A call's room (step 8b): nobody dials into it, no PIN.
-        if (CALL_ROOM.test(record.meetingId)) return { meetingId: record.meetingId, participants: await viaLiveKit(() => bridge.listParticipants(record.meetingId)) }
+        // A call's room (step 8b): nobody dials into it, no PIN. The number of someone from outside (the public network)
+        // is its owner's to see whole, who called it; masked for the others in it (second review 8b, n°6).
+        if (CALL_ROOM.test(record.meetingId)) {
+          const participants = await viaLiveKit(() => bridge.listParticipants(record.meetingId))
+          if (!calls) return { meetingId: record.meetingId, participants }
+          const outside = new Set<string>()
+          for (const p of calls) if (!(await insider(record, p))) outside.add(p.id)
+          return {
+            meetingId: record.meetingId,
+            participants: participants.map(p => (outside.has(p.id) && p.number ? { ...p, number: maskNumber(p.number), ...(p.displayName ? { displayName: maskNumber(p.number) } : {}) } : p))
+          }
+        }
         // The PIN shown lets in: the room's rule is made again if LiveKit lost it.
         await keepDialIn(bridge, record)
         return { meetingId: record.meetingId, dialIn: publicDialIn(bridge, record), participants: await viaLiveKit(() => bridge.listParticipants(record.meetingId)) }
@@ -1501,17 +1536,45 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         return false
       }
       /**
-       * Whether the call that took `grant` is another than the one LiveKit placed for the Gateway (review 8b, n°3): the
-       * SIP server keeps the From tag of the call that took it, which LiveKit SIP makes the id of its call (what
-       * dialParticipant returns). A grant taken by another call (replayed from someone else's room) is a call
-       * diverted: that call is ended at the SIP server and the administrators told. A provider that cannot say
-       * (no `taken`) is taken at its word.
+       * Settles the grant of a room's call once LiveKit answered, whatever it answered (review 8b, n°3; second review,
+       * n°1): withdrawn first if no call took it (only then: nothing can take it after), then the call that took it read
+       * from the SIP server, which keeps its From tag, the id LiveKit SIP gives its call (`placed.sipCallId`). Diverted
+       * (true: that call ended at the SIP server, the administrators told) when another call took it (replayed from
+       * someone else's room), or when LiveKit placed a call that took none. When LiveKit's call failed (`placed`
+       * undefined), the one that took the grant is LiveKit's own if the SIP server no longer has it; one still there
+       * is another's (whoever replayed the grant then refused the Gateway's call, 486). A provider that cannot say (no
+       * `taken`) is taken at its word; a grant that cannot be read is no call of the Gateway's.
        */
-      const diverted = async (provider: TelephonyProvider, tenantId: string, grant: RoomCallGrantToken, participant: DialedParticipant, extension: string, number: string) => {
-        if (!grant.taken) return false
-        const taken = await grant.taken()
-        if (taken && participant.sipCallId && taken.tag === participant.sipCallId) return false
-        if (taken) await provider.endRoomCall?.(taken.callId).catch((err: unknown) => app.log.error({ err }, 'a diverted call of a room not ended at the SIP server'))
+      const settle = async (provider: TelephonyProvider, tenantId: string, grant: RoomCallGrantToken, placed: DialedParticipant | undefined, extension: string, number: string) => {
+        const withdraw = () => grant.revoke().catch((err: unknown) => app.log.warn({ err }, 'the grant of a room call not withdrawn'))
+        if (!grant.taken) {
+          // Nothing to read: withdrawn when the call failed, as it was before.
+          if (!placed) await withdraw()
+          return false
+        }
+        await withdraw()
+        let taken: { tag: string; callId: string } | undefined
+        try {
+          taken = await grant.taken()
+        } catch (err) {
+          app.log.error({ err, tenantId }, 'the call that took the grant of a room call could not be read')
+          if (!placed) return false
+          await roomAlert(tenantId, 'call-diverted', extension, number)
+          return true
+        }
+        if (!taken) {
+          if (!placed) return false
+          await roomAlert(tenantId, 'call-diverted', extension, number)
+          return true
+        }
+        if (placed?.sipCallId && taken.tag === placed.sipCallId) return false
+        const ended = provider.endRoomCall
+          ? await provider.endRoomCall(taken.callId).catch((err: unknown) => {
+              app.log.error({ err }, 'a diverted call of a room not ended at the SIP server')
+              return undefined
+            })
+          : undefined
+        if (!placed && ended === false) return false
         await roomAlert(tenantId, 'call-diverted', extension, number)
         return true
       }
@@ -1532,13 +1595,13 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         try {
           participant = await viaLiveKit(() => bridge.dialParticipant(record.meetingId, number, { from: user.extension, grant: grant.token }))
         } catch (err) {
-          // Not taken if the call never reached the SIP server; taken, deleting it changes nothing.
-          await grant.revoke().catch(() => undefined)
+          // Failed, or LiveKit did not say: the grant is settled all the same (second review 8b, n°1).
+          if (await settle(provider, user.tenantId, grant, undefined, user.extension, number)) return reply.code(502).send(divertedReply)
           const failed = err as Error & { code?: string; sipStatus?: number; sipReason?: string }
           if (failed.code !== 'DIAL_FAILED') throw err
           return reply.code(409).send({ statusCode: 409, code: 'DIAL_FAILED', error: 'Conflict', message: failed.message, sipStatus: failed.sipStatus, sipReason: failed.sipReason })
         }
-        if (await diverted(provider, user.tenantId, grant, participant, user.extension, number)) {
+        if (await settle(provider, user.tenantId, grant, participant, user.extension, number)) {
           await viaLiveKit(() => bridge.disconnectParticipant(participant.id)).catch((err: unknown) => app.log.warn({ err }, 'the participant of a diverted call not removed'))
           return reply.code(502).send(divertedReply)
         }
@@ -1610,19 +1673,22 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         // Two calls of a room (review 8b, n°16), counted before a room is: refused, nothing of either is used.
         if (!dialOuts.allow(ownerKey(user.tenantId, user.id), 2)) return reply.code(429).send(tooManyDialOuts)
         if (!(await mayOpen(user.tenantId, user.id))) return reply.code(429).send(tooManyRooms)
-        if (!(await trunkIntact(bridge, user.tenantId, me))) return reply.code(502).send(divertedReply)
         const meetingId = `twake-call-${randomBytes(8).toString('hex')}`
         await store.claimConference({ tenantId: user.tenantId, meetingId, ownerUserId: user.id, createdAt: new Date().toISOString() })
+        const divertedCall = () => Object.assign(new Error('A call of the room was diverted'), { code: 'CALL_DIVERTED' })
+        // LiveKit's trunk read again before each grant (second review 8b, n°1): changed between the two calls, the
+        // second is not placed.
         const place = async (number: string, conference: { join: string } | { replaces: string }) => {
+          if (!(await trunkIntact(bridge, user.tenantId, me))) throw divertedCall()
           const grant = await provider.grantRoomCall!({ extension: me, number, room: meetingId, ...conference })
           let participant: DialedParticipant
           try {
             participant = await viaLiveKit(() => bridge.dialParticipant(meetingId, number, { from: me, grant: grant.token }))
           } catch (err) {
-            await grant.revoke().catch(() => undefined)
+            if (await settle(provider, user.tenantId, grant, undefined, me, number)) throw divertedCall()
             throw err
           }
-          if (await diverted(provider, user.tenantId, grant, participant, me, number)) throw Object.assign(new Error('A call of the room was diverted'), { code: 'CALL_DIVERTED' })
+          if (await settle(provider, user.tenantId, grant, participant, me, number)) throw divertedCall()
           return participant
         }
         try {
@@ -1632,6 +1698,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
           if (!(await viaLiveKit(() => bridge.listParticipants(meetingId))).some(p => p.id === own.id))
             throw Object.assign(new Error('You left the room before the conference began'), { code: 'CONFERENCE_ABANDONED' })
           const theirs = await place(other, { replaces })
+          watchOwner(bridge, { tenantId: user.tenantId, meetingId, ownerUserId: user.id })
           return reply.code(201).send({ meetingId, participants: [shown(own), shown(theirs)] })
         } catch (err) {
           // Ending the room also ends a call of it still ringing: LiveKit SIP stops dialing once its participant is gone
@@ -1646,23 +1713,50 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         }
       }
 
-      const endIfOwnerLeft = async (bridge: LiveKitConferenceBridge, record: { tenantId: string; meetingId: string; ownerUserId: string }, number: string | undefined) => {
+      /**
+       * Ends the room its owner is no longer in while someone from outside is (review 8b, n°7; insider, second review
+       * 8b, n°4): that call goes at the owner's name and on their caps, with nobody left to end it. `left`: LiveKit
+       * said the owner left (its webhook), so a call of theirs still listed is going. Whether the room ended.
+       */
+      const endIfOwnerGone = async (bridge: LiveKitConferenceBridge, record: { tenantId: string; meetingId: string; ownerUserId: string }, left = false) => {
         const owner = await store.getMappingByUser(record.tenantId, record.ownerUserId)
-        if (!owner?.extension || number !== owner.extension) return
-        const left = await viaLiveKit(() => bridge.participantNumbers(record.meetingId))
+        if (!owner?.extension) return false
+        const now = await viaLiveKit(() => bridge.participantCalls(record.meetingId))
+        if (!left && now.some(p => p.number === owner.extension)) return false
         let outsider = false
-        for (const n of left) {
-          if (n === owner.extension) continue
-          // A participant without a number (a web one), or a number no one of the tenant holds.
-          if (!n || !(await store.getMappingByExtension(record.tenantId, n))) {
+        for (const p of now) {
+          if (p.number === owner.extension) continue
+          if (!(await insider(record, p))) {
             outsider = true
             break
           }
         }
-        if (!outsider) return
+        if (!outsider) return false
         app.log.info({ tenantId: record.tenantId }, 'the owner of a conference left it with someone from outside in it: the room ends')
         await viaLiveKit(() => bridge.deleteRoom(record.meetingId))
         await store.deleteConference(record.meetingId)
+        return true
+      }
+      /**
+       * Looks every conferenceOwnerCheckMs whether the owner of the room is still in it (second review 8b, n°3): the
+       * room ends as above without LiveKit's webhook (a LiveKit that sends none, or none here). Stops once the room or
+       * its record is gone. In this process only: a Gateway started again relies on the webhook for the rooms before.
+       */
+      const ownerCheckMs = options.conferenceOwnerCheckMs ?? 15_000
+      const watchOwner = (bridge: LiveKitConferenceBridge, record: { tenantId: string; meetingId: string; ownerUserId: string }) => {
+        let busy = false
+        const timer = setInterval(() => {
+          if (busy) return
+          busy = true
+          void (async () => {
+            if (closing || !(await store.getConference(record.meetingId))) return clearInterval(timer)
+            if (!(await viaLiveKit(() => bridge.openRooms([record.meetingId]))).has(record.meetingId)) return clearInterval(timer)
+            if (await endIfOwnerGone(bridge, record)) clearInterval(timer)
+          })()
+            .catch((err: unknown) => app.log.warn({ err }, "the owner of a conference's room not looked for"))
+            .finally(() => (busy = false))
+        }, ownerCheckMs)
+        timer.unref()
       }
 
       // LiveKit webhooks: authenticated by the signature, not by a Twake identity.
@@ -1678,7 +1772,10 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         const bridge = record && cfg.bridge(record.tenantId)
         // Its owner gone while someone with no extension of the tenant is still in it (review 8b, n°7): that call goes at
         // the owner's name and on their caps, with nobody left to end it. The room ends.
-        if (record && bridge && body.event === 'participant_left' && CALL_ROOM.test(record.meetingId)) await endIfOwnerLeft(bridge, record, (body as { participant?: { attributes?: Record<string, string> } }).participant?.attributes?.['twake.number'])
+        if (record && bridge && body.event === 'participant_left' && CALL_ROOM.test(record.meetingId)) {
+          const owner = await store.getMappingByUser(record.tenantId, record.ownerUserId)
+          if (owner?.extension && (body as { participant?: { attributes?: Record<string, string> } }).participant?.attributes?.['twake.number'] === owner.extension) await endIfOwnerGone(bridge, record, true)
+        }
         const event = record && bridge ? bridge.fromWebhook(body) : undefined
         if (record && event) bus.publish(record.tenantId, record.ownerUserId, event)
         return reply.code(204).send()

@@ -85,6 +85,12 @@ services:
           address: 127.0.0.1:6379
         keys:
           ${LIVEKIT_API_KEY:-twake-dev}: ${LIVEKIT_API_SECRET:-twake-dev-only-livekit-secret-0123456789}
+        # Its webhooks to the Gateway (second review 8b, n°3: a room ended, its owner gone from a conference), signed
+        # with the Gateway's key: where the e2e listens (GATEWAY_PORT, 18080 by default), a Gateway of this host else.
+        webhook:
+          api_key: ${LIVEKIT_API_KEY:-twake-dev}
+          urls:
+            - ${LIVEKIT_WEBHOOK_URL:-http://127.0.0.1:18080/api/v1/webhooks/livekit}
         # warn: at info, the server writes each CreateSIPDispatchRule whole, the PIN of the room in it (ADR 0018).
         logging:
           level: warn

@@ -48,7 +48,7 @@ describe('DialOutGrants', () => {
       values: [token, 'A', '101', '+33612345678', 30]
     })
     await grants.revoke(token)
-    expect(db.queries.at(-1)).toEqual({ text: 'DELETE FROM dial_out_grants WHERE tenant_id = $1 AND token = $2', values: ['A', token] })
+    expect(db.queries.at(-1)).toEqual({ text: 'DELETE FROM dial_out_grants WHERE tenant_id = $1 AND token = $2 AND used_by IS NULL', values: ['A', token] })
   })
 
   it("writes a conference's grant (step 8b): the call it takes the place of, or the token of the window it joins, its person's own", async () => {
@@ -146,6 +146,9 @@ if (process.env.TEST_DATABASE_URL) {
       const token = await grants.grant('9101', '9102', 1)
       expect(await grants.taken(token)).toBeUndefined()
       expect(await taken(token, '9101', '9102', 'SCL_k1Z9x', 'a1b2c3@192.0.2.30')).toEqual([[1, '', '', '']])
+      expect(await grants.taken(token)).toEqual({ tag: 'SCL_k1Z9x', callId: 'a1b2c3@192.0.2.30' })
+      // Withdrawn once taken (the room's call failed after, second review 8b, n°1): it stays, to be read.
+      await grants.revoke(token)
       expect(await grants.taken(token)).toEqual({ tag: 'SCL_k1Z9x', callId: 'a1b2c3@192.0.2.30' })
       // Used: another call with the same grant takes nothing, and the first one's stays written.
       expect(await taken(token, '9101', '9102', 'SCL_other', 'other@192.0.2.31')).toEqual([])

@@ -891,6 +891,58 @@ describe('Softphone', () => {
     expect(phone.conferenceCall(call.id)).toBeUndefined()
   })
 
+  it("refuses the room of the far end's conference in the place of a call the far end holds (486, second review 8b, n°2): in it, our microphone did not go", async () => {
+    const { phone, ua } = await setup()
+    const conferenceRequest = { getHeader: (name: string) => (name === 'Twake-Room' ? 'conference' : undefined) }
+    const call = await phone.call('102')
+    const s = ua().lastCall!
+    s.emit('accepted', { originator: 'remote' })
+    s.emit('hold', { originator: 'remote' })
+    expect(call.remoteHold).toBe(true)
+    expect(call.state).toBe('connected')
+    const replacing = new FakeSession('incoming')
+    const reject = vi.fn()
+    s.emit('replaces', { request: conferenceRequest, accept: (init: (x: unknown) => void) => { init(replacing); ua().emit('newRTCSession', { originator: 'remote', session: replacing, request: conferenceRequest }) }, reject })
+    expect(reject).toHaveBeenCalled()
+    await new Promise(r => setTimeout(r, 5))
+    expect(replacing.answer).not.toHaveBeenCalled()
+    expect(phone.activeCalls()).toEqual([call])
+  })
+
+  it('neither holds nor transfers a call while it becomes a conference, and refuses its room once the call is no longer on line both ways (481, second review 8b, n°2)', async () => {
+    const { phone, ua } = await setup()
+    const call = await phone.call('102')
+    const s = ua().lastCall!
+    s.emit('accepted', { originator: 'remote' })
+    const token = phone.expectConference(call.id)
+    expect(call.conferencing).toBe(true)
+    await expect(call.hold()).rejects.toMatchObject({ code: 'conference-pending' })
+    await expect(call.transfer('103')).rejects.toMatchObject({ code: 'conference-pending' })
+    // A consultation would hold it first: refused too.
+    await expect(phone.call('103')).rejects.toMatchObject({ code: 'conference-pending' })
+    expect(s.hold).not.toHaveBeenCalled()
+    expect(s.refer).not.toHaveBeenCalled()
+    // The far end holds it meanwhile: the room's call is refused, the conference does not begin.
+    s.emit('hold', { originator: 'remote' })
+    const room = new FakeSession('incoming')
+    ua().emit('newRTCSession', { originator: 'remote', session: room, request: { getHeader: (name: string) => ({ 'Twake-Join': token, 'Twake-Room': 'conference' })[name] } })
+    expect(room.terminate).toHaveBeenCalledWith({ status_code: 481, reason_phrase: 'Call Does Not Exist' })
+    await new Promise(r => setTimeout(r, 5))
+    expect(room.answer).not.toHaveBeenCalled()
+    expect(phone.conferenceCall(call.id)).toBeUndefined()
+    // Given up: the call is held and transferred again as any.
+    expect(call.conferencing).toBe(false)
+    s.emit('unhold', { originator: 'remote' })
+    const again = phone.expectConference(call.id)
+    phone.cancelConference(again)
+    expect(call.conferencing).toBe(false)
+    const holding = call.hold()
+    s.reofferDone!()
+    s.emit('hold', { originator: 'local' })
+    await holding
+    expect(call.state).toBe('held')
+  })
+
   it('neither holds nor transfers a call a room places, nor calls anyone during it (step 8b)', async () => {
     const { phone, ua, incoming } = await setup()
     const s = new FakeSession('incoming')

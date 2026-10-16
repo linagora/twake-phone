@@ -155,6 +155,11 @@ export interface SoftCall {
   readonly renegotiating: boolean
   /** A transfer of this call (REFER) is waiting for the far end's report. */
   readonly transferring: boolean
+  /**
+   * A conference is being made of this call (step 8b, between expectConference and the room's call): neither held nor
+   * transferred meanwhile (`conference-pending`), or the room would take the far end back unheld (second review 8b, n°2).
+   */
+  readonly conferencing: boolean
   /** Set when this call took the place of another one of ours (an attended transfer completed by the far end). */
   readonly replacedCallId?: string
   /** Set when this call is a consultation placed during another one of ours (held meanwhile), for an attended transfer. */
@@ -305,6 +310,7 @@ class WebCall implements SoftCall {
   muted = false
   renegotiating = false
   transferring = false
+  conferencing = false
   remoteNumber: string
   remoteName: string
   private reofferPending?: { reject: (e: Error) => void }
@@ -605,8 +611,16 @@ class WebCall implements SoftCall {
 
   hold() {
     if (this.room) return Promise.reject(new CallError('room-call', 'A call of a room is not held'))
+    if (this.conferencing) return Promise.reject(new CallError('conference-pending', 'The call is becoming a conference'))
     if (this.state === 'held') return Promise.resolve()
     return this.reoffer(done => this.session.hold({}, done), 'Hold')
+  }
+
+  /** A conference is being made of this call, or no more (the softphone's pending join). */
+  setConferencing(on: boolean) {
+    if (this.conferencing === on) return
+    this.conferencing = on
+    this.changed(this)
   }
 
   /**
@@ -687,6 +701,7 @@ class WebCall implements SoftCall {
 
   async transfer(target: string) {
     if (this.room) throw new CallError('room-call', 'A call of a room is not transferred')
+    if (this.conferencing) throw new CallError('conference-pending', 'The call is becoming a conference')
     if (!DIALABLE.test(target)) throw new CallError('invalid-target', 'Invalid target')
     const wasConnected = this.state === 'connected'
     // The far end is put on hold while its new call is set up (RFC 5589 §6).
@@ -702,6 +717,7 @@ class WebCall implements SoftCall {
 
   async transferTo(consultation: SoftCall) {
     if (this.room || consultation.room) throw new CallError('room-call', 'A call of a room is not transferred')
+    if (this.conferencing) throw new CallError('conference-pending', 'The call is becoming a conference')
     const other = consultation as WebCall
     if (other === this) throw new CallError('transfer-self', 'A call cannot be transferred to itself')
     if (!other.session || (other.state !== 'connected' && other.state !== 'held')) throw new CallError('not-established', 'The consultation call is not established')
@@ -813,6 +829,14 @@ export class Softphone {
   private pendingConsultationOf?: string
   /** The conference asked for one of our calls (step 8b): the token its room's call carries (JOIN_HEADER), for a while. */
   private pendingJoin?: { token: string; of: string; timer: ReturnType<typeof setTimeout> }
+  /** The conference asked (or none): its call says it is becoming one (`conferencing`). */
+  private setPendingJoin(next?: { token: string; of: string; timer: ReturnType<typeof setTimeout> }) {
+    const before = this.pendingJoin
+    if (before) clearTimeout(before.timer)
+    this.pendingJoin = next
+    if (before && before.of !== next?.of) this.calls.get(before.of)?.setConferencing(false)
+    if (next) this.calls.get(next.of)?.setConferencing(true)
+  }
   /** Our SIP domain, from the media session: the only place a transfer, ours or asked of us, may point to. */
   private domain = ''
   private devices: AudioDevices
@@ -1014,8 +1038,14 @@ export class Softphone {
           e.session.terminate({ status_code: 481, reason_phrase: 'Call Does Not Exist' })
           return
         }
-        clearTimeout(pending!.timer)
-        this.pendingJoin = undefined
+        // Our call no longer on line, both ways (one of us holds it, or put it on hold meanwhile): the room would take
+        // the far end back unheld, its microphone open (second review 8b, n°2). The conference does not begin.
+        if (of.state !== 'connected' || of.remoteHold || of.renegotiating || of.transferring) {
+          this.setPendingJoin(undefined)
+          e.session.terminate({ status_code: 481, reason_phrase: 'Call Does Not Exist' })
+          return
+        }
+        this.setPendingJoin(undefined)
         const call = this.wrap(e.session, 'inbound', { room, conferenceOf: of.id, sipCallId, startMuted: of.muted, ...(conferenceRoom ? { conferenceRoom } : {}) })
         this.options.onCallChange?.(call)
         void call.setOutput(this.devices.outputId ?? '')
@@ -1103,9 +1133,9 @@ export class Softphone {
     if (this.pendingJoin) throw new CallError('conference-pending', 'A conference is already being made')
     const token = randomHex(16)
     const timer = setTimeout(() => {
-      if (this.pendingJoin?.token === token) this.pendingJoin = undefined
+      if (this.pendingJoin?.token === token) this.setPendingJoin(undefined)
     }, JOIN_WAIT_MS)
-    this.pendingJoin = { token, of: callId, timer }
+    this.setPendingJoin({ token, of: callId, timer })
     return token
   }
 
@@ -1115,8 +1145,7 @@ export class Softphone {
    */
   cancelConference(token: string) {
     if (this.pendingJoin?.token !== token) return
-    clearTimeout(this.pendingJoin.timer)
-    this.pendingJoin = undefined
+    this.setPendingJoin(undefined)
   }
 
   /** The call of the room of the conference made out of our call `callId`, while it is not over (step 8b). */
@@ -1247,7 +1276,7 @@ export class Softphone {
       // The room of a conference takes the place of a call in progress only (step 8b): not of one we hold (it would
       // come back unheld, our microphone open to the room), nor while we are in another call (a consultation): busy
       // (486), and the conference does not begin.
-      if (roomOf(e.request) === 'conference' && (call.state !== 'connected' || this.activeWebCalls().some(c => c !== call))) {
+      if (roomOf(e.request) === 'conference' && (call.state !== 'connected' || call.remoteHold || call.renegotiating || call.transferring || this.activeWebCalls().some(c => c !== call))) {
         e.reject()
         return
       }

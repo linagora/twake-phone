@@ -361,12 +361,17 @@ export class LiveKitConferenceBridge implements ConferenceBridgeProvider {
   }
 
   /**
-   * The number each participant of the room was called at, as the Gateway gave it (never masked: who is in it, for the
-   * Gateway only); '' for one without a number (a web participant).
+   * Each participant of the room as its call is: its id, the number it was called at as the Gateway gave it (never
+   * masked: who is in it, for the Gateway only; '' for one without a number, a web participant), and the SIP Call-ID
+   * of its call (`sip.callIDFull`, as LiveKit SIP v1.17.0 writes it), by which the SIP server's events say whose phone
+   * it rang and who answered it (a member of a group, a forward's target: second review 8b, n°4).
    */
-  async participantNumbers(meetingId: string): Promise<string[]> {
+  async participantCalls(meetingId: string): Promise<ParticipantCall[]> {
     const res = await this.api.call<{ participants?: LkParticipant[] }>('livekit.RoomService', 'ListParticipants', { room: meetingId })
-    return (res.participants ?? []).map(p => p.attributes?.['twake.number'] ?? p.attributes?.['sip.phoneNumber'] ?? '')
+    return (res.participants ?? []).map(p => {
+      const callId = p.attributes?.['sip.callIDFull']
+      return { id: participantId(meetingId, p.identity), number: p.attributes?.['twake.number'] ?? p.attributes?.['sip.phoneNumber'] ?? '', ...(callId ? { callId } : {}) }
+    })
   }
 
   disconnectParticipant: ConferenceBridgeProvider['disconnectParticipant'] = async id => {
@@ -448,6 +453,13 @@ const dialFailure = (err: LiveKitError): DialFailure | undefined => {
   if (m) return { sipStatus: Number(m[1]), sipReason: (m[2] ?? '').trim() }
   if (err.twirpCode === 'canceled' || err.twirpCode === 'deadline_exceeded' || /timed out/i.test(err.message)) return { sipStatus: 480, sipReason: 'No Answer' }
   return undefined
+}
+
+/** A participant of a room as its call is (participantCalls). */
+export interface ParticipantCall {
+  id: string
+  number: string
+  callId?: string
 }
 
 interface LkParticipant {

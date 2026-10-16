@@ -379,14 +379,19 @@ export class OpensipsProvider implements TelephonyProvider, MediaProvider {
   }
 
   /**
-   * Ends a call OpenSIPS has, by its Call-ID (MI dlg_end_dlg, review 8b, n°3): a BYE to both sides. A call it does not
-   * have (over already) is no error.
+   * Ends a call OpenSIPS has, by its Call-ID (MI dlg_end_dlg, review 8b, n°3): a BYE to both sides, a CANCEL if it
+   * still rings. False for a call it does not have (404: over already, failed, never there; OpenSIPS 3.6.9 looks among
+   * the dialogs not ended only).
    */
-  async endRoomCall(callId: string): Promise<void> {
+  async endRoomCall(callId: string): Promise<boolean> {
     if (!this.events) throw Object.assign(new Error('The SIP server cannot end a call'), { statusCode: 501 })
-    await this.events.call('dlg_end_dlg', { dialog_id: callId }).catch((err: unknown) => {
-      if ((err as { code?: unknown }).code !== 404) throw err
-    })
+    return this.events.call('dlg_end_dlg', { dialog_id: callId }).then(
+      () => true,
+      (err: unknown) => {
+        if ((err as { code?: unknown }).code !== 404) throw err
+        return false
+      }
+    )
   }
 
   /**

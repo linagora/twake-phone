@@ -120,9 +120,12 @@ export class DialOutGrants {
     return { tag: row.used_by, callId: row.used_call }
   }
 
-  /** Withdraws a grant nobody took (the room's call failed before reaching OpenSIPS). */
+  /**
+   * Withdraws a grant no call took (the room's call failed before reaching OpenSIPS, or went elsewhere): one taken
+   * stays, so that `taken` still says which call took it (second review 8b, n°1). Nothing can take it after.
+   */
   async revoke(token: string) {
     await this.opts.ready?.()
-    await this.opts.pool.query('DELETE FROM dial_out_grants WHERE tenant_id = $1 AND token = $2', [this.tenantId, token])
+    await this.opts.pool.query('DELETE FROM dial_out_grants WHERE tenant_id = $1 AND token = $2 AND used_by IS NULL', [this.tenantId, token])
   }
 }

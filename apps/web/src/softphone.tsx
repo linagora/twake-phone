@@ -206,6 +206,8 @@ export const SoftphoneProvider = ({ children }: { children: ReactNode }) => {
         meetingId = (await client.makeConference(call.sipCallId, join)).meetingId
       } catch (err) {
         softphone.cancelConference(join)
+        // Ended meanwhile (the room's call refused 481, second review 8b, n°9): the error does not say it goes on.
+        if (err && typeof err === 'object' && call.state === 'ended') Object.assign(err, { callOver: true })
         throw err
       }
       setRooms(r => ({ ...r, [call.id]: meetingId }))
@@ -254,7 +256,7 @@ export const SoftphoneProvider = ({ children }: { children: ReactNode }) => {
   useEffect(() => {
     window.twakephone = {
       state,
-      calls: calls.map(c => ({ id: c.id, sipCallId: c.sipCallId, direction: c.direction, state: c.state, remoteNumber: c.remoteNumber, remoteHold: c.remoteHold, muted: c.muted, renegotiating: c.renegotiating, transferring: c.transferring, ...(c.replacedCallId ? { replacedCallId: c.replacedCallId } : {}), ...(c.consultationOf ? { consultationOf: c.consultationOf } : {}), ...(c.room ? { room: c.room } : {}), ...(c.conferenceOf ? { conferenceOf: c.conferenceOf } : {}), ...(c.conferenceRoom ? { conferenceRoom: c.conferenceRoom } : {}) })),
+      calls: calls.map(c => ({ id: c.id, sipCallId: c.sipCallId, direction: c.direction, state: c.state, remoteNumber: c.remoteNumber, remoteHold: c.remoteHold, muted: c.muted, renegotiating: c.renegotiating, transferring: c.transferring, conferencing: c.conferencing, ...(c.replacedCallId ? { replacedCallId: c.replacedCallId } : {}), ...(c.consultationOf ? { consultationOf: c.consultationOf } : {}), ...(c.room ? { room: c.room } : {}), ...(c.conferenceOf ? { conferenceOf: c.conferenceOf } : {}), ...(c.conferenceRoom ? { conferenceRoom: c.conferenceRoom } : {}) })),
       lastEnded: lastEnded ? { id: lastEnded.id, remoteNumber: lastEnded.remoteNumber, endReason: lastEnded.endReason, endStatus: lastEnded.endStatus, ...(lastEnded.endMessage ? { endMessage: lastEnded.endMessage } : {}), ...(lastEnded.endRefusal ? { endRefusal: lastEnded.endRefusal } : {}) } : null,
       tones,
       devices,

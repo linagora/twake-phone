@@ -303,6 +303,19 @@ if [ -f "$TRUNK_SQL" ]; then
   # only leaves the reservations to their expiry: OpenSIPS starts all the same.
   PGOPTIONS="-c client_min_messages=warning" psql "$OPENSIPS_DB_URL" -v ON_ERROR_STOP=1 -qAt -c "SELECT twake_outbound_restart(7200)" \
     || echo "The calls lost at the last stop could not be cleared from the database of OPENSIPS_DB_URL" >&2
+  # The connections this configuration may open (second review 8b, n°9): DB_MAX_ASYNC_CONNECTIONS for each of the
+  # ten SIP processes, about one more each, and some 20 for the rest (the other processes, the Gateway's pool). Said
+  # when the database takes fewer (max_connections): past it, reads fail at the busiest moments. OpenSIPS starts.
+  max_connections=$(psql "$OPENSIPS_DB_URL" -qAt -c "SHOW max_connections" 2>/dev/null) || max_connections=""
+  needed=$((10 * (DB_MAX_ASYNC_CONNECTIONS + 1) + 20))
+  case "$max_connections" in
+    '' | *[!0-9]*) ;;
+    *)
+      if [ "$max_connections" -lt "$needed" ]; then
+        echo "WARNING: DB_MAX_ASYNC_CONNECTIONS=$DB_MAX_ASYNC_CONNECTIONS may open about $needed connections to the database, which takes $max_connections (max_connections): lower it, or raise max_connections" >&2
+      fi
+      ;;
+  esac
 fi
 "$OPENSIPS_BIN" -C -f "$CFG_OUT"
 exec "$OPENSIPS_BIN" -F -f "$CFG_OUT" "$@"

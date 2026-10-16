@@ -482,9 +482,10 @@ const Active = ({ call, tones, original, hasOther, onError }: { call: SoftCall; 
   }
   // A call a room places (step 8) is neither held nor transferred; a call between two people can become a
   // conference (step 8b), once nothing else is going on and both are on line: never a call either side holds (the
-  // room would bring the other back unheld, review 8b, n°1).
+  // room would bring the other back unheld, review 8b, n°1). While it becomes one, the form stays (it says so), and
+  // the call is neither held nor transferred (second review 8b, n°2).
   const room = !!call.room
-  const canAdd = phone.conferenceAvailable && !room && !hasOther && !original && call.state === 'connected' && !call.remoteHold
+  const canAdd = phone.conferenceAvailable && !room && !hasOther && !original && (call.conferencing || (call.state === 'connected' && !call.remoteHold))
   const title = call.transferring
     ? t('call.transferringWho', { who: who(call, t) })
     : !connected
@@ -495,7 +496,7 @@ const Active = ({ call, tones, original, hasOther, onError }: { call: SoftCall; 
   const originalReady = original && (original.state === 'connected' || original.state === 'held')
   // While the transfer of the original is on its way, the consultation must stay: its dialog is what the far end
   // takes over (Replaces); hanging it up first would make the transfer fail.
-  const busy = call.renegotiating || call.transferring || (original?.transferring ?? false)
+  const busy = call.renegotiating || call.transferring || call.conferencing || (original?.transferring ?? false)
   return (
     <section className="call" aria-labelledby={`call-${call.id}`} data-testid={original ? 'consultation' : undefined}>
       <p id={`call-${call.id}`} className="call-title" role="status">
@@ -579,9 +580,9 @@ export const CallPanel = () => {
   const { calls, lastEnded, tones } = usePhone()
   const [error, setError] = useState<string | null>(null)
   // Who came into or left a conference (review 8b, n°2 and n°11): written in a region always there, so it is read out.
-  const [notice, setNotice] = useState<string | null>(null)
-  // Shown while a conference goes on only.
-  const inConference = calls.some(c => c.room === 'conference')
+  // Shown while the conference call it came from goes on only: never read again at the next one (second review 8b, n°7).
+  const [notice, setNotice] = useState<{ callId: string; text: string } | null>(null)
+  const shownNotice = notice && calls.some(c => c.id === notice.callId && c.room === 'conference' && c.state !== 'ended') ? notice.text : null
   if (!calls.length && !lastEnded) return null
   // A call answered at once (it takes the place of one of ours, or joins the conference we make) never rings here.
   const ringing = (c: SoftCall) => c.direction === 'inbound' && c.state === 'ringing' && !c.replacedCallId && !c.conferenceOf
@@ -593,13 +594,13 @@ export const CallPanel = () => {
     <div className="calls" data-testid="calls">
       {shown.map(call => {
         if (ringing(call)) return <Incoming key={call.id} call={call} />
-        if (call.room === 'conference') return <ConferenceCall key={call.id} call={call} tones={tones[call.id] ?? ''} onError={setError} onNotice={setNotice} />
+        if (call.room === 'conference') return <ConferenceCall key={call.id} call={call} tones={tones[call.id] ?? ''} onError={setError} onNotice={text => setNotice({ callId: call.id, text })} />
         const original = call.consultationOf ? ours.find(c => c.id === call.consultationOf) : undefined
         return <Active key={call.id} call={call} tones={tones[call.id] ?? ''} hasOther={ours.length > 1} onError={setError} {...(original ? { original } : {})} />
       })}
       <div role="status" className="call-status" data-testid="call-status">
         {lastEnded ? <p className="call call-ended">{t(reasonKey(lastEnded), { who: who(lastEnded, t), message: lastEnded.endMessage ?? '' })}</p> : null}
-        {inConference && notice ? <p className="badge">{notice}</p> : null}
+        {shownNotice ? <p className="badge">{shownNotice}</p> : null}
       </div>
       {error && calls.length ? (
         <p className="alert alert-error" role="alert">

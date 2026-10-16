@@ -189,7 +189,9 @@ const listenDtmf = address => {
 }
 const DTMF_EVENTS = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '*', '#']
 
-const [APP_PORT, OIDC_PORT, GATEWAY_PORT, RELAY_PORT] = await Promise.all([freePort(), freePort(), freePort(), freePort()])
+const [APP_PORT, OIDC_PORT, RELAY_PORT] = await Promise.all([freePort(), freePort(), freePort()])
+// Where the stack's LiveKit sends its webhooks (docker-compose.sip.yml, LIVEKIT_WEBHOOK_URL; second review 8b, n°3).
+const GATEWAY_PORT = Number(process.env.GATEWAY_PORT ?? 18080)
 const appOrigin = `http://127.0.0.1:${APP_PORT}`
 const gatewayUrl = `http://127.0.0.1:${GATEWAY_PORT}`
 const wss = new URL(SIP_WSS_URL)
@@ -260,6 +262,11 @@ let activeBridge = bridge
 const conference = { bridge: () => activeBridge, accessNumber: MEET_NUMBER, webhookKey: LIVEKIT_API_KEY, webhookSecret: LIVEKIT_API_SECRET }
 // A call with the public network whose person has no window left is ended after 3 s here (30 s by default).
 const gateway = await buildApp(registry, { auth, store, contacts, directorySync, push, secretsKey: key, admin: { adminRole: 'twakephone-admin', adminUsers: new Set() }, conference })
+// LiveKit's webhooks as the Gateway answered them: signed with its key, each one 204.
+const livekitWebhooks = []
+gateway.addHook('onResponse', async (req, reply) => {
+  if (req.url === '/api/v1/webhooks/livekit') livekitWebhooks.push(reply.statusCode)
+})
 registry.startAll()
 await gateway.listen({ host: '127.0.0.1', port: GATEWAY_PORT })
 const web = await serveApp({
@@ -2687,11 +2694,18 @@ try {
     expectEqual(`${jeanIn.remoteNumber} ${jeanIn.direction}`, '101 inbound', 'Jean\'s history: the room called him at Alice\'s name')
     if (!(await recents(alice.page, 1)).includes('Votre conférence: Conférence')) throw new Error(`Alice's Récents: ${JSON.stringify(await recents(alice.page, 1))}`)
     if (!(await recents(jean.page, 1)).some(l => l.endsWith(': Conférence'))) throw new Error(`Jean's Récents: ${JSON.stringify(await recents(jean.page, 1))}`)
+    // Bob, the third participant, likewise (second review 8b, n°8): a call of the conference, at Alice's name.
+    const [bobIn] = await conferenceCalls('bdurand', conferenceFrom, 1)
+    expectEqual(`${bobIn.remoteNumber} ${bobIn.direction}`, '101 inbound', 'Bob\'s history: the room called him at Alice\'s name')
+    if (!(await recents(bob.page, 1)).some(l => l.endsWith(': Conférence'))) throw new Error(`Bob's Récents: ${JSON.stringify(await recents(bob.page, 1))}`)
     const cdrs = await until('the CDRs of the conference\'s calls', async () => {
       const { rows } = await db.query("SELECT callee FROM acc WHERE via = 'conference' AND id > $1 ORDER BY id", [conferenceAcc])
-      return rows.length >= 2 ? rows.map(r => r.callee).sort() : null
+      return rows.length >= 3 ? rows.map(r => r.callee).sort() : null
     })
-    expectEqual(cdrs.join(' '), '101 102', 'the CDRs of the conference\'s calls (via conference)')
+    expectEqual(cdrs.join(' '), '101 102 103', 'the CDRs of the conference\'s calls (via conference)')
+    // LiveKit told the Gateway (its webhooks, second review 8b, n°3), each time with a signature it took.
+    await until('LiveKit\'s webhooks at the Gateway', async () => (livekitWebhooks.includes(204) ? true : null))
+    expectEqual(livekitWebhooks.filter(s => s !== 204).join(' '), '', 'the webhooks of LiveKit the Gateway refused')
   })
   await step('step 8b: a call with the operator cannot become a conference: Alice is told why (CONFERENCE_EXTERNAL), nobody is called, her call goes on', async () => {
     await dial(alice.page, '06 39 98 00 06')

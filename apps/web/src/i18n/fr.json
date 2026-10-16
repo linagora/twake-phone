@@ -594,6 +594,7 @@
   "conference.end": "Terminer pour tous",
   "conference.errorExternal": "Seul un appel entre deux postes peut devenir une conférence : un correspondant extérieur ne peut pas encore y être repris. Ajoutez des participants depuis une conférence entre collègues.",
   "conference.errorNotAnswered": "L'appel n'est plus en cours : la conférence n'a pas été créée.",
+  "conference.errorCallOver": "La conférence n'a pas pu commencer : l'appel s'est terminé entre-temps.",
   "conference.errorNotStarted": "La conférence n'a pas pu commencer : la salle n'a pas pu reprendre l'appel (votre correspondant l'a mis en attente ou est dans un autre appel, par exemple). L'appel continue.",
   "conference.errorDialFailed": "{who} n'a pas pu être joint (refusé, occupé ou sans réponse) : la conférence continue sans cette personne.",
   "conference.errorLimit": "Trop de conférences ou d'appels de salle en peu de temps : réessayez dans un moment.",

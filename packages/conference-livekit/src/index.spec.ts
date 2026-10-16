@@ -355,7 +355,7 @@ describe('dial-out and moderation', () => {
       {
         'livekit.RoomService/ListParticipants': {
           participants: [
-            { identity: 'phone-102-a', attributes: { 'twake.kind': 'phone', 'twake.number': '102' } },
+            { identity: 'phone-102-a', attributes: { 'twake.kind': 'phone', 'twake.number': '102', 'sip.callIDFull': 'a1b2@192.0.2.30' } },
             { identity: 'sip-1', attributes: { 'sip.phoneNumber': '+33612345678' } },
             { identity: 'web-1', attributes: {} }
           ]
@@ -363,7 +363,11 @@ describe('dial-out and moderation', () => {
       },
       { numberPrivacy: 'hide' }
     )
-    expect(await bridge.participantNumbers('twake-call-0123456789abcdef')).toEqual(['102', '+33612345678', ''])
+    expect(await bridge.participantCalls('twake-call-0123456789abcdef')).toEqual([
+      { id: 'twake-call-0123456789abcdef:phone-102-a', number: '102', callId: 'a1b2@192.0.2.30' },
+      { id: 'twake-call-0123456789abcdef:sip-1', number: '+33612345678' },
+      { id: 'twake-call-0123456789abcdef:web-1', number: '' }
+    ])
     expect(calls[0]).toMatchObject({ path: 'livekit.RoomService/ListParticipants', body: { room: 'twake-call-0123456789abcdef' } })
   })
 

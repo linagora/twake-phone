@@ -395,17 +395,17 @@ describe('OpensipsProvider call rules', () => {
     sips.state.down = false
   })
 
-  it('ends a call OpenSIPS has by its Call-ID (MI dlg_end_dlg, review 8b, n°3); one it no longer has is no error', async () => {
+  it('ends a call OpenSIPS has by its Call-ID (MI dlg_end_dlg, review 8b, n°3); one it no longer has is no error, and said (second review 8b, n°1)', async () => {
     const sips = await fakeOpensips()
     cleanups.push(sips.close)
     const p = new OpensipsProvider({ websocketUrl: 'wss://sip.example.test', domain: 'sip.example.test', sipSecretFor: async () => 's', events: { miUrl: sips.url, timeoutMs: 300 }, logger: quiet })
     cleanups.push(() => p.close())
     await until('the subscription', () => p.getStatus() === 'CONNECTED')
     sips.state.dialogContexts.set('diverted@192.0.2.30', { callid: 'diverted@192.0.2.30' })
-    await p.endRoomCall('diverted@192.0.2.30')
+    expect(await p.endRoomCall('diverted@192.0.2.30')).toBe(true)
     expect(sips.requests.find(r => r.method === 'dlg_end_dlg')?.params).toEqual({ dialog_id: 'diverted@192.0.2.30' })
     expect(sips.state.dialogContexts.has('diverted@192.0.2.30')).toBe(false)
-    await p.endRoomCall('diverted@192.0.2.30')
+    expect(await p.endRoomCall('diverted@192.0.2.30')).toBe(false)
     await expect(make().endRoomCall('x')).rejects.toMatchObject({ statusCode: 501 })
   })
 

@@ -594,6 +594,7 @@
   "conference.end": "End for everyone",
   "conference.errorExternal": "Only a call between two extensions can become a conference: an outside caller cannot be taken into one yet. Add participants from a conference between colleagues.",
   "conference.errorNotAnswered": "The call is no longer in progress: the conference was not started.",
+  "conference.errorCallOver": "The conference could not begin: the call ended meanwhile.",
   "conference.errorNotStarted": "The conference could not begin: the room could not take the call over (the other party put it on hold or is in another call, for example). The call goes on.",
   "conference.errorDialFailed": "{who} could not be reached (declined, busy or no answer): the conference goes on without them.",
   "conference.errorLimit": "Too many conferences or room calls in a short time: try again in a moment.",

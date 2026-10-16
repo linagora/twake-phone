@@ -43,9 +43,11 @@ const CODE_KEY: Partial<Record<CallError['code'], Key>> = {
  * Why a conference did not begin (`making`: the call was to become one) or a room did not call someone (step 8b), in
  * the person's words: the Gateway's `code`, else a softphone error, else as it came. An error that came once the
  * conference was made (`conferenceMade`: the call to the third participant) is that call's, never the conference's.
+ * A conference that did not begin because its call ended meanwhile (`callOver`: refused 481 by the phone that had it,
+ * second review 8b, n°9) does not say the call goes on.
  */
 export const describeConferenceError = (err: unknown, t: T, { making = false, who = '' }: { making?: boolean; who?: string } = {}): string => {
-  const failed = err as { code?: unknown; status?: unknown; conferenceMade?: unknown } | null
+  const failed = err as { code?: unknown; status?: unknown; conferenceMade?: unknown; callOver?: unknown } | null
   if (failed?.conferenceMade === true) making = false
   switch (failed?.code) {
     case 'CONFERENCE_EXTERNAL':
@@ -53,7 +55,7 @@ export const describeConferenceError = (err: unknown, t: T, { making = false, wh
     case 'CALL_NOT_ANSWERED':
       return t('conference.errorNotAnswered')
     case 'DIAL_FAILED':
-      return making ? t('conference.errorNotStarted') : t('conference.errorDialFailed', { who })
+      return making ? t(failed.callOver === true ? 'conference.errorCallOver' : 'conference.errorNotStarted') : t('conference.errorDialFailed', { who })
     case 'CONFERENCE_LIMIT':
     case 'DIAL_OUT_LIMIT':
       return t('conference.errorLimit')

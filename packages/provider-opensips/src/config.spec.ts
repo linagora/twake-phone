@@ -1,6 +1,6 @@
 import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -167,6 +167,20 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     }
   })
 
+  it('says when the asynchronous reads may open more connections than the database takes (second review 8b, n°9); OpenSIPS starts all the same', () => {
+    // A database that takes 200 connections, as on this stack.
+    const bin = join(tmp, 'bin')
+    mkdirSync(bin, { recursive: true })
+    writeFileSync(join(bin, 'psql'), '#!/bin/sh\ncase "$*" in *max_connections*) echo 200 ;; esac\nexit 0\n')
+    chmodSync(join(bin, 'psql'), 0o755)
+    writeFileSync(join(tmp, 'trunk.sql'), '')
+    const env = { PATH: `${bin}:${process.env.PATH ?? '/usr/bin:/bin'}`, TRUNK_SQL: join(tmp, 'trunk.sql') }
+    const wide = render({ ...env, DB_MAX_ASYNC_CONNECTIONS: '32' })
+    expect(wide.status).toBe(0)
+    expect(wide.stderr).toContain('WARNING: DB_MAX_ASYNC_CONNECTIONS=32 may open about 350 connections to the database, which takes 200 (max_connections)')
+    for (const value of ['8', '16']) expect(render({ ...env, DB_MAX_ASYNC_CONNECTIONS: value }).stderr, value).not.toContain('WARNING')
+  })
+
   it("sends a conference's room call (step 8b) where its grant says, as it says, and nowhere else; no phone writes what only this script does", () => {
     const { cfg } = render({ SIP_DOMAIN: 'sip.example.test', MEET_SIP: '192.0.2.20:5080', MEET_SIP_PASSWORD: 'not-a-real-secret-0' })
     const section = (name: string, next: string) => cfg.slice(cfg.indexOf(`\n${name} {`), cfg.indexOf(`\n${next} {`))
@@ -184,7 +198,8 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(at('route(trunk_out);')).toBeLessThan(at('append_hf("Twake-Room: meet\\r\\n");'))
     expect(at('append_hf("Twake-Room: meet\\r\\n");')).toBeLessThan(at('route(rules_next);'))
     // A call of a conference's room to a third participant says so, and which room (review 8b, n°2).
-    expect(loaded).toContain('if ($avp(meet_room) =~ "^twake-call-[0-9a-f]{16}$") {\n\t\tappend_hf("Twake-Room: conference\\r\\n");\n\t\tappend_hf("Twake-Conference: $avp(meet_room)\\r\\n");\n\t} else\n\t\tappend_hf("Twake-Room: meet\\r\\n");')
+    // A call of the conference as the others' are (second review 8b, n°8): its CDR and its events say conference.
+    expect(loaded).toContain('if ($avp(meet_room) =~ "^twake-call-[0-9a-f]{16}$") {\n\t\tappend_hf("Twake-Room: conference\\r\\n");\n\t\tappend_hf("Twake-Conference: $avp(meet_room)\\r\\n");\n\t\t$avp(conference) = 1;\n\t\t$acc_extra(via) = "conference";\n\t} else\n\t\tappend_hf("Twake-Room: meet\\r\\n");')
     const leg = section('route[conference_leg]', 'route[meet_call]')
     // Never the public network; the header of its grant, written by this script; then the phones of the extension.
     expect(at('t_reply(403, "Not Granted");', leg)).toBeLessThan(at('append_hf("Replaces: $avp(meet_replaces)\\r\\n");', leg))

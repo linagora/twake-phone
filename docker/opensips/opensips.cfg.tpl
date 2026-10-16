@@ -911,10 +911,14 @@ route[meet_source_loaded] {
 		exit;
 	}
 	# The callee's phone knows a room calls (no hold nor transfer there: the room's calls are not transferred). The
-	# room of a conference (review 8b, n°2) says so, and which: whoever answers sees who is in it.
+	# room of a conference (review 8b, n°2) says so, and which: whoever answers sees who is in it. A call of the
+	# conference as the others' are (second review 8b, n°8): its CDR says `via` conference, its events `conference`
+	# (its callee's: the Récents of the third participant say Conférence, as their window does).
 	if ($avp(meet_room) =~ "^twake-call-[0-9a-f]{16}$") {
 		append_hf("Twake-Room: conference\r\n");
 		append_hf("Twake-Conference: $avp(meet_room)\r\n");
+		$avp(conference) = 1;
+		$acc_extra(via) = "conference";
 	} else
 		append_hf("Twake-Room: meet\r\n");
 	route(rules_next);
