@@ -331,7 +331,20 @@ route[rtp_offer] {
 	$(avp(offer_from)[*]) = NULL;
 	$avp(offer_from) = $var(from_kind);
 	route(rtp_flags, $var(to_kind));
-	if (!rtpengine_offer("$var(rtp_flags)")) {
+	# LiveKit SIP draws the session id and version of its o= line as any 64-bit number (step 8), half of them past the
+	# 2^63 - 1 that JSEP (RFC 8829) allows: Firefox refuses such an offer (488). rtpengine keeps them as they are; it is
+	# given them as "1" and their last 17 digits instead (below 2^63, the same in each offer of the call, a version that
+	# grows still grows).
+	$var(offer_ok) = 0;
+	if ($var(from_kind) == 2) {
+		$var(sdp_re) = '/o=([^ ]+) [0-9]*([0-9]{17}) [0-9]*([0-9]{17}) IN /o=\1 1\2 1\3 IN /';
+		$var(sdp_in) = $(rb{re.subst,$var(sdp_re)});
+		if (rtpengine_offer("$var(rtp_flags)", , , $var(sdp_in)))
+			$var(offer_ok) = 1;
+	} else if (rtpengine_offer("$var(rtp_flags)")) {
+		$var(offer_ok) = 1;
+	}
+	if ($var(offer_ok) != 1) {
 		# Never relay the browser's own SDP: without rtpengine the call would go browser to browser.
 		xlog("L_ERR", "rtpengine offer failed for $ci\n");
 		send_reply(503, "Media Unavailable");

@@ -1023,6 +1023,23 @@ try {
     await w302.close()
   })
 
+  await step('step 8: LiveKit SIP draws its o= session id and version as any 64-bit number: a browser gets them below 2^63 (RFC 8829; Firefox refuses an offer otherwise), its codecs kept', async () => {
+    p302.st.asleep = true
+    const w302 = await phone('302', { ws: true })
+    const lk = await room('301')
+    const body = ['v=0', 'o=- 15012345678901234567 15012345678901234567 IN IP4 127.0.0.1', 's=LiveKit', 'c=IN IP4 127.0.0.1', 't=0 0', 'm=audio 31000 RTP/AVP 9 0 8 101', 'a=rtpmap:9 G722/8000', 'a=rtpmap:0 PCMU/8000', 'a=rtpmap:8 PCMA/8000', 'a=rtpmap:101 telephone-event/8000', 'a=fmtp:101 0-16', 'a=ptime:20', 'a=sendrecv', ''].join('\r\n')
+    const call = await lk.dial('302', { body, type: 'application/sdp' })
+    expect('answered', call.final.status === 200, call.final.first)
+    const rung = await w302.incoming(i => header(i, 'call-id') === call.callId)
+    const origin = /^o=\S+ (\d+) (\d+) /m.exec(rung.invite.body)
+    expect('the o= line 302 got', origin?.[1] === '112345678901234567' && origin[2] === '112345678901234567', rung.invite.body)
+    expect('the codecs 302 got', ['G722/8000', 'PCMU/8000', 'PCMA/8000', 'telephone-event/8000'].every(c => rung.invite.body.includes(` ${c}`)), rung.invite.body)
+    const bye = await lk.hangup(call)
+    expect('the room\'s BYE', bye.status === 200, bye.first)
+    await w302.callState(rung, 'ended', 5_000)
+    await w302.close()
+  })
+
   await step('step 8: a room\'s call to the public network is that of whoever asked: their rights (refused, nothing sent), premium numbers never, their direct number presented, a call of theirs to the public network', async () => {
     await setOutbound({}, PROFILES, [{ userId: 'u-301', profileId: 'france' }])
     const lk = await room('301')
