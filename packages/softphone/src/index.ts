@@ -176,11 +176,6 @@ export interface SoftCall {
    * a room that is a conference: the Gateway lets each of its participants read who is there (GET /conferences/:id).
    */
   readonly conferenceRoom?: string
-  /**
-   * The far end of our call this conference's call continues (step 8b), ours made into one (`conferenceOf`) or
-   * replaced by its room: who was already with us when the conference began, not someone who joined it.
-   */
-  readonly conferenceWith?: string
   answer(): Promise<void>
   reject(): Promise<void>
   hangup(): Promise<void>
@@ -328,7 +323,6 @@ class WebCall implements SoftCall {
   readonly room?: RoomKind
   readonly conferenceOf?: string
   readonly conferenceRoom?: string
-  readonly conferenceWith?: string
   readonly sipCallId: string
   private readonly startMuted: boolean
   /** This call became a conference (its far end moved to the room, or we did): its end is that, not a hang-up. */
@@ -353,7 +347,6 @@ class WebCall implements SoftCall {
     if (links.room) this.room = links.room
     if (links.conferenceOf) this.conferenceOf = links.conferenceOf
     if (links.conferenceRoom) this.conferenceRoom = links.conferenceRoom
-    if (links.conferenceWith) this.conferenceWith = links.conferenceWith
     this.sipCallId = links.sipCallId ?? ''
     this.startMuted = links.startMuted ?? false
     this.remoteNumber = session.remote_identity?.uri?.user ?? ''
@@ -786,8 +779,6 @@ interface CallLinks {
   sipCallId?: string
   /** The room of its conference (CONFERENCE_HEADER), likewise. */
   conferenceRoom?: string
-  /** The far end of the call it continues, for a conference's call. */
-  conferenceWith?: string
   /**
    * Answered with the microphone off (step 8b): the call it continues had it off, and moving to the room of a
    * conference must not open it.
@@ -1057,7 +1048,7 @@ export class Softphone {
           return
         }
         this.setPendingJoin(undefined)
-        const call = this.wrap(e.session, 'inbound', { room, conferenceOf: of.id, sipCallId, startMuted: of.muted, ...(of.remoteNumber ? { conferenceWith: of.remoteNumber } : {}), ...(conferenceRoom ? { conferenceRoom } : {}) })
+        const call = this.wrap(e.session, 'inbound', { room, conferenceOf: of.id, sipCallId, startMuted: of.muted, ...(conferenceRoom ? { conferenceRoom } : {}) })
         this.joinedBy.set(join, call)
         this.options.onCallChange?.(call)
         void call.setOutput(this.devices.outputId ?? '')
@@ -1071,7 +1062,7 @@ export class Softphone {
         const { replaces } = this.replacing
         this.replacing = undefined
         // The microphone as it was in the call replaced: a person who had it off keeps it off in the conference.
-        const call = this.wrap(e.session, 'inbound', { replacedCallId: replaces.id, sipCallId, startMuted: replaces.muted, ...(room ? { room } : {}), ...(conferenceRoom ? { conferenceRoom } : {}), ...(room === 'conference' && replaces.remoteNumber ? { conferenceWith: replaces.remoteNumber } : {}) })
+        const call = this.wrap(e.session, 'inbound', { replacedCallId: replaces.id, sipCallId, startMuted: replaces.muted, ...(room ? { room } : {}), ...(conferenceRoom ? { conferenceRoom } : {}) })
         this.options.onCallChange?.(call)
         void call.setOutput(this.devices.outputId ?? '')
         // After its newRTCSession, JsSIP still sends the 180: the answer comes right after it.

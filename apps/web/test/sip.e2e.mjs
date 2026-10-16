@@ -2628,6 +2628,14 @@ try {
     await until('Alice seeing Jean resume the call', async () => ((await calls(alice.page))[0]?.remoteHold === false ? true : null))
     // Each one mutes their microphone: the calls of the conference start so.
     for (const who of [alice, jean]) await who.page.getByRole('button', { name: 'Couper le micro' }).click()
+    // The race of the announcement, forced: the panels of Alice and Jean get no read of the room until Bob is in it,
+    // so their first read finds him there already. He is told all the same (an arrival after their own calls).
+    const roomRead = /\/api\/v1\/conferences\/twake-call-[0-9a-f]{16}(\?|$)/
+    const refuseReads = route =>
+      route.request().method() === 'GET'
+        ? route.fulfill({ status: 429, contentType: 'application/json', headers: { 'access-control-allow-origin': '*' }, body: JSON.stringify({ statusCode: 429, code: 'CONFERENCE_READ_LIMIT', message: 'held by the e2e' }) })
+        : route.fallback()
+    for (const who of [alice, jean]) await who.page.route(roomRead, refuseReads)
     await alice.page.getByRole('button', { name: 'Ajouter un participant' }).click()
     await alice.page.getByLabel('Participant à ajouter (poste ou numéro)').fill('103')
     await alice.page.getByRole('button', { name: 'Appeler et ajouter' }).click()
@@ -2651,6 +2659,8 @@ try {
     await ringing.waitFor({ timeout: 30_000 })
     expectEqual((await calls(bob.page))[0]?.remoteNumber, '101', 'who calls Bob')
     await ringing.getByRole('button', { name: 'Répondre' }).click()
+    await until('Bob in the conference', async () => ((await calls(bob.page))[0]?.state === 'connected' ? true : null), { timeout: 30_000 })
+    for (const who of [alice, jean]) await who.page.unroute(roomRead, refuseReads)
     await alice.page.getByTestId('conference-participant').nth(2).waitFor({ timeout: 20_000 })
     const shown = await alice.page.getByTestId('conference-participant').allTextContents()
     expectEqual(shown.length, 3, `the participants Alice sees: ${JSON.stringify(shown)}`)
@@ -2667,6 +2677,11 @@ try {
     }
     // Whoever is in it is told who came, in a region read out.
     for (const who of [alice, jean]) await who.page.getByTestId('call-status').getByText('103 a rejoint la conférence.').waitFor({ timeout: 20_000 })
+    // Only Bob: neither party of the call it began with, nor oneself.
+    for (const who of [alice, jean]) {
+      const told = await who.page.getByTestId('call-status').textContent()
+      expectEqual(/10[12] a rejoint/.test(told ?? ''), false, `what ${who.name} was told: ${told}`)
+    }
     for (const who of [alice, jean]) await who.page.getByTestId('conference').getByRole('button', { name: 'Rétablir le micro' }).click()
     // Each one hears the others, through the room.
     await bothHearEachOther(alice, jean)

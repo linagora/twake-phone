@@ -2,84 +2,181 @@
 import { act } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import type { SoftCall } from '@twake/softphone'
 import type { ConferenceParticipant } from '@twake/telephony-types'
 import type { useGateway } from '../gateway.js'
-import { Participants } from './CallPanel.js'
+import type { usePhone } from '../softphone.js'
+import { CallPanel, PARTICIPANTS_EVERY_MS } from './CallPanel.js'
 
 type Gateway = ReturnType<typeof useGateway>
-// What useGateway() hands the panel, set by each test before it renders.
+type Phone = ReturnType<typeof usePhone>
+// What useGateway() and usePhone() hand the panel, set by each test before it renders.
 let gateway: Pick<Gateway, 'client' | 'me'>
+let phone: Pick<Phone, 'calls' | 'lastEnded' | 'tones' | 'rooms' | 'parties' | 'inviting'>
 vi.mock('../gateway.js', () => ({ useGateway: () => gateway }))
-vi.mock('../softphone.js', () => ({ usePhone: () => ({}) }))
+vi.mock('../softphone.js', () => ({ usePhone: () => phone }))
 // One translator for every render, as the app's (a new one would start the reads again).
 const i18n = { t: (key: string, vars?: { who?: string }) => (vars?.who ? `${key} ${vars.who}` : key) }
 vi.mock('../i18n/useT.js', () => ({ useT: () => i18n }))
 
-const phone = (number: string): ConferenceParticipant => ({ id: `phone-${number}`, meetingId: 'twake-call-0123456789abcdef', kind: 'phone', number, muted: false })
-/** A Gateway whose reads of the room answer, in turn, what the test lists (an Error: that read is refused). */
-const reads = (extension: string, ...answers: (ConferenceParticipant[] | Error)[]) => {
-  const getCallConference = vi.fn(async () => {
-    const next = answers.length > 1 ? answers.shift()! : answers[0]!
-    if (next instanceof Error) throw next
-    return { meetingId: 'twake-call-0123456789abcdef', participants: next }
-  })
-  gateway = { client: { getCallConference } as unknown as Gateway['client'], me: { extension } as unknown as Gateway['me'] }
-  return getCallConference
+const ROOM = 'twake-call-0123456789abcdef'
+/** A phone in the room, its number hidden (MEET_NUMBER_PRIVACY=hide): only its name and when it came, by the room's clock. */
+const person = (name: string, joinedAt: number, you = false): ConferenceParticipant => ({ id: `${ROOM}:${name}`, meetingId: ROOM, kind: 'phone', displayName: name, muted: false, joinedAt, ...(you ? { you } : {}) })
+const alice = (you = false) => person('Alice', 1_000, you)
+const jean = (you = false) => person('Jean', 1_400, you)
+const bob = (you = false) => person('Bob', 9_000, you)
+const dan = person('Dan', 9_500)
+
+/** The call of the room in this window: the one that made the conference (`made`), or one the room's call reached. */
+const roomCall = (made: boolean, sipCallId: string): SoftCall => {
+  const call: Partial<SoftCall> = { id: 'room-call', direction: 'inbound', state: 'connected', room: 'conference', remoteNumber: '101', remoteName: 'Alice', muted: false, sipCallId, ...(made ? { conferenceOf: 'first-call' } : { conferenceRoom: ROOM }) }
+  return call as SoftCall
 }
 
-describe('Participants (step 8b): who joined a conference is told', () => {
+/** Reads of the room answering, in turn, what the test queues (an Error: that read refused; a promise: a slow one). */
+const reads = (...answers: (ConferenceParticipant[] | Error | Promise<ConferenceParticipant[]>)[]) => {
+  const getCallConference = vi.fn(async (_meetingId: string, _options?: { call?: string }) => {
+    const next = answers.length > 1 ? answers.shift()! : answers[0]!
+    if (next instanceof Error) throw next
+    return { meetingId: ROOM, participants: await next }
+  })
+  const muteParticipant = vi.fn(async () => undefined)
+  const client: Partial<Gateway['client']> = { getCallConference, muteParticipant }
+  gateway = { client: client as Gateway['client'], me: { extension: '101' } as Gateway['me'] }
+  return { getCallConference, muteParticipant }
+}
+
+describe('CallPanel, a conference (step 8b): who comes in or leaves is told in the status region', () => {
   let root: Root
-  let notices: string[]
-  const render = (party?: string) =>
+  let host: HTMLDivElement
+  let actEnvironment: unknown
+  let chimes: number
+  const status = () => host.querySelector('[data-testid="call-status"]')!.textContent
+  const render = (call: SoftCall, parties?: string[]) =>
     act(async () => {
-      root.render(<Participants meetingId="twake-call-0123456789abcdef" manage={false} {...(party ? { party } : {})} onError={() => undefined} onNotice={m => notices.push(m)} />)
+      phone = { calls: [call], lastEnded: null, tones: {}, rooms: call.conferenceOf ? { [call.conferenceOf]: ROOM } : {}, parties: parties ? { [ROOM]: parties } : {}, inviting: {} }
+      root.render(<CallPanel />)
       await vi.advanceTimersByTimeAsync(0)
     })
-  const later = () => act(() => vi.advanceTimersByTimeAsync(5_000))
+  const later = (ms = PARTICIPANTS_EVERY_MS) => act(() => vi.advanceTimersByTimeAsync(ms))
 
   beforeEach(() => {
+    actEnvironment = (globalThis as { IS_REACT_ACT_ENVIRONMENT?: unknown }).IS_REACT_ACT_ENVIRONMENT
     ;(globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
     vi.useFakeTimers()
-    notices = []
-    root = createRoot(document.createElement('div'))
+    chimes = 0
+    // The chime of an arrival: jsdom has no sound, a stand-in counts the tones started.
+    class Audio {
+      currentTime = 0
+      destination = {}
+      createGain = () => ({ gain: { value: 0 }, connect: (to: unknown) => to })
+      createOscillator = () => ({ frequency: { value: 0 }, connect: (to: unknown) => to, start: () => void chimes++, stop: () => undefined })
+      close = async () => undefined
+    }
+    vi.stubGlobal('AudioContext', Audio)
+    host = document.createElement('div')
+    root = createRoot(host)
   })
   afterEach(() => {
     act(() => root.unmount())
+    vi.unstubAllGlobals()
     vi.useRealTimers()
+    ;(globalThis as { IS_REACT_ACT_ENVIRONMENT?: unknown }).IS_REACT_ACT_ENVIRONMENT = actEnvironment
   })
 
-  it('tells who is already there at the first read of a conference made out of our call: the third participant answered before it (the e2e race)', async () => {
-    // Alice's panel: her call with 102 became the conference, and 103 answered before the panel first read the room.
-    const read = reads('101', [phone('101'), phone('103'), phone('102')])
-    await render('102')
-    expect(read).toHaveBeenCalledTimes(1)
-    expect(notices).toEqual(['conference.joined 103'])
-    // Told once: the next reads find the same people.
+  it('tells the one who made it of a participant already there at its first read (the e2e race), numbers hidden, with a chime, once', async () => {
+    const { getCallConference } = reads([alice(true), bob(), jean()])
+    await render(roomCall(true, 'room-a@192.0.2.30'), [alice().id, jean().id])
+    // Its own call named in each read; the two parties the conference began with are no news.
+    expect(getCallConference).toHaveBeenCalledWith(ROOM, { call: 'room-a@192.0.2.30' })
+    expect(status()).toBe('conference.joined Bob')
+    expect(chimes).toBe(1)
+    const shown = host.querySelector('[data-testid="call-status"] p')
     await later()
-    expect(read).toHaveBeenCalledTimes(2)
-    expect(notices).toEqual(['conference.joined 103'])
+    expect(getCallConference).toHaveBeenCalledTimes(2)
+    expect(host.querySelector('[data-testid="call-status"] p')).toBe(shown)
+    expect(chimes).toBe(1)
   })
 
-  it('tells it all the same when the first read is refused and a later one finds the third participant', async () => {
-    reads('102', new Error('429'), [phone('101'), phone('102'), phone('103')])
-    // Jean's panel: the room took the place of his call with 101.
-    await render('101')
-    expect(notices).toEqual([])
+  it('tells it all the same when the first reads are refused and a later one finds that participant', async () => {
+    reads(new Error('429'), new Error('429'), [alice(true), jean(), bob()])
+    await render(roomCall(true, 'room-a@192.0.2.30'), [alice().id, jean().id])
+    expect(status()).toBe('')
     await later()
-    expect(notices).toEqual(['conference.joined 103'])
-  })
-
-  it("takes everyone there at the first read as there before for a third participant's panel, then tells who comes and goes", async () => {
-    reads('103', [phone('101'), phone('102'), phone('103')], [phone('101'), phone('103'), phone('104')])
-    await render()
-    expect(notices).toEqual([])
     await later()
-    expect(notices).toEqual(['conference.joined 104', 'conference.left 102'])
+    expect(status()).toBe('conference.joined Bob')
   })
 
-  it('takes everyone at the first read as there before when the far end of our call is not found by its number (a group answered)', async () => {
-    reads('101', [phone('101'), phone('102'), phone('103')])
-    await render('600')
-    expect(notices).toEqual([])
+  it('never tells someone of their own arrival: the panel waits for its own call to be in the room (the room took the place of our call)', async () => {
+    reads([alice()], [alice(), jean(true)], [alice(), jean(true), bob()])
+    await render(roomCall(false, 'room-j@192.0.2.30'))
+    await later()
+    expect(status()).toBe('')
+    await later()
+    expect(status()).toBe('conference.joined Bob')
+  })
+
+  it("tells a third participant's panel of whoever came after it, even before its first read; not of those there before", async () => {
+    reads([alice(), jean(), bob(true), dan])
+    await render(roomCall(false, 'room-b@192.0.2.30'))
+    expect(status()).toBe('conference.joined Dan')
+  })
+
+  it('takes nobody as an arrival from a read made before its own call was in the room', async () => {
+    // Read once before Bob's call is in it: Jean, there before him, is no news when it is.
+    reads([alice()], [alice(), jean(), bob(true)])
+    await render(roomCall(false, 'room-b@192.0.2.30'))
+    await later()
+    expect(status()).toBe('')
+  })
+
+  it('says all the arrivals and departures of a read in one message, and the same words again in a new one', async () => {
+    const phoneOf = (name: string, joinedAt: number) => ({ ...person(name, joinedAt), displayName: 'Phone' })
+    reads([alice(true), jean()], [alice(true), bob(), dan], [alice(true), bob(), dan, phoneOf('x', 9_700)], [alice(true), bob(), dan, phoneOf('x', 9_700), phoneOf('y', 9_800)])
+    await render(roomCall(true, 'room-a@192.0.2.30'), [alice().id, jean().id])
+    await later()
+    expect(status()).toBe('conference.joined Bob conference.joined Dan conference.left Jean')
+    await later()
+    const first = host.querySelector('[data-testid="call-status"] p')
+    expect(status()).toBe('conference.joined Phone')
+    await later()
+    expect(status()).toBe('conference.joined Phone')
+    // A paragraph of its own: read out again.
+    expect(host.querySelector('[data-testid="call-status"] p')).not.toBe(first)
+  })
+
+  it('reads one at a time, and drops the answer of a read made before an action', async () => {
+    let slow!: (participants: ConferenceParticipant[]) => void
+    const late = new Promise<ConferenceParticipant[]>(resolve => (slow = resolve))
+    const { getCallConference, muteParticipant } = reads([alice(true), jean()], late, [alice(true), jean(), bob()])
+    await render(roomCall(true, 'room-a@192.0.2.30'), [alice().id, jean().id])
+    await later()
+    // The second read is slow: no other one meanwhile.
+    await later(3 * PARTICIPANTS_EVERY_MS)
+    expect(getCallConference).toHaveBeenCalledTimes(2)
+    // An action reads again at once, and finds Bob.
+    await act(async () => {
+      host.querySelector<HTMLButtonElement>('button[aria-label="conference.muteWho Jean"]')!.click()
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    expect(muteParticipant).toHaveBeenCalled()
+    expect(status()).toBe('conference.joined Bob')
+    // The slow one answers now, without Bob: dropped, nobody said to leave.
+    await act(async () => {
+      slow([alice(true), jean()])
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    expect(status()).toBe('conference.joined Bob')
+    expect(host.querySelectorAll('[data-testid="conference-participant"]')).toHaveLength(3)
+  })
+
+  it('takes whoever is there as there before when its own call is never found in the room', async () => {
+    reads([alice(), jean(), bob()], [alice(), jean(), bob()], [alice(), jean(), bob()], [alice(), jean(), bob(), dan])
+    await render(roomCall(false, 'room-j@192.0.2.30'))
+    await later()
+    await later()
+    expect(status()).toBe('')
+    await later()
+    expect(status()).toBe('conference.joined Dan')
   })
 })

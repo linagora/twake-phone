@@ -41,6 +41,11 @@ export interface Phone {
   inviteToConference(meetingId: string, number: string): Promise<void>
   /** The room of each conference this window made, by the call that became it. */
   rooms: Record<string, string>
+  /**
+   * The participants each conference this window made began with, by room: the ids of the two parties of the call
+   * that became it (POST /calls/:id/conference). Whoever came in later is news to this window.
+   */
+  parties: Record<string, string[]>
   /** The numbers each room is calling now, by room. */
   inviting: Record<string, string[]>
 }
@@ -92,6 +97,7 @@ export const SoftphoneProvider = ({ children }: { children: ReactNode }) => {
   const [soundBlocked, setSoundBlocked] = useState(false)
   const [conferenceAvailable, setConferenceAvailable] = useState(false)
   const [rooms, setRooms] = useState<Record<string, string>>({})
+  const [parties, setParties] = useState<Record<string, string[]>>({})
   const [inviting, setInviting] = useState<Record<string, string[]>>({})
   const phone = useRef<Softphone | null>(null)
   const devicesRef = useRef(devices)
@@ -203,7 +209,9 @@ export const SoftphoneProvider = ({ children }: { children: ReactNode }) => {
       let meetingId: string
       try {
         if (!call.sipCallId) throw new Error('No Call-ID for this call')
-        meetingId = (await client.makeConference(call.sipCallId, join)).meetingId
+        const made = await client.makeConference(call.sipCallId, join)
+        meetingId = made.meetingId
+        setParties(p => ({ ...p, [made.meetingId]: made.participants.map(participant => participant.id) }))
       } catch (err) {
         // Not waited for any more, and its room's call hung up if it was answered (the Gateway stopped between the two
         // calls of the room, third review 8b, n°5): our call is back as it was.
@@ -251,8 +259,8 @@ export const SoftphoneProvider = ({ children }: { children: ReactNode }) => {
   const ringTest = useCallback(async () => (phone.current ? phone.current.ringTest() : false), [])
 
   const value = useMemo<Phone>(
-    () => ({ state, detail, calls, lastEnded, tones, call, shutdown, devices, setDevices, devicesVersion, soundBlocked, unblockAudio, ringTest, conferenceAvailable, addParticipant, inviteToConference, rooms, inviting }),
-    [state, detail, calls, lastEnded, tones, call, shutdown, devices, setDevices, devicesVersion, soundBlocked, unblockAudio, ringTest, conferenceAvailable, addParticipant, inviteToConference, rooms, inviting]
+    () => ({ state, detail, calls, lastEnded, tones, call, shutdown, devices, setDevices, devicesVersion, soundBlocked, unblockAudio, ringTest, conferenceAvailable, addParticipant, inviteToConference, rooms, parties, inviting }),
+    [state, detail, calls, lastEnded, tones, call, shutdown, devices, setDevices, devicesVersion, soundBlocked, unblockAudio, ringTest, conferenceAvailable, addParticipant, inviteToConference, rooms, parties, inviting]
   )
   // What a test can read from outside: never actions, only counters (packets, calls, tones).
   useEffect(() => {

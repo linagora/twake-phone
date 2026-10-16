@@ -1476,7 +1476,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
       })
 
       const roomReads = options.conferenceReadLimiter ?? new RateLimiter(60, 60_000)
-      v1.get<{ Params: { id: string } }>('/conferences/:id', async (req, reply) => {
+      v1.get<{ Params: { id: string }; Querystring: { call?: string } }>('/conferences/:id', async (req, reply) => {
         const { bridge, record, room, user, calls } = await owned(req, req.params.id, { reading: true })
         if (!roomReads.allow(ownerKey(user.tenantId, user.id))) return reply.code(429).send({ statusCode: 429, code: 'CONFERENCE_READ_LIMIT', error: 'Too Many Requests', message: 'Too many reads of your rooms: wait a minute' })
         if (room) {
@@ -1486,7 +1486,10 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         // A call's room (step 8b): nobody dials into it, no PIN. The number of someone from outside (the public network)
         // is its owner's to see whole, who called it; masked for the others in it (second review 8b, n°6).
         if (CALL_ROOM.test(record.meetingId)) {
-          const participants = await viaLiveKit(() => bridge.listParticipants(record.meetingId))
+          // `call`: the Call-ID of the reader's own call in it, whose participant is marked (`you`): their panel tells
+          // who came after them (fix of 8b's announcements). It says nothing to whoever does not have that Call-ID.
+          const you = typeof req.query.call === 'string' && req.query.call.length <= 256 ? req.query.call : undefined
+          const participants = await viaLiveKit(() => bridge.listParticipants(record.meetingId, you ? { you } : {}))
           if (!calls) return { meetingId: record.meetingId, participants }
           // Shown whole only when proved of the tenant by the read of the calls: one come in since is masked too (third
           // review 8b, n°2). Its id carries no number (an identity drawn at random, conference-livekit).

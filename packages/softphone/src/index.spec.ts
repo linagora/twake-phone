@@ -783,11 +783,8 @@ describe('Softphone', () => {
     const s = ua().lastCall!
     s.emit('accepted', { originator: 'remote' })
     const room = new FakeSession('incoming')
-    // The room calls from our own extension: who we were with is the far end of our call, not of the room's.
-    room.remote_identity = { uri: { user: '101', host: 'sip.test', toString: () => 'sip:101@sip.test' }, display_name: '' }
     const token = phone.expectConference(call.id)
     ua().emit('newRTCSession', { originator: 'remote', session: room, request: { getHeader: (name: string) => ({ 'Twake-Join': token, 'Twake-Room': 'conference' })[name] } })
-    expect(phone.conferenceCall(call.id)?.conferenceWith).toBe('102')
     room.emit('accepted', { originator: 'local' })
     expect(call.muted).toBe(true)
     room.emit('ended', { originator: 'remote', cause: 'Terminated' })
@@ -826,15 +823,12 @@ describe('Softphone', () => {
     const s = ua().lastCall!
     s.emit('accepted', { originator: 'remote' })
     const replacing = new FakeSession('incoming')
-    replacing.remote_identity = { uri: { user: '103', host: 'sip.test', toString: () => 'sip:103@sip.test' }, display_name: '' }
     const request = { getHeader: (name: string) => (name === 'Twake-Room' ? 'conference' : undefined) }
     s.emit('replaces', { request, accept: (init: (s: unknown) => void) => { init(replacing); ua().emit('newRTCSession', { originator: 'remote', session: replacing, request }) }, reject: vi.fn() })
     await new Promise(r => setTimeout(r, 5))
     expect(replacing.answer).toHaveBeenCalled()
     const room = phone.activeCalls().find(c => c.replacedCallId === call.id)!
     expect(room.room).toBe('conference')
-    // Who we were with before the conference: the far end of the call it replaced (the panel announces the others).
-    expect(room.conferenceWith).toBe('102')
     replacing.emit('accepted', { originator: 'local' })
     // JsSIP ends the call it replaced once the new one is confirmed.
     s.emit('ended', { originator: 'local', cause: 'Terminated' })

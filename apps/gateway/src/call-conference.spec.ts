@@ -429,13 +429,18 @@ describe('a call becomes a conference (POST /calls/:id/conference, step 8b)', ()
   })
 
   it("shows the number of someone from outside whole to the room's owner only, masked to the others in it (second review 8b, n°6)", async () => {
-    const { conference, app, as, joinsLater } = await setup()
+    const { conference, app, as, joinsLater, rooms } = await setup()
     const room = (await conference('c1')).json().meetingId
     expect((await app.inject({ method: 'POST', url: `/api/v1/conferences/${room}/participants`, headers: as('alice'), payload: { number: '0199000024' } })).statusCode).toBe(201)
+    // Read with the Call-ID of one's own call in it: that participant only is marked, numbers masked as before.
+    const bobs = rooms.get(room)!.find(p => p.attributes['twake.number'] === '102')!.attributes['sip.callIDFull']!
+    const marked = (await app.inject({ method: 'GET', url: `/api/v1/conferences/${room}?call=${encodeURIComponent(bobs)}`, headers: as('bob') })).json().participants
+    expect(marked.map((p: { number: string; you?: boolean }) => `${p.number} ${p.you ?? false}`)).toEqual(['101 false', '102 true', '019*****24 false'])
     const read = async (user: string) => (await app.inject({ method: 'GET', url: `/api/v1/conferences/${room}`, headers: as(user) })).body
     const numbers = async (user: string) => JSON.parse(await read(user)).participants.map((p: { number: string }) => p.number)
     expect(await numbers('alice')).toEqual(['101', '102', '0199000024'])
     expect(await numbers('bob')).toEqual(['101', '102', '019*****24'])
+    expect(await read('bob')).not.toContain('"you"')
     // Nowhere in what Bob reads, its ids included (third review 8b, n°2).
     expect(await read('bob')).not.toContain('99000024')
     // Someone come in between the two reads of LiveKit, not proved of the tenant: masked too.

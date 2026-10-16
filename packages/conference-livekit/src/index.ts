@@ -409,9 +409,16 @@ export class LiveKitConferenceBridge implements ConferenceBridgeProvider {
   }
 
   /** Participants currently in the room (web and phone), numbers filtered by the privacy setting. */
-  async listParticipants(meetingId: string): Promise<ConferenceParticipant[]> {
+  /**
+   * The participants of a room. `you`: the SIP Call-ID of the reader's own call (sip.callIDFull), whose participant is
+   * marked `you`: it tells nothing of the others' calls, and nothing to whoever does not have that Call-ID already.
+   */
+  async listParticipants(meetingId: string, { you }: { you?: string } = {}): Promise<ConferenceParticipant[]> {
     const res = await this.api.call<{ participants?: LkParticipant[] }>('livekit.RoomService', 'ListParticipants', { room: meetingId })
-    return (res.participants ?? []).map(p => this.toParticipant(meetingId, p))
+    return (res.participants ?? []).map(p => {
+      const participant = this.toParticipant(meetingId, p)
+      return you && p.attributes?.['sip.callIDFull'] === you ? { ...participant, you: true } : participant
+    })
   }
 
   /** Maps a LiveKit webhook event to a Twake conference event, or undefined for events we do not expose. */
@@ -432,13 +439,16 @@ export class LiveKitConferenceBridge implements ConferenceBridgeProvider {
     const mode = this.config.numberPrivacy ?? 'show'
     const number = phone && raw && mode !== 'hide' ? (mode === 'mask' ? maskNumber(raw) : raw) : undefined
     const muted = (p.tracks ?? []).some(t => (t.type === 'AUDIO' || t.type === 0) && t.muted)
+    // In milliseconds when LiveKit says so (joined_at_ms), else its seconds (joined_at); 64-bit numbers come as strings.
+    const joinedAt = Number(p.joined_at_ms ?? 0) || Number(p.joined_at ?? 0) * 1000
     return {
       id: participantId(room, p.identity),
       meetingId: room,
       kind: phone ? 'phone' : 'web',
       ...(p.name ? { displayName: phone && mode !== 'show' ? this.display(raw ?? p.name) : p.name } : {}),
       ...(number ? { number } : {}),
-      muted
+      muted,
+      ...(joinedAt > 0 ? { joinedAt } : {})
     }
   }
 }
@@ -470,4 +480,6 @@ interface LkParticipant {
   kind?: number | string
   attributes?: Record<string, string>
   tracks?: { sid?: string; type?: string | number; muted?: boolean }[]
+  joined_at?: string | number
+  joined_at_ms?: string | number
 }

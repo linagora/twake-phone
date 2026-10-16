@@ -451,6 +451,13 @@ export interface ConferenceParticipant {
   /** Honours the tenant privacy setting: show | mask | hide. */
   number?: string
   muted: boolean
+  /**
+   * When it came into the room, in milliseconds, by the clock of the conference server: to compare with another
+   * participant's only, never with the browser's clock.
+   */
+  joinedAt?: number
+  /** The reader's own call (step 8b, GET /conferences/:id?call= with its Call-ID): who came after it is news to them. */
+  you?: boolean
 }
 
 export type TelephonyEvent =
