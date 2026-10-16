@@ -46,8 +46,10 @@ const webhookCall = (userId: string, extension: string, call: Call, ended: boole
 /**
  * What the subscribers hear of a provider's event about `userId` (who holds `extension`): a call that rings, is
  * answered or ends for them (and, ended unanswered on their side without their declining it, a missed call: what
- * their Recents shows as missed); nothing for the rest (a wake, a call taken by a colleague, an alert). Each call
- * event once per call, person and type, whichever Gateway tells it (eventId).
+ * their Recents shows as missed); a call of their ring group that rang them and a colleague answered ends for them
+ * (`answered_elsewhere`: the `call.ringing` they had is closed); nothing for the rest (a wake, a call taken by a
+ * colleague that never rang them, an alert). Each call event once per call, person and type, whichever Gateway
+ * tells it (eventId).
  */
 export const webhookEventsFor = (tenantId: string, userId: string, extension: string, event: TelephonyEvent): PublishedWebhookEvent[] => {
   const at = event.timestamp
@@ -69,6 +71,12 @@ export const webhookEventsFor = (tenantId: string, userId: string, extension: st
       // As the history counts it (isMissed): inbound, never answered, not declined.
       if (call.direction === 'inbound' && !call.connectedAt && call.state === 'missed') out.push({ ...base('call.missed', call.id), type: 'call.missed', call: ended })
       return out
+    }
+    case 'call.taken': {
+      if (!event.payload.rang) return []
+      const { call } = event.payload
+      const ended = webhookCall(userId, extension, { ...call, endedAt: call.endedAt ?? at }, true)
+      return [{ ...base('call.ended', call.id), type: 'call.ended', call: { ...ended, outcome: 'answered_elsewhere' } }]
     }
     default:
       return []

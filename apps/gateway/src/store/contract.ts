@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import type { HistoryEntry, Store, WebhookSubscriptionRecord } from './types.js'
+import { WEBHOOK_STATE_ROLE, type HistoryEntry, type Store, type WebhookSubscriptionRecord } from './types.js'
 import { EMPTY_OUTBOUND, outboundVersion } from '../outbound.js'
 
 const entry = (over: Partial<HistoryEntry>): HistoryEntry => ({
@@ -499,10 +499,14 @@ export const storeContract = (name: string, make: () => Promise<Store>) =>
       events: ['call.missed'],
       enabled: true,
       secretEnc: 'enc',
+      failures: 0,
       createdAt: '2026-10-16T10:00:00.000Z',
       updatedAt: '2026-10-16T10:00:00.000Z',
       ...over
     })
+    /** Caps that leave everything to one claim (the tests of the queue itself). */
+    const OPEN = { perSubscription: 100, perTenant: 100, maxAttempts: 9 }
+    const t = (sec: number) => new Date(Date.parse('2026-10-16T10:00:00.000Z') + sec * 1000).toISOString()
 
     it('keeps the webhook subscriptions and allowed domains of each tenant apart, up to a number per tenant', async () => {
       const s = await make()
@@ -513,8 +517,10 @@ export const storeContract = (name: string, make: () => Promise<Store>) =>
       expect((await s.listWebhookSubscriptions('A')).map(w => w.id)).toEqual(['wh_0000000000000001', 'wh_0000000000000002'])
       expect(await s.getWebhookSubscription('A', 'wh_0000000000000001')).toEqual(subscription({ description: 'CRM', createdBy: 'alice' }))
       expect(await s.getWebhookSubscription('B', 'wh_0000000000000001')).toBeNull()
-      expect(await s.updateWebhookSubscription(subscription({ url: 'https://crm.example.org/v2', updatedAt: '2026-10-16T11:00:00.000Z' }))).toBe(true)
-      expect((await s.getWebhookSubscription('A', 'wh_0000000000000001'))?.url).toBe('https://crm.example.org/v2')
+      // What an administrator sets: never the secret (a renewal is its own write).
+      expect(await s.updateWebhookSubscription(subscription({ url: 'https://crm.example.org/v2', secretEnc: 'stale', updatedAt: '2026-10-16T11:00:00.000Z' }))).toBe(true)
+      const updated = await s.getWebhookSubscription('A', 'wh_0000000000000001')
+      expect([updated?.url, updated?.secretEnc, updated?.description, updated?.updatedAt]).toEqual(['https://crm.example.org/v2', 'enc', undefined, '2026-10-16T11:00:00.000Z'])
       expect(await s.updateWebhookSubscription(subscription({ tenantId: 'B' }))).toBe(false)
       expect(await s.deleteWebhookSubscription('B', 'wh_0000000000000001')).toBe(false)
       expect(await s.deleteWebhookSubscription('A', 'wh_0000000000000002')).toBe(true)
@@ -529,7 +535,26 @@ export const storeContract = (name: string, make: () => Promise<Store>) =>
       await s.close()
     })
 
-    it('queues an event once per subscription that takes it, enabled, whoever queues it again', async () => {
+    it('renews a secret in one write, the one before kept until a date, and hands both to the claimer meanwhile', async () => {
+      const s = await make()
+      await s.addWebhookSubscription(subscription({}), 20)
+      expect(await s.renewWebhookSecret('B', 'wh_0000000000000001', 'enc2', t(3600), t(0))).toBe(false)
+      // Two renewals at once: both written, the second keeps the first as the one before.
+      await Promise.all([s.renewWebhookSecret('A', 'wh_0000000000000001', 'enc2', t(3600), t(0)), s.updateWebhookSubscription(subscription({ description: 'CRM', updatedAt: t(0) }))])
+      expect(await s.renewWebhookSecret('A', 'wh_0000000000000001', 'enc3', t(3601), t(1))).toBe(true)
+      const w = await s.getWebhookSubscription('A', 'wh_0000000000000001')
+      expect([w?.secretEnc, w?.secretPrevEnc, w?.secretPrevUntil, w?.description]).toEqual(['enc3', 'enc2', t(3601), 'CRM'])
+      await s.enqueueWebhookEvent('A', 'evt_1', 'call.missed', '{}', t(0))
+      await s.enqueueWebhookEvent('A', 'evt_2', 'call.missed', '{}', t(0))
+      const [first] = await s.claimWebhookDeliveries(t(10), t(70), 1, OPEN)
+      expect([first?.secretEnc, first?.secretPrevEnc]).toEqual(['enc3', 'enc2'])
+      // Past its date, the one before signs no more.
+      const [later] = await s.claimWebhookDeliveries(t(3602), t(3662), 1, OPEN)
+      expect([later?.secretEnc, later?.secretPrevEnc]).toEqual(['enc3', undefined])
+      await s.close()
+    })
+
+    it('queues an event once per subscription that takes it, enabled, whoever queues it again; past the pending cap, recorded failed', async () => {
       const s = await make()
       await s.addWebhookSubscription(subscription({}), 20)
       await s.addWebhookSubscription(subscription({ id: 'wh_0000000000000002', events: ['call.missed', 'call.ended'] }), 20)
@@ -550,47 +575,137 @@ export const storeContract = (name: string, make: () => Promise<Store>) =>
       const test = await s.enqueueWebhookDelivery('A', 'wh_0000000000000003', 'evt_t', 'webhook.test', '{}', at)
       expect([test?.subscriptionId, test?.eventType, test?.status]).toEqual(['wh_0000000000000003', 'webhook.test', 'pending'])
       expect(await s.enqueueWebhookDelivery('B', 'wh_0000000000000003', 'evt_u', 'webhook.test', '{}', at)).toBeNull()
+      // Two pending at most: wh_1 and wh_2 have one; the second event fills them, the third is recorded failed.
+      expect(await s.enqueueWebhookEvent('A', 'evt_3', 'call.missed', '{}', at, { maxPending: 2 })).toBe(2)
+      expect(await s.enqueueWebhookEvent('A', 'evt_4', 'call.missed', '{}', at, { maxPending: 2 })).toBe(0)
+      const [full] = await s.listWebhookDeliveries('A', 'wh_0000000000000001', { status: 'failed' })
+      expect([full?.eventId, full?.lastError, full?.nextAttemptAt]).toEqual(['evt_4', 'backlog', undefined])
       await s.close()
     })
 
     it('hands each due delivery to one claimer at a time, until its lease ends, and keeps the outcome of the one that holds it', async () => {
       const s = await make()
       await s.addWebhookSubscription(subscription({}), 20)
-      const t = (sec: number) => new Date(Date.parse('2026-10-16T10:00:00.000Z') + sec * 1000).toISOString()
       await s.enqueueWebhookEvent('A', 'evt_1', 'call.missed', '{"n":1}', t(0))
       await s.enqueueWebhookEvent('A', 'evt_2', 'call.missed', '{"n":2}', t(5))
-      expect(await s.claimWebhookDeliveries(t(-1), t(59), 10)).toEqual([])
-      const [first, ...rest] = await s.claimWebhookDeliveries(t(1), t(61), 10)
+      expect(await s.claimWebhookDeliveries(t(-1), t(59), 10, OPEN)).toEqual([])
+      const [first, ...rest] = await s.claimWebhookDeliveries(t(1), t(61), 10, OPEN)
       expect(rest).toEqual([])
-      expect([first?.eventId, first?.attempts, first?.url, first?.secretEnc, first?.lastAttemptAt]).toEqual(['evt_1', 1, 'https://crm.example.org/in', 'enc', t(1)])
+      expect([first?.eventId, first?.attempts, first?.url, first?.secretEnc, first?.secretPrevEnc, first?.lastAttemptAt]).toEqual(['evt_1', 1, 'https://crm.example.org/in', 'enc', undefined, t(1)])
       // Held: not handed again before its lease ends; the other one once due.
-      expect((await s.claimWebhookDeliveries(t(10), t(70), 10)).map(d => d.eventId)).toEqual(['evt_2'])
-      // Failed, due again later; an outcome with another claim is ignored.
-      expect(await s.completeWebhookDelivery(first!.id, 'not-the-claim', { delivered: true, at: t(2), status: 204 })).toBe(false)
-      expect(await s.completeWebhookDelivery(first!.id, first!.claim, { delivered: false, at: t(2), status: 500, error: 'http', retryAt: t(30) })).toBe(true)
-      expect(await s.completeWebhookDelivery(first!.id, first!.claim, { delivered: true, at: t(3), status: 204 })).toBe(false)
+      expect((await s.claimWebhookDeliveries(t(10), t(70), 10, OPEN)).map(d => d.eventId)).toEqual(['evt_2'])
+      // Failed, due again later, a failure counted for the subscription; an outcome with another claim is ignored.
+      expect(await s.completeWebhookDelivery(first!.id, 'not-the-claim', { delivered: true, at: t(2), status: 204 })).toBeNull()
+      expect(await s.completeWebhookDelivery(first!.id, first!.claim, { delivered: false, at: t(2), status: 500, error: 'http', retryAt: t(30) })).toEqual({ failures: 1, failingSince: t(2) })
+      expect(await s.completeWebhookDelivery(first!.id, first!.claim, { delivered: true, at: t(3), status: 204 })).toBeNull()
       let d = (await s.listWebhookDeliveries('A', 'wh_0000000000000001', { status: 'pending' })).find(x => x.eventId === 'evt_1')
       expect([d?.status, d?.attempts, d?.lastStatus, d?.lastError, d?.nextAttemptAt]).toEqual(['pending', 1, 500, 'http', t(30)])
-      const again = await s.claimWebhookDeliveries(t(30), t(90), 10)
+      const again = await s.claimWebhookDeliveries(t(30), t(90), 10, OPEN)
       expect(again.map(x => [x.eventId, x.attempts])).toEqual([['evt_1', 2]])
-      expect(await s.completeWebhookDelivery(again[0]!.id, again[0]!.claim, { delivered: true, at: t(31), status: 204 })).toBe(true)
+      // Delivered: the subscription's failures start afresh.
+      expect(await s.completeWebhookDelivery(again[0]!.id, again[0]!.claim, { delivered: true, at: t(31), status: 204 })).toEqual({ failures: 0 })
       d = (await s.listWebhookDeliveries('A', 'wh_0000000000000001', { status: 'delivered' }))[0]
       expect([d?.eventId, d?.status, d?.lastStatus, d?.lastError, d?.deliveredAt, d?.nextAttemptAt]).toEqual(['evt_1', 'delivered', 204, undefined, t(31), undefined])
       // A lease that ended without an outcome (the Gateway stopped): handed again, counted as another attempt.
-      const taken = await s.claimWebhookDeliveries(t(71), t(131), 10)
+      const taken = await s.claimWebhookDeliveries(t(71), t(131), 10, OPEN)
       expect(taken.map(x => [x.eventId, x.attempts])).toEqual([['evt_2', 2]])
       // Failed for good: no retry.
-      expect(await s.completeWebhookDelivery(taken[0]!.id, taken[0]!.claim, { delivered: false, at: t(72), error: 'timeout' })).toBe(true)
+      expect(await s.completeWebhookDelivery(taken[0]!.id, taken[0]!.claim, { delivered: false, at: t(72), error: 'timeout' })).toEqual({ failures: 1, failingSince: t(72) })
       d = (await s.listWebhookDeliveries('A', 'wh_0000000000000001', { status: 'failed' }))[0]
       expect([d?.eventId, d?.status, d?.lastError, d?.lastStatus, d?.nextAttemptAt]).toEqual(['evt_2', 'failed', 'timeout', undefined, undefined])
-      expect(await s.claimWebhookDeliveries(t(1000), t(1060), 10)).toEqual([])
+      expect(await s.claimWebhookDeliveries(t(1000), t(1060), 10, OPEN)).toEqual([])
+      // One whose last attempt never came back (its lease lapsed, its attempts used): failed, never taken again.
+      await s.enqueueWebhookEvent('A', 'evt_3', 'call.missed', '{}', t(1000))
+      const [last] = await s.claimWebhookDeliveries(t(1001), t(1061), 10, { ...OPEN, maxAttempts: 1 })
+      expect(last?.eventId).toBe('evt_3')
+      expect(await s.claimWebhookDeliveries(t(1100), t(1160), 10, { ...OPEN, maxAttempts: 1 })).toEqual([])
+      d = (await s.listWebhookDeliveries('A', 'wh_0000000000000001')).find(x => x.eventId === 'evt_3')
+      expect([d?.status, d?.lastError, d?.attempts]).toEqual(['failed', 'abandoned', 1])
+      await s.close()
+    })
+
+    it('shares what is sent at once between tenants and subscriptions: each within its cap, each tenant in turn, whatever the claimers', async () => {
+      const s = await make()
+      await s.addWebhookSubscription(subscription({}), 20)
+      await s.addWebhookSubscription(subscription({ id: 'wh_0000000000000002', events: ['call.ended'] }), 20)
+      await s.addWebhookSubscription(subscription({ tenantId: 'B', id: 'wh_0000000000000003' }), 20)
+      // Tenant A queued 10 events (5 for each of its subscriptions, in turn) before tenant B queued 2.
+      for (let i = 1; i <= 5; i++) {
+        await s.enqueueWebhookEvent('A', `evt_m${i}`, 'call.missed', '{}', t(i))
+        await s.enqueueWebhookEvent('A', `evt_e${i}`, 'call.ended', '{}', t(i + 0.5))
+      }
+      for (let i = 1; i <= 2; i++) await s.enqueueWebhookEvent('B', `evt_b${i}`, 'call.missed', '{}', t(10 + i))
+      const caps = { perSubscription: 2, perTenant: 3, maxAttempts: 9 }
+      const name = (d: { subscriptionId: string; eventId: string }) => `${d.subscriptionId.slice(-1)}:${d.eventId}`
+      // Two at a time: A's earliest and B's earliest, not A's two earliest.
+      const first = await s.claimWebhookDeliveries(t(20), t(80), 2, caps)
+      expect(first.map(name).sort()).toEqual(['1:evt_m1', '3:evt_b1'])
+      // Then what is left within the caps: A three at most in all, each of its subscriptions two; B the rest.
+      const second = await s.claimWebhookDeliveries(t(20), t(80), 10, caps)
+      expect(second.map(name).sort()).toEqual(['1:evt_m2', '2:evt_e1', '3:evt_b2'])
+      expect(await s.claimWebhookDeliveries(t(20), t(80), 10, caps)).toEqual([])
+      // One of A's done: one more of A (three at most), its earliest due within the caps.
+      const done = first.find(d => d.tenantId === 'A')!
+      await s.completeWebhookDelivery(done.id, done.claim, { delivered: true, at: t(21), status: 204 })
+      expect((await s.claimWebhookDeliveries(t(22), t(82), 10, caps)).map(name)).toEqual(['2:evt_e2'])
+      await s.close()
+    })
+
+    it('never lets two claimers at once take more than a cap', async () => {
+      const s = await make()
+      await s.addWebhookSubscription(subscription({}), 20)
+      for (let i = 1; i <= 6; i++) await s.enqueueWebhookEvent('A', `evt_${i}`, 'call.missed', '{}', t(i))
+      const caps = { perSubscription: 2, perTenant: 8, maxAttempts: 9 }
+      const both = await Promise.all([s.claimWebhookDeliveries(t(10), t(70), 10, caps), s.claimWebhookDeliveries(t(10), t(70), 10, caps), s.claimWebhookDeliveries(t(10), t(70), 10, caps)])
+      expect(both.flat().map(d => d.eventId).sort()).toEqual(['evt_1', 'evt_2'])
+      await s.close()
+    })
+
+    it('leaves the deliveries of a paused subscription waiting, and disables one that kept failing', async () => {
+      const s = await make()
+      await s.addWebhookSubscription(subscription({}), 20)
+      await s.addWebhookSubscription(subscription({ tenantId: 'B', id: 'wh_0000000000000002' }), 20)
+      await s.enqueueWebhookEvent('A', 'evt_1', 'call.missed', '{}', t(0))
+      await s.enqueueWebhookEvent('A', 'evt_2', 'call.missed', '{}', t(0))
+      await s.pauseWebhookSubscription('B', 'wh_0000000000000001', t(100))
+      expect(await s.getWebhookSubscription('A', 'wh_0000000000000001')).toEqual(subscription({}))
+      await s.pauseWebhookSubscription('A', 'wh_0000000000000001', t(100))
+      expect((await s.getWebhookSubscription('A', 'wh_0000000000000001'))?.pausedUntil).toBe(t(100))
+      expect(await s.claimWebhookDeliveries(t(50), t(110), 10, OPEN)).toEqual([])
+      const [one] = await s.claimWebhookDeliveries(t(100), t(160), 1, OPEN)
+      // A failure keeps the pause written; a delivery lifts it.
+      expect(await s.completeWebhookDelivery(one!.id, one!.claim, { delivered: false, at: t(101), error: 'timeout', retryAt: t(200) })).toEqual({ failures: 1, failingSince: t(101) })
+      expect((await s.getWebhookSubscription('A', 'wh_0000000000000001'))?.pausedUntil).toBe(t(100))
+      expect(await s.disableFailingWebhookSubscription('B', 'wh_0000000000000001', t(102))).toBe(false)
+      expect(await s.disableFailingWebhookSubscription('A', 'wh_0000000000000001', t(102))).toBe(true)
+      expect(await s.disableFailingWebhookSubscription('A', 'wh_0000000000000001', t(103))).toBe(false)
+      const w = await s.getWebhookSubscription('A', 'wh_0000000000000001')
+      expect([w?.enabled, w?.disabledReason, w?.failures, w?.updatedAt]).toEqual([false, 'failing', 1, t(102)])
+      expect((await s.listWebhookDeliveries('A', 'wh_0000000000000001', { status: 'pending' })).length).toBe(0)
+      expect(await s.claimWebhookDeliveries(t(300), t(360), 10, OPEN)).toEqual([])
+      // Enabled again by an administrator: afresh.
+      await s.updateWebhookSubscription(subscription({ enabled: true, updatedAt: t(400) }))
+      const again = await s.getWebhookSubscription('A', 'wh_0000000000000001')
+      expect([again?.enabled, again?.disabledReason, again?.failures, again?.failingSince, again?.pausedUntil]).toEqual([true, undefined, 0, undefined, undefined])
+      await s.close()
+    })
+
+    it('counts the tests and replays asked of a subscription, whoever asks, a number per window', async () => {
+      const s = await make()
+      await s.addWebhookSubscription(subscription({}), 20)
+      await s.addWebhookSubscription(subscription({ id: 'wh_0000000000000002' }), 20)
+      expect(await s.takeWebhookSend('A', 'wh_0000000000000001', t(0), 2, 60_000)).toBe(true)
+      expect(await s.takeWebhookSend('A', 'wh_0000000000000001', t(1), 2, 60_000)).toBe(true)
+      expect(await s.takeWebhookSend('A', 'wh_0000000000000001', t(2), 2, 60_000)).toBe(false)
+      expect(await s.takeWebhookSend('A', 'wh_0000000000000002', t(2), 2, 60_000)).toBe(true)
+      expect(await s.takeWebhookSend('B', 'wh_0000000000000002', t(2), 2, 60_000)).toBe(false)
+      expect(await s.takeWebhookSend('A', 'wh_0000000000000001', t(60.5), 2, 60_000)).toBe(true)
       await s.close()
     })
 
     it('replays a delivery that is over, lists the log a page at a time, and purges it once old', async () => {
       const s = await make()
       await s.addWebhookSubscription(subscription({}), 20)
-      const t = (sec: number) => new Date(Date.parse('2026-10-16T10:00:00.000Z') + sec * 1000).toISOString()
       for (let i = 1; i <= 5; i++) await s.enqueueWebhookEvent('A', `evt_${i}`, 'call.missed', `{"n":${i}}`, t(i))
       const page1 = await s.listWebhookDeliveries('A', 'wh_0000000000000001', { limit: 2 })
       expect(page1.map(d => d.eventId)).toEqual(['evt_5', 'evt_4'])
@@ -599,7 +714,7 @@ export const storeContract = (name: string, make: () => Promise<Store>) =>
       const target = page2[0]!
       expect(await s.replayWebhookDelivery('A', 'wh_0000000000000001', target.id, t(10))).toBe('pending')
       // The three due at t(3) delivered (evt_1 to evt_3); evt_3 replayed.
-      const claimed = await s.claimWebhookDeliveries(t(3), t(63), 10)
+      const claimed = await s.claimWebhookDeliveries(t(3), t(63), 10, OPEN)
       expect(claimed.map(d => d.eventId).sort()).toEqual(['evt_1', 'evt_2', 'evt_3'])
       for (const c of claimed) await s.completeWebhookDelivery(c.id, c.claim, { delivered: true, at: t(4), status: 200 })
       const replayed = await s.replayWebhookDelivery('A', 'wh_0000000000000001', target.id, t(100))
@@ -619,26 +734,68 @@ export const storeContract = (name: string, make: () => Promise<Store>) =>
       await s.updateWebhookSubscription(subscription({ enabled: false }))
       const [d] = await s.listWebhookDeliveries('A', 'wh_0000000000000001')
       expect([d?.status, d?.lastError]).toEqual(['failed', 'disabled'])
-      expect(await s.claimWebhookDeliveries('2026-10-16T11:00:00.000Z', '2026-10-16T11:01:00.000Z', 10)).toEqual([])
+      expect(await s.claimWebhookDeliveries('2026-10-16T11:00:00.000Z', '2026-10-16T11:01:00.000Z', 10, OPEN)).toEqual([])
       expect(await s.enqueueWebhookEvent('A', 'evt_2', 'call.missed', '{}', '2026-10-16T10:00:00.000Z')).toBe(0)
+      // A delivery queued for it (a replay asked before) is not taken while it is disabled.
+      expect(await s.replayWebhookDelivery('A', 'wh_0000000000000001', d!.id, '2026-10-16T10:30:00.000Z')).not.toBeNull()
+      expect(await s.claimWebhookDeliveries('2026-10-16T11:00:00.000Z', '2026-10-16T11:01:00.000Z', 10, OPEN)).toEqual([])
       await s.deleteWebhookSubscription('A', 'wh_0000000000000001')
       expect(await s.listWebhookDeliveries('A', 'wh_0000000000000001')).toEqual([])
       await s.close()
     })
 
-    it('keeps what the subscribers were told of a trunk or a person, and says what it was only to the one write that changed it', async () => {
+    it('erases what was sent about a person and what was told of their presence, not what is still owed nor anyone else', async () => {
       const s = await make()
-      expect(await s.setWebhookState('A', 'trunk:main', 'up', '2026-10-16T10:00:00.000Z')).toBeUndefined()
-      expect(await s.setWebhookState('A', 'trunk:main', 'up', '2026-10-16T10:00:30.000Z')).toBeNull()
-      expect(await s.setWebhookState('A', 'trunk:main', 'down', '2026-10-16T10:01:00.000Z')).toBe('up')
-      expect(await s.setWebhookState('A', 'trunk:main', 'down', '2026-10-16T10:01:00.000Z')).toBeNull()
-      expect(await s.setWebhookState('B', 'trunk:main', 'down', '2026-10-16T10:01:00.000Z')).toBeUndefined()
-      expect(await s.setWebhookState('A', 'trunk:main', 'degraded', '2026-10-16T10:02:00.000Z')).toBe('down')
-      expect(await s.setWebhookState('A', 'presence:jdupont', 'busy', '2026-10-16T10:02:00.000Z')).toBeUndefined()
-      // Two Gateways that heard the same change at once: one of them only finds it new.
-      const both = await Promise.all([s.setWebhookState('A', 'presence:jdupont', 'available', '2026-10-16T10:03:00.000Z'), s.setWebhookState('A', 'presence:jdupont', 'available', '2026-10-16T10:03:00.020Z')])
-      expect(both.filter(x => x === 'busy')).toHaveLength(1)
-      expect(both.filter(x => x === null)).toHaveLength(1)
+      await s.addWebhookSubscription(subscription({ events: ['call.missed', 'presence.changed'] }), 20)
+      await s.enqueueWebhookEvent('A', 'evt_1', 'call.missed', '{"user":"jdupont"}', t(0), { subjectUser: 'jdupont' })
+      await s.enqueueWebhookEvent('A', 'evt_2', 'call.missed', '{"user":"jdupont"}', t(1), { subjectUser: 'jdupont' })
+      await s.enqueueWebhookEvent('A', 'evt_3', 'call.missed', '{"user":"amartin"}', t(2), { subjectUser: 'amartin' })
+      const claimed = await s.claimWebhookDeliveries(t(0.5), t(60), 10, OPEN)
+      expect(claimed.map(d => d.eventId)).toEqual(['evt_1'])
+      await s.completeWebhookDelivery(claimed[0]!.id, claimed[0]!.claim, { delivered: true, at: t(1), status: 204 })
+      expect(await s.takeWebhookLease(WEBHOOK_STATE_ROLE, 'gw_1', 60_000)).toBe(true)
+      for (const user of ['jdupont', 'amartin']) await s.setWebhookState({ tenantId: 'A', subject: `presence:${user}`, state: 'busy', at: t(3), holder: 'gw_1' }, () => null)
+      expect(await s.eraseWebhookSubject('B', 'jdupont')).toBe(0)
+      expect(await s.eraseWebhookSubject('A', 'jdupont')).toBe(1)
+      expect((await s.listWebhookDeliveries('A', 'wh_0000000000000001')).map(d => d.eventId)).toEqual(['evt_3', 'evt_2'])
+      // Told nothing of jdupont any more: the same status is a change again; amartin's is not.
+      expect(await s.setWebhookState({ tenantId: 'A', subject: 'presence:jdupont', state: 'busy', at: t(4), holder: 'gw_1' }, () => null)).toEqual({ previous: undefined, queued: 0 })
+      expect(await s.setWebhookState({ tenantId: 'A', subject: 'presence:amartin', state: 'busy', at: t(4), holder: 'gw_1' }, () => null)).toBeNull()
+      await s.close()
+    })
+
+    it('tells a change of state once, from the holder of the lease only, never one older than what was told, its event queued with it', async () => {
+      const s = await make()
+      await s.addWebhookSubscription(subscription({ events: ['trunk.degraded', 'presence.changed'] }), 20)
+      const at = (sec: number) => new Date(Date.now() + sec * 1000).toISOString()
+      const change = (subject: string, state: string, sec: number, holder = 'gw_1') => ({ tenantId: 'A', subject, state, at: at(sec), holder })
+      const event = (id: string) => (previous: string | undefined) => ({ id, type: 'trunk.degraded' as const, body: JSON.stringify({ id, previous: previous ?? null }) })
+      // Nobody holds the lease: nothing written.
+      expect(await s.setWebhookState(change('trunk:main', 'up', 0), event('evt_0'))).toBeNull()
+      expect(await s.takeWebhookLease(WEBHOOK_STATE_ROLE, 'gw_1', 60_000)).toBe(true)
+      expect(await s.takeWebhookLease(WEBHOOK_STATE_ROLE, 'gw_2', 60_000)).toBe(false)
+      expect(await s.takeWebhookLease(WEBHOOK_STATE_ROLE, 'gw_1', 60_000)).toBe(true)
+      expect(await s.setWebhookState(change('trunk:main', 'up', 1, 'gw_2'), event('evt_0'))).toBeNull()
+      expect(await s.setWebhookState(change('trunk:main', 'up', 1), () => null)).toEqual({ previous: undefined, queued: 0 })
+      expect(await s.setWebhookState(change('trunk:main', 'up', 2), event('evt_1'))).toBeNull()
+      expect(await s.setWebhookState(change('trunk:main', 'down', 3), event('evt_2'))).toEqual({ previous: 'up', queued: 1 })
+      // Older than what was told (a change heard late): refused, whatever it says.
+      expect(await s.setWebhookState(change('trunk:main', 'degraded', 2.5), event('evt_3'))).toBeNull()
+      expect(await s.setWebhookState(change('trunk:main', 'down', 4), event('evt_4'))).toBeNull()
+      expect(await s.setWebhookState({ ...change('trunk:main', 'down', 3), tenantId: 'B' }, event('evt_5'))).toEqual({ previous: undefined, queued: 0 })
+      expect(await s.setWebhookState(change('trunk:main', 'degraded', 5), event('evt_6'))).toEqual({ previous: 'down', queued: 1 })
+      const log = await s.listWebhookDeliveries('A', 'wh_0000000000000001')
+      expect(log.map(d => [d.eventId, d.body])).toEqual([
+        ['evt_6', '{"id":"evt_6","previous":"down"}'],
+        ['evt_2', '{"id":"evt_2","previous":"up"}']
+      ])
+      // Two writes of the same change at once: one only finds it new.
+      const both = await Promise.all([s.setWebhookState(change('presence:jdupont', 'busy', 6), () => null), s.setWebhookState(change('presence:jdupont', 'busy', 6.02), () => null)])
+      expect(both.filter(x => x !== null)).toHaveLength(1)
+      // States told long ago go with the purge.
+      await s.purgeWebhookDeliveries(at(5.5))
+      expect(await s.setWebhookState(change('trunk:main', 'degraded', 7), () => null)).toEqual({ previous: undefined, queued: 0 })
+      expect(Math.abs(Date.parse(await s.clock()) - Date.now())).toBeLessThan(60_000)
       await s.close()
     })
   })

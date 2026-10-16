@@ -1,16 +1,18 @@
 // A subscriber of TwakePhone's webhooks for the end-to-end tests (step 10a): it receives the deliveries on the loopback
 // and checks each signature as an integrator would, from the documentation only (not with the Gateway's code):
-// X-TwakePhone-Signature is `t=<unix seconds>,v1=<hex HMAC-SHA256 of "<t>.<raw body>" with the secret>`.
+// X-TwakePhone-Signature is `t=<unix seconds>,v1=<hex HMAC-SHA256 of "<t>.<raw body>" with the secret>`, with a
+// second `v1` for a day after a new secret (the one before): one of them matching is enough.
 import { createHmac, timingSafeEqual } from 'node:crypto'
 import { createServer } from 'node:http'
 
 /** Whether `header` signs `body` with `secret`, at most `toleranceSec` ago (a replayed old delivery is refused). */
 export const verifySignature = (secret, header, body, toleranceSec = 300, nowSec = Math.floor(Date.now() / 1000)) => {
-  const parts = Object.fromEntries(String(header ?? '').split(',').map(kv => kv.split('=', 2)))
-  const t = Number(parts.t)
-  if (!Number.isInteger(t) || !/^[0-9a-f]{64}$/.test(parts.v1 ?? '') || Math.abs(nowSec - t) > toleranceSec) return false
+  if (typeof header !== 'string') return false
+  const parts = header.split(',').map(kv => kv.trim().split('='))
+  const t = Number(parts.find(([k]) => k === 't')?.[1])
+  if (!Number.isInteger(t) || Math.abs(nowSec - t) > toleranceSec) return false
   const expected = createHmac('sha256', secret).update(`${t}.${body}`).digest()
-  return timingSafeEqual(expected, Buffer.from(parts.v1, 'hex'))
+  return parts.some(([k, v]) => k === 'v1' && /^[0-9a-f]{64}$/.test(v ?? '') && timingSafeEqual(expected, Buffer.from(v, 'hex')))
 }
 
 /**

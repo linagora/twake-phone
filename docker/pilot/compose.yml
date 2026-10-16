@@ -238,6 +238,9 @@ services:
       # Webhooks (step 10a, ADR 0020): the internal networks a webhook may reach (CIDRs, comma-separated). None by
       # default: a domain that resolves to a private address is refused at each delivery.
       WEBHOOK_PRIVATE_NETWORKS:
+      # The platform's public addresses a webhook must never reach, even inside the networks above (its entry point,
+      # services that trust this host's address); the addresses of this host's own interfaces are always refused.
+      WEBHOOK_DENY_NETWORKS:
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/ready').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"]
       start_period: 120s

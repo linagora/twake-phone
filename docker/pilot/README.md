@@ -124,11 +124,13 @@ Un appel d'une salle part au nom du poste de la personne qui l'a demandé, avec 
 
 ## Webhooks (étape 10a)
 
-Les outils de l'organisation (CRM, supervision, ticketing) s'abonnent aux événements de la téléphonie dans l'app : Administration > Webhooks, ou par l'API (`/api/v1/webhooks`, voir le [README](../../README.md)). L'administrateur y déclare d'abord les domaines autorisés, puis l'adresse `https` de chaque outil et les événements qu'il veut (appels qui sonnent, décrochés, terminés, manqués, présences, trunk dégradé). Le secret de signature n'est montré qu'une fois. Les livraisons partent de la passerelle, qui doit donc pouvoir joindre ces adresses en HTTPS sortant.
+Les outils de l'organisation (CRM, supervision, ticketing) s'abonnent aux événements de la téléphonie dans l'app : Administration > Webhooks, ou par l'API (`/api/v1/webhooks`, voir le [README](../../README.md)). L'administrateur y déclare d'abord les domaines autorisés, puis l'adresse `https` de chaque outil et les événements qu'il veut (appels qui sonnent, décrochés, terminés, manqués, présences, trunk dégradé, trunk rétabli). Le secret de signature n'est montré qu'une fois. Les livraisons partent de la passerelle, qui doit donc pouvoir joindre ces adresses en HTTPS sortant.
 
 - `WEBHOOK_PRIVATE_NETWORKS` : les réseaux internes qu'un webhook peut joindre (CIDR séparés par des virgules, par exemple le réseau du CRM du bénéficiaire). Vide par défaut : un domaine autorisé qui résout vers une adresse privée, de boucle locale ou réservée est refusé à chaque livraison, et aucune redirection n'est suivie.
+- `WEBHOOK_DENY_NETWORKS` : les adresses publiques de la plateforme qu'un webhook ne doit jamais joindre, même dans un réseau ouvert (son point d'entrée, ce qui fait confiance à l'adresse de cet hôte). Les adresses des interfaces de la passerelle sont toujours refusées : avec `network_mode: host`, c'est l'adresse publique de l'hôte. Les domaines autorisés sont posés par l'administrateur de l'organisation : ils ne protègent pas la plateforme, ces deux variables si.
+- Un abonné qui échoue 5 fois de suite est mis en pause (30 s, puis deux fois plus, 1 h au plus), puis désactivé après une journée d'échecs, avec une alerte dans Administration > Alertes ; il occupe au plus 2 envois à la fois, et une organisation 8, sur toutes les passerelles.
 - Les secrets sont gardés chiffrés par `SECRETS_KEY` : un `.env` avec une autre clé les rend illisibles (l'écran le dit pour chaque livraison en échec), et il faut alors tirer un nouveau secret pour chaque abonnement.
-- `trunk.degraded` : la passerelle relit l'état du trunk toutes les 30 s ; un serveur qui ne répond plus aux sondes, ou l'enregistrement perdu, deux relevés de suite, est dit une fois.
+- `trunk.degraded` et `trunk.recovered` : une passerelle (celle qui tient le bail des états) relit l'état du trunk toutes les 30 s ; un serveur qui ne répond plus aux sondes, ou l'enregistrement perdu, deux relevés de suite, est dit une fois, et son retour aussi, deux relevés de suite.
 - Le journal des livraisons est gardé 30 jours ; une livraison sans réponse 2xx est retentée 8 fois, sur environ deux heures.
 
 ## Exploiter

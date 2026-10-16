@@ -6,8 +6,8 @@ import { useGateway } from '../../gateway.js'
 import type { Key } from '../../i18n/index.js'
 import { useT } from '../../i18n/useT.js'
 
-const KINDS: NonNullable<AlertFilter['kind']>[] = ['fraud-warning', 'fraud-critical', 'limit', 'rights', 'emergency', 'meet']
-const PARAMS = [...FRAUD_PARAMS, ...OUTBOUND_CAPS, ...TRUNK_OUTBOUND_CLASSES, 'premium', 'burst', 'pin-tries', 'meet-calls', 'call-diverted', 'trunk-changed']
+const KINDS: NonNullable<AlertFilter['kind']>[] = ['fraud-warning', 'fraud-critical', 'limit', 'rights', 'emergency', 'meet', 'webhook']
+const PARAMS = [...FRAUD_PARAMS, ...OUTBOUND_CAPS, ...TRUNK_OUTBOUND_CLASSES, 'premium', 'burst', 'pin-tries', 'meet-calls', 'call-diverted', 'trunk-changed', 'disabled']
 const PAGE = 25
 /** How long after an answer the first page is read again while shown: a repeat counted meanwhile is seen (review 7 n°2). */
 export const ALERTS_REFRESH_MS = 30_000
@@ -18,7 +18,8 @@ const INITIAL = { kind: ALL, param: ALL, state: 'open' }
 /**
  * What an alert's `param` names, in words: a threshold, a cap, a class of numbers, a burst of emergency calls, the
  * tries of a room's PIN by phone, the calls to the rooms at the same time, or a room's call that did not go where the
- * Gateway sent it (review 8b, n°3: its grant taken by another call, or LiveKit's trunk pointed elsewhere).
+ * Gateway sent it (review 8b, n°3: its grant taken by another call, or LiveKit's trunk pointed elsewhere), or a webhook
+ * subscription disabled after a day of failed deliveries (review 10a, n°1).
  */
 const paramKey = (alert: Pick<AdminAlert, 'kind' | 'param'>): Key | undefined => {
   if ((FRAUD_PARAMS as readonly string[]).includes(alert.param)) return `admin.fraud.${alert.param}` as Key
@@ -28,6 +29,7 @@ const paramKey = (alert: Pick<AdminAlert, 'kind' | 'param'>): Key | undefined =>
   if (alert.param === 'meet-calls') return 'admin.alert.meetCalls'
   if (alert.param === 'call-diverted') return 'admin.alert.callDiverted'
   if (alert.param === 'trunk-changed') return 'admin.alert.trunkChanged'
+  if (alert.param === 'disabled') return 'admin.alert.webhookDisabled'
   if ((TRUNK_OUTBOUND_CLASSES as readonly string[]).includes(alert.param) || alert.param === 'premium') return `admin.class.${alert.param}` as Key
   return undefined
 }

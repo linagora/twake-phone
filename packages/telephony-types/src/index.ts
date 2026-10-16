@@ -237,9 +237,10 @@ export interface TelephonyAlert {
    * `meet`: the access number of the rooms (step 8): the tries of a room's PIN by phone of all callers together
    * (`param` 'pin-tries'), or the calls to it at the same time (`param` 'meet-calls'); raised by the Gateway (review 8b,
    * n°3), a room's call whose grant another call took (`call-diverted`: ended), or LiveKit's outbound trunk found
-   * pointed elsewhere than the SIP server (`trunk-changed`: written back, the call not placed).
+   * pointed elsewhere than the SIP server (`trunk-changed`: written back, the call not placed). `webhook`: raised by
+   * the Gateway's webhook hub (step 10a), a subscription disabled after failing for a day in a row (`param` 'disabled').
    */
-  kind: 'fraud-warning' | 'fraud-critical' | 'limit' | 'rights' | 'emergency' | 'meet'
+  kind: 'fraud-warning' | 'fraud-critical' | 'limit' | 'rights' | 'emergency' | 'meet' | 'webhook'
   param: string
   scope?: 'user' | 'tenant'
   value?: number
@@ -461,10 +462,11 @@ export type TelephonyEvent =
    */
   | { type: 'call.wake'; timestamp: string; payload: { call: Call; waitSec: number; group?: string } }
   /**
-   * A call this person was woken for (`call.wake`) was answered by someone else, `by` (the extension of the
-   * colleague of the ring group who answered): it no longer waits for them, and it is no missed call of theirs.
+   * A call this person was woken for (`call.wake`), or whose ring group rang their phone (`rang`), was answered by
+   * someone else, `by` (the extension of the colleague of the ring group who answered): it no longer waits for them,
+   * and it is no missed call of theirs.
    */
-  | { type: 'call.taken'; timestamp: string; payload: { call: Call; by: string } }
+  | { type: 'call.taken'; timestamp: string; payload: { call: Call; by: string; rang?: boolean } }
   /** `extension`: the telephony identity the presence is about, so that a directory can show it next to a contact. */
   | { type: 'presence.changed'; timestamp: string; payload: { userId: UserId; extension?: string; presence: Presence } }
   | { type: 'endpoint.connected' | 'endpoint.disconnected'; timestamp: string; payload: { userId: UserId; endpoint: Endpoint } }
@@ -480,7 +482,7 @@ export type ProviderStatus = 'CONNECTED' | 'DEGRADED' | 'DISCONNECTED' | 'ERROR'
  * what a provider tells the Gateway (per extension, internal): these are per person and public, written in
  * snake_case as the plan describes them, and carry a phone number only where the event needs one.
  */
-export const WEBHOOK_EVENT_TYPES = ['call.ringing', 'call.answered', 'call.ended', 'call.missed', 'presence.changed', 'trunk.degraded'] as const
+export const WEBHOOK_EVENT_TYPES = ['call.ringing', 'call.answered', 'call.ended', 'call.missed', 'presence.changed', 'trunk.degraded', 'trunk.recovered'] as const
 export type WebhookEventType = (typeof WEBHOOK_EVENT_TYPES)[number]
 /**
  * Kept for later, never emitted yet and never asked for by a subscription: the voicemail with Wazo (step 11), the
@@ -488,8 +490,11 @@ export type WebhookEventType = (typeof WEBHOOK_EVENT_TYPES)[number]
  */
 export const WEBHOOK_EVENT_TYPES_LATER = ['voicemail.created', 'voicemail.transcribed', 'quality.alert'] as const
 
-/** How a call ended, for one of its parties. `unanswered`: placed, nobody answered (given up, no reply). */
-export type WebhookCallOutcome = 'answered' | 'missed' | 'declined' | 'failed' | 'unanswered'
+/**
+ * How a call ended, for one of its parties. `unanswered`: placed, nobody answered (given up, no reply).
+ * `answered_elsewhere`: a call of a ring group that rang this member, answered by a colleague.
+ */
+export type WebhookCallOutcome = 'answered' | 'missed' | 'declined' | 'failed' | 'unanswered' | 'answered_elsewhere'
 
 /**
  * A call as one person of the organisation lived it (`user`, at `extension`): who called whom (`from`, `to`: an
@@ -537,6 +542,18 @@ export type WebhookEvent =
         name?: string
         state: Exclude<TrunkHealth, 'up'>
         previous?: TrunkHealth
+        registration?: TrunkRegistrationState
+        servers: { address: string; state: TrunkServerState }[]
+      }
+    })
+  /** A trunk told degraded or down is up again (seen up as many reads in a row as its degradation was). */
+  | (WebhookEventBase & {
+      type: 'trunk.recovered'
+      trunk: {
+        id: string
+        name?: string
+        state: 'up'
+        previous: Exclude<TrunkHealth, 'up'>
         registration?: TrunkRegistrationState
         servers: { address: string; state: TrunkServerState }[]
       }

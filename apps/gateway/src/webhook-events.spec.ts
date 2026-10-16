@@ -48,7 +48,22 @@ describe('the public events of a call', () => {
     expect(a[0]!.id).toMatch(/^evt_[0-9a-f]{32}$/)
   })
 
-  it('tells nothing of what is internal: a call created, held, a wake, a call taken by a colleague', () => {
+  it('ends the call.ringing of a ring group member a colleague answered for (review 10a, n°4), answered elsewhere, never missed', () => {
+    const rang = webhookEventsFor('acme', 'jdupont', '102', { type: 'call.taken', timestamp: at, payload: { call: call({ state: 'ended' }), by: '103', rang: true } })
+    expect(rang).toEqual([
+      {
+        id: eventId('acme', 'call.ended', call().id, 'jdupont'),
+        type: 'call.ended',
+        occurred_at: at,
+        tenant: 'acme',
+        call: expect.objectContaining({ id: call().id, direction: 'inbound', user: 'jdupont', extension: '102', outcome: 'answered_elsewhere', ended_at: at, duration_sec: 0 })
+      }
+    ])
+    // Never a missed call: a colleague answered.
+    expect(rang.map(e => e.type)).not.toContain('call.missed')
+  })
+
+  it('tells nothing of what is internal: a call created, held, a wake, a call taken by a colleague that never rang them', () => {
     expect(webhookEventsFor('acme', 'jdupont', '102', ev('call.created', call()))).toEqual([])
     expect(webhookEventsFor('acme', 'jdupont', '102', ev('call.held', call()))).toEqual([])
     expect(webhookEventsFor('acme', 'jdupont', '102', { type: 'call.wake', timestamp: at, payload: { call: call(), waitSec: 10 } })).toEqual([])

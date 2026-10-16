@@ -1,9 +1,10 @@
-import { clampLimit, isDeclined, isMissed, type HistoryEntry, type HistoryPage, type HistoryQuery, type ConferenceRecord, type AlertRecord, type AlertQuery, type DidRecord, type OutboundHand, type OutboundRecord, type OutboundRules, ALERT_DEDUP_MS, alertKey, type ProviderRecord, type StoredAlert, type PushSaveResult, type PushSubscriptionRecord, type Store, type TrunkRecord, type UserMapping, type UserPresenceRecord, type VapidKeysRecord, type ClaimedDelivery, type WebhookAttemptResult, type WebhookDeliveryQuery, type WebhookDeliveryRecord, type WebhookSubscriptionRecord } from './types.js'
+import { clampLimit, isDeclined, isMissed, type HistoryEntry, type HistoryPage, type HistoryQuery, type ConferenceRecord, type AlertRecord, type AlertQuery, type DidRecord, type OutboundHand, type OutboundRecord, type OutboundRules, ALERT_DEDUP_MS, alertKey, type ProviderRecord, type StoredAlert, type PushSaveResult, type PushSubscriptionRecord, type Store, type TrunkRecord, type UserMapping, type UserPresenceRecord, type VapidKeysRecord, type ClaimedDelivery, type WebhookAttemptResult, type WebhookClaimCaps, type WebhookDeliveryQuery, type WebhookDeliveryRecord, type WebhookQueueOptions, type WebhookStateChange, type WebhookStateEvent, type WebhookSubscriptionRecord, WEBHOOK_STATE_ROLE } from './types.js'
 import type { WebhookEventType } from '@twake/telephony-types'
 import { randomBytes } from 'node:crypto'
 import { EMPTY_OUTBOUND, outboundVersion, staleOutbound } from '../outbound.js'
 
 const key = (...parts: string[]) => parts.join('\u0000')
+type MemoryDelivery = WebhookDeliveryRecord & { claim?: string; subjectUser?: string }
 
 export const matchesHistory = (e: HistoryEntry, q: HistoryQuery): boolean => {
   if (q.direction && e.direction !== q.direction) return false
@@ -36,8 +37,10 @@ export class MemoryStore implements Store {
   private alertId = 0
   private webhooks: WebhookSubscriptionRecord[] = []
   private webhookDomains = new Map<string, string[]>()
-  private deliveries: (WebhookDeliveryRecord & { claim?: string })[] = []
-  private webhookState = new Map<string, string>()
+  private deliveries: MemoryDelivery[] = []
+  private webhookState = new Map<string, { state: string; since: string }>()
+  private webhookSends = new Map<string, number[]>()
+  private leases = new Map<string, { holder: string; until: number }>()
 
   constructor(private readonly now: () => number = Date.now) {}
 
@@ -355,18 +358,48 @@ export class MemoryStore implements Store {
     return true
   }
 
+  private failPending(subscriptionId: string) {
+    for (const d of this.deliveries)
+      if (d.subscriptionId === subscriptionId && d.status === 'pending') {
+        d.status = 'failed'
+        d.lastError = 'disabled'
+        delete d.nextAttemptAt
+        delete d.claim
+      }
+  }
+
   async updateWebhookSubscription(record: WebhookSubscriptionRecord) {
-    const i = this.webhooks.findIndex(w => w.tenantId === record.tenantId && w.id === record.id)
-    if (i < 0) return false
-    this.webhooks[i] = structuredClone(record)
-    if (!record.enabled)
-      for (const d of this.deliveries)
-        if (d.subscriptionId === record.id && d.status === 'pending') {
-          d.status = 'failed'
-          d.lastError = 'disabled'
-          delete d.nextAttemptAt
-          delete d.claim
-        }
+    const w = this.webhooks.find(x => x.tenantId === record.tenantId && x.id === record.id)
+    if (!w) return false
+    const enabling = record.enabled && !w.enabled
+    Object.assign(w, { url: record.url, events: [...record.events], enabled: record.enabled, updatedAt: record.updatedAt })
+    if (record.description) w.description = record.description
+    else delete w.description
+    if (enabling) {
+      w.failures = 0
+      for (const k of ['disabledReason', 'failingSince', 'pausedUntil'] as const) delete w[k]
+    }
+    if (!record.enabled) this.failPending(record.id)
+    return true
+  }
+
+  async renewWebhookSecret(tenantId: string, id: string, secretEnc: string, keepPreviousUntil: string, at: string) {
+    const w = this.webhooks.find(x => x.tenantId === tenantId && x.id === id)
+    if (!w) return false
+    Object.assign(w, { secretPrevEnc: w.secretEnc, secretPrevUntil: keepPreviousUntil, secretEnc, updatedAt: at })
+    return true
+  }
+
+  async pauseWebhookSubscription(tenantId: string, id: string, until: string) {
+    const w = this.webhooks.find(x => x.tenantId === tenantId && x.id === id)
+    if (w) w.pausedUntil = until
+  }
+
+  async disableFailingWebhookSubscription(tenantId: string, id: string, at: string) {
+    const w = this.webhooks.find(x => x.tenantId === tenantId && x.id === id)
+    if (!w?.enabled) return false
+    Object.assign(w, { enabled: false, disabledReason: 'failing', updatedAt: at })
+    this.failPending(id)
     return true
   }
 
@@ -375,6 +408,19 @@ export class MemoryStore implements Store {
     this.webhooks = this.webhooks.filter(w => !(w.tenantId === tenantId && w.id === id))
     if (this.webhooks.length === before) return false
     this.deliveries = this.deliveries.filter(d => d.subscriptionId !== id)
+    this.webhookSends.delete(id)
+    return true
+  }
+
+  async takeWebhookSend(tenantId: string, subscriptionId: string, at: string, limit: number, windowMs: number) {
+    if (!this.webhooks.some(w => w.tenantId === tenantId && w.id === subscriptionId)) return false
+    const t = Date.parse(at)
+    const recent = (this.webhookSends.get(subscriptionId) ?? []).filter(x => x > t - windowMs)
+    if (recent.length >= limit) {
+      this.webhookSends.set(subscriptionId, recent)
+      return false
+    }
+    this.webhookSends.set(subscriptionId, [...recent, t])
     return true
   }
 
@@ -386,17 +432,34 @@ export class MemoryStore implements Store {
     this.webhookDomains.set(tenantId, [...domains])
   }
 
-  private queue(tenantId: string, subscriptionId: string, eventId: string, eventType: string, body: string, at: string): WebhookDeliveryRecord | null {
+  private queue(tenantId: string, subscriptionId: string, eventId: string, eventType: string, body: string, at: string, options: WebhookQueueOptions = {}): WebhookDeliveryRecord | null {
     if (this.deliveries.some(d => d.subscriptionId === subscriptionId && d.eventId === eventId)) return null
-    const d: WebhookDeliveryRecord = { tenantId, id: `dlv_${randomBytes(16).toString('hex')}`, subscriptionId, eventId, eventType, body, status: 'pending', attempts: 0, createdAt: at, nextAttemptAt: at }
+    const full = options.maxPending !== undefined && this.deliveries.filter(d => d.subscriptionId === subscriptionId && d.status === 'pending').length >= options.maxPending
+    const d: WebhookDeliveryRecord & { subjectUser?: string } = {
+      tenantId,
+      id: `dlv_${randomBytes(16).toString('hex')}`,
+      subscriptionId,
+      eventId,
+      eventType,
+      body,
+      ...(full ? { status: 'failed', lastError: 'backlog' } : { status: 'pending', nextAttemptAt: at }),
+      attempts: 0,
+      createdAt: at,
+      ...(options.subjectUser ? { subjectUser: options.subjectUser } : {})
+    }
     this.deliveries.push(d)
-    return structuredClone(d)
+    const { subjectUser: _s, ...record } = d
+    return structuredClone(record)
   }
 
-  async enqueueWebhookEvent(tenantId: string, eventId: string, eventType: WebhookEventType, body: string, at: string) {
+  private queueEvent(tenantId: string, eventId: string, eventType: WebhookEventType, body: string, at: string, options?: WebhookQueueOptions) {
     let n = 0
-    for (const w of this.webhooks) if (w.tenantId === tenantId && w.enabled && w.events.includes(eventType) && this.queue(tenantId, w.id, eventId, eventType, body, at)) n++
+    for (const w of this.webhooks) if (w.tenantId === tenantId && w.enabled && w.events.includes(eventType) && this.queue(tenantId, w.id, eventId, eventType, body, at, options)?.status === 'pending') n++
     return n
+  }
+
+  async enqueueWebhookEvent(tenantId: string, eventId: string, eventType: WebhookEventType, body: string, at: string, options?: WebhookQueueOptions) {
+    return this.queueEvent(tenantId, eventId, eventType, body, at, options)
   }
 
   async enqueueWebhookDelivery(tenantId: string, subscriptionId: string, eventId: string, eventType: string, body: string, at: string) {
@@ -404,29 +467,53 @@ export class MemoryStore implements Store {
     return this.queue(tenantId, subscriptionId, eventId, eventType, body, at)
   }
 
-  async claimWebhookDeliveries(now: string, leaseUntil: string, limit: number) {
+  async claimWebhookDeliveries(now: string, leaseUntil: string, limit: number, caps: WebhookClaimCaps) {
     const claim = randomBytes(12).toString('hex')
-    const due = this.deliveries
-      .filter(d => d.status === 'pending' && d.nextAttemptAt !== undefined && Date.parse(d.nextAttemptAt) <= Date.parse(now))
-      .sort((a, b) => Date.parse(a.nextAttemptAt!) - Date.parse(b.nextAttemptAt!))
-      .slice(0, limit)
+    const t = Date.parse(now)
+    for (const d of this.deliveries)
+      if (d.status === 'pending' && d.attempts >= caps.maxAttempts && d.nextAttemptAt !== undefined && Date.parse(d.nextAttemptAt) <= t) {
+        Object.assign(d, { status: 'failed', lastError: 'abandoned' })
+        for (const k of ['nextAttemptAt', 'claim'] as const) delete d[k]
+      }
+    // What all Gateways hold: leased (taken, its lease running).
+    const held = (match: (d: WebhookDeliveryRecord) => boolean) => this.deliveries.filter(d => d.status === 'pending' && d.claim && Date.parse(d.nextAttemptAt!) > t && match(d)).length
+    const bySubscription = new Map<string, number>()
+    const byTenant = new Map<string, number>()
+    const ready = this.deliveries
+      .filter(d => {
+        if (d.status !== 'pending' || d.nextAttemptAt === undefined || Date.parse(d.nextAttemptAt) > t) return false
+        const w = this.webhooks.find(x => x.id === d.subscriptionId)
+        return !!w?.enabled && !(w.pausedUntil && Date.parse(w.pausedUntil) > t)
+      })
+      .sort((a, b) => Date.parse(a.nextAttemptAt!) - Date.parse(b.nextAttemptAt!) || (a.id < b.id ? -1 : 1))
+    // Each tenant's earliest due in turn (its first, then each one's second…), within the caps.
+    const ranked: { d: MemoryDelivery; rank: number }[] = []
+    for (const d of ready) {
+      const s = (bySubscription.get(d.subscriptionId) ?? held(x => x.subscriptionId === d.subscriptionId)) + 1
+      if (s > caps.perSubscription) continue
+      const n = (byTenant.get(d.tenantId) ?? held(x => x.tenantId === d.tenantId)) + 1
+      if (n > caps.perTenant) continue
+      bySubscription.set(d.subscriptionId, s)
+      byTenant.set(d.tenantId, n)
+      ranked.push({ d, rank: n })
+    }
     const out: ClaimedDelivery[] = []
-    for (const d of due) {
-      const w = this.webhooks.find(x => x.id === d.subscriptionId)
-      if (!w) continue
+    for (const { d } of ranked.sort((a, b) => a.rank - b.rank || Date.parse(a.d.nextAttemptAt!) - Date.parse(b.d.nextAttemptAt!)).slice(0, limit)) {
+      const w = this.webhooks.find(x => x.id === d.subscriptionId)!
       d.attempts++
       d.lastAttemptAt = now
       d.nextAttemptAt = leaseUntil
       d.claim = claim
-      const { claim: _c, ...record } = d
-      out.push({ ...structuredClone(record), url: w.url, secretEnc: w.secretEnc, claim })
+      const { claim: _c, subjectUser: _s, ...record } = d
+      const previous = w.secretPrevEnc && w.secretPrevUntil && Date.parse(w.secretPrevUntil) > t ? { secretPrevEnc: w.secretPrevEnc } : {}
+      out.push({ ...structuredClone(record), url: w.url, secretEnc: w.secretEnc, ...previous, claim })
     }
     return out
   }
 
   async completeWebhookDelivery(id: string, claim: string, result: WebhookAttemptResult) {
     const d = this.deliveries.find(x => x.id === id)
-    if (!d || d.claim !== claim || d.status !== 'pending') return false
+    if (!d || d.claim !== claim || d.status !== 'pending') return null
     delete d.claim
     if (result.status !== undefined) d.lastStatus = result.status
     else delete d.lastStatus
@@ -443,7 +530,16 @@ export class MemoryStore implements Store {
         delete d.nextAttemptAt
       }
     }
-    return true
+    const w = this.webhooks.find(x => x.id === d.subscriptionId)
+    if (!w) return { failures: 0 }
+    if (result.delivered) {
+      w.failures = 0
+      for (const k of ['failingSince', 'pausedUntil'] as const) delete w[k]
+    } else {
+      w.failures++
+      w.failingSince ??= result.at
+    }
+    return { failures: w.failures, ...(w.failingSince ? { failingSince: w.failingSince } : {}) }
   }
 
   async listWebhookDeliveries(tenantId: string, subscriptionId: string, query: WebhookDeliveryQuery = {}) {
@@ -453,7 +549,7 @@ export class MemoryStore implements Store {
       .filter(d => d.tenantId === tenantId && d.subscriptionId === subscriptionId && (!cursor || order(cursor, d) < 0) && (!query.status || d.status === query.status))
       .sort(order)
       .slice(0, clampLimit(query.limit))
-      .map(({ claim: _c, ...d }) => structuredClone(d))
+      .map(({ claim: _c, subjectUser: _s, ...d }) => structuredClone(d))
   }
 
   async replayWebhookDelivery(tenantId: string, subscriptionId: string, id: string, at: string) {
@@ -462,7 +558,7 @@ export class MemoryStore implements Store {
     if (d.status === 'pending') return 'pending' as const
     Object.assign(d, { status: 'pending', attempts: 0, nextAttemptAt: at })
     for (const k of ['claim', 'lastError', 'lastStatus', 'deliveredAt'] as const) delete d[k]
-    const { claim: _c, ...record } = d
+    const { claim: _c, subjectUser: _s, ...record } = d
     return structuredClone(record)
   }
 
@@ -470,15 +566,40 @@ export class MemoryStore implements Store {
     const kept = this.deliveries.filter(d => d.status === 'pending' || Date.parse(d.createdAt) >= Date.parse(before))
     const purged = this.deliveries.length - kept.length
     this.deliveries = kept
+    for (const [k, s] of this.webhookState) if (Date.parse(s.since) < Date.parse(before)) this.webhookState.delete(k)
     return purged
   }
 
-  async setWebhookState(tenantId: string, subject: string, state: string, _at: string) {
-    const k = key(tenantId, subject)
+  async eraseWebhookSubject(tenantId: string, userId: string) {
+    const kept = this.deliveries.filter(d => !(d.tenantId === tenantId && d.subjectUser === userId && d.status !== 'pending'))
+    const erased = this.deliveries.length - kept.length
+    this.deliveries = kept
+    this.webhookState.delete(key(tenantId, `presence:${userId}`))
+    return erased
+  }
+
+  async setWebhookState(change: WebhookStateChange, event: WebhookStateEvent, options?: WebhookQueueOptions) {
+    const lease = this.leases.get(WEBHOOK_STATE_ROLE)
+    if (!lease || lease.holder !== change.holder || lease.until <= this.now()) return null
+    const k = key(change.tenantId, change.subject)
     const before = this.webhookState.get(k)
-    if (before === state) return null
-    this.webhookState.set(k, state)
-    return before
+    if (before && (before.state === change.state || Date.parse(before.since) >= Date.parse(change.at))) return null
+    this.webhookState.set(k, { state: change.state, since: change.at })
+    const e = event(before?.state)
+    const queued = e ? this.queueEvent(change.tenantId, e.id, e.type, e.body, change.at, { ...options, ...(e.subjectUser ? { subjectUser: e.subjectUser } : {}) }) : 0
+    return { previous: before?.state, queued }
+  }
+
+  async takeWebhookLease(role: string, holder: string, ms: number) {
+    const now = this.now()
+    const lease = this.leases.get(role)
+    if (lease && lease.holder !== holder && lease.until > now) return false
+    this.leases.set(role, { holder, until: now + ms })
+    return true
+  }
+
+  async clock() {
+    return new Date(this.now()).toISOString()
   }
 
   async close() {}

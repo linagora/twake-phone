@@ -869,6 +869,41 @@ describe('the administration screens (step 7)', () => {
     expect(text()).toContain('Envoi relancé')
   })
 
+  it('asks before a new secret, says how long the old one still signs, and what the Gateway did of a failing subscriber (review 10a)', async () => {
+    const renewWebhookSecret = vi.fn(async () => ({ secret: 'whsec_renewed', previousSecretUntil: '2026-10-17T08:00:00.000Z' }))
+    const testWebhook = vi.fn(async () => {
+      throw refused(409, 'WEBHOOK_DISABLED', 'This subscription is disabled: enable it first')
+    })
+    const items: WebhookSubscription[] = [
+      hook,
+      { ...hook, id: 'wh_00000000000000a3', url: 'https://crm.example.org/paused', failures: 6, pausedUntil: '2026-10-16T09:00:00.000Z' },
+      { ...hook, id: 'wh_00000000000000a4', url: 'https://crm.example.org/off', enabled: false, disabledReason: 'failing', failures: 40 }
+    ]
+    admin(webhooksClient({ renewWebhookSecret, testWebhook, listWebhooks: vi.fn(async () => ({ items })) }))
+    await render('/admin/webhooks', <Webhooks />)
+    expect(text()).toContain('en pause jusqu')
+    expect(text()).toContain('échecs de suite : 6')
+    expect(text()).toContain("désactivé après une journée d'échecs")
+    // RGAA 2.5.3: each button's name starts with what it shows.
+    const buttons = [...host.querySelectorAll('.admin-list button')]
+    expect(buttons.length).toBeGreaterThan(10)
+    for (const b of buttons) {
+      const label = b.getAttribute('aria-label')
+      if (label) expect(label.startsWith(b.textContent ?? ''), `${label} / ${b.textContent}`).toBe(true)
+    }
+    click(host.querySelector('[aria-label="Nouveau secret pour https://crm.example.org/in"]'))
+    expect(renewWebhookSecret).not.toHaveBeenCalled()
+    expect(text()).toContain('Remplacer le secret de https://crm.example.org/in ?')
+    click(button(host, 'Générer le nouveau secret'))
+    await flush()
+    expect(renewWebhookSecret).toHaveBeenCalledWith('wh_00000000000000a1')
+    expect(($('#webhook-secret-value') as HTMLInputElement).value).toBe('whsec_renewed')
+    expect(text()).toContain("L'ancien secret signe aussi les envois jusqu'au 17/10/2026")
+    click(host.querySelector('[aria-label="Tester l\'abonnement https://crm.example.org/in"]'))
+    await flush()
+    expect(text()).toContain('Cet abonnement est désactivé : réactivez-le d')
+  })
+
   it('says webhooks are not available on a platform without SECRETS_KEY (step 10a)', async () => {
     const no = async () => {
       throw refused(501, '', 'Webhooks are not available on this platform (SECRETS_KEY is not set)')

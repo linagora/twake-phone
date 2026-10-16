@@ -461,6 +461,7 @@ try {
     const events = page.getByRole('group', { name: 'Événements envoyés' })
     expectEqual(await events.getByLabel('Appel manqué').isChecked(), true, 'a missed call ticked by default')
     await events.getByLabel('Trunk dégradé').check()
+    await events.getByLabel('Trunk rétabli').check()
     await page.getByLabel('Description').fill('CRM')
     await page.getByRole('button', { name: "Enregistrer l'abonnement" }).click()
     // The secret, shown once, the focus on it: the tool is given it.
@@ -475,8 +476,8 @@ try {
     const listed = await api('/webhooks')
     if (listed.body.includes(secret)) throw new Error('the secret is in the API')
     const list = page.getByRole('list', { name: 'Abonnements' })
-    await list.getByText(`${url} (CRM) : Appel manqué, Trunk dégradé.`).waitFor()
-    await page.getByRole('button', { name: `Envoyer un événement de test à ${url}` }).click()
+    await list.getByText(`${url} (CRM) : Appel manqué, Trunk dégradé, Trunk rétabli.`).waitFor()
+    await page.getByRole('button', { name: `Tester l'abonnement ${url}` }).click()
     const test = await receiver.waitFor(e => e?.type === 'webhook.test', 'webhook.test')
     expectEqual(test.verified, true, 'test signature')
     expectEqual(test.path, '/twakephone', 'path')
@@ -497,7 +498,7 @@ try {
     await new Promise(r => setTimeout(r, 500))
     expectEqual(receiver.received.filter(d => d.event?.type !== 'webhook.test').map(d => d.event?.type).join(), 'call.missed', 'only the missed call')
   })
-  await step('a server of the trunk answers no probe: the tool receives trunk.degraded, once', async () => {
+  await step('a server of the trunk answers no probe: the tool receives trunk.degraded, once, then trunk.recovered once it answers again', async () => {
     platform.probing.add('192.0.2.10:5060')
     try {
       const degraded = await receiver.waitFor(e => e?.type === 'trunk.degraded', 'trunk.degraded', 20_000)
@@ -510,12 +511,16 @@ try {
     } finally {
       platform.probing.clear()
     }
+    const recovered = await receiver.waitFor(e => e?.type === 'trunk.recovered', 'trunk.recovered', 20_000)
+    expectEqual(recovered.verified, true, 'trunk.recovered signature')
+    const t = recovered.event.trunk
+    expectEqual(JSON.stringify([t.id, t.state, t.previous]), JSON.stringify(['operator', 'up', 'degraded']), 'the trunk recovered')
   })
   await step('a tool that answers 500 is sent the event again until it answers 2xx; the log says so, and a delivery is replayed', async () => {
     const before = receiver.received.length
     receiver.answer = () => 500
     const url = `${receiver.url}/twakephone`
-    await page.getByRole('button', { name: `Envoyer un événement de test à ${url}` }).click()
+    await page.getByRole('button', { name: `Tester l'abonnement ${url}` }).click()
     await page.getByRole('status').getByText(`Événement de test envoyé à ${url}`).waitFor()
     const first = await receiver.waitFor((e, d) => e?.type === 'webhook.test' && receiver.received.indexOf(d) >= before, 'the second test')
     // Retried with the same event (the same id): answered 2xx this time.

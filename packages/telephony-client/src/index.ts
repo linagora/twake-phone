@@ -168,7 +168,15 @@ export interface WebhookSubscription {
   events: WebhookEventType[]
   description?: string
   enabled: boolean
+  /** `failing`: disabled by the Gateway after a day of failed deliveries (enabling it again starts afresh). */
+  disabledReason?: 'failing'
   deliverable: boolean
+  /** Deliveries failed in a row (none when the last one went through). */
+  failures?: number
+  /** Nothing is tried until then: the subscriber failed too often in a row. */
+  pausedUntil?: string
+  /** The secret before the last renewal still signs (a second `v1`) until then. */
+  previousSecretUntil?: string
   createdAt: string
   updatedAt: string
 }
@@ -381,9 +389,9 @@ export class TelephonyClient {
     await this.request<void>(`/webhooks/${encodeURIComponent(id)}`, { method: 'DELETE' })
   }
 
-  /** A new signing secret, in use at once: shown this once. */
+  /** A new signing secret, in use at once: shown this once. The one it replaces still signs until `previousSecretUntil`. */
   renewWebhookSecret(id: string) {
-    return this.request<{ secret: string }>(`/webhooks/${encodeURIComponent(id)}/secret`, { method: 'POST' })
+    return this.request<{ secret: string; previousSecretUntil: string }>(`/webhooks/${encodeURIComponent(id)}/secret`, { method: 'POST' })
   }
 
   /** Sends a `webhook.test` to the subscription now. */

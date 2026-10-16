@@ -3,7 +3,6 @@ import { afterEach, describe, expect, it } from 'vitest'
 import type { ProviderFactory, RoutedEvent, TelephonyProvider } from '@twake/telephony-provider-sdk'
 import type { Presence, TelephonyEvent, TrunkStatus } from '@twake/telephony-types'
 import { buildApp } from './app.js'
-import { RateLimiter } from './contacts.js'
 import { ProviderRegistry } from './registry.js'
 import { MemoryStore } from './store/memory.js'
 import { verifyWebhookSignature } from './webhook-delivery.js'
@@ -58,7 +57,7 @@ afterEach(async () => {
   for (const a of apps.splice(0)) await a.close()
 })
 
-const setup = async (opts: { secretsKey?: boolean; answer?: (n: number) => number; limiter?: RateLimiter; trunkWatchMs?: number } = {}) => {
+const setup = async (opts: { secretsKey?: boolean; answer?: (n: number) => number; sendsPerMinute?: number; trunkWatchMs?: number } = {}) => {
   process.env.AUTH_MODE = 'dev'
   const store = new MemoryStore()
   await store.upsertMapping({ tenantId: 'A', userId: 'amartin', extension: '101' })
@@ -78,7 +77,7 @@ const setup = async (opts: { secretsKey?: boolean; answer?: (n: number) => numbe
         return { status: opts.answer ? opts.answer(got.length) : 204 }
       }
     },
-    ...(opts.limiter ? { webhookTestLimiter: opts.limiter } : {}),
+    ...(opts.sendsPerMinute ? { webhookSendsPerMinute: opts.sendsPerMinute } : {}),
     trunkWatchMs: opts.trunkWatchMs ?? 0,
     trunkWatchConfirm: 1,
     trunkStatusCacheMs: 0
@@ -151,7 +150,7 @@ describe('the webhook routes', () => {
   })
 
   it('change, disable, renew the secret of and delete a subscription', async () => {
-    const { app } = await setup()
+    const { app, got } = await setup()
     await app.inject({ method: 'PUT', url: '/api/v1/webhooks/domains', headers: root, ...json({ domains: ['crm.example.org'] }) })
     const made = (await app.inject({ method: 'POST', url: '/api/v1/webhooks', headers: root, ...json({ url: 'https://crm.example.org/in', events: ['call.missed'], description: 'CRM' }) })).json()
     const put = await app.inject({ method: 'PUT', url: `/api/v1/webhooks/${made.id}`, headers: root, ...json({ url: 'https://crm.example.org/v2', events: ['trunk.degraded'], enabled: false }) })
@@ -162,6 +161,21 @@ describe('the webhook routes', () => {
     const renewed = (await app.inject({ method: 'POST', url: `/api/v1/webhooks/${made.id}/secret`, headers: root })).json()
     expect(renewed.secret).toMatch(/^whsec_/)
     expect(renewed.secret).not.toBe(made.secret)
+    // The secret it replaced still signs for a day (review 10a, n°6), as the subscription says.
+    expect(Date.parse(renewed.previousSecretUntil) - Date.now()).toBeGreaterThan(86_400_000 - 60_000)
+    expect((await app.inject({ url: `/api/v1/webhooks/${made.id}`, headers: root })).json().previousSecretUntil).toBe(renewed.previousSecretUntil)
+    // Renewed while a change is written: the change never puts the secret back (review 10a, n°5).
+    const [, again] = await Promise.all([
+      app.inject({ method: 'PUT', url: `/api/v1/webhooks/${made.id}`, headers: root, ...json({ url: 'https://crm.example.org/v3', events: ['trunk.degraded'], enabled: true }) }),
+      app.inject({ method: 'POST', url: `/api/v1/webhooks/${made.id}/secret`, headers: root }).then(r => r.json())
+    ])
+    const test = (await app.inject({ method: 'POST', url: `/api/v1/webhooks/${made.id}/test`, headers: root })).json()
+    await until('the test', () => got.find(g => JSON.parse(g.body).id === test.eventId))
+    const signature = got.find(g => JSON.parse(g.body).id === test.eventId)!.headers['x-twakephone-signature']
+    expect(signature).toMatch(/^t=\d+,v1=[0-9a-f]{64},v1=[0-9a-f]{64}$/)
+    expect(verifyWebhookSignature(again.secret, signature, got.at(-1)!.body)).toBe(true)
+    expect(verifyWebhookSignature(renewed.secret, signature, got.at(-1)!.body)).toBe(true)
+    expect(verifyWebhookSignature(made.secret, signature, got.at(-1)!.body)).toBe(false)
     expect((await app.inject({ method: 'DELETE', url: `/api/v1/webhooks/${made.id}`, headers: root })).statusCode).toBe(204)
     expect((await app.inject({ url: `/api/v1/webhooks/${made.id}`, headers: root })).statusCode).toBe(404)
     expect((await app.inject({ url: '/api/v1/webhooks/not-an-id', headers: root })).statusCode).toBe(404)
@@ -176,7 +190,7 @@ describe('the webhook routes', () => {
   })
 
   it('send a test, list the deliveries a page at a time, and replay one, within a limit', async () => {
-    const { app, got } = await setup({ answer: n => (n === 1 ? 500 : 204), limiter: new RateLimiter(2, 60_000) })
+    const { app, got } = await setup({ answer: n => (n === 1 ? 500 : 204), sendsPerMinute: 2 })
     await app.inject({ method: 'PUT', url: '/api/v1/webhooks/domains', headers: root, ...json({ domains: ['crm.example.org'] }) })
     const made = (await app.inject({ method: 'POST', url: '/api/v1/webhooks', headers: root, ...json({ url: 'https://crm.example.org/in', events: ['trunk.degraded'] }) })).json()
     const test = await app.inject({ method: 'POST', url: `/api/v1/webhooks/${made.id}/test`, headers: root })
@@ -202,8 +216,45 @@ describe('the webhook routes', () => {
     expect((await app.inject({ method: 'POST', url: `/api/v1/webhooks/${made.id}/deliveries/dlv_${'0'.repeat(32)}/replay`, headers: as('root', 'B') })).statusCode).toBe(404)
   })
 
+  it('send nothing to a disabled subscription, neither a test nor a replay (review 10a, n°10)', async () => {
+    const { app, got } = await setup()
+    await app.inject({ method: 'PUT', url: '/api/v1/webhooks/domains', headers: root, ...json({ domains: ['crm.example.org'] }) })
+    const made = (await app.inject({ method: 'POST', url: '/api/v1/webhooks', headers: root, ...json({ url: 'https://crm.example.org/in', events: ['call.missed'] }) })).json()
+    const sent = (await app.inject({ method: 'POST', url: `/api/v1/webhooks/${made.id}/test`, headers: root })).json()
+    await until('delivered', () => got.length === 1)
+    await app.inject({ method: 'PUT', url: `/api/v1/webhooks/${made.id}`, headers: root, ...json({ url: 'https://crm.example.org/in', events: ['call.missed'], enabled: false }) })
+    for (const url of [`/api/v1/webhooks/${made.id}/test`, `/api/v1/webhooks/${made.id}/deliveries/${sent.id}/replay`]) {
+      const res = await app.inject({ method: 'POST', url, headers: root })
+      expect([res.statusCode, res.json().code], url).toEqual([409, 'WEBHOOK_DISABLED'])
+    }
+    await sleep(60)
+    expect(got).toHaveLength(1)
+  })
+
+  it("never reach another tenant's subscription nor delivery, by its real identifier", async () => {
+    const { app, got } = await setup()
+    for (const t of ['A', 'B']) await app.inject({ method: 'PUT', url: '/api/v1/webhooks/domains', headers: as('root', t), ...json({ domains: ['crm.example.org'] }) })
+    const theirs = (await app.inject({ method: 'POST', url: '/api/v1/webhooks', headers: as('root', 'B'), ...json({ url: 'https://crm.example.org/b', events: ['call.missed'] }) })).json()
+    const delivery = (await app.inject({ method: 'POST', url: `/api/v1/webhooks/${theirs.id}/test`, headers: as('root', 'B') })).json()
+    await until('delivered', () => got.length === 1)
+    const routes: [string, string, unknown?][] = [
+      ['GET', `/api/v1/webhooks/${theirs.id}`],
+      ['PUT', `/api/v1/webhooks/${theirs.id}`, { url: 'https://crm.example.org/a', events: ['call.missed'] }],
+      ['POST', `/api/v1/webhooks/${theirs.id}/secret`],
+      ['POST', `/api/v1/webhooks/${theirs.id}/test`],
+      ['GET', `/api/v1/webhooks/${theirs.id}/deliveries`],
+      ['POST', `/api/v1/webhooks/${theirs.id}/deliveries/${delivery.id}/replay`],
+      ['DELETE', `/api/v1/webhooks/${theirs.id}`]
+    ]
+    for (const [method, url, payload] of routes) expect((await app.inject({ method: method as 'GET', url, headers: root, ...(payload ? json(payload) : {}) })).statusCode, `${method} ${url}`).toBe(404)
+    // Theirs untouched: the same address, the same log, still there.
+    expect((await app.inject({ url: `/api/v1/webhooks/${theirs.id}`, headers: as('root', 'B') })).json()).toMatchObject({ url: 'https://crm.example.org/b', enabled: true })
+    expect((await app.inject({ url: `/api/v1/webhooks/${theirs.id}/deliveries`, headers: as('root', 'B') })).json().items).toHaveLength(1)
+    expect(got).toHaveLength(1)
+  })
+
   it('pages the log with next', async () => {
-    const { app } = await setup({ limiter: new RateLimiter(100, 60_000) })
+    const { app } = await setup({ sendsPerMinute: 100 })
     await app.inject({ method: 'PUT', url: '/api/v1/webhooks/domains', headers: root, ...json({ domains: ['crm.example.org'] }) })
     const made = (await app.inject({ method: 'POST', url: '/api/v1/webhooks', headers: root, ...json({ url: 'https://crm.example.org/in', events: ['call.missed'] }) })).json()
     const ids: string[] = []
@@ -236,6 +287,13 @@ describe('the events a subscriber is sent', () => {
     expect(event).toMatchObject({ type: 'call.missed', tenant: 'A', call: { id: call.id, direction: 'inbound', from: '101', to: '102', user: 'jdupont', extension: '102', outcome: 'missed', duration_sec: 0 } })
     expect(got[0]!.headers['idempotency-key']).toBe(event.id)
     expect(verifyWebhookSignature(made.secret, got[0]!.headers['x-twakephone-signature'], got[0]!.body)).toBe(true)
+    // Jean erases his history: what the subscriber was sent about him goes from the log with it (review 10a, n°12).
+    const log = () => app.inject({ url: `/api/v1/webhooks/${made.id}/deliveries`, headers: root }).then(r => r.json().items as unknown[])
+    await until('logged as delivered', async () => (await log()).length === 1 && JSON.stringify(await log()).includes('delivered'))
+    expect((await app.inject({ method: 'DELETE', url: '/api/v1/me/history', headers: as('amartin') })).statusCode).toBe(200)
+    expect(await log()).toHaveLength(1)
+    expect((await app.inject({ method: 'DELETE', url: '/api/v1/me/history', headers: as('jdupont') })).statusCode).toBe(200)
+    expect(await log()).toEqual([])
   })
 
   it('a change of presence, told once (the status only)', async () => {
@@ -255,10 +313,10 @@ describe('the events a subscriber is sent', () => {
     expect(got.map(g => g.body).join()).not.toContain('réunion')
   })
 
-  it('a trunk that gets worse, from what the SIP server says of it', async () => {
+  it('a trunk that gets worse, then recovers, from what the SIP server says of it', async () => {
     const { app, got, setTrunks } = await setup({ trunkWatchMs: 20 })
     await app.inject({ method: 'PUT', url: '/api/v1/webhooks/domains', headers: root, ...json({ domains: ['crm.example.org'] }) })
-    await app.inject({ method: 'POST', url: '/api/v1/webhooks', headers: root, ...json({ url: 'https://crm.example.org/in', events: ['trunk.degraded'] }) })
+    await app.inject({ method: 'POST', url: '/api/v1/webhooks', headers: root, ...json({ url: 'https://crm.example.org/in', events: ['trunk.degraded', 'trunk.recovered'] }) })
     setTrunks([{ id: 'tr1', servers: [{ address: '192.0.2.10:5060', state: 'up' }, { address: '192.0.2.11:5060', state: 'up' }] }])
     await sleep(80)
     expect(got).toHaveLength(0)
@@ -267,5 +325,8 @@ describe('the events a subscriber is sent', () => {
     expect(JSON.parse(got[0]!.body)).toMatchObject({ type: 'trunk.degraded', tenant: 'A', trunk: { id: 'tr1', state: 'degraded', previous: 'up', servers: [{ address: '192.0.2.10:5060', state: 'probing' }, { address: '192.0.2.11:5060', state: 'up' }] } })
     await sleep(80)
     expect(got).toHaveLength(1)
+    setTrunks([{ id: 'tr1', servers: [{ address: '192.0.2.10:5060', state: 'up' }, { address: '192.0.2.11:5060', state: 'up' }] }])
+    await until('trunk.recovered', () => got.length === 2)
+    expect(JSON.parse(got[1]!.body)).toMatchObject({ type: 'trunk.recovered', tenant: 'A', trunk: { id: 'tr1', state: 'up', previous: 'degraded' } })
   })
 })

@@ -442,6 +442,7 @@ const GENERAL: Record<string, Key> = {
   WEBHOOK_LIMIT: 'admin.webhooks.err.limit',
   WEBHOOK_RATE: 'admin.webhooks.err.rate',
   WEBHOOK_PENDING: 'admin.webhooks.err.pending',
+  WEBHOOK_DISABLED: 'admin.webhooks.err.disabled',
   WEBHOOK_DOMAINS: 'admin.webhooks.err.domains'
 }
 

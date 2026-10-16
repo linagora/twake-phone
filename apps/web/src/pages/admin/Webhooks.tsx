@@ -7,10 +7,10 @@ import type { Key } from '../../i18n/index.js'
 import { useT } from '../../i18n/useT.js'
 
 const PAGE = 20
-const FAILURES = ['http', 'timeout', 'connection', 'dns', 'tls', 'too-large', 'redirect', 'destination-refused', 'domain-not-allowed', 'secret-unreadable', 'disabled']
+const FAILURES = ['http', 'timeout', 'connection', 'dns', 'tls', 'redirect', 'destination-refused', 'domain-not-allowed', 'secret-unreadable', 'disabled', 'backlog', 'abandoned']
 
 /** A secret just made: shown this once, for the subscription it signs. */
-type Secret = { subscription: string; url: string; value: string } | null
+type Secret = { subscription: string; url: string; value: string; previousUntil?: string } | null
 
 /**
  * The webhooks of the organisation (step 10a, ADR 0020): the domains they may be sent to, the subscriptions (an
@@ -171,7 +171,8 @@ export const Webhooks = () => {
     act(async () => {
       const r = await client.renewWebhookSecret(w.id)
       setCopied(false)
-      setSecret({ subscription: w.id, url: w.url, value: r.secret })
+      setSecret({ subscription: w.id, url: w.url, value: r.secret, previousUntil: r.previousSecretUntil })
+      load()
     })
   const remove = (w: WebhookSubscription) =>
     act(async () => {
@@ -277,6 +278,7 @@ export const Webhooks = () => {
       {secret ? (
         <Section id="webhook-secret" title={t('admin.webhooks.secret')}>
           <p className="alert">{t('admin.webhooks.secretOnce', { url: secret.url })}</p>
+          {secret.previousUntil ? <p>{t('admin.webhooks.secretGrace', { date: when.format(new Date(secret.previousUntil)) })}</p> : null}
           <div className="field">
             <label htmlFor="webhook-secret-value">{t('admin.webhooks.secretLabel')}</label>
             <input ref={secretRef} id="webhook-secret-value" className="secret" readOnly value={secret.value} onFocus={e => e.currentTarget.select()} aria-describedby="webhook-secret-hint" />
@@ -305,8 +307,18 @@ export const Webhooks = () => {
               <li key={w.id}>
                 <span>
                   <strong>{w.url}</strong>
-                  {w.description ? ` (${w.description})` : ''} : {w.events.map(eventName).join(', ')}.{' '}
-                  {!w.enabled ? <span className="state state-disabled">{t('admin.webhooks.disabled')}</span> : !w.deliverable ? <span className="state state-failed">{t('admin.webhooks.notDeliverable')}</span> : null}
+                  {w.description ? ` (${w.description})` : ''}
+                  {t('admin.webhooks.itemEvents', { events: w.events.map(eventName).join(', ') })}{' '}
+                  {!w.enabled ? (
+                    <span className="state state-disabled">{t(w.disabledReason === 'failing' ? 'admin.webhooks.disabledFailing' : 'admin.webhooks.disabled')}</span>
+                  ) : !w.deliverable ? (
+                    <span className="state state-failed">{t('admin.webhooks.notDeliverable')}</span>
+                  ) : w.pausedUntil ? (
+                    <span className="state state-failed">{t('admin.webhooks.paused', { count: w.failures ?? 0, date: when.format(new Date(w.pausedUntil)) })}</span>
+                  ) : w.failures ? (
+                    <span className="state state-failed">{t('admin.webhooks.failing', { count: w.failures })}</span>
+                  ) : null}
+                  {w.previousSecretUntil ? <span className="muted"> {t('admin.webhooks.previousSecret', { date: when.format(new Date(w.previousSecretUntil)) })}</span> : null}
                 </span>
                 <div className="actions actions-end">
                   <button type="button" className="btn" onClick={() => edit(w)} disabled={busy} aria-label={t('admin.webhooks.editOf', { url: w.url })}>
@@ -318,9 +330,7 @@ export const Webhooks = () => {
                   <button type="button" className="btn" onClick={() => showLog(w)} disabled={busy} aria-label={t('admin.webhooks.logOf', { url: w.url })}>
                     {t('admin.webhooks.log')}
                   </button>
-                  <button type="button" className="btn" onClick={() => void renew(w)} disabled={busy} aria-label={t('admin.webhooks.renewOf', { url: w.url })}>
-                    {t('admin.webhooks.renew')}
-                  </button>
+                  <ConfirmDelete action="admin.webhooks.renew" tone="plain" yes="admin.webhooks.renewYes" label={t('admin.webhooks.renewOf', { url: w.url })} question={t('admin.webhooks.renewConfirm', { url: w.url })} onConfirm={() => void renew(w)} disabled={busy} />
                   <ConfirmDelete label={t('admin.webhooks.deleteOf', { url: w.url })} question={t('admin.webhooks.deleteConfirm', { url: w.url })} onConfirm={() => void remove(w)} disabled={busy} />
                 </div>
               </li>

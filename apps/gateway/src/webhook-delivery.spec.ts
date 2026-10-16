@@ -1,7 +1,13 @@
+import { execFileSync } from 'node:child_process'
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { createServer, type Server } from 'node:http'
+import { createServer as createHttpsServer } from 'node:https'
 import type { AddressInfo } from 'node:net'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import type { TLSSocket } from 'node:tls'
 import { afterEach, describe, expect, it } from 'vitest'
-import { DeliveryError, addressAllowed, hostAllowed, newWebhookSecret, parseNetworks, parseWebhookDomains, parseWebhookUrl, postWebhook, signWebhook, verifyWebhookSignature } from './webhook-delivery.js'
+import { DeliveryError, addressAllowed, denyNetworks, hostAllowed, newWebhookSecret, parseNetworks, parseWebhookDomains, parseWebhookUrl, postWebhook, signWebhook, verifyWebhookSignature } from './webhook-delivery.js'
 
 describe('webhook signature', () => {
   const secret = newWebhookSecret()
@@ -17,6 +23,19 @@ describe('webhook signature', () => {
     expect(verifyWebhookSignature(secret, header, body, 1_760_000_000 + 301)).toBe(false)
     expect(verifyWebhookSignature(secret, undefined, body)).toBe(false)
     expect(verifyWebhookSignature(secret, 't=1760000000,v1=00', body, 1_760_000_000)).toBe(false)
+  })
+
+  it('signs with the secret before a new one too, for a day: either secret checks the delivery', () => {
+    const [current, previous] = [newWebhookSecret(), newWebhookSecret()]
+    const header = signWebhook([current, previous], 1_760_000_000, body)
+    expect(header).toMatch(/^t=1760000000,v1=[0-9a-f]{64},v1=[0-9a-f]{64}$/)
+    expect(verifyWebhookSignature(current, header, body, 1_760_000_000)).toBe(true)
+    expect(verifyWebhookSignature(previous, header, body, 1_760_000_000)).toBe(true)
+    expect(verifyWebhookSignature(newWebhookSecret(), header, body, 1_760_000_000)).toBe(false)
+    // A header without its timestamp, or with nothing but it: refused.
+    expect(verifyWebhookSignature(current, header.replace('t=1760000000,', ''), body, 1_760_000_000)).toBe(false)
+    expect(verifyWebhookSignature(current, 't=1760000000', body, 1_760_000_000)).toBe(false)
+    expect(verifyWebhookSignature(current, '', body, 1_760_000_000)).toBe(false)
   })
 
   it('draws a new secret of 256 bits each time', () => {
@@ -86,6 +105,9 @@ describe('the addresses a delivery may reach', () => {
       expect(addressAllowed(a), a).toBe(false)
     for (const a of ['::1', '::', 'fe80::1', 'fd00::1', 'fc00::1', 'ff02::1', '2001:db8::1', '64:ff9b::7f00:1', '::ffff:127.0.0.1', '::ffff:10.0.0.1', '::ffff:7f00:1', '2002:7f00:1::1'])
       expect(addressAllowed(a), a).toBe(false)
+    // The deprecated IPv4-compatible forms (::/96, whichever IPv4 address they carry, public too) and the 6bone.
+    for (const a of ['::7f00:1', '::127.0.0.1', '::a9fe:a9fe', '::169.254.169.254', '::8.8.8.8', '::0.0.0.1', '3ffe::1', '3ffe:ffff::1'])
+      expect(addressAllowed(a), a).toBe(false)
     expect(addressAllowed('not-an-ip')).toBe(false)
   })
 
@@ -105,6 +127,18 @@ describe('the addresses a delivery may reach', () => {
     expect(() => parseNetworks('10.0.0.0/33')).toThrow(/WEBHOOK_PRIVATE_NETWORKS/)
     expect(() => parseNetworks('crm.example.org')).toThrow(/WEBHOOK_PRIVATE_NETWORKS/)
     expect(addressAllowed('10.0.0.1', parseNetworks(''))).toBe(false)
+  })
+
+  it('never reaches what the operator closes, nor the addresses of this host, even inside what it opened', () => {
+    const open = parseNetworks('192.0.2.0/24, 2001:db8::/32')
+    const deny = denyNetworks('192.0.2.7, 2001:db8:1::/48', { eth0: [{ address: '192.0.2.50' }, { address: 'fe80::1%eth0' }], lo: [{ address: '127.0.0.1', internal: true }], down: undefined })
+    expect(addressAllowed('192.0.2.8', open, deny)).toBe(true)
+    expect(addressAllowed('2001:db8:2::1', open, deny)).toBe(true)
+    for (const a of ['192.0.2.7', '::ffff:192.0.2.7', '192.0.2.50', '2001:db8:1::9', 'fe80::1']) expect(addressAllowed(a, open, deny), a).toBe(false)
+    // The loopback is refused as any special range, unless opened (a receiver on a development machine).
+    expect(addressAllowed('127.0.0.1', undefined, deny)).toBe(false)
+    expect(addressAllowed('127.0.0.1', parseNetworks('127.0.0.0/8'), deny)).toBe(true)
+    expect(() => denyNetworks('crm.example.org')).toThrow(/WEBHOOK_DENY_NETWORKS/)
   })
 })
 
@@ -156,17 +190,65 @@ describe('postWebhook', () => {
     expect(got).toHaveLength(1)
   })
 
-  it('follows no redirect, bounds the wait and the size of the answer', async () => {
+  it('follows no redirect, bounds the wait, and takes a 2xx as delivered however long or slow its body', async () => {
     const open = parseNetworks('127.0.0.0/8')
     let answer: (res: import('node:http').ServerResponse) => void = res => res.writeHead(302, { location: 'http://169.254.169.254/' }).end()
     const { url } = await listen(res => answer(res))
     expect(await reason(postWebhook(url, '{}', {}, { open }))).toBe('redirect')
     answer = () => undefined
     expect(await reason(postWebhook(url, '{}', {}, { open, timeoutMs: 200 }))).toBe('timeout')
-    answer = res => res.writeHead(200).end('x'.repeat(100_000))
-    expect(await reason(postWebhook(url, '{}', {}, { open, maxResponseBytes: 1000 }))).toBe('too-large')
+    // A status at once, then a body that never ends: delivered, without waiting for it (review 10a, n°9).
+    answer = res => {
+      res.writeHead(200)
+      res.write('x'.repeat(1_000_000))
+    }
+    const started = Date.now()
+    expect(await postWebhook(url, '{}', {}, { open, timeoutMs: 2_000 })).toEqual({ status: 200 })
+    expect(Date.now() - started).toBeLessThan(1_000)
     answer = res => res.writeHead(500).end('oops')
     expect(await postWebhook(url, '{}', {}, { open })).toEqual({ status: 500 })
+  })
+
+  it('resolves the name once per delivery, connects to what it checked, and bounds the resolution and connection', async () => {
+    const { url, got } = await listen(res => res.writeHead(204).end())
+    const named = url.replace('127.0.0.1', 'crm.example.org')
+    // A name that answers a public address and then this host's (rebinding): asked once, refused on what it said.
+    let asked = 0
+    const rebinding = async () => (asked++ === 0 ? [{ address: '127.0.0.1', family: 4 }] : [{ address: '93.184.215.14', family: 4 }])
+    expect(await postWebhook(named, '{}', {}, { open: parseNetworks('127.0.0.1'), resolve: rebinding })).toEqual({ status: 204 })
+    expect(asked).toBe(1)
+    expect(got).toHaveLength(1)
+    // A DNS server that never answers: given up at the connection's bound, well before the answer's.
+    const started = Date.now()
+    expect(await reason(postWebhook(named, '{}', {}, { timeoutMs: 5_000, connectTimeoutMs: 150, resolve: () => new Promise(() => undefined) }))).toBe('timeout')
+    expect(Date.now() - started).toBeLessThan(1_000)
+  })
+
+  it('reaches an https subscriber by its name (SNI), checks its certificate against that name', async () => {
+    // A certificate made for this test, never kept: crm.example.org, signed by itself.
+    const dir = mkdtempSync(join(tmpdir(), 'webhook-tls-'))
+    try {
+      execFileSync('openssl', ['req', '-x509', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:prime256v1', '-nodes', '-days', '1', '-subj', '/CN=crm.example.org', '-addext', 'subjectAltName=DNS:crm.example.org', '-keyout', join(dir, 'key.pem'), '-out', join(dir, 'cert.pem')], { stdio: 'ignore' })
+      const [key, cert] = [readFileSync(join(dir, 'key.pem')), readFileSync(join(dir, 'cert.pem'))]
+      const names: (string | false | null)[] = []
+      const tls = createHttpsServer({ key, cert }, (req, res) => {
+        names.push((req.socket as TLSSocket).servername)
+        req.resume()
+        req.on('end', () => res.writeHead(204).end())
+      })
+      server = tls
+      await new Promise<void>(resolve => tls.listen(0, '127.0.0.1', () => resolve()))
+      const port = (tls.address() as AddressInfo).port
+      const opts = { open: parseNetworks('127.0.0.1'), resolve: async () => [{ address: '127.0.0.1', family: 4 }] }
+      expect(await postWebhook(`https://crm.example.org:${port}/hook`, '{}', {}, { ...opts, ca: cert })).toEqual({ status: 204 })
+      expect(names).toEqual(['crm.example.org'])
+      // Another name on the same address, or a certificate nobody vouches for: no delivery.
+      expect(await reason(postWebhook(`https://other.example.org:${port}/hook`, '{}', {}, { ...opts, ca: cert }))).toBe('tls')
+      expect(await reason(postWebhook(`https://crm.example.org:${port}/hook`, '{}', {}, opts))).toBe('tls')
+      expect(names).toHaveLength(1)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
   })
 
   it('says a connection refused as such', async () => {
