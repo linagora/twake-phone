@@ -125,7 +125,8 @@ const memoryPlatform = {
   })
 }
 // The tool an administrator subscribes to the webhooks (step 10a), on this host: the Gateway may reach it only because
-// the operator opens the loopback to deliveries (WEBHOOK_PRIVATE_NETWORKS) and allows http (WEBHOOK_ALLOW_HTTP=1).
+// the operator opens the loopback to deliveries (WEBHOOK_PRIVATE_NETWORKS), allows http (WEBHOOK_ALLOW_HTTP=1) and its
+// port (WEBHOOK_PORTS).
 const receiver = await startWebhookReceiver()
 const gateway = await buildApp(new ProviderRegistry(providers, [memoryPlatform]), {
   auth,
@@ -134,7 +135,7 @@ const gateway = await buildApp(new ProviderRegistry(providers, [memoryPlatform])
   directorySync,
   secretsKey: randomBytes(32),
   admin: { adminRole: 'twakephone-admin', adminUsers: new Set() },
-  webhooks: { policy: { allowHttp: true }, open: parseNetworks('127.0.0.1/32'), retryBaseMs: 300, pollMs: 100 },
+  webhooks: { policy: { allowHttp: true, ports: [Number(new URL(receiver.url).port)] }, open: parseNetworks('127.0.0.1/32'), retryBaseMs: 300, pollMs: 100 },
   trunkWatchMs: 300
 })
 await gateway.listen({ host: '127.0.0.1', port: GATEWAY_PORT })
@@ -542,7 +543,7 @@ try {
     // The missed call sent again: the same event, the same id.
     const missedId = receiver.received.find(d => d.event?.type === 'call.missed').event.id
     const count = receiver.received.filter(d => d.event?.id === missedId).length
-    await page.getByRole('button', { name: /^Renvoyer l'événement Appel manqué du / }).click()
+    await page.getByRole('button', { name: /^Renvoyer : l'événement Appel manqué du / }).click()
     await page.getByRole('status').getByText('Envoi relancé').waitFor()
     await receiver.waitFor(e => e?.id === missedId && receiver.received.filter(d => d.event?.id === missedId).length > count, 'the replay')
     const replayed = receiver.received.filter(d => d.event?.id === missedId).at(-1)

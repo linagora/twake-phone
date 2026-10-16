@@ -4,8 +4,9 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest'
 import { encrypt } from './crypto.js'
 import { MemoryStore } from './store/memory.js'
 import { PgStore } from './store/pg.js'
-import type { Store, WebhookSubscriptionRecord } from './store/types.js'
-import { DeliveryError, verifyWebhookSignature } from './webhook-delivery.js'
+import { BlockList } from 'node:net'
+import { WEBHOOK_STATE_ROLE, type Store, type WebhookDeliveryRecord, type WebhookSubscriptionRecord } from './store/types.js'
+import { DeliveryError, verifyWebhookSignature, type PostOptions } from './webhook-delivery.js'
 import { presenceEvent, type PublishedWebhookEvent } from './webhook-events.js'
 import { WebhookHub, parseSubscription, pauseMs, retryDelayMs, secretContext, type WebhookHubOptions } from './webhooks.js'
 
@@ -48,8 +49,15 @@ const missed = (id = 'evt_00000000000000000000000000000001'): Extract<PublishedW
   call: { id: 'c1', direction: 'inbound', from: '101', to: '102', user: 'jdupont', extension: '102', duration_sec: 0, outcome: 'missed', source: ['opensips'] }
 })
 
-/** What a subscriber got: each request's url, headers and body. */
-type Got = { url: string; headers: Record<string, string>; body: string }
+/** What a subscriber got: each request's url, headers and body, and what the hub asked of the request. */
+type Got = { url: string; headers: Record<string, string>; body: string; opts: PostOptions }
+
+/** A promise the test settles when it wants (a subscriber that answers when told). */
+const gate = () => {
+  let open: () => void = () => undefined
+  const opened = new Promise<void>(r => (open = r))
+  return { opened, open }
+}
 
 const hubs: WebhookHub[] = []
 afterEach(async () => {
@@ -65,8 +73,8 @@ const hubOn = (store: Store, answer: (got: Got, n: number) => Promise<number> | 
     pauseBaseMs: 5,
     stateLeaseMs: 300,
     logger: quiet,
-    post: async (url, body, headers) => {
-      const g = { url, headers, body }
+    post: async (url, body, headers, opts) => {
+      const g = { url, headers, body, opts }
       got.push(g)
       return { status: await answer(g, got.length) }
     },
@@ -140,8 +148,10 @@ describe('the webhook hub', () => {
     // Nobody takes it: nothing written. The same event again: not queued again.
     expect(await hub.publish('acme', { ...missed('evt_00000000000000000000000000000002'), type: 'call.ended' })).toBe(0)
     expect(await hub.publish('acme', missed())).toBe(0)
-    await sleep(80)
+    expect((await store.listWebhookDeliveries('acme', 'wh_00000000000000a1')).map(x => x.status)).toEqual(['delivered'])
     expect(got).toHaveLength(1)
+    // The request bounded to 5 s by default: a subscriber slower than that fails (and is paused by its breaker).
+    expect(got[0]!.opts.timeoutMs).toBe(5_000)
   })
 
   it('retries what is not answered 2xx, 8 times at most, then fails it', async () => {
@@ -187,34 +197,65 @@ describe('the webhook hub', () => {
     expect([d.attempts, d.lastError]).toEqual([1, 'destination-refused'])
   })
 
-  it('retries a timeout or a refused connection, which pass', async () => {
+  it('retries a timeout or a refused connection, which pass, the log saying `unreachable` and the server why', async () => {
     const store = await setup()
-    const { hub } = hubOn(store, (_g, n) => {
-      if (n === 1) throw new DeliveryError('timeout', 'slow')
-      if (n === 2) throw new DeliveryError('connection', 'down')
-      return 202
-    })
+    const reasons: string[] = []
+    const logger = { ...quiet, warn: (o: { reason?: string }) => void (o.reason && reasons.push(o.reason)) }
+    const errors: (string | undefined)[] = []
+    const { hub } = hubOn(
+      store,
+      async (_g, n) => {
+        errors.push((await store.listWebhookDeliveries('acme', 'wh_00000000000000a1'))[0]?.lastError)
+        if (n === 1) throw new DeliveryError('timeout', 'slow')
+        if (n === 2) throw new DeliveryError('connection', 'down')
+        if (n === 3) throw new DeliveryError('dns', 'no such host')
+        if (n === 4) throw new DeliveryError('tls', 'bad certificate')
+        return 202
+      },
+      { logger }
+    )
     hub.start()
     await hub.publish('acme', missed())
     const d = await until('delivered', async () => (await store.listWebhookDeliveries('acme', 'wh_00000000000000a1')).find(x => x.status === 'delivered'))
-    expect([d.attempts, d.lastStatus]).toEqual([3, 202])
+    expect([d.attempts, d.lastStatus]).toEqual([5, 202])
+    // What an administrator reads: one category, no oracle of what listens where; the details in the server's log.
+    expect(errors).toEqual([undefined, 'unreachable', 'unreachable', 'unreachable', 'unreachable'])
+    expect(reasons).toEqual(['timeout', 'connection', 'dns', 'tls'])
+  })
+
+  it('opens the networks the operator opened to an organisation to its deliveries only', async () => {
+    const store = await setup()
+    await store.setWebhookDomains('other', ['crm.example.net'])
+    await store.addWebhookSubscription(subscription({ tenantId: 'other', id: 'wh_00000000000000b1', url: 'https://crm.example.net/in' }), 20)
+    const acme = new BlockList()
+    acme.addSubnet('10.20.0.0', 16, 'ipv4')
+    const { hub, got } = hubOn(store, () => 204, { open: new Map([['acme', acme]]) })
+    hub.start()
+    await hub.publish('acme', missed())
+    await hub.publish('other', { ...missed(), tenant: 'other' })
+    await until('both delivered', () => got.length === 2)
+    const opened = (host: string) => got.find(g => g.url.includes(host))!.opts.open
+    expect(opened('example.org')?.check('10.20.0.5', 'ipv4')).toBe(true)
+    expect(opened('example.net')).toBeUndefined()
   })
 
   it('takes a delivery back when the Gateway that held it stopped before its outcome (the end of its lease)', async () => {
     const store = await setup()
+    const LEASE = 400
     // This one takes it and answers nothing (stopped mid-request): it stops looking at the queue meanwhile.
     let release: (status: number) => void = () => undefined
-    const first = hubOn(store, () => new Promise<number>(r => (release = r)), { leaseMs: 150 })
+    const first = hubOn(store, () => new Promise<number>(r => (release = r)), { leaseMs: LEASE })
     first.hub.start()
     await first.hub.publish('acme', missed())
     await until('taken', () => first.got.length === 1)
+    const takenAt = Date.parse((await store.listWebhookDeliveries('acme', 'wh_00000000000000a1'))[0]!.lastAttemptAt!)
     const stopping = first.hub.stop()
-    // Another Gateway: nothing to take while the lease holds, then the delivery.
-    const second = hubOn(store, () => 204, { leaseMs: 150 })
+    // Another Gateway: nothing to take while the lease holds (however slow this machine), then the delivery.
+    const second = hubOn(store, () => 204, { leaseMs: LEASE })
     second.hub.start()
-    await sleep(60)
-    expect(second.got).toHaveLength(0)
     await until('taken again', () => second.got.length === 1)
+    const retakenAt = Date.parse((await store.listWebhookDeliveries('acme', 'wh_00000000000000a1'))[0]!.lastAttemptAt!)
+    expect(retakenAt - takenAt).toBeGreaterThanOrEqual(LEASE)
     const d = await until('delivered', async () => (await store.listWebhookDeliveries('acme', 'wh_00000000000000a1')).find(x => x.status === 'delivered'))
     expect([d.attempts, d.lastStatus]).toEqual([2, 204])
     // The first one's answer, come too late, changes nothing: its claim is no longer the delivery's.
@@ -228,8 +269,8 @@ describe('the webhook hub', () => {
     const store = await setup({ events: ['trunk.degraded'] })
     const { hub, got } = hubOn(store, () => 204)
     hub.start()
-    const delivery = await hub.test('acme', 'wh_00000000000000a1')
-    expect(delivery?.eventType).toBe('webhook.test')
+    const delivery = (await hub.test('acme', 'wh_00000000000000a1')) as WebhookDeliveryRecord
+    expect(delivery.eventType).toBe('webhook.test')
     await until('the test', () => got.length === 1)
     expect(JSON.parse(got[0]!.body)).toMatchObject({ type: 'webhook.test', tenant: 'acme', subscription: 'wh_00000000000000a1' })
     expect(await hub.test('other', 'wh_00000000000000a1')).toBeNull()
@@ -295,12 +336,14 @@ describe('the webhook hub', () => {
     await store.addWebhookSubscription(subscription({ tenantId: 'other', id: 'wh_00000000000000b1', url: 'https://crm.example.net/in' }), 20)
     let inFlight = 0
     let most = 0
+    // Acme's attempts time out when the test says (after the other tenant was delivered).
+    const timeouts = gate()
     const { hub, got } = hubOn(
       store,
       async g => {
         if (g.url.includes('example.net')) return 204
         most = Math.max(most, ++inFlight)
-        await sleep(400)
+        await timeouts.opened
         inFlight--
         throw new DeliveryError('timeout', 'no answer')
       },
@@ -309,10 +352,11 @@ describe('the webhook hub', () => {
     hub.start()
     for (let i = 10; i < 40; i++) await hub.publish('acme', missed(`evt_${String(i).padStart(32, '0')}`))
     await until('acme holding what it may', () => inFlight >= 4)
-    const at = Date.now()
     await hub.publish('other', { ...missed('evt_000000000000000000000000000000ff'), tenant: 'other' })
-    await until('the other tenant delivered', () => got.some(g => g.url.includes('example.net')), 2_000)
-    expect(Date.now() - at).toBeLessThan(300)
+    // Delivered while every place acme may hold is still held: it waited for none of them.
+    await until('the other tenant delivered', () => got.some(g => g.url.includes('example.net')))
+    expect(inFlight).toBe(4)
+    timeouts.open()
     // Five failures in a row: the subscription is paused, its deliveries wait.
     const paused = await until('paused', async () => (await store.listWebhookSubscriptions('acme')).find(w => w.pausedUntil && w.failures >= 5), 10_000)
     expect(Date.parse(paused.pausedUntil!)).toBeGreaterThan(Date.now() - 1000)
@@ -385,6 +429,187 @@ describe('the webhook hub', () => {
     expect(await change(second.hub, 'available')).toBe(0)
     expect(await change(second.hub, 'busy')).toBe(1)
   })
+
+  it('never lets two tenants whose subscribers answer 204 slowly delay a third, at the default settings (review 10a, second, n°2)', async () => {
+    const store = new MemoryStore()
+    // Two tenants of 20 subscriptions each, whose subscribers answer 204 in 9 s (here: when the test says).
+    const slow = ['slow1', 'slow2']
+    for (const tenantId of [...slow, 'third']) await store.setWebhookDomains(tenantId, ['crm.example.org'])
+    for (const tenantId of slow) for (let i = 0; i < 20; i++) await store.addWebhookSubscription(subscription({ tenantId, id: `wh_${tenantId === 'slow1' ? 'a' : 'b'}${String(i).padStart(15, '0')}` }), 20)
+    await store.addWebhookSubscription(subscription({ tenantId: 'third', id: 'wh_c000000000000000' }), 20)
+    const answers = gate()
+    const held = new Map<string, number>()
+    const delivered: string[] = []
+    const hub = new WebhookHub({
+      store,
+      key,
+      logger: quiet,
+      post: async (_url, body) => {
+        const tenant = (JSON.parse(body) as { tenant: string }).tenant
+        if (tenant === 'third') {
+          delivered.push(tenant)
+          return { status: 204 }
+        }
+        held.set(tenant, (held.get(tenant) ?? 0) + 1)
+        await answers.opened
+        return { status: 204 }
+      }
+    })
+    hubs.push(hub)
+    hub.start()
+    // Each of the slow tenants has an event for each of its subscriptions, then more (a busy call centre).
+    for (const tenantId of slow) for (let i = 0; i < 3; i++) await hub.publish(tenantId, { ...missed(`evt_${tenantId === 'slow1' ? 'a' : 'b'}${String(i).padStart(31, '0')}`), tenant: tenantId })
+    await until('the slow tenants holding what they may', () => (held.get('slow1') ?? 0) + (held.get('slow2') ?? 0) >= 2 * hub.perTenant)
+    // A quarter of the Gateway each (4 of 16), whatever they have queued: the rest is free for the others.
+    expect(hub.perTenant).toBe(4)
+    expect([held.get('slow1'), held.get('slow2')]).toEqual([4, 4])
+    await hub.publish('third', { ...missed('evt_c0000000000000000000000000000001'), tenant: 'third' })
+    await until('the third tenant delivered while the slow ones still hold their places', () => delivered.length === 1)
+    expect([held.get('slow1'), held.get('slow2')]).toEqual([4, 4])
+    answers.open()
+  })
+
+  it('lifts the pause of a subscription it sends a test to, and resumes one without closing what it waits to send', async () => {
+    const store = await setup()
+    const { hub, got } = hubOn(store, () => 204)
+    hub.start()
+    const later = new Date(Date.now() + 3_600_000).toISOString()
+    await store.pauseWebhookSubscription('acme', 'wh_00000000000000a1', later)
+    await hub.publish('acme', missed())
+    // A test lifts the pause: it and what waited go now, not in an hour.
+    await hub.test('acme', 'wh_00000000000000a1')
+    await until('both delivered', () => got.length === 2)
+    expect((await store.getWebhookSubscription('acme', 'wh_00000000000000a1'))?.pausedUntil).toBeUndefined()
+    // Paused again and failing: resumed, its failures forgotten, what waits sent.
+    await store.pauseWebhookSubscription('acme', 'wh_00000000000000a1', later)
+    await hub.publish('acme', missed('evt_00000000000000000000000000000006'))
+    expect(await hub.resume('acme', 'wh_00000000000000a1')).toBe(true)
+    expect(await hub.resume('other', 'wh_00000000000000a1')).toBe(false)
+    await until('sent once resumed', () => got.length === 3)
+  })
+
+  it('alerts the administrators when a subscription has too many waiting, once, and counts what it did not queue', async () => {
+    const store = await setup()
+    const answers = gate()
+    const { hub } = hubOn(store, async () => (await answers.opened, 204), { maxPending: 2 })
+    hub.start()
+    for (let i = 60; i < 66; i++) await hub.publish('acme', missed(`evt_${String(i).padStart(32, '0')}`))
+    const alerts = await until('alerted', async () => {
+      const list = await store.listAlerts('acme')
+      return list.length ? list : undefined
+    })
+    expect(alerts.map(a => [a.alert.kind, a.alert.param, a.count])).toEqual([['webhook', 'backlog', 1]])
+    const w = await store.getWebhookSubscription('acme', 'wh_00000000000000a1')
+    expect(w?.backlog).toBe(4)
+    answers.open()
+  })
+
+  it('fails what was abandoned by a Gateway that stopped on its last attempt, apart from the claims', async () => {
+    const store = await setup()
+    const { hub } = hubOn(store, () => 204, { maxAttempts: 1 })
+    await store.enqueueWebhookEvent('acme', 'evt_x', 'call.missed', '{}', undefined)
+    const [d] = await store.claimWebhookDeliveries(1, { perSubscription: 2, perTenant: 4, maxAttempts: 1, leaseMs: 0 })
+    expect(d?.attempts).toBe(1)
+    expect(await hub.sweep()).toBe(1)
+    const [after] = await store.listWebhookDeliveries('acme', 'wh_00000000000000a1')
+    expect([after?.status, after?.lastError]).toEqual(['failed', 'abandoned'])
+  })
+
+  it('drops what it cannot queue soon enough rather than piling it up, and says so', async () => {
+    const store = await setup()
+    const warned: string[] = []
+    const enqueue = store.enqueueWebhookEvent.bind(store)
+    const slowDb = gate()
+    store.enqueueWebhookEvent = async (...args) => (await slowDb.opened, enqueue(...args))
+    const { hub } = hubOn(store, () => 204, { publishConcurrency: 1, publishQueue: 2, logger: { ...quiet, warn: (_o, msg) => void warned.push(msg ?? '') } })
+    const all = [10, 11, 12, 13].map(i => hub.publish('acme', missed(`evt_${String(i).padStart(32, '0')}`)))
+    // The fourth: one being queued, two waiting; dropped at once.
+    expect(await all[3]).toBe(0)
+    expect(warned).toEqual(['webhook events dropped: too many waiting to be queued'])
+    slowDb.open()
+    expect(await Promise.all(all.slice(0, 3))).toEqual([1, 1, 1])
+  })
+
+  it('takes no lease back after it stopped, however late the renewal under way ends (review 10a, second, n°6)', async () => {
+    const store = await setup()
+    const clock = store.clock.bind(store)
+    const slowClock = gate()
+    let reads = 0
+    store.clock = async () => {
+      if (++reads > 1) await slowClock.opened
+      return clock()
+    }
+    let leads = 0
+    const { hub } = hubOn(store, () => 204, { stateLeaseMs: 60_000 })
+    hub.onLead(() => void leads++)
+    await hub.renewLease()
+    expect([hub.leading, leads]).toEqual([true, 1])
+    // A renewal waits on a slow database; the hub stops meanwhile.
+    hub.start()
+    const renewal = hub.renewLease()
+    const stopping = hub.stop()
+    slowClock.open()
+    await Promise.all([renewal, stopping])
+    expect(hub.leading).toBe(false)
+    expect(leads).toBe(1)
+    // The lease was given back after the renewal ended: another Gateway takes it at once.
+    expect(await store.takeWebhookLease(WEBHOOK_STATE_ROLE, 'gw_next', 60_000)).toBe(true)
+    // One renewal at a time: asked twice, run once.
+    const once = new WebhookHub({ store, key, logger: quiet })
+    let taken = 0
+    const take = store.takeWebhookLease.bind(store)
+    store.takeWebhookLease = (...args) => (taken++, take(...args))
+    once.start()
+    await Promise.all([once.renewLease(), once.renewLease()])
+    expect(taken).toBe(1)
+    await once.stop()
+  })
+
+  it('gives the lease to a Gateway that hears its events, and tells again what it knows once it hears them again (review 10a, second, n°8)', async () => {
+    const store = await setup({ events: ['presence.changed'] })
+    let deafHears = false
+    const deaf = hubOn(store, () => 204, { healthy: () => deafHears, stateLeaseMs: 60_000 })
+    const ok = hubOn(store, () => 204, { stateLeaseMs: 60_000 })
+    let told = 0
+    deaf.hub.onLead(() => void told++)
+    // Alone, the one that does not hear takes the lease (better than nobody)...
+    await deaf.hub.renewLease()
+    expect(deaf.hub.leading).toBe(true)
+    // ...and gives it to one that hears at its next renewal.
+    await ok.hub.renewLease()
+    await deaf.hub.renewLease()
+    expect([deaf.hub.leading, ok.hub.leading]).toEqual([false, true])
+    await ok.hub.stop()
+    await deaf.hub.renewLease()
+    expect(deaf.hub.leading).toBe(true)
+    expect(told).toBe(2)
+    // It hears again: what it knows is told again (its events lost meanwhile).
+    deafHears = true
+    await deaf.hub.renewLease()
+    await until('told again', () => told === 3)
+  })
+
+  it('tells the changes of a lease that changed hands between two of them, with a second Gateway whose clock lags (review 10a, second, n°14)', async () => {
+    const store = await setup({ events: ['presence.changed'] })
+    const first = hubOn(store, () => 204)
+    // Its clock a minute behind the store's: the changes it tells are dated by the store, after the first one's.
+    const second = hubOn(store, () => 204, { now: () => Date.now() - 60_000 })
+    const change = (hub: WebhookHub, status: 'busy' | 'available' | 'away') => hub.publishChange('acme', 'presence:jdupont', status, ['presence.changed'], (_p, at) => presenceEvent('acme', 'jdupont', '102', status, at))
+    await first.hub.renewLease()
+    await second.hub.renewLease()
+    expect(await change(first.hub, 'busy')).toBe(1)
+    expect(await change(second.hub, 'available')).toBeNull()
+    await first.hub.stop()
+    await second.hub.renewLease()
+    expect(second.hub.leading).toBe(true)
+    expect(await change(second.hub, 'available')).toBe(1)
+    expect(await change(first.hub, 'away')).toBeNull()
+    expect(await change(second.hub, 'away')).toBe(1)
+    const log = (await store.listWebhookDeliveries('acme', 'wh_00000000000000a1')).reverse().map(d => JSON.parse(d.body) as { presence: { status: string }; occurred_at: string })
+    expect(log.map(e => e.presence.status)).toEqual(['busy', 'available', 'away'])
+    // Dated in the order they were told, whatever the second one's clock.
+    expect(log.map(e => e.occurred_at)).toEqual(log.map(e => e.occurred_at).sort())
+  })
 })
 
 if (process.env.TEST_DATABASE_URL) {
@@ -428,7 +653,8 @@ if (process.env.TEST_DATABASE_URL) {
       const [a, b] = [store(), store()]
       const tenant = `two-${Date.now()}`
       await a.setWebhookDomains(tenant, ['crm.example.org'])
-      await a.addWebhookSubscription(subscription({ tenantId: tenant, id: `wh_${randomBytes(8).toString('hex')}` }), 20)
+      const sub = `wh_${randomBytes(8).toString('hex')}`
+      await a.addWebhookSubscription(subscription({ tenantId: tenant, id: sub }), 20)
       const seen: string[] = []
       const answer = async (g: Got) => {
         seen.push(JSON.parse(g.body).id as string)
@@ -442,8 +668,8 @@ if (process.env.TEST_DATABASE_URL) {
       const ids = Array.from({ length: 40 }, (_, i) => `evt_${String(i).padStart(32, '0')}`)
       // Each event heard by both Gateways (both subscribe to OpenSIPS): queued once.
       await Promise.all(ids.flatMap(id => [one.hub.publish(tenant, { ...missed(id), tenant }), two.hub.publish(tenant, { ...missed(id), tenant })]))
-      await until('all delivered', () => seen.length >= ids.length, 10_000)
-      await sleep(200)
+      // All delivered in the store: none can be sent again (each held until its lease, a minute, and done since).
+      await until('all delivered', async () => (await a.listWebhookDeliveries(tenant, sub, { limit: 200, status: 'delivered' })).length === ids.length, 10_000)
       expect(seen.sort()).toEqual(ids)
       expect(one.got.length).toBeGreaterThan(0)
       expect(two.got.length).toBeGreaterThan(0)
@@ -475,6 +701,32 @@ if (process.env.TEST_DATABASE_URL) {
       const told = [...one.got, ...two.got].map(g => JSON.parse(g.body) as { presence: { status: string }; occurred_at: string }).sort((x, y) => x.occurred_at.localeCompare(y.occurred_at))
       expect(told.map(e => e.presence.status)).toEqual(['busy', 'available'])
       for (const h of [one.hub, two.hub]) await h.stop()
+    }, 20_000)
+
+    it('tells the changes in order across a lease changing hands, the second Gateway\u2019s clock lagging (review 10a, second, n°14)', async () => {
+      const [a, b] = [store(), store()]
+      const tenant = `handoff-${Date.now()}`
+      const sub = `wh_${randomBytes(8).toString('hex')}`
+      await a.setWebhookDomains(tenant, ['crm.example.org'])
+      await a.addWebhookSubscription(subscription({ tenantId: tenant, id: sub, events: ['presence.changed'] }), 20)
+      const one = hubOn(a, () => 204)
+      const two = hubOn(b, () => 204, { now: () => Date.now() - 60_000 })
+      await until('the first one tells', async () => {
+        await one.hub.renewLease()
+        return one.hub.leading
+      })
+      await two.hub.renewLease()
+      const change = (hub: WebhookHub, status: 'busy' | 'available' | 'away') => hub.publishChange(tenant, 'presence:jdupont', status, ['presence.changed'], (_p, at) => presenceEvent(tenant, 'jdupont', '102', status, at))
+      expect(await change(one.hub, 'busy')).toBe(1)
+      await one.hub.stop()
+      await two.hub.renewLease()
+      expect(two.hub.leading).toBe(true)
+      expect(await change(two.hub, 'available')).toBe(1)
+      expect(await change(two.hub, 'away')).toBe(1)
+      const log = (await a.listWebhookDeliveries(tenant, sub)).reverse().map(d => JSON.parse(d.body) as { presence: { status: string }; occurred_at: string })
+      expect(log.map(e => e.presence.status)).toEqual(['busy', 'available', 'away'])
+      expect(log.map(e => e.occurred_at)).toEqual(log.map(e => e.occurred_at).sort())
+      await two.hub.stop()
     }, 20_000)
   })
 }

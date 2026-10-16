@@ -234,6 +234,11 @@ export class OpensipsProvider implements TelephonyProvider, MediaProvider {
     return !this.events || this.events.connected ? 'CONNECTED' : 'DEGRADED'
   }
 
+  /** False while OpenSIPS's events are configured but not subscribed (OpenSIPS down or restarting). */
+  eventsConnected(): boolean {
+    return !this.events || this.events.connected
+  }
+
   getStatusReason(): string | undefined {
     return this.config.schemaProblem?.() ?? this.events?.reason
   }

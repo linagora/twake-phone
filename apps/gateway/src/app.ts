@@ -23,14 +23,14 @@ import { TrunkWatch } from './trunk-health.js'
 import { encrypt } from './crypto.js'
 import { newWebhookSecret, parseWebhookDomains } from './webhook-delivery.js'
 import { presenceEvent, webhookEventsFor } from './webhook-events.js'
-import { DELIVERY_CURSOR, DELIVERY_ID, MAX_WEBHOOKS, WEBHOOK_ID, WEBHOOK_SECRET_GRACE_MS, WEBHOOK_SENDS_PER_MINUTE, WebhookHub, parseSubscription, publicDelivery, publicSubscription, secretContext, type WebhookHubOptions } from './webhooks.js'
+import { DELIVERY_CURSOR, DELIVERY_ID, MAX_WEBHOOKS, WEBHOOK_ID, WEBHOOK_SECRET_GRACE_MS, WEBHOOK_SENDS_PER_MINUTE, WEBHOOK_TENANT_SENDS_PER_MINUTE, WebhookHub, parseSubscription, publicDelivery, publicSubscription, secretContext, type WebhookHubOptions } from './webhooks.js'
 import { MAX_DIDS, MAX_TRUNKS, TRUNK_ID, defaultTrunk, parseDid, parseTrunk, providerTrunks, publicDid, publicTrunk, trunkRecord } from './trunks.js'
 import { EMPTY_OUTBOUND, PROFILE_ID, outboundVersion, parseOutbound, staleOutbound, type Outbound } from './outbound.js'
 import { MemoryStore } from './store/memory.js'
 import { ALERT_RETENTION_DAYS, clampLimit, isMissed, type HistoryEntry, type HistoryQuery, type Store, type StoredAlert, type TrunkRecord, type UserPresenceRecord, type WebhookDeliveryStatus, type WebhookSubscriptionRecord } from './store/types.js'
 
 /** What the SIP server raises for the administrators (TelephonyAlert). */
-const ALERT_KINDS = ['fraud-warning', 'fraud-critical', 'limit', 'rights', 'emergency', 'meet'] as const
+const ALERT_KINDS = ['fraud-warning', 'fraud-critical', 'limit', 'rights', 'emergency', 'meet', 'webhook'] as const
 /** An extension as the log names it: the same short hash for the same tenant and extension, never the extension. */
 /**
  * The extension of an alert in the log (second review 6b, n°7): a keyed hash (HMAC-SHA-256, with a key the Gateway
@@ -79,6 +79,8 @@ const RESTORE_RETRY_MS = [1_000, 5_000, 15_000, 30_000]
 const PUSH_PURGE_GRACE_MS = 3_600_000
 /** Longest wait of a change for the one before it (a provider whose database hangs): the next one then goes. */
 const TURN_MAX_MS = 10_000
+/** Presences told again at a time when this Gateway takes the lease of the changes of state (onLead). */
+const PRESENCE_BATCH = 20
 /** One line of text: no control character (a message for callers ends up in a SIP header). */
 // eslint-disable-next-line no-control-regex -- control characters are exactly what is refused here
 const CONTROL = /[\u0000-\u001f\u007f]/
@@ -162,8 +164,17 @@ export interface BuildOptions {
    * none: the routes answer 501.
    */
   webhooks?: Partial<Omit<WebhookHubOptions, 'store' | 'key' | 'logger'>>
-  /** Tests and replays a subscription may be asked a minute, whatever Gateway or administrator asks (default 10). */
+  /**
+   * Tests and replays a subscription may be asked a minute, whatever Gateway or administrator asks (default 10), and
+   * all the subscriptions of an organisation together (default 30).
+   */
   webhookSendsPerMinute?: number
+  webhookTenantSendsPerMinute?: number
+  /**
+   * How long a person's presence stays the same before it is told (default 2 s): a short call is not two
+   * `presence.changed`, only the status it settles on. 0: at once (tests).
+   */
+  webhookPresenceSettleMs?: number
   /**
    * How often the trunks are read for `trunk.degraded` and `trunk.recovered` (step 10a), when the hub is there: every
    * 30 s by default; 0: never. `trunkWatchConfirm`: reads in a row a new health is seen before it is told (default 2).
@@ -387,8 +398,12 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
       }
     }
   })
-  // The webhook hub (step 10a, ADR 0020): only with SECRETS_KEY, which keeps the subscriptions' secrets.
-  const hub = options.secretsKey ? new WebhookHub({ store, key: options.secretsKey, ...options.webhooks, logger: app.log }) : undefined
+  // The webhook hub (step 10a, ADR 0020): only with SECRETS_KEY, which keeps the subscriptions' secrets. It tells the
+  // changes of state while the providers' event streams are up (`healthy`): otherwise another Gateway that hears them
+  // takes the lease.
+  const hub = options.secretsKey
+    ? new WebhookHub({ store, key: options.secretsKey, healthy: () => [...started.values()].every(p => p.eventsConnected?.() !== false), ...options.webhooks, logger: app.log })
+    : undefined
   /** Queues an event for the subscribers; never holds the stream of the provider's events (a database that hangs). */
   const publish = (tenantId: string, event: Parameters<WebhookHub['publish']>[1]) => {
     if (!hub) return Promise.resolve(0)
@@ -397,11 +412,31 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
       return 0
     })
   }
-  /** A person's presence, told once if it changed (WebhookHub.publishChange); not awaited. */
+  /** A person's presence, told once if it changed (WebhookHub.publishChange). */
+  const tellPresence = (tenantId: string, userId: string, extension: string | undefined, status: PresenceStatus) =>
+    hub
+      ? hub
+          .publishChange(tenantId, `presence:${userId}`, status, ['presence.changed'], (_previous, at) => presenceEvent(tenantId, userId, extension, status, at))
+          .catch((err: unknown) => {
+            app.log.error({ err, tenantId }, 'webhook presence not queued')
+            return null
+          })
+      : Promise.resolve(null)
+  // The presence a person settles on, told once it stayed webhookPresenceSettleMs (not awaited): a call that rings
+  // and ends within it is no change.
+  const presenceSettleMs = options.webhookPresenceSettleMs ?? 2_000
+  const settling = new Map<string, ReturnType<typeof setTimeout>>()
   const publishPresence = (tenantId: string, userId: string, extension: string | undefined, status: PresenceStatus) => {
-    void hub
-      ?.publishChange(tenantId, `presence:${userId}`, status, ['presence.changed'], (_previous, at) => presenceEvent(tenantId, userId, extension, status, at))
-      .catch((err: unknown) => app.log.error({ err, tenantId }, 'webhook presence not queued'))
+    if (!hub?.leading) return
+    if (!presenceSettleMs) return void tellPresence(tenantId, userId, extension, status)
+    const k = `${tenantId}\u0000${userId}`
+    clearTimeout(settling.get(k))
+    const timer = setTimeout(() => {
+      settling.delete(k)
+      void tellPresence(tenantId, userId, extension, status)
+    }, presenceSettleMs)
+    timer.unref()
+    settling.set(k, timer)
   }
   // Action endpoints (hold, hangup...) legitimately carry no body.
   // The raw text is kept: LiveKit webhooks sign the exact bytes of the body.
@@ -778,15 +813,21 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
             return status.available ? status.items : undefined
           },
           names: async tenantId => new Map((await store.listTrunks(tenantId)).map(t => [t.id, t.config.name])),
+          told: tenantId => store.listWebhookStates(tenantId, 'trunk:'),
           ...(options.trunkWatchMs ? { everyMs: options.trunkWatchMs } : {}),
           ...(options.trunkWatchConfirm ? { confirm: options.trunkWatchConfirm } : {}),
           logger: app.log
         })
       : undefined
-  // This Gateway tells the changes of state from now on: what changed while another one told them (or nobody, the
-  // lease lapsing) is told now, each presence it knows compared to what was told.
-  hub?.onLead(() => {
-    for (const tenantId of started.keys()) for (const [extension, { userId, presence }] of presencesOf(tenantId)) publishPresence(tenantId, userId, extension, presence.status)
+  // This Gateway tells the changes of state from now on (or hears its events again): what changed while another one
+  // told them (or nobody, the lease lapsing) is told now, each presence it knows compared to what was told. By
+  // batches: the API and the queue keep their share of the database meanwhile.
+  hub?.onLead(async () => {
+    const all = [...started.keys()].flatMap(tenantId => [...presencesOf(tenantId)].map(([extension, { userId, presence }]) => ({ tenantId, extension, userId, status: presence.status })))
+    for (let i = 0; i < all.length; i += PRESENCE_BATCH) {
+      if (closing || !hub.leading) return
+      await Promise.all(all.slice(i, i + PRESENCE_BATCH).map(p => tellPresence(p.tenantId, p.userId, p.extension, p.status)))
+    }
   })
   app.addHook('onReady', async () => {
     void purgeAlerts()
@@ -795,6 +836,8 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
   })
   app.addHook('onClose', async () => {
     closing = true
+    for (const timer of settling.values()) clearTimeout(timer)
+    settling.clear()
     clearInterval(alertPurge)
     trunkWatch?.stop()
     await hub?.stop()
@@ -1377,13 +1420,16 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         const domains = await store.getWebhookDomains(tenantId)
         return records.map(r => publicSubscription(r, domains, hubOf().policy, hubOf().clock()))
       }
-      // Tests and replays send a request to the subscriber: 10 a minute per subscription, whatever Gateway or
-      // administrator asks; none to a disabled one (it receives nothing, as the screen says).
+      // Tests and replays send a request to the subscriber: 10 a minute per subscription and 30 per organisation,
+      // whatever Gateway or administrator asks (a subscription deleted and made again counts the same); none to a
+      // disabled one (it receives nothing, as the screen says).
       const sendable = async (tenantId: string, record: WebhookSubscriptionRecord) => {
         if (!record.enabled) throw Object.assign(new Error('This subscription is disabled: enable it first'), { statusCode: 409, code: 'WEBHOOK_DISABLED' })
-        if (!(await store.takeWebhookSend(tenantId, record.id, new Date(hubOf().clock()).toISOString(), options.webhookSendsPerMinute ?? WEBHOOK_SENDS_PER_MINUTE, 60_000)))
-          throw Object.assign(new Error('Too many deliveries asked of this subscription, slow down'), { statusCode: 429, code: 'WEBHOOK_RATE' })
+        const limit = options.webhookSendsPerMinute ?? WEBHOOK_SENDS_PER_MINUTE
+        if (!(await store.takeWebhookSend(tenantId, record.id, undefined, limit, 60_000, options.webhookTenantSendsPerMinute ?? WEBHOOK_TENANT_SENDS_PER_MINUTE)))
+          throw Object.assign(new Error('Too many deliveries asked of this subscription or organisation, slow down'), { statusCode: 429, code: 'WEBHOOK_RATE' })
       }
+      const backlog = () => Object.assign(new Error('This subscription has too many deliveries waiting: let them go first'), { statusCode: 409, code: 'WEBHOOK_BACKLOG' })
       v1.get('/webhooks/domains', async req => {
         const user = await administrator(req)
         hubOf()
@@ -1441,17 +1487,29 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         return reply.code(204).send()
       })
       // A new secret, at once: the deliveries sent from now on are signed with it, and for a day with the one it
-      // replaced as well (a second `v1`), the time for the subscriber to take the new one.
-      v1.post<{ Params: { id: string } }>('/webhooks/:id/secret', async req => {
+      // replaced as well (a second `v1`), the time for the subscriber to take the new one. Only that one: renewed
+      // again within the day, the first one no longer signs. `?grace=0`: the one it replaced no longer signs at all (a
+      // secret that leaked).
+      v1.post<{ Params: { id: string }; Querystring: { grace?: string } }>('/webhooks/:id/secret', async req => {
         const user = await administrator(req)
         const h = hubOf()
+        if (req.query.grace !== undefined && req.query.grace !== '0') throw Object.assign(new Error('grace: 0 (the secret replaced no longer signs), or nothing (a day)'), { statusCode: 400, code: 'WEBHOOK_QUERY' })
         const current = await subscriptionOf(user.tenantId, req.params.id)
         const secret = newWebhookSecret()
         const now = h.clock()
-        const previousUntil = new Date(now + WEBHOOK_SECRET_GRACE_MS).toISOString()
+        const previousUntil = req.query.grace === '0' ? null : new Date(now + WEBHOOK_SECRET_GRACE_MS).toISOString()
         if (!(await store.renewWebhookSecret(user.tenantId, current.id, encrypt(secret, options.secretsKey!, secretContext(user.tenantId, current.id)), previousUntil, new Date(now).toISOString()))) throw notFound('webhook subscription')
-        app.log.info({ tenantId: user.tenantId, subscription: current.id, by: user.id }, 'webhook secret renewed')
-        return { secret, previousSecretUntil: previousUntil }
+        app.log.info({ tenantId: user.tenantId, subscription: current.id, by: user.id, grace: previousUntil !== null }, 'webhook secret renewed')
+        return { secret, ...(previousUntil ? { previousSecretUntil: previousUntil } : {}) }
+      })
+      // Started afresh (its subscriber repaired): no pause, no failures, no backlog counted; what waits is sent.
+      v1.post<{ Params: { id: string } }>('/webhooks/:id/resume', async req => {
+        const user = await administrator(req)
+        const h = hubOf()
+        const current = await subscriptionOf(user.tenantId, req.params.id)
+        if (!(await h.resume(user.tenantId, current.id))) throw notFound('webhook subscription')
+        app.log.info({ tenantId: user.tenantId, subscription: current.id, by: user.id }, 'webhook subscription resumed')
+        return (await webhookView(user.tenantId, [await subscriptionOf(user.tenantId, current.id)]))[0]
       })
       v1.post<{ Params: { id: string } }>('/webhooks/:id/test', async (req, reply) => {
         const user = await administrator(req)
@@ -1459,6 +1517,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         await sendable(user.tenantId, await subscriptionOf(user.tenantId, req.params.id))
         const delivery = await h.test(user.tenantId, req.params.id)
         if (!delivery) throw notFound('webhook subscription')
+        if (delivery === 'full') throw backlog()
         return reply.code(202).send(publicDelivery(delivery))
       })
       // The log of a subscription, the latest first, a page at a time (`next`: the `before` of the next page).
@@ -1487,20 +1546,21 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         const user = await administrator(req)
         const h = hubOf()
         await sendable(user.tenantId, await subscriptionOf(user.tenantId, req.params.id))
-        const replayed = DELIVERY_ID.test(req.params.deliveryId) ? await store.replayWebhookDelivery(user.tenantId, req.params.id, req.params.deliveryId, new Date(h.clock()).toISOString()) : null
+        const replayed = DELIVERY_ID.test(req.params.deliveryId) ? await h.replay(user.tenantId, req.params.id, req.params.deliveryId) : null
         if (!replayed) throw notFound('delivery')
         if (replayed === 'pending') throw Object.assign(new Error('This delivery is still pending: it is sent again by itself'), { statusCode: 409, code: 'WEBHOOK_PENDING' })
-        h.nudge()
+        if (replayed === 'full') throw backlog()
         return reply.code(202).send(publicDelivery(replayed))
       })
 
       // Right to erasure of one's own call history: with it, the log of what the subscribers were sent about them
-      // (what is still to be sent is sent all the same: the organisation's tools are owed it) and what was told of
-      // their presence.
+      // (what is still to be sent is sent all the same, the organisation's tools are owed it, then kept without its
+      // body) and what was told of their presence. The webhooks' first: a failure between the two leaves the history,
+      // which the person sees and erases again, never a log they cannot see.
       v1.delete('/me/history', async (req, reply) => {
         const user = await whoIs(req)
-        const deleted = await store.deleteHistory(user.tenantId, user.id)
         await store.eraseWebhookSubject(user.tenantId, user.id)
+        const deleted = await store.deleteHistory(user.tenantId, user.id)
         return reply.send({ deleted })
       })
 

@@ -173,8 +173,11 @@ export interface WebhookSubscription {
   deliverable: boolean
   /** Deliveries failed in a row (none when the last one went through). */
   failures?: number
-  /** Nothing is tried until then: the subscriber failed too often in a row. */
+  /** Nothing is tried until then: the subscriber failed too often in a row (a test or `resumeWebhook` lifts it). */
   pausedUntil?: string
+  /** Events not queued since it was last enabled or resumed (too many pending), the latest at `backlogAt`. */
+  backlog?: number
+  backlogAt?: string
   /** The secret before the last renewal still signs (a second `v1`) until then. */
   previousSecretUntil?: string
   createdAt: string
@@ -389,9 +392,17 @@ export class TelephonyClient {
     await this.request<void>(`/webhooks/${encodeURIComponent(id)}`, { method: 'DELETE' })
   }
 
-  /** A new signing secret, in use at once: shown this once. The one it replaces still signs until `previousSecretUntil`. */
-  renewWebhookSecret(id: string) {
-    return this.request<{ secret: string; previousSecretUntil: string }>(`/webhooks/${encodeURIComponent(id)}/secret`, { method: 'POST' })
+  /**
+   * A new signing secret, in use at once: shown this once. The one it replaces still signs until
+   * `previousSecretUntil` (a day), unless `revoke` (a secret that leaked): then it signs no more at all.
+   */
+  renewWebhookSecret(id: string, opts: { revoke?: boolean } = {}) {
+    return this.request<{ secret: string; previousSecretUntil?: string }>(`/webhooks/${encodeURIComponent(id)}/secret${opts.revoke ? '?grace=0' : ''}`, { method: 'POST' })
+  }
+
+  /** Starts the subscription afresh (its subscriber repaired): no pause, no failures counted; what waits is sent. */
+  resumeWebhook(id: string) {
+    return this.request<WebhookSubscription>(`/webhooks/${encodeURIComponent(id)}/resume`, { method: 'POST' })
   }
 
   /** Sends a `webhook.test` to the subscription now. */

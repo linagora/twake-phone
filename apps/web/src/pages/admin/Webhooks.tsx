@@ -7,7 +7,7 @@ import type { Key } from '../../i18n/index.js'
 import { useT } from '../../i18n/useT.js'
 
 const PAGE = 20
-const FAILURES = ['http', 'timeout', 'connection', 'dns', 'tls', 'redirect', 'destination-refused', 'domain-not-allowed', 'secret-unreadable', 'disabled', 'backlog', 'abandoned']
+const FAILURES = ['http', 'unreachable', 'timeout', 'connection', 'dns', 'tls', 'redirect', 'destination-refused', 'domain-not-allowed', 'secret-unreadable', 'disabled', 'backlog', 'abandoned']
 
 /** A secret just made: shown this once, for the subscription it signs. */
 type Secret = { subscription: string; url: string; value: string; previousUntil?: string } | null
@@ -167,11 +167,17 @@ export const Webhooks = () => {
       setNote({ kind: 'ok', text: t('admin.webhooks.testSent', { url: w.url }), focus: true })
       if (logOf?.id === w.id) void readLog(w)
     })
-  const renew = (w: WebhookSubscription) =>
+  const renew = (w: WebhookSubscription, revoke = false) =>
     act(async () => {
-      const r = await client.renewWebhookSecret(w.id)
+      const r = await (revoke ? client.renewWebhookSecret(w.id, { revoke: true }) : client.renewWebhookSecret(w.id))
       setCopied(false)
       setSecret({ subscription: w.id, url: w.url, value: r.secret, previousUntil: r.previousSecretUntil })
+      load()
+    })
+  const resume = (w: WebhookSubscription) =>
+    act(async () => {
+      await client.resumeWebhook(w.id)
+      setNote({ kind: 'ok', text: t('admin.webhooks.resumed', { url: w.url }), focus: true })
       load()
     })
   const remove = (w: WebhookSubscription) =>
@@ -318,6 +324,7 @@ export const Webhooks = () => {
                   ) : w.failures ? (
                     <span className="state state-failed">{t('admin.webhooks.failing', { count: w.failures })}</span>
                   ) : null}
+                  {w.backlog ? <span className="state state-failed"> {t('admin.webhooks.backlog', { count: w.backlog, date: w.backlogAt ? when.format(new Date(w.backlogAt)) : '—' })}</span> : null}
                   {w.previousSecretUntil ? <span className="muted"> {t('admin.webhooks.previousSecret', { date: when.format(new Date(w.previousSecretUntil)) })}</span> : null}
                 </span>
                 <div className="actions actions-end">
@@ -330,7 +337,13 @@ export const Webhooks = () => {
                   <button type="button" className="btn" onClick={() => showLog(w)} disabled={busy} aria-label={t('admin.webhooks.logOf', { url: w.url })}>
                     {t('admin.webhooks.log')}
                   </button>
+                  {w.enabled && (w.pausedUntil || w.failures || w.backlog) ? (
+                    <button type="button" className="btn" onClick={() => void resume(w)} disabled={busy} aria-label={t('admin.webhooks.resumeOf', { url: w.url })}>
+                      {t('admin.webhooks.resume')}
+                    </button>
+                  ) : null}
                   <ConfirmDelete action="admin.webhooks.renew" tone="plain" yes="admin.webhooks.renewYes" label={t('admin.webhooks.renewOf', { url: w.url })} question={t('admin.webhooks.renewConfirm', { url: w.url })} onConfirm={() => void renew(w)} disabled={busy} />
+                  <ConfirmDelete action="admin.webhooks.revoke" yes="admin.webhooks.revokeYes" label={t('admin.webhooks.revokeOf', { url: w.url })} question={t('admin.webhooks.revokeConfirm', { url: w.url })} onConfirm={() => void renew(w, true)} disabled={busy} />
                   <ConfirmDelete label={t('admin.webhooks.deleteOf', { url: w.url })} question={t('admin.webhooks.deleteConfirm', { url: w.url })} onConfirm={() => void remove(w)} disabled={busy} />
                 </div>
               </li>

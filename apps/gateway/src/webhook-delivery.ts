@@ -81,14 +81,37 @@ const hostOf = (url: URL) => url.hostname.toLowerCase().replace(/^\[|\]$/g, '').
 /** Whether `host` is one of `domains` (exactly, or a subdomain of a `*.` entry). */
 export const hostAllowed = (host: string, domains: readonly string[]) => domains.some(d => (d.startsWith('*.') ? host.endsWith(d.slice(1)) && host.length > d.length - 1 : host === d))
 
+/** The ports a subscriber listens on unless the operator lists others (WEBHOOK_PORTS). */
+export const WEBHOOK_PORTS: readonly number[] = [443, 80]
+
 export interface DestinationPolicy {
   /** `http:` as well as `https:` (WEBHOOK_ALLOW_HTTP=1: development and tests only). */
   allowHttp?: boolean
+  /**
+   * The ports an address may name (WEBHOOK_PORTS; WEBHOOK_PORTS by default): the Gateway is no scanner of the ports
+   * of whatever address an administrator chooses. Port 0 never.
+   */
+  ports?: readonly number[]
 }
 
+/** WEBHOOK_PORTS: ports from 1 to 65535, comma-separated (`443,8443`); WEBHOOK_PORTS when unset. */
+export const parsePorts = (value: string | undefined, name = 'WEBHOOK_PORTS'): number[] => {
+  const entries = (value ?? '').split(',').map(x => x.trim()).filter(Boolean)
+  if (!entries.length) return [...WEBHOOK_PORTS]
+  return entries.map(e => {
+    const port = Number(e)
+    if (!/^\d{1,5}$/.test(e) || port < 1 || port > 65_535) throw new Error(`${name}: ${e} is no port (1 to 65535)`)
+    return port
+  })
+}
+
+/** The port an address names, its scheme's when it names none. */
+const portOf = (url: URL) => (url.port ? Number(url.port) : url.protocol === 'https:' ? 443 : 80)
+
 /**
- * The address of a subscription, as kept: an absolute https URL (http only when the operator allows it), without
- * credentials nor fragment, whose host the organisation allows. A 400 with a code the app puts into words.
+ * The address of a subscription, as kept: an absolute https URL (http only when the operator allows it), on one of
+ * the ports allowed, without credentials nor fragment, whose host the organisation allows. A 400 with a code the app
+ * puts into words.
  */
 export const parseWebhookUrl = (value: unknown, domains: readonly string[], policy: DestinationPolicy = {}): string => {
   if (typeof value !== 'string' || !value.trim() || value.length > WEBHOOK_URL_MAX) throw refused('WEBHOOK_URL', `url: an https address of ${WEBHOOK_URL_MAX} characters at most`)
@@ -101,11 +124,14 @@ export const parseWebhookUrl = (value: unknown, domains: readonly string[], poli
   if (url.protocol !== 'https:' && !(policy.allowHttp && url.protocol === 'http:')) throw refused('WEBHOOK_URL_SCHEME', 'url: https only')
   if (url.username || url.password) throw refused('WEBHOOK_URL', 'url: no user name nor password in the address (the signature authenticates the platform)')
   if (url.hash) throw refused('WEBHOOK_URL', 'url: no fragment (#)')
+  const port = portOf(url)
+  const ports = policy.ports ?? WEBHOOK_PORTS
+  if (port === 0 || !ports.includes(port)) throw refused('WEBHOOK_URL_PORT', `url: port ${port} is not allowed (${ports.join(', ')})`)
   if (!hostAllowed(hostOf(url), domains)) throw refused('WEBHOOK_DOMAIN', `url: ${hostOf(url)} is not among the domains the organisation allows`)
   return url.toString()
 }
 
-/** Whether a kept address may still be delivered to: its scheme still allowed, its host still among the domains. */
+/** Whether a kept address may still be delivered to: its scheme and port still allowed, its host still among the domains. */
 export const destinationAllowed = (value: string, domains: readonly string[], policy: DestinationPolicy = {}) => {
   try {
     parseWebhookUrl(value, domains, policy)
@@ -168,9 +194,10 @@ for (const [net, prefix] of SPECIAL_V4) special.ipv4.addSubnet(net, prefix, 'ipv
 for (const [net, prefix] of SPECIAL_V6) special.ipv6.addSubnet(net, prefix, 'ipv6')
 
 /**
- * Networks written `10.20.0.0/16,fd00:1::/64` (an address alone is one host): those the operator opens to deliveries
- * despite the rule above (WEBHOOK_PRIVATE_NETWORKS: a CRM of its own network), or closes to them whatever the rest
- * (WEBHOOK_DENY_NETWORKS: the platform's own public addresses). `name`: the variable, for the error.
+ * Networks written `10.20.0.0/16,fd00:1::/64` (an address alone is one host): those the operator opens to the
+ * deliveries of one organisation despite the rule above (parseTenantNetworks: its CRM in a private network), or
+ * closes to all of them whatever the rest (WEBHOOK_DENY_NETWORKS: the platform's own public addresses). `name`: the
+ * variable, for the error.
  */
 export const parseNetworks = (value: string | undefined, name = 'WEBHOOK_PRIVATE_NETWORKS', into = new BlockList()): BlockList => {
   for (const entry of (value ?? '').split(',').map(s => s.trim()).filter(Boolean)) {
@@ -181,6 +208,23 @@ export const parseNetworks = (value: string | undefined, name = 'WEBHOOK_PRIVATE
     into.addSubnet(net!, prefix, family === 6 ? 'ipv6' : 'ipv4')
   }
   return into
+}
+
+/**
+ * WEBHOOK_PRIVATE_NETWORKS: the networks the operator opens to the deliveries of one organisation each, never to the
+ * others' (an administrator of another one would reach them with a domain of their own that resolves there):
+ * `acme=10.20.0.0/16,fd00:1::/64;beta=192.0.2.10`. A list without an organisation (`10.20.0.0/16`) is that of
+ * `defaultTenant` (a platform of one organisation).
+ */
+export const parseTenantNetworks = (value: string | undefined, defaultTenant: string, name = 'WEBHOOK_PRIVATE_NETWORKS'): Map<string, BlockList> => {
+  const out = new Map<string, BlockList>()
+  for (const part of (value ?? '').split(';').map(x => x.trim()).filter(Boolean)) {
+    const eq = part.indexOf('=')
+    const tenant = eq < 0 ? defaultTenant : part.slice(0, eq).trim()
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(tenant)) throw new Error(`${name}: ${tenant} is no organisation (acme=10.20.0.0/16;beta=192.0.2.10)`)
+    out.set(tenant, parseNetworks(eq < 0 ? part : part.slice(eq + 1), name, out.get(tenant)))
+  }
+  return out
 }
 
 /**
@@ -223,10 +267,11 @@ export const addressAllowed = (address: string, open?: BlockList, deny?: BlockLi
 export type Resolve = (host: string) => Promise<LookupAddress[]>
 /**
  * The DNS, asked by c-ares (A and AAAA records), not by getaddrinfo: a slow server of an allowed domain holds none of
- * the four threads of libuv that the file system, crypto and the database's name resolution share. 2 s per try, 2
- * tries. The hosts file is not read (a subscriber is a public name).
+ * the four threads of libuv that the file system, crypto and the database's name resolution share. 2 s, one try: within
+ * the 3 s of the connection (a slow DNS is told `dns`, not `timeout`). The hosts file is not read (a subscriber is a
+ * public name).
  */
-const resolver = new Resolver({ timeout: 2_000, tries: 2 })
+const resolver = new Resolver({ timeout: 2_000, tries: 1 })
 const systemResolve: Resolve = async host => {
   const [v4, v6] = await Promise.allSettled([resolver.resolve4(host), resolver.resolve6(host)])
   if (v4.status === 'rejected' && v6.status === 'rejected') throw v4.reason
@@ -235,7 +280,10 @@ const systemResolve: Resolve = async host => {
 
 export class DeliveryError extends Error {
   constructor(
-    /** What is kept in the log of deliveries and shown to the administrator: a category, never an address. */
+    /**
+     * Why: the server's log keeps it; the log of deliveries an administrator reads says `unreachable` for dns,
+     * connection, tls and timeout alike (deliveryFailure), no oracle of what listens where.
+     */
     readonly reason: 'destination-refused' | 'dns' | 'connection' | 'tls' | 'timeout' | 'redirect',
     message: string
   ) {
@@ -248,9 +296,9 @@ export class DeliveryError extends Error {
  * reached: the connection goes to an address checked here, never to one a second resolution would give (a name whose
  * records change between a check and the connection).
  */
-const guardedLookup = (resolve: Resolve, open: BlockList | undefined, deny: BlockList | undefined): LookupFunction =>
+const guardedLookup = (resolve: Resolve, open: BlockList | undefined, deny: BlockList | undefined, resolved: () => void = () => undefined): LookupFunction =>
   (hostname: string, options: { all?: boolean }, callback: (err: Error | null, address: string | LookupAddress[], family?: number) => void) => {
-    resolve(hostname).then(
+    resolve(hostname).finally(resolved).then(
       addresses => {
         if (!addresses.length) return callback(new DeliveryError('dns', 'the host has no address'), '', 4)
         if (addresses.some(a => !addressAllowed(a.address, open, deny))) return callback(new DeliveryError('destination-refused', 'the host resolves to an address deliveries may not reach'), '', 4)
@@ -262,11 +310,11 @@ const guardedLookup = (resolve: Resolve, open: BlockList | undefined, deny: Bloc
   }
 
 export interface PostOptions {
-  /** The status of the answer within this time, the name resolved and the connection made included (default 10 s). */
+  /** The status of the answer within this time, the name resolved and the connection made included (default 5 s). */
   timeoutMs?: number
   /** The name resolved and the connection made within this time (default 3 s): a host that drops the packets costs that much. */
   connectTimeoutMs?: number
-  /** Networks the operator opened (WEBHOOK_PRIVATE_NETWORKS). */
+  /** Networks the operator opened to the organisation of this delivery (WEBHOOK_PRIVATE_NETWORKS). */
   open?: BlockList
   /** Addresses never reached (WEBHOOK_DENY_NETWORKS, this host's own). */
   deny?: BlockList
@@ -285,11 +333,14 @@ export interface PostOptions {
 export const postWebhook = (url: string, body: string, headers: Record<string, string>, opts: PostOptions = {}): Promise<{ status: number }> => {
   const target = new URL(url)
   const host = hostOf(target)
-  const timeoutMs = opts.timeoutMs ?? 10_000
+  const timeoutMs = opts.timeoutMs ?? 5_000
   const connectTimeoutMs = Math.min(opts.connectTimeoutMs ?? 3_000, timeoutMs)
   if (isIP(host) && !addressAllowed(host, opts.open, opts.deny)) return Promise.reject(new DeliveryError('destination-refused', 'the address may not be reached by deliveries'))
   return new Promise((resolve, reject) => {
     let settled = false
+    // A time out before the name was resolved is the DNS's (a literal address has none to resolve).
+    let resolved = !!isIP(host)
+    const late = (what: string) => new DeliveryError(resolved ? 'timeout' : 'dns', resolved ? what : 'the host could not be resolved in time')
     const done = (err: Error | null, status?: number) => {
       if (settled) return
       settled = true
@@ -305,7 +356,7 @@ export const postWebhook = (url: string, body: string, headers: Record<string, s
         method: 'POST',
         headers: { ...headers, 'content-length': String(Buffer.byteLength(body)) },
         agent: false,
-        lookup: guardedLookup(opts.resolve ?? systemResolve, opts.open, opts.deny),
+        lookup: guardedLookup(opts.resolve ?? systemResolve, opts.open, opts.deny, () => (resolved = true)),
         ...(opts.ca ? { ca: opts.ca } : {})
       },
       (res: IncomingMessage) => {
@@ -319,11 +370,11 @@ export const postWebhook = (url: string, body: string, headers: Record<string, s
     )
     const timer = setTimeout(() => {
       req.destroy()
-      done(new DeliveryError('timeout', `no answer within ${timeoutMs} ms`))
+      done(late(`no answer within ${timeoutMs} ms`))
     }, timeoutMs)
     const connectTimer = setTimeout(() => {
       req.destroy()
-      done(new DeliveryError('timeout', `no connection within ${connectTimeoutMs} ms`))
+      done(late(`no connection within ${connectTimeoutMs} ms`))
     }, connectTimeoutMs)
     req.on('socket', socket => {
       if (!socket.connecting) clearTimeout(connectTimer)

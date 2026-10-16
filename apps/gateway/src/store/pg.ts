@@ -3,7 +3,7 @@ import { readdir, readFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import pg from 'pg'
 import { EMPTY_OUTBOUND, outboundVersion, staleOutbound } from '../outbound.js'
-import { ALERT_DEDUP_MS, alertKey, clampLimit, type AlertQuery, type AlertRecord, type StoredAlert, type ConferenceRecord, type DidRecord, type OutboundHand, type OutboundRecord, type OutboundRules, type HistoryEntry, type HistoryPage, type HistoryQuery, type MappingSource, type ProviderRecord, type PushSaveResult, type PushSubscriptionRecord, type Store, type TrunkRecord, type UserMapping, type UserPresenceRecord, type VapidKeysRecord, type ClaimedDelivery, type WebhookAttemptResult, type WebhookClaimCaps, type WebhookDeliveryQuery, type WebhookDeliveryRecord, type WebhookHealth, type WebhookQueueOptions, type WebhookStateChange, type WebhookStateEvent, type WebhookSubscriptionRecord, WEBHOOK_STATE_ROLE } from './types.js'
+import { ALERT_DEDUP_MS, alertKey, clampLimit, type AlertQuery, type AlertRecord, type StoredAlert, type ConferenceRecord, type DidRecord, type OutboundHand, type OutboundRecord, type OutboundRules, type HistoryEntry, type HistoryPage, type HistoryQuery, type MappingSource, type ProviderRecord, type PushSaveResult, type PushSubscriptionRecord, type Store, type TrunkRecord, type UserMapping, type UserPresenceRecord, type VapidKeysRecord, type ClaimedDelivery, type WebhookAttemptResult, type WebhookClaimCaps, type WebhookClaimTime, allocateClaims, type WebhookDeliveryQuery, type WebhookDeliveryRecord, type WebhookHealth, type WebhookQueueOptions, type WebhookStateChange, type WebhookStateEvent, type WebhookSubscriptionRecord, WEBHOOK_STATE_ROLE } from './types.js'
 import type { WebhookEventType } from '@twake/telephony-types'
 
 const MIGRATIONS = fileURLToPath(new URL('../../migrations/', import.meta.url))
@@ -48,6 +48,8 @@ type WebhookRow = {
   failures: number
   failing_since: Timestamp | null
   paused_until: Timestamp | null
+  backlog: number
+  backlog_at: Timestamp | null
   created_at: Timestamp
   updated_at: Timestamp
   created_by: string | null
@@ -66,6 +68,8 @@ const webhookOf = (r: WebhookRow): WebhookSubscriptionRecord => ({
   failures: r.failures,
   ...(r.failing_since !== null ? { failingSince: new Date(r.failing_since).toISOString() } : {}),
   ...(r.paused_until !== null ? { pausedUntil: new Date(r.paused_until).toISOString() } : {}),
+  ...(r.backlog ? { backlog: r.backlog } : {}),
+  ...(r.backlog_at !== null ? { backlogAt: new Date(r.backlog_at).toISOString() } : {}),
   createdAt: new Date(r.created_at).toISOString(),
   updatedAt: new Date(r.updated_at).toISOString(),
   ...(r.created_by !== null ? { createdBy: r.created_by } : {})
@@ -126,29 +130,42 @@ const toEntry = (r: HistoryRow): HistoryEntry => ({
 /** PostgreSQL store. Every statement is parameterised and carries the tenant. */
 export class PgStore implements Store {
   private readonly pool: pg.Pool
+  /** The lease of the webhook states and the clock, on a connection of their own (never behind a rush of writes). */
+  private readonly leasePool: pg.Pool
 
   constructor(connectionString: string) {
     this.pool = new pg.Pool({ connectionString, max: 10 })
+    this.leasePool = new pg.Pool({ connectionString, max: 1 })
   }
 
-  /** Applies the SQL files of migrations/ not yet applied, in order, each in a transaction. */
+  /**
+   * Applies the SQL files of migrations/ not yet applied, in order, each in a transaction: one Gateway at a time (two
+   * started at once, the second waits, then finds them applied).
+   */
   async migrate() {
-    await this.pool.query('CREATE TABLE IF NOT EXISTS schema_migrations (name text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())')
-    const done = new Set((await this.pool.query<{ name: string }>('SELECT name FROM schema_migrations')).rows.map(r => r.name))
-    for (const file of (await readdir(MIGRATIONS)).filter(f => f.endsWith('.sql')).sort()) {
-      if (done.has(file)) continue
-      const client = await this.pool.connect()
+    const client = await this.pool.connect()
+    try {
+      await client.query("SELECT pg_advisory_lock(hashtextextended('schema_migrations', 0))")
       try {
-        await client.query('BEGIN')
-        await client.query(await readFile(MIGRATIONS + file, 'utf8'))
-        await client.query('INSERT INTO schema_migrations (name) VALUES ($1)', [file])
-        await client.query('COMMIT')
-      } catch (error) {
-        await client.query('ROLLBACK')
-        throw error
+        await client.query('CREATE TABLE IF NOT EXISTS schema_migrations (name text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())')
+        const done = new Set((await client.query<{ name: string }>('SELECT name FROM schema_migrations')).rows.map(r => r.name))
+        for (const file of (await readdir(MIGRATIONS)).filter(f => f.endsWith('.sql')).sort()) {
+          if (done.has(file)) continue
+          try {
+            await client.query('BEGIN')
+            await client.query(await readFile(MIGRATIONS + file, 'utf8'))
+            await client.query('INSERT INTO schema_migrations (name) VALUES ($1)', [file])
+            await client.query('COMMIT')
+          } catch (error) {
+            await client.query('ROLLBACK')
+            throw error
+          }
+        }
       } finally {
-        client.release()
+        await client.query("SELECT pg_advisory_unlock(hashtextextended('schema_migrations', 0))")
       }
+    } finally {
+      client.release()
     }
   }
 
@@ -203,7 +220,11 @@ export class PgStore implements Store {
   }
 
   async deleteMapping(tenantId: string, userId: string) {
-    await this.pool.query('DELETE FROM user_mappings WHERE tenant_id = $1 AND user_id = $2', [tenantId, userId])
+    // What was told of their presence goes with them (it is kept otherwise, whatever its age).
+    await this.inTransaction(async client => {
+      await client.query('DELETE FROM user_mappings WHERE tenant_id = $1 AND user_id = $2', [tenantId, userId])
+      await client.query('DELETE FROM webhook_state WHERE tenant_id = $1 AND subject = $2', [tenantId, `presence:${userId}`])
+    })
   }
 
   async addHistory(e: HistoryEntry) {
@@ -632,6 +653,8 @@ export class PgStore implements Store {
            failures = CASE WHEN $6 AND NOT enabled THEN 0 ELSE failures END,
            failing_since = CASE WHEN $6 AND NOT enabled THEN NULL ELSE failing_since END,
            paused_until = CASE WHEN $6 AND NOT enabled THEN NULL ELSE paused_until END,
+           backlog = CASE WHEN $6 AND NOT enabled THEN 0 ELSE backlog END,
+           backlog_at = CASE WHEN $6 AND NOT enabled THEN NULL ELSE backlog_at END,
            disabled_reason = CASE WHEN $6 THEN NULL ELSE disabled_reason END,
            enabled = $6
          WHERE tenant_id = $1 AND id = $2`,
@@ -643,16 +666,27 @@ export class PgStore implements Store {
   }
 
   private failPending(client: pg.PoolClient, subscriptionId: string) {
-    return client.query("UPDATE webhook_deliveries SET status = 'failed', last_error = 'disabled', next_attempt_at = NULL, claim = NULL WHERE subscription_id = $1 AND status = 'pending'", [subscriptionId])
+    return client.query(
+      "UPDATE webhook_deliveries SET status = 'failed', last_error = 'disabled', next_attempt_at = NULL, claim = NULL, body = CASE WHEN erase_body THEN '' ELSE body END WHERE subscription_id = $1 AND status = 'pending'",
+      [subscriptionId]
+    )
   }
 
-  async renewWebhookSecret(tenantId: string, id: string, secretEnc: string, keepPreviousUntil: string, at: string) {
-    const r = await this.pool.query('UPDATE webhook_subscriptions SET secret_prev_enc = secret_enc, secret_prev_until = $4, secret_enc = $3, updated_at = $5 WHERE tenant_id = $1 AND id = $2', [tenantId, id, secretEnc, keepPreviousUntil, at])
+  async renewWebhookSecret(tenantId: string, id: string, secretEnc: string, keepPreviousUntil: string | null, at: string) {
+    const r = await this.pool.query(
+      'UPDATE webhook_subscriptions SET secret_prev_enc = CASE WHEN $4::timestamptz IS NULL THEN NULL ELSE secret_enc END, secret_prev_until = $4, secret_enc = $3, updated_at = $5 WHERE tenant_id = $1 AND id = $2',
+      [tenantId, id, secretEnc, keepPreviousUntil, at]
+    )
     return !!r.rowCount
   }
 
-  async pauseWebhookSubscription(tenantId: string, id: string, until: string) {
+  async pauseWebhookSubscription(tenantId: string, id: string, until: string | null) {
     await this.pool.query('UPDATE webhook_subscriptions SET paused_until = $3 WHERE tenant_id = $1 AND id = $2', [tenantId, id, until])
+  }
+
+  async resumeWebhookSubscription(tenantId: string, id: string) {
+    const r = await this.pool.query('UPDATE webhook_subscriptions SET paused_until = NULL, failures = 0, failing_since = NULL, backlog = 0, backlog_at = NULL WHERE tenant_id = $1 AND id = $2', [tenantId, id])
+    return !!r.rowCount
   }
 
   async disableFailingWebhookSubscription(tenantId: string, id: string, at: string) {
@@ -668,16 +702,16 @@ export class PgStore implements Store {
     return !!r.rowCount
   }
 
-  async takeWebhookSend(tenantId: string, subscriptionId: string, at: string, limit: number, windowMs: number) {
+  async takeWebhookSend(tenantId: string, subscriptionId: string, at: string | undefined, limit: number, windowMs: number, tenantLimit?: number) {
     return this.inTransaction(async client => {
-      // One count of a subscription at a time: two Gateways asked at once never both pass the last place.
-      await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [`webhook_sends|${subscriptionId}`])
+      // One count of a tenant at a time: two Gateways asked at once never both pass the last place.
+      await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [`webhook_sends|${tenantId}`])
       const owned = await client.query('SELECT 1 FROM webhook_subscriptions WHERE tenant_id = $1 AND id = $2', [tenantId, subscriptionId])
       if (!owned.rowCount) return false
-      await client.query("DELETE FROM webhook_sends WHERE subscription_id = $1 AND at <= $2::timestamptz - $3 * interval '1 millisecond'", [subscriptionId, at, windowMs])
-      const { rows } = await client.query<{ n: number }>('SELECT count(*)::int AS n FROM webhook_sends WHERE subscription_id = $1', [subscriptionId])
-      if ((rows[0]?.n ?? 0) >= limit) return false
-      await client.query('INSERT INTO webhook_sends (subscription_id, at) VALUES ($1, $2)', [subscriptionId, at])
+      await client.query("DELETE FROM webhook_sends WHERE tenant_id = $1 AND at <= coalesce($2::timestamptz, now()) - $3 * interval '1 millisecond'", [tenantId, at ?? null, windowMs])
+      const { rows } = await client.query<{ mine: number; all: number }>('SELECT count(*) FILTER (WHERE subscription_id = $2)::int AS mine, count(*)::int AS all FROM webhook_sends WHERE tenant_id = $1', [tenantId, subscriptionId])
+      if ((rows[0]?.mine ?? 0) >= limit || (tenantLimit !== undefined && (rows[0]?.all ?? 0) >= tenantLimit)) return false
+      await client.query('INSERT INTO webhook_sends (tenant_id, subscription_id, at) VALUES ($1, $2, coalesce($3::timestamptz, now()))', [tenantId, subscriptionId, at ?? null])
       return true
     })
   }
@@ -696,107 +730,152 @@ export class PgStore implements Store {
 
   /**
    * One event for each enabled subscription of the tenant that takes it; recorded failed (`backlog`) for one that
-   * has `maxPending` pending already (counted up to that many, no further). How many were queued pending.
+   * has `maxPending` pending already (counted up to that many, no further), and counted in its `backlog`. How many
+   * were queued pending, and the subscriptions it was recorded failed for.
    */
-  private async queueEvent(db: pg.Pool | pg.PoolClient, tenantId: string, eventId: string, eventType: WebhookEventType, body: string, at: string, options: WebhookQueueOptions = {}) {
-    const { rows } = await db.query<{ status: string }>(
+  private async queueEvent(db: pg.Pool | pg.PoolClient, tenantId: string, eventId: string, eventType: WebhookEventType, body: string, at: Timestamp | undefined, options: WebhookQueueOptions = {}) {
+    const { rows } = await db.query<{ status: string; subscription_id: string }>(
       `INSERT INTO webhook_deliveries (id, tenant_id, subscription_id, event_id, event_type, body, subject_user, status, last_error, created_at, next_attempt_at)
        SELECT ${NEW_DELIVERY_ID}, s.tenant_id, s.id, $2, $3, $4, $6,
-              CASE WHEN f.full THEN 'failed' ELSE 'pending' END, CASE WHEN f.full THEN 'backlog' END, $5, CASE WHEN f.full THEN NULL ELSE $5::timestamptz END
+              CASE WHEN f.full THEN 'failed' ELSE 'pending' END, CASE WHEN f.full THEN 'backlog' END, coalesce($5::timestamptz, now()), CASE WHEN f.full THEN NULL ELSE coalesce($5::timestamptz, now()) END
        FROM webhook_subscriptions s,
             LATERAL (SELECT $7::int IS NOT NULL AND (SELECT count(*) FROM (SELECT 1 FROM webhook_deliveries p WHERE p.subscription_id = s.id AND p.status = 'pending' LIMIT $7) x) >= $7 AS full) f
        WHERE s.tenant_id = $1 AND s.enabled AND $3 = ANY (s.events)
        ON CONFLICT (subscription_id, event_id) DO NOTHING
-       RETURNING status`,
-      [tenantId, eventId, eventType, body, at, options.subjectUser ?? null, options.maxPending ?? null]
+       RETURNING status, subscription_id`,
+      [tenantId, eventId, eventType, body, at ?? null, options.subjectUser ?? null, options.maxPending ?? null]
     )
-    return rows.filter(r => r.status === 'pending').length
+    const backlogged = rows.filter(r => r.status === 'failed').map(r => r.subscription_id)
+    if (backlogged.length) await db.query('UPDATE webhook_subscriptions SET backlog = backlog + 1, backlog_at = coalesce($2::timestamptz, now()) WHERE id = ANY ($1)', [backlogged, at ?? null])
+    return { queued: rows.length - backlogged.length, backlogged }
   }
 
-  async enqueueWebhookEvent(tenantId: string, eventId: string, eventType: WebhookEventType, body: string, at: string, options?: WebhookQueueOptions) {
-    return this.queueEvent(this.pool, tenantId, eventId, eventType, body, at, options)
+  async enqueueWebhookEvent(tenantId: string, eventId: string, eventType: WebhookEventType, body: string, at: string | undefined, options?: WebhookQueueOptions) {
+    const { queued, backlogged } = await this.queueEvent(this.pool, tenantId, eventId, eventType, body, at, options)
+    if (backlogged.length) options?.onBacklog?.(backlogged)
+    return queued
   }
 
-  async enqueueWebhookDelivery(tenantId: string, subscriptionId: string, eventId: string, eventType: string, body: string, at: string) {
+  async enqueueWebhookDelivery(tenantId: string, subscriptionId: string, eventId: string, eventType: string, body: string, at: string | undefined, maxPending?: number) {
+    const { rows: found } = await this.pool.query<{ n: number }>(
+      "SELECT (SELECT count(*) FROM (SELECT 1 FROM webhook_deliveries p WHERE p.subscription_id = s.id AND p.status = 'pending' LIMIT $3) x)::int AS n FROM webhook_subscriptions s WHERE s.tenant_id = $1 AND s.id = $2",
+      [tenantId, subscriptionId, maxPending ?? 1]
+    )
+    if (!found[0]) return null
+    if (maxPending !== undefined && found[0].n >= maxPending) return 'full' as const
     const { rows } = await this.pool.query<DeliveryRow>(
       `INSERT INTO webhook_deliveries (id, tenant_id, subscription_id, event_id, event_type, body, created_at, next_attempt_at)
-       SELECT ${NEW_DELIVERY_ID}, tenant_id, id, $3, $4, $5, $6, $6 FROM webhook_subscriptions WHERE tenant_id = $1 AND id = $2
+       SELECT ${NEW_DELIVERY_ID}, tenant_id, id, $3, $4, $5, coalesce($6::timestamptz, now()), coalesce($6::timestamptz, now()) FROM webhook_subscriptions WHERE tenant_id = $1 AND id = $2
        ON CONFLICT (subscription_id, event_id) DO NOTHING RETURNING ${DELIVERY_COLUMNS}`,
-      [tenantId, subscriptionId, eventId, eventType, body, at]
+      [tenantId, subscriptionId, eventId, eventType, body, at ?? null]
     )
     return rows[0] ? deliveryOf(rows[0]) : null
   }
 
-  async claimWebhookDeliveries(now: string, leaseUntil: string, limit: number, caps: WebhookClaimCaps) {
+  async claimWebhookDeliveries(limit: number, caps: WebhookClaimCaps, at?: WebhookClaimTime) {
+    if (limit <= 0) return []
     const claim = randomBytes(12).toString('hex')
     return this.inTransaction(async client => {
-      // One claim at a time, whatever the Gateways: the caps count what the others hold, which the one before took.
-      await client.query("SELECT pg_advisory_xact_lock(hashtextextended('webhook_claim', 0))")
-      await client.query(
-        "UPDATE webhook_deliveries SET status = 'failed', last_error = 'abandoned', next_attempt_at = NULL, claim = NULL WHERE status = 'pending' AND attempts >= $2 AND next_attempt_at <= $1",
+      const { rows: times } = await client.query<{ now: Date; lease: Date }>(
+        "SELECT coalesce($1::timestamptz, now()) AS now, coalesce($2::timestamptz, coalesce($1::timestamptz, now()) + $3 * interval '1 millisecond') AS lease",
+        [at?.now ?? null, at?.leaseUntil ?? null, caps.leaseMs ?? 60_000]
+      )
+      const { now, lease } = times[0]!
+      // The enabled subscriptions not paused, and when each one's earliest due is: one read of the index each,
+      // whatever waits behind it (a subscription with a thousand pending costs as much as one with one).
+      const { rows: ready } = await client.query<{ id: string; tenant_id: string }>(
+        `SELECT s.id, s.tenant_id FROM webhook_subscriptions s
+         CROSS JOIN LATERAL (
+           SELECT d.next_attempt_at FROM webhook_deliveries d
+           WHERE d.subscription_id = s.id AND d.status = 'pending' AND d.next_attempt_at <= $1 AND d.attempts < $2
+           ORDER BY d.next_attempt_at LIMIT 1
+         ) f
+         WHERE s.enabled AND (s.paused_until IS NULL OR s.paused_until <= $1)
+         ORDER BY f.next_attempt_at, s.id`,
         [now, caps.maxAttempts]
       )
-      // The due ones of the enabled subscriptions not paused, each subscription within its cap (counting what is
-      // held, leased and not lapsed), then each tenant within its own, each tenant's earliest in turn; SKIP LOCKED:
-      // one being completed or replayed meanwhile is left for the next claim. Each held until leaseUntil: if its
-      // outcome never comes (that Gateway stopped), it is due again then.
-      const { rows } = await client.query<DeliveryRow & { url: string; secret_enc: string; secret_prev_enc: string | null }>(
-        `WITH held AS (
-           SELECT tenant_id, subscription_id FROM webhook_deliveries WHERE status = 'pending' AND claim IS NOT NULL AND next_attempt_at > $1
-         ),
-         held_s AS (SELECT subscription_id, count(*)::int AS n FROM held GROUP BY subscription_id),
-         held_t AS (SELECT tenant_id, count(*)::int AS n FROM held GROUP BY tenant_id),
-         ready AS (
-           SELECT d.id, d.tenant_id, d.next_attempt_at,
-                  coalesce(hs.n, 0) + row_number() OVER (PARTITION BY d.subscription_id ORDER BY d.next_attempt_at, d.id) AS in_subscription
-           FROM webhook_deliveries d
-           JOIN webhook_subscriptions s ON s.id = d.subscription_id
-           LEFT JOIN held_s hs ON hs.subscription_id = d.subscription_id
-           WHERE d.status = 'pending' AND d.next_attempt_at <= $1 AND s.enabled AND (s.paused_until IS NULL OR s.paused_until <= $1)
-         ),
-         fair AS (
-           SELECT r.id, r.next_attempt_at,
-                  coalesce(ht.n, 0) + row_number() OVER (PARTITION BY r.tenant_id ORDER BY r.next_attempt_at, r.id) AS in_tenant
-           FROM ready r LEFT JOIN held_t ht ON ht.tenant_id = r.tenant_id
-           WHERE r.in_subscription <= $5
-         ),
-         pick AS (SELECT id FROM fair WHERE in_tenant <= $6 ORDER BY in_tenant, next_attempt_at, id LIMIT $3),
-         due AS (
-           SELECT d.id FROM webhook_deliveries d JOIN pick ON pick.id = d.id WHERE d.status = 'pending' AND d.next_attempt_at <= $1 FOR UPDATE OF d SKIP LOCKED
-         )
-         UPDATE webhook_deliveries d SET attempts = d.attempts + 1, last_attempt_at = $1, next_attempt_at = $2, claim = $4
-         FROM due, webhook_subscriptions s WHERE d.id = due.id AND s.id = d.subscription_id
-         RETURNING ${DELIVERY_COLUMNS.split(', ').map(c => `d.${c}`).join(', ')}, s.url, s.secret_enc, CASE WHEN s.secret_prev_until > $1 THEN s.secret_prev_enc END AS secret_prev_enc`,
-        [now, leaseUntil, limit, claim, caps.perSubscription, caps.perTenant]
+      if (!ready.length) return []
+      // Each tenant claimed by one Gateway at a time (another passes it over meanwhile, and takes the next one): what
+      // it holds is counted as it stands. The earliest due first, as many tenants as there may be places.
+      const order: string[] = []
+      for (const r of ready) if (!order.includes(r.tenant_id) && order.length < limit * 2) order.push(r.tenant_id)
+      const { rows: locked } = await client.query<{ t: string }>(
+        "SELECT t FROM unnest($1::text[]) WITH ORDINALITY AS u(t, n) WHERE pg_try_advisory_xact_lock(hashtextextended('webhook_claim|' || t, 0)) ORDER BY n",
+        [order]
       )
-      return rows.map((r): ClaimedDelivery => ({ ...deliveryOf(r), url: r.url, secretEnc: r.secret_enc, ...(r.secret_prev_enc ? { secretPrevEnc: r.secret_prev_enc } : {}), claim }))
+      if (!locked.length) return []
+      const tenants = locked.map(r => r.t)
+      const { rows: held } = await client.query<{ tenant_id: string; subscription_id: string; n: number }>(
+        "SELECT tenant_id, subscription_id, count(*)::int AS n FROM webhook_deliveries WHERE tenant_id = ANY ($1) AND status = 'pending' AND claim IS NOT NULL AND next_attempt_at > $2 GROUP BY tenant_id, subscription_id",
+        [tenants, now]
+      )
+      const want = allocateClaims(
+        limit,
+        caps,
+        tenants,
+        ready.filter(r => tenants.includes(r.tenant_id)).map(r => ({ id: r.id, tenantId: r.tenant_id })),
+        held.map(h => ({ tenantId: h.tenant_id, subscriptionId: h.subscription_id, n: h.n }))
+      )
+      if (!want.length) return []
+      // SKIP LOCKED: one being completed or replayed meanwhile is left for the next claim. Each held until the
+      // lease: if its outcome never comes (that Gateway stopped), it is due again then.
+      const { rows } = await client.query<DeliveryRow & { url: string; secret_enc: string; secret_prev_enc: string | null }>(
+        `WITH want AS (SELECT * FROM unnest($1::text[], $2::int[]) AS w(sub, n)),
+         due AS (
+           SELECT x.id FROM want CROSS JOIN LATERAL (
+             SELECT d.id FROM webhook_deliveries d
+             WHERE d.subscription_id = want.sub AND d.status = 'pending' AND d.next_attempt_at <= $3 AND d.attempts < $4
+             ORDER BY d.next_attempt_at, d.id LIMIT want.n FOR UPDATE OF d SKIP LOCKED
+           ) x
+         )
+         UPDATE webhook_deliveries d SET attempts = d.attempts + 1, last_attempt_at = $3, next_attempt_at = $5, claim = $6
+         FROM due, webhook_subscriptions s WHERE d.id = due.id AND s.id = d.subscription_id
+         RETURNING ${DELIVERY_COLUMNS.split(', ').map(c => `d.${c}`).join(', ')}, s.url, s.secret_enc, CASE WHEN s.secret_prev_until > $3 THEN s.secret_prev_enc END AS secret_prev_enc`,
+        [want.map(w => w.subscriptionId), want.map(w => w.n), now, caps.maxAttempts, lease, claim]
+      )
+      return rows
+        .map((r): ClaimedDelivery => ({ ...deliveryOf(r), url: r.url, secretEnc: r.secret_enc, ...(r.secret_prev_enc ? { secretPrevEnc: r.secret_prev_enc } : {}), claim }))
+        .sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt) || (a.id < b.id ? -1 : 1))
     })
+  }
+
+  async sweepWebhookDeliveries(maxAttempts: number, now?: string) {
+    const r = await this.pool.query(
+      "UPDATE webhook_deliveries SET status = 'failed', last_error = 'abandoned', next_attempt_at = NULL, claim = NULL, body = CASE WHEN erase_body THEN '' ELSE body END WHERE status = 'pending' AND attempts >= $1 AND next_attempt_at <= coalesce($2::timestamptz, now())",
+      [maxAttempts, now ?? null]
+    )
+    return r.rowCount ?? 0
   }
 
   async completeWebhookDelivery(id: string, claim: string, result: WebhookAttemptResult): Promise<WebhookHealth | null> {
     // The outcome and the subscription's health in one statement: a delivery starts it afresh, a failure adds one.
+    // Dated on the database's clock unless the result names a time; a body erased meanwhile goes once it is done.
     const subscription = `UPDATE webhook_subscriptions s SET
          failures = CASE WHEN $3 THEN 0 ELSE s.failures + 1 END,
-         failing_since = CASE WHEN $3 THEN NULL ELSE coalesce(s.failing_since, $4::timestamptz) END,
+         failing_since = CASE WHEN $3 THEN NULL ELSE coalesce(s.failing_since, coalesce($4::timestamptz, now())) END,
          paused_until = CASE WHEN $3 THEN NULL ELSE s.paused_until END
-       FROM d WHERE s.id = d.subscription_id RETURNING s.failures, s.failing_since`
+       FROM d WHERE s.id = d.subscription_id RETURNING s.failures, s.failing_since, coalesce($4::timestamptz, now()) AS at`
+    type Health = { failures: number; failing_since: Timestamp | null; at: Timestamp }
     const { rows } = result.delivered
-      ? await this.pool.query<{ failures: number; failing_since: Timestamp | null }>(
+      ? await this.pool.query<Health>(
           `WITH d AS (
-             UPDATE webhook_deliveries SET status = 'delivered', delivered_at = $4, last_status = $5, last_error = NULL, next_attempt_at = NULL, claim = NULL
+             UPDATE webhook_deliveries SET status = 'delivered', delivered_at = coalesce($4::timestamptz, now()), last_status = $5, last_error = NULL, next_attempt_at = NULL, claim = NULL,
+               body = CASE WHEN erase_body THEN '' ELSE body END
              WHERE id = $1 AND claim = $2 AND status = 'pending' RETURNING subscription_id
            ) ${subscription}`,
-          [id, claim, true, result.at, result.status]
+          [id, claim, true, result.at ?? null, result.status]
         )
-      : await this.pool.query<{ failures: number; failing_since: Timestamp | null }>(
-          `WITH d AS (
-             UPDATE webhook_deliveries SET status = CASE WHEN $5::timestamptz IS NULL THEN 'failed' ELSE 'pending' END, next_attempt_at = $5, last_status = $6, last_error = $7, claim = NULL
-             WHERE id = $1 AND claim = $2 AND status = 'pending' RETURNING subscription_id
+      : await this.pool.query<Health>(
+          `WITH r AS (SELECT coalesce($5::timestamptz, now() + $8 * interval '1 millisecond') AS next),
+           d AS (
+             UPDATE webhook_deliveries SET status = CASE WHEN r.next IS NULL THEN 'failed' ELSE 'pending' END, next_attempt_at = r.next, last_status = $6, last_error = $7, claim = NULL,
+               body = CASE WHEN erase_body AND r.next IS NULL THEN '' ELSE body END
+             FROM r WHERE id = $1 AND claim = $2 AND status = 'pending' RETURNING subscription_id
            ) ${subscription}`,
-          [id, claim, false, result.at, result.retryAt ?? null, result.status ?? null, result.error]
+          [id, claim, false, result.at ?? null, result.retryAt ?? null, result.status ?? null, result.error, result.retryInMs ?? null]
         )
     const r = rows[0]
-    return r ? { failures: r.failures, ...(r.failing_since ? { failingSince: iso(r.failing_since) } : {}) } : null
+    return r ? { failures: r.failures, ...(r.failing_since ? { failingSince: iso(r.failing_since) } : {}), at: iso(r.at) } : null
   }
 
   async listWebhookDeliveries(tenantId: string, subscriptionId: string, query: WebhookDeliveryQuery = {}) {
@@ -809,15 +888,23 @@ export class PgStore implements Store {
     return rows.map(deliveryOf)
   }
 
-  async replayWebhookDelivery(tenantId: string, subscriptionId: string, id: string, at: string) {
-    const { rows } = await this.pool.query<DeliveryRow>(
-      `UPDATE webhook_deliveries SET status = 'pending', attempts = 0, next_attempt_at = $4, claim = NULL, last_status = NULL, last_error = NULL, delivered_at = NULL
-       WHERE tenant_id = $1 AND subscription_id = $2 AND id = $3 AND status <> 'pending' RETURNING ${DELIVERY_COLUMNS}`,
-      [tenantId, subscriptionId, id, at]
+  async replayWebhookDelivery(tenantId: string, subscriptionId: string, id: string, at?: string, maxPending?: number) {
+    const { rows: found } = await this.pool.query<{ status: string; erase_body: boolean; n: number }>(
+      `SELECT d.status, d.erase_body, (SELECT count(*) FROM (SELECT 1 FROM webhook_deliveries p WHERE p.subscription_id = d.subscription_id AND p.status = 'pending' LIMIT $4) x)::int AS n
+       FROM webhook_deliveries d WHERE d.tenant_id = $1 AND d.subscription_id = $2 AND d.id = $3`,
+      [tenantId, subscriptionId, id, maxPending ?? 1]
     )
-    if (rows[0]) return deliveryOf(rows[0])
-    const pending = await this.pool.query('SELECT 1 FROM webhook_deliveries WHERE tenant_id = $1 AND subscription_id = $2 AND id = $3', [tenantId, subscriptionId, id])
-    return pending.rowCount ? ('pending' as const) : null
+    const f = found[0]
+    // One its person asked to erase is not sent again (its body is gone).
+    if (!f || f.erase_body) return null
+    if (f.status === 'pending') return 'pending' as const
+    if (maxPending !== undefined && f.n >= maxPending) return 'full' as const
+    const { rows } = await this.pool.query<DeliveryRow>(
+      `UPDATE webhook_deliveries SET status = 'pending', attempts = 0, next_attempt_at = coalesce($4::timestamptz, now()), claim = NULL, last_status = NULL, last_error = NULL, delivered_at = NULL
+       WHERE tenant_id = $1 AND subscription_id = $2 AND id = $3 AND status <> 'pending' RETURNING ${DELIVERY_COLUMNS}`,
+      [tenantId, subscriptionId, id, at ?? null]
+    )
+    return rows[0] ? deliveryOf(rows[0]) : ('pending' as const)
   }
 
   async purgeWebhookDeliveries(before: string) {
@@ -833,7 +920,7 @@ export class PgStore implements Store {
           purged += r.rowCount ?? 0
           if ((r.rowCount ?? 0) < PURGE_BATCH) break
         }
-        await client.query('DELETE FROM webhook_state WHERE since < $1', [before])
+        await client.query("DELETE FROM webhook_state WHERE state = 'removed' AND since < $1", [before])
         return purged
       } finally {
         await client.query("SELECT pg_advisory_unlock(hashtextextended('webhook_purge', 0))")
@@ -846,47 +933,65 @@ export class PgStore implements Store {
   async eraseWebhookSubject(tenantId: string, userId: string) {
     return this.inTransaction(async client => {
       const r = await client.query("DELETE FROM webhook_deliveries WHERE tenant_id = $1 AND subject_user = $2 AND status <> 'pending'", [tenantId, userId])
+      await client.query("UPDATE webhook_deliveries SET erase_body = true WHERE tenant_id = $1 AND subject_user = $2 AND status = 'pending'", [tenantId, userId])
       await client.query('DELETE FROM webhook_state WHERE tenant_id = $1 AND subject = $2', [tenantId, `presence:${userId}`])
       return r.rowCount ?? 0
     })
   }
 
   async setWebhookState(change: WebhookStateChange, event: WebhookStateEvent, options?: WebhookQueueOptions) {
-    const { tenantId, subject, state, at, holder } = change
-    return this.inTransaction(async client => {
+    const { tenantId, subject, state, holder } = change
+    const out = await this.inTransaction(async client => {
       // Told by the Gateway that holds the lease only, and kept until this commits (FOR SHARE: another takes it over
       // after, never meanwhile).
       const lease = await client.query('SELECT 1 FROM webhook_leases WHERE role = $1 AND holder = $2 AND until > now() FOR SHARE', [WEBHOOK_STATE_ROLE, holder])
       if (!lease.rowCount) return null
-      // One writer of a subject at a time (a lock that holds whether its row exists yet or not).
+      // One writer of a subject at a time (a lock that holds whether its row exists yet or not), its change dated on
+      // the database's clock once it holds it: two changes are dated in the order they are written.
       await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [`webhook_state|${tenantId}|${subject}`])
-      const { rows } = await client.query<{ state: string; since: Timestamp }>('SELECT state, since FROM webhook_state WHERE tenant_id = $1 AND subject = $2', [tenantId, subject])
+      // Compared in the database, to the microsecond: two changes within a millisecond are two changes.
+      const { rows: times } = await client.query<{ at: Date; exact: string }>('SELECT x AS at, x::text AS exact FROM (SELECT coalesce($1::timestamptz, clock_timestamp()) AS x) q', [change.at ?? null])
+      const { at, exact } = times[0]!
+      const { rows } = await client.query<{ state: string; newer: boolean }>('SELECT state, since >= $3::timestamptz AS newer FROM webhook_state WHERE tenant_id = $1 AND subject = $2', [tenantId, subject, exact])
       const before = rows[0]
-      if (before && (before.state === state || new Date(before.since).getTime() >= Date.parse(at))) return null
-      await client.query('INSERT INTO webhook_state (tenant_id, subject, state, since) VALUES ($1, $2, $3, $4) ON CONFLICT (tenant_id, subject) DO UPDATE SET state = EXCLUDED.state, since = EXCLUDED.since', [tenantId, subject, state, at])
-      const e = event(before?.state)
-      const queued = e ? await this.queueEvent(client, tenantId, e.id, e.type, e.body, at, { ...options, ...(e.subjectUser ? { subjectUser: e.subjectUser } : {}) }) : 0
-      return { previous: before?.state, queued }
+      if (before && (before.state === state || before.newer)) return null
+      await client.query('INSERT INTO webhook_state (tenant_id, subject, state, since) VALUES ($1, $2, $3, $4::timestamptz) ON CONFLICT (tenant_id, subject) DO UPDATE SET state = EXCLUDED.state, since = EXCLUDED.since', [tenantId, subject, state, exact])
+      const e = event(before?.state, iso(at))
+      const { queued, backlogged } = e ? await this.queueEvent(client, tenantId, e.id, e.type, e.body, at, { ...options, ...(e.subjectUser ? { subjectUser: e.subjectUser } : {}) }) : { queued: 0, backlogged: [] }
+      return { previous: before?.state, queued, backlogged }
     })
+    if (!out) return null
+    if (out.backlogged.length) options?.onBacklog?.(out.backlogged)
+    return { previous: out.previous, queued: out.queued }
   }
 
-  async takeWebhookLease(role: string, holder: string, ms: number) {
-    const r = await this.pool.query(
-      `INSERT INTO webhook_leases (role, holder, until) VALUES ($1, $2, now() + $3 * interval '1 millisecond')
-       ON CONFLICT (role) DO UPDATE SET holder = EXCLUDED.holder, until = EXCLUDED.until
-       WHERE webhook_leases.holder = EXCLUDED.holder OR webhook_leases.until <= now()`,
-      [role, holder, ms]
+  async takeWebhookLease(role: string, holder: string, ms: number, healthy = true) {
+    // On a connection of its own: a pool busy with a rush of writes never holds a renewal until the lease lapses.
+    // Taken from another holder (FOR SHARE of setWebhookState: once what it writes is committed) when it lapsed, or
+    // at once when this one hears its events and the other does not.
+    const r = await this.leasePool.query(
+      `INSERT INTO webhook_leases (role, holder, until, healthy) VALUES ($1, $2, now() + $3 * interval '1 millisecond', $4)
+       ON CONFLICT (role) DO UPDATE SET holder = EXCLUDED.holder, until = EXCLUDED.until, healthy = EXCLUDED.healthy
+       WHERE webhook_leases.holder = EXCLUDED.holder OR webhook_leases.until <= now() OR (EXCLUDED.healthy AND NOT webhook_leases.healthy)`,
+      [role, holder, ms, healthy]
     )
     return !!r.rowCount
   }
 
+  async listWebhookStates(tenantId: string, prefix: string) {
+    const { rows } = await this.pool.query<{ subject: string; state: string }>(
+      "SELECT subject, state FROM webhook_state WHERE tenant_id = $1 AND starts_with(subject, $2) ORDER BY subject",
+      [tenantId, prefix]
+    )
+    return rows
+  }
+
   async clock() {
-    const { rows } = await this.pool.query<{ now: Timestamp }>('SELECT clock_timestamp() AS now')
+    const { rows } = await this.leasePool.query<{ now: Timestamp }>('SELECT clock_timestamp() AS now')
     return iso(rows[0]!.now)
   }
 
   async close() {
-    await this.pool.end()
+    await Promise.all([this.pool.end(), this.leasePool.end()])
   }
 }
-

@@ -443,6 +443,7 @@ const GENERAL: Record<string, Key> = {
   WEBHOOK_RATE: 'admin.webhooks.err.rate',
   WEBHOOK_PENDING: 'admin.webhooks.err.pending',
   WEBHOOK_DISABLED: 'admin.webhooks.err.disabled',
+  WEBHOOK_BACKLOG: 'admin.webhooks.err.backlog',
   WEBHOOK_DOMAINS: 'admin.webhooks.err.domains'
 }
 
@@ -648,6 +649,7 @@ export const webhookRefusal = (err: unknown) =>
   refusalOf<WebhookField>(err, (_field, code) => {
     if (code === 'WEBHOOK_URL') return { field: 'url', problem: p('admin.webhooks.err.url') }
     if (code === 'WEBHOOK_URL_SCHEME') return { field: 'url', problem: p('admin.webhooks.err.urlScheme') }
+    if (code === 'WEBHOOK_URL_PORT') return { field: 'url', problem: p('admin.webhooks.err.urlPort') }
     if (code === 'WEBHOOK_DOMAIN') return { field: 'url', problem: p('admin.webhooks.err.urlDomainServer') }
     if (code === 'WEBHOOK_EVENTS') return { field: 'events', problem: p('admin.webhooks.err.events') }
     if (code === 'WEBHOOK_DESCRIPTION') return { field: 'description', problem: p('admin.webhooks.err.description') }

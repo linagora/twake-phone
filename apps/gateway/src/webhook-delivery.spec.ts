@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { TLSSocket } from 'node:tls'
 import { afterEach, describe, expect, it } from 'vitest'
-import { DeliveryError, addressAllowed, denyNetworks, hostAllowed, newWebhookSecret, parseNetworks, parseWebhookDomains, parseWebhookUrl, postWebhook, signWebhook, verifyWebhookSignature } from './webhook-delivery.js'
+import { DeliveryError, WEBHOOK_PORTS, addressAllowed, denyNetworks, hostAllowed, newWebhookSecret, parseNetworks, parsePorts, parseTenantNetworks, parseWebhookDomains, parseWebhookUrl, postWebhook, signWebhook, verifyWebhookSignature } from './webhook-delivery.js'
 
 describe('webhook signature', () => {
   const secret = newWebhookSecret()
@@ -71,7 +71,8 @@ describe('the address of a subscription', () => {
 
   it('is an https address of an allowed domain, kept as written by the URL standard', () => {
     expect(parseWebhookUrl('https://CRM.example.org/twakephone?x=1', domains)).toBe('https://crm.example.org/twakephone?x=1')
-    expect(parseWebhookUrl('https://eu.hooks.example.net:8443/in', domains)).toBe('https://eu.hooks.example.net:8443/in')
+    expect(parseWebhookUrl('https://eu.hooks.example.net:8443/in', domains, { ports: [443, 8443] })).toBe('https://eu.hooks.example.net:8443/in')
+    expect(parseWebhookUrl('https://crm.example.org:443/in', domains)).toBe('https://crm.example.org/in')
     expect(parseWebhookUrl('https://192.0.2.10/in', domains)).toBe('https://192.0.2.10/in')
   })
 
@@ -96,6 +97,28 @@ describe('the address of a subscription', () => {
     expect(code('not an address')).toBe('WEBHOOK_URL')
     expect(code(`https://crm.example.org/${'a'.repeat(2050)}`)).toBe('WEBHOOK_URL')
     expect(code(undefined)).toBe('WEBHOOK_URL')
+  })
+
+  it('names one of the ports allowed: 443 and 80 unless the operator lists others, never 0 (review 10a, second, n°3)', () => {
+    const code = (url: string, policy = {}) => {
+      try {
+        parseWebhookUrl(url, domains, policy)
+        return 'ok'
+      } catch (err) {
+        return (err as { code?: string }).code
+      }
+    }
+    expect(WEBHOOK_PORTS).toEqual([443, 80])
+    expect(code('https://crm.example.org/in')).toBe('ok')
+    expect(code('http://crm.example.org/in', { allowHttp: true })).toBe('ok')
+    expect(code('http://crm.example.org:80/in', { allowHttp: true })).toBe('ok')
+    for (const port of [22, 6379, 8080, 8443, 0]) expect(code(`https://crm.example.org:${port}/in`), String(port)).toBe('WEBHOOK_URL_PORT')
+    expect(code('https://crm.example.org:8443/in', { ports: [8443] })).toBe('ok')
+    expect(code('https://crm.example.org/in', { ports: [8443] })).toBe('WEBHOOK_URL_PORT')
+    expect(code('https://crm.example.org:0/in', { ports: [0, 443] })).toBe('WEBHOOK_URL_PORT')
+    expect(parsePorts(undefined)).toEqual([443, 80])
+    expect(parsePorts(' 443, 8443 ')).toEqual([443, 8443])
+    for (const bad of ['0', '65536', 'http', '443;80', '-1']) expect(() => parsePorts(bad), bad).toThrow(/WEBHOOK_PORTS/)
   })
 })
 
@@ -127,6 +150,20 @@ describe('the addresses a delivery may reach', () => {
     expect(() => parseNetworks('10.0.0.0/33')).toThrow(/WEBHOOK_PRIVATE_NETWORKS/)
     expect(() => parseNetworks('crm.example.org')).toThrow(/WEBHOOK_PRIVATE_NETWORKS/)
     expect(addressAllowed('10.0.0.1', parseNetworks(''))).toBe(false)
+  })
+
+  it('opens networks to one organisation each, a bare list to the default one (review 10a, second, n°3)', () => {
+    const open = parseTenantNetworks('acme=10.20.0.0/16,fd00:1::/64; beta=192.0.2.10 ;acme=10.30.0.1', 'default')
+    expect([...open.keys()]).toEqual(['acme', 'beta'])
+    expect(addressAllowed('10.20.3.4', open.get('acme'))).toBe(true)
+    expect(addressAllowed('10.30.0.1', open.get('acme'))).toBe(true)
+    expect(addressAllowed('192.0.2.10', open.get('acme'))).toBe(false)
+    expect(addressAllowed('10.20.3.4', open.get('beta'))).toBe(false)
+    expect(addressAllowed('10.20.3.4', open.get('gamma'))).toBe(false)
+    expect([...parseTenantNetworks('10.20.0.0/16', 'default').keys()]).toEqual(['default'])
+    expect(parseTenantNetworks(undefined, 'default').size).toBe(0)
+    expect(() => parseTenantNetworks('acme=crm.example.org', 'default')).toThrow(/WEBHOOK_PRIVATE_NETWORKS/)
+    expect(() => parseTenantNetworks('a cme=10.0.0.0/8', 'default')).toThrow(/WEBHOOK_PRIVATE_NETWORKS/)
   })
 
   it('never reaches what the operator closes, nor the addresses of this host, even inside what it opened', () => {
@@ -218,9 +255,10 @@ describe('postWebhook', () => {
     expect(await postWebhook(named, '{}', {}, { open: parseNetworks('127.0.0.1'), resolve: rebinding })).toEqual({ status: 204 })
     expect(asked).toBe(1)
     expect(got).toHaveLength(1)
-    // A DNS server that never answers: given up at the connection's bound, well before the answer's.
+    // A DNS server that never answers: given up at the connection's bound, well before the answer's, and told
+    // `dns` (the name was never resolved), not `timeout` (review 10a, second, n°20).
     const started = Date.now()
-    expect(await reason(postWebhook(named, '{}', {}, { timeoutMs: 5_000, connectTimeoutMs: 150, resolve: () => new Promise(() => undefined) }))).toBe('timeout')
+    expect(await reason(postWebhook(named, '{}', {}, { timeoutMs: 5_000, connectTimeoutMs: 150, resolve: () => new Promise(() => undefined) }))).toBe('dns')
     expect(Date.now() - started).toBeLessThan(1_000)
   })
 

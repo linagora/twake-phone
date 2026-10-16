@@ -266,7 +266,8 @@ let activeBridge = bridge
 const conference = { bridge: () => activeBridge, accessNumber: MEET_NUMBER, webhookKey: LIVEKIT_API_KEY, webhookSecret: LIVEKIT_API_SECRET }
 // A call with the public network whose person has no window left is ended after 3 s here (30 s by default).
 // Step 10a: the tool an administrator subscribes to the webhooks, on this host (the operator opens the loopback to
-// the deliveries and allows http: WEBHOOK_PRIVATE_NETWORKS, WEBHOOK_ALLOW_HTTP=1); the trunks read every 2 s.
+// the deliveries and allows http and its port: WEBHOOK_PRIVATE_NETWORKS, WEBHOOK_ALLOW_HTTP=1, WEBHOOK_PORTS); the
+// trunks read every 2 s.
 const receiver = await startWebhookReceiver()
 const gateway = await buildApp(registry, {
   auth,
@@ -277,7 +278,7 @@ const gateway = await buildApp(registry, {
   secretsKey: key,
   admin: { adminRole: 'twakephone-admin', adminUsers: new Set() },
   conference,
-  webhooks: { policy: { allowHttp: true }, open: parseNetworks('127.0.0.1/32'), retryBaseMs: 1_000 },
+  webhooks: { policy: { allowHttp: true, ports: [Number(new URL(receiver.url).port)] }, open: parseNetworks('127.0.0.1/32'), retryBaseMs: 1_000 },
   trunkWatchMs: 2_000
 })
 // LiveKit's webhooks as the Gateway answered them: signed with its key, each one 204.

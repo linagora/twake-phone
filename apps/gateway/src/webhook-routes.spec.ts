@@ -57,7 +57,9 @@ afterEach(async () => {
   for (const a of apps.splice(0)) await a.close()
 })
 
-const setup = async (opts: { secretsKey?: boolean; answer?: (n: number) => number; sendsPerMinute?: number; trunkWatchMs?: number } = {}) => {
+const setup = async (
+  opts: { secretsKey?: boolean; answer?: (n: number) => number; hold?: Promise<void>; sendsPerMinute?: number; tenantSendsPerMinute?: number; maxPending?: number; presenceSettleMs?: number; trunkWatchMs?: number } = {}
+) => {
   process.env.AUTH_MODE = 'dev'
   const store = new MemoryStore()
   await store.upsertMapping({ tenantId: 'A', userId: 'amartin', extension: '101' })
@@ -72,12 +74,16 @@ const setup = async (opts: { secretsKey?: boolean; answer?: (n: number) => numbe
     webhooks: {
       pollMs: 20,
       retryBaseMs: 30,
+      ...(opts.maxPending ? { maxPending: opts.maxPending } : {}),
       post: async (url, body, headers) => {
         got.push({ url, headers, body })
+        await opts.hold
         return { status: opts.answer ? opts.answer(got.length) : 204 }
       }
     },
     ...(opts.sendsPerMinute ? { webhookSendsPerMinute: opts.sendsPerMinute } : {}),
+    ...(opts.tenantSendsPerMinute ? { webhookTenantSendsPerMinute: opts.tenantSendsPerMinute } : {}),
+    webhookPresenceSettleMs: opts.presenceSettleMs ?? 0,
     trunkWatchMs: opts.trunkWatchMs ?? 0,
     trunkWatchConfirm: 1,
     trunkStatusCacheMs: 0
@@ -103,6 +109,7 @@ describe('the webhook routes', () => {
       ['DELETE', '/api/v1/webhooks/wh_0000000000000001'],
       ['POST', '/api/v1/webhooks/wh_0000000000000001/secret'],
       ['POST', '/api/v1/webhooks/wh_0000000000000001/test'],
+      ['POST', '/api/v1/webhooks/wh_0000000000000001/resume'],
       ['GET', '/api/v1/webhooks/wh_0000000000000001/deliveries'],
       ['POST', `/api/v1/webhooks/wh_0000000000000001/deliveries/dlv_${'0'.repeat(32)}/replay`]
     ]
@@ -112,6 +119,15 @@ describe('the webhook routes', () => {
       expect((await app.inject({ ...opts, headers: as('root', 'C') })).statusCode, `${method} ${url} other tenant`).toBe(403)
       expect((await app.inject(opts)).statusCode, `${method} ${url} anonymous`).toBe(401)
     }
+  })
+
+  it('let the administrators find the alerts of the webhooks by their kind (review 10a, second, n°4)', async () => {
+    const { app, store } = await setup()
+    await store.addAlert({ tenantId: 'A', at: new Date().toISOString(), alert: { kind: 'webhook', param: 'disabled', scope: 'tenant', value: 9 } })
+    await store.addAlert({ tenantId: 'A', at: new Date().toISOString(), alert: { kind: 'limit', param: 'concurrent', scope: 'tenant', value: 3 } })
+    const res = await app.inject({ url: '/api/v1/admin/alerts?kind=webhook', headers: root })
+    expect(res.statusCode).toBe(200)
+    expect(res.json().items.map((a: { kind: string; param: string }) => [a.kind, a.param])).toEqual([['webhook', 'disabled']])
   })
 
   it('answer 501 without SECRETS_KEY, which keeps the secrets', async () => {
@@ -128,9 +144,11 @@ describe('the webhook routes', () => {
     expect((await app.inject({ method: 'PUT', url: '/api/v1/webhooks/domains', headers: root, ...json({ domains: ['CRM.example.org', '*.hooks.example.net'] }) })).json()).toEqual({ domains: ['crm.example.org', '*.hooks.example.net'] })
     expect((await app.inject({ url: '/api/v1/webhooks/domains', headers: root })).json()).toEqual({ domains: ['crm.example.org', '*.hooks.example.net'] })
     expect((await create({ url: 'http://crm.example.org/in', events: ['call.missed'] })).json()).toMatchObject({ code: 'WEBHOOK_URL_SCHEME' })
+    // Ports 443 and 80 only (the operator lists others): no scanner of the ports of an address of their choice.
+    for (const url of ['https://crm.example.org:8080/in', 'https://crm.example.org:22/in', 'https://crm.example.org:0/in']) expect((await create({ url, events: ['call.missed'] })).json(), url).toMatchObject({ code: 'WEBHOOK_URL_PORT' })
     expect((await create({ url: 'https://crm.example.org/in', events: ['voicemail.created'] })).json()).toMatchObject({ code: 'WEBHOOK_EVENTS' })
 
-    const res = await create({ url: 'https://crm.example.org/in', events: ['call.missed', 'call.ringing'], description: 'CRM' })
+    const res = await create({ url: 'https://crm.example.org:443/in', events: ['call.missed', 'call.ringing'], description: 'CRM' })
     expect(res.statusCode).toBe(201)
     const made = res.json()
     expect(made).toEqual({ id: expect.stringMatching(/^wh_[0-9a-f]{16}$/), url: 'https://crm.example.org/in', events: ['call.ringing', 'call.missed'], description: 'CRM', enabled: true, deliverable: true, createdAt: expect.any(String), updatedAt: expect.any(String), secret: expect.stringMatching(/^whsec_/) })
@@ -176,9 +194,87 @@ describe('the webhook routes', () => {
     expect(verifyWebhookSignature(again.secret, signature, got.at(-1)!.body)).toBe(true)
     expect(verifyWebhookSignature(renewed.secret, signature, got.at(-1)!.body)).toBe(true)
     expect(verifyWebhookSignature(made.secret, signature, got.at(-1)!.body)).toBe(false)
+    // Renewed without grace (a secret that leaked): the one it replaced no longer signs at all.
+    const revoked = await app.inject({ method: 'POST', url: `/api/v1/webhooks/${made.id}/secret?grace=0`, headers: root })
+    expect(revoked.statusCode).toBe(200)
+    expect(revoked.json()).not.toHaveProperty('previousSecretUntil')
+    expect((await app.inject({ url: `/api/v1/webhooks/${made.id}`, headers: root })).json()).not.toHaveProperty('previousSecretUntil')
+    const lastTest = (await app.inject({ method: 'POST', url: `/api/v1/webhooks/${made.id}/test`, headers: root })).json()
+    const signed = await until('the test after', () => got.find(g => JSON.parse(g.body).id === lastTest.eventId))
+    expect(signed.headers['x-twakephone-signature']).toMatch(/^t=\d+,v1=[0-9a-f]{64}$/)
+    expect(verifyWebhookSignature(revoked.json().secret, signed.headers['x-twakephone-signature'], signed.body)).toBe(true)
+    expect((await app.inject({ method: 'POST', url: `/api/v1/webhooks/${made.id}/secret?grace=1`, headers: root })).json().code).toBe('WEBHOOK_QUERY')
     expect((await app.inject({ method: 'DELETE', url: `/api/v1/webhooks/${made.id}`, headers: root })).statusCode).toBe(204)
     expect((await app.inject({ url: `/api/v1/webhooks/${made.id}`, headers: root })).statusCode).toBe(404)
     expect((await app.inject({ url: '/api/v1/webhooks/not-an-id', headers: root })).statusCode).toBe(404)
+  })
+
+  it('resume a paused subscription without closing what it waits to send, and a test lifts its pause (review 10a, second, n°10)', async () => {
+    const { app, store, got } = await setup()
+    await app.inject({ method: 'PUT', url: '/api/v1/webhooks/domains', headers: root, ...json({ domains: ['crm.example.org'] }) })
+    const made = (await app.inject({ method: 'POST', url: '/api/v1/webhooks', headers: root, ...json({ url: 'https://crm.example.org/in', events: ['call.missed'] }) })).json()
+    const later = new Date(Date.now() + 3_600_000).toISOString()
+    await store.pauseWebhookSubscription('A', made.id, later)
+    expect((await app.inject({ url: `/api/v1/webhooks/${made.id}`, headers: root })).json().pausedUntil).toBe(later)
+    // A test: sent now, the pause lifted.
+    await app.inject({ method: 'POST', url: `/api/v1/webhooks/${made.id}/test`, headers: root })
+    await until('the test', () => got.length === 1)
+    expect((await app.inject({ url: `/api/v1/webhooks/${made.id}`, headers: root })).json()).not.toHaveProperty('pausedUntil')
+    // Resumed: no pause, its failures forgotten.
+    await store.pauseWebhookSubscription('A', made.id, later)
+    const resumed = await app.inject({ method: 'POST', url: `/api/v1/webhooks/${made.id}/resume`, headers: root })
+    expect(resumed.statusCode).toBe(200)
+    expect(resumed.json()).toMatchObject({ id: made.id, enabled: true })
+    expect(resumed.json()).not.toHaveProperty('pausedUntil')
+    expect((await app.inject({ method: 'POST', url: `/api/v1/webhooks/${made.id}/resume`, headers: as('root', 'B') })).statusCode).toBe(404)
+  })
+
+  it('refuse a test or a replay to a subscription with too many waiting, count what it did not queue and alert (review 10a, second, n°11 and 12)', async () => {
+    let answer: () => void = () => undefined
+    const hold = new Promise<void>(r => (answer = r))
+    const { app, got, push } = await setup({ maxPending: 1, hold })
+    await app.inject({ method: 'PUT', url: '/api/v1/webhooks/domains', headers: root, ...json({ domains: ['crm.example.org'] }) })
+    const made = (await app.inject({ method: 'POST', url: '/api/v1/webhooks', headers: root, ...json({ url: 'https://crm.example.org/in', events: ['call.missed'] }) })).json()
+    const first = (await app.inject({ method: 'POST', url: `/api/v1/webhooks/${made.id}/test`, headers: root })).json()
+    await until('sent, not answered', () => got.length === 1)
+    const more = await app.inject({ method: 'POST', url: `/api/v1/webhooks/${made.id}/test`, headers: root })
+    expect([more.statusCode, more.json().code]).toEqual([409, 'WEBHOOK_BACKLOG'])
+    // Missed calls meanwhile: recorded failed, counted, the administrators alerted (and the alert found by its kind).
+    const call = { id: 'c-backlog@192.0.2.10', direction: 'inbound' as const, remoteNumber: '101', startedAt: '2026-10-16T10:00:00.000Z' }
+    push('102', { type: 'call.ended', timestamp: '2026-10-16T10:00:05.000Z', payload: { call: { ...call, state: 'missed', endedAt: '2026-10-16T10:00:05.000Z' } } })
+    const listed = await until('counted', async () => {
+      const w = (await app.inject({ url: `/api/v1/webhooks/${made.id}`, headers: root })).json()
+      return w.backlog ? w : undefined
+    })
+    expect(listed).toMatchObject({ backlog: 1, backlogAt: expect.any(String) })
+    const alerts = await until('alerted', async () => {
+      const r = (await app.inject({ url: '/api/v1/admin/alerts?kind=webhook', headers: root })).json()
+      return r.items?.length ? r.items : undefined
+    })
+    expect(alerts.map((a: { kind: string; param: string }) => [a.kind, a.param])).toEqual([['webhook', 'backlog']])
+    answer()
+    await until('delivered', async () => (await app.inject({ url: `/api/v1/webhooks/${made.id}/deliveries?status=delivered`, headers: root })).json().items.length === 1)
+    // A replay is held to the cap as well; the test is now over, so it is replayed.
+    expect((await app.inject({ method: 'POST', url: `/api/v1/webhooks/${made.id}/deliveries/${first.id}/replay`, headers: root })).statusCode).toBe(202)
+  })
+
+  it('limit the tests and replays of an organisation all together, however many subscriptions (review 10a, second, n°11)', async () => {
+    const { app } = await setup({ tenantSendsPerMinute: 2 })
+    await app.inject({ method: 'PUT', url: '/api/v1/webhooks/domains', headers: root, ...json({ domains: ['crm.example.org'] }) })
+    const ids: string[] = []
+    for (let i = 0; i < 3; i++) ids.push((await app.inject({ method: 'POST', url: '/api/v1/webhooks', headers: root, ...json({ url: `https://crm.example.org/${i}`, events: ['call.missed'] }) })).json().id)
+    expect((await app.inject({ method: 'POST', url: `/api/v1/webhooks/${ids[0]}/test`, headers: root })).statusCode).toBe(202)
+    expect((await app.inject({ method: 'POST', url: `/api/v1/webhooks/${ids[1]}/test`, headers: root })).statusCode).toBe(202)
+    const third = await app.inject({ method: 'POST', url: `/api/v1/webhooks/${ids[2]}/test`, headers: root })
+    expect([third.statusCode, third.json().code]).toEqual([429, 'WEBHOOK_RATE'])
+    // Deleted and made again: counted the same.
+    await app.inject({ method: 'DELETE', url: `/api/v1/webhooks/${ids[0]}`, headers: root })
+    const again = (await app.inject({ method: 'POST', url: '/api/v1/webhooks', headers: root, ...json({ url: 'https://crm.example.org/0', events: ['call.missed'] }) })).json()
+    expect((await app.inject({ method: 'POST', url: `/api/v1/webhooks/${again.id}/test`, headers: root })).statusCode).toBe(429)
+    // Another organisation has its own.
+    await app.inject({ method: 'PUT', url: '/api/v1/webhooks/domains', headers: as('root', 'B'), ...json({ domains: ['crm.example.org'] }) })
+    const theirs = (await app.inject({ method: 'POST', url: '/api/v1/webhooks', headers: as('root', 'B'), ...json({ url: 'https://crm.example.org/b', events: ['call.missed'] }) })).json()
+    expect((await app.inject({ method: 'POST', url: `/api/v1/webhooks/${theirs.id}/test`, headers: as('root', 'B') })).statusCode).toBe(202)
   })
 
   it('keep 20 subscriptions at most', async () => {
@@ -311,6 +407,23 @@ describe('the events a subscriber is sent', () => {
       { user: 'jdupont', extension: '102', status: 'available' }
     ])
     expect(got.map(g => g.body).join()).not.toContain('réunion')
+  })
+
+  it('a presence that settles: a status kept less than the settling time is not told (review 10a, second, n°19)', async () => {
+    const { app, got, push } = await setup({ presenceSettleMs: 80 })
+    await app.inject({ method: 'PUT', url: '/api/v1/webhooks/domains', headers: root, ...json({ domains: ['crm.example.org'] }) })
+    await app.inject({ method: 'POST', url: '/api/v1/webhooks', headers: root, ...json({ url: 'https://crm.example.org/in', events: ['presence.changed'] }) })
+    const presence = (p: Presence): TelephonyEvent => ({ type: 'presence.changed', timestamp: at, payload: { userId: '', presence: p } })
+    // A short call: busy, then available again, within the settling time.
+    push('102', presence({ status: 'busy', source: 'telephony' }))
+    push('102', presence({ status: 'available', source: 'telephony' }))
+    push('101', presence({ status: 'dnd', source: 'user' }))
+    await until('the settled ones', () => got.length === 2)
+    const told = got.map(g => JSON.parse(g.body).presence as { user: string; status: string }).sort((a, b) => a.user.localeCompare(b.user))
+    expect(told.map(p => [p.user, p.status])).toEqual([
+      ['amartin', 'dnd'],
+      ['jdupont', 'available']
+    ])
   })
 
   it('a trunk that gets worse, then recovers, from what the SIP server says of it', async () => {

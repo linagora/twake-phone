@@ -535,6 +535,7 @@ export type WebhookEvent =
   | (WebhookEventBase & { type: 'call.ringing' | 'call.answered' | 'call.ended' | 'call.missed'; call: WebhookCall })
   /** A person's telephony presence; nothing of what they wrote for their callers. */
   | (WebhookEventBase & { type: 'presence.changed'; presence: { user: UserId; extension?: string; status: PresenceStatus } })
+  /** A trunk's health is no longer up and changed: worse (up to degraded or down, degraded to down) or partly better (down to degraded). */
   | (WebhookEventBase & {
       type: 'trunk.degraded'
       trunk: {
@@ -546,7 +547,10 @@ export type WebhookEvent =
         servers: { address: string; state: TrunkServerState }[]
       }
     })
-  /** A trunk told degraded or down is up again (seen up as many reads in a row as its degradation was). */
+  /**
+   * A trunk told degraded or down is up again (seen up as many reads in a row as its degradation was), or is no
+   * longer watched (`removed`: an administrator disabled it whole or deleted it): nothing to wait for any more.
+   */
   | (WebhookEventBase & {
       type: 'trunk.recovered'
       trunk: {
@@ -554,6 +558,7 @@ export type WebhookEvent =
         name?: string
         state: 'up'
         previous: Exclude<TrunkHealth, 'up'>
+        removed?: true
         registration?: TrunkRegistrationState
         servers: { address: string; state: TrunkServerState }[]
       }

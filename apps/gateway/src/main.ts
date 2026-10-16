@@ -12,7 +12,7 @@ import { ProviderRegistry } from './registry.js'
 import { PgStore } from './store/pg.js'
 import { trunkFromEnv, trunkRecord } from './trunks.js'
 import { networkInterfaces } from 'node:os'
-import { denyNetworks, parseNetworks } from './webhook-delivery.js'
+import { denyNetworks, parsePorts, parseTenantNetworks } from './webhook-delivery.js'
 
 const env = process.env
 const need = (name: string): string => {
@@ -159,12 +159,15 @@ const groupNumbers = async (tenantId: string) => {
   return provider.listGroups ? (await provider.listGroups()).map(g => g.number) : []
 }
 const directorySync = contacts && env.LDAP_ATTR_EXTENSION ? new DirectorySync({ store, directory: contacts, tenantId: env.LDAP_TENANT ?? tenant, reserved: async t => [...(await groupNumbers(t)), ...(conference && accessNumber ? [accessNumber] : [])] }) : undefined
-// Webhooks (step 10a, ADR 0020), with SECRETS_KEY: deliveries in https only, never to this host or the private
-// networks, unless the operator opens some (WEBHOOK_PRIVATE_NETWORKS, CIDR, comma-separated: a CRM of its own
-// network) or allows http (WEBHOOK_ALLOW_HTTP=1, development only). Never, whatever it opened, to the addresses of
-// this host's interfaces (its public one included) nor to WEBHOOK_DENY_NETWORKS (the platform's other public
-// addresses: its entry point, services that trust the Gateway's address).
-const webhookOpen = parseNetworks(env.WEBHOOK_PRIVATE_NETWORKS)
+// Webhooks (step 10a, ADR 0020), with SECRETS_KEY: deliveries in https only, on ports 443 and 80 (WEBHOOK_PORTS:
+// others), never to this host or the private networks, unless the operator opens some to one organisation
+// (WEBHOOK_PRIVATE_NETWORKS, `acme=10.20.0.0/16;beta=192.0.2.10`, a bare list for DEFAULT_TENANT: the CRM of that
+// organisation in its network, never the others') or allows http (WEBHOOK_ALLOW_HTTP=1, development only). Never,
+// whatever it opened, to the addresses of this host's interfaces (its public one included) nor to
+// WEBHOOK_DENY_NETWORKS (the platform's other public addresses: its entry point, services that trust the Gateway's
+// address).
+const webhookOpen = parseTenantNetworks(env.WEBHOOK_PRIVATE_NETWORKS, tenant)
+const webhookPorts = parsePorts(env.WEBHOOK_PORTS)
 const webhookDeny = denyNetworks(env.WEBHOOK_DENY_NETWORKS, networkInterfaces())
 const webhookHttp = env.WEBHOOK_ALLOW_HTTP === '1'
 if (webhookHttp) console.warn('WARNING: WEBHOOK_ALLOW_HTTP=1: webhooks may be delivered in clear (http), for development only')
@@ -180,7 +183,7 @@ const app = await buildApp(registry, {
   auth: authenticatorFromEnv(env),
   ...(push ? { push } : {}),
   ...(key ? { secretsKey: key } : {}),
-  webhooks: { policy: { allowHttp: webhookHttp }, open: webhookOpen, deny: webhookDeny },
+  webhooks: { policy: { allowHttp: webhookHttp, ports: webhookPorts }, open: webhookOpen, deny: webhookDeny },
   ...(conference ? { conference } : {})
 })
 directorySync?.useLogger(app.log)

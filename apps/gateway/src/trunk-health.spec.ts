@@ -50,6 +50,7 @@ describe('the watch over the trunks', () => {
         tenants: () => tenants,
         read: async () => status,
         names: async () => new Map([['tr1', 'Opérateur principal']]),
+        told: tenantId => store.listWebhookStates(tenantId, 'trunk:'),
         confirm
       })
       return { hub, watch }
@@ -99,6 +100,95 @@ describe('the watch over the trunks', () => {
     ])
     expect(events[3]!.trunk.registration).toBe('refused')
     expect(events[2]!.trunk.servers).toEqual(UP)
+  })
+
+  it('tells a partial recovery (down to degraded), and a trunk no longer watched as recovered, removed (review 10a, second, n°16)', async () => {
+    const { told, gateway, set } = await setup()
+    const { watch: w } = await gateway()
+    const twice = async () => {
+      await w.tick()
+      await w.tick()
+    }
+    const backup = (servers: TrunkStatus['servers']): TrunkStatus => ({ id: 'tr2', servers })
+    set([trunk(UP), backup(UP)])
+    await twice()
+    set([trunk(ALL_OUT), backup(ALL_OUT)])
+    await twice()
+    set([trunk(ONE_OUT), backup(ALL_OUT)])
+    await twice()
+    // tr1 disabled whole by an administrator, tr2 deleted: nothing to wait for any more, told at once.
+    set([trunk([{ address: '192.0.2.10:5060', state: 'disabled' }, { address: '192.0.2.11:5060', state: 'disabled' }])])
+    await w.tick()
+    const events = await told()
+    const of = (id: string) => events.filter(e => e.trunk.id === id).map(e => [e.type, e.trunk.state, e.trunk.previous, 'removed' in e.trunk ? e.trunk.removed : undefined])
+    expect(of('tr1')).toEqual([
+      ['trunk.degraded', 'down', 'up', undefined],
+      ['trunk.degraded', 'degraded', 'down', undefined],
+      ['trunk.recovered', 'up', 'degraded', true]
+    ])
+    expect(of('tr2')).toEqual([
+      ['trunk.degraded', 'down', 'up', undefined],
+      ['trunk.recovered', 'up', 'down', true]
+    ])
+    // Enabled again and up: nothing (it was told recovered); down again: told from up.
+    set([trunk(UP)])
+    await twice()
+    expect(await told()).toHaveLength(5)
+    set([trunk(ALL_OUT)])
+    await twice()
+    expect(steps((await told()).filter(e => e.trunk.id === 'tr1').slice(3))).toEqual([['trunk.degraded', 'down', 'up']])
+  })
+
+  it('tells the trunk deleted while another Gateway told it down, from what the store kept (review 10a, second, n°16)', async () => {
+    const { told, gateway, set } = await setup()
+    const a = await gateway()
+    set([trunk(ALL_OUT)])
+    await a.watch.tick()
+    await a.watch.tick()
+    await a.hub.stop()
+    // The trunk deleted meanwhile; the next Gateway never saw it, the store did.
+    set([])
+    const b = await gateway()
+    expect(b.hub.leading).toBe(true)
+    await b.watch.tick()
+    expect(steps(await told())).toEqual([
+      ['trunk.degraded', 'down', undefined],
+      ['trunk.recovered', 'up', 'down']
+    ])
+  })
+
+  it('reads several tenants at a time, and says when a round runs over the next one', async () => {
+    const { store } = await setup()
+    const warned: string[] = []
+    const hub = new WebhookHub({ store, key: randomBytes(32), logger: quiet, stateLeaseMs: 60_000 })
+    await hub.renewLease()
+    let reading = 0
+    let most = 0
+    let release: () => void = () => undefined
+    const held = new Promise<void>(r => (release = r))
+    const watch = new TrunkWatch({
+      leading: () => hub.leading,
+      publishChange: (...args) => hub.publishChange(...args),
+      tenants: () => Array.from({ length: 20 }, (_, i) => `t${i}`),
+      read: async () => {
+        most = Math.max(most, ++reading)
+        await held
+        reading--
+        return []
+      },
+      names: async () => new Map(),
+      parallel: 4,
+      logger: { warn: (_o, msg) => void warned.push(msg ?? '') }
+    })
+    const round = watch.tick()
+    await new Promise(r => setTimeout(r, 20))
+    await watch.tick()
+    await watch.tick()
+    release()
+    await round
+    expect(most).toBe(4)
+    expect(warned).toEqual(['trunk health: a round is still going, the next one is skipped'])
+    await hub.stop()
   })
 
   it('tells nothing of a blip of one read, nor when the SIP server cannot say, nor of a trunk that wavers back for one read', async () => {

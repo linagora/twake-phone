@@ -213,6 +213,9 @@ export interface WebhookSubscriptionRecord {
   failingSince?: string
   /** Its deliveries wait until then (the circuit breaker). */
   pausedUntil?: string
+  /** Events recorded failed (`backlog`) since it was last enabled or resumed, the latest at `backlogAt`. */
+  backlog?: number
+  backlogAt?: string
   createdAt: string
   updatedAt: string
   /** The administrator who created it. */
@@ -223,6 +226,8 @@ export interface WebhookSubscriptionRecord {
 export interface WebhookHealth {
   failures: number
   failingSince?: string
+  /** When the outcome was dated (the store's clock): the breaker reckons from it. */
+  at: string
 }
 
 /** What queueing an event takes besides it: the person it is about (erased with their history), the pending cap. */
@@ -233,6 +238,8 @@ export interface WebhookQueueOptions {
    * for the log (an administrator may replay it), and never sent by itself.
    */
   maxPending?: number
+  /** Told the subscriptions an event was recorded failed for (`backlog`), once it is written. */
+  onBacklog?: (subscriptionIds: string[]) => void
 }
 
 /** What claimWebhookDeliveries leaves to others: in flight at the same time, whatever the Gateways. */
@@ -241,24 +248,77 @@ export interface WebhookClaimCaps {
   perSubscription: number
   /** Deliveries of one tenant in flight at most: the others always find room. */
   perTenant: number
-  /** A delivery that used them all (its last lease lapsed without an outcome) is failed (`abandoned`), not taken again. */
+  /** A delivery that used them all is not taken again (sweepWebhookDeliveries fails it once its last lease lapsed). */
   maxAttempts: number
+  /** How long a delivery taken is held (from the store's clock), when the claim names no `leaseUntil`. */
+  leaseMs?: number
+}
+
+/** A time the tests give a store instead of its clock (the database's): every write is dated on it otherwise. */
+export interface WebhookClaimTime {
+  now: string
+  leaseUntil: string
+}
+
+/**
+ * The places of a claim (claimWebhookDeliveries): one to each tenant in turn, the earliest due first, and within a
+ * tenant to each of its subscriptions in turn, within what the caps leave once what all Gateways hold is counted.
+ * How many to take of each subscription.
+ */
+export const allocateClaims = (
+  limit: number,
+  caps: Pick<WebhookClaimCaps, 'perSubscription' | 'perTenant'>,
+  tenants: readonly string[],
+  ready: readonly { id: string; tenantId: string }[],
+  held: readonly { tenantId: string; subscriptionId: string; n: number }[]
+): { subscriptionId: string; n: number }[] => {
+  const roomT = new Map(tenants.map(t => [t, caps.perTenant - held.filter(h => h.tenantId === t).reduce((a, h) => a + h.n, 0)]))
+  const roomS = new Map(ready.map(r => [r.id, caps.perSubscription - (held.find(h => h.subscriptionId === r.id)?.n ?? 0)]))
+  const subsOf = new Map(tenants.map(t => [t, ready.filter(r => r.tenantId === t).map(r => r.id)]))
+  const next = new Map(tenants.map(t => [t, 0]))
+  const want = new Map<string, number>()
+  let left = limit
+  for (let progress = true; left > 0 && progress; ) {
+    progress = false
+    for (const t of tenants) {
+      if (left === 0) break
+      if ((roomT.get(t) ?? 0) <= 0) continue
+      const subs = subsOf.get(t)!
+      for (let i = 0; i < subs.length; i++) {
+        const k = (next.get(t)! + i) % subs.length
+        const id = subs[k]!
+        if ((roomS.get(id) ?? 0) <= 0) continue
+        want.set(id, (want.get(id) ?? 0) + 1)
+        roomS.set(id, roomS.get(id)! - 1)
+        roomT.set(t, roomT.get(t)! - 1)
+        next.set(t, k + 1)
+        left--
+        progress = true
+        break
+      }
+    }
+  }
+  return [...want].map(([subscriptionId, n]) => ({ subscriptionId, n }))
 }
 
 /**
  * A change of state told once (setWebhookState): `holder` holds the lease of the role (takeWebhookLease) or nothing
- * is written; `at`, on the database's clock, is newer than what was told, or nothing is written either.
+ * is written. It is dated on the store's clock (the database's) unless `at` is given (tests), and must be newer than
+ * what was told.
  */
 export interface WebhookStateChange {
   tenantId: string
   subject: string
   state: string
-  at: string
+  at?: string
   holder: string
 }
 
-/** The event that tells a change, queued with it (the same transaction): null to tell none (written all the same). */
-export type WebhookStateEvent = (previous: string | undefined) => { id: string; type: WebhookEventType; body: string; subjectUser?: string } | null
+/**
+ * The event that tells a change, queued with it (the same transaction), from what it was before and when the change
+ * is dated: null to tell none (written all the same).
+ */
+export type WebhookStateEvent = (previous: string | undefined, at: string) => { id: string; type: WebhookEventType; body: string; subjectUser?: string } | null
 
 /** The role of the Gateway that tells the changes of state of every tenant (webhook_leases). */
 export const WEBHOOK_STATE_ROLE = 'webhook-state'
@@ -304,9 +364,13 @@ export interface ClaimedDelivery extends WebhookDeliveryRecord {
  * The outcome of an attempt: delivered, or failed and due again at `retryAt` (absent: failed for good). `at` and
  * `retryAt` on the database's clock (the hub corrects its own).
  */
+/**
+ * The outcome of an attempt, dated on the store's clock unless `at` is given (tests). A failure is retried `retryInMs`
+ * later (or at `retryAt`), or failed for good without either.
+ */
 export type WebhookAttemptResult =
-  | { delivered: true; at: string; status: number }
-  | { delivered: false; at: string; status?: number; error: string; retryAt?: string }
+  | { delivered: true; at?: string; status: number }
+  | { delivered: false; at?: string; status?: number; error: string; retryAt?: string; retryInMs?: number }
 
 /** A page of a subscription's deliveries, the latest first: `before` the last one of the page before. */
 export interface WebhookDeliveryQuery {
@@ -453,9 +517,14 @@ export interface Store {
    * the previous one (a second renewal replaces it). One write: two renewals at once, or a renewal during an update,
    * lose neither. False when the tenant has none of that id.
    */
-  renewWebhookSecret(tenantId: string, id: string, secretEnc: string, keepPreviousUntil: string, at: string): Promise<boolean>
-  /** Its deliveries wait until `until` (the circuit breaker: its subscriber kept failing). */
-  pauseWebhookSubscription(tenantId: string, id: string, until: string): Promise<void>
+  renewWebhookSecret(tenantId: string, id: string, secretEnc: string, keepPreviousUntil: string | null, at: string): Promise<boolean>
+  /** Its deliveries wait until `until` (the circuit breaker: its subscriber kept failing); null lifts the pause. */
+  pauseWebhookSubscription(tenantId: string, id: string, until: string | null): Promise<void>
+  /**
+   * Starts it afresh without closing what it waits to send (an administrator repaired its subscriber): no pause, no
+   * failures, no backlog counted. False when the tenant has none of that id.
+   */
+  resumeWebhookSubscription(tenantId: string, id: string): Promise<boolean>
   /**
    * Disables one that kept failing (`disabledReason` 'failing'), its pending deliveries failed (`disabled`): true when
    * it was enabled until then (the administrators are told once).
@@ -464,29 +533,38 @@ export interface Store {
   /** Removes one and its deliveries. Whether it was there. */
   deleteWebhookSubscription(tenantId: string, id: string): Promise<boolean>
   /**
-   * Counts a test or a replay asked of a subscription at `at`, unless `limit` were asked within `windowMs` before
-   * (false then, nothing counted): whatever Gateway or administrator asks.
+   * Counts a test or a replay asked of a subscription (at `at`, the store's clock otherwise), unless `limit` were
+   * asked of it within `windowMs` before, or `tenantLimit` of the tenant's (false then, nothing counted): whatever
+   * Gateway or administrator asks, and a subscription deleted and made again counts the same.
    */
-  takeWebhookSend(tenantId: string, subscriptionId: string, at: string, limit: number, windowMs: number): Promise<boolean>
+  takeWebhookSend(tenantId: string, subscriptionId: string, at: string | undefined, limit: number, windowMs: number, tenantLimit?: number): Promise<boolean>
   /** The domains the tenant allows its subscriptions to point to, as written. */
   getWebhookDomains(tenantId: string): Promise<string[]>
   setWebhookDomains(tenantId: string, domains: string[]): Promise<void>
   /**
    * Queues `body` (the event `eventId` of type `eventType`) for each enabled subscription of the tenant that takes
-   * this type, once per subscription and event whoever queues it again (another Gateway heard it too). Due at `at`.
-   * How many deliveries were queued pending (those past `maxPending` are recorded failed: not counted).
+   * this type, once per subscription and event whoever queues it again (another Gateway heard it too). Due at `at`
+   * (the store's clock without it). How many deliveries were queued pending (those past `maxPending` are recorded
+   * failed and counted in their subscription's `backlog`: not counted here).
    */
-  enqueueWebhookEvent(tenantId: string, eventId: string, eventType: WebhookEventType, body: string, at: string, options?: WebhookQueueOptions): Promise<number>
-  /** Queues `body` for one subscription of the tenant, whatever it takes (a test): the delivery, or null without it. */
-  enqueueWebhookDelivery(tenantId: string, subscriptionId: string, eventId: string, eventType: string, body: string, at: string): Promise<WebhookDeliveryRecord | null>
+  enqueueWebhookEvent(tenantId: string, eventId: string, eventType: WebhookEventType, body: string, at: string | undefined, options?: WebhookQueueOptions): Promise<number>
   /**
-   * Takes up to `limit` pending deliveries due at `now`, whatever tenant, that no other Gateway holds, of enabled
-   * subscriptions not paused: each one counts an attempt and is held until `leaseUntil` (then due again, if its
-   * outcome never came). Within `caps` (what all Gateways hold counted), taking each tenant's earliest due in turn: a
-   * tenant whose subscriber never answers holds a few deliveries at most, never the others'. Two Gateways never take
-   * the same one at the same time.
+   * Queues `body` for one subscription of the tenant, whatever it takes (a test): the delivery, null without it, or
+   * `full` when it has `maxPending` pending already (nothing queued).
    */
-  claimWebhookDeliveries(now: string, leaseUntil: string, limit: number, caps: WebhookClaimCaps): Promise<ClaimedDelivery[]>
+  enqueueWebhookDelivery(tenantId: string, subscriptionId: string, eventId: string, eventType: string, body: string, at: string | undefined, maxPending?: number): Promise<WebhookDeliveryRecord | 'full' | null>
+  /**
+   * Takes up to `limit` pending deliveries due now, whatever tenant, that no other Gateway holds, of enabled
+   * subscriptions not paused, with attempts left: each one counts an attempt and is held for `caps.leaseMs` (then due
+   * again, if its outcome never came). Within `caps` (what all Gateways hold counted), each tenant's earliest due in
+   * turn: a tenant whose subscriber never answers, or answers slowly, holds a few deliveries at most, never the
+   * others'. Its cost does not grow with what waits: each subscription's next due is read by an index, and one tenant
+   * is claimed by one Gateway at a time (another passes it over meanwhile). Two Gateways never take the same one.
+   * `at`: the time the tests give instead of the store's clock.
+   */
+  claimWebhookDeliveries(limit: number, caps: WebhookClaimCaps, at?: WebhookClaimTime): Promise<ClaimedDelivery[]>
+  /** Fails (`abandoned`) the deliveries whose last attempt never came back (their lease lapsed): how many. */
+  sweepWebhookDeliveries(maxAttempts: number, now?: string): Promise<number>
   /**
    * Records the outcome of an attempt taken with `claim`, and counts it in its subscription's health (a delivery
    * starts it afresh, a failure adds one): the health then, or null when ignored (the lease was taken back since).
@@ -498,32 +576,38 @@ export interface Store {
    * Sends a delivery again (its attempts from zero, due at `at`): the delivery as it is then; `pending` when it is
    * still pending (not replayed); null when the subscription of the tenant has none of that id.
    */
-  replayWebhookDelivery(tenantId: string, subscriptionId: string, id: string, at: string): Promise<WebhookDeliveryRecord | 'pending' | null>
+  replayWebhookDelivery(tenantId: string, subscriptionId: string, id: string, at?: string, maxPending?: number): Promise<WebhookDeliveryRecord | 'pending' | 'full' | null>
   /**
-   * Removes the deliveries of every tenant created before `before` (ISO), unless pending, and the states told before
-   * it (webhook_state): by batches, one Gateway at a time (another one that tries meanwhile removes nothing). How
-   * many deliveries.
+   * Removes the deliveries of every tenant created before `before` (ISO), unless pending: by batches, one Gateway at
+   * a time (another one that tries meanwhile removes nothing). How many. What was told of each subject is kept,
+   * whatever its age (one row per person and trunk; a person's goes with their mapping or their erasure), unless it is
+   * `removed` (a trunk no longer watched) since before `before`.
    */
   purgeWebhookDeliveries(before: string): Promise<number>
   /**
    * The right to erasure (DELETE /me/history): the deliveries about the person (`subject_user`) that are no longer
-   * pending, and what was told of their presence. How many deliveries.
+   * pending, and what was told of their presence; those still pending are sent, then kept without their body. How
+   * many deliveries.
    */
   eraseWebhookSubject(tenantId: string, userId: string): Promise<number>
 
   /**
    * Keeps what the subscribers were last told of `subject` (step 10a: `trunk:<id>` its health, `presence:<user>` a
-   * person's status) as `state` since `at`, if it changed, and queues the event `event` makes of it in the same
-   * transaction (both or neither): what it was before (undefined when never kept) and how many deliveries, or null
-   * when nothing was written: it was already that, what was told is not older than `at`, or `holder` no longer
-   * holds the lease of WEBHOOK_STATE_ROLE (another Gateway tells the changes now).
+   * person's status) as `state` since now (the store's clock, or `at`), if it changed, and queues the event `event`
+   * makes of it in the same transaction (both or neither): what it was before (undefined when never kept) and how
+   * many deliveries, or null when nothing was written: it was already that, what was told is not older, or `holder`
+   * no longer holds the lease of WEBHOOK_STATE_ROLE (another Gateway tells the changes now).
    */
   setWebhookState(change: WebhookStateChange, event: WebhookStateEvent, options?: WebhookQueueOptions): Promise<{ previous: string | undefined; queued: number } | null>
   /**
    * Takes the lease of `role` for `holder` for `ms` (on the database's clock), or renews it: whether it holds it
-   * (false while another holds it and its lease has not lapsed).
+   * (false while another holds it and its lease has not lapsed). `healthy` (true by default): whether `holder` hears
+   * what it would tell (its event streams are up); a healthy one takes the lease from one that is not, at once,
+   * and one that is not takes it only once it lapsed (better than nobody).
    */
-  takeWebhookLease(role: string, holder: string, ms: number): Promise<boolean>
+  takeWebhookLease(role: string, holder: string, ms: number, healthy?: boolean): Promise<boolean>
+  /** What was told of the tenant's subjects starting with `prefix` (`trunk:`): the subject and its state. */
+  listWebhookStates(tenantId: string, prefix: string): Promise<{ subject: string; state: string }[]>
   /** The time on the store's clock (the database's): the hub dates the queue on it, whatever its own clock says. */
   clock(): Promise<string>
 

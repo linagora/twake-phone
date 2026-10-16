@@ -792,6 +792,7 @@ describe('the administration screens (step 7)', () => {
     updateWebhook: vi.fn(),
     deleteWebhook: vi.fn(),
     renewWebhookSecret: vi.fn(),
+    resumeWebhook: vi.fn(),
     testWebhook: vi.fn(),
     listWebhookDeliveries: vi.fn(async () => ({ items: [] })),
     replayWebhookDelivery: vi.fn(),
@@ -884,13 +885,6 @@ describe('the administration screens (step 7)', () => {
     expect(text()).toContain('en pause jusqu')
     expect(text()).toContain('échecs de suite : 6')
     expect(text()).toContain("désactivé après une journée d'échecs")
-    // RGAA 2.5.3: each button's name starts with what it shows.
-    const buttons = [...host.querySelectorAll('.admin-list button')]
-    expect(buttons.length).toBeGreaterThan(10)
-    for (const b of buttons) {
-      const label = b.getAttribute('aria-label')
-      if (label) expect(label.startsWith(b.textContent ?? ''), `${label} / ${b.textContent}`).toBe(true)
-    }
     click(host.querySelector('[aria-label="Nouveau secret pour https://crm.example.org/in"]'))
     expect(renewWebhookSecret).not.toHaveBeenCalled()
     expect(text()).toContain('Remplacer le secret de https://crm.example.org/in ?')
@@ -902,6 +896,67 @@ describe('the administration screens (step 7)', () => {
     click(host.querySelector('[aria-label="Tester l\'abonnement https://crm.example.org/in"]'))
     await flush()
     expect(text()).toContain('Cet abonnement est désactivé : réactivez-le d')
+  })
+
+  it("names each button by what it shows first, in the list and the log, in French and in English (WCAG 2.5.3, review 10a, second, n°5)", async () => {
+    const delivery: WebhookDelivery = { id: `dlv_${'1'.repeat(32)}`, eventId: `evt_${'2'.repeat(32)}`, eventType: 'call.missed', status: 'failed', attempts: 9, createdAt: '2026-10-16T08:00:00.000Z', lastStatus: 503, lastError: 'http' }
+    const items: WebhookSubscription[] = [hook, { ...hook, id: 'wh_00000000000000a3', url: 'https://crm.example.org/paused', failures: 6, pausedUntil: '2026-10-16T09:00:00.000Z' }]
+    admin(webhooksClient({ listWebhooks: vi.fn(async () => ({ items })), listWebhookDeliveries: vi.fn(async () => ({ items: [delivery] })) }))
+    await render(
+      '/admin/webhooks',
+      <>
+        <LangSwitch />
+        <Webhooks />
+      </>
+    )
+    // The name of a button holds what it shows, at its start (WCAG 2.5.3, RGAA 6.1 for the links).
+    const check = (min: number) => {
+      const buttons = [...host.querySelectorAll('.admin-list button, #webhook-log-section table button, table button')]
+      expect(buttons.length).toBeGreaterThanOrEqual(min)
+      for (const b of buttons) {
+        const label = b.getAttribute('aria-label')
+        if (label) expect(label.startsWith(b.textContent ?? ''), `${label} / ${b.textContent}`).toBe(true)
+      }
+    }
+    click(host.querySelector('[aria-label="Journal des envois à https://crm.example.org/in"]'))
+    await flush()
+    expect(host.querySelector('table button')?.getAttribute('aria-label')).toMatch(/^Renvoyer : l'événement Appel manqué du 16\/10\/2026/)
+    check(12)
+    click(button(host, 'English'))
+    await flush()
+    expect(host.querySelector('table button')?.textContent).toBe('Send again')
+    expect(host.querySelector('table button')?.getAttribute('aria-label')).toMatch(/^Send again: Missed call of /)
+    check(12)
+  })
+
+  it('resumes a paused subscription, revokes a secret at once, says what was dropped and refuses a port (review 10a, second)', async () => {
+    const resumeWebhook = vi.fn(async () => ({ ...hook }))
+    const renewWebhookSecret = vi.fn(async () => ({ secret: 'whsec_revoked' }))
+    const createWebhook = vi.fn(async () => {
+      throw refused(400, 'WEBHOOK_URL_PORT', 'url: port 8080 is not allowed (443, 80)')
+    })
+    const paused = { ...hook, id: 'wh_00000000000000a3', url: 'https://crm.example.org/paused', failures: 6, pausedUntil: '2026-10-16T09:00:00.000Z', backlog: 12, backlogAt: '2026-10-16T08:30:00.000Z' }
+    admin(webhooksClient({ resumeWebhook, renewWebhookSecret, createWebhook, listWebhooks: vi.fn(async () => ({ items: [hook, paused] })) }))
+    await render('/admin/webhooks', <Webhooks />)
+    expect(text()).toContain('12 événements écartés (trop en attente), le dernier le 16/10/2026')
+    // Resume only where something holds it back.
+    expect(host.querySelector('[aria-label="Reprendre https://crm.example.org/in"]')).toBeNull()
+    click(host.querySelector('[aria-label="Reprendre https://crm.example.org/paused"]'))
+    await flush()
+    expect(resumeWebhook).toHaveBeenCalledWith('wh_00000000000000a3')
+    expect(text()).toContain('https://crm.example.org/paused repris')
+    click(host.querySelector('[aria-label="Révoquer le secret de https://crm.example.org/in"]'))
+    expect(text()).toContain("arrêter l'ancien tout de suite")
+    click(button(host, 'Révoquer et générer un nouveau secret'))
+    await flush()
+    expect(renewWebhookSecret).toHaveBeenCalledWith('wh_00000000000000a1', { revoke: true })
+    expect(($('#webhook-secret-value') as HTMLInputElement).value).toBe('whsec_revoked')
+    expect(text()).not.toContain("L'ancien secret signe aussi")
+    click(button(host, "J'ai copié le secret"))
+    type($('#webhook-url'), 'https://crm.example.org:8080/in')
+    await submit($('#webhook-url')!.closest('form'))
+    await flush()
+    expect($('#webhook-url-error')?.textContent).toContain("Ce port n'est pas autorisé")
   })
 
   it('says webhooks are not available on a platform without SECRETS_KEY (step 10a)', async () => {
