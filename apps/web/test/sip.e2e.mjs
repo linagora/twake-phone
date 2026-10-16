@@ -2679,11 +2679,11 @@ try {
     for (const button of ['Retirer 102 de la conférence', 'Retirer 103 de la conférence', 'Terminer pour tous', 'Quitter la conférence']) await alice.page.getByRole('button', { name: button }).waitFor()
     CONFERENCE = await until('the room of the conference, kept for Alice', async () => (await store.listConferences(TENANT, 'amartin')).find(r => /^twake-call-[0-9a-f]{16}$/.test(r.meetingId))?.meetingId ?? null)
     expectEqual((await inConference()).map(p => `${p.kind} ${p.number}`).sort().join(', '), 'phone 101, phone 102, phone 103', 'the room of the conference')
-    // When each came in, by LiveKit's clock: there for everyone. Its unit is only told here, not proved (Bob comes in
-    // seconds after the others, so whole seconds would pass as well).
-    const joinedAt = (await inConference()).map(p => p.joinedAt)
-    expectEqual(joinedAt.every(at => Number.isFinite(at) && at > 1e12), true, `when each came in: ${JSON.stringify(joinedAt)}`)
-    console.log(`LiveKit's joinedAt: ${joinedAt.some(at => at % 1000 !== 0) ? 'milliseconds' : 'whole seconds, it seems'}`)
+    // When each came in, by the Gateway's clock (it dials every call of the room and writes when): there for everyone,
+    // in milliseconds, Bob after the two others.
+    const came = Object.fromEntries((await inConference()).map(p => [p.number, p.joinedAt]))
+    expectEqual(Object.values(came).every(at => Number.isSafeInteger(at) && at > 1e12), true, `when each came in: ${JSON.stringify(came)}`)
+    expectEqual(came['103'] > Math.max(came['101'], came['102']), true, `Bob after the others: ${JSON.stringify(came)}`)
     // Bob's call names the room of the conference (Twake-Conference): he sees who is in it, as Jean does; neither acts on anyone.
     const [bobs] = await calls(bob.page)
     expectEqual(`${bobs?.room} ${bobs?.conferenceRoom === CONFERENCE}`, 'conference true', `Bob's call of the conference ${JSON.stringify(bobs)}`)

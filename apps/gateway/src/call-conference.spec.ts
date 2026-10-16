@@ -442,6 +442,8 @@ describe('a call becomes a conference (POST /calls/:id/conference, step 8b)', ()
     expect(await marks({ 'x-twake-call': 'elsewhere@192.0.2.30' })).toEqual(none)
     expect(await marks({ 'x-twake-call': `${bobs}${'x'.repeat(257)}` })).toEqual(none)
     expect(await marks({ 'x-twake-call': [bobs, 'other@192.0.2.30'] })).toEqual(none)
+    // Two given at once as Node hands them over (joined in one string, third review of the notice, n°4).
+    expect(await marks({ 'x-twake-call': `${bobs}, other@192.0.2.30` })).toEqual(none)
     // Not in the URL: a query string marks nothing.
     expect((await app.inject({ method: 'GET', url: `/api/v1/conferences/${room}?call=${encodeURIComponent(bobs)}`, headers: as('bob') })).body).not.toContain('"you"')
     const read = async (user: string) => (await app.inject({ method: 'GET', url: `/api/v1/conferences/${room}`, headers: as(user) })).body

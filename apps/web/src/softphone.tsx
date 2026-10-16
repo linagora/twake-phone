@@ -220,9 +220,11 @@ export const SoftphoneProvider = ({ children }: { children: ReactNode }) => {
         throw err
       }
       const { meetingId } = answer
-      setMade(m => conferenceMade(m, call.id, answer))
-      // The person left the room meanwhile (hung up while it began): nobody else is called at their name (review 8b, n°8).
+      // The person left the room meanwhile (hung up while it began): nobody else is called at their name (review 8b, n°8),
+      // and its conference is not kept: the end of its call, already told, would never forget it (third review of the
+      // notice, n°3).
       if (!softphone.conferenceCall(call.id)) return
+      setMade(m => conferenceMade(m, call.id, answer))
       // The conference is there: what fails now is the call to the third participant only (review 8b, n°4).
       try {
         await inviteToConference(meetingId, number)

@@ -85,6 +85,22 @@ describe('gateway', () => {
       delete process.env.CORS_ORIGINS
     }
   })
+
+  it("lets an allowed origin send X-Twake-Call, the Call-ID of a conference participant's own call (third review of the notice, n°4)", async () => {
+    process.env.CORS_ORIGINS = 'https://phone.example.org'
+    try {
+      const app = await buildApp(new ProviderRegistry([]))
+      const res = await app.inject({
+        method: 'OPTIONS',
+        url: '/api/v1/conferences/twake-call-0123456789abcdef',
+        headers: { origin: 'https://phone.example.org', 'access-control-request-method': 'GET', 'access-control-request-headers': 'authorization, x-twake-call' }
+      })
+      expect(res.statusCode).toBe(204)
+      expect(String(res.headers['access-control-allow-headers']).toLowerCase().split(/,\s*/)).toEqual(expect.arrayContaining(['authorization', 'x-twake-call']))
+    } finally {
+      delete process.env.CORS_ORIGINS
+    }
+  })
 })
 
 describe('event stream', () => {

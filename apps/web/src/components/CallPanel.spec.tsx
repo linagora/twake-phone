@@ -122,6 +122,17 @@ describe('CallPanel, a conference (step 8b): who comes in or leaves is told in t
     expect(status()).toBe('conference.joined Dan')
   })
 
+  it.each([
+    ['Alice, who made it', true],
+    ['Jean', false]
+  ])("tells %s of Bob, called within the same second as Jean's call, 800 ms after it (third review of the notice, n°2)", async (_who, made) => {
+    // The Gateway's clock, in milliseconds: Alice's and Jean's calls dialled at …400.050 and …400.100, Bob's at …400.900.
+    const at = (p: ConferenceParticipant, joinedAt: number) => ({ ...p, joinedAt })
+    reads([at(alice(made), 1_792_171_400_050), at(jean(!made), 1_792_171_400_100), at(bob(), 1_792_171_400_900)])
+    await render(roomCall(made, made ? 'room-a@192.0.2.30' : 'room-j@192.0.2.30'), made ? [alice(), jean()] : undefined)
+    expect(status()).toBe('conference.joined Bob')
+  })
+
   it('takes nobody as an arrival from a read made before its own call was in the room', async () => {
     // Read once before Bob's call is in it: Jean, there before him, is no news when it is.
     reads([alice()], [alice(), jean(), bob(true)])

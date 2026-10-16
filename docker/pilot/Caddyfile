@@ -3,6 +3,17 @@
 {
 	# The configuration is this file: no admin API on the host's loopback for a local process to rewrite.
 	admin off
+	# The Call-ID of a conference participant's own call (GET /conferences/:id, X-Twake-Call): it allows nothing, but
+	# ties calls together and often carries an address. Caddy writes the request's headers in two logs: the access log
+	# (the site's `log` below) and the error log of a request the Gateway did not answer (a 502 while it restarts), which
+	# goes to this default logger. Both drop that header; Caddy already hides Authorization in both.
+	log default {
+		output stderr
+		format filter {
+			wrap json
+			request>headers>X-Twake-Call delete
+		}
+	}
 }
 
 {$DOMAIN} {
@@ -35,8 +46,7 @@
 
 	log {
 		output stdout
-		# The Call-ID of a conference participant's own call (GET /conferences/:id, X-Twake-Call): it allows nothing,
-		# but ties calls together and often carries an address; kept out of the access log, as Authorization is.
+		# The access log, without X-Twake-Call (see the default logger above).
 		format filter {
 			wrap console
 			request>headers>X-Twake-Call delete

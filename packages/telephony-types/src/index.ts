@@ -452,10 +452,11 @@ export interface ConferenceParticipant {
   number?: string
   muted: boolean
   /**
-   * When it came into the room, in milliseconds since the epoch, by the clock of the conference server: to compare
-   * with another participant's only, never with the browser's clock. A whole second when the server tells seconds
-   * only (two who came in within it then look simultaneous: one there no later than us counts as there before us). A
-   * call the room places is in it from its dialling, ringing included.
+   * When it came into the room, in milliseconds since the epoch: to compare with another participant's of the same
+   * list only, never with the browser's clock. One clock for a whole list: the Gateway's, which writes when it dials
+   * each call of a call's room, else the conference server's milliseconds; none on any participant when neither is
+   * there for all (whole seconds would make two calls placed within a second look simultaneous). A call the room places
+   * is in it from its dialling, ringing included.
    */
   joinedAt?: number
   /**

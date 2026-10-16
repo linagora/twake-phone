@@ -235,8 +235,9 @@ const Participants = ({ meetingId, manage, call, parties = [], onError, onNotice
         const ids = own ? thereBefore(participants, began) : null
         if (ids) {
           before = new Map([...now].filter(([id]) => ids.has(id)))
-          // A party the conference began with, gone before this read: it left.
-          for (const p of began) if (!now.has(p.id) && !p.you) before.set(p.id, participantLabel(p))
+          // A party the conference began with, gone before this read: it left. Never ourselves: our own call is in
+          // this read (`ids` says so), and what is told leaves ours out anyway.
+          for (const p of began) if (!now.has(p.id)) before.set(p.id, participantLabel(p))
         } else if (ids === null || ++misses.current >= OWN_CALL_READS) before = first.current
         // Our own call not in the room yet: nothing fixed, the next read tells.
         else return
