@@ -429,13 +429,28 @@ describe('a call becomes a conference (POST /calls/:id/conference, step 8b)', ()
   })
 
   it("shows the number of someone from outside whole to the room's owner only, masked to the others in it (second review 8b, n°6)", async () => {
-    const { conference, app, as, joinsLater } = await setup()
+    const { conference, app, as, joinsLater, rooms } = await setup()
     const room = (await conference('c1')).json().meetingId
     expect((await app.inject({ method: 'POST', url: `/api/v1/conferences/${room}/participants`, headers: as('alice'), payload: { number: '0199000024' } })).statusCode).toBe(201)
+    // Read with the Call-ID of one's own call in it (X-Twake-Call): that participant only is marked, numbers masked as before.
+    const bobs = rooms.get(room)!.find(p => p.attributes['twake.number'] === '102')!.attributes['sip.callIDFull']!
+    const marks = async (headers: Record<string, string | string[]>, meetingId = room) =>
+      (await app.inject({ method: 'GET', url: `/api/v1/conferences/${meetingId}`, headers: { ...as('bob'), ...headers } })).json().participants.map((p: { number?: string; you?: boolean }) => `${p.number} ${p.you ?? false}`)
+    expect(await marks({ 'x-twake-call': bobs })).toEqual(['101 false', '102 true', '019*****24 false'])
+    // A Call-ID of no participant of it, one too long, or two given at once: nobody marked.
+    const none = ['101 false', '102 false', '019*****24 false']
+    expect(await marks({ 'x-twake-call': 'elsewhere@192.0.2.30' })).toEqual(none)
+    expect(await marks({ 'x-twake-call': `${bobs}${'x'.repeat(257)}` })).toEqual(none)
+    expect(await marks({ 'x-twake-call': [bobs, 'other@192.0.2.30'] })).toEqual(none)
+    // Two given at once as Node hands them over (joined in one string, third review of the notice, n°4).
+    expect(await marks({ 'x-twake-call': `${bobs}, other@192.0.2.30` })).toEqual(none)
+    // Not in the URL: a query string marks nothing.
+    expect((await app.inject({ method: 'GET', url: `/api/v1/conferences/${room}?call=${encodeURIComponent(bobs)}`, headers: as('bob') })).body).not.toContain('"you"')
     const read = async (user: string) => (await app.inject({ method: 'GET', url: `/api/v1/conferences/${room}`, headers: as(user) })).body
     const numbers = async (user: string) => JSON.parse(await read(user)).participants.map((p: { number: string }) => p.number)
     expect(await numbers('alice')).toEqual(['101', '102', '0199000024'])
     expect(await numbers('bob')).toEqual(['101', '102', '019*****24'])
+    expect(await read('bob')).not.toContain('"you"')
     // Nowhere in what Bob reads, its ids included (third review 8b, n°2).
     expect(await read('bob')).not.toContain('99000024')
     // Someone come in between the two reads of LiveKit, not proved of the tenant: masked too.

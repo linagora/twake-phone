@@ -389,7 +389,8 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
     origin: process.env.CORS_ORIGINS?.split(',') ?? false,
     // The plugin's default is GET, HEAD and POST: the browser's preflight would refuse every PUT and DELETE.
     methods: ['GET', 'HEAD', 'POST', 'PUT', 'DELETE'],
-    allowedHeaders: ['authorization', 'content-type', 'idempotency-key', 'x-cozy-instance']
+    // x-twake-call: the Call-ID of the reader's own call in a conference's room (GET /conferences/:id).
+    allowedHeaders: ['authorization', 'content-type', 'idempotency-key', 'x-cozy-instance', 'x-twake-call']
   })
   await app.register(swagger, { openapi: { info: { title: 'Twake Telephony Gateway', version: '0.1.0' } } })
   await app.register(swaggerUi, { routePrefix: '/docs' })
@@ -1486,7 +1487,12 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         // A call's room (step 8b): nobody dials into it, no PIN. The number of someone from outside (the public network)
         // is its owner's to see whole, who called it; masked for the others in it (second review 8b, n°6).
         if (CALL_ROOM.test(record.meetingId)) {
-          const participants = await viaLiveKit(() => bridge.listParticipants(record.meetingId))
+          // X-Twake-Call: the Call-ID of the reader's own call in it (a header, not in the URL proxies log), whose
+          // participant is marked (`you`): their panel tells who came after them. It decides nothing here, and says
+          // nothing to whoever does not have that Call-ID already. One value, of 256 characters at most, else none.
+          const header = req.headers['x-twake-call']
+          const you = typeof header === 'string' && header.length <= 256 ? header : undefined
+          const participants = await viaLiveKit(() => bridge.listParticipants(record.meetingId, you ? { you } : {}))
           if (!calls) return { meetingId: record.meetingId, participants }
           // Shown whole only when proved of the tenant by the read of the calls: one come in since is masked too (third
           // review 8b, n°2). Its id carries no number (an identity drawn at random, conference-livekit).
