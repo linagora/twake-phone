@@ -389,7 +389,8 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
     origin: process.env.CORS_ORIGINS?.split(',') ?? false,
     // The plugin's default is GET, HEAD and POST: the browser's preflight would refuse every PUT and DELETE.
     methods: ['GET', 'HEAD', 'POST', 'PUT', 'DELETE'],
-    allowedHeaders: ['authorization', 'content-type', 'idempotency-key', 'x-cozy-instance']
+    // x-twake-call: the Call-ID of the reader's own call in a conference's room (GET /conferences/:id).
+    allowedHeaders: ['authorization', 'content-type', 'idempotency-key', 'x-cozy-instance', 'x-twake-call']
   })
   await app.register(swagger, { openapi: { info: { title: 'Twake Telephony Gateway', version: '0.1.0' } } })
   await app.register(swaggerUi, { routePrefix: '/docs' })
@@ -1476,7 +1477,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
       })
 
       const roomReads = options.conferenceReadLimiter ?? new RateLimiter(60, 60_000)
-      v1.get<{ Params: { id: string }; Querystring: { call?: string } }>('/conferences/:id', async (req, reply) => {
+      v1.get<{ Params: { id: string } }>('/conferences/:id', async (req, reply) => {
         const { bridge, record, room, user, calls } = await owned(req, req.params.id, { reading: true })
         if (!roomReads.allow(ownerKey(user.tenantId, user.id))) return reply.code(429).send({ statusCode: 429, code: 'CONFERENCE_READ_LIMIT', error: 'Too Many Requests', message: 'Too many reads of your rooms: wait a minute' })
         if (room) {
@@ -1486,9 +1487,11 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         // A call's room (step 8b): nobody dials into it, no PIN. The number of someone from outside (the public network)
         // is its owner's to see whole, who called it; masked for the others in it (second review 8b, n°6).
         if (CALL_ROOM.test(record.meetingId)) {
-          // `call`: the Call-ID of the reader's own call in it, whose participant is marked (`you`): their panel tells
-          // who came after them (fix of 8b's announcements). It says nothing to whoever does not have that Call-ID.
-          const you = typeof req.query.call === 'string' && req.query.call.length <= 256 ? req.query.call : undefined
+          // X-Twake-Call: the Call-ID of the reader's own call in it (a header, not in the URL proxies log), whose
+          // participant is marked (`you`): their panel tells who came after them. It decides nothing here, and says
+          // nothing to whoever does not have that Call-ID already. One value, of 256 characters at most, else none.
+          const header = req.headers['x-twake-call']
+          const you = typeof header === 'string' && header.length <= 256 ? header : undefined
           const participants = await viaLiveKit(() => bridge.listParticipants(record.meetingId, you ? { you } : {}))
           if (!calls) return { meetingId: record.meetingId, participants }
           // Shown whole only when proved of the tenant by the read of the calls: one come in since is masked too (third

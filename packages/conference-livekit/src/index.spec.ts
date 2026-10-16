@@ -373,18 +373,32 @@ describe('dial-out and moderation', () => {
     expect(calls[0]).toMatchObject({ path: 'livekit.RoomService/ListParticipants', body: { room: 'twake-call-0123456789abcdef' } })
   })
 
-  it("says when each participant came in, by LiveKit's clock, and which one is the reader's own call (step 8b)", async () => {
+  it("says when each participant came in, in milliseconds whether LiveKit tells milliseconds or seconds, and which one is the reader's own call (step 8b)", async () => {
     const { bridge } = make({
       'livekit.RoomService/ListParticipants': {
         participants: [
+          // 64-bit numbers as protojson writes them (strings), milliseconds given: they win over the seconds.
           { identity: 'phone-a', joined_at: '1792171400', joined_at_ms: '1792171400250', attributes: { 'twake.kind': 'phone', 'twake.number': '101', 'sip.callIDFull': 'a1b2@192.0.2.30' } },
+          // Seconds only: made milliseconds.
           { identity: 'phone-b', joined_at: '1792171401', attributes: { 'twake.kind': 'phone', 'twake.number': '102', 'sip.callIDFull': 'c3d4@192.0.2.30' } },
-          { identity: 'web-1', attributes: {} }
+          // As plain numbers, either way.
+          { identity: 'phone-c', joined_at: 1792171402, attributes: { 'twake.kind': 'phone', 'twake.number': '103' } },
+          { identity: 'phone-d', joined_at: 1792171403, joined_at_ms: 1792171403999, attributes: { 'twake.kind': 'phone', 'twake.number': '104' } },
+          // Neither, or zero (not set): none.
+          { identity: 'web-1', attributes: {} },
+          { identity: 'web-2', joined_at: '0', joined_at_ms: '0', attributes: {} }
         ]
       }
     })
     const read = await bridge.listParticipants('twake-call-0123456789abcdef', { you: 'c3d4@192.0.2.30' })
-    expect(read.map(p => [p.joinedAt, p.you])).toEqual([[1792171400250, undefined], [1792171401000, true], [undefined, undefined]])
+    expect(read.map(p => [p.joinedAt, p.you])).toEqual([
+      [1792171400250, undefined],
+      [1792171401000, true],
+      [1792171402000, undefined],
+      [1792171403999, undefined],
+      [undefined, undefined],
+      [undefined, undefined]
+    ])
     expect((await bridge.listParticipants('twake-call-0123456789abcdef')).some(p => p.you)).toBe(false)
   })
 

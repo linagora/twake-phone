@@ -158,16 +158,16 @@ const AddParticipantForm = ({ id, run, onClose, onError, making }: { id: string;
 const participantLabel = (p: ConferenceParticipant) => (p.number ? formatNumber(p.number) : (p.displayName ?? p.id))
 
 /**
- * Who a conference's panel takes as there before it, at its first read: whoever came into the room no later than our
- * own call (`you`) and, for the window that made the conference, the two parties it began with (`parties`), by the
- * room's own clock (`joinedAt`, never the browser's). Anyone else came after, and is told, however late that read
- * comes, whatever the numbers shown (masked or hidden), on every participant's panel. Undefined while our own call is
- * not in the room yet: read again. Without the room's clock, everyone then in it.
+ * Who a conference's panel takes as there before it: whoever came into the room no later than our own call (`you`)
+ * and, for the window that made the conference, the parties it began with (`parties`), by the room's own clock
+ * (`joinedAt`, never the browser's; a tie is there before). Anyone else came after, and is told, however late the
+ * read comes, whatever the numbers shown (masked or hidden), on every participant's panel. `undefined` while our own
+ * call is not in the room yet (read again); `null` without the room's clock.
  */
-const thereBefore = (participants: ConferenceParticipant[], parties: readonly string[]): Set<string> | undefined => {
-  const start = [...participants.filter(p => p.you), ...participants.filter(p => parties.includes(p.id))]
+const thereBefore = (participants: ConferenceParticipant[], parties: readonly ConferenceParticipant[]): Set<string> | null | undefined => {
+  const start = [...participants.filter(p => p.you), ...participants.filter(p => parties.some(q => q.id === p.id))]
   if (!start.some(p => p.you)) return undefined
-  if (start.some(p => p.joinedAt === undefined)) return new Set(participants.map(p => p.id))
+  if (start.some(p => p.joinedAt === undefined)) return null
   const since = Math.max(...start.map(p => p.joinedAt!))
   return new Set(participants.filter(p => p.you || p.joinedAt === undefined || p.joinedAt <= since).map(p => p.id))
 }
@@ -195,23 +195,26 @@ const chime = () => {
 }
 
 /** What a conference's panel reads with (`call`, `parties`) and whom it tells (`onNotice`): the latest ones. */
-type PanelInputs = { call?: string; parties: readonly string[]; onNotice: (message: string) => void }
+type PanelInputs = { call?: string; parties: readonly ConferenceParticipant[]; onNotice: (message: string) => void }
 
 /**
- * The participants of a conference, read every few seconds and after each action on one. Every participant of the
- * conference sees them (review 8b, n°2); the one who made it (`manage`) also mutes or removes one. Each read names our
- * own call (`call`, its SIP Call-ID), which the Gateway marks `you`. Who comes in or leaves is told (`onNotice`, the
- * panel's status region), all of a read in one message, with a chime for an arrival; whoever came in after us is told
- * at the first read too (thereBefore), and our own call never. One read at a time, the next one after it (a slow read
- * holds the next); an action reads again at once, dropping the answer of the read before it. After an action whose button goes (a participant muted or removed), the
+ * The participants of a conference, read again a few seconds after each answer, and at once after each action on one.
+ * Every participant of the conference sees them (review 8b, n°2); the one who made it (`manage`) also mutes or
+ * removes one. Each read names our own call (`call`, its SIP Call-ID), which the Gateway marks `you`. Who comes in or
+ * leaves is told (`onNotice`, the panel's status region), all of a read in one message, with a chime for an arrival:
+ * whoever came in after us is told at the first read too (thereBefore), a party the conference began with that left
+ * before it too, and our own call never. Without the room's clock, or our own call not found in OWN_CALL_READS reads,
+ * the first read is who was there. One read at a time (a slow read holds the next); an action reads again at once,
+ * dropping the answer of the read before it. After an action whose button goes (a participant muted or removed), the
  * focus goes to the list, not to the top of the page.
  */
-export const Participants = ({ meetingId, manage, call, parties = [], onError, onNotice }: { meetingId: string; manage: boolean; call?: string; parties?: readonly string[]; onError: (message: string | null) => void; onNotice: (message: string) => void }) => {
+const Participants = ({ meetingId, manage, call, parties = [], onError, onNotice }: { meetingId: string; manage: boolean; call?: string; parties?: readonly ConferenceParticipant[]; onError: (message: string | null) => void; onNotice: (message: string) => void }) => {
   const { t } = useT()
   const { client, me } = useGateway()
   const [people, setPeople] = useState<ConferenceParticipant[] | null>(null)
   const [version, setVersion] = useState(0)
   const known = useRef<Map<string, string> | null>(null)
+  const first = useRef<Map<string, string> | null>(null)
   const misses = useRef(0)
   const list = useRef<HTMLUListElement>(null)
   const acted = useRef(false)
@@ -225,12 +228,18 @@ export const Participants = ({ meetingId, manage, call, parties = [], onError, o
     const apply = (participants: ConferenceParticipant[]) => {
       const now = new Map(participants.map(p => [p.id, participantLabel(p)] as const))
       const ours = new Set(participants.filter(p => p.you).map(p => p.id))
+      const { call: own, parties: began } = inputs.current
+      first.current ??= now
       let before = known.current
       if (!before) {
-        const ids = (inputs.current.call ? thereBefore(participants, inputs.current.parties) : undefined) ?? (++misses.current >= OWN_CALL_READS || !inputs.current.call ? new Set(now.keys()) : undefined)
+        const ids = own ? thereBefore(participants, began) : null
+        if (ids) {
+          before = new Map([...now].filter(([id]) => ids.has(id)))
+          // A party the conference began with, gone before this read: it left.
+          for (const p of began) if (!now.has(p.id) && !p.you) before.set(p.id, participantLabel(p))
+        } else if (ids === null || ++misses.current >= OWN_CALL_READS) before = first.current
         // Our own call not in the room yet: nothing fixed, the next read tells.
-        if (!ids) return
-        before = new Map([...now].filter(([id]) => ids.has(id)))
+        else return
       }
       known.current = now
       const joined = [...now].filter(([id]) => !before.has(id) && !ours.has(id)).map(([, label]) => label)
@@ -281,11 +290,13 @@ export const Participants = ({ meetingId, manage, call, parties = [], onError, o
     })()
   }
   if (!people) return <p className="badge">{t('conference.loading')}</p>
+  const marked = people.some(p => p.you)
   return (
     <ul ref={list} tabIndex={-1} className="list participants" aria-label={t('conference.participants')} data-testid="conference-participants">
       {people.map(p => {
         const label = participantLabel(p)
-        const self = !!p.you || (!!me?.extension && p.number === me.extension)
+        // Ours as the Gateway marks it; by the number only when it marks none (another leg of the same extension is not us).
+        const self = marked ? !!p.you : !!me?.extension && p.number === me.extension
         return (
           <li key={p.id} data-testid="conference-participant">
             <span>
@@ -353,6 +364,8 @@ const ConferenceCall = ({ call, tones, onError, onNotice }: { call: SoftCall; to
   const title = useRef<HTMLParagraphElement>(null)
   const mine = !!call.conferenceOf
   const meetingId = call.conferenceOf ? phone.rooms[call.conferenceOf] : call.conferenceRoom
+  // Who the conference this window made began with (POST /calls/:id/conference): no news to it.
+  const began = call.conferenceOf ? phone.parties[call.conferenceOf] : undefined
   const inviting = mine && meetingId ? (phone.inviting[meetingId] ?? []) : []
   const connected = call.state === 'connected' || call.state === 'held'
   useEffect(() => {
@@ -394,7 +407,7 @@ const ConferenceCall = ({ call, tones, onError, onNotice }: { call: SoftCall; to
         </p>
       ))}
       {tones ? <p className="badge">{t('call.tonesReceived', { tones })}</p> : null}
-      {meetingId ? <Participants key={meetingId} meetingId={meetingId} manage={mine} {...(call.sipCallId ? { call: call.sipCallId } : {})} {...(mine && phone.parties[meetingId] ? { parties: phone.parties[meetingId] } : {})} onError={onError} onNotice={onNotice} /> : null}
+      {meetingId ? <Participants key={meetingId} meetingId={meetingId} manage={mine} {...(call.sipCallId ? { call: call.sipCallId } : {})} {...(began ? { parties: began } : {})} onError={onError} onNotice={onNotice} /> : null}
       <div className="actions">
         {connected ? (
           <button type="button" className="btn" aria-pressed={call.muted} onClick={guard(() => call.setMuted(!call.muted))}>

@@ -452,11 +452,16 @@ export interface ConferenceParticipant {
   number?: string
   muted: boolean
   /**
-   * When it came into the room, in milliseconds, by the clock of the conference server: to compare with another
-   * participant's only, never with the browser's clock.
+   * When it came into the room, in milliseconds since the epoch, by the clock of the conference server: to compare
+   * with another participant's only, never with the browser's clock. A whole second when the server tells seconds
+   * only (two who came in within it then look simultaneous: one there no later than us counts as there before us). A
+   * call the room places is in it from its dialling, ringing included.
    */
   joinedAt?: number
-  /** The reader's own call (step 8b, GET /conferences/:id?call= with its Call-ID): who came after it is news to them. */
+  /**
+   * The reader's own call (step 8b): GET /conferences/:id with its SIP Call-ID in the X-Twake-Call header. Whoever
+   * came in after it is news to them.
+   */
   you?: boolean
 }
 

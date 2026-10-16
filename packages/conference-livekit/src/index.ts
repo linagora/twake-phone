@@ -408,10 +408,11 @@ export class LiveKitConferenceBridge implements ConferenceBridgeProvider {
     return new Set((res.rooms ?? []).flatMap(r => (r.name && names.includes(r.name) ? [r.name] : [])))
   }
 
-  /** Participants currently in the room (web and phone), numbers filtered by the privacy setting. */
   /**
-   * The participants of a room. `you`: the SIP Call-ID of the reader's own call (sip.callIDFull), whose participant is
-   * marked `you`: it tells nothing of the others' calls, and nothing to whoever does not have that Call-ID already.
+   * Participants currently in the room (web and phone), numbers filtered by the privacy setting, each with when it came
+   * in (`joinedAt`, LiveKit's clock: a call it places is in the room from its dialling, ringing included). `you`: the
+   * SIP Call-ID of the reader's own call (sip.callIDFull), whose participant is marked `you`: it tells nothing of the
+   * others' calls, and nothing to whoever does not have that Call-ID already.
    */
   async listParticipants(meetingId: string, { you }: { you?: string } = {}): Promise<ConferenceParticipant[]> {
     const res = await this.api.call<{ participants?: LkParticipant[] }>('livekit.RoomService', 'ListParticipants', { room: meetingId })

@@ -432,10 +432,18 @@ describe('a call becomes a conference (POST /calls/:id/conference, step 8b)', ()
     const { conference, app, as, joinsLater, rooms } = await setup()
     const room = (await conference('c1')).json().meetingId
     expect((await app.inject({ method: 'POST', url: `/api/v1/conferences/${room}/participants`, headers: as('alice'), payload: { number: '0199000024' } })).statusCode).toBe(201)
-    // Read with the Call-ID of one's own call in it: that participant only is marked, numbers masked as before.
+    // Read with the Call-ID of one's own call in it (X-Twake-Call): that participant only is marked, numbers masked as before.
     const bobs = rooms.get(room)!.find(p => p.attributes['twake.number'] === '102')!.attributes['sip.callIDFull']!
-    const marked = (await app.inject({ method: 'GET', url: `/api/v1/conferences/${room}?call=${encodeURIComponent(bobs)}`, headers: as('bob') })).json().participants
-    expect(marked.map((p: { number: string; you?: boolean }) => `${p.number} ${p.you ?? false}`)).toEqual(['101 false', '102 true', '019*****24 false'])
+    const marks = async (headers: Record<string, string | string[]>, meetingId = room) =>
+      (await app.inject({ method: 'GET', url: `/api/v1/conferences/${meetingId}`, headers: { ...as('bob'), ...headers } })).json().participants.map((p: { number?: string; you?: boolean }) => `${p.number} ${p.you ?? false}`)
+    expect(await marks({ 'x-twake-call': bobs })).toEqual(['101 false', '102 true', '019*****24 false'])
+    // A Call-ID of no participant of it, one too long, or two given at once: nobody marked.
+    const none = ['101 false', '102 false', '019*****24 false']
+    expect(await marks({ 'x-twake-call': 'elsewhere@192.0.2.30' })).toEqual(none)
+    expect(await marks({ 'x-twake-call': `${bobs}${'x'.repeat(257)}` })).toEqual(none)
+    expect(await marks({ 'x-twake-call': [bobs, 'other@192.0.2.30'] })).toEqual(none)
+    // Not in the URL: a query string marks nothing.
+    expect((await app.inject({ method: 'GET', url: `/api/v1/conferences/${room}?call=${encodeURIComponent(bobs)}`, headers: as('bob') })).body).not.toContain('"you"')
     const read = async (user: string) => (await app.inject({ method: 'GET', url: `/api/v1/conferences/${room}`, headers: as(user) })).body
     const numbers = async (user: string) => JSON.parse(await read(user)).participants.map((p: { number: string }) => p.number)
     expect(await numbers('alice')).toEqual(['101', '102', '0199000024'])

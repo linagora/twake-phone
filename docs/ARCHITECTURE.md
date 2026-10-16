@@ -115,7 +115,7 @@ Fastify, TypeScript. Routes principales sous `/api/v1` :
 | `GET /calls/history`, `DELETE /me/history` | Historique serveur de l'appelant (filtres, curseur) et effacement |
 | `POST /calls/:id/{hangup,hold,resume,dtmf,transfer,answer,reject}` | Actions sur un appel, réservées à ses participants (voir ci-dessous) |
 | `POST /ws-ticket`, `GET /ws` | Ticket à usage unique, puis flux d'événements temps réel : d'abord `{"type":"stream.ready"}` (la session est acceptée, le client peut relire l'état), puis ceux de l'utilisateur (appels) et ceux du tenant (`presence.changed`, avec le poste) |
-| `POST /conferences`, `GET/DELETE /conferences/:id`, `POST /conferences/:id/participants`, `DELETE …/participants/:pid`, `POST …/participants/:pid/mute` | Accès téléphonique à une salle Meet (§12) |
+| `POST /conferences`, `GET/DELETE /conferences/:id`, `POST /conferences/:id/participants`, `DELETE …/participants/:pid`, `POST …/participants/:pid/mute` | Accès téléphonique à une salle Meet (§12) ; pour la salle d'un appel (étape 8b), chaque participant lu porte son heure d'entrée chez LiveKit (`joinedAt`), et `GET` avec l'en-tête `X-Twake-Call` (le Call-ID de son propre appel) marque ce participant (`you`) |
 | `POST /webhooks/livekit` | Webhooks LiveKit, authentifiés par signature (§12) |
 | `/health`, `/ready`, `/docs`, `/openapi.json` | Exploitation |
 

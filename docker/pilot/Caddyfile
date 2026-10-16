@@ -35,6 +35,11 @@
 
 	log {
 		output stdout
-		format console
+		# The Call-ID of a conference participant's own call (GET /conferences/:id, X-Twake-Call): it allows nothing,
+		# but ties calls together and often carries an address; kept out of the access log, as Authorization is.
+		format filter {
+			wrap console
+			request>headers>X-Twake-Call delete
+		}
 	}
 }

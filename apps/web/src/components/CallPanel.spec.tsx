@@ -52,9 +52,9 @@ describe('CallPanel, a conference (step 8b): who comes in or leaves is told in t
   let actEnvironment: unknown
   let chimes: number
   const status = () => host.querySelector('[data-testid="call-status"]')!.textContent
-  const render = (call: SoftCall, parties?: string[]) =>
+  const render = (call: SoftCall, parties?: ConferenceParticipant[]) =>
     act(async () => {
-      phone = { calls: [call], lastEnded: null, tones: {}, rooms: call.conferenceOf ? { [call.conferenceOf]: ROOM } : {}, parties: parties ? { [ROOM]: parties } : {}, inviting: {} }
+      phone = { calls: [call], lastEnded: null, tones: {}, rooms: call.conferenceOf ? { [call.conferenceOf]: ROOM } : {}, parties: parties && call.conferenceOf ? { [call.conferenceOf]: parties } : {}, inviting: {} }
       root.render(<CallPanel />)
       await vi.advanceTimersByTimeAsync(0)
     })
@@ -86,7 +86,7 @@ describe('CallPanel, a conference (step 8b): who comes in or leaves is told in t
 
   it('tells the one who made it of a participant already there at its first read (the e2e race), numbers hidden, with a chime, once', async () => {
     const { getCallConference } = reads([alice(true), bob(), jean()])
-    await render(roomCall(true, 'room-a@192.0.2.30'), [alice().id, jean().id])
+    await render(roomCall(true, 'room-a@192.0.2.30'), [alice(), jean()])
     // Its own call named in each read; the two parties the conference began with are no news.
     expect(getCallConference).toHaveBeenCalledWith(ROOM, { call: 'room-a@192.0.2.30' })
     expect(status()).toBe('conference.joined Bob')
@@ -100,7 +100,7 @@ describe('CallPanel, a conference (step 8b): who comes in or leaves is told in t
 
   it('tells it all the same when the first reads are refused and a later one finds that participant', async () => {
     reads(new Error('429'), new Error('429'), [alice(true), jean(), bob()])
-    await render(roomCall(true, 'room-a@192.0.2.30'), [alice().id, jean().id])
+    await render(roomCall(true, 'room-a@192.0.2.30'), [alice(), jean()])
     expect(status()).toBe('')
     await later()
     await later()
@@ -133,7 +133,7 @@ describe('CallPanel, a conference (step 8b): who comes in or leaves is told in t
   it('says all the arrivals and departures of a read in one message, and the same words again in a new one', async () => {
     const phoneOf = (name: string, joinedAt: number) => ({ ...person(name, joinedAt), displayName: 'Phone' })
     reads([alice(true), jean()], [alice(true), bob(), dan], [alice(true), bob(), dan, phoneOf('x', 9_700)], [alice(true), bob(), dan, phoneOf('x', 9_700), phoneOf('y', 9_800)])
-    await render(roomCall(true, 'room-a@192.0.2.30'), [alice().id, jean().id])
+    await render(roomCall(true, 'room-a@192.0.2.30'), [alice(), jean()])
     await later()
     expect(status()).toBe('conference.joined Bob conference.joined Dan conference.left Jean')
     await later()
@@ -149,7 +149,7 @@ describe('CallPanel, a conference (step 8b): who comes in or leaves is told in t
     let slow!: (participants: ConferenceParticipant[]) => void
     const late = new Promise<ConferenceParticipant[]>(resolve => (slow = resolve))
     const { getCallConference, muteParticipant } = reads([alice(true), jean()], late, [alice(true), jean(), bob()])
-    await render(roomCall(true, 'room-a@192.0.2.30'), [alice().id, jean().id])
+    await render(roomCall(true, 'room-a@192.0.2.30'), [alice(), jean()])
     await later()
     // The second read is slow: no other one meanwhile.
     await later(3 * PARTICIPANTS_EVERY_MS)
@@ -170,13 +170,49 @@ describe('CallPanel, a conference (step 8b): who comes in or leaves is told in t
     expect(host.querySelectorAll('[data-testid="conference-participant"]')).toHaveLength(3)
   })
 
-  it('takes whoever is there as there before when its own call is never found in the room', async () => {
-    reads([alice(), jean(), bob()], [alice(), jean(), bob()], [alice(), jean(), bob()], [alice(), jean(), bob(), dan])
+  it('takes its first read as who was there when its own call is not found in three, and tells what changed since', async () => {
+    // Dan comes in at the second read, Jean leaves at the third: both told once the panel gives up on its own call.
+    reads([alice(), jean(), bob()], [alice(), jean(), bob(), dan], [alice(), bob(), dan], [alice(), bob(), dan])
     await render(roomCall(false, 'room-j@192.0.2.30'))
-    await later()
     await later()
     expect(status()).toBe('')
     await later()
-    expect(status()).toBe('conference.joined Dan')
+    expect(status()).toBe('conference.joined Dan conference.left Jean')
+    await later()
+    expect(status()).toBe('conference.joined Dan conference.left Jean')
+  })
+
+  it('takes its first read as who was there without the clock of the room', async () => {
+    const unclocked = (p: ConferenceParticipant) => {
+      const { joinedAt: _, ...rest } = p
+      return rest
+    }
+    // Read once before its own call is marked: that first read is who was there, Bob came after it.
+    reads([unclocked(alice()), unclocked(jean())], [unclocked(alice(true)), unclocked(jean()), unclocked(bob())])
+    await render(roomCall(true, 'room-a@192.0.2.30'), [alice(), jean()])
+    expect(status()).toBe('')
+    await later()
+    expect(status()).toBe('conference.joined Bob')
+  })
+
+  it('tells the one who made it that a party it began with left before its first read', async () => {
+    reads(new Error('429'), [alice(true), bob()])
+    await render(roomCall(true, 'room-a@192.0.2.30'), [alice(), jean()])
+    await later()
+    expect(status()).toBe('conference.joined Bob conference.left Jean')
+  })
+
+  it('says « (vous) » of its own call only, not of another leg of the same extension', async () => {
+    const leg = (name: string, you: boolean): ConferenceParticipant => ({ ...person(name, 1_000, you), number: '101' })
+    reads([leg('a', true), leg('b', false), jean()])
+    await render(roomCall(false, 'room-a@192.0.2.30'))
+    const items = [...host.querySelectorAll('[data-testid="conference-participant"]')].map(li => li.textContent)
+    expect(items.filter(text => text?.includes('conference.you'))).toHaveLength(1)
+    // Unmarked (the Gateway marks none), the number tells.
+    reads([leg('a', false), jean()])
+    act(() => root.unmount())
+    root = createRoot(host)
+    await render(roomCall(false, 'room-a@192.0.2.30'))
+    expect([...host.querySelectorAll('[data-testid="conference-participant"]')].filter(li => li.textContent?.includes('conference.you'))).toHaveLength(1)
   })
 })

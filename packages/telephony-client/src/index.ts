@@ -461,10 +461,11 @@ export class TelephonyClient {
 
   /**
    * The participants of a call's conference (GET /conferences/:id). `call`: the SIP Call-ID of the reader's own call
-   * in it, whose participant comes back marked `you`.
+   * in it (header X-Twake-Call, out of the URL that proxies write in their logs), whose participant comes back marked
+   * `you`.
    */
   getCallConference(meetingId: string, { call }: { call?: string } = {}) {
-    return this.request<CallConference>(`/conferences/${encodeURIComponent(meetingId)}${call ? `?call=${encodeURIComponent(call)}` : ''}`)
+    return this.request<CallConference>(`/conferences/${encodeURIComponent(meetingId)}`, call ? { headers: { 'x-twake-call': call } } : {})
   }
 
   /** Ends a call's conference for everyone in it (« Terminer pour tous »). */

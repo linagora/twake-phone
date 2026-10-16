@@ -2636,6 +2636,18 @@ try {
         ? route.fulfill({ status: 429, contentType: 'application/json', headers: { 'access-control-allow-origin': '*' }, body: JSON.stringify({ statusCode: 429, code: 'CONFERENCE_READ_LIMIT', message: 'held by the e2e' }) })
         : route.fallback()
     for (const who of [alice, jean]) await who.page.route(roomRead, refuseReads)
+    // Every text the status region shows from now on, in each window: no announcement is lost by being replaced.
+    for (const who of [alice, jean, bob])
+      await who.page.evaluate(() => {
+        const seen = (window.__statusTexts = [])
+        const look = () => {
+          const text = document.querySelector('[data-testid="call-status"]')?.textContent ?? ''
+          if (text && seen.at(-1) !== text) seen.push(text)
+        }
+        new MutationObserver(look).observe(document.body, { childList: true, subtree: true, characterData: true })
+        look()
+      })
+    const statusTexts = who => who.page.evaluate(() => window.__statusTexts ?? [])
     await alice.page.getByRole('button', { name: 'Ajouter un participant' }).click()
     await alice.page.getByLabel('Participant à ajouter (poste ou numéro)').fill('103')
     await alice.page.getByRole('button', { name: 'Appeler et ajouter' }).click()
@@ -2667,6 +2679,11 @@ try {
     for (const button of ['Retirer 102 de la conférence', 'Retirer 103 de la conférence', 'Terminer pour tous', 'Quitter la conférence']) await alice.page.getByRole('button', { name: button }).waitFor()
     CONFERENCE = await until('the room of the conference, kept for Alice', async () => (await store.listConferences(TENANT, 'amartin')).find(r => /^twake-call-[0-9a-f]{16}$/.test(r.meetingId))?.meetingId ?? null)
     expectEqual((await inConference()).map(p => `${p.kind} ${p.number}`).sort().join(', '), 'phone 101, phone 102, phone 103', 'the room of the conference')
+    // When each came in, by LiveKit's clock: there for everyone. Its unit is only told here, not proved (Bob comes in
+    // seconds after the others, so whole seconds would pass as well).
+    const joinedAt = (await inConference()).map(p => p.joinedAt)
+    expectEqual(joinedAt.every(at => Number.isFinite(at) && at > 1e12), true, `when each came in: ${JSON.stringify(joinedAt)}`)
+    console.log(`LiveKit's joinedAt: ${joinedAt.some(at => at % 1000 !== 0) ? 'milliseconds' : 'whole seconds, it seems'}`)
     // Bob's call names the room of the conference (Twake-Conference): he sees who is in it, as Jean does; neither acts on anyone.
     const [bobs] = await calls(bob.page)
     expectEqual(`${bobs?.room} ${bobs?.conferenceRoom === CONFERENCE}`, 'conference true', `Bob's call of the conference ${JSON.stringify(bobs)}`)
@@ -2677,11 +2694,13 @@ try {
     }
     // Whoever is in it is told who came, in a region read out.
     for (const who of [alice, jean]) await who.page.getByTestId('call-status').getByText('103 a rejoint la conférence.').waitFor({ timeout: 20_000 })
-    // Only Bob: neither party of the call it began with, nor oneself.
+    // Only Bob, ever: neither party of the call it began with, nor oneself; and Bob, who came last, of nobody.
     for (const who of [alice, jean]) {
-      const told = await who.page.getByTestId('call-status').textContent()
-      expectEqual(/10[12] a rejoint/.test(told ?? ''), false, `what ${who.name} was told: ${told}`)
+      const told = await statusTexts(who)
+      expectEqual(told.some(text => /10[12] a rejoint/.test(text)), false, `what ${who.name} was told: ${JSON.stringify(told)}`)
     }
+    const toldBob = await statusTexts(bob)
+    expectEqual(toldBob.some(text => /a rejoint|a quitté/.test(text)), false, `what Bob was told: ${JSON.stringify(toldBob)}`)
     for (const who of [alice, jean]) await who.page.getByTestId('conference').getByRole('button', { name: 'Rétablir le micro' }).click()
     // Each one hears the others, through the room.
     await bothHearEachOther(alice, jean)
