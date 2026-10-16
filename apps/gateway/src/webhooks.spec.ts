@@ -283,7 +283,16 @@ if (process.env.TEST_DATABASE_URL) {
         for (const h of hubs.splice(0)) await h.stop()
         await a.close()
         await b.close()
-        await server.query(`DROP DATABASE IF EXISTS "${name}" WITH (FORCE)`)
+        // Not WITH (FORCE): the backends of the pools just closed may not have exited yet, and killing them sends a
+        // FATAL to sockets this process still reads. Retried until they are gone; the next run drops it anyway.
+        for (let i = 0; i < 50; i++) {
+          try {
+            await server.query(`DROP DATABASE IF EXISTS "${name}"`)
+            break
+          } catch {
+            await sleep(100)
+          }
+        }
         await server.end()
       }
     }, 20_000)
