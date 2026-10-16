@@ -8,7 +8,8 @@ export const ADMIN_SECTIONS: readonly (readonly [string, Key])[] = [
   ['groups', 'admin.nav.groups'],
   ['rights', 'admin.nav.rights'],
   ['limits', 'admin.nav.limits'],
-  ['alerts', 'admin.nav.alerts']
+  ['alerts', 'admin.nav.alerts'],
+  ['webhooks', 'admin.nav.webhooks']
 ]
 
 /** The name of the part of the administration at `pathname`, when it is one under /admin (not /admin itself). */

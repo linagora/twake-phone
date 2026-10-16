@@ -1,4 +1,4 @@
-import type { Call, Capabilities, ConferenceParticipant, Contact, DialInConfiguration, DidRange, ForwardingRules, FraudRule, MediaSession, OutboundAssignment, OutboundCaps, OutboundPolicy, OutboundProfile, Presence, PresenceStatus, RingGroup, TelephonyAlert, TelephonyEvent, Trunk, TrunkInput, TrunkStatus } from '@twake/telephony-types'
+import type { Call, Capabilities, ConferenceParticipant, Contact, DialInConfiguration, DidRange, ForwardingRules, FraudRule, MediaSession, OutboundAssignment, OutboundCaps, OutboundPolicy, OutboundProfile, Presence, PresenceStatus, RingGroup, TelephonyAlert, TelephonyEvent, Trunk, TrunkInput, TrunkStatus, WebhookEventType } from '@twake/telephony-types'
 
 export type {
   Contact,
@@ -21,7 +21,9 @@ export type {
   TrunkOutboundClass,
   TrunkRegistrationState,
   TrunkServerState,
-  TrunkStatus
+  TrunkStatus,
+  WebhookEvent,
+  WebhookEventType
 } from '@twake/telephony-types'
 // The rules the Gateway checks an administrator's settings with (step 7): the app checks them the same way before sending.
 export {
@@ -36,6 +38,7 @@ export {
   TRUNK_COUNTRY_EXCLUDED,
   TRUNK_OUTBOUND_CLASSES,
   TRUNK_OUTBOUND_DEFAULT,
+  WEBHOOK_EVENT_TYPES,
   isReservedNumber,
   isValidExtension
 } from '@twake/telephony-types'
@@ -153,6 +156,54 @@ export type AdminAlert = TelephonyAlert & {
   first: { value?: number; number?: string }
   acknowledgedAt?: string
   acknowledgedBy?: string
+}
+
+/**
+ * A subscription to the events of the organisation (step 10a): where they are sent, which ones. `deliverable`: false
+ * when its domain is no longer allowed (nothing is sent to it then). Its secret is never read back.
+ */
+export interface WebhookSubscription {
+  id: string
+  url: string
+  events: WebhookEventType[]
+  description?: string
+  enabled: boolean
+  /** `failing`: disabled by the Gateway after a day of failed deliveries (enabling it again starts afresh). */
+  disabledReason?: 'failing'
+  deliverable: boolean
+  /** Deliveries failed in a row (none when the last one went through). */
+  failures?: number
+  /** Nothing is tried until then: the subscriber failed too often in a row (a test or `resumeWebhook` lifts it). */
+  pausedUntil?: string
+  /** Events not queued since it was last enabled or resumed (too many pending), the latest at `backlogAt`. */
+  backlog?: number
+  backlogAt?: string
+  /** The secret before the last renewal still signs (a second `v1`) until then. */
+  previousSecretUntil?: string
+  createdAt: string
+  updatedAt: string
+}
+
+export interface WebhookSubscriptionInput {
+  url: string
+  events: WebhookEventType[]
+  description?: string
+  enabled?: boolean
+}
+
+/** One event sent (or being sent) to a subscription, and how it went. `lastError`: why the last attempt failed. */
+export interface WebhookDelivery {
+  id: string
+  eventId: string
+  eventType: WebhookEventType | 'webhook.test'
+  status: 'pending' | 'delivered' | 'failed'
+  attempts: number
+  createdAt: string
+  nextAttemptAt?: string
+  lastAttemptAt?: string
+  lastStatus?: number
+  lastError?: string
+  deliveredAt?: string
 }
 
 export interface AlertFilter {
@@ -312,6 +363,64 @@ export class TelephonyClient {
    */
   setUserProfile(userId: string, profileId: string | null, version: string) {
     return this.request<{ userId: string; profileId: string | null } & OutboundSettings>(`/admin/outbound/users/${encodeURIComponent(userId)}`, { method: 'PUT', body: JSON.stringify({ profileId, version }) })
+  }
+
+  /** The domains webhooks may be sent to (step 10a). */
+  getWebhookDomains() {
+    return this.request<{ domains: string[] }>('/webhooks/domains')
+  }
+
+  /** Replaces them: host names, or `*.example.org` for its subdomains. */
+  setWebhookDomains(domains: string[]) {
+    return this.request<{ domains: string[] }>('/webhooks/domains', { method: 'PUT', body: JSON.stringify({ domains }) })
+  }
+
+  listWebhooks() {
+    return this.request<{ items: WebhookSubscription[] }>('/webhooks')
+  }
+
+  /** A new subscription, with its signing secret: shown this once. */
+  createWebhook(input: WebhookSubscriptionInput) {
+    return this.request<WebhookSubscription & { secret: string }>('/webhooks', { method: 'POST', body: JSON.stringify(input) })
+  }
+
+  updateWebhook(id: string, input: WebhookSubscriptionInput) {
+    return this.request<WebhookSubscription>(`/webhooks/${encodeURIComponent(id)}`, { method: 'PUT', body: JSON.stringify(input) })
+  }
+
+  async deleteWebhook(id: string) {
+    await this.request<void>(`/webhooks/${encodeURIComponent(id)}`, { method: 'DELETE' })
+  }
+
+  /**
+   * A new signing secret, in use at once: shown this once. The one it replaces still signs until
+   * `previousSecretUntil` (a day), unless `revoke` (a secret that leaked): then it signs no more at all.
+   */
+  renewWebhookSecret(id: string, opts: { revoke?: boolean } = {}) {
+    return this.request<{ secret: string; previousSecretUntil?: string }>(`/webhooks/${encodeURIComponent(id)}/secret${opts.revoke ? '?grace=0' : ''}`, { method: 'POST' })
+  }
+
+  /** Starts the subscription afresh (its subscriber repaired): no pause, no failures counted; what waits is sent. */
+  resumeWebhook(id: string) {
+    return this.request<WebhookSubscription>(`/webhooks/${encodeURIComponent(id)}/resume`, { method: 'POST' })
+  }
+
+  /** Sends a `webhook.test` to the subscription now. */
+  testWebhook(id: string) {
+    return this.request<WebhookDelivery>(`/webhooks/${encodeURIComponent(id)}/test`, { method: 'POST' })
+  }
+
+  /** A page of the deliveries of a subscription, the latest first (`next`: the `before` of the next page). */
+  listWebhookDeliveries(id: string, filter: { status?: WebhookDelivery['status']; limit?: number; before?: string } = {}) {
+    const params = new URLSearchParams()
+    for (const [k, v] of Object.entries(filter)) if (v !== undefined && v !== '') params.set(k, String(v))
+    const qs = params.toString()
+    return this.request<{ items: WebhookDelivery[]; next?: string }>(`/webhooks/${encodeURIComponent(id)}/deliveries${qs ? `?${qs}` : ''}`)
+  }
+
+  /** Sends a delivery that is over again (the same event, the same id). */
+  replayWebhookDelivery(id: string, deliveryId: string) {
+    return this.request<WebhookDelivery>(`/webhooks/${encodeURIComponent(id)}/deliveries/${encodeURIComponent(deliveryId)}/replay`, { method: 'POST' })
   }
 
   /** A page of alerts, the latest repeated first (`next`: the `before` of the next page). */

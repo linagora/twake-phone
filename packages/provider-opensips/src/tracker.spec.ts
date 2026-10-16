@@ -542,8 +542,8 @@ describe('CallTracker', () => {
     expect(told.slice(7)).toEqual(['101:dnd', '101:dnd'])
   })
 
-  it('rings the members of a ring group one by one as their phones ring; the one who answers takes the call, the others hear no more of it', () => {
-    const { tracker, calls, presences, clear } = make()
+  it('rings the members of a ring group one by one as their phones ring; the one who answers takes the call, the others are told it was taken', () => {
+    const { tracker, calls, events, presences, clear } = make()
     for (const ext of ['101', '102', '103', '104']) tracker.handle('E_UL_CONTACT_INSERT', contact(ext, `sip:${ext}@x.invalid`))
     clear()
     const g = (callee: string) => ({ ...call('g1', '101', callee), dialled: '200', group: '200' })
@@ -561,8 +561,10 @@ describe('CallTracker', () => {
     tracker.handle('E_TWAKEPHONE_DND', { ...g('104'), told: '1', code: '0' })
     expect(calls()).toEqual([])
     tracker.handle('E_TWAKEPHONE_ANSWERED', g('103'))
-    // 102 stops ringing without a call of its own to show: a colleague answered.
-    expect(calls()).toEqual(['101:call.connected:outbound:200:connected', '103:call.connected:inbound:101:connected'])
+    // 102 stops ringing without a call of its own to show: told a colleague took it (its phone rang: the subscribers'
+    // call.ringing for it ends, answered elsewhere; review 10a, n°4).
+    expect(calls()).toEqual(['102:call.taken:inbound:101:ended', '101:call.connected:outbound:200:connected', '103:call.connected:inbound:101:connected'])
+    expect(events.filter(e => e.event.type === 'call.taken').map(e => e.event.payload)).toEqual([{ call: expect.anything(), by: '103', rang: true }])
     expect(presences()).toEqual(['102:available'])
     clear()
     // acc names the member who answered; the caller keeps the number dialled.

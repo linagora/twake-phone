@@ -12,7 +12,9 @@ import { DirectorySync } from '../../gateway/dist/directory-sync.js'
 import { DEFAULT_ATTRIBUTES, LdapDirectory } from '../../gateway/dist/ldap-directory.js'
 import { ProviderRegistry } from '../../gateway/dist/registry.js'
 import { MemoryStore } from '../../gateway/dist/store/memory.js'
+import { parseNetworks } from '../../gateway/dist/webhook-delivery.js'
 import { BASE_DN, READER_DN, READER_PASSWORD, startLdapMock } from '../../gateway/test/ldap-mock.mjs'
+import { startWebhookReceiver } from '../../gateway/test/webhook-receiver.mjs'
 import { startOidcMock } from './oidc-mock.mjs'
 import { serveApp } from '../server/serve.mjs'
 
@@ -56,7 +58,21 @@ const directorySync = new DirectorySync({ store, directory: contacts, tenantId: 
 // memory: what the screens send it is what a SIP server would be handed (trunks with their password, direct
 // numbers, rights), and it says its trunks are registered.
 const providers = []
-const platform = { trunks: [], dids: [], groups: [], outbound: null }
+const platform = {
+  trunks: [],
+  dids: [],
+  groups: [],
+  outbound: null,
+  // The trunk servers that answer no probe (step 10a: trunk.degraded).
+  probing: new Set(),
+  // What the SIP server tells (step 10a: a missed call), in order; `waiting` is the stream waiting for the next one.
+  events: [],
+  waiting: null,
+  tell(extension, event) {
+    this.events.push({ extension, event })
+    this.waiting?.()
+  }
+}
 const notHere = async () => {
   throw Object.assign(new Error('Not on this platform'), { statusCode: 501 })
 }
@@ -87,7 +103,7 @@ const memoryPlatform = {
       platform.trunks = trunks
       platform.dids = dids
     },
-    getTrunkStatus: async () => platform.trunks.map(t => ({ id: t.id, ...(t.auth === 'register' ? { registration: { state: 'registered' } } : {}), servers: (t.proxies ?? [t.domain]).map(address => ({ address, state: 'up' })) })),
+    getTrunkStatus: async () => platform.trunks.map(t => ({ id: t.id, ...(t.auth === 'register' ? { registration: { state: 'registered' } } : {}), servers: (t.proxies ?? [t.domain]).map(address => ({ address, state: platform.probing.has(address) ? 'probing' : 'up' })) })),
     setOutboundPolicy: async (policy, profiles, assignments) => {
       platform.outbound = { policy, profiles, assignments }
     },
@@ -99,14 +115,29 @@ const memoryPlatform = {
     transfer: notHere,
     sendDTMF: notHere,
     close: async () => {},
-    // No event ever: nobody calls on this platform.
+    // Nobody calls on this platform, save what a step tells (platform.tell).
     subscribe: async function* () {
-      await new Promise(() => {})
-      yield* []
+      for (;;) {
+        while (platform.events.length) yield platform.events.shift()
+        await new Promise(resolve => (platform.waiting = resolve))
+      }
     }
   })
 }
-const gateway = await buildApp(new ProviderRegistry(providers, [memoryPlatform]), { auth, store, contacts, directorySync, secretsKey: randomBytes(32), admin: { adminRole: 'twakephone-admin', adminUsers: new Set() } })
+// The tool an administrator subscribes to the webhooks (step 10a), on this host: the Gateway may reach it only because
+// the operator opens the loopback to deliveries (WEBHOOK_PRIVATE_NETWORKS), allows http (WEBHOOK_ALLOW_HTTP=1) and its
+// port (WEBHOOK_PORTS).
+const receiver = await startWebhookReceiver()
+const gateway = await buildApp(new ProviderRegistry(providers, [memoryPlatform]), {
+  auth,
+  store,
+  contacts,
+  directorySync,
+  secretsKey: randomBytes(32),
+  admin: { adminRole: 'twakephone-admin', adminUsers: new Set() },
+  webhooks: { policy: { allowHttp: true, ports: [Number(new URL(receiver.url).port)] }, open: parseNetworks('127.0.0.1/32'), retryBaseMs: 300, pollMs: 100 },
+  trunkWatchMs: 300
+})
 await gateway.listen({ host: '127.0.0.1', port: GATEWAY_PORT })
 const web = await serveApp({
   dir: fileURLToPath(new URL('../dist/', import.meta.url)),
@@ -414,6 +445,111 @@ try {
     expectEqual(acknowledged.length, 1, 'acknowledged alerts')
     expectEqual(typeof acknowledged[0].acknowledgedBy, 'string', 'acknowledged by someone')
   })
+  await step('an administrator subscribes a tool to the webhooks: its domain allowed first, the secret shown once, a signed test received', async () => {
+    await subnav.getByRole('link', { name: 'Webhooks' }).click()
+    await page.getByRole('heading', { level: 2, name: 'Webhooks' }).waitFor()
+    expectEqual(await page.title(), 'Webhooks – Administration – TwakePhone', 'document title')
+    await page.getByText('Aucun abonnement.').waitFor()
+    const url = `${receiver.url}/twakephone`
+    // Not among the allowed domains: refused before anything is sent, the focus on the address.
+    await page.getByLabel('Adresse de réception').fill(url)
+    await page.getByRole('button', { name: "Enregistrer l'abonnement" }).click()
+    await page.locator('#webhook-url-error').getByText("127.0.0.1 n'est pas parmi les domaines autorisés").waitFor()
+    expectEqual(await page.evaluate(() => document.activeElement?.id), 'webhook-url', 'focus on the address')
+    await page.getByLabel('Domaines vers lesquels un webhook peut être envoyé').fill('127.0.0.1')
+    await page.getByRole('button', { name: 'Enregistrer les domaines' }).click()
+    await page.getByRole('status').getByText('Domaines enregistrés (1).').waitFor()
+    const events = page.getByRole('group', { name: 'Événements envoyés' })
+    expectEqual(await events.getByLabel('Appel manqué').isChecked(), true, 'a missed call ticked by default')
+    await events.getByLabel('Trunk dégradé').check()
+    await events.getByLabel('Trunk rétabli').check()
+    await page.getByLabel('Description').fill('CRM')
+    await page.getByRole('button', { name: "Enregistrer l'abonnement" }).click()
+    // The secret, shown once, the focus on it: the tool is given it.
+    const secretField = page.getByRole('textbox', { name: 'Secret', exact: true })
+    await secretField.waitFor()
+    const secret = await secretField.inputValue()
+    if (!/^whsec_[A-Za-z0-9_-]{43}$/.test(secret)) throw new Error(`unexpected secret ${secret}`)
+    expectEqual(await page.evaluate(() => document.activeElement?.id), 'webhook-secret-value', 'focus on the secret')
+    receiver.secret = secret
+    await page.getByRole('button', { name: "J'ai copié le secret" }).click()
+    if ((await page.content()).includes(secret)) throw new Error('the secret is still in the page')
+    const listed = await api('/webhooks')
+    if (listed.body.includes(secret)) throw new Error('the secret is in the API')
+    const list = page.getByRole('list', { name: 'Abonnements' })
+    await list.getByText(`${url} (CRM) : Appel manqué, Trunk dégradé, Trunk rétabli.`).waitFor()
+    await page.getByRole('button', { name: `Tester l'abonnement ${url}` }).click()
+    const test = await receiver.waitFor(e => e?.type === 'webhook.test', 'webhook.test')
+    expectEqual(test.verified, true, 'test signature')
+    expectEqual(test.path, '/twakephone', 'path')
+    expectEqual(test.headers['idempotency-key'], test.event.id, 'idempotency key')
+    expectEqual(test.headers['x-twakephone-event'], 'webhook.test', 'event header')
+  })
+  await step('Jean misses a call: the tool receives a signed call.missed, with the numbers and the person, once', async () => {
+    const call = { id: 'e2e-missed-1@192.0.2.10', direction: 'inbound', remoteNumber: '+33639980001', startedAt: new Date(Date.now() - 8000).toISOString() }
+    platform.tell('102', { type: 'call.ringing', timestamp: call.startedAt, payload: { call: { ...call, state: 'ringing' } } })
+    const endedAt = new Date().toISOString()
+    platform.tell('102', { type: 'call.ended', timestamp: endedAt, payload: { call: { ...call, state: 'missed', endedAt } } })
+    const missed = await receiver.waitFor(e => e?.type === 'call.missed', 'call.missed')
+    expectEqual(missed.verified, true, 'call.missed signature')
+    const c = missed.event.call
+    expectEqual(JSON.stringify([c.id, c.direction, c.from, c.to, c.user, c.extension, c.outcome, c.duration_sec]), JSON.stringify([call.id, 'inbound', '+33639980001', '102', 'jdupont', '102', 'missed', 0]), 'the missed call')
+    expectEqual(missed.event.tenant, 'e2e', 'tenant')
+    // Neither the ringing nor the end: not subscribed.
+    await new Promise(r => setTimeout(r, 500))
+    expectEqual(receiver.received.filter(d => d.event?.type !== 'webhook.test').map(d => d.event?.type).join(), 'call.missed', 'only the missed call')
+  })
+  await step('a server of the trunk answers no probe: the tool receives trunk.degraded, once, then trunk.recovered once it answers again', async () => {
+    platform.probing.add('192.0.2.10:5060')
+    try {
+      const degraded = await receiver.waitFor(e => e?.type === 'trunk.degraded', 'trunk.degraded', 20_000)
+      expectEqual(degraded.verified, true, 'trunk.degraded signature')
+      const t = degraded.event.trunk
+      expectEqual(JSON.stringify([t.id, t.name, t.state, t.previous]), JSON.stringify(['operator', 'Opérateur', 'degraded', 'up']), 'the trunk')
+      expectEqual(JSON.stringify(t.servers), JSON.stringify([{ address: 'sip1.operator.example', state: 'up' }, { address: '192.0.2.10:5060', state: 'probing' }]), 'its servers')
+      await new Promise(r => setTimeout(r, 3000))
+      expectEqual(receiver.received.filter(d => d.event?.type === 'trunk.degraded').length, 1, 'told once')
+    } finally {
+      platform.probing.clear()
+    }
+    const recovered = await receiver.waitFor(e => e?.type === 'trunk.recovered', 'trunk.recovered', 20_000)
+    expectEqual(recovered.verified, true, 'trunk.recovered signature')
+    const t = recovered.event.trunk
+    expectEqual(JSON.stringify([t.id, t.state, t.previous]), JSON.stringify(['operator', 'up', 'degraded']), 'the trunk recovered')
+  })
+  await step('a tool that answers 500 is sent the event again until it answers 2xx; the log says so, and a delivery is replayed', async () => {
+    const before = receiver.received.length
+    receiver.answer = () => 500
+    const url = `${receiver.url}/twakephone`
+    await page.getByRole('button', { name: `Tester l'abonnement ${url}` }).click()
+    await page.getByRole('status').getByText(`Événement de test envoyé à ${url}`).waitFor()
+    const first = await receiver.waitFor((e, d) => e?.type === 'webhook.test' && receiver.received.indexOf(d) >= before, 'the second test')
+    // Retried with the same event (the same id): answered 2xx this time.
+    receiver.answer = () => 204
+    await receiver.waitFor((e, d) => e?.id === first.event.id && d !== first, 'the retry')
+    await page.getByRole('button', { name: `Journal des envois à ${url}` }).click()
+    const log = page.getByRole('table', { name: `Journal des envois à ${url}` })
+    await log.waitFor()
+    // Read again until the retry's outcome is in.
+    for (let i = 0; i < 30 && !(await log.getByText(first.event.id).locator('xpath=ancestor::tr').getByText('Livré').count()); i++) {
+      await page.getByRole('button', { name: 'Actualiser le journal' }).click()
+      await page.waitForTimeout(200)
+    }
+    const row = log.getByText(first.event.id).locator('xpath=ancestor::tr')
+    await row.getByText('Livré').waitFor()
+    await row.getByText('réponse 204').waitFor()
+    await row.getByRole('cell', { name: '2', exact: true }).waitFor()
+    await log.getByText('Appel manqué').first().waitFor()
+    // The missed call sent again: the same event, the same id.
+    const missedId = receiver.received.find(d => d.event?.type === 'call.missed').event.id
+    const count = receiver.received.filter(d => d.event?.id === missedId).length
+    await page.getByRole('button', { name: /^Renvoyer : l'événement Appel manqué du / }).click()
+    await page.getByRole('status').getByText('Envoi relancé').waitFor()
+    await receiver.waitFor(e => e?.id === missedId && receiver.received.filter(d => d.event?.id === missedId).length > count, 'the replay')
+    const replayed = receiver.received.filter(d => d.event?.id === missedId).at(-1)
+    expectEqual(replayed.verified, true, 'replay signature')
+    expectEqual(replayed.headers['idempotency-key'], missedId, 'replay idempotency key')
+  })
   await step('in English, the refusals of the Gateway read in English too', async () => {
     await page.getByRole('link', { name: 'Réglages' }).click()
     await page.getByLabel("Langue de l'interface").selectOption('en')
@@ -477,7 +613,10 @@ try {
       ['PUT', '/admin/outbound/users/bdurand', { profileId: null }],
       ['GET', '/admin/users'],
       ['GET', '/admin/alerts'],
-      ['POST', '/admin/alerts/1/acknowledge']
+      ['POST', '/admin/alerts/1/acknowledge'],
+      ['GET', '/webhooks'],
+      ['PUT', '/webhooks/domains', { domains: ['evil.example'] }],
+      ['POST', '/webhooks', { url: 'https://evil.example/in', events: ['call.missed'] }]
     ]) {
       const res = await gateway.inject({ method, url: `/api/v1${url}`, headers: { authorization: `Bearer ${bob}` }, ...(payload ? { payload } : {}) })
       expectEqual(res.statusCode, 403, `${method} ${url} as Bob`)
@@ -534,5 +673,6 @@ try {
   await gateway.close()
   await oidc.stop()
   await ldap.stop()
+  await receiver.stop()
 }
 process.exit(failed ? 1 : 0)

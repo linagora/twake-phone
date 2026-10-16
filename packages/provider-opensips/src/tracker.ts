@@ -552,20 +552,21 @@ export class CallTracker {
   }
 
   /**
-   * A member answers a group call: it becomes the callee (busy already if its phone rang). The others stop ringing
-   * and hear nothing more of it: the call was answered, by a colleague.
+   * A member answers a group call: it becomes the callee (busy already if its phone rang). The others stop ringing:
+   * the call was answered, by a colleague; no missed call of theirs.
    */
   private memberAnswers(call: TrackedCall, member: string) {
     const group = call.group!
     if (!member) return
-    for (const other of group.ringing) if (other !== member) this.count(other, -1)
+    const others = [...group.ringing].filter(other => other !== member)
+    for (const other of others) this.count(other, -1)
     const rang = group.ringing.has(member)
     group.ringing.clear()
-    // Those woken for it hear nothing more either, but that a colleague took the call (their browsers' notification
-    // says so instead of ringing on).
-    for (const other of call.woken ?? []) {
-      if (other !== member) this.emit(other, { type: 'call.taken', timestamp: this.now(), payload: { call: this.toCall(call, other, 'ended'), by: member } })
-    }
+    // Those it rang, and those woken for it, hear only that a colleague took the call (`rang`: their phone rang for
+    // it; their browsers' notification says so instead of ringing on).
+    const taken = (other: string, rang: boolean) => this.emit(other, { type: 'call.taken', timestamp: this.now(), payload: { call: this.toCall(call, other, 'ended'), by: member, ...(rang ? { rang } : {}) } })
+    for (const other of others) taken(other, true)
+    for (const other of call.woken ?? []) if (other !== member && !others.includes(other)) taken(other, false)
     call.woken?.clear()
     call.callee = member
     call.rang = rang
