@@ -1134,8 +1134,15 @@ try {
     // after 15 s (408). A call let through has no refusal of OpenSIPS's own.
     const gone = callIds => until('the end of the calls to 8000', async () => {
       const dialogs = (await mi('dlg_list')).result?.Dialogs ?? []
-      return callIds.every(id => !dialogs.some(d => d.callid === id))
+      return callIds.every(id => !dialogs.some(d => d.callid === id)) && (await meetCalls()) === 0
     }, 40_000)
+    // The calls to 8000 OpenSIPS counts (all, or one caller's). A call is counted once OpenSIPS has read what it needs
+    // (its direct number, its rules: in the database, asynchronously), which takes longer for some of many calls placed
+    // at once: the one past a cap is placed once the others are all counted, never after a fixed delay (the CI once
+    // had the last of the MEET_CALLS_ALL calls counted after the one more, which got through and the last refused).
+    const meetCalls = async caller =>
+      Number((await mi('profile_get_size', caller ? { profile: 'meet_caller', value: caller } : { profile: 'meet_all' })).result?.Profile?.count ?? 0)
+    const allCounted = (what, n, caller) => until(`${what}, counted`, async () => (await meetCalls(caller)) === n, 10_000)
     const heldBy = async p => p.dial(MEET_NUMBER, { giveUpMs: 1_500 })
     const letThrough = call => !call.final || !header(call.final, 'twake-call-refused')
     const refusedFor = (what, answer, status, word) => expect(what, answer?.status === status && header(answer, 'twake-call-refused') === word, answer?.first ?? 'no answer')
@@ -1148,7 +1155,7 @@ try {
       await gone([first.callId])
       // Two at the same time: the next one is busy, not a try.
       const held = [p301.dial(MEET_NUMBER, { giveUpMs: 6_000 }), p301.dial(MEET_NUMBER, { giveUpMs: 6_000 })]
-      await sleep(1_500)
+      await allCounted('the two calls of 301', 2, '301')
       if (MEET_CALLS_PER_CALLER === 2) refusedFor('the third call of 301 at the same time', (await p301.dial(MEET_NUMBER, { giveUpMs: 3_000 })).final, 486, 'meet-busy')
       const pair = await Promise.all(held)
       expect('the two calls of 301, let through', pair.every(letThrough), pair.map(c => c.final?.first).join(', '))
@@ -1173,11 +1180,17 @@ try {
       alerts.length = 0
       const many = []
       for (let i = 0; i < MEET_CALLS_ALL; i++) many.push(await C.call('+33199000304', { from: `+336399820${String(i).padStart(2, '0')}`, timeoutMs: 60_000 }))
-      await sleep(1_000)
+      const early = []
+      for (const call of many) call.final.then(answer => early.push(answer.first), () => undefined)
+      await allCounted(`the ${MEET_CALLS_ALL} calls`, MEET_CALLS_ALL).catch(err => {
+        throw new Error(`${err.message} (answered meanwhile: ${early.join(', ') || 'none'})`)
+      })
       refusedFor('one call more than MEET_CALLS_ALL', await (await C.call('+33199000304', { from: '+33639982099' })).final, 503, 'meet-full')
       const full = await untilAlert('the alert of the calls at the same time', (m, p) => m === 'E_TWAKEPHONE_PIN' && p.param === 'calls')
       expect('the alert of the calls', Number(full.value) === MEET_CALLS_ALL + 1 && Number(full.threshold) === MEET_CALLS_ALL, JSON.stringify(full))
       for (const call of many) await call.cancel()
+      const ends = await Promise.all(many.map(c => c.final.catch(() => undefined)))
+      expect(`the ${MEET_CALLS_ALL} calls, let through`, ends.every(answer => !answer || !header(answer, 'twake-call-refused')), ends.map(a => a?.first).join(', '))
       await gone(many.map(c => c.callId))
     } finally {
       await tables.set([main, backup], dids)
