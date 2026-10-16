@@ -18,7 +18,7 @@ import { ENDED_TTL_SEC, MISSED_TTL_SEC, type PushMessage, type WebPush } from '.
 import type { ProviderRegistry } from './registry.js'
 import { securityHeadersFor, type SecurityOptions } from './security.js'
 import { MAX_DIDS, MAX_TRUNKS, TRUNK_ID, defaultTrunk, parseDid, parseTrunk, providerTrunks, publicDid, publicTrunk, trunkRecord } from './trunks.js'
-import { EMPTY_OUTBOUND, PROFILE_ID, parseOutbound, type Outbound } from './outbound.js'
+import { EMPTY_OUTBOUND, PROFILE_ID, outboundVersion, parseOutbound, type Outbound } from './outbound.js'
 import { MemoryStore } from './store/memory.js'
 import { ALERT_RETENTION_DAYS, clampLimit, isMissed, type HistoryEntry, type HistoryQuery, type Store, type StoredAlert, type TrunkRecord, type UserPresenceRecord } from './store/types.js'
 
@@ -120,6 +120,11 @@ export interface BuildOptions {
   push?: WebPush
   /** How often the alerts past their retention are removed (step 6b). Default: every hour. */
   alertPurgeIntervalMs?: number
+  /**
+   * How long the state of a tenant's trunks is kept (step 7): every open Trunks screen reads it every few seconds, each
+   * read costs the SIP server a query and a control message. Default 2.5 s.
+   */
+  trunkStatusCacheMs?: number
   /**
    * The key the passwords of the trunks are encrypted with (SECRETS_KEY, step 6). Absent: a trunk can be kept without
    * a password only.
@@ -298,6 +303,10 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
   const tickets = options.tickets ?? new TicketStore()
   const historyWriteMs = options.historyWriteTimeoutMs ?? HISTORY_WRITE_MS
   const turnMaxMs = options.turnMaxMs ?? TURN_MAX_MS
+  const trunkStatusMs = options.trunkStatusCacheMs ?? 2_500
+  /** The last read of the state of each tenant's trunks, and the tenants whose SIP server did not answer it. */
+  const trunkStatus = new Map<string, { at: number; answer: Promise<{ available: boolean; items: unknown[] }> }>()
+  const trunkStatusFailing = new Set<string>()
   let directory = options.directory
   if (!directory) {
     // Dev convenience: a bare in-memory gateway maps users from DEV_USER_MAP.
@@ -1030,13 +1039,26 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         const provider = registry.forTenant(user.tenantId)
         trunksOf(provider)
         if (!provider.getTrunkStatus) return { available: false, items: [] }
-        try {
-          const items = await provider.getTrunkStatus()
-          return items ? { available: true, items } : { available: false, items: [] }
-        } catch (err) {
-          req.log.warn({ err, tenantId: user.tenantId }, 'trunks: the SIP server did not say how they are doing')
-          return { available: false, items: [] }
-        }
+        const tenantId = user.tenantId
+        const kept = trunkStatus.get(tenantId)
+        if (kept && Date.now() - kept.at < trunkStatusMs) return kept.answer
+        // One read for every screen open within the window (the reads under way included); a failure is logged
+        // when it starts and when it ends, not at every read of every open screen.
+        const answer = (async () => {
+          try {
+            const items = await provider.getTrunkStatus!()
+            if (trunkStatusFailing.delete(tenantId)) app.log.info({ tenantId }, 'trunks: the SIP server says how they are doing again')
+            return items ? { available: true, items } : { available: false, items: [] }
+          } catch (err) {
+            if (!trunkStatusFailing.has(tenantId)) {
+              trunkStatusFailing.add(tenantId)
+              app.log.warn({ err, tenantId }, 'trunks: the SIP server did not say how they are doing')
+            }
+            return { available: false, items: [] }
+          }
+        })()
+        trunkStatus.set(tenantId, { at: Date.now(), answer })
+        return answer
       })
       v1.put<{ Params: { id: string } }>('/admin/trunks/:id', async (req, reply) => {
         const user = await administrator(req)
@@ -1143,7 +1165,8 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         await store.setOutbound({ tenantId, ...next }).catch(undo)
       }
       // What holds when an administrator says nothing (ADR 0017): shown with what they said.
-      const outboundView = (o: Outbound) => ({ ...o, defaults: { fraud: FRAUD_DEFAULTS, caps: OUTBOUND_CAP_DEFAULTS } })
+      // `version`: what to send back with a change, so that it is refused if the setting changed since (OUTBOUND_STALE).
+      const outboundView = (o: Outbound) => ({ ...o, version: outboundVersion(o), defaults: { fraud: FRAUD_DEFAULTS, caps: OUTBOUND_CAP_DEFAULTS } })
       v1.get('/admin/outbound', async req => {
         const user = await administrator(req)
         outboundOf(registry.forTenant(user.tenantId))
@@ -1153,7 +1176,15 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         const user = await administrator(req)
         const apply = outboundOf(registry.forTenant(user.tenantId))
         const next = parseOutbound(req.body)
-        await inTurn(user.tenantId, () => changeOutbound(user.tenantId, apply, next))
+        // The version read (the screens always send it): the setting is replaced only if it is still the one read. A
+        // script that means to replace it whole, whatever it is, sends none.
+        const version = (req.body as { version?: unknown }).version
+        if (version !== undefined && typeof version !== 'string') throw Object.assign(new Error('version: the version of GET /admin/outbound'), { statusCode: 400, code: 'OUTBOUND_INVALID' })
+        await inTurn(user.tenantId, async () => {
+          if (version !== undefined && outboundVersion(await outboundFor(user.tenantId)) !== version)
+            throw Object.assign(new Error('The outbound rules changed since they were read: read them again'), { statusCode: 409, code: 'OUTBOUND_STALE' })
+          await changeOutbound(user.tenantId, apply, next)
+        })
         return outboundView(next)
       })
       // One person's profile (`profileId`, or null: the default one).
@@ -1169,7 +1200,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
           const assignments = current.assignments.filter(a => a.userId !== userId)
           const next = parseOutbound({ ...current, assignments: profileId ? [...assignments, { userId, profileId }] : assignments })
           await changeOutbound(user.tenantId, apply, next)
-          return { userId, profileId: profileId ?? null }
+          return { userId, profileId: profileId ?? null, version: outboundVersion(next) }
         })
       })
       // The people who hold an extension (step 7), by user id: whom a rights profile is given to, where a direct
@@ -1203,10 +1234,16 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         }
       })
       // An administrator has seen it (step 7): kept with who and when; a repeat from then on opens a new alert.
+      // `lastAt`: its last repeat as they saw it. Repeated since, it stays open (409 ALERT_CHANGED): what came after
+      // is never acknowledged unseen.
       v1.post<{ Params: { id: string } }>('/admin/alerts/:id/acknowledge', async req => {
         const user = await administrator(req)
-        const alert = await store.acknowledgeAlert(user.tenantId, req.params.id, user.id, new Date().toISOString())
+        const seen = (req.body as { lastAt?: unknown } | undefined)?.lastAt
+        if (typeof seen !== 'string' || !/^\d{4}-\d{2}-\d{2}T[0-9:.]+Z$/.test(seen) || Number.isNaN(Date.parse(seen)))
+          throw Object.assign(new Error('lastAt: the lastAt of the alert as listed'), { statusCode: 400, code: 'ALERT_INVALID' })
+        const alert = await store.acknowledgeAlert(user.tenantId, req.params.id, user.id, new Date().toISOString(), new Date(seen).toISOString())
         if (!alert) throw notFound('alert')
+        if (!alert.acknowledgedAt) throw Object.assign(new Error('The alert repeated since it was listed: list it again'), { statusCode: 409, code: 'ALERT_CHANGED' })
         return publicAlert(alert)
       })
 

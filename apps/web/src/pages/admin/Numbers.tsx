@@ -92,10 +92,11 @@ export const Numbers = () => {
     setBusy(true)
     try {
       await client.deleteDid(range.id)
-      setNote({ kind: 'ok', text: t('admin.did.deleted', { id: range.id }) })
+      // The row goes, its buttons with it: the focus goes to what is said.
+      setNote({ kind: 'ok', text: t('admin.did.deleted', { id: range.id }), focus: true })
       if (editing?.id === range.id) reset()
     } catch (err) {
-      setNote({ kind: 'error', text: say(didRefusal(err).problem)! })
+      setNote({ kind: 'error', text: say(didRefusal(err).problem)!, focus: true })
     } finally {
       setBusy(false)
       load()

@@ -251,6 +251,7 @@
   "admin.groupNameInvalid": "The name must be one line of 1 to 64 characters.",
   "admin.groupMembersInvalid": "A group has 1 to 12 members.",
   "admin.groupMemberNotExtension": "Only extensions of your organisation can be members of a group.",
+  "admin.group.err.memberFormat": "Members are extensions of 2 to 6 digits, the first not 0: {members} is not one.",
   "admin.groupSyncRunning": "A synchronisation of the directory is running: try again in a moment.",
   "call.endedAnsweredElsewhere": "Call from {who} answered on another phone.",
   "settings.notifications": "Call notifications",
@@ -305,6 +306,8 @@
   "admin.err.trunkOtherTenant": "This trunk name is already used on the platform: choose another one.",
   "admin.err.trunkLimit": "The maximum number of trunks is reached.",
   "admin.err.didLimit": "The maximum number of direct number ranges is reached.",
+  "admin.err.profileLimit": "{max} profiles at most: delete one before creating another.",
+  "admin.err.stale": "Another administrator changed these settings since this page was opened: nothing was saved, and what they are now has just been read again. Check them, then try again.",
   "admin.err.targetUnknown": "This number is neither an assigned extension nor a ring group of your organisation.",
   "admin.class.fixed": "Mainland landlines",
   "admin.class.mobile": "Mobiles",
@@ -473,6 +476,7 @@
   "admin.rights.defaultSave": "Save default profile",
   "admin.rights.defaultSaved": "Default profile saved.",
   "admin.rights.noProfile": "Default profile",
+  "admin.rights.defaultNone": "None: what the trunk allows",
   "admin.rights.people": "Each person's profile",
   "admin.rights.peopleHelp": "People who hold an extension. Choose a profile, then apply it.",
   "admin.rights.nobody": "Nobody holds an extension yet.",
@@ -550,6 +554,9 @@
   "admin.alert.acknowledge": "Acknowledge",
   "admin.alert.acknowledgeOf": "Acknowledge the alert {cause} of {when}",
   "admin.alert.acknowledged": "Alert acknowledged.",
+  "admin.alert.changed": "This alert repeated since it was shown: it was not acknowledged. The list has just been read again: look at the repeat before acknowledging.",
+  "admin.alert.gone": "This alert no longer exists (removed at the end of its retention period): the list has just been read again.",
   "admin.alert.acknowledgedBy": "Acknowledged on {date} by {by}",
-  "admin.alert.more": "Show more alerts"
+  "admin.alert.more": "Show more alerts",
+  "admin.alert.refresh": "Read the alerts again"
 }

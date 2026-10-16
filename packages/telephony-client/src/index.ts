@@ -131,6 +131,8 @@ export interface OutboundSettings {
   policy: OutboundPolicy
   profiles: OutboundProfile[]
   assignments: OutboundAssignment[]
+  /** What was read: sent back with a change, which is refused (409 OUTBOUND_STALE) when the setting changed since. */
+  version: string
   defaults: { fraud: { national: FraudRule; international: FraudRule }; caps: { user: OutboundCaps; tenant: OutboundCaps } }
 }
 
@@ -285,15 +287,18 @@ export class TelephonyClient {
     return this.request<OutboundSettings>('/admin/outbound')
   }
 
-  /** Replaces them whole (profiles, policy, assignments). */
-  setOutbound(settings: Pick<OutboundSettings, 'policy' | 'profiles' | 'assignments'>) {
-    const { policy, profiles, assignments } = settings
-    return this.request<OutboundSettings>('/admin/outbound', { method: 'PUT', body: JSON.stringify({ policy, profiles, assignments }) })
+  /**
+   * Replaces them whole (profiles, policy, assignments). With the `version` read, refused (409 OUTBOUND_STALE) when
+   * another administrator changed them since: read them again before writing.
+   */
+  setOutbound(settings: Pick<OutboundSettings, 'policy' | 'profiles' | 'assignments'> & { version?: string }) {
+    const { policy, profiles, assignments, version } = settings
+    return this.request<OutboundSettings>('/admin/outbound', { method: 'PUT', body: JSON.stringify({ policy, profiles, assignments, ...(version ? { version } : {}) }) })
   }
 
-  /** Gives one person a profile, or the default one (`null`). */
+  /** Gives one person a profile, or the default one (`null`); says the version of the setting it makes. */
   setUserProfile(userId: string, profileId: string | null) {
-    return this.request<{ userId: string; profileId: string | null }>(`/admin/outbound/users/${encodeURIComponent(userId)}`, { method: 'PUT', body: JSON.stringify({ profileId }) })
+    return this.request<{ userId: string; profileId: string | null; version: string }>(`/admin/outbound/users/${encodeURIComponent(userId)}`, { method: 'PUT', body: JSON.stringify({ profileId }) })
   }
 
   /** A page of alerts, the latest repeated first (`next`: the `before` of the next page). */
@@ -304,8 +309,12 @@ export class TelephonyClient {
     return this.request<{ items: AdminAlert[]; next?: string }>(`/admin/alerts${qs ? `?${qs}` : ''}`)
   }
 
-  acknowledgeAlert(id: string) {
-    return this.request<AdminAlert>(`/admin/alerts/${encodeURIComponent(id)}/acknowledge`, { method: 'POST' })
+  /**
+   * Acknowledges an alert as it was seen (`lastAt`, its last repeat shown): refused (409 ALERT_CHANGED) when it
+   * repeated since, so that a repeat nobody saw is never acknowledged.
+   */
+  acknowledgeAlert(id: string, lastAt: string) {
+    return this.request<AdminAlert>(`/admin/alerts/${encodeURIComponent(id)}/acknowledge`, { method: 'POST', body: JSON.stringify({ lastAt }) })
   }
 
   getMediaSession() {

@@ -2,7 +2,7 @@ import { OUTBOUND_CAPS, type OutboundCaps } from '@twake/telephony-client'
 import type { Key } from '../i18n/index.js'
 import { useT } from '../i18n/useT.js'
 import type { CapForm, CapKey, CapsForm, Problem } from './validate.js'
-import { useProblem } from './ui.js'
+import { FieldError, useProblem } from './ui.js'
 
 /**
  * The caps of a person or of the organisation (step 7), one row each: its default (said with its value), none, or a
@@ -49,11 +49,7 @@ export const CapFields = ({ prefix, legend, hint, caps, defaults, problems, onCh
                 aria-describedby={error ? `${id}-error` : undefined}
               />
             ) : null}
-            {error ? (
-              <span id={`${id}-error`} className="field-error">
-                {error}
-              </span>
-            ) : null}
+            <FieldError id={id} error={error} />
           </div>
         )
       })}

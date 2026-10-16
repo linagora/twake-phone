@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import {
   FRAUD_PARAMS,
   OUTBOUND_CAPS,
@@ -100,7 +101,8 @@ export interface Outbound {
 export const parseOutbound = (body: unknown): Outbound => {
   if (!isObject(body)) throw invalid('a JSON object of policy, profiles and assignments')
   const rawProfiles = body.profiles ?? []
-  if (!Array.isArray(rawProfiles) || rawProfiles.length > MAX_PROFILES) throw invalid(`profiles: at most ${MAX_PROFILES}`)
+  if (!Array.isArray(rawProfiles)) throw invalid('profiles: a list')
+  if (rawProfiles.length > MAX_PROFILES) throw Object.assign(new Error(`profiles: at most ${MAX_PROFILES}`), { statusCode: 400, code: 'PROFILE_LIMIT' })
   const profiles = rawProfiles.map(p => parseProfile(isObject(p) && typeof p.id === 'string' ? p.id : '', p))
   const ids = new Set(profiles.map(p => p.id))
   if (ids.size !== profiles.length) throw invalid('profiles: each id once')
@@ -132,6 +134,17 @@ export const parseOutbound = (body: unknown): Outbound => {
   })
   return { policy, profiles, assignments }
 }
+
+/** JSON with the keys of every object in order: the same setting reads the same, however it was stored (jsonb). */
+const canonical = (v: unknown): string =>
+  Array.isArray(v) ? `[${v.map(canonical).join(',')}]` : isObject(v) ? `{${Object.keys(v).sort().filter(k => v[k] !== undefined).map(k => `${JSON.stringify(k)}:${canonical(v[k])}`).join(',')}}` : JSON.stringify(v)
+
+/**
+ * What an administrator read (step 7): a digest of the whole setting. A change sent with the version read is refused
+ * when the setting changed since (409 OUTBOUND_STALE): a screen opened earlier never undoes what another administrator
+ * did meanwhile (a right withdrawn from a compromised account, a cap lowered).
+ */
+export const outboundVersion = (o: Outbound): string => createHash('sha256').update(canonical({ policy: o.policy, profiles: o.profiles, assignments: o.assignments })).digest('base64url').slice(0, 22)
 
 /** Nothing set: no profile (what the trunks call), the default caps and thresholds. */
 export const EMPTY_OUTBOUND: Outbound = { policy: {}, profiles: [], assignments: [] }

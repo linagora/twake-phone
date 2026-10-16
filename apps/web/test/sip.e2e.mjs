@@ -1042,19 +1042,25 @@ try {
       return `${res.status()} ${res.ok() ? '' : (await res.json()).code}`.trim()
     }
     expectEqual(await save('102'), '409 GROUP_NUMBER_TAKEN', 'creating group 102')
-    await alice.page.getByRole('alert').filter({ hasText: 'Ce numéro est déjà pris' }).waitFor()
+    // Said next to the number (its error, tied to the field), the form saying how many problems it has.
+    await alice.page.locator('#group-number-error').filter({ hasText: 'Ce numéro est déjà pris' }).waitFor()
+    await alice.page.getByRole('alert').filter({ hasText: '1 erreur' }).waitFor()
     // An account an older Gateway left in subscriber (nobody's extension any more): OpenSIPS would route 106 as an
     // extension, so no group gets it either (the provider checks subscriber).
     await db.query("INSERT INTO subscriber (username, domain, password, ha1, ha1_sha256, ha1_sha512t256) VALUES ('106', '', '', 'x', 'x', 'x') ON CONFLICT DO NOTHING")
     expectEqual(await save('106'), '409 GROUP_NUMBER_TAKEN', 'creating group 106')
-    await alice.page.getByRole('alert').filter({ hasText: 'Ce numéro est déjà pris' }).waitFor()
+    // Said next to the number (its error, tied to the field), the form saying how many problems it has.
+    await alice.page.locator('#group-number-error').filter({ hasText: 'Ce numéro est déjà pris' }).waitFor()
+    await alice.page.getByRole('alert').filter({ hasText: '1 erreur' }).waitFor()
     expectEqual((await db.query("SELECT 1 FROM call_groups WHERE number = '106'")).rows.length, 0, 'call_groups rows of 106')
     expectEqual(await save('200'), '201', 'creating group 200')
     await alice.page.getByRole('status').filter({ hasText: 'Groupe 200 enregistré.' }).waitFor()
     await alice.page.getByRole('list', { name: 'Groupes existants' }).getByText('101, 102, 103').waitFor()
     // The creation form again, with the same number: refused, the group stays as it was.
     expectEqual(await save('200', 'Autre chose'), '409 GROUP_EXISTS', 'creating group 200 again')
-    await alice.page.getByRole('alert').filter({ hasText: 'Un groupe de votre organisation a déjà ce numéro' }).waitFor()
+    await alice.page.locator('#group-number-error').filter({ hasText: 'Un groupe de votre organisation a déjà ce numéro' }).waitFor()
+    // The focus on the field in error.
+    await alice.page.waitForFunction(() => document.activeElement?.id === 'group-number', undefined, { timeout: 5_000 })
     const { rows } = await db.query("SELECT tenant_id, name, members FROM call_groups WHERE number = '200'")
     expectEqual(rows, [{ tenant_id: TENANT, name: 'Accueil commun', members: ['101', '102', '103'] }], 'the group OpenSIPS reads')
     await alice.page.getByLabel('Numéro du groupe').fill('')

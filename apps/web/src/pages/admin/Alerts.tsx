@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react'
 import { FRAUD_PARAMS, OUTBOUND_CAPS, TRUNK_OUTBOUND_CLASSES, type AdminAlert, type AdminUser, type AlertFilter } from '@twake/telephony-client'
-import { NoteLine, Section, SelectField, useProblem, type Note } from '../../admin/ui.js'
-import { refusalOf } from '../../admin/validate.js'
+import { NoteLine, Section, SelectField, useLatest, useProblem, useRefresh, type Note } from '../../admin/ui.js'
+import { refusalCode, refusalOf, refusalStatus } from '../../admin/validate.js'
 import { useGateway } from '../../gateway.js'
 import type { Key } from '../../i18n/index.js'
 import { useT } from '../../i18n/useT.js'
@@ -9,6 +9,8 @@ import { useT } from '../../i18n/useT.js'
 const KINDS: NonNullable<AlertFilter['kind']>[] = ['fraud-warning', 'fraud-critical', 'limit', 'rights', 'emergency']
 const PARAMS = [...FRAUD_PARAMS, ...OUTBOUND_CAPS, ...TRUNK_OUTBOUND_CLASSES, 'premium', 'burst']
 const PAGE = 25
+/** How long after an answer the first page is read again while shown: a repeat counted meanwhile is seen (review 7 n°2). */
+export const ALERTS_REFRESH_MS = 30_000
 const ALL = ''
 /** What the screen shows first: the alerts not yet looked at. */
 const INITIAL = { kind: ALL, param: ALL, state: 'open' }
@@ -39,6 +41,9 @@ export const Alerts = () => {
   const [note, setNote] = useState<Note>(null)
   const firstNew = useRef<HTMLTableRowElement | null>(null)
   const [focusAt, setFocusAt] = useState<number | null>(null)
+  // More than the first page shown: not read again on its own (the rows would move under the reader).
+  const [extended, setExtended] = useState(false)
+  const words = useLatest(say)
 
   const query = useCallback(
     (f: typeof filter, before?: string): AlertFilter => ({
@@ -50,22 +55,26 @@ export const Alerts = () => {
     }),
     []
   )
+  // The first page of `f`. It depends on nothing the language changes: a change of language reads nothing again, and
+  // never puts back the first filter while the lists show another one (review 7 n°13).
   const read = useCallback(
     (f: typeof filter) =>
-      client
-        .listAlerts(query(f))
-        .then(
-          r => {
-            setItems(r.items)
-            setNext(r.next)
-            setShown(f)
-          },
-          (err: unknown) => setNote({ kind: 'error', text: say(refusalOf(err, () => undefined).problem)! })
-        )
-        .finally(() => setBusy(false)),
-    [client, query, say]
+      client.listAlerts(query(f)).then(
+        r => {
+          setItems(r.items)
+          setNext(r.next)
+          setShown(f)
+          setExtended(false)
+        },
+        (err: unknown) => setNote({ kind: 'error', text: words.current(refusalOf(err, () => undefined).problem)! })
+      ),
+    [client, query, words]
   )
-  useEffect(() => void read(INITIAL), [read])
+  useEffect(() => {
+    void read(INITIAL)
+  }, [read])
+  const again = () => read(shown)
+  useRefresh(again, ALERTS_REFRESH_MS, items !== null && !extended)
   useEffect(() => {
     client.listAdminUsers().then(
       r => setUsers(r.items),
@@ -80,7 +89,13 @@ export const Alerts = () => {
     e.preventDefault()
     setNote(null)
     setBusy(true)
-    void read(filter)
+    void read(filter).finally(() => setBusy(false))
+  }
+
+  const refresh = () => {
+    setNote(null)
+    setBusy(true)
+    void again().finally(() => setBusy(false))
   }
 
   const more = () => {
@@ -93,6 +108,7 @@ export const Alerts = () => {
         r => {
           setItems([...items, ...r.items])
           setNext(r.next)
+          setExtended(true)
           // The focus goes to the first alert of the new page (the button may disappear with the last one).
           setFocusAt(from)
         },
@@ -105,11 +121,17 @@ export const Alerts = () => {
     setNote(null)
     setBusy(true)
     try {
-      const done = await client.acknowledgeAlert(alert.id)
+      // As it was seen: refused when it repeated since (the repeat is shown, to be looked at first).
+      const done = await client.acknowledgeAlert(alert.id, alert.lastAt)
       setItems(list => (list ?? []).flatMap(a => (a.id !== alert.id ? [a] : shown.state === 'open' ? [] : [done])))
-      setNote({ kind: 'ok', text: t('admin.alert.acknowledged') })
+      // The row may go, its button with it: the focus goes to what is said.
+      setNote({ kind: 'ok', text: t('admin.alert.acknowledged'), focus: true })
     } catch (err) {
-      setNote({ kind: 'error', text: say(refusalOf(err, () => undefined).problem)! })
+      const changed = refusalCode(err) === 'ALERT_CHANGED'
+      // Gone: removed after its retention (or never this organisation's), not a platform that cannot.
+      const gone = refusalStatus(err) === 404
+      if (changed || gone) await read(shown)
+      setNote({ kind: 'error', text: gone ? t('admin.alert.gone') : say(refusalOf(err, () => undefined).problem)!, focus: true })
     } finally {
       setBusy(false)
     }
@@ -120,6 +142,10 @@ export const Alerts = () => {
     if (!a.extension) return a.scope === 'tenant' ? t('admin.alert.tenant') : '—'
     const user = users.find(u => u.extension === a.extension)
     return user ? `${a.extension} (${user.displayName ?? user.userId})` : a.extension
+  }
+  const byName = (id: string | undefined) => {
+    const user = id ? users.find(u => u.userId === id) : undefined
+    return user?.displayName ?? id ?? '—'
   }
   const cause = (a: AdminAlert) => {
     const key = paramKey(a)
@@ -172,7 +198,7 @@ export const Alerts = () => {
                   <td>{a.count > 1 ? t('admin.alert.repeated', { count: a.count, first: when.format(new Date(a.at)) }) : '1'}</td>
                   <td>
                     {a.acknowledgedAt ? (
-                      t('admin.alert.acknowledgedBy', { date: when.format(new Date(a.acknowledgedAt)), by: a.acknowledgedBy ?? '—' })
+                      t('admin.alert.acknowledgedBy', { date: when.format(new Date(a.acknowledgedAt)), by: byName(a.acknowledgedBy) })
                     ) : (
                       <button type="button" className="btn" onClick={() => void acknowledge(a)} disabled={busy} aria-label={t('admin.alert.acknowledgeOf', { cause: cause(a), when: when.format(new Date(a.lastAt)) })}>
                         {t('admin.alert.acknowledge')}
@@ -187,13 +213,16 @@ export const Alerts = () => {
       ) : (
         <p className="muted">{t('admin.alert.none')}</p>
       )}
-      {next ? (
-        <p>
+      <p className="actions actions-start">
+        {next ? (
           <button type="button" className="btn" onClick={more} disabled={busy}>
             {t('admin.alert.more')}
           </button>
-        </p>
-      ) : null}
+        ) : null}
+        <button type="button" className="btn" onClick={refresh} disabled={busy}>
+          {t('admin.alert.refresh')}
+        </button>
+      </p>
       <NoteLine note={note} />
     </Section>
   )

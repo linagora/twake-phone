@@ -1,15 +1,18 @@
-import { useCallback, useEffect, useState, type FormEvent } from 'react'
+import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react'
 import { TRUNK_CODECS, TRUNK_OUTBOUND_CLASSES, type Trunk, type TrunkNumberFormat, type TrunkStatus } from '@twake/telephony-client'
 import { TargetList } from '../../admin/TargetList.js'
 import { targetLabel, useTargets } from '../../admin/targets.js'
-import { CheckBox, CheckGroup, ConfirmDelete, NoteLine, ProblemSummary, Section, SelectField, TextField, useFocusLater, useProblem, type Note } from '../../admin/ui.js'
+import { CheckBox, CheckGroup, ConfirmDelete, NoteLine, ProblemSummary, Section, SelectField, TextField, useFocusLater, useProblem, useRefresh, type Note } from '../../admin/ui.js'
 import { TRUNK_FIELDS, checkTrunk, emptyTrunk, trunkForm, trunkRefusal, type Problems, type TrunkField, type TrunkForm } from '../../admin/validate.js'
 import { useGateway } from '../../gateway.js'
 import type { Key } from '../../i18n/index.js'
 import { useT } from '../../i18n/useT.js'
 
-/** How often the status of the trunks is read again while this screen is open (a registration takes a few seconds). */
-const STATUS_POLL_MS = 5_000
+/**
+ * How long after an answer the status of the trunks is read again while this screen is shown (a registration takes a
+ * few seconds); never in a hidden tab (useRefresh).
+ */
+export const STATUS_POLL_MS = 5_000
 const FORMATS: TrunkNumberFormat[] = ['e164', 'e164-no-plus', 'international-00', 'national']
 const statusOf = (err: unknown) => (err as { status?: unknown } | null)?.status
 
@@ -54,8 +57,14 @@ export const Trunks = () => {
   const [busy, setBusy] = useState(false)
   const [note, setNote] = useState<Note>(null)
 
+  // Only the answer to the last read is shown: one asked by the button never comes after a later one.
+  const asked = useRef(0)
   const readStatus = useCallback(() => {
-    client.getTrunkStatus().then(setStatus, () => setStatus({ available: false, items: [] }))
+    const n = ++asked.current
+    const show = (s: { available: boolean; items: TrunkStatus[] }) => {
+      if (n === asked.current) setStatus(s)
+    }
+    return client.getTrunkStatus().then(show, () => show({ available: false, items: [] }))
   }, [client])
   const load = useCallback(() => {
     client.listTrunks().then(
@@ -65,14 +74,10 @@ export const Trunks = () => {
         else setNote({ kind: 'error', text: t('admin.loadError') })
       }
     )
-    readStatus()
-  }, [client, readStatus, t])
+  }, [client, t])
   useEffect(load, [load])
-  useEffect(() => {
-    if (unavailable) return
-    const timer = setInterval(readStatus, STATUS_POLL_MS)
-    return () => clearInterval(timer)
-  }, [readStatus, unavailable])
+  // The state of the trunks: read at once, then again after each answer while shown.
+  useRefresh(readStatus, STATUS_POLL_MS, !unavailable, true)
 
   const set = <K extends keyof TrunkForm>(key: K) => (value: TrunkForm[K]) => setForm(f => ({ ...f, [key]: value }))
   const reset = () => {
@@ -96,6 +101,7 @@ export const Trunks = () => {
       setNote({ kind: 'ok', text: t('admin.trunk.saved', { id: saved.id }) })
       reset()
       load()
+      void readStatus()
     } catch (err) {
       const refusal = trunkRefusal(err)
       if (refusal.field === 'form') setNote({ kind: 'error', text: say(refusal.problem)! })
@@ -123,13 +129,15 @@ export const Trunks = () => {
     setBusy(true)
     try {
       await client.deleteTrunk(trunk.id)
-      setNote({ kind: 'ok', text: t('admin.trunk.deleted', { id: trunk.id }) })
+      // The row goes, its buttons with it: the focus goes to what is said.
+      setNote({ kind: 'ok', text: t('admin.trunk.deleted', { id: trunk.id }), focus: true })
       if (editing?.id === trunk.id) reset()
     } catch (err) {
-      setNote({ kind: 'error', text: say(trunkRefusal(err).problem)! })
+      setNote({ kind: 'error', text: say(trunkRefusal(err).problem)!, focus: true })
     } finally {
       setBusy(false)
       load()
+      void readStatus()
     }
   }
 
@@ -216,7 +224,7 @@ export const Trunks = () => {
           <p className="muted">{t('admin.trunk.none')}</p>
         )}
         <p>
-          <button type="button" className="btn" onClick={readStatus}>
+          <button type="button" className="btn" onClick={() => void readStatus()}>
             {t('admin.trunk.refresh')}
           </button>
         </p>
@@ -250,7 +258,7 @@ export const Trunks = () => {
             disabled={busy || form.removePassword}
             maxLength={64}
           />
-          {editing?.hasPassword ? <CheckBox id="trunk-remove-password" label={t('admin.trunk.removePassword')} checked={form.removePassword} onChange={set('removePassword')} disabled={busy} /> : null}
+          {editing?.hasPassword ? <CheckBox id="trunk-remove-password" label={t('admin.trunk.removePassword')} checked={form.removePassword} onChange={v => setForm(f => ({ ...f, removePassword: v, ...(v ? { password: '' } : {}) }))} disabled={busy} /> : null}
           <TextField id="trunk-realm" label={t('admin.trunk.realm')} hint={t('admin.trunk.realmHint')} value={form.realm} onChange={set('realm')} error={field('realm')} disabled={busy} maxLength={128} />
           <TextField id="trunk-registrar" label={t('admin.trunk.registrar')} hint={t('admin.trunk.registrarHint')} value={form.registrar} onChange={set('registrar')} error={field('registrar')} disabled={busy || form.auth !== 'register'} />
           <TextField id="trunk-registerExpires" label={t('admin.trunk.registerExpires')} hint={t('admin.trunk.registerExpiresHint')} inputMode="numeric" value={form.registerExpires} onChange={set('registerExpires')} error={field('registerExpires')} disabled={busy || form.auth !== 'register'} maxLength={4} />

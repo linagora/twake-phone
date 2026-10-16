@@ -268,10 +268,10 @@ export class MemoryStore implements Store {
       .map(a => structuredClone(a))
   }
 
-  async acknowledgeAlert(tenantId: string, id: string, by: string, at: string) {
+  async acknowledgeAlert(tenantId: string, id: string, by: string, at: string, seen: string) {
     const alert = this.alerts.find(a => a.tenantId === tenantId && a.id === id)
     if (!alert) return null
-    if (!alert.acknowledgedAt) Object.assign(alert, { acknowledgedAt: at, acknowledgedBy: by })
+    if (!alert.acknowledgedAt && Date.parse(alert.lastAt) === Date.parse(seen)) Object.assign(alert, { acknowledgedAt: at, acknowledgedBy: by })
     return structuredClone(alert)
   }
 

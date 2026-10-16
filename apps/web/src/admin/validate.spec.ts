@@ -5,11 +5,13 @@ import fr from '../i18n/fr.json'
 import { ADMIN_SECTIONS, adminSectionOf } from './sections.js'
 import {
   DID_FIELDS,
+  MAX_PROFILES,
   TRUNK_FIELDS,
   capsForm,
   checkCaps,
   checkDid,
   checkFraud,
+  checkGroup,
   checkProfile,
   checkTrunk,
   didRefusal,
@@ -17,8 +19,10 @@ import {
   emptyProfile,
   emptyTrunk,
   fraudForm,
+  groupRefusal,
   limitsRefusal,
   normaliseNumber,
+  parseMembers,
   profileRefusal,
   refusedField,
   reservedSuffixes,
@@ -46,6 +50,16 @@ describe('the trunk form (step 7)', () => {
     expect(normaliseNumber('01 99 00 01 00')).toBe('+33199000100')
     expect(normaliseNumber('0033 1 99 00 01 00')).toBe('+33199000100')
     expect(normaliseNumber('+44 20 7946 0123')).toBe('+442079460123')
+  })
+
+  it('leaves out the « (0) » of the business cards, and refuses a French number with a 0 after +33 (review 7 n°4)', () => {
+    expect(normaliseNumber('+33 (0)1 99 00 01 00')).toBe('+33199000100')
+    expect(normaliseNumber('0033 (0) 1 99 00 01 00')).toBe('+33199000100')
+    expect(normaliseNumber('+44 (0)20 7946 0123')).toBe('+442079460123')
+    expect(checkTrunk({ ...operator, defaultNumber: '+33 (0)1 99 00 01 00' }, { ids: [] }).input?.defaultNumber).toBe('+33199000100')
+    // Typed whole, without the parentheses: no French number is +330…, refused as the Gateway refuses it.
+    expect(checkTrunk({ ...operator, defaultNumber: '+330199000100' }, { ids: [] }).problems.defaultNumber?.key).toBe('admin.trunk.err.defaultNumber')
+    expect(checkDid({ ...emptyDid('operator'), id: 'x', first: '+330199000101', target: '101' }, { isNew: true, trunks: [{ id: 'operator' }], others: [] }).problems.first?.key).toBe('admin.did.err.number')
   })
 
   it('says what is wrong with an empty form, as the Gateway would, field by field', () => {
@@ -85,6 +99,9 @@ describe('the trunk form (step 7)', () => {
     // Removing it leaves a registering trunk without one: refused before anything is sent.
     expect(checkTrunk({ ...form, removePassword: true }, { current: kept, ids: [] }).problems.password?.key).toBe('admin.trunk.err.registerNeeds')
     expect(checkTrunk({ ...form, auth: 'ip', removePassword: true }, { current: kept, ids: [] }).input?.password).toBeNull()
+    // A password typed, then its removal asked (the field disabled, still holding it): removed, never sent (review 7 n°6).
+    expect(checkTrunk({ ...form, auth: 'ip', password: 'typed-then-removed', removePassword: true }, { current: kept, ids: [] }).input?.password).toBeNull()
+    expect(checkTrunk({ ...form, password: 'typed-then-removed', removePassword: true }, { current: kept, ids: [] }).problems.password?.key).toBe('admin.trunk.err.registerNeeds')
   })
 
   it('asks for the countries when international calls are allowed, and only then', () => {
@@ -170,6 +187,17 @@ describe('the caps, thresholds and profiles forms (step 7)', () => {
     expect(checkProfile({ ...emptyProfile(), id: 'Bad id' }, { isNew: true, ids: [] }).problems.id?.key).toBe('admin.rights.err.id')
   })
 
+  it('says there are as many profiles as there can be, before sending, and when the Gateway says so (review 7 n°14)', () => {
+    const ids = Array.from({ length: MAX_PROFILES }, (_, i) => `p${i}`)
+    expect(checkProfile({ ...emptyProfile(), id: 'one-more' }, { isNew: true, ids }).problems.form).toEqual({ key: 'admin.err.profileLimit', params: { max: 32 } })
+    // Changing one of them is no new one.
+    expect(checkProfile({ ...emptyProfile(), id: 'p3' }, { isNew: false, ids }).profile).toEqual({ id: 'p3', allowed: [] })
+    expect(profileRefusal(refused(400, 'PROFILE_LIMIT', 'profiles: at most 32'))).toEqual({ field: 'form', problem: { key: 'admin.err.profileLimit', params: { max: 32 } } })
+    // A setting changed by someone else meanwhile, and an alert repeated since it was shown: said as such.
+    expect(profileRefusal(refused(409, 'OUTBOUND_STALE', 'changed since')).problem.key).toBe('admin.err.stale')
+    expect(limitsRefusal(refused(409, 'OUTBOUND_STALE', 'changed since')).problem.key).toBe('admin.err.stale')
+  })
+
   it("puts the Gateway's refusals of the outbound setting on their field", () => {
     expect(limitsRefusal(refused(400, 'OUTBOUND_INVALID', 'policy.caps.concurrent: a whole number from 1 to 1000000')).field).toBe('tenant-concurrent')
     expect(limitsRefusal(refused(400, 'OUTBOUND_INVALID', 'policy.userCaps.dailyMinutes: a whole number')).field).toBe('user-dailyMinutes')
@@ -178,6 +206,32 @@ describe('the caps, thresholds and profiles forms (step 7)', () => {
     expect(profileRefusal(refused(400, 'OUTBOUND_INVALID', 'profile interne: caps.dailyMinutes: a whole number')).field).toBe('dailyMinutes')
     expect(profileRefusal(refused(400, 'OUTBOUND_INVALID', 'profile interne: name, 64 characters at most, on one line')).field).toBe('name')
     expect(profileRefusal(refused(502, 'OUTBOUND_RELOAD_FAILED', 'x')).problem.key).toBe('admin.err.reloadFailed')
+  })
+})
+
+describe('the ring group form (review 7 n°7)', () => {
+  it('reads the members as typed, in order, each once', () => {
+    expect(parseMembers(' 101, 102 ;103\n101 ')).toEqual(['101', '102', '103'])
+    expect(parseMembers('  ')).toEqual([])
+  })
+
+  it('checks what the Gateway checks before sending, field by field', () => {
+    expect(checkGroup({ number: '200', name: ' Accueil ', members: '101, 102' })).toEqual({ problems: {}, group: { number: '200', name: 'Accueil', members: ['101', '102'] } })
+    const keys = (f: Parameters<typeof checkGroup>[0]) => Object.fromEntries(Object.entries(checkGroup(f).problems).map(([k, v]) => [k, v.key]))
+    expect(keys({ number: '', name: '', members: '' })).toEqual({ number: 'admin.groupNumberInvalid', name: 'admin.groupNameInvalid', members: 'admin.groupMembersInvalid' })
+    expect(keys({ number: '0200', name: 'x'.repeat(65), members: '101' })).toEqual({ number: 'admin.groupNumberInvalid', name: 'admin.groupNameInvalid' })
+    expect(keys({ number: '112', name: 'Accueil', members: '101' })).toEqual({ number: 'admin.groupNumberReserved' })
+    expect(keys({ number: '200', name: 'Accueil', members: Array.from({ length: 13 }, (_, i) => String(101 + i)).join(',') })).toEqual({ members: 'admin.groupMembersInvalid' })
+    expect(checkGroup({ number: '200', name: 'Accueil', members: '101, 0102, alice' }).problems.members).toEqual({ key: 'admin.group.err.memberFormat', params: { members: '0102, alice' } })
+  })
+
+  it("puts the Gateway's refusals on the field they are about", () => {
+    expect(groupRefusal(refused(409, 'GROUP_NUMBER_TAKEN', '102 is an extension'))).toEqual({ field: 'number', problem: { key: 'admin.groupNumberTaken' } })
+    expect(groupRefusal(refused(409, 'GROUP_EXISTS', 'exists'))).toEqual({ field: 'number', problem: { key: 'admin.groupExists' } })
+    expect(groupRefusal(refused(400, 'GROUP_NUMBER_RESERVED', 'x')).field).toBe('number')
+    expect(groupRefusal(refused(400, 'GROUP_NAME', 'x')).field).toBe('name')
+    expect(groupRefusal(refused(400, 'GROUP_MEMBER_NOT_EXTENSION', 'x'))).toEqual({ field: 'members', problem: { key: 'admin.groupMemberNotExtension' } })
+    expect(groupRefusal(refused(503, 'SYNC_RUNNING', 'x'))).toEqual({ field: 'form', problem: { key: 'admin.groupSyncRunning' } })
   })
 })
 

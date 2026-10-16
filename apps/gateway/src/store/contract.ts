@@ -270,16 +270,21 @@ export const storeContract = (name: string, make: () => Promise<Store>) =>
       const s = await make()
       const alert = { kind: 'rights' as const, param: 'international', scope: 'user' as const, extension: '101', number: '+442079460123' }
       await s.addAlert({ tenantId: 'A', at: '2026-10-16T10:00:00.000Z', alert })
+      const [seen] = await s.listAlerts('A')
+      expect(seen).not.toHaveProperty('acknowledgedAt')
+      // Repeated after the administrator saw it: not acknowledged, the repeat stays in view (review 7, n°2).
       await s.addAlert({ tenantId: 'A', at: '2026-10-16T10:05:00.000Z', alert })
-      const [open] = await s.listAlerts('A')
-      expect(open).not.toHaveProperty('acknowledgedAt')
+      const stale = await s.acknowledgeAlert('A', seen!.id, 'root', '2026-10-16T10:06:00.000Z', seen!.lastAt)
+      expect(stale).toMatchObject({ id: seen!.id, count: 2, lastAt: '2026-10-16T10:05:00.000Z' })
+      expect(stale).not.toHaveProperty('acknowledgedAt')
+      const [open] = await s.listAlerts('A', { state: 'open' })
       // Another tenant, an id of none, an id that is no number: nothing.
-      expect(await s.acknowledgeAlert('B', open!.id, 'root', '2026-10-16T10:06:00.000Z')).toBeNull()
-      expect(await s.acknowledgeAlert('A', '999999', 'root', '2026-10-16T10:06:00.000Z')).toBeNull()
-      expect(await s.acknowledgeAlert('A', 'x1', 'root', '2026-10-16T10:06:00.000Z')).toBeNull()
-      expect(await s.acknowledgeAlert('A', open!.id, 'root', '2026-10-16T10:06:00.000Z')).toMatchObject({ id: open!.id, count: 2, acknowledgedAt: '2026-10-16T10:06:00.000Z', acknowledgedBy: 'root' })
+      expect(await s.acknowledgeAlert('B', open!.id, 'root', '2026-10-16T10:06:00.000Z', open!.lastAt)).toBeNull()
+      expect(await s.acknowledgeAlert('A', '999999', 'root', '2026-10-16T10:06:00.000Z', open!.lastAt)).toBeNull()
+      expect(await s.acknowledgeAlert('A', 'x1', 'root', '2026-10-16T10:06:00.000Z', open!.lastAt)).toBeNull()
+      expect(await s.acknowledgeAlert('A', open!.id, 'root', '2026-10-16T10:06:00.000Z', open!.lastAt)).toMatchObject({ id: open!.id, count: 2, acknowledgedAt: '2026-10-16T10:06:00.000Z', acknowledgedBy: 'root' })
       // Acknowledged again by someone else: the first acknowledgement stays.
-      expect(await s.acknowledgeAlert('A', open!.id, 'other', '2026-10-16T10:07:00.000Z')).toMatchObject({ acknowledgedAt: '2026-10-16T10:06:00.000Z', acknowledgedBy: 'root' })
+      expect(await s.acknowledgeAlert('A', open!.id, 'other', '2026-10-16T10:07:00.000Z', open!.lastAt)).toMatchObject({ acknowledgedAt: '2026-10-16T10:06:00.000Z', acknowledgedBy: 'root' })
       // Within the hour, the same alert again: a new one, not counted in the acknowledged one.
       await s.addAlert({ tenantId: 'A', at: '2026-10-16T10:10:00.000Z', alert })
       await s.addAlert({ tenantId: 'A', at: '2026-10-16T10:11:00.000Z', alert })

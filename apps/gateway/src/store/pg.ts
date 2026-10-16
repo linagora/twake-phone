@@ -421,13 +421,16 @@ export class PgStore implements Store {
     return rows.map(alertOf)
   }
 
-  async acknowledgeAlert(tenantId: string, id: string, by: string, at: string) {
+  async acknowledgeAlert(tenantId: string, id: string, by: string, at: string, seen: string) {
     if (!/^[1-9][0-9]{0,17}$/.test(id)) return null
-    // The first acknowledgement stays: who did it, and when.
+    // The first acknowledgement stays: who did it, and when. Only as it was seen: a repeat counted since (its row
+    // locked by this update, or updated before it) leaves it open. Times to the millisecond, as they are shown.
     const { rows } = await this.pool.query<AlertRow>(
-      `UPDATE telephony_alerts SET acknowledged_at = coalesce(acknowledged_at, $3::timestamptz), acknowledged_by = coalesce(acknowledged_by, $4)
+      `UPDATE telephony_alerts SET
+         acknowledged_at = coalesce(acknowledged_at, CASE WHEN date_trunc('milliseconds', last_at) = $5::timestamptz THEN $3::timestamptz END),
+         acknowledged_by = coalesce(acknowledged_by, CASE WHEN date_trunc('milliseconds', last_at) = $5::timestamptz THEN $4 END)
        WHERE tenant_id = $1 AND id = $2::bigint RETURNING ${ALERT_COLUMNS}`,
-      [tenantId, id, at, by]
+      [tenantId, id, at, by, seen]
     )
     return rows[0] ? alertOf(rows[0]) : null
   }

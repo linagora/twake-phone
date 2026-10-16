@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useState, type FormEvent } from 'react'
 import { OUTBOUND_CAPS, TRUNK_OUTBOUND_CLASSES, type AdminUser, type OutboundProfile, type OutboundSettings } from '@twake/telephony-client'
 import { CapFields } from '../../admin/CapFields.js'
-import { CheckGroup, ConfirmDelete, NoteLine, ProblemSummary, Section, SelectField, TextField, useFocusLater, useProblem, type Note } from '../../admin/ui.js'
-import { PROFILE_FIELDS, checkProfile, emptyProfile, profileForm, profileRefusal, refusalOf, type ProfileField, type ProfileForm, type Problems } from '../../admin/validate.js'
+import { CheckGroup, ConfirmDelete, NoteLine, useLatest, ProblemSummary, Section, SelectField, TextField, useFocusLater, useProblem, type Note } from '../../admin/ui.js'
+import { PROFILE_FIELDS, checkProfile, emptyProfile, profileForm, profileRefusal, refusalCode, refusalOf, type ProfileField, type ProfileForm, type Problems } from '../../admin/validate.js'
 import { useGateway } from '../../gateway.js'
 import type { Key } from '../../i18n/index.js'
 import { useT } from '../../i18n/useT.js'
@@ -20,6 +20,7 @@ export const Rights = () => {
   const say = useProblem()
   const focusLater = useFocusLater()
   const { client } = useGateway()
+  const words = useLatest(t)
   const [settings, setSettings] = useState<OutboundSettings | null>(null)
   const [users, setUsers] = useState<AdminUser[]>([])
   const [unavailable, setUnavailable] = useState(false)
@@ -40,13 +41,13 @@ export const Rights = () => {
   const load = useCallback(() => {
     client.getOutbound().then(show, (err: unknown) => {
       if (statusOf(err) === 501 || statusOf(err) === 404) setUnavailable(true)
-      else setNote({ kind: 'error', text: t('admin.loadError') })
+      else setNote({ kind: 'error', text: words.current('admin.loadError') })
     })
     client.listAdminUsers().then(
       r => setUsers(r.items),
       () => setUsers([])
     )
-  }, [client, show, t])
+  }, [client, show, words])
   useEffect(load, [load])
 
   const reset = () => {
@@ -55,11 +56,19 @@ export const Rights = () => {
     setProblems({})
   }
 
-  /** Sends the whole setting with `change` made to it. */
+  /**
+   * Sends the whole setting with `change` made to it, with the version read: refused (OUTBOUND_STALE) when another
+   * administrator changed it since, never undoing what they did (review 7 n°1).
+   */
   const send = async (change: (s: OutboundSettings) => Pick<OutboundSettings, 'policy' | 'profiles' | 'assignments'>) => {
-    const next = await client.setOutbound(change(settings!))
+    const { policy, profiles, assignments } = change(settings!)
+    const next = await client.setOutbound({ policy, profiles, assignments, version: settings!.version })
     show(next)
     return next
+  }
+  /** After a refusal for a setting changed meanwhile: read again what it is now (the page says so). */
+  const stale = (err: unknown) => {
+    if (refusalCode(err) === 'OUTBOUND_STALE') load()
   }
 
   const save = async (e: FormEvent) => {
@@ -69,6 +78,8 @@ export const Rights = () => {
     const checked = checkProfile(form, { isNew: !editing, ids: settings.profiles.map(x => x.id) })
     setProblems(checked.problems)
     if (!checked.profile) {
+      // One profile too many is no field's problem: said for the form.
+      if (checked.problems.form) setNote({ kind: 'error', text: say(checked.problems.form)! })
       focusLater(PROFILE_FIELDS, checked.problems, 'profile')
       return
     }
@@ -79,6 +90,7 @@ export const Rights = () => {
       setNote({ kind: 'ok', text: t('admin.rights.saved', { id: profile.id }) })
       reset()
     } catch (err) {
+      stale(err)
       const refusal = profileRefusal(err)
       if (refusal.field === 'form') setNote({ kind: 'error', text: say(refusal.problem)! })
       else {
@@ -108,10 +120,12 @@ export const Rights = () => {
         const { defaultProfile: def, ...policy } = s.policy
         return { policy: def === profile.id ? policy : s.policy, profiles: s.profiles.filter(x => x.id !== profile.id), assignments: s.assignments.filter(a => a.profileId !== profile.id) }
       })
-      setNote({ kind: 'ok', text: t('admin.rights.deleted', { id: profile.id }) })
+      // The row goes, its buttons with it: the focus goes to what is said.
+      setNote({ kind: 'ok', text: t('admin.rights.deleted', { id: profile.id }), focus: true })
       if (editing?.id === profile.id) reset()
     } catch (err) {
-      setNote({ kind: 'error', text: say(refusalOf(err, () => undefined).problem)! })
+      stale(err)
+      setNote({ kind: 'error', text: say(refusalOf(err, () => undefined).problem)!, focus: true })
     } finally {
       setBusy(false)
     }
@@ -128,6 +142,7 @@ export const Rights = () => {
       })
       setNote({ kind: 'ok', text: t('admin.rights.defaultSaved') })
     } catch (err) {
+      stale(err)
       setNote({ kind: 'error', text: say(refusalOf(err, () => undefined).problem)! })
     } finally {
       setBusy(false)
@@ -139,8 +154,9 @@ export const Rights = () => {
     setBusy(true)
     const profileId = chosen[user.userId] || null
     try {
-      await client.setUserProfile(user.userId, profileId)
-      setSettings(s => (s ? { ...s, assignments: [...s.assignments.filter(a => a.userId !== user.userId), ...(profileId ? [{ userId: user.userId, profileId }] : [])] } : s))
+      const { version } = await client.setUserProfile(user.userId, profileId)
+      // The setting as it is now: this change made, and its version (the next whole change is sent with it).
+      setSettings(s => (s ? { ...s, version, assignments: [...s.assignments.filter(a => a.userId !== user.userId), ...(profileId ? [{ userId: user.userId, profileId }] : [])] } : s))
       setPeopleNote({ kind: 'ok', text: t('admin.rights.assigned', { name: user.displayName ?? user.userId }) })
     } catch (err) {
       setPeopleNote({ kind: 'error', text: say(refusalOf(err, () => undefined).problem)! })
@@ -164,13 +180,16 @@ export const Rights = () => {
 
   const classLabel = (c: string) => t(`admin.class.${c}` as Key)
   const profileName = (pr: OutboundProfile) => (pr.name ? `${pr.name} (${pr.id})` : pr.id)
-  const options = [{ value: NONE, label: t('admin.rights.noProfile') }, ...settings.profiles.map(pr => ({ value: pr.id, label: profileName(pr) }))]
+  const profileOptions = settings.profiles.map(pr => ({ value: pr.id, label: profileName(pr) }))
+  // A person without a profile has the default one; the default one, when none, is what the trunks allow.
+  const options = [{ value: NONE, label: t('admin.rights.noProfile') }, ...profileOptions]
+  const defaultOptions = [{ value: NONE, label: t('admin.rights.defaultNone') }, ...profileOptions]
   const assigned = (userId: string) => settings.assignments.find(a => a.userId === userId)?.profileId ?? NONE
   const capsText = (pr: OutboundProfile) =>
     OUTBOUND_CAPS.filter(k => pr.caps?.[k] !== undefined)
       .map(k => `${t(`admin.cap.${k}` as Key)} : ${pr.caps![k] === null ? t('admin.cap.none') : pr.caps![k]}`)
       .join(' · ')
-  const count = Object.keys(problems).length
+  const count = Object.keys(problems).filter(k => k !== 'form').length
   return (
     <>
       <Section id="rights" title={t('admin.nav.rights')}>
@@ -212,7 +231,7 @@ export const Rights = () => {
           <p className="muted">{t('admin.rights.none')}</p>
         )}
         <form onSubmit={e => void saveDefault(e)} className="inline-form">
-          <SelectField id="rights-default" label={t('admin.rights.default')} hint={t('admin.rights.defaultHint')} value={defaultProfile} onChange={setDefaultProfile} options={options} disabled={busy} />
+          <SelectField id="rights-default" label={t('admin.rights.default')} hint={t('admin.rights.defaultHint')} value={defaultProfile} onChange={setDefaultProfile} options={defaultOptions} disabled={busy} />
           <button type="submit" className="btn" disabled={busy}>
             {t('admin.rights.defaultSave')}
           </button>

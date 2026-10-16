@@ -251,6 +251,7 @@
   "admin.groupNameInvalid": "Le nom doit tenir sur une ligne, de 1 à 64 caractères.",
   "admin.groupMembersInvalid": "Un groupe a de 1 à 12 membres.",
   "admin.groupMemberNotExtension": "Seuls les postes de votre organisation peuvent être membres d'un groupe.",
+  "admin.group.err.memberFormat": "Les membres sont des postes de 2 à 6 chiffres, le premier n'étant pas 0 : {members} n'en est pas.",
   "admin.groupSyncRunning": "Une synchronisation de l'annuaire est en cours : réessayez dans un instant.",
   "call.endedAnsweredElsewhere": "Appel de {who} pris sur un autre poste.",
   "settings.notifications": "Notifications d'appel",
@@ -305,6 +306,8 @@
   "admin.err.trunkOtherTenant": "Ce nom de trunk est déjà utilisé sur la plateforme : choisissez-en un autre.",
   "admin.err.trunkLimit": "Le nombre maximal de trunks est atteint.",
   "admin.err.didLimit": "Le nombre maximal de plages de numéros directs est atteint.",
+  "admin.err.profileLimit": "{max} profils au plus : supprimez-en un avant d'en créer un autre.",
+  "admin.err.stale": "Un autre administrateur a modifié ces réglages depuis l'ouverture de la page : rien n'a été enregistré, et ce qu'ils sont maintenant vient d'être relu. Vérifiez puis recommencez.",
   "admin.err.targetUnknown": "Ce numéro n'est ni un poste attribué ni un groupe d'appel de votre organisation.",
   "admin.class.fixed": "Fixes en métropole",
   "admin.class.mobile": "Mobiles",
@@ -473,6 +476,7 @@
   "admin.rights.defaultSave": "Enregistrer le profil par défaut",
   "admin.rights.defaultSaved": "Profil par défaut enregistré.",
   "admin.rights.noProfile": "Profil par défaut",
+  "admin.rights.defaultNone": "Aucun : ce que le trunk permet",
   "admin.rights.people": "Profil de chaque personne",
   "admin.rights.peopleHelp": "Les personnes qui ont un poste. Choisissez un profil, puis appliquez-le.",
   "admin.rights.nobody": "Aucune personne n'a de poste pour l'instant.",
@@ -550,6 +554,9 @@
   "admin.alert.acknowledge": "Acquitter",
   "admin.alert.acknowledgeOf": "Acquitter l'alerte {cause} du {when}",
   "admin.alert.acknowledged": "Alerte acquittée.",
+  "admin.alert.changed": "Cette alerte s'est répétée depuis son affichage : elle n'a pas été acquittée. La liste vient d'être relue : regardez la répétition avant d'acquitter.",
+  "admin.alert.gone": "Cette alerte n'existe plus (supprimée au bout de sa durée de conservation) : la liste vient d'être relue.",
   "admin.alert.acknowledgedBy": "Acquittée le {date} par {by}",
-  "admin.alert.more": "Afficher plus d'alertes"
+  "admin.alert.more": "Afficher plus d'alertes",
+  "admin.alert.refresh": "Relire les alertes"
 }

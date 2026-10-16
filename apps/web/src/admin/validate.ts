@@ -35,7 +35,8 @@ export type Problems<F extends string> = Partial<Record<F, Problem>>
 const p = (key: Key, params?: Record<string, string | number>): Problem => (params ? { key, params } : { key })
 
 export const SLUG = /^[a-z0-9][a-z0-9-]{0,31}$/
-const E164 = /^\+[1-9][0-9]{6,14}$/
+// No French number has a 0 after +33: « +33 (0)1 … » of the business cards, kept whole, is a wrong one (as the Gateway).
+const E164 = /^\+(?!330)[1-9][0-9]{6,14}$/
 const HOST = /^(?=.{1,253}$)[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$/
 const IPV4 = /^(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}$/
 const SIP_USER = /^[A-Za-z0-9._+-]{1,64}$/
@@ -57,11 +58,13 @@ const hostPort = (value: string) => {
 export const splitList = (text: string) => text.split(/[\s,;]+/).filter(Boolean)
 
 /**
- * A number as an administrator may type it (`01 99 00 01 00`, `+33 1 99…`, `0033…`), in E.164 when it reads as one;
- * otherwise what was typed, without its spaces (the check says what is wrong).
+ * A number as an administrator may type it (`01 99 00 01 00`, `+33 1 99…`, `0033…`, `+33 (0)1 99…`), in E.164 when it
+ * reads as one; otherwise what was typed, without its spaces (the check says what is wrong). The « (0) » after a
+ * country code is the trunk prefix of the national form: never dialled from abroad, so left out.
  */
 export const normaliseNumber = (text: string): string => {
-  const compact = text.replace(/[\s.()-]/g, '')
+  const international = /^\s*(\+|00)/.test(text)
+  const compact = (international ? text.replace(/\(\s*0\s*\)/g, '') : text).replace(/[\s.()-]/g, '')
   if (/^00[1-9]/.test(compact)) return `+${compact.slice(2)}`
   if (/^0[1-9][0-9]{8}$/.test(compact)) return `+33${compact.slice(1)}`
   return compact
@@ -180,8 +183,8 @@ export const checkTrunk = (f: TrunkForm, ctx: { current?: Trunk; ids: readonly s
   const expires = f.registerExpires.trim()
   if (expires && !wholeNumber(expires, 60, 3600)) problems.registerExpires = p('admin.trunk.err.registerExpires')
   if (!f.codecs.length) problems.codecs = p('admin.trunk.err.codecs')
-  // A new password, none (removed), or the one kept.
-  const typed = f.password
+  // A new password, none (removed), or the one kept. Removal asked wins over what the field (then disabled) still holds.
+  const typed = f.removePassword ? '' : f.password
   if (typed && (typed.length > 64 || CONTROL.test(typed))) problems.password = p('admin.trunk.err.password')
   const willHavePassword = typed ? true : f.removePassword ? false : !!ctx.current?.hasPassword
   if (f.auth === 'register' && !username) problems.username ??= p('admin.trunk.err.registerNeeds')
@@ -386,8 +389,12 @@ export const PROFILE_FIELDS: ProfileField[] = ['id', 'name', 'allowed', ...OUTBO
 export const emptyProfile = (): ProfileForm => ({ id: '', name: '', allowed: [], caps: capsForm(undefined) })
 export const profileForm = (pr: OutboundProfile): ProfileForm => ({ id: pr.id, name: pr.name ?? '', allowed: [...pr.allowed], caps: capsForm(pr.caps) })
 
+/** Rights profiles of an organisation at most (MAX_PROFILES of the Gateway). */
+export const MAX_PROFILES = 32
+
 export const checkProfile = (f: ProfileForm, ctx: { isNew: boolean; ids: readonly string[] }): { profile?: OutboundProfile; problems: Problems<ProfileField> } => {
   const problems: Problems<ProfileField> = {}
+  if (ctx.isNew && ctx.ids.length >= MAX_PROFILES) problems.form = p('admin.err.profileLimit', { max: MAX_PROFILES })
   const id = f.id.trim()
   if (!SLUG.test(id)) problems.id = p('admin.rights.err.id')
   else if (ctx.isNew && ctx.ids.includes(id)) problems.id = p('admin.rights.err.idTaken')
@@ -418,8 +425,18 @@ const GENERAL: Record<string, Key> = {
   TRUNK_RELOAD_FAILED: 'admin.err.reloadFailed',
   OUTBOUND_RELOAD_FAILED: 'admin.err.reloadFailed',
   TRUNK_LIMIT: 'admin.err.trunkLimit',
-  DID_LIMIT: 'admin.err.didLimit'
+  DID_LIMIT: 'admin.err.didLimit',
+  PROFILE_LIMIT: 'admin.err.profileLimit',
+  OUTBOUND_STALE: 'admin.err.stale',
+  ALERT_CHANGED: 'admin.alert.changed'
 }
+
+/** The words of GENERAL that name a number. */
+const GENERAL_PARAMS: Record<string, Record<string, number>> = { PROFILE_LIMIT: { max: MAX_PROFILES } }
+
+/** The code of a refusal of the Gateway (`OUTBOUND_STALE`, `ALERT_CHANGED`…), or its status (404) when it has none. */
+export const refusalCode = (err: unknown) => refusalParts(err).code
+export const refusalStatus = (err: unknown) => refusalParts(err).status
 
 /**
  * A refusal of the Gateway in the administrator's words: on the field it names when the form has it (`fields`: the
@@ -427,7 +444,7 @@ const GENERAL: Record<string, Key> = {
  */
 export const refusalOf = <F extends string>(err: unknown, fields: (gatewayField: string, code: string | undefined, detail: string) => { field: F; problem: Problem } | undefined): { field: F | 'form'; problem: Problem } => {
   const { status, code, detail } = refusalParts(err)
-  if (code && GENERAL[code]) return { field: 'form', problem: p(GENERAL[code]) }
+  if (code && GENERAL[code]) return { field: 'form', problem: p(GENERAL[code], GENERAL_PARAMS[code]) }
   if (status === 400 || status === 409) {
     const named = refusedField(detail)
     const found = fields(named ?? '', code, detail)
@@ -485,5 +502,55 @@ export const didRefusal = (err: unknown) =>
     if (code === 'DID_RESERVED') return field === 'suffixDigits' ? { field: 'suffixDigits', problem: p('admin.did.err.suffixReservedServer') } : { field: 'target', problem: p('admin.did.err.targetReserved', { target: /^target: ([0-9]+) /.exec(detail)?.[1] ?? '' }) }
     if (field === 'first' || field === 'last') return { field, problem: p(field === 'last' ? 'admin.did.err.lastOrder' : 'admin.did.err.number') }
     if ((DID_FIELDS as string[]).includes(field)) return { field: field as DidField, problem: p(`admin.did.err.${field}` as Key) }
+    return undefined
+  })
+
+// ---------------------------------------------------------------------------------------------------------------
+// Ring groups
+
+export interface GroupForm {
+  number: string
+  name: string
+  members: string
+}
+export type GroupField = keyof GroupForm | 'form'
+export const GROUP_FIELDS: GroupField[] = ['number', 'name', 'members']
+/** Members of a group at most (GROUP_MEMBERS_MAX of the Gateway: the branches of a call of the SIP server). */
+export const GROUP_MEMBERS_MAX = 12
+
+export const emptyGroup = (): GroupForm => ({ number: '', name: '', members: '' })
+
+/** The members an administrator typed (`101, 102 103`): extensions in their order, each once. */
+export const parseMembers = (text: string): string[] => [...new Set(splitList(text))]
+
+/**
+ * The group as the Gateway takes it (POST /admin/groups, PUT /admin/groups/:number), or what is wrong (the Gateway
+ * checks the same, and whether the number is free and the members are extensions of the organisation).
+ */
+export const checkGroup = (f: GroupForm): { group?: { number: string; name: string; members: string[] }; problems: Problems<GroupField> } => {
+  const problems: Problems<GroupField> = {}
+  const number = f.number.trim()
+  if (!EXTENSION_FORMAT.test(number)) problems.number = p('admin.groupNumberInvalid')
+  else if (RESERVED_NUMBER.test(number)) problems.number = p('admin.groupNumberReserved')
+  const name = f.name.trim()
+  if (!name || name.length > 64 || CONTROL.test(name)) problems.name = p('admin.groupNameInvalid')
+  const members = parseMembers(f.members)
+  const wrong = members.filter(m => !EXTENSION_FORMAT.test(m))
+  if (!members.length || members.length > GROUP_MEMBERS_MAX) problems.members = p('admin.groupMembersInvalid')
+  else if (wrong.length) problems.members = p('admin.group.err.memberFormat', { members: wrong.join(', ') })
+  if (Object.keys(problems).length) return { problems }
+  return { problems, group: { number, name, members } }
+}
+
+/** The refusals of the ring group routes, on the field they are about. */
+export const groupRefusal = (err: unknown) =>
+  refusalOf<GroupField>(err, (_field, code) => {
+    if (code === 'GROUP_NUMBER') return { field: 'number', problem: p('admin.groupNumberInvalid') }
+    if (code === 'GROUP_NUMBER_TAKEN') return { field: 'number', problem: p('admin.groupNumberTaken') }
+    if (code === 'GROUP_NUMBER_RESERVED') return { field: 'number', problem: p('admin.groupNumberReserved') }
+    if (code === 'GROUP_EXISTS') return { field: 'number', problem: p('admin.groupExists') }
+    if (code === 'GROUP_NAME') return { field: 'name', problem: p('admin.groupNameInvalid') }
+    if (code === 'GROUP_MEMBERS') return { field: 'members', problem: p('admin.groupMembersInvalid') }
+    if (code === 'GROUP_MEMBER_NOT_EXTENSION') return { field: 'members', problem: p('admin.groupMemberNotExtension') }
     return undefined
   })

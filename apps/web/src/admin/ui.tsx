@@ -12,6 +12,30 @@ export const useProblem = () => {
   return useCallback((problem: Problem | undefined) => (problem ? t(problem.key, problem.params) : undefined), [t])
 }
 
+/**
+ * The error of a field, named `${id}-error` (its aria-describedby). The sign before it is drawn, not read: a screen
+ * reader says the error once, without "warning" before each one (review 7 n°15).
+ */
+export const FieldError = ({ id, error }: { id: string; error?: string | undefined }) =>
+  error ? (
+    <span id={`${id}-error`} className="field-error">
+      <span aria-hidden="true">⚠ </span>
+      {error}
+    </span>
+  ) : null
+
+/**
+ * The latest `value`, for the callbacks that read what a screen shows: a change of language changes the words, never
+ * what was read nor what is typed (a read that depended on them would start again, review 7 n°13).
+ */
+export const useLatest = <V,>(value: V) => {
+  const ref = useRef(value)
+  useEffect(() => {
+    ref.current = value
+  })
+  return ref
+}
+
 const describedBy = (...ids: (string | false | undefined)[]) => ids.filter(Boolean).join(' ') || undefined
 
 interface TextFieldProps {
@@ -57,11 +81,7 @@ export const TextField = ({ id, label, value, onChange, hint, error, type = 'tex
         {hint}
       </span>
     ) : null}
-    {error ? (
-      <span id={`${id}-error`} className="field-error">
-        {error}
-      </span>
-    ) : null}
+    <FieldError id={id} error={error} />
   </div>
 )
 
@@ -91,11 +111,7 @@ export const SelectField = ({ id, label, value, onChange, options, hint, error, 
         {hint}
       </span>
     ) : null}
-    {error ? (
-      <span id={`${id}-error`} className="field-error">
-        {error}
-      </span>
-    ) : null}
+    <FieldError id={id} error={error} />
   </div>
 )
 
@@ -122,11 +138,7 @@ export const CheckGroup = <V extends string>({ id, legend, values, chosen, label
         {hint}
       </span>
     ) : null}
-    {error ? (
-      <span id={`${id}-error`} className="field-error">
-        {error}
-      </span>
-    ) : null}
+    <FieldError id={id} error={error} />
   </fieldset>
 )
 
@@ -164,19 +176,70 @@ export const useFocusLater = () => {
   }, [])
 }
 
-/** What a form says after a send: a success (status) or a failure (alert), the second read at once. */
-export type Note = { kind: 'ok' | 'error'; text: string } | null
+/**
+ * What a form says after a send: a success (status) or a failure (alert), the second read at once. `focus`: the
+ * focus goes to it, when what had it is gone (a row deleted or acknowledged, its buttons with it).
+ */
+export type Note = { kind: 'ok' | 'error'; text: string; focus?: boolean } | null
 
-export const NoteLine = ({ note }: { note: Note }) =>
-  note?.kind === 'error' ? (
-    <p className="alert alert-error" role="alert">
+export const NoteLine = ({ note }: { note: Note }) => {
+  const ref = useRef<HTMLParagraphElement>(null)
+  useEffect(() => {
+    if (note?.focus) ref.current?.focus()
+  }, [note])
+  return note?.kind === 'error' ? (
+    <p ref={ref} className="alert alert-error" role="alert" tabIndex={-1}>
       {note.text}
     </p>
   ) : (
-    <p className="badge" role="status">
+    <p ref={ref} className="badge" role="status" tabIndex={-1}>
       {note?.text ?? ''}
     </p>
   )
+}
+
+/**
+ * Runs `read` again `everyMs` after each answer (never two at once, never out of order), while the page is shown: a
+ * hidden tab reads nothing, and reads at once when shown again (review 7 n°5). Stops when the screen goes away.
+ * `now`: the first read at once, else after `everyMs` (the screen read it already).
+ */
+export const useRefresh = (read: () => Promise<unknown>, everyMs: number, enabled = true, now = false) => {
+  // The latest `read` (what it reads may change, the timer goes on).
+  const latest = useLatest(read)
+  useEffect(() => {
+    if (!enabled) return
+    let live = true
+    let timer: ReturnType<typeof setTimeout> | undefined
+    let running = false
+    const next = () => {
+      clearTimeout(timer)
+      if (live && !document.hidden) timer = setTimeout(run, everyMs)
+    }
+    const run = () => {
+      if (running || !live || document.hidden) return
+      running = true
+      void latest
+        .current()
+        .catch(() => undefined)
+        .finally(() => {
+          running = false
+          next()
+        })
+    }
+    const shown = () => {
+      if (document.hidden) clearTimeout(timer)
+      else run()
+    }
+    if (now) run()
+    else next()
+    document.addEventListener('visibilitychange', shown)
+    return () => {
+      live = false
+      clearTimeout(timer)
+      document.removeEventListener('visibilitychange', shown)
+    }
+  }, [latest, everyMs, enabled, now])
+}
 
 /** A summary of the problems of a form, read at once (the focus goes to the first field in error). */
 export const ProblemSummary = ({ count }: { count: number }) => {
@@ -190,19 +253,37 @@ export const ProblemSummary = ({ count }: { count: number }) => {
 
 /**
  * A delete button that asks first: "Delete X?" then yes or no, in a group named by the question (the yes button gets
- * the focus, Escape or no puts it back on the delete button).
+ * the focus, Escape or no puts it back on the delete button; after yes, the page puts it on what it says).
  */
 export const ConfirmDelete = ({ label, question, onConfirm, disabled, yes = 'admin.confirm.yes', no = 'admin.confirm.no' }: { label: string; question: string; onConfirm: () => void; disabled?: boolean; yes?: Key; no?: Key }) => {
   const { t } = useT()
   const [asking, setAsking] = useState(false)
+  const button = useRef<HTMLButtonElement>(null)
+  const back = useRef(false)
+  useEffect(() => {
+    if (asking || !back.current) return
+    back.current = false
+    button.current?.focus()
+  }, [asking])
+  const keep = () => {
+    back.current = true
+    setAsking(false)
+  }
   if (!asking)
     return (
-      <button type="button" className="btn btn-danger" onClick={() => setAsking(true)} disabled={disabled} aria-label={label}>
+      <button ref={button} type="button" className="btn btn-danger" onClick={() => setAsking(true)} disabled={disabled} aria-label={label}>
         {t('admin.delete')}
       </button>
     )
   return (
-    <span role="group" aria-label={question} className="confirm" onKeyDown={e => e.key === 'Escape' && setAsking(false)}>
+    <span
+      role="group"
+      aria-label={question}
+      className="confirm"
+      onKeyDown={e => {
+        if (e.key === 'Escape') keep()
+      }}
+    >
       {question}{' '}
       <button
         type="button"
@@ -216,7 +297,7 @@ export const ConfirmDelete = ({ label, question, onConfirm, disabled, yes = 'adm
       >
         {t(yes)}
       </button>{' '}
-      <button type="button" className="btn" onClick={() => setAsking(false)} disabled={disabled}>
+      <button type="button" className="btn" onClick={keep} disabled={disabled}>
         {t(no)}
       </button>
     </span>

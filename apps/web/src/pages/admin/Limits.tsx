@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useState, type FormEvent } from 'react'
 import { FRAUD_PARAMS, type FraudRule, type OutboundSettings } from '@twake/telephony-client'
 import { CapFields } from '../../admin/CapFields.js'
-import { NoteLine, ProblemSummary, Section, useFocusLater, useProblem, type Note } from '../../admin/ui.js'
-import { LIMITS_FIELDS, capsForm, checkCaps, checkFraud, fraudForm, limitsRefusal, type CapsForm, type FraudForm, type FraudParam, type LimitsField, type Problem, type ThresholdForm } from '../../admin/validate.js'
+import { FieldError, NoteLine, useLatest, ProblemSummary, Section, useFocusLater, useProblem, type Note } from '../../admin/ui.js'
+import { LIMITS_FIELDS, capsForm, checkCaps, checkFraud, fraudForm, limitsRefusal, refusalCode, type CapsForm, type FraudForm, type FraudParam, type LimitsField, type Problem, type ThresholdForm } from '../../admin/validate.js'
 import { useGateway } from '../../gateway.js'
 import type { Key } from '../../i18n/index.js'
 import { useT } from '../../i18n/useT.js'
@@ -81,11 +81,7 @@ const FraudFields = ({ zone, form, defaults, problems, onChange, disabled }: { z
                 />
               </span>
             ) : null}
-            {error ? (
-              <span id={`${id}-error`} className="field-error">
-                {error}
-              </span>
-            ) : null}
+            <FieldError id={id} error={error} />
           </div>
         )
       })}
@@ -102,6 +98,7 @@ export const Limits = () => {
   const say = useProblem()
   const focusLater = useFocusLater()
   const { client } = useGateway()
+  const words = useLatest(t)
   const [settings, setSettings] = useState<OutboundSettings | null>(null)
   const [form, setForm] = useState<LimitsForm | null>(null)
   const [unavailable, setUnavailable] = useState(false)
@@ -113,12 +110,13 @@ export const Limits = () => {
     setSettings(s)
     setForm(limitsForm(s))
   }, [])
-  useEffect(() => {
+  const read = useCallback(() => {
     client.getOutbound().then(show, (err: unknown) => {
       if (statusOf(err) === 501 || statusOf(err) === 404) setUnavailable(true)
-      else setNote({ kind: 'error', text: t('admin.loadError') })
+      else setNote({ kind: 'error', text: words.current('admin.loadError') })
     })
-  }, [client, show, t])
+  }, [client, show, words])
+  useEffect(read, [read])
 
   const save = async (e: FormEvent) => {
     e.preventDefault()
@@ -150,9 +148,15 @@ export const Limits = () => {
     }
     setBusy(true)
     try {
-      show(await client.setOutbound({ policy, profiles: settings.profiles, assignments: settings.assignments }))
+      // With the version read: refused when another administrator changed the setting since (review 7 n°1).
+      show(await client.setOutbound({ policy, profiles: settings.profiles, assignments: settings.assignments, version: settings.version }))
       setNote({ kind: 'ok', text: t('admin.limits.saved') })
     } catch (err) {
+      // Changed meanwhile: what it is now is shown again, to be checked before saving (the note says so).
+      if (refusalCode(err) === 'OUTBOUND_STALE') {
+        setProblems({})
+        read()
+      }
       const refusal = limitsRefusal(err)
       if (refusal.field === 'form') setNote({ kind: 'error', text: say(refusal.problem)! })
       else {

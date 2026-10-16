@@ -144,7 +144,7 @@ describe('outbound routes', () => {
     expect(handed.at(-1)).toEqual([{ defaultProfile: 'internal', caps: { concurrent: 4 } }, [expect.objectContaining({ id: 'national', allowed: ['fixed', 'mobile'] }), { id: 'internal', allowed: [] }], [{ userId: 'alice', profileId: 'national' }]])
     expect((await store.getOutbound('A'))?.assignments).toEqual([{ userId: 'alice', profileId: 'national' }])
     // One person's profile, or back to the default one.
-    expect((await app.inject({ method: 'PUT', url: '/api/v1/admin/outbound/users/bob', headers: admin, payload: { profileId: 'national' } })).json()).toEqual({ userId: 'bob', profileId: 'national' })
+    expect((await app.inject({ method: 'PUT', url: '/api/v1/admin/outbound/users/bob', headers: admin, payload: { profileId: 'national' } })).json()).toEqual({ userId: 'bob', profileId: 'national', version: expect.any(String) })
     expect(handed.at(-1)![2]).toEqual([{ userId: 'alice', profileId: 'national' }, { userId: 'bob', profileId: 'national' }])
     expect((await app.inject({ method: 'PUT', url: '/api/v1/admin/outbound/users/alice', headers: admin, payload: { profileId: null } })).statusCode).toBe(200)
     expect((await store.getOutbound('A'))?.assignments).toEqual([{ userId: 'bob', profileId: 'national' }])
@@ -154,6 +154,40 @@ describe('outbound routes', () => {
     // A profile still given to someone cannot go.
     expect((await app.inject({ method: 'PUT', url: '/api/v1/admin/outbound', headers: admin, payload: { profiles: [profiles[1]], assignments: [{ userId: 'bob', profileId: 'national' }] } })).statusCode).toBe(400)
     expect((await app.inject({ url: '/api/v1/admin/outbound', headers: admin })).json()).toMatchObject({ policy: { defaultProfile: 'internal' }, assignments: [{ userId: 'bob', profileId: 'national' }] })
+  })
+
+  it('refuses a change sent with a version older than the setting (two administrators, review 7, n°1): 409, nothing changed', async () => {
+    const { app, admin, handed, store } = await setup()
+    const read = async () => (await app.inject({ url: '/api/v1/admin/outbound', headers: admin })).json()
+    const first = await read()
+    expect(first.version).toEqual(expect.any(String))
+    // Two screens read the same setting; the first one withdraws a right from Bob.
+    const put = await app.inject({ method: 'PUT', url: '/api/v1/admin/outbound', headers: admin, payload: { profiles, assignments: [{ userId: 'bob', profileId: 'internal' }], version: first.version } })
+    expect(put.statusCode).toBe(200)
+    expect(put.json().version).not.toBe(first.version)
+    expect(put.json().version).toBe((await read()).version)
+    const handedBefore = handed.length
+    // The second screen, opened before, sends a cap with what it read: refused, Bob keeps "internal".
+    const stale = await app.inject({ method: 'PUT', url: '/api/v1/admin/outbound', headers: admin, payload: { profiles: [], policy: { caps: { concurrent: 3 } }, assignments: [], version: first.version } })
+    expect(stale.statusCode).toBe(409)
+    expect(stale.json()).toMatchObject({ code: 'OUTBOUND_STALE' })
+    expect(handed.length).toBe(handedBefore)
+    expect((await store.getOutbound('A'))?.assignments).toEqual([{ userId: 'bob', profileId: 'internal' }])
+    // One person's profile changes the version too: the answer gives the new one, which a change can then carry.
+    const assigned = (await app.inject({ method: 'PUT', url: '/api/v1/admin/outbound/users/alice', headers: admin, payload: { profileId: 'national' } })).json()
+    const now = await read()
+    expect(assigned.version).toBe(now.version)
+    expect((await app.inject({ method: 'PUT', url: '/api/v1/admin/outbound', headers: admin, payload: { ...now, policy: { caps: { concurrent: 3 } }, version: put.json().version } })).statusCode).toBe(409)
+    expect((await app.inject({ method: 'PUT', url: '/api/v1/admin/outbound', headers: admin, payload: { ...now, policy: { caps: { concurrent: 3 } } } })).statusCode).toBe(200)
+    expect((await app.inject({ method: 'PUT', url: '/api/v1/admin/outbound', headers: admin, payload: { profiles, version: 7 } })).statusCode).toBe(400)
+  })
+
+  it('says how many profiles at most, with its own code (review 7, n°14)', async () => {
+    const { app, admin } = await setup()
+    const many = Array.from({ length: 33 }, (_, i) => ({ id: `p${i}`, allowed: [] }))
+    const res = await app.inject({ method: 'PUT', url: '/api/v1/admin/outbound', headers: admin, payload: { profiles: many } })
+    expect(res.statusCode).toBe(400)
+    expect(res.json()).toMatchObject({ code: 'PROFILE_LIMIT' })
   })
 
   it('keeps out whoever is not an administrator, each tenant to its own rules, and says 501 where they are not available', async () => {
@@ -266,18 +300,28 @@ describe('outbound routes', () => {
     const events: RoutedEvent[] = [{ extension: '101', event: { type: 'alert.raised', timestamp: '2026-10-16T10:00:00.000Z', payload: { alert: rights } } }]
     const { app, admin, as, store } = await setup({ events })
     await settle(async () => (await store.listAlerts('A')).length === 1)
-    const [open] = (await app.inject({ url: '/api/v1/admin/alerts', headers: admin })).json().items
-    expect(open).not.toHaveProperty('acknowledgedAt')
-    expect((await app.inject({ method: 'POST', url: `/api/v1/admin/alerts/${open.id}/acknowledge`, headers: as('bob') })).statusCode).toBe(403)
+    const [seen] = (await app.inject({ url: '/api/v1/admin/alerts', headers: admin })).json().items
+    expect(seen).not.toHaveProperty('acknowledgedAt')
+    const ack = (id: string, lastAt: unknown, headers = admin) => app.inject({ method: 'POST', url: `/api/v1/admin/alerts/${id}/acknowledge`, headers, payload: lastAt === undefined ? {} : { lastAt } })
+    expect((await ack(seen.id, seen.lastAt, as('bob'))).statusCode).toBe(403)
+    // Repeated between the list and the click (review 7, n°2): 409, still open, the repeat in view.
+    await store.addAlert({ tenantId: 'A', at: '2026-10-16T10:01:00.000Z', alert: rights })
+    const changed = await ack(seen.id, seen.lastAt)
+    expect(changed.statusCode).toBe(409)
+    expect(changed.json()).toMatchObject({ code: 'ALERT_CHANGED' })
+    const [open] = (await app.inject({ url: '/api/v1/admin/alerts?state=open', headers: admin })).json().items
+    expect(open).toMatchObject({ id: seen.id, count: 2, lastAt: '2026-10-16T10:01:00.000Z' })
+    // What was seen is said, as listed.
+    for (const bad of [undefined, 12, 'yesterday', '2026-10-16'])
+      expect((await ack(open.id, bad)).json(), String(bad)).toMatchObject({ statusCode: 400, code: 'ALERT_INVALID' })
     // Another tenant's administrator, an id of none, an id that is no number: not found.
-    expect((await app.inject({ method: 'POST', url: `/api/v1/admin/alerts/${open.id}/acknowledge`, headers: as('root', 'twakephone-admin', 'B') })).statusCode).toBe(404)
-    for (const id of ['999999', 'abc', '1%3B'])
-      expect((await app.inject({ method: 'POST', url: `/api/v1/admin/alerts/${id}/acknowledge`, headers: admin })).statusCode, id).toBe(404)
-    const acked = await app.inject({ method: 'POST', url: `/api/v1/admin/alerts/${open.id}/acknowledge`, headers: admin })
+    expect((await ack(open.id, open.lastAt, as('root', 'twakephone-admin', 'B'))).statusCode).toBe(404)
+    for (const id of ['999999', 'abc', '1%3B']) expect((await ack(id, open.lastAt)).statusCode, id).toBe(404)
+    const acked = await ack(open.id, open.lastAt)
     expect(acked.statusCode).toBe(200)
     expect(acked.json()).toMatchObject({ id: open.id, kind: 'rights', acknowledgedBy: 'root', acknowledgedAt: expect.stringMatching(/^\d{4}-/) })
     // Twice: the same, the first acknowledgement kept.
-    expect((await app.inject({ method: 'POST', url: `/api/v1/admin/alerts/${open.id}/acknowledge`, headers: as('carol', 'twakephone-admin') })).json().acknowledgedBy).toBe('root')
+    expect((await ack(open.id, open.lastAt, as('carol', 'twakephone-admin'))).json().acknowledgedBy).toBe('root')
     await store.addAlert({ tenantId: 'A', at: '2026-10-16T10:05:00.000Z', alert: rights })
     const states = async (q: string) => (await app.inject({ url: `/api/v1/admin/alerts${q}`, headers: admin })).json().items.map((a: { id: string; acknowledgedBy?: string }) => a.acknowledgedBy ?? 'open')
     expect(await states('')).toEqual(['open', 'root'])

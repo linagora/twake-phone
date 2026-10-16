@@ -7,7 +7,8 @@ import type { DidRecord, TrunkRecord } from './store/types.js'
 // what its SIP server reads.
 
 export const TRUNK_ID = /^[a-z0-9][a-z0-9-]{0,31}$/
-const E164 = /^\+[1-9][0-9]{6,14}$/
+// A French number written with its trunk prefix after +33 ("+33 (0)1 99...", review 7, n°4) is no number at all.
+const E164 = /^\+(?!330)[1-9][0-9]{6,14}$/
 /** A host name (labels of letters, digits and dashes). */
 const HOST = /^(?=.{1,253}$)[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$/
 // IPv4 only, as OpenSIPS's trunk socket (TRUNK_LISTEN_IP of entrypoint.sh): an IPv6 address could never reach it.
@@ -95,7 +96,7 @@ export const parseTrunk = (body: unknown, current?: Pick<TrunkRecord, 'passwordE
   if (allowed?.includes('international') && !countries) throw invalid('countries: the country codes international numbers may have are required with international')
   if (countries && !allowed?.includes('international')) throw invalid('countries: only with international in allowed')
   if (b.default !== undefined && typeof b.default !== 'boolean') throw invalid('default: true or false')
-  const defaultNumber = text(b, 'defaultNumber', v => E164.test(v), 'an E.164 number (+ then 7 to 15 digits)')
+  const defaultNumber = text(b, 'defaultNumber', v => E164.test(v), 'an E.164 number (+ then 7 to 15 digits, no 0 after +33)')
   if (!defaultNumber) throw invalid('defaultNumber: the number presented by those without a direct number is required')
   // Step 6b (FR-C8): who rings inside when a call to one of its direct numbers does not go through.
   const fallbackTarget = fallback(b)
@@ -163,9 +164,9 @@ export const parseDid = (id: string, body: unknown, trunks: readonly Pick<TrunkR
   if (!body || typeof body !== 'object' || Array.isArray(body)) throw invalid('a direct number is a JSON object')
   const b = body as Record<string, unknown>
   if (typeof b.trunkId !== 'string' || !trunks.some(t => t.id === b.trunkId)) throw invalid('trunkId: one of the trunks')
-  const first = text(b, 'first', v => E164.test(v), 'an E.164 number (+ then 7 to 15 digits)')
+  const first = text(b, 'first', v => E164.test(v), 'an E.164 number (+ then 7 to 15 digits, no 0 after +33)')
   if (!first) throw invalid('first: the (first) direct number is required')
-  const last = text(b, 'last', v => E164.test(v), 'an E.164 number (+ then 7 to 15 digits)') ?? first
+  const last = text(b, 'last', v => E164.test(v), 'an E.164 number (+ then 7 to 15 digits, no 0 after +33)') ?? first
   if (last.length !== first.length || last < first) throw invalid('last: a number of the same length, from first on')
   if (Number(last.slice(1)) - Number(first.slice(1)) + 1 > MAX_RANGE) throw invalid(`last: ${MAX_RANGE} numbers in a range at most`)
   // An extension or a group: the internal plan (2 to 6 digits, not 0 first), never a number that goes out.

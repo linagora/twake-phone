@@ -107,7 +107,6 @@ h3 { font-size: 1rem; margin: 12px 0 8px; }
 .subnav a { display: inline-flex; align-items: center; padding: 8px 12px; min-height: 44px; border: 1px solid var(--border); border-radius: var(--radius); text-decoration: none; color: var(--text); background: var(--surface); }
 .subnav a[aria-current="page"] { background: var(--accent); color: var(--accent-text); border-color: transparent; font-weight: 600; }
 .field-error { color: var(--danger); font-weight: 600; }
-.field-error::before { content: "⚠ "; }
 [aria-invalid="true"] { border-color: var(--danger); border-width: 2px; }
 .field legend { padding: 0 4px; }
 .checks { display: flex; flex-wrap: wrap; gap: 4px 16px; }

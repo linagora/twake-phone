@@ -183,6 +183,32 @@ describe('trunkStatusFrom', () => {
     expect(trunkStatusFrom(sets, ds('Weird'), undefined)[0]!.servers).toEqual([])
     expect(trunkStatusFrom(sets, null, null)).toEqual([{ id: 'operator', servers: [] }])
   })
+
+  it('reads what a real OpenSIPS 3.6 answers for a refused, a silent, a disabled and a registered trunk (review 7 n°10)', () => {
+    // Captured from OpenSIPS 3.6.9 (uac_registrant, dispatcher, MI over a datagram) with a registrar refusing every
+    // login, one that never answers, a registrant disabled in its table (state 1) and one accepted; servers: one
+    // answering OPTIONS, one never answering (state 2, probing), one disabled in the table (state 1). Only the
+    // addresses were replaced by documentation ones (RFC 5737, RFC 2606), nothing else of the answers.
+    const { reg_list: regList, ds_list: dsList } = JSON.parse(readFileSync(new URL('../test/opensips-3.6-trunk-status.json', import.meta.url), 'utf8')) as { reg_list: unknown; ds_list: unknown }
+    const trunk = (id: string, aor: string) => ({ id, setid: 1, aor })
+    const said = trunkStatusFrom(
+      [trunk('refused', 'sip:refused@operator.example'), trunk('silent', 'sip:silent@operator.example'), trunk('off', 'sip:off@operator.example'), trunk('good', 'sip:good@operator.example'), trunk('ip', '')],
+      dsList,
+      regList
+    )
+    expect(said.map(t => [t.id, t.registration?.state])).toEqual([
+      ['refused', 'refused'],
+      ['silent', 'timeout'],
+      ['off', 'disabled'],
+      ['good', 'registered'],
+      ['ip', undefined]
+    ])
+    expect(said[0]!.servers).toEqual([
+      { address: '192.0.2.20:5060', state: 'up' },
+      { address: '192.0.2.21:5060', state: 'probing' },
+      { address: '192.0.2.22:5060', state: 'disabled' }
+    ])
+  })
 })
 
 // Against a real PostgreSQL (TEST_DATABASE_URL): the SQL itself, and the queries of opensips.cfg.tpl on what it writes.

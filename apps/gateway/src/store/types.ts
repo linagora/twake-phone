@@ -269,10 +269,12 @@ export interface Store {
   /** The alerts of a tenant, the latest repeated first, `limit` at most (clamped as a page). */
   listAlerts(tenantId: string, query?: AlertQuery): Promise<StoredAlert[]>
   /**
-   * Marks an alert of the tenant acknowledged, by `by` at `at` (ISO): its repeats open a new one from then on. The
-   * alert as kept then (the first acknowledgement stays), null when the tenant has none of that id.
+   * Marks an alert of the tenant acknowledged, by `by` at `at` (ISO), if it is still as the administrator saw it: its
+   * last repeat at `seen` (ISO). Repeated since, it stays open (returned without `acknowledgedAt`: they look again).
+   * Its repeats open a new one once it is acknowledged. The alert as kept then (the first acknowledgement stays),
+   * null when the tenant has none of that id.
    */
-  acknowledgeAlert(tenantId: string, id: string, by: string, at: string): Promise<StoredAlert | null>
+  acknowledgeAlert(tenantId: string, id: string, by: string, at: string, seen: string): Promise<StoredAlert | null>
   /** Removes the alerts of every tenant whose last repeat is before `before` (ISO); how many. */
   purgeAlerts(before: string): Promise<number>
 
