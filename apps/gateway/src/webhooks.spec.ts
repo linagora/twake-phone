@@ -1,4 +1,5 @@
 import { randomBytes } from 'node:crypto'
+import pg from 'pg'
 import { afterEach, describe, expect, it } from 'vitest'
 import { encrypt } from './crypto.js'
 import { MemoryStore } from './store/memory.js'
@@ -244,8 +245,17 @@ describe('the webhook hub', () => {
 if (process.env.TEST_DATABASE_URL) {
   describe('the webhook hub on PostgreSQL, two Gateways', () => {
     it('delivers each event once, shared between them (SKIP LOCKED), whichever queued it', async () => {
-      const a = new PgStore(process.env.TEST_DATABASE_URL!)
-      const b = new PgStore(process.env.TEST_DATABASE_URL!)
+      // A database of its own: these workers claim what is due in any tenant, and the store contract (run at the same
+      // time against TEST_DATABASE_URL) empties its tables between its tests.
+      const base = new URL(process.env.TEST_DATABASE_URL!)
+      const name = `${decodeURIComponent(base.pathname.slice(1)) || 'postgres'}_webhooks_spec`
+      const server = new pg.Pool({ connectionString: base.toString(), max: 1 })
+      await server.query(`DROP DATABASE IF EXISTS "${name}" WITH (FORCE)`)
+      await server.query(`CREATE DATABASE "${name}"`)
+      const own = new URL(base.toString())
+      own.pathname = `/${name}`
+      const a = new PgStore(own.toString())
+      const b = new PgStore(own.toString())
       await a.migrate()
       const tenant = `two-${Date.now()}`
       try {
@@ -271,11 +281,10 @@ if (process.env.TEST_DATABASE_URL) {
         expect(two.got.length).toBeGreaterThan(0)
       } finally {
         for (const h of hubs.splice(0)) await h.stop()
-        const pool = (a as unknown as { pool: { query(sql: string, v: unknown[]): Promise<unknown> } }).pool
-        await pool.query('DELETE FROM webhook_subscriptions WHERE tenant_id = $1', [tenant])
-        await pool.query('DELETE FROM webhook_domains WHERE tenant_id = $1', [tenant])
         await a.close()
         await b.close()
+        await server.query(`DROP DATABASE IF EXISTS "${name}" WITH (FORCE)`)
+        await server.end()
       }
     }, 20_000)
   })
