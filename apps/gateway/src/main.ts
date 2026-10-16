@@ -159,7 +159,7 @@ const groupNumbers = async (tenantId: string) => {
   return provider.listGroups ? (await provider.listGroups()).map(g => g.number) : []
 }
 const directorySync = contacts && env.LDAP_ATTR_EXTENSION ? new DirectorySync({ store, directory: contacts, tenantId: env.LDAP_TENANT ?? tenant, reserved: async t => [...(await groupNumbers(t)), ...(conference && accessNumber ? [accessNumber] : [])] }) : undefined
-// Webhooks (step 10a, ADR 0020), with SECRETS_KEY: deliveries in https only, on ports 443 and 80 (WEBHOOK_PORTS:
+// Webhooks (step 10a, ADR 0020), with SECRETS_KEY: deliveries in https only, on port 443 (80 in http; WEBHOOK_PORTS:
 // others), never to this host or the private networks, unless the operator opens some to one organisation
 // (WEBHOOK_PRIVATE_NETWORKS, `acme=10.20.0.0/16;beta=192.0.2.10`, a bare list for DEFAULT_TENANT: the CRM of that
 // organisation in its network, never the others') or allows http (WEBHOOK_ALLOW_HTTP=1, development only). Never,
@@ -167,6 +167,12 @@ const directorySync = contacts && env.LDAP_ATTR_EXTENSION ? new DirectorySync({ 
 // WEBHOOK_DENY_NETWORKS (the platform's other public addresses: its entry point, services that trust the Gateway's
 // address).
 const webhookOpen = parseTenantNetworks(env.WEBHOOK_PRIVATE_NETWORKS, tenant)
+// Said at each start: what the operator opened, to whom; an organisation no provider configuration serves (a typing
+// error, another case) opens nothing now, and would to one made later under that name.
+for (const [t, networks] of webhookOpen) {
+  console.info(`webhooks: networks opened to the deliveries of ${JSON.stringify(t)}: ${networks.entries.join(', ')}`)
+  if (!registry.serves(t)) console.warn(`WARNING: WEBHOOK_PRIVATE_NETWORKS names ${JSON.stringify(t)}, which no provider configuration serves: check how its organisation is written`)
+}
 const webhookPorts = parsePorts(env.WEBHOOK_PORTS)
 const webhookDeny = denyNetworks(env.WEBHOOK_DENY_NETWORKS, networkInterfaces())
 const webhookHttp = env.WEBHOOK_ALLOW_HTTP === '1'
@@ -183,7 +189,7 @@ const app = await buildApp(registry, {
   auth: authenticatorFromEnv(env),
   ...(push ? { push } : {}),
   ...(key ? { secretsKey: key } : {}),
-  webhooks: { policy: { allowHttp: webhookHttp, ports: webhookPorts }, open: webhookOpen, deny: webhookDeny },
+  webhooks: { policy: { allowHttp: webhookHttp, ...(webhookPorts ? { ports: webhookPorts } : {}) }, open: webhookOpen, deny: webhookDeny },
   ...(conference ? { conference } : {})
 })
 directorySync?.useLogger(app.log)

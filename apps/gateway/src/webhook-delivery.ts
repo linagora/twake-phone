@@ -81,23 +81,29 @@ const hostOf = (url: URL) => url.hostname.toLowerCase().replace(/^\[|\]$/g, '').
 /** Whether `host` is one of `domains` (exactly, or a subdomain of a `*.` entry). */
 export const hostAllowed = (host: string, domains: readonly string[]) => domains.some(d => (d.startsWith('*.') ? host.endsWith(d.slice(1)) && host.length > d.length - 1 : host === d))
 
-/** The ports a subscriber listens on unless the operator lists others (WEBHOOK_PORTS). */
+/** The ports a subscriber listens on unless the operator lists others (WEBHOOK_PORTS): https's, and http's in http. */
 export const WEBHOOK_PORTS: readonly number[] = [443, 80]
+/** The port of each scheme, the only one allowed in it without WEBHOOK_PORTS. */
+const SCHEME_PORT: Record<string, number> = { 'https:': 443, 'http:': 80 }
 
 export interface DestinationPolicy {
   /** `http:` as well as `https:` (WEBHOOK_ALLOW_HTTP=1: development and tests only). */
   allowHttp?: boolean
   /**
-   * The ports an address may name (WEBHOOK_PORTS; WEBHOOK_PORTS by default): the Gateway is no scanner of the ports
-   * of whatever address an administrator chooses. Port 0 never.
+   * The ports an address may name, whatever its scheme (WEBHOOK_PORTS): the Gateway is no scanner of the ports of
+   * whatever address an administrator chooses. Without it, its scheme's own only: 443 in https, 80 in http. Port 0
+   * never.
    */
   ports?: readonly number[]
 }
 
-/** WEBHOOK_PORTS: ports from 1 to 65535, comma-separated (`443,8443`); WEBHOOK_PORTS when unset. */
-export const parsePorts = (value: string | undefined, name = 'WEBHOOK_PORTS'): number[] => {
+/**
+ * WEBHOOK_PORTS: ports from 1 to 65535, comma-separated (`443,8443`); undefined when unset (each scheme its own
+ * port).
+ */
+export const parsePorts = (value: string | undefined, name = 'WEBHOOK_PORTS'): number[] | undefined => {
   const entries = (value ?? '').split(',').map(x => x.trim()).filter(Boolean)
-  if (!entries.length) return [...WEBHOOK_PORTS]
+  if (!entries.length) return undefined
   return entries.map(e => {
     const port = Number(e)
     if (!/^\d{1,5}$/.test(e) || port < 1 || port > 65_535) throw new Error(`${name}: ${e} is no port (1 to 65535)`)
@@ -125,8 +131,8 @@ export const parseWebhookUrl = (value: unknown, domains: readonly string[], poli
   if (url.username || url.password) throw refused('WEBHOOK_URL', 'url: no user name nor password in the address (the signature authenticates the platform)')
   if (url.hash) throw refused('WEBHOOK_URL', 'url: no fragment (#)')
   const port = portOf(url)
-  const ports = policy.ports ?? WEBHOOK_PORTS
-  if (port === 0 || !ports.includes(port)) throw refused('WEBHOOK_URL_PORT', `url: port ${port} is not allowed (${ports.join(', ')})`)
+  const ports = policy.ports ?? [SCHEME_PORT[url.protocol]!]
+  if (port === 0 || !ports.includes(port)) throw refused('WEBHOOK_URL_PORT', `url: port ${port} is not allowed in ${url.protocol.slice(0, -1)} (${ports.join(', ')})`)
   if (!hostAllowed(hostOf(url), domains)) throw refused('WEBHOOK_DOMAIN', `url: ${hostOf(url)} is not among the domains the organisation allows`)
   return url.toString()
 }
@@ -193,38 +199,138 @@ const special = { ipv4: new BlockList(), ipv6: new BlockList() }
 for (const [net, prefix] of SPECIAL_V4) special.ipv4.addSubnet(net, prefix, 'ipv4')
 for (const [net, prefix] of SPECIAL_V6) special.ipv6.addSubnet(net, prefix, 'ipv6')
 
+/** What addresses a delivery may reach are checked against: a BlockList, or the networks an operator opened. */
+export interface AddressSet {
+  check(address: string, type: 'ipv4' | 'ipv6'): boolean
+}
+
 /**
- * Networks written `10.20.0.0/16,fd00:1::/64` (an address alone is one host): those the operator opens to the
- * deliveries of one organisation despite the rule above (parseTenantNetworks: its CRM in a private network), or
- * closes to all of them whatever the rest (WEBHOOK_DENY_NETWORKS: the platform's own public addresses). `name`: the
- * variable, for the error.
+ * Addresses refused even inside a network the operator opened, unless an entry names them (lies within one of
+ * these): this host (loopback, the unspecified address), link-local (where clouds answer the metadata of the
+ * machine, its credentials included), and the metadata services of the clouds elsewhere.
  */
-export const parseNetworks = (value: string | undefined, name = 'WEBHOOK_PRIVATE_NETWORKS', into = new BlockList()): BlockList => {
-  for (const entry of (value ?? '').split(',').map(s => s.trim()).filter(Boolean)) {
-    const [net, bits] = entry.split('/')
-    const family = isIP(net ?? '')
-    const prefix = bits === undefined ? (family === 6 ? 128 : 32) : Number(bits)
-    if (!family || !Number.isInteger(prefix) || prefix < 0 || prefix > (family === 6 ? 128 : 32)) throw new Error(`${name}: ${entry} is no network (10.20.0.0/16, fd00:1::/64)`)
-    into.addSubnet(net!, prefix, family === 6 ? 'ipv6' : 'ipv4')
-  }
+const GUARDED: [string, number, 'ipv4' | 'ipv6'][] = [
+  ['0.0.0.0', 8, 'ipv4'],
+  ['127.0.0.0', 8, 'ipv4'],
+  ['169.254.0.0', 16, 'ipv4'],
+  // Alibaba Cloud's metadata (inside 100.64.0.0/10), Azure's WireServer (a public address, inside Azure only).
+  ['100.100.100.200', 32, 'ipv4'],
+  ['168.63.129.16', 32, 'ipv4'],
+  ['::', 128, 'ipv6'],
+  ['::1', 128, 'ipv6'],
+  ['fe80::', 10, 'ipv6'],
+  // AWS's metadata in IPv6 (inside fc00::/7).
+  ['fd00:ec2::254', 128, 'ipv6']
+]
+const guarded = { ipv4: new BlockList(), ipv6: new BlockList() }
+const guardedRanges = GUARDED.map(([net, prefix, type]) => {
+  const one = new BlockList()
+  one.addSubnet(net, prefix, type)
+  guarded[type].addSubnet(net, prefix, type)
+  return { one, prefix, type }
+})
+
+/** Shortest prefix of a network opened (WEBHOOK_PRIVATE_NETWORKS): wider, a typing error would open far too much. */
+export const MIN_OPEN_PREFIX = { ipv4: 8, ipv6: 16 } as const
+
+interface Network {
+  net: string
+  prefix: number
+  type: 'ipv4' | 'ipv6'
+}
+
+/**
+ * One network as written: an IPv4 or IPv6 address (no zone, `%eth0`), alone (one host) or with a prefix of 1 to 3
+ * digits within its family's length. Anything else, `10.0.0.0/` (an empty prefix), `10.0.0.0/8/30`, `/0x8`, is an
+ * error that says the entry.
+ */
+const parseNetwork = (entry: string, name: string): Network => {
+  const bad = () => new Error(`${name}: ${entry} is no network (10.20.0.0/16, fd00:1::/64, or one address)`)
+  const parts = entry.split('/')
+  if (parts.length > 2) throw bad()
+  const [net, bits] = parts as [string, string | undefined]
+  const family = isIP(net)
+  if (!family || net.includes('%')) throw bad()
+  const type = family === 6 ? 'ipv6' : 'ipv4'
+  const max = family === 6 ? 128 : 32
+  if (bits !== undefined && !/^\d{1,3}$/.test(bits)) throw bad()
+  const prefix = bits === undefined ? max : Number(bits)
+  if (prefix > max) throw bad()
+  return { net, prefix, type }
+}
+
+/** The entries of a list written `10.20.0.0/16,fd00:1::/64`, each read strictly (parseNetwork). */
+const networksOf = (value: string | undefined, name: string) =>
+  (value ?? '')
+    .split(',')
+    .map(x => x.trim())
+    .filter(Boolean)
+    .map(entry => parseNetwork(entry, name))
+
+/**
+ * Networks written `10.20.0.0/16,fd00:1::/64` (an address alone is one host), that the operator closes to every
+ * delivery whatever the rest (WEBHOOK_DENY_NETWORKS: the platform's own public addresses), or that tests open.
+ * `name`: the variable, for the error.
+ */
+export const parseNetworks = (value: string | undefined, name = 'WEBHOOK_DENY_NETWORKS', into = new BlockList()): BlockList => {
+  for (const n of networksOf(value, name)) into.addSubnet(n.net, n.prefix, n.type)
   return into
+}
+
+/**
+ * The networks the operator opens to the deliveries of one organisation (WEBHOOK_PRIVATE_NETWORKS), despite the rule
+ * that keeps the special ranges out: none wider than MIN_OPEN_PREFIX (a /0 or a /4 is a typing error, never a
+ * network), and never this host, link-local nor a cloud's metadata (GUARDED) unless an entry lies within them (names
+ * them: `127.0.0.1/32` for a receiver on a development machine). `entries`: as written, for the log.
+ */
+export class OpenNetworks implements AddressSet {
+  private readonly list = new BlockList()
+  /** The entries within a guarded range: they open what they name of it. */
+  private readonly named = new BlockList()
+  readonly entries: string[] = []
+
+  constructor(value: string, name = 'WEBHOOK_PRIVATE_NETWORKS') {
+    const networks = networksOf(value, name)
+    if (!networks.length) throw new Error(`${name}: an organisation without networks (acme=10.20.0.0/16)`)
+    for (const n of networks) {
+      if (n.prefix < MIN_OPEN_PREFIX[n.type])
+        throw new Error(`${name}: ${n.net}/${n.prefix} opens too much (/${MIN_OPEN_PREFIX[n.type]} at the widest in ${n.type === 'ipv6' ? 'IPv6' : 'IPv4'})`)
+      this.list.addSubnet(n.net, n.prefix, n.type)
+      if (guardedRanges.some(g => g.type === n.type && n.prefix >= g.prefix && g.one.check(n.net, n.type))) this.named.addSubnet(n.net, n.prefix, n.type)
+      this.entries.push(`${n.net}/${n.prefix}`)
+    }
+  }
+
+  check(address: string, type: 'ipv4' | 'ipv6') {
+    if (guarded[type].check(address, type)) return this.named.check(address, type)
+    return this.list.check(address, type)
+  }
 }
 
 /**
  * WEBHOOK_PRIVATE_NETWORKS: the networks the operator opens to the deliveries of one organisation each, never to the
  * others' (an administrator of another one would reach them with a domain of their own that resolves there):
- * `acme=10.20.0.0/16,fd00:1::/64;beta=192.0.2.10`. A list without an organisation (`10.20.0.0/16`) is that of
- * `defaultTenant` (a platform of one organisation).
+ * `acme=10.20.0.0/16,fd00:1::/64;beta=192.0.2.10`. The organisation is written as the token names it (any character),
+ * `;`, `=` and `%` percent-encoded (`%3B`, `%3D`, `%25`: `urn%3Aacme` is fine as `urn:acme`). A list without an
+ * organisation (`10.20.0.0/16`) is that of `defaultTenant` (a platform of one organisation).
  */
-export const parseTenantNetworks = (value: string | undefined, defaultTenant: string, name = 'WEBHOOK_PRIVATE_NETWORKS'): Map<string, BlockList> => {
-  const out = new Map<string, BlockList>()
+export const parseTenantNetworks = (value: string | undefined, defaultTenant: string, name = 'WEBHOOK_PRIVATE_NETWORKS'): Map<string, OpenNetworks> => {
+  const lists = new Map<string, string[]>()
   for (const part of (value ?? '').split(';').map(x => x.trim()).filter(Boolean)) {
     const eq = part.indexOf('=')
-    const tenant = eq < 0 ? defaultTenant : part.slice(0, eq).trim()
-    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(tenant)) throw new Error(`${name}: ${tenant} is no organisation (acme=10.20.0.0/16;beta=192.0.2.10)`)
-    out.set(tenant, parseNetworks(eq < 0 ? part : part.slice(eq + 1), name, out.get(tenant)))
+    let tenant = defaultTenant
+    if (eq >= 0) {
+      const written = part.slice(0, eq).trim()
+      try {
+        tenant = decodeURIComponent(written)
+      } catch {
+        throw new Error(`${name}: ${written} is no organisation (write % as %25)`)
+      }
+      if (!tenant) throw new Error(`${name}: ${part} names no organisation (acme=10.20.0.0/16;beta=192.0.2.10)`)
+    }
+    lists.set(tenant, [...(lists.get(tenant) ?? []), eq < 0 ? part : part.slice(eq + 1)])
   }
-  return out
+  return new Map([...lists].map(([tenant, parts]) => [tenant, new OpenNetworks(parts.join(','), name)]))
 }
 
 /**
@@ -249,9 +355,10 @@ const MAPPED = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/i
 
 /**
  * Whether a delivery may reach `address`: a public address, or one of the networks the operator opened (`open`);
- * never one it closed (`deny`), even inside what it opened.
+ * never one it closed (`deny`), even inside what it opened, nor a guarded one (this host, link-local, the clouds'
+ * metadata) that `open` does not name.
  */
-export const addressAllowed = (address: string, open?: BlockList, deny?: BlockList): boolean => {
+export const addressAllowed = (address: string, open?: AddressSet, deny?: AddressSet): boolean => {
   const family = isIP(address)
   if (!family) return false
   const mapped = family === 6 ? MAPPED.exec(address)?.[1] : undefined
@@ -261,6 +368,7 @@ export const addressAllowed = (address: string, open?: BlockList, deny?: BlockLi
   // ::ffff:0:0/96 written another way (hexadecimal): refused, its IPv4 part is not read here.
   if (family === 6 && /^::ffff:/i.test(address)) return !!open?.check(address, 'ipv6')
   if (open?.check(address, type)) return true
+  if (guarded[type].check(address, type)) return false
   return !special[type].check(address, type)
 }
 
@@ -296,7 +404,7 @@ export class DeliveryError extends Error {
  * reached: the connection goes to an address checked here, never to one a second resolution would give (a name whose
  * records change between a check and the connection).
  */
-const guardedLookup = (resolve: Resolve, open: BlockList | undefined, deny: BlockList | undefined, resolved: () => void = () => undefined): LookupFunction =>
+const guardedLookup = (resolve: Resolve, open: AddressSet | undefined, deny: AddressSet | undefined, resolved: () => void = () => undefined): LookupFunction =>
   (hostname: string, options: { all?: boolean }, callback: (err: Error | null, address: string | LookupAddress[], family?: number) => void) => {
     resolve(hostname).finally(resolved).then(
       addresses => {
@@ -315,9 +423,9 @@ export interface PostOptions {
   /** The name resolved and the connection made within this time (default 3 s): a host that drops the packets costs that much. */
   connectTimeoutMs?: number
   /** Networks the operator opened to the organisation of this delivery (WEBHOOK_PRIVATE_NETWORKS). */
-  open?: BlockList
+  open?: AddressSet
   /** Addresses never reached (WEBHOOK_DENY_NETWORKS, this host's own). */
-  deny?: BlockList
+  deny?: AddressSet
   /** The resolver (tests give one that answers what they want). */
   resolve?: Resolve
   /** Certificates trusted besides the system's (tests: a local https subscriber). */

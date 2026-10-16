@@ -5,6 +5,7 @@ import type { Presence, TelephonyEvent, TrunkStatus } from '@twake/telephony-typ
 import { buildApp } from './app.js'
 import { ProviderRegistry } from './registry.js'
 import { MemoryStore } from './store/memory.js'
+import { WEBHOOK_STATE_ROLE } from './store/types.js'
 import { verifyWebhookSignature } from './webhook-delivery.js'
 
 // Documentation domains (RFC 2606) and fictional numbers only.
@@ -58,7 +59,18 @@ afterEach(async () => {
 })
 
 const setup = async (
-  opts: { secretsKey?: boolean; answer?: (n: number) => number; hold?: Promise<void>; sendsPerMinute?: number; tenantSendsPerMinute?: number; maxPending?: number; presenceSettleMs?: number; trunkWatchMs?: number } = {}
+  opts: {
+    secretsKey?: boolean
+    answer?: (n: number) => number
+    hold?: Promise<void>
+    sendsPerMinute?: number
+    tenantSendsPerMinute?: number
+    maxPending?: number
+    presenceSettleMs?: number
+    presenceSettleMaxMs?: number
+    trunkWatchMs?: number
+    stateLeaseMs?: number
+  } = {}
 ) => {
   process.env.AUTH_MODE = 'dev'
   const store = new MemoryStore()
@@ -75,6 +87,7 @@ const setup = async (
       pollMs: 20,
       retryBaseMs: 30,
       ...(opts.maxPending ? { maxPending: opts.maxPending } : {}),
+      ...(opts.stateLeaseMs ? { stateLeaseMs: opts.stateLeaseMs } : {}),
       post: async (url, body, headers) => {
         got.push({ url, headers, body })
         await opts.hold
@@ -84,6 +97,7 @@ const setup = async (
     ...(opts.sendsPerMinute ? { webhookSendsPerMinute: opts.sendsPerMinute } : {}),
     ...(opts.tenantSendsPerMinute ? { webhookTenantSendsPerMinute: opts.tenantSendsPerMinute } : {}),
     webhookPresenceSettleMs: opts.presenceSettleMs ?? 0,
+    ...(opts.presenceSettleMaxMs ? { webhookPresenceSettleMaxMs: opts.presenceSettleMaxMs } : {}),
     trunkWatchMs: opts.trunkWatchMs ?? 0,
     trunkWatchConfirm: 1,
     trunkStatusCacheMs: 0
@@ -277,6 +291,20 @@ describe('the webhook routes', () => {
     expect((await app.inject({ method: 'POST', url: `/api/v1/webhooks/${theirs.id}/test`, headers: as('root', 'B') })).statusCode).toBe(202)
   })
 
+  it('count a test or a replay once accepted only: one refused costs none of the limit (review 10a, third, n°14)', async () => {
+    const { app, got } = await setup({ sendsPerMinute: 2 })
+    await app.inject({ method: 'PUT', url: '/api/v1/webhooks/domains', headers: root, ...json({ domains: ['crm.example.org'] }) })
+    const made = (await app.inject({ method: 'POST', url: '/api/v1/webhooks', headers: root, ...json({ url: 'https://crm.example.org/in', events: ['call.missed'] }) })).json()
+    for (let i = 0; i < 3; i++) expect((await app.inject({ method: 'POST', url: `/api/v1/webhooks/${made.id}/deliveries/dlv_${'0'.repeat(32)}/replay`, headers: root })).statusCode).toBe(404)
+    const sent = (await app.inject({ method: 'POST', url: `/api/v1/webhooks/${made.id}/test`, headers: root })).json()
+    // Still pending: 409, nothing counted.
+    expect((await app.inject({ method: 'POST', url: `/api/v1/webhooks/${made.id}/deliveries/${sent.id}/replay`, headers: root })).json().code).toMatch(/WEBHOOK_PENDING|WEBHOOK_RATE/)
+    await until('delivered', () => got.length === 1)
+    expect((await app.inject({ method: 'POST', url: `/api/v1/webhooks/${made.id}/test`, headers: root })).statusCode).toBe(202)
+    const more = await app.inject({ method: 'POST', url: `/api/v1/webhooks/${made.id}/test`, headers: root })
+    expect([more.statusCode, more.json().code]).toEqual([429, 'WEBHOOK_RATE'])
+  })
+
   it('keep 20 subscriptions at most', async () => {
     const { app } = await setup()
     await app.inject({ method: 'PUT', url: '/api/v1/webhooks/domains', headers: root, ...json({ domains: ['crm.example.org'] }) })
@@ -409,21 +437,54 @@ describe('the events a subscriber is sent', () => {
     expect(got.map(g => g.body).join()).not.toContain('réunion')
   })
 
-  it('a presence that settles: a status kept less than the settling time is not told (review 10a, second, n°19)', async () => {
-    const { app, got, push } = await setup({ presenceSettleMs: 80 })
+  it('a presence that settles: a short call from a status told is no change; one that keeps changing is told all the same (review 10a, second, n°19; third, n°10)', async () => {
+    const { app, got, push } = await setup({ presenceSettleMs: 80, presenceSettleMaxMs: 300 })
     await app.inject({ method: 'PUT', url: '/api/v1/webhooks/domains', headers: root, ...json({ domains: ['crm.example.org'] }) })
     await app.inject({ method: 'POST', url: '/api/v1/webhooks', headers: root, ...json({ url: 'https://crm.example.org/in', events: ['presence.changed'] }) })
     const presence = (p: Presence): TelephonyEvent => ({ type: 'presence.changed', timestamp: at, payload: { userId: '', presence: p } })
-    // A short call: busy, then available again, within the settling time.
+    const told = () => got.map(g => JSON.parse(g.body).presence as { user: string; status: string }).map(p => `${p.user}:${p.status}`)
+    push('102', presence({ status: 'available', source: 'telephony' }))
+    await until('available told', () => got.length === 1)
+    // A short call: busy, then available again, within the settling time: nothing, available was told.
     push('102', presence({ status: 'busy', source: 'telephony' }))
+    await sleep(20)
     push('102', presence({ status: 'available', source: 'telephony' }))
     push('101', presence({ status: 'dnd', source: 'user' }))
-    await until('the settled ones', () => got.length === 2)
-    const told = got.map(g => JSON.parse(g.body).presence as { user: string; status: string }).sort((a, b) => a.user.localeCompare(b.user))
-    expect(told.map(p => [p.user, p.status])).toEqual([
-      ['amartin', 'dnd'],
-      ['jdupont', 'available']
-    ])
+    await until('the settled one', () => got.length === 2)
+    await sleep(200)
+    expect(told()).toEqual(['jdupont:available', 'amartin:dnd'])
+    // A status that changes more often than the settling time: told as it stands after 300 ms all the same.
+    const started = Date.now()
+    let n = 0
+    while (Date.now() - started < 700 && got.length === 2) {
+      push('102', presence({ status: n++ % 2 ? 'away' : 'busy', source: 'telephony' }))
+      await sleep(30)
+    }
+    expect(got.length).toBe(3)
+    expect(Date.now() - started).toBeLessThan(600)
+  })
+
+  it('tells nothing of a person erased, nor of one never told, when a Gateway starts telling again (review 10a, third, n°7)', async () => {
+    const { app, got, push, store } = await setup({ stateLeaseMs: 300 })
+    await app.inject({ method: 'PUT', url: '/api/v1/webhooks/domains', headers: root, ...json({ domains: ['crm.example.org'] }) })
+    await app.inject({ method: 'POST', url: '/api/v1/webhooks', headers: root, ...json({ url: 'https://crm.example.org/in', events: ['presence.changed'] }) })
+    const presence = (p: Presence): TelephonyEvent => ({ type: 'presence.changed', timestamp: at, payload: { userId: '', presence: p } })
+    push('102', presence({ status: 'busy', source: 'telephony' }))
+    await until('told', () => got.length === 1)
+    // Jean erases his history; another Gateway, which hears more, takes the lease; Alice changes meanwhile (not told:
+    // this Gateway no longer tells).
+    expect((await app.inject({ method: 'DELETE', url: '/api/v1/me/history', headers: as('jdupont') })).statusCode).toBe(200)
+    expect(await store.takeWebhookLease(WEBHOOK_STATE_ROLE, 'gw_other', 300, 99)).toBeTruthy()
+    await sleep(150)
+    push('101', presence({ status: 'dnd', source: 'user' }))
+    await sleep(50)
+    // It gives the lease back: this Gateway tells again what it knows. Alice, never told: written, not told; Jean,
+    // erased: nothing.
+    await store.takeWebhookLease(WEBHOOK_STATE_ROLE, 'gw_other', 0)
+    await until('told again', async () => (await store.listWebhookStates('A', 'presence:')).length > 0, 3_000)
+    await sleep(100)
+    expect(await store.listWebhookStates('A', 'presence:')).toEqual([{ subject: 'presence:amartin', state: 'dnd' }])
+    expect(got).toHaveLength(1)
   })
 
   it('a trunk that gets worse, then recovers, from what the SIP server says of it', async () => {

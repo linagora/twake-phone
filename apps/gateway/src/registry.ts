@@ -21,6 +21,11 @@ export class ProviderRegistry {
     return !!record && this.factories.has(record.type)
   }
 
+  /** The tenants that have a provider this Gateway can build (started or not). */
+  tenants(): string[] {
+    return [...new Set(this.records.filter(r => this.factories.has(r.type)).map(r => r.tenantId))]
+  }
+
   forTenant(tenantId: string): TelephonyProvider {
     const cached = this.cache.get(tenantId)
     if (cached) return cached

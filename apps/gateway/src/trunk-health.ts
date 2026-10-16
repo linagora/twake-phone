@@ -24,7 +24,10 @@ export interface TrunkWatchOptions {
   tenants: () => string[]
   /** How a tenant's trunks are doing (the SIP server's word); undefined when it cannot say. */
   read: (tenantId: string) => Promise<TrunkStatus[] | undefined>
-  /** The names administrators gave the tenant's trunks. */
+  /**
+   * The names administrators gave the tenant's trunks, for each trunk the store keeps: one the SIP server leaves out
+   * of a read but the store still has is no trunk removed (a partial read: a reload under way).
+   */
   names: (tenantId: string) => Promise<Map<string, string | undefined>>
   /**
    * What was told of the tenant's trunks (Store.listWebhookStates, `trunk:`), read once each time this Gateway starts
@@ -53,11 +56,11 @@ const REMOVED = 'removed'
  * `confirm` reads in a row whichever way it goes: `trunk.degraded` when its health is no longer up and changes (from
  * up, or never read, to degraded or down; from degraded to down; from down to degraded, a partial recovery),
  * `trunk.recovered` when one told degraded or down is up again, or is no longer watched (`removed`: an administrator
- * disabled or deleted it). Only the Gateway that holds the lease of the changes of state reads them; the health told
+ * disabled or deleted it, as the store and the SIP server both say, `confirm` reads in a row too). Only the Gateway that holds the lease of the changes of state reads them; the health told
  * is kept in the store, which never lets an older one through: told once whatever the Gateways.
  */
 export class TrunkWatch {
-  private readonly seen = new Map<string, { health: TrunkHealth; reads: number }>()
+  private readonly seen = new Map<string, { health: TrunkHealth | typeof REMOVED; reads: number }>()
   /** What was last written for each trunk of each tenant (by this Gateway, or read from the store): the same costs no write. */
   private readonly written = new Map<string, Map<string, string>>()
   private timer: ReturnType<typeof setInterval> | undefined
@@ -156,11 +159,24 @@ export class TrunkWatch {
       if (queued !== null) written.set(status.id, health)
     }
     // A trunk no longer watched (disabled whole, or deleted): told recovered if it was told degraded or down, then
-    // kept `removed` (purged after the retention).
+    // kept `removed` (purged after the retention). Only once the store says so as well (deleted from it, or the SIP
+    // server reads it disabled whole), `confirm` reads in a row: a read that leaves it out while the store still has
+    // it is partial, not a removal.
     for (const [id, state] of [...written]) {
       if (watched.has(id) || state === REMOVED) continue
-      this.seen.delete(`${tenantId}\u0000${id}`)
-      const trunk = await describe(statuses.find(s => s.id === id), id)
+      const status = statuses.find(s => s.id === id)
+      names ??= await this.options.names(tenantId)
+      const k = `${tenantId}\u0000${id}`
+      if (!status && names.has(id)) {
+        this.seen.delete(k)
+        continue
+      }
+      const before = this.seen.get(k)
+      const reads = before?.health === REMOVED ? before.reads + 1 : 1
+      this.seen.set(k, { health: REMOVED, reads })
+      if (reads < confirm) continue
+      this.seen.delete(k)
+      const trunk = await describe(status, id)
       const queued = await this.options.publishChange(tenantId, `trunk:${id}`, REMOVED, TYPES, (was, at): PublishedWebhookEvent | null => {
         if (was !== 'degraded' && was !== 'down') return null
         return { id: randomEventId(), occurred_at: at, tenant: tenantId, type: 'trunk.recovered', trunk: { ...trunk, state: 'up', previous: was, removed: true } }

@@ -67,6 +67,150 @@ if (process.env.TEST_DATABASE_URL) {
     }, 120_000)
   })
 
+  describe('PgStore, the webhook queue and its lease under concurrent writes (review 10a, third)', () => {
+    const sub = (tenantId: string, id: string) => ({
+      tenantId,
+      id,
+      url: 'https://crm.example.org/in',
+      events: ['call.missed' as const],
+      enabled: true,
+      secretEnc: 'enc',
+      failures: 0,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    })
+    /** Until a statement of another session waits on a lock (pg_stat_activity, read afresh each time). */
+    const waiting = async (other: pg.Client, like: string) => {
+      for (let i = 0; ; i++) {
+        await other.query('SELECT pg_stat_clear_snapshot()')
+        const { rows } = await other.query("SELECT count(*)::int AS n FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE $1 AND pid <> pg_backend_pid()", [like])
+        if (rows[0].n > 0) return
+        if (i > 300) throw new Error(`nothing waited on a lock: ${like}`)
+        await new Promise(r => setTimeout(r, 10))
+      }
+    }
+
+    it('disables a subscription while the outcome of one of its deliveries is being written, without a deadlock (n°4)', async () => {
+      const store = new PgStore(process.env.TEST_DATABASE_URL!)
+      await store.migrate()
+      const other = new pg.Client({ connectionString: process.env.TEST_DATABASE_URL })
+      await other.connect()
+      const tenant = `deadlock-${Date.now()}`
+      const id = `wh_${Date.now().toString(16).padStart(16, '0').slice(-16)}`
+      try {
+        await store.addWebhookSubscription(sub(tenant, id), 20)
+        await store.enqueueWebhookEvent(tenant, 'evt_1', 'call.missed', '{}', undefined)
+        await store.enqueueWebhookEvent(tenant, 'evt_2', 'call.missed', '{}', undefined)
+        const claimed = (await store.claimWebhookDeliveries(10, { perSubscription: 10, perTenant: 10, maxAttempts: 9 })).filter(d => d.tenantId === tenant)
+        expect(claimed).toHaveLength(2)
+        // An outcome being written, as completeWebhookDelivery writes it: the delivery first, then its subscription.
+        await other.query('BEGIN')
+        await other.query("UPDATE webhook_deliveries SET status = 'delivered', claim = NULL WHERE id = $1", [claimed[0]!.id])
+        // The breaker disables the subscription meanwhile: it waits on the delivery, holding nothing the outcome needs.
+        const disabled = store.disableFailingWebhookSubscription(tenant, id, new Date().toISOString())
+        await waiting(other, '%webhook_deliveries%')
+        await other.query('UPDATE webhook_subscriptions SET failures = 0 WHERE id = $1', [id])
+        await other.query('COMMIT')
+        expect(await disabled).toBe(true)
+        const log = await store.listWebhookDeliveries(tenant, id)
+        expect(log.map(d => [d.eventId, d.status, d.lastError]).sort()).toEqual([
+          ['evt_1', 'delivered', undefined],
+          ['evt_2', 'failed', 'disabled']
+        ])
+      } finally {
+        await other.query('ROLLBACK').catch(() => undefined)
+        await other.end()
+        await store.deleteWebhookSubscription(tenant, id)
+        await store.close()
+      }
+    })
+
+    it('renews the lease within its bound however many changes of state are written at the same time (n°5)', async () => {
+      const store = new PgStore(process.env.TEST_DATABASE_URL!)
+      await store.migrate()
+      const tenant = `lease-${Date.now()}`
+      const holder = `gw_${Date.now()}`
+      try {
+        await store.takeWebhookLease('webhook-state', holder, 0)
+        // The lease of an earlier test lapses first.
+        for (let i = 0; !(await store.takeWebhookLease('webhook-state', holder, 15_000, 1)); i++) {
+          if (i > 200) throw new Error('the lease never came')
+          await new Promise(r => setTimeout(r, 100))
+        }
+        let writing = true
+        let written = 0
+        const writer = async (w: number) => {
+          for (let n = 0; writing; n++) {
+            await store.setWebhookState({ tenantId: tenant, subject: `presence:u${w}`, state: n % 2 ? 'busy' : 'available', holder }, () => null)
+            written++
+          }
+        }
+        const writers = Array.from({ length: 16 }, (_, w) => writer(w))
+        const times: number[] = []
+        for (let i = 0; i < 20; i++) {
+          const started = performance.now()
+          expect(await store.takeWebhookLease('webhook-state', holder, 15_000, 1)).toBeTruthy()
+          times.push(performance.now() - started)
+          await new Promise(r => setTimeout(r, 25))
+        }
+        writing = false
+        await Promise.all(writers)
+        expect(written).toBeGreaterThan(100)
+        times.sort((a, b) => a - b)
+        // Behind the writes (FOR SHARE), it took 579 ms in the median and 1.56 s at worst under 9 writers.
+        expect(times[Math.floor(times.length / 2)]!).toBeLessThan(100)
+        expect(times.at(-1)!).toBeLessThan(500)
+      } finally {
+        await store.takeWebhookLease('webhook-state', holder, 0)
+        const pool = (store as unknown as { pool: pg.Pool }).pool
+        await pool.query('DELETE FROM webhook_state WHERE tenant_id = $1', [tenant])
+        await store.close()
+      }
+    }, 30_000)
+
+    it('brings up to date a database that played migration 013 as it stood before the second review (n°12)', async () => {
+      const base = new URL(process.env.TEST_DATABASE_URL!)
+      const name = `${decodeURIComponent(base.pathname.slice(1)) || 'postgres'}_migrate_spec`
+      const own = new URL(base.toString())
+      own.pathname = `/${name}`
+      const server = new pg.Client({ connectionString: base.toString() })
+      await server.connect()
+      await server.query(`DROP DATABASE IF EXISTS "${name}" WITH (FORCE)`)
+      await server.query(`CREATE DATABASE "${name}"`)
+      const store = new PgStore(own.toString())
+      try {
+        await store.migrate()
+        const pool = (store as unknown as { pool: pg.Pool }).pool
+        // 013 as it was at the first review: what the second added taken out, 014 never played.
+        await pool.query(`
+          ALTER TABLE webhook_subscriptions DROP COLUMN backlog, DROP COLUMN backlog_at, DROP COLUMN claimed_at;
+          ALTER TABLE webhook_deliveries DROP COLUMN erase_body;
+          DROP INDEX webhook_deliveries_held_idx;
+          DROP INDEX webhook_deliveries_pending_idx;
+          CREATE INDEX webhook_deliveries_pending_idx ON webhook_deliveries (subscription_id) WHERE status = 'pending';
+          DROP TABLE webhook_sends;
+          CREATE TABLE webhook_sends (subscription_id text NOT NULL REFERENCES webhook_subscriptions (id) ON DELETE CASCADE, at timestamptz NOT NULL);
+          ALTER TABLE webhook_leases DROP COLUMN heard, DROP COLUMN write_from, DROP COLUMN write_until;
+          DELETE FROM schema_migrations WHERE name = '014_webhooks_fairness.sql';
+        `)
+        await store.migrate()
+        expect(await store.takeWebhookLease('webhook-state', 'gw_1', 15_000, 1)).toBeTruthy()
+        await store.addWebhookSubscription(sub('acme', 'wh_00000000000000a1'), 20)
+        expect(await store.enqueueWebhookDelivery('acme', 'wh_00000000000000a1', 'evt_1', 'webhook.test', '{}', undefined, 1000, { perSubscription: 1, windowMs: 60_000 })).toMatchObject({ eventId: 'evt_1' })
+        expect(await store.claimWebhookDeliveries(4, { perSubscription: 2, perTenant: 4, maxAttempts: 9 })).toHaveLength(1)
+        const { rows } = await pool.query<{ n: number }>("SELECT indnatts AS n FROM pg_index WHERE indexrelid = 'webhook_deliveries_pending_idx'::regclass")
+        expect(rows[0]!.n).toBe(3)
+        // Played again on a database up to date: nothing to do.
+        await pool.query("DELETE FROM schema_migrations WHERE name = '014_webhooks_fairness.sql'")
+        await store.migrate()
+      } finally {
+        await store.close()
+        await server.query(`DROP DATABASE IF EXISTS "${name}" WITH (FORCE)`).catch(() => undefined)
+        await server.end()
+      }
+    }, 30_000)
+  })
+
   describe('PgStore, trunks written together', () => {
     it('writes all of them or none: the default mark is never on two trunks, nor on none', async () => {
       const store = new PgStore(process.env.TEST_DATABASE_URL!)

@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { TLSSocket } from 'node:tls'
 import { afterEach, describe, expect, it } from 'vitest'
-import { DeliveryError, WEBHOOK_PORTS, addressAllowed, denyNetworks, hostAllowed, newWebhookSecret, parseNetworks, parsePorts, parseTenantNetworks, parseWebhookDomains, parseWebhookUrl, postWebhook, signWebhook, verifyWebhookSignature } from './webhook-delivery.js'
+import { DeliveryError, OpenNetworks, WEBHOOK_PORTS, addressAllowed, denyNetworks, hostAllowed, newWebhookSecret, parseNetworks, parsePorts, parseTenantNetworks, parseWebhookDomains, parseWebhookUrl, postWebhook, signWebhook, verifyWebhookSignature } from './webhook-delivery.js'
 
 describe('webhook signature', () => {
   const secret = newWebhookSecret()
@@ -99,7 +99,7 @@ describe('the address of a subscription', () => {
     expect(code(undefined)).toBe('WEBHOOK_URL')
   })
 
-  it('names one of the ports allowed: 443 and 80 unless the operator lists others, never 0 (review 10a, second, n°3)', () => {
+  it('names the port of its scheme (443 in https, 80 in http) unless the operator lists others, never 0 (review 10a, second, n°3; third, n°15)', () => {
     const code = (url: string, policy = {}) => {
       try {
         parseWebhookUrl(url, domains, policy)
@@ -113,10 +113,16 @@ describe('the address of a subscription', () => {
     expect(code('http://crm.example.org/in', { allowHttp: true })).toBe('ok')
     expect(code('http://crm.example.org:80/in', { allowHttp: true })).toBe('ok')
     for (const port of [22, 6379, 8080, 8443, 0]) expect(code(`https://crm.example.org:${port}/in`), String(port)).toBe('WEBHOOK_URL_PORT')
+    // Each scheme its own port: 80 is no https port, 443 no http one.
+    expect(code('https://crm.example.org:80/in')).toBe('WEBHOOK_URL_PORT')
+    expect(code('http://crm.example.org:443/in', { allowHttp: true })).toBe('WEBHOOK_URL_PORT')
+    // The operator's list, whatever the scheme.
+    expect(code('http://crm.example.org:443/in', { allowHttp: true, ports: [443, 80] })).toBe('ok')
     expect(code('https://crm.example.org:8443/in', { ports: [8443] })).toBe('ok')
     expect(code('https://crm.example.org/in', { ports: [8443] })).toBe('WEBHOOK_URL_PORT')
     expect(code('https://crm.example.org:0/in', { ports: [0, 443] })).toBe('WEBHOOK_URL_PORT')
-    expect(parsePorts(undefined)).toEqual([443, 80])
+    expect(parsePorts(undefined)).toBeUndefined()
+    expect(parsePorts(' ')).toBeUndefined()
     expect(parsePorts(' 443, 8443 ')).toEqual([443, 8443])
     for (const bad of ['0', '65536', 'http', '443;80', '-1']) expect(() => parsePorts(bad), bad).toThrow(/WEBHOOK_PORTS/)
   })
@@ -139,7 +145,7 @@ describe('the addresses a delivery may reach', () => {
   })
 
   it('lets through the networks the operator opens, and only those', () => {
-    const open = parseNetworks('10.20.0.0/16, 127.0.0.1, fd00:1::/64')
+    const open = new OpenNetworks('10.20.0.0/16, 127.0.0.1, fd00:1::/64')
     expect(addressAllowed('10.20.3.4', open)).toBe(true)
     expect(addressAllowed('10.21.3.4', open)).toBe(false)
     expect(addressAllowed('127.0.0.1', open)).toBe(true)
@@ -147,12 +153,44 @@ describe('the addresses a delivery may reach', () => {
     expect(addressAllowed('::ffff:127.0.0.1', open)).toBe(true)
     expect(addressAllowed('fd00:1::5', open)).toBe(true)
     expect(addressAllowed('fd00:2::5', open)).toBe(false)
-    expect(() => parseNetworks('10.0.0.0/33')).toThrow(/WEBHOOK_PRIVATE_NETWORKS/)
-    expect(() => parseNetworks('crm.example.org')).toThrow(/WEBHOOK_PRIVATE_NETWORKS/)
+    expect(open.entries).toEqual(['10.20.0.0/16', '127.0.0.1/32', 'fd00:1::/64'])
     expect(addressAllowed('10.0.0.1', parseNetworks(''))).toBe(false)
   })
 
-  it('opens networks to one organisation each, a bare list to the default one (review 10a, second, n°3)', () => {
+  it('reads a network strictly, and refuses one that opens too much (review 10a, third, n°3)', () => {
+    // A typing error never opens all of IPv4 or IPv6: an empty prefix, a second one, hexadecimal, a zone, nothing.
+    for (const bad of ['10.20.0.0/', 'fd00::/', '10.0.0.0/8/30', '10.0.0.0/0x8', '10.0.0.0/ 8', '10.0.0.0/+8', '10.0.0.0/33', 'fe80::1%eth0', 'crm.example.org', '10.0.0.0/-1'])
+      expect(() => new OpenNetworks(bad), bad).toThrow(/WEBHOOK_PRIVATE_NETWORKS/)
+    for (const wide of ['0.0.0.0/0', '10.0.0.0/7', '::/0', 'fc00::/7', '2001:db8::/15']) expect(() => new OpenNetworks(wide), wide).toThrow(/opens too much/)
+    expect(() => new OpenNetworks('')).toThrow(/without networks/)
+    expect(new OpenNetworks('10.0.0.0/8, fd00::/16').entries).toEqual(['10.0.0.0/8', 'fd00::/16'])
+    // The same strictness for the networks closed (any width: closing more is no risk).
+    for (const bad of ['192.0.2.0/', '192.0.2.0/24/30', '192.0.2.0/0x18']) expect(() => parseNetworks(bad, 'WEBHOOK_DENY_NETWORKS'), bad).toThrow(/WEBHOOK_DENY_NETWORKS/)
+    expect(parseNetworks('0.0.0.0/0').check('203.0.113.9', 'ipv4')).toBe(true)
+  })
+
+  it('never opens this host, link-local nor the clouds\' metadata with a wider network, only with an entry that names them (review 10a, third, n°3)', () => {
+    const wide = new OpenNetworks('127.0.0.0/8, 169.0.0.0/8, 100.64.0.0/10, fd00::/16, fe80::/16')
+    // 127.0.0.0/8 names the loopback; fe80::/16 lies within link-local: opened.
+    expect(addressAllowed('127.0.0.1', wide)).toBe(true)
+    expect(addressAllowed('fe80::1', wide)).toBe(true)
+    // Inside the wider ones, what they do not name stays refused: link-local, Alibaba's and AWS's metadata.
+    expect(addressAllowed('169.1.2.3', wide)).toBe(true)
+    expect(addressAllowed('169.254.169.254', wide)).toBe(false)
+    expect(addressAllowed('100.64.0.1', wide)).toBe(true)
+    expect(addressAllowed('100.100.100.200', wide)).toBe(false)
+    expect(addressAllowed('fd00:ec2::254', wide)).toBe(false)
+    expect(addressAllowed('fd00:ec2::253', wide)).toBe(true)
+    // Named: opened.
+    expect(addressAllowed('169.254.169.254', new OpenNetworks('169.254.169.254'))).toBe(true)
+    // Azure's WireServer, a public address: refused even unopened.
+    expect(addressAllowed('168.63.129.16')).toBe(false)
+    expect(addressAllowed('168.63.129.17')).toBe(true)
+    // The networks of a test (a BlockList) open what they hold.
+    expect(addressAllowed('127.0.0.1', parseNetworks('127.0.0.1'))).toBe(true)
+  })
+
+  it('opens networks to one organisation each, a bare list to the default one, whatever the characters of its id (review 10a, second, n°3; third, n°8)', () => {
     const open = parseTenantNetworks('acme=10.20.0.0/16,fd00:1::/64; beta=192.0.2.10 ;acme=10.30.0.1', 'default')
     expect([...open.keys()]).toEqual(['acme', 'beta'])
     expect(addressAllowed('10.20.3.4', open.get('acme'))).toBe(true)
@@ -163,7 +201,14 @@ describe('the addresses a delivery may reach', () => {
     expect([...parseTenantNetworks('10.20.0.0/16', 'default').keys()]).toEqual(['default'])
     expect(parseTenantNetworks(undefined, 'default').size).toBe(0)
     expect(() => parseTenantNetworks('acme=crm.example.org', 'default')).toThrow(/WEBHOOK_PRIVATE_NETWORKS/)
-    expect(() => parseTenantNetworks('a cme=10.0.0.0/8', 'default')).toThrow(/WEBHOOK_PRIVATE_NETWORKS/)
+    expect(() => parseTenantNetworks('acme=', 'default')).toThrow(/without networks/)
+    expect(() => parseTenantNetworks('acme=10.20.0.0/', 'default')).toThrow(/10.20.0.0\//)
+    expect(() => parseTenantNetworks('=10.20.0.0/16', 'default')).toThrow(/names no organisation/)
+    // The ids the token gives: an URN, an address, a space; `;`, `=` and `%` percent-encoded.
+    const ids = parseTenantNetworks('urn:org:acme=10.20.0.0/16;ops@example.org=10.21.0.0/16;a cme=10.22.0.0/16;x%3By%3Dz%25=10.23.0.0/16', 'default')
+    expect([...ids.keys()]).toEqual(['urn:org:acme', 'ops@example.org', 'a cme', 'x;y=z%'])
+    expect(addressAllowed('10.23.0.1', ids.get('x;y=z%'))).toBe(true)
+    expect(() => parseTenantNetworks('50%off=10.0.0.0/8', 'default')).toThrow(/%25/)
   })
 
   it('never reaches what the operator closes, nor the addresses of this host, even inside what it opened', () => {

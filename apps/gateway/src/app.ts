@@ -172,9 +172,11 @@ export interface BuildOptions {
   webhookTenantSendsPerMinute?: number
   /**
    * How long a person's presence stays the same before it is told (default 2 s): a short call is not two
-   * `presence.changed`, only the status it settles on. 0: at once (tests).
+   * `presence.changed`, only the status it settles on. 0: at once (tests). One that keeps changing is told as it is
+   * after webhookPresenceSettleMaxMs all the same (default 10 s).
    */
   webhookPresenceSettleMs?: number
+  webhookPresenceSettleMaxMs?: number
   /**
    * How often the trunks are read for `trunk.degraded` and `trunk.recovered` (step 10a), when the hub is there: every
    * 30 s by default; 0: never. `trunkWatchConfirm`: reads in a row a new health is seen before it is told (default 2).
@@ -399,10 +401,16 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
     }
   })
   // The webhook hub (step 10a, ADR 0020): only with SECRETS_KEY, which keeps the subscriptions' secrets. It tells the
-  // changes of state while the providers' event streams are up (`healthy`): otherwise another Gateway that hears them
-  // takes the lease.
+  // changes of state; a Gateway that hears the events of more tenants (their provider started here, its event stream
+  // up) takes the lease from one that hears fewer. A tenant whose provider has not started here is not heard.
   const hub = options.secretsKey
-    ? new WebhookHub({ store, key: options.secretsKey, healthy: () => [...started.values()].every(p => p.eventsConnected?.() !== false), ...options.webhooks, logger: app.log })
+    ? new WebhookHub({
+        store,
+        key: options.secretsKey,
+        streams: () => registry.tenants().map(tenantId => [tenantId, started.get(tenantId)?.eventsConnected?.() ?? started.has(tenantId)] as const),
+        ...options.webhooks,
+        logger: app.log
+      })
     : undefined
   /** Queues an event for the subscribers; never holds the stream of the provider's events (a database that hangs). */
   const publish = (tenantId: string, event: Parameters<WebhookHub['publish']>[1]) => {
@@ -412,31 +420,41 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
       return 0
     })
   }
-  /** A person's presence, told once if it changed (WebhookHub.publishChange). */
-  const tellPresence = (tenantId: string, userId: string, extension: string | undefined, status: PresenceStatus) =>
+  /**
+   * A person's presence, told once if it changed (WebhookHub.publishChange). `known`: only if something was told of
+   * them before (told again from what this Gateway knows: one never told is written, not told).
+   */
+  const tellPresence = (tenantId: string, userId: string, extension: string | undefined, status: PresenceStatus, known = false) =>
     hub
       ? hub
-          .publishChange(tenantId, `presence:${userId}`, status, ['presence.changed'], (_previous, at) => presenceEvent(tenantId, userId, extension, status, at))
+          .publishChange(tenantId, `presence:${userId}`, status, ['presence.changed'], (previous, at) => (known && previous === undefined ? null : presenceEvent(tenantId, userId, extension, status, at)))
           .catch((err: unknown) => {
             app.log.error({ err, tenantId }, 'webhook presence not queued')
             return null
           })
       : Promise.resolve(null)
   // The presence a person settles on, told once it stayed webhookPresenceSettleMs (not awaited): a call that rings
-  // and ends within it is no change.
+  // and ends within it is no change. One that keeps changing is told as it stands webhookPresenceSettleMaxMs after it
+  // started to.
   const presenceSettleMs = options.webhookPresenceSettleMs ?? 2_000
-  const settling = new Map<string, ReturnType<typeof setTimeout>>()
+  const presenceSettleMaxMs = options.webhookPresenceSettleMaxMs ?? 10_000
+  const settling = new Map<string, { timer: ReturnType<typeof setTimeout>; since: number }>()
   const publishPresence = (tenantId: string, userId: string, extension: string | undefined, status: PresenceStatus) => {
     if (!hub?.leading) return
     if (!presenceSettleMs) return void tellPresence(tenantId, userId, extension, status)
     const k = `${tenantId}\u0000${userId}`
-    clearTimeout(settling.get(k))
-    const timer = setTimeout(() => {
-      settling.delete(k)
-      void tellPresence(tenantId, userId, extension, status)
-    }, presenceSettleMs)
+    const before = settling.get(k)
+    clearTimeout(before?.timer)
+    const since = before?.since ?? Date.now()
+    const timer = setTimeout(
+      () => {
+        settling.delete(k)
+        void tellPresence(tenantId, userId, extension, status)
+      },
+      Math.max(0, Math.min(presenceSettleMs, since + presenceSettleMaxMs - Date.now()))
+    )
     timer.unref()
-    settling.set(k, timer)
+    settling.set(k, { timer, since })
   }
   // Action endpoints (hold, hangup...) legitimately carry no body.
   // The raw text is kept: LiveKit webhooks sign the exact bytes of the body.
@@ -471,6 +489,32 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
     const map = presences.get(tenantId) ?? new Map<string, { userId: string; presence: Presence }>()
     presences.set(tenantId, map)
     return map
+  }
+  /**
+   * What is kept of the presences of a tenant, each extension still that of the person it was heard for (the
+   * directory's word now): an extension given to another person since, or to nobody, is forgotten (its next event
+   * says who has it).
+   */
+  const checkedPresences = async (tenantId: string) => {
+    const map = presencesOf(tenantId)
+    const out: { extension: string; userId: string; status: PresenceStatus }[] = []
+    for (const [extension, { userId, presence }] of [...map]) {
+      const holder = await dir.userIdForExtension(tenantId, extension).catch(() => userId)
+      if (holder !== userId) {
+        if (map.get(extension)?.userId === userId) map.delete(extension)
+        continue
+      }
+      out.push({ extension, userId, status: presence.status })
+    }
+    return out
+  }
+  /** A person erased (or gone): what is kept of their presence goes too, and is never told again. */
+  const forgetPresence = (tenantId: string, userId: string) => {
+    const map = presencesOf(tenantId)
+    for (const [extension, kept] of [...map]) if (kept.userId === userId) map.delete(extension)
+    const k = `${tenantId}\u0000${userId}`
+    clearTimeout(settling.get(k)?.timer)
+    settling.delete(k)
   }
   // Pump provider events to the Twake users they concern, and keep the history of finished calls. A presence is
   // everyone's business in the tenant (the directory shows it); a call is its two parties' only. One event that
@@ -748,6 +792,8 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
   options.directorySync?.onChange(tenantId => {
     const provider = started.get(tenantId)
     if (provider) void restorePresences(tenantId, provider)
+    // Extensions given to someone else, or to nobody: what was heard of them before is forgotten.
+    void checkedPresences(tenantId).catch((err: unknown) => app.log.error({ err, tenantId }, 'presences not checked against the directory'))
   })
   registry.onCreate = (tenantId, provider) => {
     started.set(tenantId, provider)
@@ -819,14 +865,18 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
           logger: app.log
         })
       : undefined
-  // This Gateway tells the changes of state from now on (or hears its events again): what changed while another one
-  // told them (or nobody, the lease lapsing) is told now, each presence it knows compared to what was told. By
+  // This Gateway tells the changes of state from now on (all tenants), or hears the events of some tenants again
+  // (those only): what changed while another one told them (or nobody, the lease lapsing) is told now, each presence
+  // it knows, still of the person it was heard for, compared to what was told. A person of whom nothing was told is
+  // written, not told (nothing changed for the subscribers: they never heard of them, or they were erased). By
   // batches: the API and the queue keep their share of the database meanwhile.
-  hub?.onLead(async () => {
-    const all = [...started.keys()].flatMap(tenantId => [...presencesOf(tenantId)].map(([extension, { userId, presence }]) => ({ tenantId, extension, userId, status: presence.status })))
-    for (let i = 0; i < all.length; i += PRESENCE_BATCH) {
-      if (closing || !hub.leading) return
-      await Promise.all(all.slice(i, i + PRESENCE_BATCH).map(p => tellPresence(p.tenantId, p.userId, p.extension, p.status)))
+  hub?.onLead(async tenants => {
+    for (const tenantId of tenants ?? [...started.keys()]) {
+      const all = await checkedPresences(tenantId)
+      for (let i = 0; i < all.length; i += PRESENCE_BATCH) {
+        if (closing || !hub.leading) return
+        await Promise.all(all.slice(i, i + PRESENCE_BATCH).map(p => tellPresence(tenantId, p.userId, p.extension, p.status, true)))
+      }
     }
   })
   app.addHook('onReady', async () => {
@@ -836,7 +886,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
   })
   app.addHook('onClose', async () => {
     closing = true
-    for (const timer of settling.values()) clearTimeout(timer)
+    for (const { timer } of settling.values()) clearTimeout(timer)
     settling.clear()
     clearInterval(alertPurge)
     trunkWatch?.stop()
@@ -1421,14 +1471,14 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         return records.map(r => publicSubscription(r, domains, hubOf().policy, hubOf().clock()))
       }
       // Tests and replays send a request to the subscriber: 10 a minute per subscription and 30 per organisation,
-      // whatever Gateway or administrator asks (a subscription deleted and made again counts the same); none to a
-      // disabled one (it receives nothing, as the screen says).
-      const sendable = async (tenantId: string, record: WebhookSubscriptionRecord) => {
+      // whatever Gateway or administrator asks (a subscription deleted and made again counts the same), each counted
+      // once accepted, in the transaction that queues it (one refused costs none); none to a disabled one (it
+      // receives nothing, as the screen says).
+      const sendable = (record: WebhookSubscriptionRecord) => {
         if (!record.enabled) throw Object.assign(new Error('This subscription is disabled: enable it first'), { statusCode: 409, code: 'WEBHOOK_DISABLED' })
-        const limit = options.webhookSendsPerMinute ?? WEBHOOK_SENDS_PER_MINUTE
-        if (!(await store.takeWebhookSend(tenantId, record.id, undefined, limit, 60_000, options.webhookTenantSendsPerMinute ?? WEBHOOK_TENANT_SENDS_PER_MINUTE)))
-          throw Object.assign(new Error('Too many deliveries asked of this subscription or organisation, slow down'), { statusCode: 429, code: 'WEBHOOK_RATE' })
       }
+      const quota = { perSubscription: options.webhookSendsPerMinute ?? WEBHOOK_SENDS_PER_MINUTE, perTenant: options.webhookTenantSendsPerMinute ?? WEBHOOK_TENANT_SENDS_PER_MINUTE, windowMs: 60_000 }
+      const rate = () => Object.assign(new Error('Too many deliveries asked of this subscription or organisation, slow down'), { statusCode: 429, code: 'WEBHOOK_RATE' })
       const backlog = () => Object.assign(new Error('This subscription has too many deliveries waiting: let them go first'), { statusCode: 409, code: 'WEBHOOK_BACKLOG' })
       v1.get('/webhooks/domains', async req => {
         const user = await administrator(req)
@@ -1514,10 +1564,11 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
       v1.post<{ Params: { id: string } }>('/webhooks/:id/test', async (req, reply) => {
         const user = await administrator(req)
         const h = hubOf()
-        await sendable(user.tenantId, await subscriptionOf(user.tenantId, req.params.id))
-        const delivery = await h.test(user.tenantId, req.params.id)
+        sendable(await subscriptionOf(user.tenantId, req.params.id))
+        const delivery = await h.test(user.tenantId, req.params.id, quota)
         if (!delivery) throw notFound('webhook subscription')
         if (delivery === 'full') throw backlog()
+        if (delivery === 'rate') throw rate()
         return reply.code(202).send(publicDelivery(delivery))
       })
       // The log of a subscription, the latest first, a page at a time (`next`: the `before` of the next page).
@@ -1545,11 +1596,12 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
       v1.post<{ Params: { id: string; deliveryId: string } }>('/webhooks/:id/deliveries/:deliveryId/replay', async (req, reply) => {
         const user = await administrator(req)
         const h = hubOf()
-        await sendable(user.tenantId, await subscriptionOf(user.tenantId, req.params.id))
-        const replayed = DELIVERY_ID.test(req.params.deliveryId) ? await h.replay(user.tenantId, req.params.id, req.params.deliveryId) : null
+        sendable(await subscriptionOf(user.tenantId, req.params.id))
+        const replayed = DELIVERY_ID.test(req.params.deliveryId) ? await h.replay(user.tenantId, req.params.id, req.params.deliveryId, quota) : null
         if (!replayed) throw notFound('delivery')
         if (replayed === 'pending') throw Object.assign(new Error('This delivery is still pending: it is sent again by itself'), { statusCode: 409, code: 'WEBHOOK_PENDING' })
         if (replayed === 'full') throw backlog()
+        if (replayed === 'rate') throw rate()
         return reply.code(202).send(publicDelivery(replayed))
       })
 
@@ -1559,6 +1611,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
       // which the person sees and erases again, never a log they cannot see.
       v1.delete('/me/history', async (req, reply) => {
         const user = await whoIs(req)
+        forgetPresence(user.tenantId, user.id)
         await store.eraseWebhookSubject(user.tenantId, user.id)
         const deleted = await store.deleteHistory(user.tenantId, user.id)
         return reply.send({ deleted })

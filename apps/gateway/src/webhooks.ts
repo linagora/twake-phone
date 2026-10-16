@@ -1,10 +1,9 @@
 import { randomBytes } from 'node:crypto'
-import type { BlockList } from 'node:net'
 import { WEBHOOK_EVENT_TYPES, WEBHOOK_EVENT_TYPES_LATER, type WebhookEvent, type WebhookEventType } from '@twake/telephony-types'
 import { decrypt } from './crypto.js'
-import { DeliveryError, SIGNATURE_HEADER, destinationAllowed, parseWebhookUrl, postWebhook, signWebhook, type DestinationPolicy, type PostOptions } from './webhook-delivery.js'
+import { DeliveryError, SIGNATURE_HEADER, destinationAllowed, parseWebhookUrl, postWebhook, signWebhook, type AddressSet, type DestinationPolicy, type PostOptions } from './webhook-delivery.js'
 import { randomEventId, type PublishedWebhookEvent } from './webhook-events.js'
-import { WEBHOOK_RETENTION_DAYS, WEBHOOK_STATE_ROLE, type ClaimedDelivery, type Store, type WebhookDeliveryRecord, type WebhookHealth, type WebhookSubscriptionRecord } from './store/types.js'
+import { WEBHOOK_RETENTION_DAYS, WEBHOOK_STATE_ROLE, type ClaimedDelivery, type Store, type WebhookDeliveryRecord, type WebhookHealth, type WebhookSendQuota, type WebhookSubscriptionRecord } from './store/types.js'
 
 /** Attempts of a delivery: the first and 8 retries (the plan), then it is failed. */
 export const WEBHOOK_MAX_ATTEMPTS = 9
@@ -136,11 +135,11 @@ export interface WebhookHubOptions {
   policy?: DestinationPolicy
   /**
    * Networks the operator opens to the deliveries of each organisation (WEBHOOK_PRIVATE_NETWORKS, parseTenantNetworks),
-   * never to the others'. A BlockList alone opens its networks to every one (tests).
+   * never to the others'. One set alone opens its networks to every one (tests).
    */
-  open?: BlockList | ReadonlyMap<string, BlockList>
+  open?: AddressSet | ReadonlyMap<string, AddressSet>
   /** Addresses no delivery reaches (WEBHOOK_DENY_NETWORKS, this host's own). */
-  deny?: BlockList
+  deny?: AddressSet
   /** How deliveries are sent (tests give their own); postWebhook by default. */
   post?: (url: string, body: string, headers: Record<string, string>, opts: PostOptions) => Promise<{ status: number }>
   /** The resolver of postWebhook (tests). */
@@ -157,9 +156,17 @@ export interface WebhookHubOptions {
   perSubscription?: number
   /**
    * Deliveries of one tenant in flight at most, whatever the Gateways (default a quarter of `concurrency`, 4): two
-   * tenants whose subscribers answer slowly hold half of one Gateway at most, never all of it.
+   * tenants whose subscribers answer slowly hold half of one Gateway at most.
    */
   perTenant?: number
+  /**
+   * Places of this Gateway kept for the first delivery in flight of a tenant (default an eighth of `concurrency`, 2;
+   * none below 4): a tenant that holds some takes another only while more are free. However many tenants keep the
+   * others busy with slow subscribers, a tenant with a delivery due is served at the next look at the queue, not when
+   * one of theirs ends. The places free go first to the tenant holding fewest deliveries, then to the one served
+   * least recently (Store.claimWebhookDeliveries): a place that frees goes to a tenant holding none before any other.
+   */
+  reserve?: number
   /** Pending deliveries a subscription has at most (default WEBHOOK_MAX_PENDING). */
   maxPending?: number
   /** How long a delivery taken is held before another Gateway may take it again (default 60 s, beyond a request's bound). */
@@ -180,10 +187,14 @@ export interface WebhookHubOptions {
   /** How long the lease of WEBHOOK_STATE_ROLE is taken for (default 15 s, renewed every third of it). */
   stateLeaseMs?: number
   /**
-   * Whether this Gateway hears what it would tell (the event streams of its providers are up): one that does not
-   * gives the lease to one that does (Store.takeWebhookLease), and tells again what it knows once it hears again.
+   * The tenants whose changes of state this Gateway would tell, and whether it hears their events now (their
+   * provider started, its event stream up). A tenant counts as not heard once its stream stayed down
+   * streamSettleMs, and as heard again once it stayed up as long: then what is known of it, of it only, is told
+   * again. One Gateway that hears more tenants takes the lease from one that hears fewer (Store.takeWebhookLease).
    */
-  healthy?: () => boolean
+  streams?: () => Iterable<readonly [tenantId: string, up: boolean]>
+  /** How long a stream must stay down, or up again, before it counts (default 10 s): one that flaps changes nothing. */
+  streamSettleMs?: number
   /** How often the deliveries past their retention are removed (default every hour). */
   purgeEveryMs?: number
   /** How often the deliveries whose last attempt never came back are failed (default every minute). */
@@ -234,13 +245,18 @@ export class WebhookHub {
   private renewal: Promise<void> | undefined
   /** What onLead's listeners tell under way, awaited by stop() too; another round asked meanwhile. */
   private telling: Promise<void> | undefined
-  private tellPending = false
   /** The database's clock minus this one's (ms): the signatures' `t` only (the queue is dated by the database). */
   private skew = 0
   private skewRead = false
   private leads = false
-  private heard = true
-  private readonly leadListeners: (() => void | Promise<void>)[] = []
+  /** When this Gateway may write the changes of state (this clock reckoned on the database's): the lease's `writeFrom`. */
+  private writableAt = Infinity
+  private writableTimer: ReturnType<typeof setTimeout> | undefined
+  /** Whether each tenant's events are heard (streams), with the state of its stream now and since when. */
+  private readonly streamHealth = new Map<string, { heard: boolean; up: boolean; since: number }>()
+  private readonly leadListeners: ((tenants?: readonly string[]) => void | Promise<void>)[] = []
+  /** The tenants whose changes are to be told again (all of them: 'all'), while a round runs. */
+  private tellPending: Set<string> | 'all' | undefined
   /** The events being queued, and those waiting to be (publish, publishChange): bounded. */
   private publishing = 0
   private readonly publishWaiting: (() => void)[] = []
@@ -269,6 +285,11 @@ export class WebhookHub {
     return this.options.perTenant ?? Math.max(1, Math.floor(this.concurrency / 4))
   }
 
+  /** Places of this Gateway kept for a tenant that has none in flight. */
+  get reserve() {
+    return this.options.reserve ?? (this.concurrency >= 4 ? Math.max(1, Math.floor(this.concurrency / 8)) : 0)
+  }
+
   useLogger(logger: Logger) {
     this.logger = logger
   }
@@ -284,18 +305,50 @@ export class WebhookHub {
 
   /**
    * Whether this Gateway tells the changes of state (presences, trunks) of every tenant now: it holds the lease of
-   * WEBHOOK_STATE_ROLE. The others hear the same changes and leave them to it.
+   * WEBHOOK_STATE_ROLE, and what the Gateway that held it before could still write is done. The others hear the same
+   * changes and leave them to it.
    */
   get leading() {
-    return this.leads
+    return this.leads && this.clock() >= this.writableAt
   }
 
   /**
-   * `listener` runs each time this Gateway takes the lease, and when it hears its events again while it holds it
-   * (the app tells then what changed meanwhile). Awaited: one renewal at a time.
+   * `listener` runs each time this Gateway starts telling the changes (`tenants` undefined: all of them), and when
+   * it hears the events of some tenants again while it tells (`tenants`: those): the app tells then what changed
+   * meanwhile. One round at a time, apart from the renewals.
    */
-  onLead(listener: () => void | Promise<void>) {
+  onLead(listener: (tenants?: readonly string[]) => void | Promise<void>) {
     this.leadListeners.push(listener)
+  }
+
+  /**
+   * How many tenants this Gateway hears (streams), and those it hears again since the last renewal: a stream counts
+   * as down, or up again, once it stayed so streamSettleMs. Said in the log when a tenant changes.
+   */
+  private hearing(): { heard: number; again: string[] } {
+    const streams = this.options.streams?.()
+    if (!streams) return { heard: 0, again: [] }
+    const settle = this.options.streamSettleMs ?? 10_000
+    const now = this.now()
+    const seen = new Set<string>()
+    const again: string[] = []
+    let heard = 0
+    for (const [tenantId, up] of streams) {
+      seen.add(tenantId)
+      let h = this.streamHealth.get(tenantId)
+      if (!h) this.streamHealth.set(tenantId, (h = { heard: true, up, since: now }))
+      if (h.up !== up) Object.assign(h, { up, since: now })
+      if (h.heard !== h.up && now - h.since >= settle) {
+        h.heard = h.up
+        if (h.heard) {
+          again.push(tenantId)
+          this.logger.info({ tenantId }, 'webhook changes of state: the events of this tenant are heard again')
+        } else this.logger.warn({ tenantId }, 'webhook changes of state: the events of this tenant are not heard')
+      }
+      if (h.heard) heard++
+    }
+    for (const k of [...this.streamHealth.keys()]) if (!seen.has(k)) this.streamHealth.delete(k)
+    return { heard, again }
   }
 
   /**
@@ -322,40 +375,57 @@ export class WebhookHub {
     try {
       await this.readClock()
       if (this.closed) return
-      const healthy = this.options.healthy?.() ?? true
-      const held = await this.store.takeWebhookLease(WEBHOOK_STATE_ROLE, this.holder, this.stateLeaseMs, healthy)
-      // Stopped meanwhile: the lease it renewed is given back (stop() waits for this renewal).
-      if (this.closed) return
-      const gained = held && !this.leads
-      const heardAgain = held && !gained && healthy && !this.heard
-      this.leads = held
-      this.heard = healthy
-      if (gained) this.logger.info({ holder: this.holder, healthy }, 'webhook changes of state told by this Gateway')
-      if (heardAgain) this.logger.info({ holder: this.holder }, 'webhook changes of state heard again: what is known is told')
-      // Told apart from the renewal (which goes on every third of the lease meanwhile, however long this takes).
-      if (gained || heardAgain) this.tellAgain()
+      const { heard, again } = this.hearing()
+      const lease = await this.store.takeWebhookLease(WEBHOOK_STATE_ROLE, this.holder, this.stateLeaseMs, heard)
+      // Stopped meanwhile: a lease it took or renewed is given back (stop() waits for this renewal and reads `leads`).
+      if (this.closed) {
+        this.leads = !!lease
+        return
+      }
+      const gained = !!lease && !this.leads
+      this.leads = !!lease
+      if (!lease) {
+        this.writableAt = Infinity
+        clearTimeout(this.writableTimer)
+        return
+      }
+      this.writableAt = Date.parse(lease.writeFrom)
+      if (gained) {
+        this.logger.info({ holder: this.holder, heard, from: lease.writeFrom }, 'webhook changes of state told by this Gateway')
+        // What it knows is told once it may write (what the previous holder was writing done), apart from the renewal.
+        clearTimeout(this.writableTimer)
+        const wait = this.writableAt - this.clock()
+        if (wait > 0) {
+          this.writableTimer = setTimeout(() => this.tellAgain(), wait)
+          this.writableTimer.unref()
+        } else this.tellAgain()
+      } else if (again.length && this.leading) this.tellAgain(again)
     } catch (err) {
       this.leads = false
+      this.writableAt = Infinity
       this.logger.error({ err }, 'webhook lease not renewed')
     }
   }
 
-  /** Runs the listeners of onLead, one round at a time (another asked meanwhile runs after it). */
-  private tellAgain() {
-    if (this.telling) {
-      this.tellPending = true
-      return
-    }
+  /**
+   * Runs the listeners of onLead for `tenants` (all of them when undefined), one round at a time: those asked
+   * meanwhile run in the next round.
+   */
+  private tellAgain(tenants?: readonly string[]) {
+    const pending = this.tellPending
+    this.tellPending = pending === 'all' || !tenants ? 'all' : new Set([...(pending ?? []), ...tenants])
+    if (this.telling) return
     this.telling = (async () => {
-      do {
-        this.tellPending = false
+      while (this.tellPending) {
+        const round = this.tellPending
+        this.tellPending = undefined
         for (const listener of this.leadListeners) {
-          if (this.closed || !this.leads) return
+          if (this.closed || !this.leading) return
           await Promise.resolve()
-            .then(listener)
+            .then(() => listener(round === 'all' ? undefined : [...round]))
             .catch((err: unknown) => this.logger.error({ err }, 'webhook changes of state not told again'))
         }
-      } while (this.tellPending)
+      }
     })().finally(() => (this.telling = undefined))
   }
 
@@ -468,21 +538,21 @@ export class WebhookHub {
   /**
    * Queues a `webhook.test` for one subscription (whatever events it takes), and lifts its pause (an administrator
    * who repaired the subscriber checks it now, not in an hour): the delivery, `full` when it has WEBHOOK_MAX_PENDING
-   * waiting already, or null if it has none of that id.
+   * waiting already, `rate` when `quota` is used up, or null if it has none of that id.
    */
-  async test(tenantId: string, subscriptionId: string) {
+  async test(tenantId: string, subscriptionId: string, quota?: WebhookSendQuota) {
     const event: WebhookEvent = { id: randomEventId(), type: 'webhook.test', occurred_at: this.iso(), tenant: tenantId, subscription: subscriptionId }
-    const delivery = await this.store.enqueueWebhookDelivery(tenantId, subscriptionId, event.id, event.type, JSON.stringify(event), undefined, this.options.maxPending ?? WEBHOOK_MAX_PENDING)
-    if (delivery && delivery !== 'full') await this.unpause(tenantId, subscriptionId)
+    const delivery = await this.store.enqueueWebhookDelivery(tenantId, subscriptionId, event.id, event.type, JSON.stringify(event), undefined, this.options.maxPending ?? WEBHOOK_MAX_PENDING, quota)
+    if (delivery && typeof delivery !== 'string') await this.unpause(tenantId, subscriptionId)
     return delivery
   }
 
   /**
    * Sends a delivery again (Store.replayWebhookDelivery), lifting its subscription's pause as a test does: the
-   * delivery, `pending` (it still is), `full`, or null.
+   * delivery, `pending` (it still is), `full`, `rate`, or null.
    */
-  async replay(tenantId: string, subscriptionId: string, id: string) {
-    const replayed = await this.store.replayWebhookDelivery(tenantId, subscriptionId, id, undefined, this.options.maxPending ?? WEBHOOK_MAX_PENDING)
+  async replay(tenantId: string, subscriptionId: string, id: string, quota?: WebhookSendQuota) {
+    const replayed = await this.store.replayWebhookDelivery(tenantId, subscriptionId, id, undefined, this.options.maxPending ?? WEBHOOK_MAX_PENDING, quota)
     if (replayed && typeof replayed !== 'string') await this.unpause(tenantId, subscriptionId)
     return replayed
   }
@@ -545,9 +615,11 @@ export class WebhookHub {
     clearInterval(this.purgeTimer)
     clearInterval(this.sweepTimer)
     clearInterval(this.leaseTimer)
+    clearTimeout(this.writableTimer)
     await this.renewal
     const led = this.leads
     this.leads = false
+    this.writableAt = Infinity
     await this.telling
     if (led) await this.store.takeWebhookLease(WEBHOOK_STATE_ROLE, this.holder, 0).catch(() => undefined)
     while (this.inflight.size || this.running) await Promise.allSettled([...this.inflight, new Promise(r => setTimeout(r, 10))])
@@ -586,6 +658,7 @@ export class WebhookHub {
         const claimed = await this.store.claimWebhookDeliveries(room, {
           perSubscription: this.options.perSubscription ?? 2,
           perTenant: this.perTenant,
+          reserve: this.reserve,
           maxAttempts: this.maxAttempts,
           leaseMs: this.leaseMs
         })
@@ -615,7 +688,7 @@ export class WebhookHub {
   }
 
   /** The networks the operator opened to the deliveries of `tenantId`. */
-  private openTo(tenantId: string): BlockList | undefined {
+  private openTo(tenantId: string): AddressSet | undefined {
     const open = this.options.open
     if (!open) return undefined
     return 'check' in open ? open : open.get(tenantId)

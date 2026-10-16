@@ -1,4 +1,4 @@
-import { clampLimit, isDeclined, isMissed, type HistoryEntry, type HistoryPage, type HistoryQuery, type ConferenceRecord, type AlertRecord, type AlertQuery, type DidRecord, type OutboundHand, type OutboundRecord, type OutboundRules, ALERT_DEDUP_MS, alertKey, type ProviderRecord, type StoredAlert, type PushSaveResult, type PushSubscriptionRecord, type Store, type TrunkRecord, type UserMapping, type UserPresenceRecord, type VapidKeysRecord, type ClaimedDelivery, type WebhookAttemptResult, type WebhookClaimCaps, type WebhookClaimTime, allocateClaims, type WebhookDeliveryQuery, type WebhookDeliveryRecord, type WebhookQueueOptions, type WebhookStateChange, type WebhookStateEvent, type WebhookSubscriptionRecord, WEBHOOK_STATE_ROLE } from './types.js'
+import { clampLimit, isDeclined, isMissed, type HistoryEntry, type HistoryPage, type HistoryQuery, type ConferenceRecord, type AlertRecord, type AlertQuery, type DidRecord, type OutboundHand, type OutboundRecord, type OutboundRules, ALERT_DEDUP_MS, alertKey, type ProviderRecord, type StoredAlert, type PushSaveResult, type PushSubscriptionRecord, type Store, type TrunkRecord, type UserMapping, type UserPresenceRecord, type VapidKeysRecord, type ClaimedDelivery, type WebhookAttemptResult, type WebhookClaimCaps, type WebhookClaimTime, allocateClaims, type WebhookDeliveryQuery, type WebhookLease, type WebhookSendQuota, type WebhookDeliveryRecord, type WebhookQueueOptions, type WebhookStateChange, type WebhookStateEvent, type WebhookSubscriptionRecord, WEBHOOK_STATE_ROLE } from './types.js'
 import type { WebhookEventType } from '@twake/telephony-types'
 import { randomBytes } from 'node:crypto'
 import { EMPTY_OUTBOUND, outboundVersion, staleOutbound } from '../outbound.js'
@@ -40,7 +40,9 @@ export class MemoryStore implements Store {
   private deliveries: MemoryDelivery[] = []
   private webhookState = new Map<string, { state: string; since: string }>()
   private webhookSends = new Map<string, { subscriptionId: string; at: number }[]>()
-  private leases = new Map<string, { holder: string; until: number; healthy: boolean }>()
+  private leases = new Map<string, { holder: string; until: number; heard: number; writeFrom: number; writeUntil: number }>()
+  /** When deliveries were last taken of each subscription (claimWebhookDeliveries). */
+  private claimedAt = new Map<string, string>()
 
   constructor(private readonly now: () => number = Date.now) {}
 
@@ -429,18 +431,23 @@ export class MemoryStore implements Store {
     this.webhooks = this.webhooks.filter(w => !(w.tenantId === tenantId && w.id === id))
     if (this.webhooks.length === before) return false
     this.deliveries = this.deliveries.filter(d => d.subscriptionId !== id)
+    this.claimedAt.delete(id)
     // Its sends are kept (a subscription deleted and made again counts the same).
     return true
   }
 
-  async takeWebhookSend(tenantId: string, subscriptionId: string, at: string | undefined, limit: number, windowMs: number, tenantLimit?: number) {
-    if (!this.webhooks.some(w => w.tenantId === tenantId && w.id === subscriptionId)) return false
+  /** Whether a test or a replay may be sent now under `quota`; what is older than the window goes first. */
+  private sendAllowed(tenantId: string, subscriptionId: string, at: string | undefined, quota: WebhookSendQuota) {
     const t = Date.parse(this.at(at))
-    const recent = (this.webhookSends.get(tenantId) ?? []).filter(x => x.at > t - windowMs)
+    const recent = (this.webhookSends.get(tenantId) ?? []).filter(x => x.at > t - quota.windowMs)
     this.webhookSends.set(tenantId, recent)
-    if (recent.filter(x => x.subscriptionId === subscriptionId).length >= limit || (tenantLimit !== undefined && recent.length >= tenantLimit)) return false
-    recent.push({ subscriptionId, at: t })
-    return true
+    return recent.filter(x => x.subscriptionId === subscriptionId).length < quota.perSubscription && (quota.perTenant === undefined || recent.length < quota.perTenant)
+  }
+
+  private countSend(tenantId: string, subscriptionId: string, at: string | undefined) {
+    const recent = this.webhookSends.get(tenantId) ?? []
+    recent.push({ subscriptionId, at: Date.parse(this.at(at)) })
+    this.webhookSends.set(tenantId, recent)
   }
 
   async getWebhookDomains(tenantId: string) {
@@ -500,10 +507,13 @@ export class MemoryStore implements Store {
     return queued
   }
 
-  async enqueueWebhookDelivery(tenantId: string, subscriptionId: string, eventId: string, eventType: string, body: string, at: string | undefined, maxPending?: number) {
+  async enqueueWebhookDelivery(tenantId: string, subscriptionId: string, eventId: string, eventType: string, body: string, at: string | undefined, maxPending?: number, quota?: WebhookSendQuota) {
     if (!this.webhooks.some(w => w.tenantId === tenantId && w.id === subscriptionId)) return null
     if (maxPending !== undefined && this.pendingOf(subscriptionId) >= maxPending) return 'full' as const
-    return this.queue(tenantId, subscriptionId, eventId, eventType, body, this.at(at))
+    if (quota && !this.sendAllowed(tenantId, subscriptionId, at, quota)) return 'rate' as const
+    const queued = this.queue(tenantId, subscriptionId, eventId, eventType, body, this.at(at))
+    if (queued && quota) this.countSend(tenantId, subscriptionId, at)
+    return queued
   }
 
   async claimWebhookDeliveries(limit: number, caps: WebhookClaimCaps, at?: WebhookClaimTime) {
@@ -514,14 +524,12 @@ export class MemoryStore implements Store {
     const leaseUntil = at?.leaseUntil ?? new Date(t + (caps.leaseMs ?? 60_000)).toISOString()
     const due = (d: MemoryDelivery) => d.status === 'pending' && d.nextAttemptAt !== undefined && Date.parse(d.nextAttemptAt) <= t && d.attempts < caps.maxAttempts
     const byDue = (a: MemoryDelivery, b: MemoryDelivery) => Date.parse(a.nextAttemptAt!) - Date.parse(b.nextAttemptAt!) || (a.id < b.id ? -1 : 1)
-    // The enabled subscriptions not paused that have one due, the earliest due first (as the database orders them).
+    // The enabled subscriptions not paused that have one due.
     const first = new Map<string, MemoryDelivery>()
     for (const d of this.deliveries.filter(due).sort(byDue)) if (!first.has(d.subscriptionId)) first.set(d.subscriptionId, d)
     const ready = this.webhooks
       .filter(w => first.has(w.id) && w.enabled && !(w.pausedUntil && Date.parse(w.pausedUntil) > t))
-      .sort((a, b) => byDue(first.get(a.id)!, first.get(b.id)!) || (a.id < b.id ? -1 : 1))
-      .map(w => ({ id: w.id, tenantId: w.tenantId }))
-    const tenants = [...new Set(ready.map(r => r.tenantId))]
+      .map(w => ({ id: w.id, tenantId: w.tenantId, dueAt: first.get(w.id)!.nextAttemptAt!, ...(this.claimedAt.has(w.id) ? { claimedAt: this.claimedAt.get(w.id)! } : {}) }))
     // What all Gateways hold: taken, its lease running.
     const held = new Map<string, { tenantId: string; subscriptionId: string; n: number }>()
     for (const d of this.deliveries)
@@ -531,8 +539,9 @@ export class MemoryStore implements Store {
         held.set(d.subscriptionId, h)
       }
     const out: ClaimedDelivery[] = []
-    for (const { subscriptionId, n } of allocateClaims(limit, caps, tenants, ready, [...held.values()])) {
+    for (const { subscriptionId, n } of allocateClaims(limit, caps, ready, [...held.values()])) {
       const w = this.webhooks.find(x => x.id === subscriptionId)!
+      this.claimedAt.set(subscriptionId, now)
       const previous = w.secretPrevEnc && w.secretPrevUntil && Date.parse(w.secretPrevUntil) > t ? { secretPrevEnc: w.secretPrevEnc } : {}
       for (const d of this.deliveries.filter(x => x.subscriptionId === subscriptionId && due(x)).sort(byDue).slice(0, n)) {
         d.attempts++
@@ -597,14 +606,16 @@ export class MemoryStore implements Store {
       .map(d => this.record(d))
   }
 
-  async replayWebhookDelivery(tenantId: string, subscriptionId: string, id: string, at?: string, maxPending?: number) {
+  async replayWebhookDelivery(tenantId: string, subscriptionId: string, id: string, at?: string, maxPending?: number, quota?: WebhookSendQuota) {
     const d = this.deliveries.find(x => x.tenantId === tenantId && x.subscriptionId === subscriptionId && x.id === id)
     // One its person asked to erase is not sent again (its body is gone).
     if (!d || d.eraseBody) return null
     if (d.status === 'pending') return 'pending' as const
     if (maxPending !== undefined && this.pendingOf(subscriptionId) >= maxPending) return 'full' as const
+    if (quota && !this.sendAllowed(tenantId, subscriptionId, at, quota)) return 'rate' as const
     Object.assign(d, { status: 'pending', attempts: 0, nextAttemptAt: this.at(at) })
     for (const k of ['claim', 'lastError', 'lastStatus', 'deliveredAt'] as const) delete d[k]
+    if (quota) this.countSend(tenantId, subscriptionId, at)
     return this.record(d)
   }
 
@@ -628,7 +639,8 @@ export class MemoryStore implements Store {
 
   async setWebhookState(change: WebhookStateChange, event: WebhookStateEvent, options?: WebhookQueueOptions) {
     const lease = this.leases.get(WEBHOOK_STATE_ROLE)
-    if (!lease || lease.holder !== change.holder || lease.until <= this.now()) return null
+    const now = this.now()
+    if (!lease || lease.holder !== change.holder || lease.writeFrom > now || lease.writeUntil <= now) return null
     const k = key(change.tenantId, change.subject)
     const before = this.webhookState.get(k)
     // On its own clock, later than what was told (as the database's, to the microsecond, never goes back).
@@ -641,12 +653,18 @@ export class MemoryStore implements Store {
     return { previous: before?.state, queued }
   }
 
-  async takeWebhookLease(role: string, holder: string, ms: number, healthy = true) {
+  async takeWebhookLease(role: string, holder: string, ms: number, heard = 0): Promise<WebhookLease | null> {
     const now = this.now()
     const lease = this.leases.get(role)
-    if (lease && lease.holder !== holder && lease.until > now && !(healthy && !lease.healthy)) return false
-    this.leases.set(role, { holder, until: now + ms, healthy })
-    return true
+    if (ms <= 0) {
+      if (lease?.holder === holder) Object.assign(lease, { until: Math.min(lease.until, now), writeUntil: Math.min(lease.writeUntil, now) })
+      return null
+    }
+    if (lease && lease.holder !== holder && lease.until > now && !(heard > lease.heard)) return null
+    const margin = Math.floor(ms / 3)
+    const writeFrom = !lease ? now : lease.holder === holder ? lease.writeFrom : Math.max(now, Math.min(lease.writeUntil, now) + margin)
+    this.leases.set(role, { holder, until: now + ms, heard, writeFrom, writeUntil: now + ms - margin })
+    return { writeFrom: new Date(writeFrom).toISOString() }
   }
 
   async listWebhookStates(tenantId: string, prefix: string) {

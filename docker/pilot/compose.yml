@@ -239,7 +239,7 @@ services:
       # (acme=10.20.0.0/16;beta=192.0.2.0/24; a bare CIDR list is DEFAULT_TENANT's). None by default: a domain that
       # resolves to a private address is refused at each delivery.
       WEBHOOK_PRIVATE_NETWORKS:
-      # The ports a webhook URL may name (443,80 by default; 0 never).
+      # The ports a webhook URL may name, whatever its scheme (by default its scheme's: 443 in https, 80 in http; 0 never).
       WEBHOOK_PORTS:
       # The platform's public addresses a webhook must never reach, even inside the networks above (its entry point,
       # services that trust this host's address); the addresses of this host's own interfaces are always refused.
