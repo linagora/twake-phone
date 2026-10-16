@@ -120,6 +120,25 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(cfg).toContain('$acc_extra(via) = "meet";')
   })
 
+  it('makes the reads a call cannot go without again, synchronously, when OpenSIPS dropped them (past db_max_async_connections: -1), and never a read that changes what it reads', () => {
+    const { cfg } = render({ MEET_SIP: '192.0.2.20:5080', MEET_SIP_PASSWORD: 'not-a-real-secret-0' })
+    const section = (name: string, next: string) => cfg.slice(cfg.indexOf(`\n${name} {`), cfg.indexOf(`\n${next} {`))
+    // The direct number of a call from the operator: a burst of them past the cap answered 404 (the CI, step 8a).
+    expect(section('route[trunk_in]', 'route[inbound_number]')).toContain('$avp(did_query) = $var(did_query);\n\tasync(sql_query_one("$var(did_query)", "$avp(did_target);')
+    const din = section('route[trunk_in_loaded]', 'route[did_fallback]')
+    expect(din).toContain('if ($var(did_rc) == -1 && route(read_again)) {\n\t\tsql_query_one("$avp(did_query)", "$avp(did_target);$avp(t_codecs);$avp(fb_target);$avp(fb_kind);$avp(fb_members);$avp(did_assigned)");\n\t\t$var(did_rc) = $rc;\n\t}')
+    expect(din.indexOf('route(read_again)')).toBeLessThan(din.indexOf('t_reply(404, "Not Found");'))
+    // The trunk of a call to the operator, likewise, before it is told there is none.
+    expect(section('route[trunk_out]', 'route[trunk_out_loaded]')).toContain('$avp(trunk_query) = $var(trunk_query);\n\tasync(sql_query_one("$var(trunk_query)",')
+    const tout = section('route[trunk_out_loaded]', 'route[trunk_out_send]')
+    expect(tout).toContain('if ($var(trunk_rc) == -1 && route(read_again)) {\n\t\tsql_query_one("$avp(trunk_query)", "$avp(t_setid);')
+    expect(tout.indexOf('route(read_again)')).toBeLessThan(tout.indexOf('if ($var(trunk_rc) == -2) {'))
+    // twake_outbound() reserves minutes, a grant is taken once: neither is made twice.
+    expect(section('route[outbound_loaded]', 'route[outbound_rights]')).not.toContain('read_again')
+    expect(section('route[meet_source_loaded]', 'route[conference_leg]')).not.toContain('read_again')
+    expect(cfg.match(/route\(read_again\)/g)).toHaveLength(2)
+  })
+
   it("sends a conference's room call (step 8b) where its grant says, as it says, and nowhere else; no phone writes what only this script does", () => {
     const { cfg } = render({ SIP_DOMAIN: 'sip.example.test', MEET_SIP: '192.0.2.20:5080', MEET_SIP_PASSWORD: 'not-a-real-secret-0' })
     const section = (name: string, next: string) => cfg.slice(cfg.indexOf(`\n${name} {`), cfg.indexOf(`\n${next} {`))
@@ -319,8 +338,9 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     // step 8). Two synchronous queries ask the catalog whether the tables
     // of step 4c, or that of step 5, exist, only after a read failed, from the routes that resume a read; two more read
     // the default trunk and the direct numbers on it every 15 s, in a timer of its own, never in a call (an emergency
-    // call's fallback when the trunk of the call cannot be read, with its caller's own number).
-    expect(cfg.match(/sql_query/g)).toHaveLength(14)
+    // call's fallback when the trunk of the call cannot be read, with its caller's own number). The last two make the
+    // direct number's and the trunk's reads again, synchronously, when OpenSIPS dropped them (route[read_again]).
+    expect(cfg.match(/sql_query/g)).toHaveLength(16)
     expect(cfg.match(/async\(sql_query/g)).toHaveLength(10)
     const timer = cfg.slice(cfg.indexOf('\ntimer_route[default_trunk, 15] {'), cfg.indexOf('\nroute[emergency_failed] {'))
     expect(timer.match(/sql_query(_one)?\(/g)).toHaveLength(2)

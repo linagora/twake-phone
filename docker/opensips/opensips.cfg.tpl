@@ -34,7 +34,10 @@ tcp_workers=4
 tcp_connection_lifetime=3605
 # Each SIP process opens a database connection per asynchronous read in flight (the call rules, below) and keeps it
 # for the next ones: at most 3 per process (6 processes, 18 connections to the database the Gateway uses too). Past
-# that, a read runs synchronously in the process, bounded by RULES_QUERY_TIMEOUT_MS like the others.
+# that, OpenSIPS 3.6 runs the read synchronously but drops its result: the read fails (-1), its row never read. The
+# reads a call cannot go without (the direct number of a call from the operator, the trunk of a call to it) are made
+# again then, synchronously, bounded by RULES_QUERY_TIMEOUT_MS like the others (route[read_again]); the others go as a
+# failed read does (route[read_failed]). twake_outbound() and a room's grant change what they read: never made twice.
 db_max_async_connections=3
 
 auto_aliases=no
@@ -1109,7 +1112,9 @@ route[trunk_out] {
 	$var(called) = "";
 	if ($avp(callee) =~ "^\+?[0-9]{2,16}$")
 		$var(called) = $avp(callee);
+	$(avp(trunk_query)[*]) = NULL;
 	$var(trunk_query) = "SELECT t.setid, t.domain, t.number_format, t.assert_identity, t.auth_username, t.auth_password, t.auth_realm, t.codec_flags, coalesce(d.number, t.default_number) AS presented, t.allowed, t.countries, (SELECT CASE WHEN i.suffix_digits > 0 THEN right('" + $var(called) + "', i.suffix_digits) ELSE i.target END FROM dids i WHERE length(i.first_number) = length('" + $var(called) + "') AND '" + $var(called) + "' BETWEEN i.first_number AND i.last_number ORDER BY i.suffix_digits LIMIT 1) AS internal FROM trunks t LEFT JOIN LATERAL (SELECT CASE WHEN x.suffix_digits > 0 THEN left(x.first_number, length(x.first_number) - x.suffix_digits) || '" + $var(ext) + "' ELSE x.first_number END AS number FROM dids x WHERE x.trunk_id = t.id AND ((x.suffix_digits = 0 AND x.target = '" + $var(ext) + "') OR (x.suffix_digits = length('" + $var(ext) + "') AND left(x.first_number, length(x.first_number) - x.suffix_digits) || '" + $var(ext) + "' BETWEEN x.first_number AND x.last_number)) ORDER BY x.suffix_digits, x.first_number LIMIT 1) d ON true ORDER BY (d.number IS NULL), t.position LIMIT 1";
+	$avp(trunk_query) = $var(trunk_query);
 	async(sql_query_one("$var(trunk_query)", "$avp(t_setid);$avp(t_domain);$avp(t_format);$avp(t_pai);$avp(t_user);$avp(t_pass);$avp(t_realm);$avp(t_codecs);$avp(t_presented);$avp(t_allowed);$avp(t_countries);$avp(t_internal)"), trunk_out_loaded);
 }
 
@@ -1193,6 +1198,10 @@ route[trunk_out_loaded] {
 	if (t_was_cancelled()) {
 		t_reply(487, "Request Terminated");
 		exit;
+	}
+	if ($var(trunk_rc) == -1 && route(read_again)) {
+		sql_query_one("$avp(trunk_query)", "$avp(t_setid);$avp(t_domain);$avp(t_format);$avp(t_pai);$avp(t_user);$avp(t_pass);$avp(t_realm);$avp(t_codecs);$avp(t_presented);$avp(t_allowed);$avp(t_countries);$avp(t_internal)");
+		$var(trunk_rc) = $rc;
 	}
 	if ($var(trunk_rc) == -2) {
 		# No trunk at all: the caller is told to call an emergency number from another phone.
@@ -1780,6 +1789,7 @@ route[trunk_in] {
 	$var(dnd_sql) = "SELECT 1 FROM call_rules r WHERE r.extension = ";
 	$var(dnd_now) = " AND r.dnd AND (r.dnd_until IS NULL OR r.dnd_until > now())";
 	$var(did_query) = "SELECT x.target, x.codecs, x.fb, CASE WHEN EXISTS (SELECT 1 FROM subscriber s WHERE s.username = x.fb) THEN CASE WHEN EXISTS (" + $var(dnd_sql) + "x.fb" + $var(dnd_now) + ") THEN '' ELSE 'extension' END WHEN EXISTS (SELECT 1 FROM call_groups g WHERE g.number = x.fb) THEN 'group' ELSE '' END, coalesce((SELECT string_agg(m.ext, '|' ORDER BY m.pos) FROM call_groups g CROSS JOIN LATERAL unnest(g.members) WITH ORDINALITY AS m(ext, pos) WHERE g.number = x.fb AND m.ext ~ '^[A-Za-z0-9._+-]{1,64}$' AND NOT EXISTS (" + $var(dnd_sql) + "m.ext" + $var(dnd_now) + ")), ''), CASE WHEN EXISTS (SELECT 1 FROM subscriber s WHERE s.username = x.target) OR EXISTS (SELECT 1 FROM call_groups g WHERE g.number = x.target) THEN 1 ELSE 0 END FROM (SELECT CASE WHEN d.suffix_digits > 0 THEN right(n.num, d.suffix_digits) ELSE d.target END AS target, t.codec_flags AS codecs, coalesce(nullif(d.fallback, ''), t.fallback) AS fb FROM (VALUES (CASE WHEN EXISTS (SELECT 1 FROM trunks b WHERE b.reg_aor <> '' AND b.auth_username = '" + $var(ru_user) + "') THEN 3 ELSE 1 END, '" + $var(n1) + "'), (2, '" + $var(n2) + "')) AS n(o, num) JOIN dids d ON length(d.first_number) = length(n.num) AND n.num BETWEEN d.first_number AND d.last_number JOIN trunks t ON t.id = d.trunk_id ORDER BY n.o, d.suffix_digits LIMIT 1) x";
+	$avp(did_query) = $var(did_query);
 	async(sql_query_one("$var(did_query)", "$avp(did_target);$avp(t_codecs);$avp(fb_target);$avp(fb_kind);$avp(fb_members);$avp(did_assigned)"), trunk_in_loaded);
 }
 
@@ -1803,6 +1813,10 @@ route[trunk_in_loaded] {
 	if (t_was_cancelled()) {
 		t_reply(487, "Request Terminated");
 		exit;
+	}
+	if ($var(did_rc) == -1 && route(read_again)) {
+		sql_query_one("$avp(did_query)", "$avp(did_target);$avp(t_codecs);$avp(fb_target);$avp(fb_kind);$avp(fb_members);$avp(did_assigned)");
+		$var(did_rc) = $rc;
 	}
 	if ($var(did_rc) < 0 && $var(did_rc) != -2)
 		xlog("L_WARN", "call $ci: direct numbers not read ($var(did_rc))\n");
@@ -2099,6 +2113,15 @@ route[caller_name] {
 route[tables_4c] {
 	if ($shv(no4c_until) > $Ts)
 		return(-1);
+	return(1);
+}
+
+# A read the call cannot go without (route[trunk_in], route[trunk_out]) that failed (-1): 1 to make it again, once,
+# synchronously. Past db_max_async_connections in this process, OpenSIPS 3.6 ran it but dropped its row (a burst of
+# calls from the operator: the direct number of one of them not found, 404); a database that fails it costs one
+# RULES_QUERY_TIMEOUT_MS more. Only for a SELECT: what it reads, it does not change.
+route[read_again] {
+	xlog("L_NOTICE", "call $ci: a read failed (-1, past db_max_async_connections or the database): made again\n");
 	return(1);
 }
 
