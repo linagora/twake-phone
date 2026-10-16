@@ -50,7 +50,8 @@ export const SUBSCRIBED_EVENTS = [
   'E_FRD_CRITICAL',
   'E_TWAKEPHONE_LIMIT',
   'E_TWAKEPHONE_RIGHTS',
-  'E_TWAKEPHONE_EMERGENCY'
+  'E_TWAKEPHONE_EMERGENCY',
+  'E_TWAKEPHONE_PIN'
 ]
 
 // Everything OpenSIPS-specific stays inside this package: the Gateway and the app only see the provider contract.

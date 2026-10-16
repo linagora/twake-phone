@@ -112,6 +112,21 @@ export class LiveKitConferenceBridge implements ConferenceBridgeProvider {
   }
 
   /**
+   * The inbound trunk this process keeps, if LiveKit still lists it; written again otherwise (its Redis emptied, the
+   * trunk deleted by hand). LiveKit takes a dispatch rule on a trunk it no longer has (no not_found, second review
+   * n°3): without this, the rules made on it would let nobody in until the Gateway restarts.
+   */
+  private async liveInbound(): Promise<string> {
+    const cached = this.inboundTrunkId
+    if (!cached) return this.ensureInbound()
+    const trunk = await cached
+    const list = await this.api.call<{ items?: { sip_trunk_id: string; name: string }[] }>('livekit.SIP', 'ListSIPInboundTrunk', {})
+    if ((list.items ?? []).some(t => t.sip_trunk_id === trunk)) return trunk
+    if (this.inboundTrunkId === cached) this.inboundTrunkId = undefined
+    return this.ensureInbound()
+  }
+
+  /**
    * The outbound trunk as the configuration says, written again over the one found: the PBX may have moved (a stale
    * address sends calls nowhere) or changed the credentials it challenges with.
    */
@@ -154,7 +169,7 @@ export class LiveKitConferenceBridge implements ConferenceBridgeProvider {
    * (its Redis emptied, the trunk deleted by hand), instead of failing until the Gateway restarts.
    */
   private async withTrunk<T>(which: 'in' | 'out', run: (trunk: string) => Promise<T>): Promise<T> {
-    const ensure = () => (which === 'in' ? this.ensureInbound() : this.ensureOutbound())
+    const ensure = () => (which === 'in' ? this.liveInbound() : this.ensureOutbound())
     try {
       return await run(await ensure())
     } catch (err) {
@@ -203,7 +218,7 @@ export class LiveKitConferenceBridge implements ConferenceBridgeProvider {
    * trunk that is gone (its Redis emptied, deleted by hand): the PIN shown always lets in.
    */
   async ensureDialIn(meetingId: string, pin: string): Promise<void> {
-    const trunk = await this.ensureInbound()
+    const trunk = await this.liveInbound()
     const list = await this.api.call<{ items?: { sip_dispatch_rule_id: string; name: string; trunk_ids?: string[] }[] }>('livekit.SIP', 'ListSIPDispatchRule', {})
     const found = list.items?.find(r => r.name === `twake-meet-${meetingId}`)
     if (found && (found.trunk_ids ?? []).includes(trunk)) {

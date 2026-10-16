@@ -1125,35 +1125,18 @@ try {
     await setOutbound({}, PROFILES, [])
   })
 
-  await step(`review 8a, n°2: the calls to the access number, each one try of a room's PIN, are bounded: ${MEET_PIN_TRIES} per caller in 10 minutes, then refused (403, pin-tries) before LiveKit SIP; ${MEET_PIN_TRIES_ALL} for all callers together`, async () => {
-    // What LiveKit SIP does with each does not matter here (with no rule of a room it may ring, then never answer):
-    // a call OpenSIPS let through has no refusal of its own within 3 s, and is cancelled then.
-    const tried = async (p, n) => {
-      for (let i = 0; i < n; i++) {
-        const call = await p.dial(MEET_NUMBER, { giveUpMs: 3_000 })
-        expect(`call ${i + 1} of ${p.user}, to LiveKit SIP`, !call.final || call.final.status !== 403 || header(call.final, 'twake-call-refused') !== 'pin-tries', call.final?.first)
-        if (call.final?.status === 200) await p.hangup(call)
-      }
+  await step(`second review 8a, n°1: a call to the access number that LiveKit SIP does not answer is no failed try of a PIN: ${MEET_PIN_TRIES + 1} of them from 301, and ${MEET_PIN_TRIES_ALL + 1} of all, refuse nobody (the failed tries, counted at the end of a call LiveKit SIP answered, are played by the SIP e2e)`, async () => {
+    // What LiveKit SIP does with each does not matter here (with no rule of a room it may ring, then never answer, or
+    // refuse): a call OpenSIPS let through has no refusal of its own within 3 s, and is cancelled then.
+    const notRefused = async (p, i) => {
+      const call = await p.dial(MEET_NUMBER, { giveUpMs: 3_000 })
+      expect(`call ${i} of ${p.user} to 8000, let through`, !call.final || call.final.status !== 403 || header(call.final, 'twake-call-refused') !== 'pin-tries', call.final?.first)
+      if (call.final?.status === 200) await p.hangup(call)
     }
-    const tooMany = (what, call) => expect(what, call.final.status === 403 && header(call.final, 'twake-call-refused') === 'pin-tries', `${call.final.first} ${header(call.final, 'twake-call-refused')}`)
     await mi('cache_remove_chunk', { glob: 'pin:*' })
     try {
-      await tried(p301, MEET_PIN_TRIES)
-      tooMany(`call ${MEET_PIN_TRIES + 1} of 301`, await p301.dial(MEET_NUMBER))
-      // All callers together: what is left of MEET_PIN_TRIES_ALL, from the others, then refused whoever calls.
-      if (MEET_PIN_TRIES_ALL <= MEET_PIN_TRIES * 3) {
-        let left = MEET_PIN_TRIES_ALL - MEET_PIN_TRIES
-        for (const p of [p303, p115]) {
-          const n = Math.min(left, MEET_PIN_TRIES)
-          await tried(p, n)
-          left -= n
-        }
-        // 302, which has not called it yet.
-        p302.st.asleep = true
-        const w302 = await phone('302', { ws: true })
-        tooMany('a call of 302 once the others made all theirs', await w302.dial(MEET_NUMBER))
-        await w302.close()
-      } else console.log(`     (MEET_PIN_TRIES_ALL ${MEET_PIN_TRIES_ALL}: more than three callers can make, not played)`)
+      for (let i = 1; i <= MEET_PIN_TRIES + 1; i++) await notRefused(p301, i)
+      for (let i = MEET_PIN_TRIES + 2; i <= MEET_PIN_TRIES_ALL + 1; i++) await notRefused(p303, i)
     } finally {
       await mi('cache_remove_chunk', { glob: 'pin:*' })
     }

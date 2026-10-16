@@ -120,10 +120,12 @@ services:
       MEET_NUMBER:
       MEET_SIP_USER:
       MEET_SIP_PASSWORD:
-      # The calls to MEET_NUMBER (each one try of a PIN) per caller and for all callers in 10 minutes (10 and 300 by
-      # default), and the longest a room's call to the public network lasts (7200 s by default).
+      # The failed tries of a PIN (a call to MEET_NUMBER LiveKit SIP answered that ends within MEET_PIN_FAIL_SEC, 60 s
+      # by default) after which a caller is refused for 10 minutes (10 by default), those of all callers in 10 minutes
+      # that tell the administrators (300), and the longest a call with LiveKit SIP lasts (7200 s by default).
       MEET_PIN_TRIES:
       MEET_PIN_TRIES_ALL:
+      MEET_PIN_FAIL_SEC:
       MEET_MAX_CALL_SEC:
     healthcheck:
       # One MI request over UDP (mi_datagram, loopback): healthy once OpenSIPS answers, not once its fifo exists.

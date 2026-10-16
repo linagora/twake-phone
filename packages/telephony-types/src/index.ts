@@ -233,7 +233,8 @@ export interface OutboundPolicy {
  * threshold; concurrent, dailyCalls... for a cap, with `scope` user or tenant; the class of the number for rights).
  */
 export interface TelephonyAlert {
-  kind: 'fraud-warning' | 'fraud-critical' | 'limit' | 'rights' | 'emergency'
+  /** `meet`: failed tries of a room's PIN by phone, all callers together (step 8, `param` 'pin-tries'). */
+  kind: 'fraud-warning' | 'fraud-critical' | 'limit' | 'rights' | 'emergency' | 'meet'
   param: string
   scope?: 'user' | 'tenant'
   value?: number

@@ -547,6 +547,9 @@ route {
 		}
 		if (is_method("BYE"))
 			rtpengine_delete();
+		# A call to the access number ending: a failed try of a PIN when it was short (route[meet_bye]).
+		if (is_method("BYE") && $dlg_val(meet) == "callee")
+			route(meet_bye);
 		# Who the parties are was said once, by this script, in the initial INVITE and its answer.
 		remove_hf("P-Asserted-Identity");
 		remove_hf("P-Preferred-Identity");
@@ -836,8 +839,14 @@ route {
 #   anyone's. It is then that person's call: an extension or a group as from their phone, a number of the public
 #   network with their rights, caps, volume thresholds and direct number (route[trunk_out]), never longer than
 #   MEET_MAX_CALL_SEC; never an emergency number nor the access number. The callee's phone shows "Meet (<name>)".
-# - a call to the access number is a try of a room's PIN (one per call, LiveKit SIP): MEET_PIN_TRIES per caller in 10
-#   minutes, MEET_PIN_TRIES_ALL for all of them together, refused past that (403, pin-tries).
+# - a call to the access number is a try of a room's PIN (one per call, LiveKit SIP). A try that failed is a call
+#   LiveKit SIP answered that ends (either side) within MEET_PIN_FAIL_SEC of its answer (a wrong PIN: LiveKit SIP hangs
+#   up; a caller who gives up): counted per caller over 10 minutes (route[meet_bye]). A caller with MEET_PIN_TRIES of
+#   them is refused (403, pin-tries) for the rest of those 10 minutes; those who hide their number share one count,
+#   refused past MEET_PIN_TRIES_ALL. Nobody else is ever refused for what others tried: MEET_PIN_TRIES_ALL failed tries
+#   of all callers together in 10 minutes tell the administrators (E_TWAKEPHONE_PIN), once per 10 minutes. The counts
+#   are in memory, this OpenSIPS's only, forgotten when it restarts. A call to the access number lasts
+#   MEET_MAX_CALL_SEC at most, as a room's call.
 # The media through rtpengine, plain RTP on LiveKit SIP's side (route[rtp_flags]).
 
 # A room's call: its grant taken (deleted, so used once), for whoever its From names, one of our accounts, and the
@@ -889,24 +898,30 @@ route[meet_call] {
 		t_reply(482, "Loop Detected");
 		exit;
 	}
-	# A try of a PIN (one per call): counted per caller (the extension, the operator's caller, `anonymous` for all who
-	# hide their number) and for all, over 10 minutes from the first one; past MEET_PIN_TRIES or MEET_PIN_TRIES_ALL,
-	# refused before LiveKit SIP.
+	# The failed tries of a PIN of this caller (the extension, the operator's caller; `anonymous` for all who hide
+	# their number) in 10 minutes (route[meet_bye]): MEET_PIN_TRIES of them (MEET_PIN_TRIES_ALL for `anonymous`), and
+	# it is refused before LiveKit SIP. Never for what other callers tried.
 	$var(pin_who) = "other";
 	if ($avp(caller) =~ "^[A-Za-z0-9._+-]{1,64}$")
 		$var(pin_who) = $avp(caller);
+	$var(pin_cap) = ${MEET_PIN_TRIES};
+	if ($var(pin_who) == "anonymous" || $var(pin_who) == "other")
+		$var(pin_cap) = ${MEET_PIN_TRIES_ALL};
 	$var(pin_n) = 0;
-	$var(pin_all) = 0;
-	cache_add("local", "pin:c:$var(pin_who)", 1, 600, $var(pin_n));
-	if ($var(pin_n) <= ${MEET_PIN_TRIES})
-		cache_add("local", "pin:all", 1, 600, $var(pin_all));
-	if ($var(pin_n) > ${MEET_PIN_TRIES} || $var(pin_all) > ${MEET_PIN_TRIES_ALL}) {
-		xlog("L_WARN", "meet: call $ci from $avp(caller) to the access number refused: $var(pin_n) calls of it, $var(pin_all) of all, in 10 minutes\n");
+	if (!cache_counter_fetch("local", "pin:c:$var(pin_who)", $var(pin_n)))
+		$var(pin_n) = 0;
+	if ($var(pin_n) >= $var(pin_cap)) {
+		xlog("L_WARN", "meet: call $ci from $avp(caller) to the access number refused: $var(pin_n) failed tries of a PIN in 10 minutes\n");
 		append_to_reply("Twake-Call-Refused: pin-tries\r\n");
 		t_reply(403, "Too Many Tries");
 		exit;
 	}
 	$dlg_val(meet) = "callee";
+	$dlg_val(pin_who) = $var(pin_who);
+	# Never longer than MEET_MAX_CALL_SEC (from the operator: BYE to both sides): LiveKit SIP answers any OPTIONS, a
+	# LiveKit SIP gone in the middle of the call is not noticed otherwise.
+	if ($DLG_timeout > ${MEET_MAX_CALL_SEC})
+		$DLG_timeout = ${MEET_MAX_CALL_SEC};
 	$dlg_val(caller_sock) = $socket_in;
 	$dlg_val(callee) = $avp(callee);
 	$dlg_val(dialled) = $avp(dialled);
@@ -932,6 +947,41 @@ route[meet_call] {
 failure_route[meet_failed] {
 	if ($avp(rtp_on) != NULL)
 		rtpengine_delete();
+}
+
+# The BYE of a call to the access number (either side): ended within MEET_PIN_FAIL_SEC of its answer, it is a failed
+# try of a PIN (a wrong one: LiveKit SIP hangs up; or given up), counted for its caller and for all, over 10 minutes
+# from the first one (route[meet_call]). Past MEET_PIN_TRIES_ALL for all callers, the administrators hear it
+# (E_TWAKEPHONE_PIN), once per 10 minutes; nobody is refused for it.
+route[meet_bye] {
+	if ($dlg_val(pin_counted) == "1" || $DLG_lifetime >= ${MEET_PIN_FAIL_SEC})
+		return(1);
+	$dlg_val(pin_counted) = "1";
+	$var(pin_who) = $dlg_val(pin_who);
+	if (!($var(pin_who) =~ "^[A-Za-z0-9._+-]{1,64}$"))
+		$var(pin_who) = "other";
+	$var(pin_n) = 0;
+	$var(pin_all) = 0;
+	cache_add("local", "pin:c:$var(pin_who)", 1, 600, $var(pin_n));
+	cache_add("local", "pin:all", 1, 600, $var(pin_all));
+	xlog("L_NOTICE", "meet: call $ci from $var(pin_who) to the access number ended after $DLG_lifetime s: a failed try of a PIN ($var(pin_n) of it, $var(pin_all) of all, in 10 minutes)\n");
+	if ($var(pin_all) <= ${MEET_PIN_TRIES_ALL})
+		return(1);
+	$var(pin_told) = 0;
+	cache_add("local", "pin:told", 1, 600, $var(pin_told));
+	if ($var(pin_told) != 1)
+		return(1);
+	xlog("L_WARN", "meet: $var(pin_all) failed tries of a PIN in 10 minutes, past MEET_PIN_TRIES_ALL (${MEET_PIN_TRIES_ALL})\n");
+	$(avp(ev_attr)[*]) = NULL;
+	$(avp(ev_val)[*]) = NULL;
+	$avp(ev_attr) = "number";
+	$avp(ev_val) = "${MEET_NUMBER}";
+	$avp(ev_attr) = "value";
+	$avp(ev_val) = $var(pin_all);
+	$avp(ev_attr) = "threshold";
+	$avp(ev_val) = ${MEET_PIN_TRIES_ALL};
+	raise_event("E_TWAKEPHONE_PIN", $avp(ev_attr), $avp(ev_val));
+	return(1);
 }
 
 #### Trunks (step 6, ADR 0016) #########################################################################################

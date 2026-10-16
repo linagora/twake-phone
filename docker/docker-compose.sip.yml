@@ -83,8 +83,9 @@ services:
           address: 127.0.0.1:6379
         keys:
           ${LIVEKIT_API_KEY:-twake-dev}: ${LIVEKIT_API_SECRET:-twake-dev-only-livekit-secret-0123456789}
+        # warn: at info, the server writes each CreateSIPDispatchRule whole, the PIN of the room in it (ADR 0018).
         logging:
-          level: info
+          level: warn
     network_mode: host
     healthcheck:
       test: ["CMD", "/bin/busybox", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:7880"]
@@ -111,6 +112,7 @@ services:
         nat_1_to_1_ip: 127.0.0.1
         rtp_port: 31000-31100
         health_port: 9082
+        # info here, for the CI's log of a failed call: it writes the PIN typed (only the e2e's); warn anywhere else.
         logging:
           level: info
     network_mode: host
@@ -162,10 +164,12 @@ services:
       MEET_NUMBER: ${MEET_NUMBER:-8000}
       MEET_SIP_USER: ${MEET_SIP_USER:-livekit}
       MEET_SIP_PASSWORD: ${MEET_SIP_PASSWORD:-twake-meet-dev-only}
-      # The calls to the access number (each one try of a PIN) per caller and for all in 10 minutes, and the longest a
-      # room's call to the public network lasts.
+      # The failed tries of a PIN (a call LiveKit SIP answered that ends within MEET_PIN_FAIL_SEC) after which a caller
+      # is refused for 10 minutes, those of all callers that tell the administrators, and the longest a call with
+      # LiveKit SIP lasts.
       MEET_PIN_TRIES: ${MEET_PIN_TRIES:-10}
       MEET_PIN_TRIES_ALL: ${MEET_PIN_TRIES_ALL:-300}
+      MEET_PIN_FAIL_SEC: ${MEET_PIN_FAIL_SEC:-60}
       MEET_MAX_CALL_SEC: ${MEET_MAX_CALL_SEC:-7200}
     network_mode: host
     healthcheck:

@@ -79,16 +79,24 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
       [{ MEET_LISTEN_IP: '0.0.0.0' }, /MEET_LISTEN_IP/],
       [{ MEET_NUMBER: '0800' }, /MEET_NUMBER/],
       [{ MEET_SIP_USER: "livekit'" }, /MEET_SIP_USER/],
-      [{ MEET_PIN_TRIES: '0' }, /MEET_PIN_TRIES/],
-      [{ MEET_PIN_TRIES: 'x' }, /MEET_PIN_TRIES/],
-      [{ MEET_PIN_TRIES: '20', MEET_PIN_TRIES_ALL: '10' }, /MEET_PIN_TRIES_ALL/],
-      [{ MEET_MAX_CALL_SEC: '30' }, /MEET_MAX_CALL_SEC/],
-      [{ MEET_MAX_CALL_SEC: '100000' }, /MEET_MAX_CALL_SEC/]
+      ...([
+        [{ MEET_PIN_TRIES: '0' }, /MEET_PIN_TRIES/],
+        [{ MEET_PIN_TRIES: 'x' }, /MEET_PIN_TRIES/],
+        [{ MEET_PIN_TRIES: '20', MEET_PIN_TRIES_ALL: '10' }, /MEET_PIN_TRIES_ALL/],
+        [{ MEET_PIN_FAIL_SEC: '5' }, /MEET_PIN_FAIL_SEC/],
+        [{ MEET_PIN_FAIL_SEC: '601' }, /MEET_PIN_FAIL_SEC/],
+        [{ MEET_MAX_CALL_SEC: '30' }, /MEET_MAX_CALL_SEC/],
+        [{ MEET_MAX_CALL_SEC: '100000' }, /MEET_MAX_CALL_SEC/]
+      ] as [Record<string, string>, RegExp][]).map(([e, m]) => [{ MEET_SIP: '192.0.2.20:5080', MEET_SIP_PASSWORD: password, ...e }, m])
     ] as [Record<string, string>, RegExp][]) {
       const { status, stderr } = render(env)
       expect(status, JSON.stringify(env)).toBe(1)
       expect(stderr).toMatch(message)
     }
+    // Meet off: its settings are not read (second review n°10), whatever they say.
+    const offWrong = render({ MEET_PIN_TRIES: 'x', MEET_PIN_TRIES_ALL: '0', MEET_PIN_FAIL_SEC: '1', MEET_MAX_CALL_SEC: '30' })
+    expect(offWrong.status, offWrong.stderr).toBe(0)
+    expect(offWrong.cfg).toContain('$DLG_timeout > 7200)')
   })
 
   it('takes a room call only with the Gateway grant of that very call: used once, for its person and number (step 8, review n°1)', () => {
@@ -110,19 +118,35 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(cfg).toContain('$acc_extra(via) = "meet";')
   })
 
-  it('caps the tries of a PIN per caller and for all, and the length of a room call (step 8, review n°2 and n°5)', () => {
-    const { cfg } = render({ MEET_SIP: '192.0.2.20:5080', MEET_SIP_PASSWORD: 'not-a-real-secret-0', MEET_PIN_TRIES: '4', MEET_PIN_TRIES_ALL: '50', MEET_MAX_CALL_SEC: '1800' })
+  it('counts the failed tries of a PIN per caller, refuses only that caller, tells the administrators of all, and bounds every call with LiveKit SIP (step 8, second review n°1, n°2)', () => {
+    const { cfg } = render({ MEET_SIP: '192.0.2.20:5080', MEET_SIP_PASSWORD: 'not-a-real-secret-0', MEET_PIN_TRIES: '4', MEET_PIN_TRIES_ALL: '50', MEET_PIN_FAIL_SEC: '45', MEET_MAX_CALL_SEC: '1800' })
     const section = (name: string, next: string) => cfg.slice(cfg.indexOf(`\n${name} {`), cfg.indexOf(`\n${next} {`))
     const call = section('route[meet_call]', 'failure_route[meet_failed]')
-    expect(call).toContain('cache_add("local", "pin:c:$var(pin_who)", 1, 600, $var(pin_n));')
-    // A caller over its cap does not use up everybody's.
-    expect(call).toContain('if ($var(pin_n) <= 4)\n\t\tcache_add("local", "pin:all", 1, 600, $var(pin_all));')
-    expect(call).toContain('if ($var(pin_n) > 4 || $var(pin_all) > 50) {')
+    // A call to the access number reads its caller's failed tries, never counts one itself, never reads those of all.
+    expect(call).toContain('if (!cache_counter_fetch("local", "pin:c:$var(pin_who)", $var(pin_n)))')
+    expect(call).not.toContain('cache_add(')
+    expect(call).not.toContain('pin:all')
+    expect(call).toContain('$var(pin_cap) = 4;\n\tif ($var(pin_who) == "anonymous" || $var(pin_who) == "other")\n\t\t$var(pin_cap) = 50;')
+    expect(call).toContain('if ($var(pin_n) >= $var(pin_cap)) {')
     expect(call.indexOf('t_reply(403, "Too Many Tries");')).toBeLessThan(call.indexOf('$ru = "sip:8000@192.0.2.20:5080";'))
+    // Every call to it lasts MEET_MAX_CALL_SEC at most, from the operator too.
+    expect(call).toContain('if ($DLG_timeout > 1800)\n\t\t$DLG_timeout = 1800;')
     expect(cfg).toContain('if ($dlg_val(meet) == "caller" && $DLG_timeout > 1800)\n\t\t$DLG_timeout = 1800;')
+    // A failed try: its BYE, either side, within MEET_PIN_FAIL_SEC of the answer, once.
+    expect(cfg).toContain('if (is_method("BYE") && $dlg_val(meet) == "callee")\n\t\t\troute(meet_bye);')
+    const bye = section('route[meet_bye]', 'route[outbound_policy]')
+    expect(bye).toContain('if ($dlg_val(pin_counted) == "1" || $DLG_lifetime >= 45)\n\t\treturn(1);')
+    expect(bye).toContain('cache_add("local", "pin:c:$var(pin_who)", 1, 600, $var(pin_n));\n\tcache_add("local", "pin:all", 1, 600, $var(pin_all));')
+    // Those of all: an alert, once per 10 minutes, and nobody refused for them.
+    expect(bye).toContain('if ($var(pin_all) <= 50)\n\t\treturn(1);')
+    expect(bye).toContain('cache_add("local", "pin:told", 1, 600, $var(pin_told));\n\tif ($var(pin_told) != 1)\n\t\treturn(1);')
+    expect(bye).toContain('raise_event("E_TWAKEPHONE_PIN", $avp(ev_attr), $avp(ev_val));')
+    expect(bye).not.toContain('t_reply(')
     // The defaults.
     const defaults = render({ MEET_SIP: '192.0.2.20:5080', MEET_SIP_PASSWORD: 'not-a-real-secret-0' }).cfg
-    expect(defaults).toContain('if ($var(pin_n) > 10 || $var(pin_all) > 300) {')
+    expect(defaults).toContain('$var(pin_cap) = 10;')
+    expect(defaults).toContain('$DLG_lifetime >= 60)')
+    expect(defaults).toContain('if ($var(pin_all) <= 300)')
     expect(defaults).toContain('$DLG_timeout > 7200)')
   })
 
@@ -929,7 +953,7 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
   })
 
   it('bounds every call with the operator, and ends it with a BYE to both sides at TRUNK_MAX_CALL_SEC', () => {
-    const { cfg } = render({ TRUNK_MAX_CALL_SEC: '7200', MEET_MAX_CALL_SEC: '3600' })
+    const { cfg } = render({ TRUNK_MAX_CALL_SEC: '7200', MEET_SIP: '192.0.2.20:5080', MEET_SIP_PASSWORD: 'not-a-real-secret-0', MEET_MAX_CALL_SEC: '3600' })
     const section = (name: string, next: string) => cfg.slice(cfg.indexOf(`\n${name} {`), cfg.indexOf(`\n${next} {`))
     // Every INVITE gets its dialog; a call that goes to the operator, its flags once that is known (one of our own
     // direct numbers stays an internal call, route[trunk_out_loaded]).

@@ -34,7 +34,7 @@ const providerOf = (grants?: { extension: string; number: string; token: string;
     }
   ])
 
-const setup = async ({ fail, grants = true, dialOutLimiter }: { fail?: { status: number; body: unknown }; grants?: boolean; dialOutLimiter?: RateLimiter } = {}) => {
+const setup = async ({ fail, grants = true, dialOutLimiter, conferenceLimiter }: { fail?: { status: number; body: unknown }; grants?: boolean; dialOutLimiter?: RateLimiter; conferenceLimiter?: RateLimiter } = {}) => {
   const calls: string[] = []
   const rules = new Set<string>()
   const fetch: Fetch = async (url, init) => {
@@ -43,7 +43,7 @@ const setup = async ({ fail, grants = true, dialOutLimiter }: { fail?: { status:
     if (fail && path === 'livekit.SIP/CreateSIPParticipant') return { ok: false, status: fail.status, text: async () => JSON.stringify(fail.body) }
     if (path === 'livekit.SIP/CreateSIPDispatchRule') rules.add(JSON.parse(init.body ?? '{}').dispatch_rule.name)
     const out: Record<string, unknown> = {
-      'livekit.SIP/CreateSIPInboundTrunk': { sip_trunk_id: 'T' },
+      'livekit.SIP/ListSIPInboundTrunk': { items: [{ sip_trunk_id: 'T', name: 'twake-meet-in' }] },
       'livekit.SIP/CreateSIPDispatchRule': { sip_dispatch_rule_id: 'R' },
       'livekit.SIP/ListSIPDispatchRule': { items: [...rules].map(name => ({ sip_dispatch_rule_id: 'R', name, trunk_ids: ['T'] })) },
       'livekit.SIP/CreateSIPOutboundTrunk': { sip_trunk_id: 'O' },
@@ -61,23 +61,24 @@ const setup = async ({ fail, grants = true, dialOutLimiter }: { fail?: { status:
     bus,
     store,
     ...(dialOutLimiter ? { dialOutLimiter } : {}),
+    ...(conferenceLimiter ? { conferenceLimiter } : {}),
     conference: { bridge: t => (t === 'off' ? undefined : bridge), accessNumber: '8000', webhookKey: 'k', webhookSecret: 's' }
   })
   const as = (user: string, tenant = 'dev') => ({ 'x-dev-user': user, 'x-dev-tenant': tenant })
   /** Alice's room, named by the Gateway. */
   const open = async (user = 'alice') => {
-    const res = await app.inject({ method: 'POST', url: '/api/v1/conferences', headers: as(user), payload: {} })
+    const res = await app.inject({ method: 'POST', url: '/api/v1/conferences', headers: as(user), payload: { create: true } })
     expect(res.statusCode, res.body).toBe(201)
     return res.json().meetingId as string
   }
-  return { app, calls, bus, as, open, granted, rules }
+  return { app, calls, bus, as, open, granted, rules, store }
 }
 const sentOf = (calls: string[], path: string) => calls.filter(c => c.startsWith(path)).map(c => JSON.parse(c.split(' ').slice(1).join(' ')))
 
 describe('conference endpoints', () => {
   it('names a room itself and returns the dial-in info with a PIN; the owner reopens it with the same PIN', async () => {
     const { app, as, calls } = await setup()
-    const res = await app.inject({ method: 'POST', url: '/api/v1/conferences', headers: as('alice'), payload: {} })
+    const res = await app.inject({ method: 'POST', url: '/api/v1/conferences', headers: as('alice'), payload: { create: true } })
     expect(res.statusCode).toBe(201)
     const { meetingId } = res.json()
     expect(meetingId).toMatch(/^twake-[0-9a-f]{16}$/)
@@ -88,7 +89,55 @@ describe('conference endpoints', () => {
     expect(again.json().dialIn.pin).toBe('5000000000')
     expect(sentOf(calls, 'livekit.SIP/CreateSIPDispatchRule')).toHaveLength(1)
     // A second room has a name of its own.
-    expect((await app.inject({ method: 'POST', url: '/api/v1/conferences', headers: as('alice'), payload: {} })).json().meetingId).not.toBe(meetingId)
+    expect((await app.inject({ method: 'POST', url: '/api/v1/conferences', headers: as('alice'), payload: { create: true } })).json().meetingId).not.toBe(meetingId)
+  })
+
+  it('opens a new room only when asked (create), past the rooms a person may open 429; reopening one is no new room (second review n°4)', async () => {
+    const { app, as, calls, open } = await setup({ conferenceLimiter: new RateLimiter(2, 60_000) })
+    for (const payload of [{}, { slug: 'abc-defg-hij' }, { create: 'yes' }]) {
+      const res = await app.inject({ method: 'POST', url: '/api/v1/conferences', headers: as('alice'), payload })
+      expect(res.statusCode, JSON.stringify(payload)).toBe(400)
+    }
+    expect(calls.some(c => c.startsWith('livekit.SIP/CreateSIPDispatchRule'))).toBe(false)
+    const room = await open()
+    await open()
+    const third = await app.inject({ method: 'POST', url: '/api/v1/conferences', headers: as('alice'), payload: { create: true } })
+    expect(`${third.statusCode} ${third.json().code}`).toBe('429 CONFERENCE_LIMIT')
+    expect(sentOf(calls, 'livekit.SIP/CreateSIPDispatchRule')).toHaveLength(2)
+    expect((await app.inject({ method: 'POST', url: '/api/v1/conferences', headers: as('alice'), payload: { meetingId: room } })).statusCode).toBe(201)
+    // Each person their own count.
+    await open('bob')
+  })
+
+  it('draws again the PIN of a room opened before the PINs had PIN_DIGITS digits, its old rule removed (second review n°6)', async () => {
+    const { app, as, calls, store, rules } = await setup()
+    const room = 'twake-0123456789abcdef'
+    await store.claimConference({ tenantId: 'dev', meetingId: room, ownerUserId: 'alice', createdAt: '2026-10-01T00:00:00.000Z' })
+    await store.setConferencePin(room, '123456')
+    rules.add(`twake-meet-${room}`)
+    const res = await app.inject({ url: `/api/v1/conferences/${room}`, headers: as('alice') })
+    expect(res.statusCode, res.body).toBe(200)
+    expect(res.json().dialIn.pin).toMatch(/^\d{10}$/)
+    expect((await store.getConference(room))?.pin).toBe(res.json().dialIn.pin)
+    expect(sentOf(calls, 'livekit.SIP/DeleteSIPDispatchRule')).toHaveLength(1)
+    expect(sentOf(calls, 'livekit.SIP/CreateSIPDispatchRule').map(r => r.dispatch_rule.rule.dispatch_rule_direct.pin)).toEqual([res.json().dialIn.pin])
+    // Reopened, the PIN drawn again is kept.
+    const again = await app.inject({ method: 'POST', url: '/api/v1/conferences', headers: as('alice'), payload: { meetingId: room } })
+    expect(again.json().dialIn.pin).toBe(res.json().dialIn.pin)
+    expect(sentOf(calls, 'livekit.SIP/CreateSIPDispatchRule')).toHaveLength(1)
+  })
+
+  it('without Meet, serves no room it did not name (claimed by its name before), except to close it (second review n°6)', async () => {
+    const { app, as, calls, store } = await setup()
+    const room = 'abc-defg-hij'
+    await store.claimConference({ tenantId: 'dev', meetingId: room, ownerUserId: 'alice', createdAt: '2026-10-01T00:00:00.000Z' })
+    await store.setConferencePin(room, '1234567890')
+    expect((await app.inject({ url: `/api/v1/conferences/${room}`, headers: as('alice') })).statusCode).toBe(404)
+    expect((await app.inject({ method: 'POST', url: '/api/v1/conferences', headers: as('alice'), payload: { meetingId: room } })).statusCode).toBe(404)
+    expect((await app.inject({ method: 'POST', url: `/api/v1/conferences/${room}/participants`, headers: as('alice'), payload: { number: '103' } })).statusCode).toBe(404)
+    expect(calls.some(c => c.startsWith('livekit.SIP/CreateSIPParticipant') || c.startsWith('livekit.SIP/CreateSIPDispatchRule'))).toBe(false)
+    expect((await app.inject({ method: 'DELETE', url: `/api/v1/conferences/${room}`, headers: as('alice') })).statusCode).toBe(204)
+    expect(await store.getConference(room)).toBeNull()
   })
 
   it('never takes over a LiveKit room it did not name: a meeting id nobody opened here is not found (review n°6)', async () => {
@@ -214,7 +263,7 @@ describe('conference endpoints', () => {
 
   it('answers 501 when no bridge is configured for the tenant, and reports it in capabilities', async () => {
     const { app, as } = await setup()
-    expect((await app.inject({ method: 'POST', url: '/api/v1/conferences', headers: as('alice', 'off'), payload: {} })).statusCode).toBe(501)
+    expect((await app.inject({ method: 'POST', url: '/api/v1/conferences', headers: as('alice', 'off'), payload: { create: true } })).statusCode).toBe(501)
     const caps = await app.inject({ url: '/api/v1/capabilities', headers: as('alice') })
     expect(caps.json().conference).toEqual({ dialIn: true, dialOut: true })
   })

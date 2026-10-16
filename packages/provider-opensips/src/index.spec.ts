@@ -458,7 +458,7 @@ describe('OpensipsProvider call rules', () => {
       for await (const e of p.subscribe()) got.push(e)
     })()
     await until('the subscription', () => p.getStatus() === 'CONNECTED')
-    for (const e of ['E_FRD_WARNING', 'E_FRD_CRITICAL', 'E_TWAKEPHONE_LIMIT', 'E_TWAKEPHONE_RIGHTS', 'E_TWAKEPHONE_EMERGENCY']) expect(sips.subscriptions.map(s => s.event)).toContain(e)
+    for (const e of ['E_FRD_WARNING', 'E_FRD_CRITICAL', 'E_TWAKEPHONE_LIMIT', 'E_TWAKEPHONE_RIGHTS', 'E_TWAKEPHONE_EMERGENCY', 'E_TWAKEPHONE_PIN']) expect(sips.subscriptions.map(s => s.event)).toContain(e)
     sips.push('E_FRD_CRITICAL', { param: 'total-calls', value: 500, threshold: 500, user: '101', called_number: '442079460123', rule_id: 2, profile_id: 1 })
     sips.push('E_TWAKEPHONE_LIMIT', { caller: '102', number: '+33639980001', param: 'dailyMinutes', scope: 'tenant', callid: 'x1' })
     // Review 6b, n°11: a number outside the caller's rights, and emergency calls in a row (the third raises it).
