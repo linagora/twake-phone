@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto'
 import { TRUNK_COUNTRY, TRUNK_COUNTRY_EXCLUDED, TRUNK_OUTBOUND_CLASSES, TRUNK_OUTBOUND_DEFAULT, isValidExtension, type DidRange, type Trunk, type TrunkRegistrationState, type TrunkServerState, type TrunkStatus } from '@twake/telephony-types'
 import { DIALPLAN_SQL } from './numbering.js'
+import { DIAL_OUT_GRANTS_SCHEMA } from './dial-out-grants.js'
 import { ACC_EXTERNAL_SQL, OUTBOUND_SCHEMA } from './outbound.js'
 import type { Queryable } from './subscriber.js'
 
@@ -25,7 +26,8 @@ export const REGISTRANT_TABLE_VERSION = 3
  * `fallback`: an extension or a ring group, '' none). `dids`: the direct numbers, a range of E.164 numbers of the same
  * length, to an extension or group (`target`) or to the extension that ends with their last `suffix_digits` digits,
  * and their own fallback. `tenant_id` is whose they are: OpenSIPS does not read it, and one tenant only may have trunks
- * in a database (TrunkTables refuses a second one). Then the tables of the outbound policy (outbound.ts, step 6b).
+ * in a database (TrunkTables refuses a second one). Then the tables of the outbound policy (outbound.ts, step 6b) and
+ * the grants of the calls Meet's rooms place (dial-out-grants.ts, step 8).
  * Run as a whole by docker/opensips/entrypoint.sh before OpenSIPS starts (a database created before step 6 has none
  * of these tables, and OpenSIPS would not start without them) and at each start of the Gateway.
  */
@@ -102,7 +104,7 @@ CREATE TABLE IF NOT EXISTS dids (
 CREATE INDEX IF NOT EXISTS dids_first_number_idx ON dids (first_number);
 ALTER TABLE trunks ADD COLUMN IF NOT EXISTS fallback VARCHAR(16) DEFAULT '' NOT NULL;
 ALTER TABLE dids ADD COLUMN IF NOT EXISTS fallback VARCHAR(16) DEFAULT '' NOT NULL;
-${OUTBOUND_SCHEMA}${DIALPLAN_SQL}`
+${OUTBOUND_SCHEMA}${DIAL_OUT_GRANTS_SCHEMA}${DIALPLAN_SQL}`
 
 /**
  * docker/opensips/trunk.sql, which entrypoint.sh runs before each start of OpenSIPS (psql): the tables its modules

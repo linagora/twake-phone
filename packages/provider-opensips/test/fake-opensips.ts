@@ -22,6 +22,8 @@ export const fakeOpensips = async () => {
     dispatcher: { PARTITIONS: [{ name: 'default', SETS: [] as unknown[] }] },
     registrations: { Records: [] as unknown[] },
     unknownEvents: new Set<string>(),
+    /** What MI shv_get answers (step 8: meet_on, meet_number); undefined: the method is unknown. */
+    shv: undefined as { name: string; type: number; value: unknown }[] | undefined,
     eventsVia: undefined as dgram.Socket | undefined
   }
   socket.on('message', (raw, rinfo) => {
@@ -57,6 +59,7 @@ export const fakeOpensips = async () => {
     if (req.method === 'dlg_list') return reply({ result: state.dialogs })
     if (req.method === 'ds_list') return reply({ result: state.dispatcher })
     if (req.method === 'reg_list') return reply({ result: state.registrations })
+    if (req.method === 'shv_get' && state.shv) return reply({ result: { VARs: state.shv } })
     // The trunks (step 6): OpenSIPS reads its tables again.
     if (['ds_reload', 'reg_reload', 'dp_reload', 'fraud_reload'].includes(req.method)) return reply({ result: 'OK' })
     if (req.method === 'ul_rm') {

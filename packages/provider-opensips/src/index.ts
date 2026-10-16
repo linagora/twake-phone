@@ -3,6 +3,7 @@ import type { Call, Capabilities, DidRange, Endpoint, ForwardingRules, MediaSess
 import type { CallGroups } from './call-groups.js'
 import type { CallRules } from './call-rules.js'
 import type { PushTargets } from './push-targets.js'
+import type { DialOutGrants } from './dial-out-grants.js'
 import type { OutboundTables } from './outbound.js'
 import { trunkStatusFrom, type TrunkTables } from './trunks.js'
 import { OpensipsEvents, parseDlgList, parseUlDump, type EventsLogger } from './events.js'
@@ -15,6 +16,7 @@ export { CallTracker, alertOf, userOf, isExternalParty, EMERGENCY_BURST, EMERGEN
 export { CallRules, CALL_RULES_SCHEMA, DND_MESSAGE_MAX, NOANSWER_DELAY, type CallRulesOptions, type DndRule, type ExtensionHolder } from './call-rules.js'
 export { CallGroups, CALL_GROUPS_SCHEMA, DISPLAY_NAMES_SCHEMA, GROUP_MEMBERS_MAX, NAME_MAX, sipDisplayName, type CallGroupsOptions } from './call-groups.js'
 export { PushTargets, PUSH_TARGETS_SCHEMA, type PushTargetsOptions } from './push-targets.js'
+export { DialOutGrants, DIAL_OUT_GRANTS_SCHEMA, GRANT_HEADER, GRANT_TTL_SEC, type DialOutGrantsOptions } from './dial-out-grants.js'
 export { AsyncQueue } from './queue.js'
 export { TrunkTables, TRUNK_SCHEMA, TRUNK_SQL, DEFAULT_TRUNK_SOCKET, SOURCES_SET, DISPATCHER_TABLE_VERSION, DIALPLAN_TABLE_VERSION, REGISTRANT_TABLE_VERSION, codecFlags, projectTrunks, trunkSecret, trunkStatusFrom, type TrunkTablesOptions } from './trunks.js'
 export { OutboundTables, OUTBOUND_SCHEMA, ACC_EXTERNAL_SQL, FRAUD_PROFILE, FRAUD_RULE_INTERNATIONAL, FRAUD_RULE_NATIONAL, FRAUD_TABLE_VERSION, FRAUD_OVERSEAS_PREFIXES, DR_TABLE_VERSIONS, DIALOG_TABLE_VERSION, OUTBOUND_TIME_ZONE, CAP_MAX, PROFILE_ID, fraudRow, projectOutbound, type OutboundTablesOptions } from './outbound.js'
@@ -48,7 +50,8 @@ export const SUBSCRIBED_EVENTS = [
   'E_FRD_CRITICAL',
   'E_TWAKEPHONE_LIMIT',
   'E_TWAKEPHONE_RIGHTS',
-  'E_TWAKEPHONE_EMERGENCY'
+  'E_TWAKEPHONE_EMERGENCY',
+  'E_TWAKEPHONE_PIN'
 ]
 
 // Everything OpenSIPS-specific stays inside this package: the Gateway and the app only see the provider contract.
@@ -93,6 +96,11 @@ export interface OpensipsConfig {
    * forwards at once, as before.
    */
   pushTargets?: PushTargets
+  /**
+   * The grants OpenSIPS takes for each call a room of Meet places (ADR 0018, route[meet_source]): written before the
+   * Gateway asks LiveKit for the call. Without it, OpenSIPS refuses every call of the rooms.
+   */
+  dialOutGrants?: DialOutGrants
   /**
    * The trunks and direct numbers OpenSIPS reads (ADR 0016): its dispatcher, registrations and numbering plan are
    * reloaded through the MI when they change. Without it, no call to or from the public network.
@@ -333,6 +341,28 @@ export class OpensipsProvider implements TelephonyProvider, MediaProvider {
   async setWakeableOne(holder: { extension: string; userId: string }, on: boolean) {
     if (!this.config.pushTargets) return
     await this.config.pushTargets.setOne(holder, on && !!this.events)
+  }
+
+  /**
+   * The access number of Meet's rooms as OpenSIPS has it (its shared variables meet_on and meet_number, MI shv_get):
+   * `number` undefined when Meet is off there. Undefined when it cannot be asked (no MI) or did not say.
+   */
+  async getMeetAccess(): Promise<{ number?: string } | undefined> {
+    if (!this.events) return undefined
+    const vars = (await this.events.call<{ VARs?: { name?: string; value?: unknown }[] } | undefined>('shv_get'))?.VARs
+    if (!Array.isArray(vars)) return undefined
+    const on = vars.find(v => v.name === 'meet_on')?.value
+    const number = vars.find(v => v.name === 'meet_number')?.value
+    if (on === undefined) return undefined
+    return Number(on) === 1 && typeof number === 'string' ? { number } : {}
+  }
+
+  /** A room of Meet may call `number` at the name of `extension`, once, within `ttlSec` seconds (route[meet_source]). */
+  async grantRoomCall(grant: { extension: string; number: string; ttlSec?: number }): Promise<{ token: string; revoke(): Promise<void> }> {
+    const grants = this.config.dialOutGrants
+    if (!grants) throw Object.assign(new Error('The SIP server cannot let a room call'), { statusCode: 501 })
+    const token = await grants.grant(grant.extension, grant.number, grant.ttlSec)
+    return { token, revoke: () => grants.revoke(token) }
   }
 
   /**

@@ -8,8 +8,15 @@
 #   docker compose -f docker/docker-compose.sip.yml up --build --wait
 #   OPENSIPS_WS_URL=wss://127.0.0.1:8089 SIP_DOMAIN=127.0.0.1 OPENSIPS_DB_URL=postgres://twake:twake@127.0.0.1:54320/twake ...
 #
-# Ports: 5060/udp SIP, 5070/udp the trunk to the operator (step 6; simulated by the e2e), 8088 WS, 8089 WSS,
-# 22222/udp rtpengine control, 22223/udp its DTMF report, 30000-30400/udp RTP (100 calls, each one held 30 s after its end), 54320 PostgreSQL.
+# Ports: 5060/udp SIP, 5070/udp the trunk to the operator (step 6; simulated by the e2e), 5090/udp the socket of
+# LiveKit SIP (step 8), 8088 WS, 8089 WSS, 22222/udp rtpengine control, 22223/udp its DTMF report, 30000-30400/udp RTP
+# (100 calls, each one held 30 s after its end), 54320 PostgreSQL.
+#
+# Meet's phone access (step 8, ADR 0018): a LiveKit server (7880 API, 7881/tcp and 7882/udp WebRTC), LiveKit SIP
+# (5080 SIP, 31000-31100/udp RTP, 9082 health) and the Redis they share (6379), self-hosted here as in a deployment
+# next to La Suite Meet. LiveKit SIP sees OpenSIPS only: calls to the access number (MEET_NUMBER, 8000) come from it,
+# the rooms' calls go to it (5090) with the credentials below. The keys and the password are this stack's own, for
+# development and CI only (as twake:twake for PostgreSQL); a deployment sets its own.
 services:
   postgres:
     image: postgres:16
@@ -45,6 +52,76 @@ services:
       timeout: 3s
       retries: 15
 
+  # Shared by LiveKit and LiveKit SIP (their RPC and state), on the loopback, without persistence.
+  redis:
+    image: redis:7.4.2-alpine
+    command: ["redis-server", "--bind", "127.0.0.1", "--port", "6379", "--save", "", "--appendonly", "no"]
+    network_mode: host
+    healthcheck:
+      test: ["CMD", "redis-cli", "-h", "127.0.0.1", "-p", "6379", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  livekit:
+    image: livekit/livekit-server:v1.13.7
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      # The loopback only; its own candidate is offered to LiveKit SIP (a WebRTC client of the rooms on this host).
+      LIVEKIT_CONFIG: |
+        port: 7880
+        bind_addresses: ["127.0.0.1"]
+        rtc:
+          tcp_port: 7881
+          udp_port: 7882
+          use_external_ip: false
+          enable_loopback_candidate: true
+          node_ip: 127.0.0.1
+        redis:
+          address: 127.0.0.1:6379
+        keys:
+          ${LIVEKIT_API_KEY:-twake-dev}: ${LIVEKIT_API_SECRET:-twake-dev-only-livekit-secret-0123456789}
+        # warn: at info, the server writes each CreateSIPDispatchRule whole, the PIN of the room in it (ADR 0018).
+        logging:
+          level: warn
+    network_mode: host
+    healthcheck:
+      test: ["CMD", "/bin/busybox", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:7880"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  livekit-sip:
+    image: livekit/sip:v1.17.0
+    depends_on:
+      livekit:
+        condition: service_healthy
+    environment:
+      # SIP on the loopback (5080), its SDP naming the loopback too: OpenSIPS and rtpengine are on this host.
+      SIP_CONFIG_BODY: |
+        api_key: ${LIVEKIT_API_KEY:-twake-dev}
+        api_secret: ${LIVEKIT_API_SECRET:-twake-dev-only-livekit-secret-0123456789}
+        ws_url: ws://127.0.0.1:7880
+        redis:
+          address: 127.0.0.1:6379
+        sip_port: 5080
+        listen_ip: 127.0.0.1
+        use_external_ip: false
+        nat_1_to_1_ip: 127.0.0.1
+        rtp_port: 31000-31100
+        health_port: 9082
+        # info here, for the CI's log of a failed call: it writes the PIN typed (only the e2e's); warn anywhere else.
+        logging:
+          level: info
+    network_mode: host
+    healthcheck:
+      test: ["CMD", "bash", "-c", "</dev/tcp/127.0.0.1/5080"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
   opensips:
     build: ./opensips
     depends_on:
@@ -79,6 +156,22 @@ services:
       CALL_PING_SEC: ${CALL_PING_SEC:-30}
       # How long that OPTIONS waits for its answer (seconds, 5 to 60): the first one unanswered ends the call.
       CALL_PING_TIMEOUT_SEC: ${CALL_PING_TIMEOUT_SEC:-15}
+      # LiveKit SIP (step 8, ADR 0018): its address (empty: Meet off), OpenSIPS's socket for it, the access number of
+      # the rooms, and the account its calls answer the challenge with (the Gateway gives LiveKit the same).
+      MEET_SIP: ${MEET_SIP-127.0.0.1:5080}
+      MEET_LISTEN_IP: ${MEET_LISTEN_IP:-127.0.0.1}
+      MEET_PORT: ${MEET_PORT:-5090}
+      MEET_NUMBER: ${MEET_NUMBER:-8000}
+      MEET_SIP_USER: ${MEET_SIP_USER:-livekit}
+      MEET_SIP_PASSWORD: ${MEET_SIP_PASSWORD:-twake-meet-dev-only}
+      # The tries of a PIN (each call to MEET_NUMBER LiveKit SIP answers) after which a caller is refused for 10
+      # minutes, those of all callers that tell the administrators, the calls to MEET_NUMBER at the same time of one
+      # caller and of all, and the longest a call with LiveKit SIP lasts.
+      MEET_PIN_TRIES: ${MEET_PIN_TRIES:-10}
+      MEET_PIN_TRIES_ALL: ${MEET_PIN_TRIES_ALL:-300}
+      MEET_CALLS_PER_CALLER: ${MEET_CALLS_PER_CALLER:-2}
+      MEET_CALLS_ALL: ${MEET_CALLS_ALL:-100}
+      MEET_MAX_CALL_SEC: ${MEET_MAX_CALL_SEC:-7200}
     network_mode: host
     healthcheck:
       test: ["CMD-SHELL", "test -p /tmp/opensips_fifo"]

@@ -489,6 +489,14 @@ BEGIN
 END
 $twake$;
 RESET check_function_bodies;
+
+CREATE TABLE IF NOT EXISTS dial_out_grants (
+    token VARCHAR(64) PRIMARY KEY NOT NULL,
+    tenant_id TEXT DEFAULT '' NOT NULL,
+    extension VARCHAR(64) NOT NULL,
+    number VARCHAR(64) NOT NULL,
+    expires_at TIMESTAMP WITH TIME ZONE NOT NULL
+);
 DELETE FROM dialplan WHERE dpid IN (1, 2, 3, 4);
 INSERT INTO dialplan (dpid, pr, match_op, match_exp, match_flags, subst_exp, repl_exp, disabled, attrs) VALUES
   (1, 10, 1, '^(1[578]|11[2459]|19[167]|116000|116117)$', 0, '^(.*)$', '\1', 0, 'emergency'),
@@ -536,6 +544,12 @@ BEGIN
   END IF;
   IF to_regclass('missed_calls') IS NOT NULL AND NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'missed_calls' AND column_name = 'external') THEN
     ALTER TABLE missed_calls ADD COLUMN external VARCHAR(64) DEFAULT '' NOT NULL;
+  END IF;
+  IF to_regclass('acc') IS NOT NULL AND NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'acc' AND column_name = 'via') THEN
+    ALTER TABLE acc ADD COLUMN via VARCHAR(16) DEFAULT '' NOT NULL;
+  END IF;
+  IF to_regclass('missed_calls') IS NOT NULL AND NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'missed_calls' AND column_name = 'via') THEN
+    ALTER TABLE missed_calls ADD COLUMN via VARCHAR(16) DEFAULT '' NOT NULL;
   END IF;
   IF to_regclass('acc') IS NOT NULL AND NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'twake_outbound_acc' AND tgrelid = to_regclass('acc')) THEN
     CREATE TRIGGER twake_outbound_acc AFTER INSERT ON acc FOR EACH ROW WHEN (NEW.external = 'out') EXECUTE FUNCTION twake_outbound_cdr();

@@ -170,6 +170,18 @@ export const storeContract = (name: string, make: () => Promise<Store>) =>
       expect((await s.getConference('abc-defg'))?.pin).toBe('123456')
       await s.setConferencePin('abc-defg', null)
       expect((await s.getConference('abc-defg'))?.pin).toBeUndefined()
+      // A PIN replaced only if it is still the one read (third review n°5).
+      expect(await s.replaceConferencePin('abc-defg', null, '0123456789')).toBe(true)
+      expect(await s.replaceConferencePin('abc-defg', null, '9876543210')).toBe(false)
+      expect(await s.replaceConferencePin('abc-defg', '123456', '9876543210')).toBe(false)
+      expect((await s.getConference('abc-defg'))?.pin).toBe('0123456789')
+      expect(await s.replaceConferencePin('abc-defg', '0123456789', '1111111111')).toBe(true)
+      expect((await s.getConference('abc-defg'))?.pin).toBe('1111111111')
+      expect(await s.replaceConferencePin('nope', null, '1')).toBe(false)
+      // Counted per tenant, and per owner in it.
+      await s.claimConference({ meetingId: 'second', createdAt: base.createdAt, tenantId: 'A', ownerUserId: 'bob' })
+      await s.claimConference({ meetingId: 'third', createdAt: base.createdAt, tenantId: 'B', ownerUserId: 'alice' })
+      expect([await s.countConferences('A'), await s.countConferences('A', 'alice'), await s.countConferences('A', 'carol'), await s.countConferences('B')]).toEqual([2, 1, 0, 1])
       await s.deleteConference('abc-defg')
       expect(await s.getConference('abc-defg')).toBeNull()
       await s.close()

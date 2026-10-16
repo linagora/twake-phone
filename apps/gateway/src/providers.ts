@@ -119,6 +119,8 @@ export const storedOpensipsFactory = ({ store, key, env = process.env, provision
         callGroups: provisioner.callGroups({ ready: ensureSchema, tenantId }),
         // Who can be woken for a call (their browser subscribed to notifications), in the same database (ADR 0015).
         pushTargets: provisioner.pushTargets({ ready: ensureSchema, tenantId }),
+        // The calls the rooms of Meet may place, each granted before LiveKit is asked for it (ADR 0018).
+        dialOutGrants: provisioner.dialOutGrants({ ready: ensureSchema, tenantId }),
         outbound: provisioner.outboundTables({ ready: ensureSchema, tenantId }),
         // The trunks to an operator and their direct numbers, as OpenSIPS reads them, in the same database (ADR 0016).
         trunks: provisioner.trunkTables({ ready: ensureSchema, tenantId, socket: config.trunkSocket ?? (env.OPENSIPS_TRUNK_SOCKET || DEFAULT_TRUNK_SOCKET), ...((config.trunkAdvertise ?? env.OPENSIPS_TRUNK_ADVERTISE) ? { advertise: (config.trunkAdvertise ?? env.OPENSIPS_TRUNK_ADVERTISE)! } : {}) }),

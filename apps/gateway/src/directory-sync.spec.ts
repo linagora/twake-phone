@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 import type { Contact } from '@twake/telephony-types'
 import { MemoryContactDirectory } from './contacts.js'
 import { DirectorySync, MAX_INTERVAL_MS, extensionOf, parseInterval } from './directory-sync.js'
-import { reservedInUse, seedUserMap } from './directory.js'
+import { accessNumberInUse, meetAccessMismatch, reservedInUse, seedUserMap } from './directory.js'
 import { MemoryStore } from './store/memory.js'
 
 const person = (id: string, name: string, extension?: string, department = 'Support'): Contact => ({
@@ -321,5 +321,38 @@ describe('the short numbers of the French plan (an emergency number...) as exten
     await store.upsertMapping({ tenantId: 'acme', userId: 'carol', extension: '115' })
     expect(await reservedInUse(store, 'acme', ['200', '17'])).toEqual(['extension 115 (carol)', 'ring group 17'])
     expect(await reservedInUse(store, 'other', [])).toEqual([])
+  })
+})
+
+describe("the access number of Meet's rooms (step 8, review n°12)", () => {
+  it('seeds DEV_USER_MAP without it when the rooms are on, and says so', async () => {
+    const store = new MemoryStore()
+    const warned: string[] = []
+    await seedUserMap(store, 'acme', 'alice:101,bob:8000', m => warned.push(m), '8000')
+    expect((await store.listMappings('acme')).map(m => `${m.userId}:${m.extension}`)).toEqual(['alice:101'])
+    expect(warned).toEqual([expect.stringMatching(/^bob:8000 left out: 8000 is the access number of the meeting rooms \(MEET_NUMBER\)/)])
+    // The rooms off: 8000 is an extension like another.
+    const off = new MemoryStore()
+    await seedUserMap(off, 'acme', 'alice:101,bob:8000', m => warned.push(m))
+    expect((await off.listMappings('acme')).map(m => m.extension).sort()).toEqual(['101', '8000'])
+    expect(warned).toHaveLength(1)
+  })
+
+  it('names the extension or ring group kept from before that is the access number, to be changed', async () => {
+    const store = new MemoryStore()
+    await store.upsertMapping({ tenantId: 'acme', userId: 'alice', extension: '101' })
+    await store.upsertMapping({ tenantId: 'acme', userId: 'bob', extension: '8000' })
+    expect(await accessNumberInUse(store, 'acme', '8000', ['200'])).toEqual(['extension 8000 (bob)'])
+    expect(await accessNumberInUse(store, 'acme', '200', ['200', '300'])).toEqual(['ring group 200'])
+    expect(await accessNumberInUse(store, 'acme', undefined, ['8000'])).toEqual([])
+  })
+
+  it('says when the Gateway and OpenSIPS disagree on it, nothing when they agree or OpenSIPS cannot say', () => {
+    expect(meetAccessMismatch('8000', { number: '8000' })).toEqual([])
+    expect(meetAccessMismatch(undefined, {})).toEqual([])
+    expect(meetAccessMismatch('8000', undefined)).toEqual([])
+    expect(meetAccessMismatch('8000', { number: '7000' })).toEqual([expect.stringMatching(/8000 here and 7000 in OpenSIPS/)])
+    expect(meetAccessMismatch('8000', {})).toEqual([expect.stringMatching(/on here .* and off in OpenSIPS/)])
+    expect(meetAccessMismatch(undefined, { number: '8000' })).toEqual([expect.stringMatching(/off here .* and on in OpenSIPS/)])
   })
 })

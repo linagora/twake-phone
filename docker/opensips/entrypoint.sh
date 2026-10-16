@@ -109,7 +109,113 @@ case "$TRUNK_ADVERTISE" in
   '') TRUNK_SOCKET_AS='' ;;
   *) TRUNK_SOCKET_AS=" as $TRUNK_ADVERTISE" ;;
 esac
-export SIP_DOMAIN LISTEN_IP SIP_PORT WS_PORT WSS_PORT OPENSIPS_DB_URL OPENSIPS_RULES_DB_URL PUSH_WAIT_SEC RTPENGINE_SOCK OPENSIPS_LOG_LEVEL OPENSIPS_MPATH MI_FIFO MI_LISTEN_IP MI_PORT TLS_CERT TLS_KEY TRUNK_LISTEN_IP TRUNK_PORT TRUNK_SOCKET_AS TRUNK_MAX_CALL_SEC TRUNK_MIN_CALL_SEC CALL_PING_SEC CALL_PING_TIMEOUT_SEC TZ
+# The phone access of Meet's rooms (step 8, ADR 0018): LiveKit SIP, at MEET_SIP (an IPv4 address and its port), sees
+# no other trunk than OpenSIPS, on a UDP socket of its own (MEET_LISTEN_IP:MEET_PORT, the loopback and 5090 by
+# default), which hears its address only. A call to MEET_NUMBER (8000 by default) goes to it, which asks for a room's
+# PIN; a call it places for a room answers OpenSIPS's challenge with MEET_SIP_USER and MEET_SIP_PASSWORD (the same as
+# the Gateway gives LiveKit's outbound trunk: only their HA1 is in the configuration), and only with the Gateway's
+# grant of that very call (route[meet_source]). MEET_SIP empty (the default): Meet is off, OpenSIPS has no socket for
+# it at all and MEET_NUMBER is nobody's. A call to MEET_NUMBER that LiveKit SIP answers is one try of a PIN
+# (LiveKit SIP takes one per call), whatever happens in it. MEET_PIN_TRIES: the tries after which a caller is refused
+# for the rest of 10 minutes, 10 by default (1 to 1000); MEET_PIN_TRIES_ALL: those of all callers together in 10
+# minutes that tell the administrators, 300 by default (and the cap of those who hide their number, who share one
+# count). MEET_CALLS_PER_CALLER: the calls of one caller to MEET_NUMBER at the same time, 2 by default (1 to 20);
+# MEET_CALLS_ALL: those of all callers, 100 by default (MEET_CALLS_PER_CALLER to 10000), refused past it and told to
+# the administrators. MEET_MAX_CALL_SEC: the longest a call with LiveKit SIP
+# lasts, either way (7200 s by default, 60 to 86400, never more than TRUNK_MAX_CALL_SEC): LiveKit SIP answers any
+# OPTIONS, so a LiveKit SIP gone in the middle of the call is only noticed then.
+: "${MEET_SIP:=}"
+: "${MEET_LISTEN_IP:=127.0.0.1}"
+: "${MEET_PORT:=5090}"
+: "${MEET_NUMBER:=8000}"
+: "${MEET_SIP_USER:=livekit}"
+: "${MEET_SIP_PASSWORD:=}"
+# The settings of Meet's phone access, read only when it is on (MEET_SIP): the defaults otherwise, whatever is set.
+if [ -n "$MEET_SIP" ]; then
+  : "${MEET_PIN_TRIES:=10}"
+  : "${MEET_PIN_TRIES_ALL:=300}"
+  : "${MEET_CALLS_PER_CALLER:=2}"
+  : "${MEET_CALLS_ALL:=100}"
+  : "${MEET_MAX_CALL_SEC:=7200}"
+  case "$MEET_PIN_TRIES" in
+    '' | *[!0-9]*) echo "MEET_PIN_TRIES must be a number of tries" >&2; exit 1 ;;
+  esac
+  if [ "$MEET_PIN_TRIES" -lt 1 ] || [ "$MEET_PIN_TRIES" -gt 1000 ]; then
+    echo "MEET_PIN_TRIES must be 1 to 1000 tries" >&2; exit 1
+  fi
+  case "$MEET_PIN_TRIES_ALL" in
+    '' | *[!0-9]*) echo "MEET_PIN_TRIES_ALL must be a number of tries" >&2; exit 1 ;;
+  esac
+  if [ "$MEET_PIN_TRIES_ALL" -lt "$MEET_PIN_TRIES" ] || [ "$MEET_PIN_TRIES_ALL" -gt 100000 ]; then
+    echo "MEET_PIN_TRIES_ALL must be MEET_PIN_TRIES to 100000 tries" >&2; exit 1
+  fi
+  case "$MEET_CALLS_PER_CALLER" in
+    '' | *[!0-9]*) echo "MEET_CALLS_PER_CALLER must be a number of calls" >&2; exit 1 ;;
+  esac
+  if [ "$MEET_CALLS_PER_CALLER" -lt 1 ] || [ "$MEET_CALLS_PER_CALLER" -gt 20 ]; then
+    echo "MEET_CALLS_PER_CALLER must be 1 to 20 calls" >&2; exit 1
+  fi
+  case "$MEET_CALLS_ALL" in
+    '' | *[!0-9]*) echo "MEET_CALLS_ALL must be a number of calls" >&2; exit 1 ;;
+  esac
+  if [ "$MEET_CALLS_ALL" -lt "$MEET_CALLS_PER_CALLER" ] || [ "$MEET_CALLS_ALL" -gt 10000 ]; then
+    echo "MEET_CALLS_ALL must be MEET_CALLS_PER_CALLER to 10000 calls" >&2; exit 1
+  fi
+  case "$MEET_MAX_CALL_SEC" in
+    '' | *[!0-9]*) echo "MEET_MAX_CALL_SEC must be a number of seconds" >&2; exit 1 ;;
+  esac
+  if [ "$MEET_MAX_CALL_SEC" -lt 60 ] || [ "$MEET_MAX_CALL_SEC" -gt 86400 ]; then
+    echo "MEET_MAX_CALL_SEC must be 60 to 86400 seconds" >&2; exit 1
+  fi
+else
+  MEET_PIN_TRIES=10
+  MEET_PIN_TRIES_ALL=300
+  MEET_CALLS_PER_CALLER=2
+  MEET_CALLS_ALL=100
+  MEET_MAX_CALL_SEC=7200
+fi
+case "$MEET_PORT" in
+  '' | *[!0-9]*) echo "MEET_PORT must be a port number" >&2; exit 1 ;;
+esac
+if [ "$MEET_PORT" -lt 1 ] || [ "$MEET_PORT" -gt 65535 ]; then
+  echo "MEET_PORT must be 1 to 65535" >&2; exit 1
+fi
+if { [ "$MEET_LISTEN_IP" = "$LISTEN_IP" ] && [ "$MEET_PORT" = "$SIP_PORT" ]; } || { [ "$MEET_LISTEN_IP" = "$TRUNK_LISTEN_IP" ] && [ "$MEET_PORT" = "$TRUNK_PORT" ]; }; then
+  echo "MEET_PORT must differ from SIP_PORT and TRUNK_PORT on the same address: LiveKit SIP has a socket of its own" >&2; exit 1
+fi
+# An extension's format (the Gateway's): two to six digits, not starting with 0.
+case "$MEET_NUMBER" in
+  [1-9][0-9] | [1-9][0-9][0-9] | [1-9][0-9][0-9][0-9] | [1-9][0-9][0-9][0-9][0-9] | [1-9][0-9][0-9][0-9][0-9][0-9]) ;;
+  *) echo "MEET_NUMBER must be two to six digits, not starting with 0" >&2; exit 1 ;;
+esac
+case "$MEET_SIP_USER" in
+  '' | *[!A-Za-z0-9._-]*) echo "MEET_SIP_USER must be letters, digits, dots, dashes or underscores" >&2; exit 1 ;;
+esac
+MEET_ON=0
+MEET_SIP_IP=''
+MEET_SIP_HA1=''
+MEET_SOCKET='# None: Meet is off (MEET_SIP empty).'
+if [ -n "$MEET_SIP" ]; then
+  MEET_ON=1
+  MEET_SOCKET="socket=udp:$MEET_LISTEN_IP:$MEET_PORT"
+  MEET_SIP_IP=${MEET_SIP%:*}
+  meet_sip_port=${MEET_SIP##*:}
+  case "$meet_sip_port" in
+    '' | *[!0-9]*) echo "MEET_SIP must be LiveKit SIP's IPv4 address and port (192.0.2.20:5080)" >&2; exit 1 ;;
+  esac
+  if [ "$MEET_SIP_IP" = "$MEET_SIP" ] || [ "$meet_sip_port" -lt 1 ] || [ "$meet_sip_port" -gt 65535 ]; then
+    echo "MEET_SIP must be LiveKit SIP's IPv4 address and port (192.0.2.20:5080)" >&2; exit 1
+  fi
+  if [ "${#MEET_SIP_PASSWORD}" -lt 12 ]; then
+    echo "MEET_SIP_PASSWORD (12 characters at least) is needed with MEET_SIP: LiveKit SIP's calls must answer a challenge" >&2; exit 1
+  fi
+  MEET_SIP_HA1=$(printf '%s' "$MEET_SIP_USER:$SIP_DOMAIN:$MEET_SIP_PASSWORD" | md5sum | cut -c1-32)
+else
+  # Never reached (MEET_ON 0), still a valid URI.
+  MEET_SIP=meet.invalid
+fi
+unset MEET_SIP_PASSWORD
+export SIP_DOMAIN LISTEN_IP SIP_PORT WS_PORT WSS_PORT OPENSIPS_DB_URL OPENSIPS_RULES_DB_URL PUSH_WAIT_SEC RTPENGINE_SOCK OPENSIPS_LOG_LEVEL OPENSIPS_MPATH MI_FIFO MI_LISTEN_IP MI_PORT TLS_CERT TLS_KEY TRUNK_LISTEN_IP TRUNK_PORT TRUNK_SOCKET_AS TRUNK_MAX_CALL_SEC TRUNK_MIN_CALL_SEC CALL_PING_SEC CALL_PING_TIMEOUT_SEC TZ MEET_ON MEET_SIP MEET_SIP_IP MEET_LISTEN_IP MEET_PORT MEET_NUMBER MEET_SIP_USER MEET_SIP_HA1 MEET_SOCKET MEET_PIN_TRIES MEET_PIN_TRIES_ALL MEET_CALLS_PER_CALLER MEET_CALLS_ALL MEET_MAX_CALL_SEC
 
 # The MI socket (mi_datagram) has no authentication: whoever reaches it can stop OpenSIPS, drop registrations, end
 # calls, read who is registered and subscribe to the events (who calls whom). It listens on its own address, the
@@ -146,6 +252,12 @@ mi_address_is_private() {
 if ! is_ipv4 "$TRUNK_LISTEN_IP" || [ "$TRUNK_LISTEN_IP" = "0.0.0.0" ]; then
   echo "TRUNK_LISTEN_IP=$TRUNK_LISTEN_IP must be an IPv4 address of this machine (not 0.0.0.0)" >&2; exit 1
 fi
+if ! is_ipv4 "$MEET_LISTEN_IP" || [ "$MEET_LISTEN_IP" = "0.0.0.0" ]; then
+  echo "MEET_LISTEN_IP=$MEET_LISTEN_IP must be an IPv4 address of this machine (not 0.0.0.0)" >&2; exit 1
+fi
+if [ "$MEET_ON" = 1 ] && { ! is_ipv4 "$MEET_SIP_IP" || [ "$MEET_SIP_IP" = "0.0.0.0" ]; }; then
+  echo "MEET_SIP must be LiveKit SIP's IPv4 address and port (192.0.2.20:5080)" >&2; exit 1
+fi
 if ! mi_address_is_private "$MI_LISTEN_IP" && [ "$MI_ALLOW_PUBLIC" != "1" ]; then
   echo "MI_LISTEN_IP=$MI_LISTEN_IP is not a loopback or private IPv4 address: the MI has no authentication." >&2
   echo "Keep it on 127.0.0.1 (or the private network the Gateway reaches it on), or set MI_ALLOW_PUBLIC=1 behind a firewall." >&2
@@ -161,7 +273,7 @@ if [ ! -f "$TLS_CERT" ] || [ ! -f "$TLS_KEY" ]; then
 fi
 
 # Only the listed variables are substituted: a "$avp(...)" of the script must stay as it is.
-envsubst '$SIP_DOMAIN $LISTEN_IP $SIP_PORT $WS_PORT $WSS_PORT $OPENSIPS_DB_URL $OPENSIPS_RULES_DB_URL $PUSH_WAIT_SEC $RTPENGINE_SOCK $OPENSIPS_LOG_LEVEL $OPENSIPS_MPATH $MI_FIFO $MI_LISTEN_IP $MI_PORT $TLS_CERT $TLS_KEY $TRUNK_LISTEN_IP $TRUNK_PORT $TRUNK_SOCKET_AS $TRUNK_MAX_CALL_SEC $TRUNK_MIN_CALL_SEC $CALL_PING_SEC $CALL_PING_TIMEOUT_SEC' \
+envsubst '$SIP_DOMAIN $LISTEN_IP $SIP_PORT $WS_PORT $WSS_PORT $OPENSIPS_DB_URL $OPENSIPS_RULES_DB_URL $PUSH_WAIT_SEC $RTPENGINE_SOCK $OPENSIPS_LOG_LEVEL $OPENSIPS_MPATH $MI_FIFO $MI_LISTEN_IP $MI_PORT $TLS_CERT $TLS_KEY $TRUNK_LISTEN_IP $TRUNK_PORT $TRUNK_SOCKET_AS $TRUNK_MAX_CALL_SEC $TRUNK_MIN_CALL_SEC $CALL_PING_SEC $CALL_PING_TIMEOUT_SEC $MEET_ON $MEET_SIP $MEET_SIP_IP $MEET_LISTEN_IP $MEET_PORT $MEET_NUMBER $MEET_SIP_USER $MEET_SIP_HA1 $MEET_SOCKET $MEET_PIN_TRIES $MEET_PIN_TRIES_ALL $MEET_CALLS_PER_CALLER $MEET_CALLS_ALL $MEET_MAX_CALL_SEC' \
   < "$CFG_TEMPLATE" > "$CFG_OUT"
 
 # The tables of the trunks (step 6): dispatcher, dialplan and uac_registrant read theirs at start and OpenSIPS stops

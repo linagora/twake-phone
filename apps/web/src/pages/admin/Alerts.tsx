@@ -6,8 +6,8 @@ import { useGateway } from '../../gateway.js'
 import type { Key } from '../../i18n/index.js'
 import { useT } from '../../i18n/useT.js'
 
-const KINDS: NonNullable<AlertFilter['kind']>[] = ['fraud-warning', 'fraud-critical', 'limit', 'rights', 'emergency']
-const PARAMS = [...FRAUD_PARAMS, ...OUTBOUND_CAPS, ...TRUNK_OUTBOUND_CLASSES, 'premium', 'burst']
+const KINDS: NonNullable<AlertFilter['kind']>[] = ['fraud-warning', 'fraud-critical', 'limit', 'rights', 'emergency', 'meet']
+const PARAMS = [...FRAUD_PARAMS, ...OUTBOUND_CAPS, ...TRUNK_OUTBOUND_CLASSES, 'premium', 'burst', 'pin-tries', 'meet-calls']
 const PAGE = 25
 /** How long after an answer the first page is read again while shown: a repeat counted meanwhile is seen (review 7 n°2). */
 export const ALERTS_REFRESH_MS = 30_000
@@ -15,11 +15,16 @@ const ALL = ''
 /** What the screen shows first: the alerts not yet looked at. */
 const INITIAL = { kind: ALL, param: ALL, state: 'open' }
 
-/** What an alert's `param` names, in words: a threshold, a cap, a class of numbers, or a burst of emergency calls. */
+/**
+ * What an alert's `param` names, in words: a threshold, a cap, a class of numbers, a burst of emergency calls, the
+ * tries of a room's PIN by phone, or the calls to the rooms at the same time.
+ */
 const paramKey = (alert: Pick<AdminAlert, 'kind' | 'param'>): Key | undefined => {
   if ((FRAUD_PARAMS as readonly string[]).includes(alert.param)) return `admin.fraud.${alert.param}` as Key
   if ((OUTBOUND_CAPS as readonly string[]).includes(alert.param)) return `admin.cap.${alert.param}` as Key
   if (alert.param === 'burst') return 'admin.alert.burst'
+  if (alert.param === 'pin-tries') return 'admin.alert.pinTries'
+  if (alert.param === 'meet-calls') return 'admin.alert.meetCalls'
   if ((TRUNK_OUTBOUND_CLASSES as readonly string[]).includes(alert.param) || alert.param === 'premium') return `admin.class.${alert.param}` as Key
   return undefined
 }

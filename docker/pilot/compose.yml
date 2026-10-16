@@ -112,6 +112,23 @@ services:
       # How long that OPTIONS waits for its answer (seconds, 5 to 60, 15 by default): the first one unanswered ends the
       # call, so a phone gone is noticed within CALL_PING_SEC + CALL_PING_TIMEOUT_SEC.
       CALL_PING_TIMEOUT_SEC:
+      # Meet's phone access (step 8, ADR 0018; README, "Meet par téléphone"): off unless MEET_SIP names LiveKit SIP
+      # (ip:port). OpenSIPS's socket for it stays on the loopback (MEET_LISTEN_IP, MEET_PORT 5090) and hears only it.
+      MEET_SIP:
+      MEET_LISTEN_IP:
+      MEET_PORT:
+      MEET_NUMBER:
+      MEET_SIP_USER:
+      MEET_SIP_PASSWORD:
+      # The tries of a PIN (each call to MEET_NUMBER LiveKit SIP answers) after which a caller is refused for 10
+      # minutes (10 by default), those of all callers in 10 minutes that tell the administrators (300), the calls to
+      # MEET_NUMBER at the same time of one caller (2) and of all (100, refused past it), and the longest a call with
+      # LiveKit SIP lasts (7200 s by default).
+      MEET_PIN_TRIES:
+      MEET_PIN_TRIES_ALL:
+      MEET_CALLS_PER_CALLER:
+      MEET_CALLS_ALL:
+      MEET_MAX_CALL_SEC:
     healthcheck:
       # One MI request over UDP (mi_datagram, loopback): healthy once OpenSIPS answers, not once its fifo exists.
       test: ["CMD", "bash", "-c", "exec 3<>/dev/udp/127.0.0.1/8880 && printf '{\"jsonrpc\":\"2.0\",\"method\":\"version\",\"id\":\"health\"}' >&3 && read -r -t 2 -n 1 _ <&3"]
@@ -195,6 +212,21 @@ services:
       TRUNK_COUNTRIES:
       TRUNK_DIDS:
       TRUNK_FALLBACK_TARGET:
+      # Meet's phone access (step 8, ADR 0018): on once the LiveKit server's API and keys are given, with OpenSIPS's
+      # address for LiveKit SIP's inbound trunk and OpenSIPS's socket for its calls (README, "Meet par téléphone").
+      LIVEKIT_URL:
+      LIVEKIT_API_KEY:
+      LIVEKIT_API_SECRET:
+      MEET_NUMBER:
+      MEET_DIALIN_NUMBERS:
+      MEET_INBOUND_ADDRESSES:
+      MEET_OUTBOUND_ADDRESS:
+      MEET_SIP_USER:
+      MEET_SIP_PASSWORD:
+      MEET_MAX_CALL_SEC:
+      MEET_URL:
+      MEET_CLIENT_ID:
+      MEET_CLIENT_SECRET:
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/ready').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"]
       start_period: 120s

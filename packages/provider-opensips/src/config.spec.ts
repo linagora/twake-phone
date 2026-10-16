@@ -1,4 +1,5 @@
 import { spawnSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -49,6 +50,120 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
       expect(stderr).toMatch(/no authentication/)
     }
     expect(render({ MI_LISTEN_IP: '203.0.113.5', MI_ALLOW_PUBLIC: '1' }).status).toBe(0)
+  })
+
+  it('gives LiveKit SIP a socket of its own that hears its address only, nothing when Meet is off, and only the HA1 of its account (step 8)', () => {
+    const off = render()
+    expect(off.status).toBe(0)
+    // No socket at all when Meet is off: nothing hears on its port (review n°17).
+    expect(off.cfg).not.toMatch(/^socket=udp:[^\n]*:5090/m)
+    expect(off.cfg).toContain('# None: Meet is off (MEET_SIP empty).')
+    expect(off.cfg).toContain('modparam("cfgutils", "shvset", "meet_on=i:0")')
+    expect(off.cfg).toContain('$ru = "sip:8000@meet.invalid";')
+    const password = 'not-a-real-secret-0'
+    const on = render({ SIP_DOMAIN: 'sip.example.test', MEET_SIP: '192.0.2.20:5080', MEET_SIP_PASSWORD: password, MEET_NUMBER: '7000' })
+    expect(on.status, on.stderr).toBe(0)
+    expect(on.cfg).toContain('modparam("cfgutils", "shvset", "meet_on=i:1")')
+    expect(on.cfg).toMatch(/^socket=udp:127\.0\.0\.1:5090$/m)
+    expect(on.cfg).toContain('modparam("cfgutils", "shvset", "meet_number=s:7000")')
+    expect(on.cfg).toContain('if ($shv(meet_on) != 1 || $si != "192.0.2.20") {')
+    expect(on.cfg).toContain('$ru = "sip:7000@192.0.2.20:5080";')
+    expect(on.cfg).toContain(`$var(meet_ha1) = "${createHash('md5').update(`livekit:sip.example.test:${password}`).digest('hex')}";`)
+    expect(on.cfg).not.toContain(password)
+    for (const [env, message] of [
+      [{ MEET_SIP: '192.0.2.20:5080' }, /MEET_SIP_PASSWORD/],
+      [{ MEET_SIP: '192.0.2.20:5080', MEET_SIP_PASSWORD: 'short' }, /12 characters/],
+      [{ MEET_SIP: 'livekit.example.test:5080', MEET_SIP_PASSWORD: password }, /IPv4 address and port/],
+      [{ MEET_SIP: '192.0.2.20', MEET_SIP_PASSWORD: password }, /IPv4 address and port/],
+      [{ MEET_PORT: '5060' }, /socket of its own/],
+      [{ MEET_LISTEN_IP: '0.0.0.0' }, /MEET_LISTEN_IP/],
+      [{ MEET_NUMBER: '0800' }, /MEET_NUMBER/],
+      [{ MEET_SIP_USER: "livekit'" }, /MEET_SIP_USER/],
+      ...([
+        [{ MEET_PIN_TRIES: '0' }, /MEET_PIN_TRIES/],
+        [{ MEET_PIN_TRIES: 'x' }, /MEET_PIN_TRIES/],
+        [{ MEET_PIN_TRIES: '20', MEET_PIN_TRIES_ALL: '10' }, /MEET_PIN_TRIES_ALL/],
+        [{ MEET_CALLS_PER_CALLER: '0' }, /MEET_CALLS_PER_CALLER/],
+        [{ MEET_CALLS_PER_CALLER: '21' }, /MEET_CALLS_PER_CALLER/],
+        [{ MEET_CALLS_PER_CALLER: '5', MEET_CALLS_ALL: '4' }, /MEET_CALLS_ALL/],
+        [{ MEET_CALLS_ALL: '10001' }, /MEET_CALLS_ALL/],
+        [{ MEET_MAX_CALL_SEC: '30' }, /MEET_MAX_CALL_SEC/],
+        [{ MEET_MAX_CALL_SEC: '100000' }, /MEET_MAX_CALL_SEC/]
+      ] as [Record<string, string>, RegExp][]).map(([e, m]) => [{ MEET_SIP: '192.0.2.20:5080', MEET_SIP_PASSWORD: password, ...e }, m])
+    ] as [Record<string, string>, RegExp][]) {
+      const { status, stderr } = render(env)
+      expect(status, JSON.stringify(env)).toBe(1)
+      expect(stderr).toMatch(message)
+    }
+    // Meet off: its settings are not read (second review n°10), whatever they say.
+    const offWrong = render({ MEET_PIN_TRIES: 'x', MEET_PIN_TRIES_ALL: '0', MEET_CALLS_PER_CALLER: '0', MEET_CALLS_ALL: 'x', MEET_MAX_CALL_SEC: '30' })
+    expect(offWrong.status, offWrong.stderr).toBe(0)
+    expect(offWrong.cfg).toContain('modparam("cfgutils", "shvset", "meet_max_sec=i:7200")')
+  })
+
+  it('takes a room call only with the Gateway grant of that very call: used once, for its person and number (step 8, review n°1)', () => {
+    const { cfg } = render({ SIP_DOMAIN: 'sip.example.test', MEET_SIP: '192.0.2.20:5080', MEET_SIP_PASSWORD: 'not-a-real-secret-0' })
+    const section = (name: string, next: string) => cfg.slice(cfg.indexOf(`\n${name} {`), cfg.indexOf(`\n${next} {`))
+    // Read once LiveKit SIP authenticated, never passed on.
+    expect(cfg).toContain('$avp(meet_grant) = $hdr(X-Twake-Grant);')
+    expect(cfg).toContain('remove_hf("X-Twake-Grant");')
+    const source = section('route[meet_source]', 'route[meet_source_loaded]')
+    // Only the characters of a grant and of a number get into the query; anything else is refused before it.
+    expect(source).toContain('if (!($avp(meet_grant) =~ "^[0-9a-f]{32}$") || !($rU =~ "^[+]?[0-9*#]{2,20}$")) {')
+    expect(source.indexOf('t_reply(403, "Not Granted");')).toBeLessThan(source.indexOf('async(sql_query_one('))
+    // Deleted as it is read: used once, before its expiry, for this person and this number only.
+    expect(source).toContain(`"DELETE FROM dial_out_grants g WHERE g.token = '" + $avp(meet_grant) + "' AND g.extension = '" + $fU + "' AND g.number = '" + $rU + "' AND g.expires_at > now() AND EXISTS (SELECT 1 FROM subscriber s WHERE s.username = g.extension) RETURNING 1"`)
+    const loaded = section('route[meet_source_loaded]', 'route[meet_call]')
+    expect(loaded).toContain('if ($var(meet_rc) == -2) {')
+    expect(loaded.indexOf('append_to_reply("Twake-Call-Refused: not-granted\\r\\n");')).toBeLessThan(loaded.indexOf('route(trunk_out);'))
+    // The CDR says the call came from a room.
+    expect(cfg).toContain('$acc_extra(via) = "meet";')
+  })
+
+  it('counts every call LiveKit SIP answers as a try of its caller, when it comes, caps the calls at the same time, tells the administrators, and bounds every call with LiveKit SIP (step 8, third review n°1, n°2, n°3)', () => {
+    const { cfg } = render({ MEET_SIP: '192.0.2.20:5080', MEET_SIP_PASSWORD: 'not-a-real-secret-0', MEET_PIN_TRIES: '4', MEET_PIN_TRIES_ALL: '50', MEET_CALLS_PER_CALLER: '3', MEET_CALLS_ALL: '40', MEET_MAX_CALL_SEC: '1800' })
+    const section = (name: string, next: string) => cfg.slice(cfg.indexOf(`\n${name} {`), cfg.indexOf(`\n${next} {`))
+    const call = section('route[meet_call]', 'failure_route[meet_failed]')
+    const at = (text: string) => {
+      const i = call.indexOf(text)
+      expect(i, text).toBeGreaterThan(0)
+      return i
+    }
+    // The calls at the same time, this one counted in, under a lock; those who hide their number under the cap of all.
+    expect(call).toContain('$var(pin_cap) = 4;\n\t$var(m_cap) = 3;\n\tif ($var(pin_who) == "anonymous" || $var(pin_who) == "other") {\n\t\t$var(pin_cap) = 50;\n\t\t$var(m_cap) = 40;\n\t}')
+    expect(call).toContain('get_static_lock("meet_count");\n\tset_dlg_profile("meet_caller", "$var(pin_who)");\n\tset_dlg_profile("meet_all");\n\tget_profile_size("meet_caller", "$var(pin_who)", $var(m_mine));\n\tget_profile_size("meet_all", , $var(m_all));\n\trelease_static_lock("meet_count");')
+    expect(call).toContain('if ($var(m_all) > 40) {')
+    expect(at('t_reply(503, "Service Unavailable");')).toBeGreaterThan(at('route(meet_alert, "calls", $var(m_all), 40);'))
+    expect(call).toContain('if ($var(m_mine) > $var(m_cap)) {')
+    // A try counted when the call comes (whatever its length), before the refusal: calls at once count each other.
+    expect(call).toContain('cache_add("local", "pin:c:$var(pin_who)", 1, 600, $var(pin_n));\n\tif ($var(pin_n) > $var(pin_cap)) {')
+    expect(at('t_reply(486, "Busy Here");')).toBeLessThan(at('cache_add("local", "pin:c:'))
+    expect(at('t_reply(403, "Too Many Tries");')).toBeLessThan(at('$ru = "sip:8000@192.0.2.20:5080";'))
+    // Those of all: the alert at the threshold (not past it: those who hide their number are refused past it).
+    expect(call).toContain('cache_add("local", "pin:all", 1, 600, $var(pin_all));\n\tif ($var(pin_all) >= 50)\n\t\troute(meet_alert, "pin-tries", $var(pin_all), 50);')
+    // Given back when LiveKit SIP does not answer.
+    const failed = section('failure_route[meet_failed]', 'route[meet_alert]')
+    expect(failed).toContain('cache_sub("local", "pin:c:$avp(pin_who)", 1, 600, $var(left));')
+    expect(failed).toContain('cache_sub("local", "pin:all", 1, 600, $var(left));')
+    // Told once per 10 minutes for each; nobody refused there.
+    const alert = section('route[meet_alert]', 'route[outbound_policy]')
+    expect(alert).toContain('cache_add("local", "pin:told:$param(1)", 1, 600, $var(told));\n\tif ($var(told) != 1)\n\t\treturn(1);')
+    expect(alert).toContain('raise_event("E_TWAKEPHONE_PIN", $avp(ev_attr), $avp(ev_val));')
+    expect(alert).not.toContain('t_reply(')
+    // No count at a BYE any more (a wrong PIN typed late was none).
+    expect(cfg).not.toContain('route(meet_bye)')
+    // Every call to it lasts MEET_MAX_CALL_SEC at most, then BYE to both sides: from a phone too (B; the operator's
+    // calls have it already), and the rooms' calls; the e2e shortens it through the MI.
+    expect(cfg).toContain('modparam("cfgutils", "shvset", "meet_max_sec=i:1800")')
+    expect(call).toContain('if ($dlg_val(trunk) == NULL)\n\t\tcreate_dialog("B");\n\tif ($DLG_timeout > $shv(meet_max_sec))\n\t\t$DLG_timeout = $shv(meet_max_sec);')
+    expect(cfg).toContain('if ($dlg_val(meet) == "caller" && $DLG_timeout > $shv(meet_max_sec))\n\t\t$DLG_timeout = $shv(meet_max_sec);')
+    expect(cfg).toContain('modparam("dialog", "profiles_with_value", "trunk_caller;meet_caller")')
+    // The defaults.
+    const defaults = render({ MEET_SIP: '192.0.2.20:5080', MEET_SIP_PASSWORD: 'not-a-real-secret-0' }).cfg
+    expect(defaults).toContain('$var(pin_cap) = 10;\n\t$var(m_cap) = 2;')
+    expect(defaults).toContain('if ($var(m_all) > 100) {')
+    expect(defaults).toContain('if ($var(pin_all) >= 300)')
+    expect(defaults).toContain('modparam("cfgutils", "shvset", "meet_max_sec=i:7200")')
   })
 
   it('announces a call once nothing can refuse it without a transaction: after lookup and rtpengine, just before the relay', () => {
@@ -166,12 +281,13 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     // Each query is asynchronous (the rules, the first of them with the caller's name, the names of a Replaces, the
     // members of a group, the preload, whether the callee can be woken), none is run where async is not available.
     // The trunk of a call to the public network, the direct number of a call from it: step 6; the caller's rights and
-    // caps, a query of its own after the trunk's: step 6b). Two synchronous queries ask the catalog whether the tables
+    // caps, a query of its own after the trunk's: step 6b; whether the From of a room's call is one of our accounts:
+    // step 8). Two synchronous queries ask the catalog whether the tables
     // of step 4c, or that of step 5, exist, only after a read failed, from the routes that resume a read; two more read
     // the default trunk and the direct numbers on it every 15 s, in a timer of its own, never in a call (an emergency
     // call's fallback when the trunk of the call cannot be read, with its caller's own number).
-    expect(cfg.match(/sql_query/g)).toHaveLength(13)
-    expect(cfg.match(/async\(sql_query/g)).toHaveLength(9)
+    expect(cfg.match(/sql_query/g)).toHaveLength(14)
+    expect(cfg.match(/async\(sql_query/g)).toHaveLength(10)
     const timer = cfg.slice(cfg.indexOf('\ntimer_route[default_trunk, 15] {'), cfg.indexOf('\nroute[emergency_failed] {'))
     expect(timer.match(/sql_query(_one)?\(/g)).toHaveLength(2)
     expect(section('route[tables_4c_missing]', 'route[table_5_missing]').match(/sql_query_one\(/g)).toHaveLength(1)
@@ -309,7 +425,7 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
 
   it('keeps what the caller dialled in the CDRs, next to the extension the call reached', () => {
     const { cfg } = render()
-    expect(cfg).toContain('modparam("acc", "extra_fields", "db: caller; callee; dialled; external")')
+    expect(cfg).toContain('modparam("acc", "extra_fields", "db: caller; callee; dialled; external; via")')
     expect(cfg).toContain('modparam("acc", "extra_fields", "evi: caller; callee; dialled")')
     expect(cfg).toContain('$acc_extra(dialled) = $rU;')
     // A number of the public network, in E.164 (step 6); the extension a direct number reaches.
@@ -330,7 +446,9 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(callerName.indexOf('if (!($hdr(From) =~ "<"))')).toBeLessThan(callerName.indexOf('uac_replace_from("$var(caller_name)", "");'))
     // The others: the number a call to the operator presents, in place of the extension, and the caller of a call from
     // the operator as read (step 6).
-    expect(cfg.match(/uac_replace_from\(/g)).toHaveLength(3)
+    // And a room's call (step 8): "Meet", with the name of whom it calls for when read, never the person's phone.
+    expect(cfg.match(/uac_replace_from\(/g)).toHaveLength(4)
+    expect(callerName).toContain('$var(caller_name) = "Meet";\n\t\tif ($avp(names_read) == 1 && $avp(n_caller) != NULL && $avp(n_caller) != "")\n\t\t\t$var(caller_name) = "Meet (" + $avp(n_caller) + ")";')
     expect(callerName).toContain('uac_replace_from("", "$avp(caller_uri)");')
     expect(section('branch_route[trunk_out]', 'route[trunk_number]')).toContain('uac_replace_from("", "sip:$avp(t_from_user)@$avp(t_domain)");')
     // Once the first read resumed (the rules, or the names of a Replaces), before anything rings.
@@ -352,7 +470,7 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     }
     // Names not read: the From is left as the phone sent it (never emptied); a call from the operator excepted, whose
     // From never reaches a browser.
-    expect(callerName.indexOf('if ($avp(names_read) != 1)\n\t\treturn(-1);')).toBeLessThan(callerName.indexOf('uac_replace_from("$var(caller_name)", "");'))
+    expect(callerName.indexOf('if ($avp(names_read) != 1)\n\t\treturn(-1);')).toBeLessThan(callerName.lastIndexOf('uac_replace_from("$var(caller_name)", "");'))
     const onreply = cfg.slice(cfg.indexOf('onreply_route[rtp] {'), cfg.indexOf('route[event_attrs]'))
     expect(onreply.indexOf('remove_hf("P-Asserted-Identity");')).toBeLessThan(onreply.indexOf('append_hf("P-Asserted-Identity: '))
     expect(onreply).toContain('append_hf("P-Asserted-Identity: \\"$var(pai_name)\\" <sip:$var(pai_ext)@$avp(domain)>\\r\\n");')
@@ -750,16 +868,16 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(trunkIn).toContain('$avp(did_target);$avp(t_codecs);$avp(fb_target);$avp(fb_kind);$avp(fb_members);$avp(did_assigned)')
   })
 
-  it('never lets a call with the operator be transferred by it, from either side', () => {
+  it('never lets a call with the operator or LiveKit SIP be transferred by it, from either side', () => {
     const { cfg } = render()
     const main = cfg.slice(cfg.indexOf('\nroute {'), cfg.indexOf('\nroute[outbound_policy] {'))
     const inDialog = main.slice(main.indexOf('if (has_totag()) {'), main.indexOf('if (is_method("CANCEL")) {'))
-    const refer = inDialog.indexOf('if (is_method("REFER") && $dlg_val(trunk) != NULL) {')
+    const refer = inDialog.indexOf('if (is_method("REFER") && ($dlg_val(trunk) != NULL || $dlg_val(meet) != NULL)) {')
     expect(refer).toBeGreaterThan(inDialog.indexOf('if (!match_dialog()) {'))
     expect(refer).toBeLessThan(inDialog.indexOf('route(relay);'))
     expect(inDialog.slice(refer)).toMatch(/^[^]*?send_reply\(403, "Transfer Not Allowed"\);\n\t\t\texit;/)
     // Nor completed by an INVITE with Replaces of such a call.
-    expect(cfg).toContain('\tif ($dlg_val(trunk) != NULL)\n\t\t$var(replaces_trunk) = 1;\n\tunload_dialog_ctx();')
+    expect(cfg).toContain('\tif ($dlg_val(trunk) != NULL || $dlg_val(meet) != NULL)\n\t\t$var(replaces_trunk) = 1;\n\tunload_dialog_ctx();')
     const replaced = main.indexOf('if ($var(replaces_trunk) == 1) {')
     expect(replaced).toBeGreaterThan(main.indexOf('route(replaces_target);'))
     expect(replaced).toBeLessThan(main.indexOf('record_route();'))
@@ -800,7 +918,13 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(fromTrunk).toBeLessThan(inDialog.indexOf('route(relay);'))
     expect(inDialog.slice(fromTrunk)).toMatch(/^[^]*?send_reply\(500, "Internal Error"\);\n\t\t\t\texit;/)
     // Its answers go back through onreply_route[rtp], which takes the extension out of the phone's Contact.
-    expect(inDialog).toContain('if ($var(from_trunk) == 1) {\n\t\t\t$avp(reply_to_trunk) = 1;\n\t\t\tt_on_reply("rtp");\n\t\t}\n\t\troute(relay);')
+    const replies = inDialog.indexOf('if ($var(from_trunk) == 1) {\n\t\t\t$avp(reply_to_trunk) = 1;\n\t\t\tt_on_reply("rtp");\n\t\t}\n')
+    expect(replies).toBeGreaterThan(fromTrunk)
+    expect(replies).toBeLessThan(inDialog.indexOf('route(relay);'))
+    // Step 8: LiveKit SIP's requests in a call it answered leave from the socket the call came from, not the one their
+    // Route names.
+    const meetSocket = inDialog.indexOf('if ($var(from_meet) == 1 && $dlg_val(meet) == "callee" && $dlg_val(caller_sock) != NULL)\n\t\t\t$socket_out = $dlg_val(caller_sock);\n\t\troute(relay);')
+    expect(meetSocket).toBeGreaterThan(replies)
   })
 
   it('sends the operator only the headers a call needs, whatever the phone added', () => {
@@ -836,14 +960,16 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(inDialog).toContain('if (is_method("ACK") && $dlg_val(late_answer) == "1" && has_body_part("application/sdp")) {')
     expect(section('route[trunk_in]', 'route[inbound_number]')).toContain('if (!has_body_part("application/sdp")) {\n\t\t$(avp(late_offer)[*]) = NULL;\n\t\t$avp(late_offer) = "trunk";')
     // A SIP phone's call to the operator without SDP: the operator's offer in its 2xx through rtpengine, never as sent.
-    expect(section('route[trunk_out_loaded]', 'route[trunk_headers]')).toContain('if (has_body_part("application/sdp")) {\n\t\troute(rtp_offer);\n\t} else {\n\t\t$(avp(late_offer)[*]) = NULL;\n\t\t$avp(late_offer) = "browser";\n\t}')
+    expect(section('route[trunk_out_loaded]', 'route[trunk_headers]')).toContain('if (has_body_part("application/sdp"))\n\t\troute(rtp_offer);\n\telse\n\t\troute(late_offer);')
+    // Whoever sent the INVITE without SDP gets the offer: a phone or browser, the operator, LiveKit SIP (step 8).
+    expect(section('route[late_offer]', 'route[rtp_late_offer]')).toContain('$avp(late_offer) = "browser";\n\tif ($var(from_kind) == 1)\n\t\t$avp(late_offer) = "trunk";\n\telse if ($var(from_kind) == 2)\n\t\t$avp(late_offer) = "meet";')
     const reply = section('onreply_route[rtp]', 'route[event_attrs]')
     expect(reply).toContain('if ($avp(late_offer) != NULL) {\n\t\t\tif ($rs >= 200 && $rs < 300)\n\t\t\t\troute(rtp_late_offer);\n\t\t} else {\n\t\t\troute(rtp_answer);')
     expect(section('route[rtp_late_offer]', 'route')).toContain('$dlg_val(late_answer) = "1";')
   })
 
   it('bounds every call with the operator, and ends it with a BYE to both sides at TRUNK_MAX_CALL_SEC', () => {
-    const { cfg } = render({ TRUNK_MAX_CALL_SEC: '7200' })
+    const { cfg } = render({ TRUNK_MAX_CALL_SEC: '7200', MEET_SIP: '192.0.2.20:5080', MEET_SIP_PASSWORD: 'not-a-real-secret-0', MEET_MAX_CALL_SEC: '3600' })
     const section = (name: string, next: string) => cfg.slice(cfg.indexOf(`\n${name} {`), cfg.indexOf(`\n${next} {`))
     // Every INVITE gets its dialog; a call that goes to the operator, its flags once that is known (one of our own
     // direct numbers stays an internal call, route[trunk_out_loaded]).
@@ -861,7 +987,8 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     const { cfg } = render({ CALL_PING_SEC: '12' })
     expect(cfg).toContain('modparam("dialog", "options_ping_interval", 12)')
     // Never for an emergency call (B only): the emergency services hang up themselves, a silent phone must not cut them.
-    expect(cfg.replace(/#.*$/gm, '').match(/create_dialog\(("[^"]*")?\)/g)).toEqual(['create_dialog()', 'create_dialog("B")', 'create_dialog("BP")', 'create_dialog("Bp")'])
+    // A phone's call to the access number of Meet's rooms (route[meet_call]): B only, LiveKit SIP is not asked either.
+    expect(cfg.replace(/#.*$/gm, '').match(/create_dialog\(("[^"]*")?\)/g)).toEqual(['create_dialog()', 'create_dialog("B")', 'create_dialog("B")', 'create_dialog("BP")', 'create_dialog("Bp")'])
     expect(render().cfg).toContain('modparam("dialog", "options_ping_interval", 30)')
     expect(render({ CALL_PING_SEC: '5' }).status).toBe(0)
     expect(render({ CALL_PING_SEC: '300' }).status).toBe(0)
@@ -1051,7 +1178,7 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(section('route[default_trunk]', 'timer_route[default_trunk, 15]')).toContain('$(var(dn){s.select,1,|}{s.int}) >= $shv(dn_gen)')
     expect(cfg).toContain('modparam("cfgutils", "shvset", "dn_gen=i:0")')
     // n°10: the emergency calls known as such in the database (their profile), a day at most, 2 h once restored.
-    expect(cfg).toContain('modparam("dialog", "profiles_no_value", "trunk_out;trunk_emergency")')
+    expect(cfg).toContain('modparam("dialog", "profiles_no_value", "trunk_out;trunk_emergency;meet_all")')
     const entry = readFileSync(join(dir, 'entrypoint.sh'), 'utf8')
     expect(entry).toContain(`-c "SELECT twake_outbound_restart(${EMERGENCY_RESTORED_SEC})"`)
     // n°4: before OpenSIPS starts, after the tables are there.

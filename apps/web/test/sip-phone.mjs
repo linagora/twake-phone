@@ -45,9 +45,10 @@ const digest = (challenge, { user, password, method, uri }) => {
 
 /**
  * The phone of account `user`: over UDP to `proxy` ("host:port"), or over the WebSocket `ws` (ws://...). `domain` is
- * the SIP domain and digest realm.
+ * the SIP domain and digest realm. To play LiveKit SIP (step 8): `from`, the user its calls name in the From (`user`
+ * answers the challenge), and over UDP `bind` (the address it sends from, 127.0.0.1 by default) and `port`.
  */
-export const sipPhone = async ({ proxy, ws, domain, user, password }) => {
+export const sipPhone = async ({ proxy, ws, domain, user, password, from = user, bind = '127.0.0.1', port: bindPort = 0 }) => {
   const responses = []
   const waiters = new Set()
   const changed = () => {
@@ -97,7 +98,7 @@ export const sipPhone = async ({ proxy, ws, domain, user, password }) => {
     udp = createSocket('udp4')
     await new Promise((resolve, reject) => {
       udp.once('error', reject)
-      udp.bind(0, '127.0.0.1', resolve)
+      udp.bind(bindPort, bind, resolve)
     })
     const { address, port } = udp.address()
     via = () => `SIP/2.0/UDP ${address}:${port}`
@@ -206,28 +207,44 @@ export const sipPhone = async ({ proxy, ws, domain, user, password }) => {
   /**
    * Calls `target` (`offer: false`: no SDP, a late offer whose answer goes in the ACK; `extra`: more headers; `body`
    * and `type`: another body than our SDP): resolves with the call once the final answer came (`call.final`), ACKed;
-   * `call.provisional` lists the 1xx.
+   * `call.provisional` lists the 1xx. `giveUpMs`: no final answer by then, the call is cancelled (CANCEL) and resolves
+   * with `state` 'cancelled' and no `final` (its final answer, when it comes, is ACKed).
    */
-  const dial = async (target, { offer = true, extra = [], timeoutMs = 30_000, body: otherBody, type } = {}) => {
+  const dial = async (target, { offer = true, extra = [], timeoutMs = 30_000, body: otherBody, type, giveUpMs } = {}) => {
     const uri = `sip:${target}@${domain}`
     const callId = `phone-${token()}`
     const tag = token()
-    const call = { callId, state: 'calling', rtpPort: rtpPort(), version: 1, reinvites: [], requests: [], acks: [], cseq: 1, local: `<sip:${user}@${domain}>;tag=${tag}`, remote: `<sip:${target}@${domain}>`, route: [], target: uri }
+    const call = { callId, state: 'calling', rtpPort: rtpPort(), version: 1, reinvites: [], requests: [], acks: [], cseq: 1, local: `<sip:${from}@${domain}>;tag=${tag}`, remote: `<sip:${target}@${domain}>`, route: [], target: uri }
     calls.set(callId, call)
     const body = otherBody ?? (offer ? sdpOf(call.rtpPort) : '')
     const invite = (cseq, branch, more = []) => withBody([`INVITE ${uri} SIP/2.0`, `Via: ${via()};branch=${branch};rport`, 'Max-Forwards: 70', `From: ${call.local}`, `To: ${call.remote}`, `Call-ID: ${callId}`, `CSeq: ${cseq} INVITE`, `Contact: ${contact}`, ...extra, ...more], body, type)
     const ackFailure = (cseq, branch, answer) => send(withBody([`ACK ${uri} SIP/2.0`, `Via: ${via()};branch=${branch};rport`, 'Max-Forwards: 70', `From: ${call.local}`, `To: ${one(answer, 'to')}`, `Call-ID: ${callId}`, `CSeq: ${cseq} ACK`]))
     let branch = `z9hG4bK${token()}`
+    /** The final answer to the INVITE of `cseq`, or undefined once `giveUpMs` passed (then cancelled). */
+    const finalOf = async cseq => {
+      const what = `the answer to the call to ${target}`
+      if (giveUpMs === undefined) return response(callId, `${cseq} INVITE`, final, what, timeoutMs)
+      const answer = await response(callId, `${cseq} INVITE`, final, what, giveUpMs).catch(() => undefined)
+      if (answer) return answer
+      const sent = branch
+      await send(withBody([`CANCEL ${uri} SIP/2.0`, `Via: ${via()};branch=${sent};rport`, 'Max-Forwards: 70', `From: ${call.local}`, `To: ${call.remote}`, `Call-ID: ${callId}`, `CSeq: ${cseq} CANCEL`]))
+      void response(callId, `${cseq} INVITE`, final, what, 90_000).then(late => ackFailure(cseq, sent, late), () => undefined)
+      return undefined
+    }
     await send(invite(1, branch))
-    let answer = await response(callId, '1 INVITE', final, `the answer to the call to ${target}`, timeoutMs)
-    if (answer.status === 407) {
+    let answer = await finalOf(1)
+    if (answer?.status === 407) {
       await ackFailure(1, branch, answer)
       branch = `z9hG4bK${token()}`
       call.cseq = 2
       await send(invite(2, branch, [`Proxy-Authorization: ${digest(one(answer, 'proxy-authenticate'), { user, password, method: 'INVITE', uri })}`]))
-      answer = await response(callId, '2 INVITE', final, `the answer to the call to ${target}`, timeoutMs)
+      answer = await finalOf(2)
     }
     call.provisional = responses.filter(r => one(r, 'call-id') === callId && r.status < 200).map(r => r.status)
+    if (!answer) {
+      call.state = 'cancelled'
+      return call
+    }
     call.final = answer
     if (answer.status >= 300) {
       await ackFailure(call.cseq, branch, answer)

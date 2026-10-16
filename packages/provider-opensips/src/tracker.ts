@@ -344,6 +344,20 @@ export class CallTracker {
         if (alert?.extension) this.emit(alert.extension, { type: 'alert.raised', timestamp: now, payload: { alert } })
         return
       }
+      case 'E_TWAKEPHONE_PIN': {
+        // The access number of the rooms (step 8), for the administrators, under it (nobody's extension): the tries of
+        // a PIN of all callers in 10 minutes at MEET_PIN_TRIES_ALL (pin-tries), or MEET_CALLS_ALL calls to it at the same
+        // time (meet-calls, the next ones refused).
+        const number = str(p.number)
+        if (!/^[1-9][0-9]{1,5}$/.test(number)) return
+        const param = p.param === undefined ? 'pin-tries' : str(p.param) === 'calls' ? 'meet-calls' : str(p.param)
+        if (param !== 'pin-tries' && param !== 'meet-calls') return
+        const value = num(p.value)
+        const threshold = num(p.threshold)
+        const alert: TelephonyAlert = { kind: 'meet', param, scope: 'tenant', number, ...(value !== undefined ? { value } : {}), ...(threshold !== undefined ? { threshold } : {}) }
+        this.emit(number, { type: 'alert.raised', timestamp: now, payload: { alert } })
+        return
+      }
       case 'E_TWAKEPHONE_EMERGENCY': {
         // Never refused, never counted by a cap: emergency calls in a row from one extension (EMERGENCY_BURST within
         // EMERGENCY_BURST_WINDOW_MS) are told to the administrators, each one from there on.

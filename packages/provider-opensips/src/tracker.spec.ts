@@ -599,6 +599,25 @@ describe('CallTracker', () => {
     expect(events).toHaveLength(2)
   })
 
+  it("tells the administrators of failed tries of a room's PIN by phone, all callers together, under the access number (step 8, second review n°1)", () => {
+    const { tracker, events, clear } = make()
+    clear()
+    tracker.handle('E_TWAKEPHONE_PIN', { number: '8000', value: '301', threshold: 300 })
+    expect(events.map(e => [e.extension, e.event.type === 'alert.raised' && e.event.payload.alert])).toEqual([['8000', { kind: 'meet', param: 'pin-tries', scope: 'tenant', number: '8000', value: 301, threshold: 300 }]])
+    // Nothing that is no access number.
+    tracker.handle('E_TWAKEPHONE_PIN', { number: '+33199000150', value: 301, threshold: 300 })
+    tracker.handle('E_TWAKEPHONE_PIN', { value: 301 })
+    tracker.handle('E_TWAKEPHONE_PIN', { param: 'other', number: '8000', value: 301 })
+    expect(events).toHaveLength(1)
+    // The calls to it at the same time (third review n°1), and the tries told with their kind.
+    tracker.handle('E_TWAKEPHONE_PIN', { param: 'calls', number: '8000', value: '101', threshold: '100' })
+    tracker.handle('E_TWAKEPHONE_PIN', { param: 'pin-tries', number: '8000', value: '300', threshold: '300' })
+    expect(events.slice(1).map(e => e.event.type === 'alert.raised' && e.event.payload.alert)).toEqual([
+      { kind: 'meet', param: 'meet-calls', scope: 'tenant', number: '8000', value: 101, threshold: 100 },
+      { kind: 'meet', param: 'pin-tries', scope: 'tenant', number: '8000', value: 300, threshold: 300 }
+    ])
+  })
+
   it('forgets the emergency calls older than the window, on the clock it was given (review 6b, n°11, n°21)', () => {
     const events: unknown[] = []
     let t = Date.parse('2026-10-14T18:00:00.000Z')

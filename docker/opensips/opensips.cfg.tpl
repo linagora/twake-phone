@@ -13,8 +13,12 @@
 # (P-Asserted-Identity in the 2xx), whatever the phones claim. Step 6 (ADR 0016): calls to and from the public
 # network through the operator's trunk, on a UDP socket of its own (route[trunk_in], route[trunk_out]), with the
 # numbering plan of `dialplan`, the operator's servers in `dispatcher` and the registrations of `uac_registrant`, all
-# written by the Gateway; the emergency numbers go out whatever the policy. Everything in here is OpenSIPS-specific;
-# the Gateway only knows `provider-opensips`.
+# written by the Gateway; the emergency numbers go out whatever the policy. Step 8 (ADR 0018): LiveKit SIP, the phone
+# access of Meet's rooms, sees no other trunk than this OpenSIPS, on a UDP socket of its own (route[meet_call],
+# route[meet_source]): a call to the access number (MEET_NUMBER) goes to it, which asks for the room's PIN; a call it
+# places for a room (dial-out) answers our challenge, is the call of the person who asked for it (their extension in
+# the From) and follows the path of a call from their phone, the rules of the calls to the public network included.
+# Everything in here is OpenSIPS-specific; the Gateway only knows `provider-opensips`.
 
 log_level=${OPENSIPS_LOG_LEVEL}
 xlog_level=${OPENSIPS_LOG_LEVEL}
@@ -47,6 +51,9 @@ socket=wss:${LISTEN_IP}:${WSS_PORT} as ${SIP_DOMAIN}:${WSS_PORT}
 # The trunk's own socket (step 6, ADR 0016; ARCHITECTURE §13): never 5060 by default (some NATs drop what leaves from
 # it), and no other address declared unless TRUNK_ADVERTISE says so: the operator answers where the packets come from.
 socket=udp:${TRUNK_LISTEN_IP}:${TRUNK_PORT}${TRUNK_SOCKET_AS}
+# The socket of LiveKit SIP (step 8, ADR 0018): it hears LiveKit SIP's address only (MEET_SIP). None at all when Meet is
+# off (MEET_ON 0, entrypoint.sh). On the loopback by default, like the others.
+${MEET_SOCKET}
 
 mpath="${OPENSIPS_MPATH}"
 
@@ -107,6 +114,10 @@ modparam("auth_db", "password_column", "ha1")
 modparam("auth_db", "use_domain", 0)
 # Only the hash is read: no extra column (rpid and the like) is loaded into AVPs.
 modparam("auth_db", "load_credentials", "")
+# LiveKit SIP's credentials (step 8, route[meet_source]): one account, outside `subscriber` (no phone may register or
+# call with it), its HA1 only (for the realm SIP_DOMAIN, made by entrypoint.sh from MEET_SIP_PASSWORD).
+modparam("auth", "username_spec", "$var(meet_user)")
+modparam("auth", "password_spec", "$var(meet_ha1)")
 
 #### Registrations: in memory, one node (clustering is a V1 exploitation item)
 loadmodule "usrloc.so"
@@ -150,8 +161,9 @@ modparam("dialog", "default_timeout", 14400)
 modparam("dialog", "options_ping_interval", ${CALL_PING_SEC})
 # The calls to the public network in progress (step 6b, route[outbound_count]): per caller's extension, and all of them
 # (one organisation per OpenSIPS). An emergency call is in neither, but in trunk_emergency: how a restart knows it.
-modparam("dialog", "profiles_with_value", "trunk_caller")
-modparam("dialog", "profiles_no_value", "trunk_out;trunk_emergency")
+# The calls to the access number of Meet's rooms in progress (step 8, route[meet_call]): per caller, and all of them.
+modparam("dialog", "profiles_with_value", "trunk_caller;meet_caller")
+modparam("dialog", "profiles_no_value", "trunk_out;trunk_emergency;meet_all")
 loadmodule "rtpengine.so"
 modparam("rtpengine", "rtpengine_sock", "${RTPENGINE_SOCK}")
 
@@ -181,6 +193,13 @@ loadmodule "cfgutils.so"
 modparam("cfgutils", "shvset", "no4c_until=i:0")
 # The table of step 5 (`push_targets`) likewise: when the database says it is missing, nobody is woken for 30 s.
 modparam("cfgutils", "shvset", "no5_until=i:0")
+# Whether the phone access of Meet's rooms is on (step 8, ADR 0018): MEET_SIP set (entrypoint.sh); and its access
+# number. The Gateway reads both through the MI (shv_get) and says at its start when it has another view of them.
+modparam("cfgutils", "shvset", "meet_on=i:${MEET_ON}")
+modparam("cfgutils", "shvset", "meet_number=s:${MEET_NUMBER}")
+# The longest a call with LiveKit SIP lasts (MEET_MAX_CALL_SEC): for the calls to come once changed (MI shv_set; the e2e
+# shortens it a moment).
+modparam("cfgutils", "shvset", "meet_max_sec=i:${MEET_MAX_CALL_SEC}")
 
 #### Calls to someone without a window (step 5, ADR 0015): when the extension a call reaches has no registered window
 #### and its holder has a browser to wake (`push_targets`, written by the Gateway for a person with a push
@@ -195,10 +214,11 @@ loadmodule "event_routing.so"
 #### callee (the extension the call reached) and dialled (what the caller dialled) as extra fields: the default ones
 #### only carry tags and the Call-ID. In the database, `external` too (step 6b): "out" for a call to the public
 #### network, which the caps count (a trigger keeps `outbound_usage` as each CDR is written), "emergency" for an
-#### emergency call, which they never do.
+#### emergency call, which they never do; and `via` (step 8): "meet" for a call a room of Meet placed at the name of
+#### `caller`, not their phone.
 loadmodule "acc.so"
 modparam("acc", "db_url", "${OPENSIPS_DB_URL}")
-modparam("acc", "extra_fields", "db: caller; callee; dialled; external")
+modparam("acc", "extra_fields", "db: caller; callee; dialled; external; via")
 modparam("acc", "extra_fields", "evi: caller; callee; dialled")
 
 #### Trunks (step 6, ADR 0016): the Gateway writes the operator's servers (`dispatcher`), the registrations
@@ -251,43 +271,87 @@ loadmodule "cachedb_local.so"
 
 #### Routing ###########################################################################################################
 
+# A call has two sides, each of a kind: 0 one of our phones (a browser), 1 the operator (step 6), 2 LiveKit SIP (step 8).
 # Towards a browser: DTLS-SRTP (RTP/SAVPF), rtcp-mux, ICE with rtpengine as the only candidate (the browsers never see
 # each other's address, and a browser behind a NAT still works), SDP origin and connection rewritten. Towards the
 # operator (step 6): plain RTP (RTP/AVP, no ICE, no DTLS nor SDES, RTCP on its own port), only the trunk's codecs
-# and DTMF events ($dlg_val(codecs)); a call from the operator offers the browser rtcp-mux and a=mid, as it expects.
-# SIP INFO (DTMF) and the other in-dialog requests pass untouched.
+# and DTMF events ($dlg_val(codecs)). Towards LiveKit SIP (step 8): plain RTP likewise, in the codecs it speaks
+# (G.722, G.711) and DTMF events (how a room's PIN is typed). A browser whose other side is not a browser is offered
+# rtcp-mux and a=mid, as it expects. SIP INFO (DTMF) and the other in-dialog requests pass untouched.
 route[rtp_flags] {
 	$var(rtp_flags) = "ICE=force RTP/SAVPF rtcp-mux-require replace-origin replace-session-connection";
 	if ($param(1) == 1)
 		$var(rtp_flags) = "ICE=remove RTP/AVP rtcp-mux-demux DTLS=off SDES-off replace-origin replace-session-connection " + $dlg_val(codecs);
-	else if ($dlg_val(trunk) != NULL)
+	else if ($param(1) == 2)
+		$var(rtp_flags) = "ICE=remove RTP/AVP rtcp-mux-demux DTLS=off SDES-off replace-origin replace-session-connection codec-strip-all codec-except-G722 codec-except-PCMA codec-except-PCMU codec-except-telephone-event";
+	else if ($dlg_val(trunk) != NULL || $dlg_val(meet) != NULL)
 		$var(rtp_flags) = "ICE=force RTP/SAVPF rtcp-mux-require generate-mid SDES-off replace-origin replace-session-connection";
 }
 
-# Whether the request in hand goes to the operator (1) or to a browser (-1): the trunk is the callee of an outbound
-# call, the caller of an inbound one ($dlg_val(trunk)); an in-dialog request goes downstream (to the callee) or
-# upstream (rr's ftag).
+# The kind of the side the request in hand goes to ($var(to_kind)) and of the side it comes from ($var(from_kind)):
+# the operator is the callee of an outbound call, the caller of an inbound one ($dlg_val(trunk)), LiveKit SIP the callee
+# of a call to the access number, the caller of a call a room places ($dlg_val(meet)); an in-dialog request goes
+# downstream (to the callee) or upstream (rr's ftag).
+route[sides] {
+	$var(callee_kind) = 0;
+	$var(caller_kind) = 0;
+	if ($dlg_val(trunk) == "callee")
+		$var(callee_kind) = 1;
+	else if ($dlg_val(meet) == "callee")
+		$var(callee_kind) = 2;
+	if ($dlg_val(trunk) == "caller")
+		$var(caller_kind) = 1;
+	else if ($dlg_val(meet) == "caller")
+		$var(caller_kind) = 2;
+	if (!has_totag() || is_direction("downstream")) {
+		$var(to_kind) = $var(callee_kind);
+		$var(from_kind) = $var(caller_kind);
+	} else {
+		$var(to_kind) = $var(caller_kind);
+		$var(from_kind) = $var(callee_kind);
+	}
+}
+
+# Whether the request in hand goes to the operator (1) or not (-1).
 route[to_trunk] {
 	if ($dlg_val(trunk) == NULL)
 		return(-1);
-	if (!has_totag() || is_direction("downstream")) {
-		if ($dlg_val(trunk) == "callee")
-			return(1);
+	route(sides);
+	if ($var(to_kind) == 1)
+		return(1);
+	return(-1);
+}
+
+# Whether the request in hand goes to LiveKit SIP (1) or not (-1).
+route[to_meet] {
+	if ($dlg_val(meet) == NULL)
 		return(-1);
-	}
-	if ($dlg_val(trunk) == "caller")
+	route(sides);
+	if ($var(to_kind) == 2)
 		return(1);
 	return(-1);
 }
 
 route[rtp_offer] {
-	# The offer's side, for its answer (onreply_route[rtp]: it goes the other way).
-	$(avp(offer_to_trunk)[*]) = NULL;
-	$avp(offer_to_trunk) = 0;
-	if (route(to_trunk))
-		$avp(offer_to_trunk) = 1;
-	route(rtp_flags, $avp(offer_to_trunk));
-	if (!rtpengine_offer("$var(rtp_flags)")) {
+	# The offer's side, for its answer (onreply_route[rtp]: it goes back there).
+	route(sides);
+	$(avp(offer_from)[*]) = NULL;
+	$avp(offer_from) = $var(from_kind);
+	route(rtp_flags, $var(to_kind));
+	# LiveKit SIP draws the session id and version of its o= line as any 64-bit number (step 8), half of them past the
+	# 2^63 - 1 that JSEP (RFC 8829) allows: Firefox refuses such an offer (488). rtpengine keeps them as they are; it is
+	# given them as "1" and their last 17 digits instead (below 2^63, the same in each offer of the call, a version that
+	# grows still grows).
+	$var(offer_ok) = 0;
+	if ($var(from_kind) == 2) {
+		$var(sdp_re) = '/o=([^ ]+) [0-9]*([0-9]{17}) [0-9]*([0-9]{17}) IN /o=\1 1\2 1\3 IN /';
+		$var(sdp_in) = $(rb{re.subst,$var(sdp_re)});
+		if (rtpengine_offer("$var(rtp_flags)", , , $var(sdp_in)))
+			$var(offer_ok) = 1;
+	} else if (rtpengine_offer("$var(rtp_flags)")) {
+		$var(offer_ok) = 1;
+	}
+	if ($var(offer_ok) != 1) {
 		# Never relay the browser's own SDP: without rtpengine the call would go browser to browser.
 		xlog("L_ERR", "rtpengine offer failed for $ci\n");
 		send_reply(503, "Media Unavailable");
@@ -297,32 +361,38 @@ route[rtp_offer] {
 	$avp(rtp_on) = 1;
 }
 # An answer in a reply goes back the way its offer came ($param(1) unset); one in an ACK goes the way of the request
-# ($param(1): 1 to the operator, 0 to a browser).
+# ($param(1): the kind of the side it goes to).
 route[rtp_answer] {
-	$var(answer_to_trunk) = 0;
+	$var(answer_to) = 0;
 	if ($param(1) != NULL)
-		$var(answer_to_trunk) = $param(1);
-	else if ($dlg_val(trunk) != NULL && $avp(offer_to_trunk) != 1)
-		$var(answer_to_trunk) = 1;
-	route(rtp_flags, $var(answer_to_trunk));
+		$var(answer_to) = $param(1);
+	else if ($avp(offer_from) != NULL)
+		$var(answer_to) = $avp(offer_from);
+	route(rtp_flags, $var(answer_to));
 	if (!rtpengine_answer("$var(rtp_flags)"))
 		xlog("L_ERR", "rtpengine answer failed for $ci\n");
 }
 
 # An INVITE without SDP (a "late offer", RFC 3264: an operator refreshing its session, or calling that way): the offer
-# comes in the 2xx, back to whoever sent the INVITE, and the answer in the ACK. Both go through rtpengine
-# (onreply_route[rtp], then the in-dialog ACK in the main route), never from one side to the other untouched.
+# comes in the 2xx, back to whoever sent the INVITE (its kind, $avp(late_offer)), and the answer in the ACK. Both go
+# through rtpengine (onreply_route[rtp], then the in-dialog ACK in the main route), never from one side to the other
+# untouched.
 route[late_offer] {
+	route(sides);
 	$(avp(late_offer)[*]) = NULL;
 	$avp(late_offer) = "browser";
-	if ($dlg_val(trunk) != NULL && !route(to_trunk))
+	if ($var(from_kind) == 1)
 		$avp(late_offer) = "trunk";
+	else if ($var(from_kind) == 2)
+		$avp(late_offer) = "meet";
 }
 route[rtp_late_offer] {
-	$var(offer_to_trunk) = 0;
+	$var(offer_to) = 0;
 	if ($avp(late_offer) == "trunk")
-		$var(offer_to_trunk) = 1;
-	route(rtp_flags, $var(offer_to_trunk));
+		$var(offer_to) = 1;
+	else if ($avp(late_offer) == "meet")
+		$var(offer_to) = 2;
+	route(rtp_flags, $var(offer_to));
 	if (rtpengine_offer("$var(rtp_flags)")) {
 		$avp(rtp_on) = 1;
 		$dlg_val(late_answer) = "1";
@@ -358,14 +428,25 @@ route {
 		$var(stranger) = 1;
 	}
 
+	# The socket of LiveKit SIP (step 8, ADR 0018) hears LiveKit SIP only: its address (MEET_SIP), any port, and nothing
+	# when Meet is off. Its calls must still answer our challenge (below).
+	$var(meet) = 0;
+	if ($socket_in(ip) == "${MEET_LISTEN_IP}" && $socket_in(port) == ${MEET_PORT}) {
+		if ($shv(meet_on) != 1 || $si != "${MEET_SIP_IP}") {
+			xlog("L_NOTICE", "meet: $rm from $si:$sp refused, not LiveKit SIP\n");
+			if (!is_method("ACK"))
+				send_reply(403, "Forbidden");
+			exit;
+		}
+		$var(meet) = 1;
+	}
+
 	# In-dialog requests (ACK, BYE, re-INVITE for hold, INFO, REFER...) follow the Record-Route.
 	if (has_totag()) {
 		if (is_method("ACK") && $var(stranger) == 0 && t_check_trans()) {
 			if (has_body_part("application/sdp")) {
-				$var(ack_to_trunk) = 0;
-				if (route(to_trunk))
-					$var(ack_to_trunk) = 1;
-				route(rtp_answer, $var(ack_to_trunk));
+				route(sides);
+				route(rtp_answer, $var(to_kind));
 			}
 			t_relay();
 			exit;
@@ -401,6 +482,19 @@ route {
 			}
 			xlog("L_NOTICE", "trunk: $rm of call $ci from $si:$sp, an address the trunk does not declare (accepted in this call)\n");
 		}
+		# LiveKit SIP's side of a call speaks from its socket, and nothing else does (step 8).
+		$var(from_meet) = 0;
+		if ($dlg_val(meet) != NULL) {
+			route(sides);
+			if ($var(from_kind) == 2)
+				$var(from_meet) = 1;
+		}
+		if ($var(from_meet) != $var(meet)) {
+			xlog("L_NOTICE", "meet: $rm of call $ci from $si:$sp refused, not LiveKit SIP's side of a call with it\n");
+			if (!is_method("ACK"))
+				send_reply(403, "Forbidden");
+			exit;
+		}
 		# From the operator's side of a call to the phone's: to the phone of this dialog, at the Contact it gave
 		# (fix_route_dialog), whatever the Request-URI says: the operator never had the phone's own (route[trunk_contact])
 		# and nothing it sends can go anywhere else. Its answers go back to the operator (onreply_route[rtp]).
@@ -420,10 +514,11 @@ route {
 		}
 		# Nothing in a call with the operator may have it place a call (step 6a, ADR 0016): a REFER (a transfer) would
 		# have it call whatever the Refer-To says, on our account and past route[outbound_policy]. Refused whichever
-		# side sends it: a transfer with an external party waits for one the platform makes itself.
-		if (is_method("REFER") && $dlg_val(trunk) != NULL) {
-			xlog("L_NOTICE", "call $ci: REFER in a call with the operator refused\n");
-			if (route(to_trunk))
+		# side sends it: a transfer with an external party waits for one the platform makes itself. Likewise in a call
+		# with LiveKit SIP (step 8): a room calls through the Gateway only, at the name of whoever asked.
+		if (is_method("REFER") && ($dlg_val(trunk) != NULL || $dlg_val(meet) != NULL)) {
+			xlog("L_NOTICE", "call $ci: REFER in a call with the operator or LiveKit SIP refused\n");
+			if (route(to_trunk) || route(to_meet))
 				append_to_reply("Twake-Call-Refused: transfer-external\r\n");
 			send_reply(403, "Transfer Not Allowed");
 			exit;
@@ -451,10 +546,8 @@ route {
 		# The answer to an offer made in a 2xx (route[rtp_late_offer]).
 		if (is_method("ACK") && $dlg_val(late_answer) == "1" && has_body_part("application/sdp")) {
 			$dlg_val(late_answer) = "0";
-			$var(ack_to_trunk) = 0;
-			if (route(to_trunk))
-				$var(ack_to_trunk) = 1;
-			route(rtp_answer, $var(ack_to_trunk));
+			route(sides);
+			route(rtp_answer, $var(to_kind));
 		}
 		if (is_method("BYE"))
 			rtpengine_delete();
@@ -473,6 +566,11 @@ route {
 			$avp(reply_to_trunk) = 1;
 			t_on_reply("rtp");
 		}
+		# LiveKit SIP's requests in a call it answered name our sockets in reverse order (the route set a caller would
+		# have, step 8): loose_route would send them from the socket they came to. They leave from the socket the call
+		# came from (route[meet_call]).
+		if ($var(from_meet) == 1 && $dlg_val(meet) == "callee" && $dlg_val(caller_sock) != NULL)
+			$socket_out = $dlg_val(caller_sock);
 		route(relay);
 		exit;
 	}
@@ -490,6 +588,20 @@ route {
 	if ($socket_in(ip) == "${TRUNK_LISTEN_IP}" && $socket_in(port) == ${TRUNK_PORT}) {
 		route(trunk_in);
 		exit;
+	}
+
+	# The socket of LiveKit SIP (step 8): the calls its rooms place (dial-out), and its keepalives. Nothing registers there.
+	if ($var(meet) == 1) {
+		if (is_method("ACK"))
+			exit;
+		if (is_method("OPTIONS")) {
+			send_reply(200, "OK");
+			exit;
+		}
+		if (!is_method("INVITE")) {
+			send_reply(405, "Method Not Allowed");
+			exit;
+		}
 	}
 
 	if (loose_route()) {
@@ -537,14 +649,40 @@ route {
 		exit;
 	}
 
-	# A call: the caller must be one of our accounts and call as itself.
-	if (!proxy_authorize("", "subscriber")) {
-		proxy_challenge("", "auth");
-		exit;
-	}
-	if ($au != $fU) {
-		send_reply(403, "Forbidden");
-		exit;
+	# A call: the caller must be one of our accounts and call as itself. A call a room places (step 8) comes with
+	# LiveKit SIP's own account (MEET_SIP_USER, its HA1 for our realm), and its From names the person who asked for it
+	# (the Gateway's dial-out): one of our accounts, read after the transaction (route[meet_source]).
+	if ($var(meet) == 1) {
+		$var(meet_user) = "${MEET_SIP_USER}";
+		$var(meet_ha1) = "${MEET_SIP_HA1}";
+		if (!pv_proxy_authorize("${SIP_DOMAIN}")) {
+			proxy_challenge("${SIP_DOMAIN}", "auth");
+			exit;
+		}
+		if (!($fU =~ "^[A-Za-z0-9._+-]{1,64}$") || is_present_hf("Replaces")) {
+			xlog("L_NOTICE", "meet: call $ci from $fU refused\n");
+			send_reply(403, "Forbidden");
+			exit;
+		}
+		# A room never calls its own access number (a loop through LiveKit SIP).
+		if ($rU == "${MEET_NUMBER}") {
+			send_reply(482, "Loop Detected");
+			exit;
+		}
+		# The Gateway's grant of this very call (route[meet_source]), read here and never passed on.
+		$avp(meet_grant) = "";
+		if (is_present_hf("X-Twake-Grant"))
+			$avp(meet_grant) = $hdr(X-Twake-Grant);
+		remove_hf("X-Twake-Grant");
+	} else {
+		if (!proxy_authorize("", "subscriber")) {
+			proxy_challenge("", "auth");
+			exit;
+		}
+		if ($au != $fU) {
+			send_reply(403, "Forbidden");
+			exit;
+		}
 	}
 	consume_credentials();
 	# Who calls is told by this script only (the From's display, route[caller_name]): no identity a phone asserts
@@ -562,18 +700,27 @@ route {
 	# (`dialplan`); only what route[outbound_policy] allows goes to the operator. An emergency number goes to it
 	# whatever extension or group could have its digits. Anything else is an extension or a group, as before.
 	$var(pstn) = 0;
-	if (!is_present_hf("Replaces") && dp_translate(1, "$rU", $var(num), $var(num_class)))
+	if (!is_present_hf("Replaces") && dp_translate(1, "$rU", $var(num), $var(num_class))) {
+		# A room never calls an emergency number (step 8): an emergency call comes from a person's phone, whose
+		# number and place the emergency services are given.
+		if ($var(meet) == 1 && $var(num_class) == "emergency") {
+			xlog("L_NOTICE", "meet: call $ci from $fU to $var(num) refused (emergency)\n");
+			send_reply(403, "Emergency Calls Not From A Room");
+			exit;
+		}
 		route(outbound_policy);
+	}
 
 	# The INVITE that completes an attended transfer (Replaces) goes where the call it replaces went: the extension
 	# named in it may have forwarded that call elsewhere (the transferor dialled 104, 104's rules took it to 103).
-	# Never into a call with the operator (step 6a): the platform does not transfer external parties yet.
+	# Never into a call with the operator (step 6a) or LiveKit SIP (step 8): the platform does not transfer external
+	# parties yet.
 	$var(replaces_to) = "";
 	$var(replaces_trunk) = 0;
 	if (is_present_hf("Replaces"))
 		route(replaces_target);
 	if ($var(replaces_trunk) == 1) {
-		xlog("L_NOTICE", "call $ci: Replaces of a call with the operator refused\n");
+		xlog("L_NOTICE", "call $ci: Replaces of a call with the operator or LiveKit SIP refused\n");
 		append_to_reply("Twake-Call-Refused: transfer-external\r\n");
 		send_reply(403, "Transfer Not Allowed");
 		exit;
@@ -600,6 +747,10 @@ route {
 	# phone asked whether it is still there (P), the call ended past its longest duration (B). One of our own direct
 	# numbers dialled stays an internal call, without either.
 	create_dialog();
+	if ($var(meet) == 1) {
+		$dlg_val(meet) = "caller";
+		$acc_extra(via) = "meet";
+	}
 
 	# Who calls whom, as dialled (the Request-URI changes with the lookup): for the CDR and the events. `callee` is
 	# where the call goes now (the callee's rules may move it), `dialled` stays what the caller dialled.
@@ -634,6 +785,18 @@ route {
 		exit;
 	}
 
+	# A room's call (step 8): whoever its From names must be one of our accounts (route[meet_source]).
+	if ($var(meet) == 1) {
+		route(meet_source);
+		exit;
+	}
+
+	# The access number of Meet's rooms (step 8): to LiveKit SIP (route[meet_call]).
+	if ($shv(meet_on) == 1 && $var(pstn) == 0 && !is_present_hf("Replaces") && $rU == "${MEET_NUMBER}") {
+		route(meet_call);
+		exit;
+	}
+
 	if (is_present_hf("Replaces")) {
 		# No rules for it: it must reach the very call it replaces.
 		if ($var(replaces_to) != "") {
@@ -663,6 +826,198 @@ route {
 	# registered window of the extension reached rings: route[rules_next] reads them without holding this process.
 	route(rules_next);
 	exit;
+}
+
+#### Meet (step 8, ADR 0018) ###########################################################################################
+# LiveKit SIP, the phone access of Meet's rooms, sees no other trunk than this proxy, on a socket of its own
+# (MEET_LISTEN_IP:MEET_PORT, the main route: its address only, MEET_SIP). Both ways:
+# - a call to the access number (MEET_NUMBER), from one of our phones or from the operator on a direct number that
+#   aims at it, goes to LiveKit SIP, which asks for the room's PIN (route[meet_call]);
+# - a call a room places (the Gateway's dial-out) answers our challenge with LiveKit SIP's account, names in its From
+#   the person who asked for it, one of our accounts, and carries the Gateway's grant of that very call (X-Twake-Grant,
+#   a row of `dial_out_grants` the Gateway wrote just before: that person, that number, single use, a few seconds to
+#   live): LiveKit SIP's account alone, which anyone with an API key of the LiveKit server can read back, makes no call
+#   anyone's. It is then that person's call: an extension or a group as from their phone, a number of the public
+#   network with their rights, caps, volume thresholds and direct number (route[trunk_out]), never longer than
+#   MEET_MAX_CALL_SEC; never an emergency number nor the access number. The callee's phone shows "Meet (<name>)".
+# - a call to the access number is a try of a room's PIN (one per call, LiveKit SIP): counted for its caller when it
+#   comes, given back if LiveKit SIP does not answer it (route[meet_call], failure_route[meet_failed]), whatever then
+#   happens in it (a right PIN, a wrong one typed at once or after an hour). A caller with MEET_PIN_TRIES of them in 10
+#   minutes is refused (403, pin-tries) for the rest of those 10 minutes; those who hide their number share one count,
+#   refused past MEET_PIN_TRIES_ALL. A caller has MEET_CALLS_PER_CALLER calls to it at the same time at most (486,
+#   meet-busy; those who hide their number together MEET_CALLS_ALL), all callers MEET_CALLS_ALL (503, meet-full). The
+#   administrators are told (E_TWAKEPHONE_PIN, once per 10 minutes for each) when the calls of all callers in 10
+#   minutes reach MEET_PIN_TRIES_ALL (pin-tries) and when MEET_CALLS_ALL are in progress (calls). The counts of 10
+#   minutes are in memory, this OpenSIPS's only, forgotten when it restarts. A call with LiveKit SIP lasts
+#   MEET_MAX_CALL_SEC at most ($shv(meet_max_sec)), then BYE to both sides.
+# The media through rtpengine, plain RTP on LiveKit SIP's side (route[rtp_flags]).
+
+# A room's call: its grant taken (deleted, so used once), for whoever its From names, one of our accounts, and the
+# number it calls as the Gateway gave it to LiveKit (the Request-URI), read without holding this process. Only the
+# characters of a grant (32 hexadecimal) and of a number get into the query.
+route[meet_source] {
+	$avp(meet_pstn) = $var(pstn);
+	if (!($avp(meet_grant) =~ "^[0-9a-f]{32}$") || !($rU =~ "^[+]?[0-9*#]{2,20}$")) {
+		xlog("L_NOTICE", "meet: call $ci from $avp(caller) to $rU refused, without a grant\n");
+		append_to_reply("Twake-Call-Refused: not-granted\r\n");
+		t_reply(403, "Not Granted");
+		exit;
+	}
+	$var(meet_query) = "DELETE FROM dial_out_grants g WHERE g.token = '" + $avp(meet_grant) + "' AND g.extension = '" + $fU + "' AND g.number = '" + $rU + "' AND g.expires_at > now() AND EXISTS (SELECT 1 FROM subscriber s WHERE s.username = g.extension) RETURNING 1";
+	async(sql_query_one("$var(meet_query)", "$avp(meet_known)"), meet_source_loaded);
+}
+
+route[meet_source_loaded] {
+	$var(meet_rc) = $rc;
+	if (t_was_cancelled()) {
+		t_reply(487, "Request Terminated");
+		exit;
+	}
+	if ($var(meet_rc) == -2) {
+		xlog("L_NOTICE", "meet: call $ci from $avp(caller) to $rU refused: no grant of the Gateway for it (used, past its time, another person or number), or none of our accounts\n");
+		append_to_reply("Twake-Call-Refused: not-granted\r\n");
+		t_reply(403, "Not Granted");
+		exit;
+	}
+	if ($var(meet_rc) < 0) {
+		xlog("L_WARN", "meet: call $ci from $avp(caller), its grant not read ($var(meet_rc))\n");
+		t_reply(503, "Service Unavailable");
+		exit;
+	}
+	if ($avp(meet_pstn) == 1) {
+		route(trunk_out);
+		exit;
+	}
+	route(rules_next);
+	exit;
+}
+
+# A call to the access number: to LiveKit SIP, from its socket. No rules, groups nor windows: the number is nobody's.
+# Never from LiveKit SIP itself (a room calling one of our direct numbers that aims at it). The socket the call came
+# from is kept for LiveKit SIP's requests in the call (main route).
+route[meet_call] {
+	if ($dlg_val(meet) == "caller") {
+		xlog("L_NOTICE", "meet: call $ci, a room calling its own access, refused\n");
+		t_reply(482, "Loop Detected");
+		exit;
+	}
+	# Who calls: the extension, the operator's caller; `anonymous` for all who hide their number.
+	$var(pin_who) = "other";
+	if ($avp(caller) =~ "^[A-Za-z0-9._+-]{1,64}$")
+		$var(pin_who) = $avp(caller);
+	$var(pin_cap) = ${MEET_PIN_TRIES};
+	$var(m_cap) = ${MEET_CALLS_PER_CALLER};
+	if ($var(pin_who) == "anonymous" || $var(pin_who) == "other") {
+		$var(pin_cap) = ${MEET_PIN_TRIES_ALL};
+		$var(m_cap) = ${MEET_CALLS_ALL};
+	}
+	# The calls to the access number at the same time, this one counted in, under a lock: of two calls at once, one
+	# counts the other. Its dialog leaves the profiles when it ends, refused or not.
+	get_static_lock("meet_count");
+	set_dlg_profile("meet_caller", "$var(pin_who)");
+	set_dlg_profile("meet_all");
+	get_profile_size("meet_caller", "$var(pin_who)", $var(m_mine));
+	get_profile_size("meet_all", , $var(m_all));
+	release_static_lock("meet_count");
+	if ($var(m_all) > ${MEET_CALLS_ALL}) {
+		xlog("L_WARN", "meet: call $ci from $avp(caller) to the access number refused: $var(m_all) calls to it at the same time\n");
+		route(meet_alert, "calls", $var(m_all), ${MEET_CALLS_ALL});
+		append_to_reply("Twake-Call-Refused: meet-full\r\n");
+		t_reply(503, "Service Unavailable");
+		exit;
+	}
+	if ($var(m_mine) > $var(m_cap)) {
+		xlog("L_NOTICE", "meet: call $ci from $avp(caller) to the access number refused: $var(m_mine) calls of it at the same time\n");
+		append_to_reply("Twake-Call-Refused: meet-busy\r\n");
+		t_reply(486, "Busy Here");
+		exit;
+	}
+	# A try of a PIN, counted now (calls at once count each other), given back if LiveKit SIP does not answer it
+	# (failure_route[meet_failed]): past MEET_PIN_TRIES of this caller in 10 minutes from the first one
+	# (MEET_PIN_TRIES_ALL for `anonymous`), refused before LiveKit SIP. Never for what other callers tried.
+	$var(pin_n) = 0;
+	cache_add("local", "pin:c:$var(pin_who)", 1, 600, $var(pin_n));
+	if ($var(pin_n) > $var(pin_cap)) {
+		xlog("L_WARN", "meet: call $ci from $avp(caller) to the access number refused: $var(pin_n) calls of it in 10 minutes\n");
+		append_to_reply("Twake-Call-Refused: pin-tries\r\n");
+		t_reply(403, "Too Many Tries");
+		exit;
+	}
+	$avp(pin_who) = $var(pin_who);
+	# All callers' tries in 10 minutes: at MEET_PIN_TRIES_ALL, the administrators hear it (at the latest when those who
+	# hide their number reach their cap, the same number); nobody is refused for it.
+	$var(pin_all) = 0;
+	cache_add("local", "pin:all", 1, 600, $var(pin_all));
+	if ($var(pin_all) >= ${MEET_PIN_TRIES_ALL})
+		route(meet_alert, "pin-tries", $var(pin_all), ${MEET_PIN_TRIES_ALL});
+	$dlg_val(meet) = "callee";
+	# Never longer than MEET_MAX_CALL_SEC, then BYE to both sides (B; a call from the operator has it already, with its
+	# phone ping): LiveKit SIP answers any OPTIONS, a LiveKit SIP gone in the middle of the call is not noticed otherwise.
+	if ($dlg_val(trunk) == NULL)
+		create_dialog("B");
+	if ($DLG_timeout > $shv(meet_max_sec))
+		$DLG_timeout = $shv(meet_max_sec);
+	$dlg_val(caller_sock) = $socket_in;
+	$dlg_val(callee) = $avp(callee);
+	$dlg_val(dialled) = $avp(dialled);
+	$ru = "sip:${MEET_NUMBER}@${MEET_SIP}";
+	$socket_out = "udp:${MEET_LISTEN_IP}:${MEET_PORT}";
+	route(caller_name);
+	if (has_body_part("application/sdp"))
+		route(rtp_offer);
+	else
+		route(late_offer);
+	t_on_reply("rtp");
+	t_on_failure("meet_failed");
+	# LiveKit SIP answers at once (the PIN is asked once answered) or never (no room's rule: it rings and drops the
+	# call): 15 s, not fr_inv_timeout, before it is given up and its try given back.
+	$T_fr_inv_timeout = 15;
+	route(account_missed);
+	route(calling);
+	if (!t_relay()) {
+		if ($avp(rtp_on) != NULL)
+			rtpengine_delete();
+		t_reply(503, "Service Unavailable");
+	}
+	exit;
+}
+
+# Not answered by LiveKit SIP (refused, busy, given up, nobody answered in time): no try of a PIN, given back.
+failure_route[meet_failed] {
+	if ($avp(rtp_on) != NULL)
+		rtpengine_delete();
+	if ($avp(pin_who) == NULL)
+		return;
+	$var(left) = 0;
+	cache_sub("local", "pin:c:$avp(pin_who)", 1, 600, $var(left));
+	if ($var(left) <= 0)
+		cache_remove("local", "pin:c:$avp(pin_who)");
+	$var(left) = 0;
+	cache_sub("local", "pin:all", 1, 600, $var(left));
+	if ($var(left) <= 0)
+		cache_remove("local", "pin:all");
+}
+
+# Tells the administrators (E_TWAKEPHONE_PIN) about the access number: $param(1) "pin-tries" (the tries of all callers
+# in 10 minutes) or "calls" (at the same time), its value $param(2) and threshold $param(3); once per 10 minutes each.
+route[meet_alert] {
+	$var(told) = 0;
+	cache_add("local", "pin:told:$param(1)", 1, 600, $var(told));
+	if ($var(told) != 1)
+		return(1);
+	xlog("L_WARN", "meet: $param(2) $param(1) to the access number, MEET's threshold $param(3)\n");
+	$(avp(ev_attr)[*]) = NULL;
+	$(avp(ev_val)[*]) = NULL;
+	$avp(ev_attr) = "param";
+	$avp(ev_val) = $param(1);
+	$avp(ev_attr) = "number";
+	$avp(ev_val) = "${MEET_NUMBER}";
+	$avp(ev_attr) = "value";
+	$avp(ev_val) = $param(2);
+	$avp(ev_attr) = "threshold";
+	$avp(ev_val) = $param(3);
+	raise_event("E_TWAKEPHONE_PIN", $avp(ev_attr), $avp(ev_val));
+	return(1);
 }
 
 #### Trunks (step 6, ADR 0016) #########################################################################################
@@ -834,6 +1189,10 @@ route[trunk_out_loaded] {
 		$acc_extra(callee) = $var(internal);
 		$(avp(fwd_seen)[*]) = NULL;
 		$avp(fwd_seen) = "," + $var(internal) + ",";
+		if ($shv(meet_on) == 1 && $var(internal) == "${MEET_NUMBER}") {
+			route(meet_call);
+			exit;
+		}
 		route(rules_next);
 		exit;
 	}
@@ -936,19 +1295,21 @@ route[trunk_out_send] {
 		$DLG_timeout = $avp(o_max_sec);
 	else
 		$DLG_timeout = ${TRUNK_MAX_CALL_SEC};
+	# A room's call (step 8): MEET_MAX_CALL_SEC at most. Its OPTIONS (P) reach LiveKit SIP, which answers any: a
+	# LiveKit SIP gone in the middle of the call is not noticed before that.
+	if ($dlg_val(meet) == "caller" && $DLG_timeout > $shv(meet_max_sec))
+		$DLG_timeout = $shv(meet_max_sec);
 	$(avp(t_rang)[*]) = NULL;
 	$dlg_val(trunk) = "callee";
 	$dlg_val(codecs) = $avp(t_codecs);
 	$dlg_val(callee) = $avp(callee);
 	$dlg_val(dialled) = $avp(dialled);
-	# A call without SDP (a SIP phone's late offer): the operator's offer in its 2xx, through rtpengine, to the phone,
-	# whose answer in the ACK goes through it too (route[rtp_late_offer]), never the operator's own SDP.
-	if (has_body_part("application/sdp")) {
+	# A call without SDP (a SIP phone's late offer): the operator's offer in its 2xx, through rtpengine, to the phone (or
+	# LiveKit SIP), whose answer in the ACK goes through it too (route[rtp_late_offer]), never the operator's own SDP.
+	if (has_body_part("application/sdp"))
 		route(rtp_offer);
-	} else {
-		$(avp(late_offer)[*]) = NULL;
-		$avp(late_offer) = "browser";
-	}
+	else
+		route(late_offer);
 	t_on_reply("rtp");
 	t_on_failure("trunk_failed");
 	route(calling);
@@ -1416,6 +1777,10 @@ route[trunk_in_loaded] {
 	$acc_extra(dialled) = $avp(did_target);
 	$avp(fwd_hops) = 0;
 	$avp(fwd_seen) = "," + $avp(did_target) + ",";
+	if ($shv(meet_on) == 1 && $avp(did_target) == "${MEET_NUMBER}") {
+		route(meet_call);
+		exit;
+	}
 	route(rules_next);
 	exit;
 }
@@ -1663,9 +2028,18 @@ route[caller_name] {
 		uac_replace_from("", "$avp(caller_uri)");
 		return(1);
 	}
-	if ($avp(names_read) != 1)
-		return(-1);
 	if (!($hdr(From) =~ "<"))
+		return(-1);
+	# A room's call (step 8): the callee knows a room calls, at whose name ("Meet (Alice Martin)"; "Meet" alone when
+	# the names cannot be read), not the person's phone.
+	if ($dlg_val(meet) == "caller") {
+		$var(caller_name) = "Meet";
+		if ($avp(names_read) == 1 && $avp(n_caller) != NULL && $avp(n_caller) != "")
+			$var(caller_name) = "Meet (" + $avp(n_caller) + ")";
+		uac_replace_from("$var(caller_name)", "");
+		return(1);
+	}
+	if ($avp(names_read) != 1)
 		return(-1);
 	$var(caller_name) = "";
 	if ($avp(n_caller) != NULL)
@@ -2339,7 +2713,7 @@ route[replaces_target] {
 		return(-1);
 	$var(reached) = $dlg_val(callee);
 	$var(was_dialled) = $dlg_val(dialled);
-	if ($dlg_val(trunk) != NULL)
+	if ($dlg_val(trunk) != NULL || $dlg_val(meet) != NULL)
 		$var(replaces_trunk) = 1;
 	unload_dialog_ctx();
 	if ($var(was_dialled) == NULL || $var(was_dialled) != $rU)

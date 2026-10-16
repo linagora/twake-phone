@@ -247,6 +247,19 @@ export class PgStore implements Store {
     await this.pool.query('UPDATE conferences SET pin = $2 WHERE meeting_id = $1', [meetingId, pin])
   }
 
+  async replaceConferencePin(meetingId: string, from: string | null, to: string | null) {
+    const { rowCount } = await this.pool.query('UPDATE conferences SET pin = $3 WHERE meeting_id = $1 AND pin IS NOT DISTINCT FROM $2', [meetingId, from, to])
+    return (rowCount ?? 0) > 0
+  }
+
+  async countConferences(tenantId: string, ownerUserId?: string) {
+    const { rows } = await this.pool.query<{ n: string }>(
+      'SELECT count(*) AS n FROM conferences WHERE tenant_id = $1 AND ($2::text IS NULL OR owner_user_id = $2)',
+      [tenantId, ownerUserId ?? null]
+    )
+    return Number(rows[0]?.n ?? 0)
+  }
+
   async deleteConference(meetingId: string) {
     await this.pool.query('DELETE FROM conferences WHERE meeting_id = $1', [meetingId])
   }
