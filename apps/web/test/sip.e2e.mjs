@@ -2647,10 +2647,12 @@ try {
   await step('step 8b: Alice ends the conference for everyone (« Terminer pour tous »): the three calls end, the room and its record go; the history of Alice and Jean says conference, as their Récents do', async () => {
     await alice.page.getByRole('button', { name: 'Terminer pour tous' }).click()
     for (const who of [alice, jean, bob]) await until(`the end of the conference on ${who.name}'s page`, async () => ((await calls(who.page)).length === 0 ? true : null), { timeout: 20_000 })
+    for (const who of [alice, jean]) await who.page.getByText('Conférence terminée.').waitFor()
     expectEqual((await (await asPerson(alice))('GET', `/conferences/${CONFERENCE}`)).statusCode, 404, 'GET /conferences/:id once ended')
     expectEqual(await store.getConference(CONFERENCE), null, 'the record of the conference')
     const [aliceIn] = await conferenceCalls('amartin', conferenceFrom, 1)
-    expectEqual(`${aliceIn.remoteNumber} ${aliceIn.direction}`, '101 inbound', 'Alice\'s history: the room called her')
+    // The room called her at her own name: a call of hers, to herself (Récents reads « Votre conférence »).
+    expectEqual(`${aliceIn.remoteNumber} ${aliceIn.direction}`, '101 outbound', 'Alice\'s history: the room called her at her name')
     const [jeanIn] = await conferenceCalls('jdupont', conferenceFrom, 1)
     expectEqual(`${jeanIn.remoteNumber} ${jeanIn.direction}`, '101 inbound', 'Jean\'s history: the room called him at Alice\'s name')
     if (!(await recents(alice.page, 1)).includes('Votre conférence: Conférence')) throw new Error(`Alice's Récents: ${JSON.stringify(await recents(alice.page, 1))}`)

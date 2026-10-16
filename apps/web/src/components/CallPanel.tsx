@@ -52,6 +52,8 @@ const who = (call: SoftCall, t: (key: Key) => string) => {
  * does not call says why (an emergency number: to call from another phone).
  */
 const reasonKey = (call: SoftCall): Key => {
+  // A conference's call (step 8b) names whoever the room called at: not who the person was with.
+  if (call.room === 'conference' && (call.endReason ?? 'hangup') === 'hangup') return 'call.endedConferenceOver'
   if (call.direction === 'inbound' && call.endReason === 'cancelled') return 'call.endedCancelledInbound'
   if (call.endReason === 'dnd' && call.endMessage) return 'call.endedDndMessage'
   if (call.endReason === 'refused') return REFUSAL_KEY[call.endRefusal ?? 'not-allowed']

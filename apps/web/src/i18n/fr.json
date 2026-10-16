@@ -576,6 +576,7 @@
   "call.addParticipantSubmit": "Appeler et ajouter",
   "call.addParticipantClose": "Fermer",
   "call.endedConference": "Votre appel avec {who} est devenu une conférence.",
+  "call.endedConferenceOver": "Conférence terminée.",
   "call.errorRoomCall": "Pendant une conférence ou un appel d'une salle, pas de mise en attente, de transfert ni d'autre appel.",
   "conference.title": "Conférence",
   "conference.titleWith": "Conférence avec {who}",
