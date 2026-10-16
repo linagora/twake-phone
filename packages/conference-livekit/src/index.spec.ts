@@ -7,12 +7,25 @@ interface Call {
   body: any
   auth: string
 }
+/** A Twirp error LiveKit answers with (its HTTP status, code, message and metadata). */
+class TwirpFailure extends Error {
+  constructor(
+    message: string,
+    readonly status = 400,
+    readonly meta: Record<string, string> = {}
+  ) {
+    super(message)
+  }
+}
 const fakeLiveKit = (responses: Record<string, unknown> = {}) => {
   const calls: Call[] = []
   const fetch: Fetch = async (url, init) => {
     const path = new URL(url).pathname.replace('/twirp/', '')
     calls.push({ path, body: JSON.parse(init.body ?? 'null'), auth: init.headers.authorization! })
-    const r = responses[path]
+    let r = responses[path]
+    // A list of answers: one per call, the last one kept.
+    if (Array.isArray(r)) r = r.length > 1 ? r.shift() : r[0]
+    if (r instanceof TwirpFailure) return { ok: false, status: r.status, text: async () => JSON.stringify({ code: 'invalid_argument', msg: r.message, meta: r.meta }) }
     if (r instanceof Error) return { ok: false, status: 400, text: async () => JSON.stringify({ msg: r.message }) }
     return { ok: true, status: 200, text: async () => JSON.stringify(r ?? {}) }
   }
@@ -58,9 +71,30 @@ describe('dial-in', () => {
     expect(cfg).toEqual({ numbers: [{ country: 'FR', e164: '8000' }], meetingCode: 'abc-defg', pin: '123456' })
     expect(calls.filter(c => c.path === 'livekit.SIP/CreateSIPInboundTrunk')).toHaveLength(1)
     const rule = calls.find(c => c.path === 'livekit.SIP/CreateSIPDispatchRule')!
-    expect(rule.body.rule.dispatch_rule_direct).toEqual({ room_name: 'abc-defg', pin: '123456' })
-    expect(rule.body.trunk_ids).toEqual(['T1'])
+    expect(rule.body.dispatch_rule.rule.dispatch_rule_direct).toEqual({ room_name: 'abc-defg', pin: '123456' })
+    expect(rule.body.dispatch_rule.trunk_ids).toEqual(['T1'])
+    expect(rule.body.dispatch_rule.name).toBe('twake-meet-abc-defg')
     expect(rule.auth).toMatch(/^Bearer /)
+    // Any called number (only the PBX reaches LiveKit SIP), from the PBX's address only.
+    expect(calls.find(c => c.path === 'livekit.SIP/CreateSIPInboundTrunk')!.body.trunk).toEqual({ name: 'twake-meet-in', numbers: [], allowed_addresses: [] })
+  })
+
+  it('lets only the PBX call: the inbound trunk takes its addresses, written again over the one found', async () => {
+    const { bridge, calls } = make({ 'livekit.SIP/ListSIPInboundTrunk': { items: [{ sip_trunk_id: 'EXIST', name: 'twake-meet-in' }] } }, { inboundAddresses: ['192.0.2.30'] })
+    await bridge.ensureTrunks()
+    expect(calls.find(c => c.path === 'livekit.SIP/UpdateSIPInboundTrunk')!.body).toEqual({ sip_trunk_id: 'EXIST', replace: { name: 'twake-meet-in', numbers: [], allowed_addresses: ['192.0.2.30'] } })
+    expect(calls.some(c => c.path === 'livekit.SIP/CreateSIPInboundTrunk')).toBe(false)
+  })
+
+  it('draws another PIN when one is taken by another room', async () => {
+    let n = 0
+    const lk = fakeLiveKit({
+      'livekit.SIP/ListSIPInboundTrunk': { items: [{ sip_trunk_id: 'T', name: 'twake-meet-in' }] },
+      'livekit.SIP/CreateSIPDispatchRule': [new TwirpFailure('Dispatch rule for the same trunk, inbound number, number, and PIN combination already exists'), { sip_dispatch_rule_id: 'R2' }]
+    })
+    const bridge = new LiveKitConferenceBridge({ url: 'http://lk', apiKey: 'k', apiSecret: 's', dialInNumbers: [{ country: 'FR', e164: '8000' }], outboundAddress: 'pbx:5060', fetch: lk.fetch }, () => [0.111111, 0.222222][n++ % 2]!)
+    expect((await bridge.createDialIn({ id: 'm', tenantId: 't' })).pin).toBe('222222')
+    expect(lk.calls.filter(c => c.path === 'livekit.SIP/CreateSIPDispatchRule')).toHaveLength(2)
   })
 
   it('reuses an existing trunk and replaces the rule when dial-in is created again', async () => {
@@ -90,23 +124,42 @@ describe('dial-in', () => {
 
 describe('dial-out and moderation', () => {
   it('dials through the outbound trunk and returns a phone participant', async () => {
-    const { bridge, calls } = make({ 'livekit.SIP/ListSIPOutboundTrunk': {}, 'livekit.SIP/CreateSIPOutboundTrunk': { sip_trunk_id: 'O1' } })
-    const p = await bridge.dialParticipant('room', '+33612345678')
+    const { bridge, calls } = make({ 'livekit.SIP/ListSIPOutboundTrunk': {}, 'livekit.SIP/CreateSIPOutboundTrunk': { sip_trunk_id: 'O1' } }, { outboundAuth: { username: 'livekit', password: 'not-a-real-password' } })
+    const p = await bridge.dialParticipant('room', '+33612345678', { from: '101' })
     const call = calls.find(c => c.path === 'livekit.SIP/CreateSIPParticipant')!
-    expect(call.body).toMatchObject({ sip_trunk_id: 'O1', sip_call_to: '+33612345678', room_name: 'room' })
+    // At the name of whoever asked (their extension in the From), waited for until answered.
+    expect(call.body).toMatchObject({ sip_trunk_id: 'O1', sip_call_to: '+33612345678', sip_number: '101', room_name: 'room', wait_until_answered: true, ringing_timeout: '30s' })
+    // The PBX's challenge is answered with its credentials.
+    expect(calls.find(c => c.path === 'livekit.SIP/CreateSIPOutboundTrunk')!.body.trunk).toMatchObject({ address: 'pbx:5060', transport: 'SIP_TRANSPORT_UDP', auth_username: 'livekit', auth_password: 'not-a-real-password' })
     expect(p).toMatchObject({ meetingId: 'room', kind: 'phone', number: '+33612345678', muted: false })
     expect(p.id.startsWith('room:phone-33612345678-')).toBe(true)
   })
 
-  it('replaces an outbound trunk that points at an old PBX address', async () => {
+  it('writes the outbound trunk found again: the PBX may have moved or changed its credentials', async () => {
     const { bridge, calls } = make({
-      'livekit.SIP/ListSIPOutboundTrunk': { items: [{ sip_trunk_id: 'OLD', name: 'twake-meet-out', address: 'old-pbx:5060' }] },
-      'livekit.SIP/CreateSIPOutboundTrunk': { sip_trunk_id: 'NEW' }
+      'livekit.SIP/ListSIPOutboundTrunk': { items: [{ sip_trunk_id: 'OLD', name: 'twake-meet-out', address: 'old-pbx:5060' }] }
     })
     await bridge.dialParticipant('room', '+33612345678')
-    expect(calls.find(c => c.path === 'livekit.SIP/DeleteSIPTrunk')?.body).toEqual({ sip_trunk_id: 'OLD' })
-    expect(calls.find(c => c.path === 'livekit.SIP/CreateSIPParticipant')?.body.sip_trunk_id).toBe('NEW')
-    expect(calls.find(c => c.path === 'livekit.SIP/CreateSIPOutboundTrunk')?.body.trunk.address).toBe('pbx:5060')
+    expect(calls.find(c => c.path === 'livekit.SIP/UpdateSIPOutboundTrunk')?.body).toMatchObject({ sip_trunk_id: 'OLD', replace: { name: 'twake-meet-out', address: 'pbx:5060' } })
+    expect(calls.some(c => c.path === 'livekit.SIP/CreateSIPOutboundTrunk')).toBe(false)
+    expect(calls.find(c => c.path === 'livekit.SIP/CreateSIPParticipant')?.body.sip_trunk_id).toBe('OLD')
+  })
+
+  it('tells the SIP status of a dial-out that did not go through', async () => {
+    const out = { 'livekit.SIP/ListSIPOutboundTrunk': { items: [{ sip_trunk_id: 'O', name: 'twake-meet-out' }] } }
+    const meta = make({ ...out, 'livekit.SIP/CreateSIPParticipant': new TwirpFailure('sip status 403: Destination Not Allowed', 403, { sip_status_code: '403', sip_status: 'Destination Not Allowed' }) })
+    await expect(meta.bridge.dialParticipant('room', '0899000000', { from: '101' })).rejects.toMatchObject({ statusCode: 409, code: 'DIAL_FAILED', sipStatus: 403, sipReason: 'Destination Not Allowed' })
+    // Without metadata, from the message.
+    const msg = make({ ...out, 'livekit.SIP/CreateSIPParticipant': new TwirpFailure('sip status 486: Busy Here') })
+    await expect(msg.bridge.dialParticipant('room', '102')).rejects.toMatchObject({ code: 'DIAL_FAILED', sipStatus: 486, sipReason: 'Busy Here' })
+    // Any other failure stays LiveKit's.
+    const other = make({ ...out, 'livekit.SIP/CreateSIPParticipant': new TwirpFailure('room not found', 404) })
+    await expect(other.bridge.dialParticipant('room', '102')).rejects.toThrow(/room not found/)
+  })
+
+  it('rejects a caller that is no extension', async () => {
+    const { bridge } = make()
+    await expect(bridge.dialParticipant('room', '102', { from: "101'; --" })).rejects.toMatchObject({ statusCode: 400 })
   })
 
   it('rejects numbers that are not dialable', async () => {

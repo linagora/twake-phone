@@ -9,11 +9,12 @@ import type { TelephonyEvent } from '@twake/telephony-types'
 
 process.env.AUTH_MODE = 'dev'
 
-const setup = async () => {
+const setup = async (fail?: { status: number; body: unknown }) => {
   const calls: string[] = []
   const fetch: Fetch = async (url, init) => {
     const path = new URL(url).pathname.replace('/twirp/', '')
     calls.push(`${path} ${init.body}`)
+    if (fail && path === 'livekit.SIP/CreateSIPParticipant') return { ok: false, status: fail.status, text: async () => JSON.stringify(fail.body) }
     const out: Record<string, unknown> = {
       'livekit.SIP/CreateSIPInboundTrunk': { sip_trunk_id: 'T' },
       'livekit.SIP/CreateSIPDispatchRule': { sip_dispatch_rule_id: 'R' },
@@ -24,10 +25,13 @@ const setup = async () => {
   }
   const bridge = new LiveKitConferenceBridge({ url: 'http://lk', apiKey: 'k', apiSecret: 's', dialInNumbers: [{ country: 'FR', e164: '8000' }], outboundAddress: 'pbx:5060', fetch }, () => 0.5)
   const bus = new EventBus()
+  // Alice holds an extension (a room calls at her name); Bob does not.
+  const store = new MemoryStore()
+  await store.upsertMapping({ tenantId: 'dev', userId: 'alice', extension: '101' })
   const app = await buildApp(new ProviderRegistry([{ tenantId: 'dev', type: 'none', config: {} }], [{ type: 'none', create: () => ({ getStatus: () => 'CONNECTED', getCapabilities: async () => ({ conference: { dialIn: false, dialOut: false } }) as any, subscribe: async function* () {}, close: async () => {} }) as any }]), {
     bus,
-    store: new MemoryStore(),
-    conference: { bridge: t => (t === 'off' ? undefined : bridge), webhookKey: 'k', webhookSecret: 's' }
+    store,
+    conference: { bridge: t => (t === 'off' ? undefined : bridge), accessNumber: '8000', webhookKey: 'k', webhookSecret: 's' }
   })
   const as = (user: string, tenant = 'dev') => ({ 'x-dev-user': user, 'x-dev-tenant': tenant })
   return { app, calls, bus, as }
@@ -69,8 +73,11 @@ describe('conference endpoints', () => {
     expect(room.json().participants).toMatchObject([{ id: 'room-1:web1', kind: 'web' }])
 
     const dial = await app.inject({ method: 'POST', url: '/api/v1/conferences/room-1/participants', headers: as('alice'), payload: { number: '+33612345678' } })
-    expect(dial.statusCode).toBe(202)
+    expect(dial.statusCode).toBe(201)
     expect(dial.json()).toMatchObject({ kind: 'phone', number: '+33612345678' })
+    // At her name: her extension is the From the SIP server reads, and the call is waited for.
+    const sent = JSON.parse(calls.find(c => c.startsWith('livekit.SIP/CreateSIPParticipant'))!.split(' ').slice(1).join(' '))
+    expect(sent).toMatchObject({ sip_call_to: '+33612345678', sip_number: '101', room_name: 'room-1', wait_until_answered: true })
 
     expect((await app.inject({ method: 'DELETE', url: '/api/v1/conferences/room-1/participants/room-1:web1', headers: as('alice') })).statusCode).toBe(204)
     expect(calls.some(c => c.startsWith('livekit.RoomService/RemoveParticipant') && c.includes('"room":"room-1"'))).toBe(true)
@@ -79,6 +86,23 @@ describe('conference endpoints', () => {
     expect(foreign.statusCode).toBe(400)
     const muteForeign = await app.inject({ method: 'POST', url: '/api/v1/conferences/room-1/participants/room-2:web1/mute', headers: as('alice') })
     expect(muteForeign.statusCode).toBe(400)
+  })
+
+  it('refuses a dial-out to an owner without an extension', async () => {
+    const { app, as, calls } = await setup()
+    await app.inject({ method: 'POST', url: '/api/v1/conferences', headers: as('bob'), payload: { meetingId: 'room-2' } })
+    const dial = await app.inject({ method: 'POST', url: '/api/v1/conferences/room-2/participants', headers: as('bob'), payload: { number: '+33612345678' } })
+    expect(dial.statusCode).toBe(403)
+    expect(dial.json().code).toBe('NO_EXTENSION')
+    expect(calls.some(c => c.startsWith('livekit.SIP/CreateSIPParticipant'))).toBe(false)
+  })
+
+  it('says why a dial-out did not go through, with the SIP status', async () => {
+    const { app, as } = await setup({ status: 403, body: { code: 'permission_denied', msg: 'sip status 403: Destination Not Allowed', meta: { sip_status_code: '403', sip_status: 'Destination Not Allowed' } } })
+    await app.inject({ method: 'POST', url: '/api/v1/conferences', headers: as('alice'), payload: { meetingId: 'room-1' } })
+    const dial = await app.inject({ method: 'POST', url: '/api/v1/conferences/room-1/participants', headers: as('alice'), payload: { number: '0899000000' } })
+    expect(dial.statusCode).toBe(409)
+    expect(dial.json()).toMatchObject({ code: 'DIAL_FAILED', sipStatus: 403, sipReason: 'Destination Not Allowed' })
   })
 
   it('removes the dial-in when the meeting is deleted', async () => {
@@ -146,9 +170,11 @@ describe('conference endpoints with Meet', () => {
       return { ok: true, status: 200, text: async () => JSON.stringify(new URL(url).pathname.endsWith('ListParticipants') ? { participants: [] } : {}) }
     }
     const bridge = new LiveKitConferenceBridge({ url: 'http://lk', apiKey: 'k', apiSecret: 's', dialInNumbers: [{ country: 'FR', e164: '8000' }], outboundAddress: 'pbx:5060', fetch })
+    const store = new MemoryStore()
+    await store.upsertMapping({ tenantId: 'dev', userId: 'alice', extension: '101' })
     const app = await buildApp(new ProviderRegistry([{ tenantId: 'dev', type: 'none', config: {} }], [{ type: 'none', create: () => ({ getStatus: () => 'CONNECTED', getCapabilities: async () => ({}) as any, subscribe: async function* () {}, close: async () => {} }) as any }]), {
       bus: new EventBus(),
-      store: new MemoryStore(),
+      store,
       conference: { bridge: () => bridge, meet: meet as any, webhookKey: 'k', webhookSecret: 's' }
     })
     return { ...base, app, access, asked, lkCalls }
@@ -194,7 +220,7 @@ describe('conference endpoints with Meet', () => {
     const dial = await app.inject({ method: 'POST', url: `/api/v1/conferences/${meetRoom.id}/participants`, headers: alice, payload: { number: 'not a number' } })
     expect(dial.statusCode).toBe(400)
     const ok = await app.inject({ method: 'POST', url: `/api/v1/conferences/${meetRoom.id}/participants`, headers: alice, payload: { number: '+33612345678' } })
-    expect(ok.statusCode).toBe(202)
+    expect(ok.statusCode).toBe(201)
     expect(ok.json().meetingId).toBe(meetRoom.id)
     expect(lkCalls).toContain('livekit.SIP/CreateSIPParticipant')
   })

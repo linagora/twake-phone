@@ -142,9 +142,15 @@ jobs:
           BROWSER: ${{ matrix.browser }}
           SIP_WSS_URL: wss://127.0.0.1:8089
           OPENSIPS_DB_URL: postgres://twake:twake@127.0.0.1:54320/twake
+      # Service par service (étape 8 : LiveKit et LiveKit SIP écrivent beaucoup), la fin de chacun.
       - name: Journaux de la stack SIP en cas d'échec
         if: failure()
-        run: docker compose -f docker/docker-compose.sip.yml logs --no-color --timestamps | tail -n 400
+        run: |
+          for service in opensips rtpengine livekit-sip livekit; do
+            echo "::group::$service"
+            docker compose -f docker/docker-compose.sip.yml logs --no-color --timestamps --tail 300 "$service"
+            echo "::endgroup::"
+          done
       - name: Captures d'écran de l'e2e en cas d'échec
         if: failure()
         uses: actions/upload-artifact@v4

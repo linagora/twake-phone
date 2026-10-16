@@ -1,4 +1,5 @@
 import { spawnSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -49,6 +50,36 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
       expect(stderr).toMatch(/no authentication/)
     }
     expect(render({ MI_LISTEN_IP: '203.0.113.5', MI_ALLOW_PUBLIC: '1' }).status).toBe(0)
+  })
+
+  it('gives LiveKit SIP a socket of its own that hears its address only, nothing when Meet is off, and only the HA1 of its account (step 8)', () => {
+    const off = render()
+    expect(off.status).toBe(0)
+    expect(off.cfg).toContain('socket=udp:127.0.0.1:5090\n')
+    expect(off.cfg).toContain('modparam("cfgutils", "shvset", "meet_on=i:0")')
+    expect(off.cfg).toContain('$ru = "sip:8000@meet.invalid";')
+    const password = 'not-a-real-secret-0'
+    const on = render({ SIP_DOMAIN: 'sip.example.test', MEET_SIP: '192.0.2.20:5080', MEET_SIP_PASSWORD: password, MEET_NUMBER: '7000' })
+    expect(on.status, on.stderr).toBe(0)
+    expect(on.cfg).toContain('modparam("cfgutils", "shvset", "meet_on=i:1")')
+    expect(on.cfg).toContain('if ($shv(meet_on) != 1 || $si != "192.0.2.20") {')
+    expect(on.cfg).toContain('$ru = "sip:7000@192.0.2.20:5080";')
+    expect(on.cfg).toContain(`$var(meet_ha1) = "${createHash('md5').update(`livekit:sip.example.test:${password}`).digest('hex')}";`)
+    expect(on.cfg).not.toContain(password)
+    for (const [env, message] of [
+      [{ MEET_SIP: '192.0.2.20:5080' }, /MEET_SIP_PASSWORD/],
+      [{ MEET_SIP: '192.0.2.20:5080', MEET_SIP_PASSWORD: 'short' }, /12 characters/],
+      [{ MEET_SIP: 'livekit.example.test:5080', MEET_SIP_PASSWORD: password }, /IPv4 address and port/],
+      [{ MEET_SIP: '192.0.2.20', MEET_SIP_PASSWORD: password }, /IPv4 address and port/],
+      [{ MEET_PORT: '5060' }, /socket of its own/],
+      [{ MEET_LISTEN_IP: '0.0.0.0' }, /MEET_LISTEN_IP/],
+      [{ MEET_NUMBER: '0800' }, /MEET_NUMBER/],
+      [{ MEET_SIP_USER: "livekit'" }, /MEET_SIP_USER/]
+    ] as [Record<string, string>, RegExp][]) {
+      const { status, stderr } = render(env)
+      expect(status, JSON.stringify(env)).toBe(1)
+      expect(stderr).toMatch(message)
+    }
   })
 
   it('announces a call once nothing can refuse it without a transaction: after lookup and rtpengine, just before the relay', () => {
@@ -166,12 +197,13 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     // Each query is asynchronous (the rules, the first of them with the caller's name, the names of a Replaces, the
     // members of a group, the preload, whether the callee can be woken), none is run where async is not available.
     // The trunk of a call to the public network, the direct number of a call from it: step 6; the caller's rights and
-    // caps, a query of its own after the trunk's: step 6b). Two synchronous queries ask the catalog whether the tables
+    // caps, a query of its own after the trunk's: step 6b; whether the From of a room's call is one of our accounts:
+    // step 8). Two synchronous queries ask the catalog whether the tables
     // of step 4c, or that of step 5, exist, only after a read failed, from the routes that resume a read; two more read
     // the default trunk and the direct numbers on it every 15 s, in a timer of its own, never in a call (an emergency
     // call's fallback when the trunk of the call cannot be read, with its caller's own number).
-    expect(cfg.match(/sql_query/g)).toHaveLength(13)
-    expect(cfg.match(/async\(sql_query/g)).toHaveLength(9)
+    expect(cfg.match(/sql_query/g)).toHaveLength(14)
+    expect(cfg.match(/async\(sql_query/g)).toHaveLength(10)
     const timer = cfg.slice(cfg.indexOf('\ntimer_route[default_trunk, 15] {'), cfg.indexOf('\nroute[emergency_failed] {'))
     expect(timer.match(/sql_query(_one)?\(/g)).toHaveLength(2)
     expect(section('route[tables_4c_missing]', 'route[table_5_missing]').match(/sql_query_one\(/g)).toHaveLength(1)
@@ -750,16 +782,16 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(trunkIn).toContain('$avp(did_target);$avp(t_codecs);$avp(fb_target);$avp(fb_kind);$avp(fb_members);$avp(did_assigned)')
   })
 
-  it('never lets a call with the operator be transferred by it, from either side', () => {
+  it('never lets a call with the operator or LiveKit SIP be transferred by it, from either side', () => {
     const { cfg } = render()
     const main = cfg.slice(cfg.indexOf('\nroute {'), cfg.indexOf('\nroute[outbound_policy] {'))
     const inDialog = main.slice(main.indexOf('if (has_totag()) {'), main.indexOf('if (is_method("CANCEL")) {'))
-    const refer = inDialog.indexOf('if (is_method("REFER") && $dlg_val(trunk) != NULL) {')
+    const refer = inDialog.indexOf('if (is_method("REFER") && ($dlg_val(trunk) != NULL || $dlg_val(meet) != NULL)) {')
     expect(refer).toBeGreaterThan(inDialog.indexOf('if (!match_dialog()) {'))
     expect(refer).toBeLessThan(inDialog.indexOf('route(relay);'))
     expect(inDialog.slice(refer)).toMatch(/^[^]*?send_reply\(403, "Transfer Not Allowed"\);\n\t\t\texit;/)
     // Nor completed by an INVITE with Replaces of such a call.
-    expect(cfg).toContain('\tif ($dlg_val(trunk) != NULL)\n\t\t$var(replaces_trunk) = 1;\n\tunload_dialog_ctx();')
+    expect(cfg).toContain('\tif ($dlg_val(trunk) != NULL || $dlg_val(meet) != NULL)\n\t\t$var(replaces_trunk) = 1;\n\tunload_dialog_ctx();')
     const replaced = main.indexOf('if ($var(replaces_trunk) == 1) {')
     expect(replaced).toBeGreaterThan(main.indexOf('route(replaces_target);'))
     expect(replaced).toBeLessThan(main.indexOf('record_route();'))
@@ -800,7 +832,13 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(fromTrunk).toBeLessThan(inDialog.indexOf('route(relay);'))
     expect(inDialog.slice(fromTrunk)).toMatch(/^[^]*?send_reply\(500, "Internal Error"\);\n\t\t\t\texit;/)
     // Its answers go back through onreply_route[rtp], which takes the extension out of the phone's Contact.
-    expect(inDialog).toContain('if ($var(from_trunk) == 1) {\n\t\t\t$avp(reply_to_trunk) = 1;\n\t\t\tt_on_reply("rtp");\n\t\t}\n\t\troute(relay);')
+    const replies = inDialog.indexOf('if ($var(from_trunk) == 1) {\n\t\t\t$avp(reply_to_trunk) = 1;\n\t\t\tt_on_reply("rtp");\n\t\t}\n')
+    expect(replies).toBeGreaterThan(fromTrunk)
+    expect(replies).toBeLessThan(inDialog.indexOf('route(relay);'))
+    // Step 8: LiveKit SIP's requests in a call it answered leave from the socket the call came from, not the one their
+    // Route names.
+    const meetSocket = inDialog.indexOf('if ($var(from_meet) == 1 && $dlg_val(meet) == "callee" && $dlg_val(caller_sock) != NULL)\n\t\t\t$socket_out = $dlg_val(caller_sock);\n\t\troute(relay);')
+    expect(meetSocket).toBeGreaterThan(replies)
   })
 
   it('sends the operator only the headers a call needs, whatever the phone added', () => {
@@ -836,7 +874,9 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(inDialog).toContain('if (is_method("ACK") && $dlg_val(late_answer) == "1" && has_body_part("application/sdp")) {')
     expect(section('route[trunk_in]', 'route[inbound_number]')).toContain('if (!has_body_part("application/sdp")) {\n\t\t$(avp(late_offer)[*]) = NULL;\n\t\t$avp(late_offer) = "trunk";')
     // A SIP phone's call to the operator without SDP: the operator's offer in its 2xx through rtpengine, never as sent.
-    expect(section('route[trunk_out_loaded]', 'route[trunk_headers]')).toContain('if (has_body_part("application/sdp")) {\n\t\troute(rtp_offer);\n\t} else {\n\t\t$(avp(late_offer)[*]) = NULL;\n\t\t$avp(late_offer) = "browser";\n\t}')
+    expect(section('route[trunk_out_loaded]', 'route[trunk_headers]')).toContain('if (has_body_part("application/sdp"))\n\t\troute(rtp_offer);\n\telse\n\t\troute(late_offer);')
+    // Whoever sent the INVITE without SDP gets the offer: a phone or browser, the operator, LiveKit SIP (step 8).
+    expect(section('route[late_offer]', 'route[rtp_late_offer]')).toContain('$avp(late_offer) = "browser";\n\tif ($var(from_kind) == 1)\n\t\t$avp(late_offer) = "trunk";\n\telse if ($var(from_kind) == 2)\n\t\t$avp(late_offer) = "meet";')
     const reply = section('onreply_route[rtp]', 'route[event_attrs]')
     expect(reply).toContain('if ($avp(late_offer) != NULL) {\n\t\t\tif ($rs >= 200 && $rs < 300)\n\t\t\t\troute(rtp_late_offer);\n\t\t} else {\n\t\t\troute(rtp_answer);')
     expect(section('route[rtp_late_offer]', 'route')).toContain('$dlg_val(late_answer) = "1";')

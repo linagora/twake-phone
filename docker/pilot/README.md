@@ -109,6 +109,16 @@ OpenSIPS garde les appels en cours dans sa base : redémarré (mise à jour, pla
 
 Ce qui vient des leçons du POC sur une ligne réelle ([ARCHITECTURE §13](../../docs/ARCHITECTURE.md)) : un socket pour le trunk, à part de celui des téléphones ; des OPTIONS toutes les 15 s vers chaque serveur de l'opérateur, qui gardent ouvert le passage du NAT ; aucune adresse externe déclarée par défaut (une leçon apprise avec un B2BUA : avec OpenSIPS, qui fait du Record-Route, le BYE de l'opérateur est à vérifier, point 1). Un appel dont le téléphone a disparu (onglet fermé ou rechargé, ordinateur en veille, réseau perdu) est raccroché avec l'opérateur dès que ce téléphone ne répond plus aux OPTIONS qu'OpenSIPS lui envoie dans l'appel (`CALL_PING_SEC`) ; la connexion de l'app à la passerelle n'y est pour rien (une seconde fenêtre, un téléphone SIP sans l'app, une passerelle redémarrée ne raccrochent rien). Vers l'opérateur ne partent que les en-têtes qu'un appel demande : rien de ce qu'un téléphone pourrait dire de l'identité, de la facturation ou du routage (`Diversion`, `P-Charge-Info`, `Privacy`…). Le `Contact` qu'un téléphone donne à l'opérateur ne porte ni le poste ni le jeton d'un navigateur, seulement son adresse ; le `Via` d'un navigateur n'est pas caché. Un 112 que le trunk de l'appelant refuse repart par le trunk par défaut. Rien n'a encore été vérifié contre un vrai trunk OVHcloud : le premier pilote le fera (la forme de ses INVITE, son realm, ses adresses, sa façon d'acheminer les urgences).
 
+## Meet par téléphone (étape 8)
+
+Désactivé par défaut : le kit ne contient ni LiveKit ni LiveKit SIP, le socket d'OpenSIPS pour LiveKit SIP (`127.0.0.1:5090`) refuse tout et 8000 n'est le numéro de personne. Pour rejoindre les salles d'un Meet de La Suite numérique par téléphone, avec un LiveKit SIP qui ne voit qu'OpenSIPS (ADR 0018) :
+
+- OpenSIPS : `MEET_SIP` (l'adresse `ip:port` de LiveKit SIP, seule entendue sur son socket), `MEET_LISTEN_IP` et `MEET_PORT` (le socket, sur la boucle locale par défaut : une adresse de la machine si LiveKit SIP est ailleurs), `MEET_NUMBER` (le numéro d'accès, 8000 par défaut), `MEET_SIP_USER` et `MEET_SIP_PASSWORD` (le compte dont LiveKit SIP répond au défi pour les appels des salles : `openssl rand -base64 18`, 12 caractères au moins).
+- Passerelle : `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET` (le serveur LiveKit de Meet), `MEET_INBOUND_ADDRESSES` (l'adresse d'où OpenSIPS appelle LiveKit SIP), `MEET_OUTBOUND_ADDRESS` (le socket ci-dessus, `ip:port`), les mêmes `MEET_SIP_USER`, `MEET_SIP_PASSWORD` et `MEET_NUMBER` ; `MEET_DIALIN_NUMBERS` pour montrer un numéro public plutôt que 8000. `MEET_URL`, `MEET_CLIENT_ID` et `MEET_CLIENT_SECRET` laissent Meet décider des salles et des PIN.
+- Depuis l'extérieur : un numéro direct qui vise le numéro d'accès (Administration, Numéros directs : le numéro d'accès pour destination).
+
+Un appel d'une salle part au nom du poste de la personne qui l'a demandé, avec ses droits, ses plafonds et son numéro direct ; jamais une urgence. Rien de cela n'a été vérifié contre une instance de Meet : seulement contre LiveKit et LiveKit SIP en CI.
+
 ## Exploiter
 
 | Quoi | Comment |

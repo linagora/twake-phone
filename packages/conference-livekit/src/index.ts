@@ -1,6 +1,6 @@
 import type { ConferenceBridgeProvider } from '@twake/telephony-provider-sdk'
 import type { ConferenceParticipant, DialInConfiguration, Meeting } from '@twake/telephony-types'
-import { LiveKitApi, type Fetch } from './livekit-api.js'
+import { LiveKitApi, LiveKitError, type Fetch } from './livekit-api.js'
 
 export { LiveKitApi, LiveKitError, signToken, verifyWebhook } from './livekit-api.js'
 export type { Fetch } from './livekit-api.js'
@@ -14,12 +14,21 @@ export interface LiveKitConferenceConfig {
   apiSecret: string
   /** Numbers shown to people who dial in (E.164, or the internal extension for the dev PBX). */
   dialInNumbers: { country: string; e164: string }[]
-  /** The called number the inbound trunk accepts (what the PBX sends to LiveKit). Default: the first dial-in number. */
+  /** The called number the inbound trunk accepts (what the PBX sends to LiveKit). Default: any (only the PBX is let in). */
   inboundNumber?: string
+  /**
+   * The addresses (IPs or CIDRs) LiveKit SIP takes calls from: the PBX's (ADR 0018: OpenSIPS is the only trunk LiveKit
+   * sees). Empty: any, for a LiveKit SIP nobody else can reach.
+   */
+  inboundAddresses?: string[]
   /** Where LiveKit sends dial-out calls: the PBX's SIP address (host:port). */
   outboundAddress: string
-  /** Caller id used on dial-out. */
+  /** The credentials LiveKit answers the PBX's challenge with on dial-out (OpenSIPS's MEET_SIP_USER and MEET_SIP_PASSWORD). */
+  outboundAuth?: { username: string; password: string }
+  /** Caller id of a dial-out nobody asked for by name (one normally carries the extension of whoever asked for it). */
   outboundNumber?: string
+  /** How long a dial-out rings before it is given up, in seconds. Default 30. */
+  ringingTimeoutSec?: number
   /** Hide, mask or show phone numbers of participants (tenant privacy setting). */
   numberPrivacy?: 'show' | 'mask' | 'hide'
   fetch?: Fetch
@@ -27,6 +36,12 @@ export interface LiveKitConferenceConfig {
 
 const TRUNK_IN = 'twake-meet-in'
 const TRUNK_OUT = 'twake-meet-out'
+
+/** What a dial-out says when the call did not go through: the SIP status, as the PBX or the callee answered. */
+export interface DialFailure {
+  sipStatus: number
+  sipReason: string
+}
 
 const pad = (n: number) => String(n).padStart(6, '0')
 /** 6-digit PIN, not predictable from the room id. */
@@ -61,17 +76,20 @@ export class LiveKitConferenceBridge implements ConferenceBridgeProvider {
   }
 
   private get inboundNumber() {
-    return this.config.inboundNumber ?? this.config.dialInNumbers[0]?.e164 ?? ''
+    return this.config.inboundNumber ?? ''
   }
 
+  /** The inbound trunk as the configuration says, written again over the one found (the PBX may have moved). */
   private ensureInbound(): Promise<string> {
     return (this.inboundTrunkId ??= (async () => {
+      const trunk = { name: TRUNK_IN, numbers: this.inboundNumber ? [this.inboundNumber] : [], allowed_addresses: this.config.inboundAddresses ?? [] }
       const list = await this.api.call<{ items?: { sip_trunk_id: string; name: string }[] }>('livekit.SIP', 'ListSIPInboundTrunk', {})
       const found = list.items?.find(t => t.name === TRUNK_IN)
-      if (found) return found.sip_trunk_id
-      const created = await this.api.call<{ sip_trunk_id: string }>('livekit.SIP', 'CreateSIPInboundTrunk', {
-        trunk: { name: TRUNK_IN, numbers: [this.inboundNumber] }
-      })
+      if (found) {
+        await this.api.call('livekit.SIP', 'UpdateSIPInboundTrunk', { sip_trunk_id: found.sip_trunk_id, replace: trunk })
+        return found.sip_trunk_id
+      }
+      const created = await this.api.call<{ sip_trunk_id: string }>('livekit.SIP', 'CreateSIPInboundTrunk', { trunk })
       return created.sip_trunk_id
     })().catch(err => {
       this.inboundTrunkId = undefined
@@ -79,16 +97,27 @@ export class LiveKitConferenceBridge implements ConferenceBridgeProvider {
     }))
   }
 
+  /**
+   * The outbound trunk as the configuration says, written again over the one found: the PBX may have moved (a stale
+   * address sends calls nowhere) or changed the credentials it challenges with.
+   */
   private ensureOutbound(): Promise<string> {
     return (this.outboundTrunkId ??= (async () => {
-      const list = await this.api.call<{ items?: { sip_trunk_id: string; name: string; address?: string }[] }>('livekit.SIP', 'ListSIPOutboundTrunk', {})
+      const auth = this.config.outboundAuth
+      const trunk = {
+        name: TRUNK_OUT,
+        address: this.config.outboundAddress,
+        transport: 'SIP_TRANSPORT_UDP',
+        numbers: [this.config.outboundNumber ?? 'twake'],
+        ...(auth ? { auth_username: auth.username, auth_password: auth.password } : {})
+      }
+      const list = await this.api.call<{ items?: { sip_trunk_id: string; name: string }[] }>('livekit.SIP', 'ListSIPOutboundTrunk', {})
       const found = list.items?.find(t => t.name === TRUNK_OUT)
-      if (found && found.address === this.config.outboundAddress) return found.sip_trunk_id
-      // The PBX moved (new address or SIP port): the stale trunk would send calls nowhere.
-      if (found) await this.api.call('livekit.SIP', 'DeleteSIPTrunk', { sip_trunk_id: found.sip_trunk_id })
-      const created = await this.api.call<{ sip_trunk_id: string }>('livekit.SIP', 'CreateSIPOutboundTrunk', {
-        trunk: { name: TRUNK_OUT, address: this.config.outboundAddress, transport: 'SIP_TRANSPORT_UDP', numbers: [this.config.outboundNumber ?? 'twake'] }
-      })
+      if (found) {
+        await this.api.call('livekit.SIP', 'UpdateSIPOutboundTrunk', { sip_trunk_id: found.sip_trunk_id, replace: trunk })
+        return found.sip_trunk_id
+      }
+      const created = await this.api.call<{ sip_trunk_id: string }>('livekit.SIP', 'CreateSIPOutboundTrunk', { trunk })
       return created.sip_trunk_id
     })().catch(err => {
       this.outboundTrunkId = undefined
@@ -109,14 +138,19 @@ export class LiveKitConferenceBridge implements ConferenceBridgeProvider {
     const trunk = await this.ensureInbound()
     const existing = this.rules.get(meeting.id)
     if (existing) await this.api.call('livekit.SIP', 'DeleteSIPDispatchRule', { sip_dispatch_rule_id: existing }).catch(() => {})
-    const pin = randomPin(this.random)
-    const rule = await this.api.call<{ sip_dispatch_rule_id: string }>('livekit.SIP', 'CreateSIPDispatchRule', {
-      name: `twake-meet-${meeting.id}`,
-      trunk_ids: [trunk],
-      rule: { dispatch_rule_direct: { room_name: meeting.id, pin } }
-    })
-    this.rules.set(meeting.id, rule.sip_dispatch_rule_id)
-    return { numbers: this.config.dialInNumbers, meetingCode: meeting.id, pin }
+    // A PIN another room's rule has already: LiveKit refuses the rule, another PIN is drawn.
+    for (let attempt = 1; ; attempt++) {
+      const pin = randomPin(this.random)
+      try {
+        const rule = await this.api.call<{ sip_dispatch_rule_id: string }>('livekit.SIP', 'CreateSIPDispatchRule', {
+          dispatch_rule: { name: `twake-meet-${meeting.id}`, trunk_ids: [trunk], rule: { dispatch_rule_direct: { room_name: meeting.id, pin } } }
+        })
+        this.rules.set(meeting.id, rule.sip_dispatch_rule_id)
+        return { numbers: this.config.dialInNumbers, meetingCode: meeting.id, pin }
+      } catch (err) {
+        if (attempt >= 5 || !(err instanceof LiveKitError && /already exists/i.test(err.message))) throw err
+      }
+    }
   }
 
   removeDialIn: ConferenceBridgeProvider['removeDialIn'] = async meetingId => {
@@ -130,19 +164,33 @@ export class LiveKitConferenceBridge implements ConferenceBridgeProvider {
     this.rules.delete(meetingId)
   }
 
-  dialParticipant: ConferenceBridgeProvider['dialParticipant'] = async (meetingId, number) => {
+  /**
+   * Has the room call a number through the PBX, at the name of whoever asked (`from`, their extension: the PBX treats
+   * the call as theirs, rights and caps included). Waits for the answer: a call that does not go through fails with
+   * statusCode 409, code DIAL_FAILED and the SIP status the PBX or the callee answered (`sipStatus`, `sipReason`).
+   */
+  dialParticipant: ConferenceBridgeProvider['dialParticipant'] = async (meetingId, number, options = {}) => {
     if (!/^\+?[0-9*#]{2,20}$/.test(number)) throw Object.assign(new Error('Invalid phone number'), { statusCode: 400 })
+    if (options.from !== undefined && !/^[A-Za-z0-9._+-]{1,64}$/.test(options.from)) throw Object.assign(new Error('Invalid caller'), { statusCode: 400 })
     const trunk = await this.ensureOutbound()
     const identity = `phone-${number.replace(/\D/g, '')}-${Math.floor(this.random() * 1e6)}`
-    await this.api.call('livekit.SIP', 'CreateSIPParticipant', {
-      sip_trunk_id: trunk,
-      sip_call_to: number,
-      room_name: meetingId,
-      participant_identity: identity,
-      participant_name: this.display(number),
-      participant_attributes: { 'twake.kind': 'phone', 'twake.number': number },
-      wait_until_answered: false
-    })
+    try {
+      await this.api.call('livekit.SIP', 'CreateSIPParticipant', {
+        sip_trunk_id: trunk,
+        sip_call_to: number,
+        ...(options.from ? { sip_number: options.from } : {}),
+        room_name: meetingId,
+        participant_identity: identity,
+        participant_name: this.display(number),
+        participant_attributes: { 'twake.kind': 'phone', 'twake.number': number },
+        wait_until_answered: true,
+        ringing_timeout: `${this.config.ringingTimeoutSec ?? 30}s`
+      })
+    } catch (err) {
+      const failure = err instanceof LiveKitError ? dialFailure(err) : undefined
+      if (!failure) throw err
+      throw Object.assign(new Error(`The call to ${number} did not go through (${failure.sipStatus} ${failure.sipReason})`), { statusCode: 409, code: 'DIAL_FAILED', ...failure })
+    }
     return this.toParticipant(meetingId, { identity, name: this.display(number), attributes: { 'twake.kind': 'phone', 'twake.number': number } })
   }
 
@@ -191,6 +239,14 @@ export class LiveKitConferenceBridge implements ConferenceBridgeProvider {
       muted
     }
   }
+}
+
+/** The SIP status of a dial-out that failed, from the Twirp error's metadata, else from its message ("sip status 486: ..."). */
+const dialFailure = (err: LiveKitError): DialFailure | undefined => {
+  const code = Number(err.meta.sip_status_code)
+  if (Number.isInteger(code) && code >= 300 && code < 700) return { sipStatus: code, sipReason: err.meta.sip_status ?? '' }
+  const m = /sip status (\d{3}):?\s*([^"]*)/i.exec(err.message)
+  return m ? { sipStatus: Number(m[1]), sipReason: (m[2] ?? '').trim() } : undefined
 }
 
 interface LkParticipant {

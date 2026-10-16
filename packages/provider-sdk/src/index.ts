@@ -102,7 +102,8 @@ export interface MediaProvider {
 export interface ConferenceBridgeProvider {
   createDialIn(meeting: Meeting): Promise<DialInConfiguration>
   removeDialIn(meetingId: string): Promise<void>
-  dialParticipant(meetingId: string, number: string): Promise<ConferenceParticipant>
+  /** `from`: the extension of whoever asked for the call (step 8): the call is theirs, at their name and with their rights. */
+  dialParticipant(meetingId: string, number: string, options?: { from?: string }): Promise<ConferenceParticipant>
   disconnectParticipant(participantId: string): Promise<void>
   muteParticipant(participantId: string): Promise<void>
 }

@@ -6,7 +6,7 @@
 // challenge or its refusal too; it places calls to the trunk's direct numbers (with an offer,
 // or none: a late offer), sends re-INVITEs without SDP in either kind of call, and records every request it gets in a
 // dialog (REFER, re-INVITE, BYE...). Media both ways: an A-law tone over RTP out, the RTP received counted (sound,
-// and RFC 4733 events). `dead` plays a server that answers nothing at all. Behind a NAT (`nat`): what OpenSIPS
+// and RFC 4733 events), and digits typed in a call it placed (RFC 4733, step 8: a room's PIN). `dead` plays a server that answers nothing at all. Behind a NAT (`nat`): what OpenSIPS
 // announces (TRUNK_ADVERTISE) is reached at its real address. No retransmissions of its own (the loopback loses no
 // datagram).
 import { createHash, randomBytes } from 'node:crypto'
@@ -110,6 +110,36 @@ const media = async () => {
         socket.send(Buffer.concat([header, TONE]), target.port, target.host)
         stats.sent++
       }, 20)
+    },
+    /**
+     * Types `digits` (0-9, *, #) as RFC 4733 events on payload type `pt` (step 8: a room's PIN), between the tone's
+     * packets: each digit 100 ms (its end sent three times, as the RFC asks), then 150 ms of nothing typed.
+     */
+    async dtmf(digits, pt = 101) {
+      if (!target) throw new Error('no media to type into')
+      const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
+      for (const digit of digits) {
+        const event = '0123456789*#'.indexOf(digit)
+        if (event < 0) throw new Error(`not a DTMF digit: ${digit}`)
+        const start = ts >>> 0
+        ts += 800
+        for (let i = 1; i <= 8; i++) {
+          const end = i >= 6
+          const packet = Buffer.alloc(16)
+          packet[0] = 0x80
+          packet[1] = (i === 1 ? 0x80 : 0) | pt
+          packet.writeUInt16BE(seq++ & 0xffff, 2)
+          packet.writeUInt32BE(start, 4)
+          packet.writeUInt32BE(ssrc, 8)
+          packet[12] = event
+          packet[13] = (end ? 0x80 : 0) | 10
+          packet.writeUInt16BE(Math.min(i, 5) * 160, 14)
+          socket.send(packet, target.port, target.host)
+          stats.sent++
+          await sleep(20)
+        }
+        await sleep(150)
+      }
     },
     stop() {
       clearInterval(timer)
@@ -486,6 +516,8 @@ export const startOperator = async ({ opensips, user, password, realm = 'operato
       })
       call.final.catch(() => undefined)
       call.cancel = () => send(withBody(head('CANCEL', 1, branch)))
+      /** Types `digits` in the call (RFC 4733, on the payload type of the answer's DTMF events). */
+      call.dtmf = digits => m.dtmf(digits, eventsOf(call.answer?.body))
       call.hangup = async () => {
         const answer = await inDialog(call, 'BYE')
         call.state = 'ended'

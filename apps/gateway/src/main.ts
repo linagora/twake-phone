@@ -74,17 +74,26 @@ if (seed && env.TRUNK_PASSWORD) console.warn('TRUNK_PASSWORD: the trunk is in th
 
 const registry = new ProviderRegistry(await store.listProviders(), [storedOpensipsFactory({ store, ...(key ? { key } : {}) })])
 
-// Meet phone access: one LiveKit for the deployment, enabled when its API credentials are given.
+// Meet phone access: one LiveKit for the deployment, enabled when its API credentials are given (step 8, ADR 0018).
+// LiveKit SIP sees OpenSIPS only: it takes calls from MEET_INBOUND_ADDRESSES (OpenSIPS's address, comma-separated),
+// places its dial-out calls to MEET_OUTBOUND_ADDRESS (OpenSIPS's socket for it) and answers OpenSIPS's challenge with
+// MEET_SIP_USER and MEET_SIP_PASSWORD, the same as OpenSIPS's. MEET_NUMBER: the access number OpenSIPS sends to it.
+const accessNumber = env.MEET_NUMBER ?? '8000'
+if (!/^[1-9][0-9]{1,5}$/.test(accessNumber)) throw new Error('MEET_NUMBER must be two to six digits, not starting with 0')
 const conference = env.LIVEKIT_API_KEY && env.LIVEKIT_API_SECRET && env.LIVEKIT_URL
   ? (() => {
+      const inboundAddresses = (env.MEET_INBOUND_ADDRESSES ?? '').split(',').map(a => a.trim()).filter(Boolean)
       const bridge = new LiveKitConferenceBridge({
         url: env.LIVEKIT_URL,
         apiKey: env.LIVEKIT_API_KEY,
         apiSecret: env.LIVEKIT_API_SECRET,
-        dialInNumbers: (env.MEET_DIALIN_NUMBERS ?? '8000').split(',').map(e164 => ({ country: env.MEET_DIALIN_COUNTRY ?? 'FR', e164: e164.trim() })),
+        dialInNumbers: (env.MEET_DIALIN_NUMBERS ?? accessNumber).split(',').map(e164 => ({ country: env.MEET_DIALIN_COUNTRY ?? 'FR', e164: e164.trim() })),
+        ...(inboundAddresses.length ? { inboundAddresses } : {}),
         outboundAddress: need('MEET_OUTBOUND_ADDRESS'),
+        ...(env.MEET_SIP_PASSWORD ? { outboundAuth: { username: env.MEET_SIP_USER ?? 'livekit', password: env.MEET_SIP_PASSWORD } } : {}),
         ...(env.MEET_NUMBER_PRIVACY ? { numberPrivacy: env.MEET_NUMBER_PRIVACY as 'show' | 'mask' | 'hide' } : {})
       })
+      if (!env.MEET_SIP_PASSWORD) console.warn('WARNING: MEET_SIP_PASSWORD is not set: OpenSIPS refuses the calls of the rooms (dial-out)')
       // Meet owns rooms, PINs and dial-in rules when its external API is configured for the Gateway.
       const meet = env.MEET_URL && env.MEET_CLIENT_ID && env.MEET_CLIENT_SECRET ? new MeetApi({ url: env.MEET_URL, clientId: env.MEET_CLIENT_ID, clientSecret: env.MEET_CLIENT_SECRET }) : undefined
       // The trunks LiveKit needs (accept calls to the dial-in number, place dial-out calls). LiveKit may start later.
@@ -95,7 +104,7 @@ const conference = env.LIVEKIT_API_KEY && env.LIVEKIT_API_SECRET && env.LIVEKIT_
         })
       }
       prepare()
-      return { bridge: () => bridge, ...(meet ? { meet } : {}), webhookKey: env.LIVEKIT_API_KEY, webhookSecret: env.LIVEKIT_API_SECRET }
+      return { bridge: () => bridge, ...(meet ? { meet } : {}), accessNumber, webhookKey: env.LIVEKIT_API_KEY, webhookSecret: env.LIVEKIT_API_SECRET }
     })()
   : undefined
 
@@ -130,7 +139,7 @@ const groupNumbers = async (tenantId: string) => {
   const provider = registry.forTenant(tenantId)
   return provider.listGroups ? (await provider.listGroups()).map(g => g.number) : []
 }
-const directorySync = contacts && env.LDAP_ATTR_EXTENSION ? new DirectorySync({ store, directory: contacts, tenantId: env.LDAP_TENANT ?? tenant, reserved: groupNumbers }) : undefined
+const directorySync = contacts && env.LDAP_ATTR_EXTENSION ? new DirectorySync({ store, directory: contacts, tenantId: env.LDAP_TENANT ?? tenant, reserved: async t => [...(await groupNumbers(t)), ...(conference ? [accessNumber] : [])] }) : undefined
 const hstsMaxAge = env.HSTS_MAX_AGE ? Number(env.HSTS_MAX_AGE) : undefined
 if (hstsMaxAge !== undefined && !(Number.isInteger(hstsMaxAge) && hstsMaxAge >= 0)) throw new Error('HSTS_MAX_AGE must be a number of seconds')
 const app = await buildApp(registry, {

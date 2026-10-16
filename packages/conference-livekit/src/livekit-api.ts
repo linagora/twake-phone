@@ -32,7 +32,13 @@ export const verifyWebhook = (apiKey: string, apiSecret: string, authorization: 
 export type Fetch = (url: string, init: { method: string; headers: Record<string, string>; body?: string }) => Promise<{ ok: boolean; status: number; text(): Promise<string> }>
 
 export class LiveKitError extends Error {
-  constructor(message: string, readonly status: number) {
+  constructor(
+    message: string,
+    readonly status: number,
+    /** The Twirp error's code and metadata (a SIP call that failed: `sip_status_code`, `sip_status`). */
+    readonly twirpCode?: string,
+    readonly meta: Record<string, string> = {}
+  ) {
     super(message)
   }
 }
@@ -62,12 +68,17 @@ export class LiveKitApi {
     const text = await res.text()
     if (!res.ok) {
       let msg = text
+      let code: string | undefined
+      let meta: Record<string, string> = {}
       try {
-        msg = (JSON.parse(text) as { msg?: string }).msg ?? text
+        const err = JSON.parse(text) as { msg?: string; code?: string; meta?: Record<string, string> }
+        msg = err.msg ?? text
+        code = err.code
+        if (err.meta && typeof err.meta === 'object') meta = err.meta
       } catch {
         // not JSON: the body itself is the message
       }
-      throw new LiveKitError(`LiveKit ${method} failed (${res.status}): ${msg}`, res.status)
+      throw new LiveKitError(`LiveKit ${method} failed (${res.status}): ${msg}`, res.status, code, meta)
     }
     return (text ? JSON.parse(text) : {}) as T
   }

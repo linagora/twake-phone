@@ -45,9 +45,10 @@ const digest = (challenge, { user, password, method, uri }) => {
 
 /**
  * The phone of account `user`: over UDP to `proxy` ("host:port"), or over the WebSocket `ws` (ws://...). `domain` is
- * the SIP domain and digest realm.
+ * the SIP domain and digest realm. To play LiveKit SIP (step 8): `from`, the user its calls name in the From (`user`
+ * answers the challenge), and over UDP `bind` (the address it sends from, 127.0.0.1 by default) and `port`.
  */
-export const sipPhone = async ({ proxy, ws, domain, user, password }) => {
+export const sipPhone = async ({ proxy, ws, domain, user, password, from = user, bind = '127.0.0.1', port: bindPort = 0 }) => {
   const responses = []
   const waiters = new Set()
   const changed = () => {
@@ -97,7 +98,7 @@ export const sipPhone = async ({ proxy, ws, domain, user, password }) => {
     udp = createSocket('udp4')
     await new Promise((resolve, reject) => {
       udp.once('error', reject)
-      udp.bind(0, '127.0.0.1', resolve)
+      udp.bind(bindPort, bind, resolve)
     })
     const { address, port } = udp.address()
     via = () => `SIP/2.0/UDP ${address}:${port}`
@@ -212,7 +213,7 @@ export const sipPhone = async ({ proxy, ws, domain, user, password }) => {
     const uri = `sip:${target}@${domain}`
     const callId = `phone-${token()}`
     const tag = token()
-    const call = { callId, state: 'calling', rtpPort: rtpPort(), version: 1, reinvites: [], requests: [], acks: [], cseq: 1, local: `<sip:${user}@${domain}>;tag=${tag}`, remote: `<sip:${target}@${domain}>`, route: [], target: uri }
+    const call = { callId, state: 'calling', rtpPort: rtpPort(), version: 1, reinvites: [], requests: [], acks: [], cseq: 1, local: `<sip:${from}@${domain}>;tag=${tag}`, remote: `<sip:${target}@${domain}>`, route: [], target: uri }
     calls.set(callId, call)
     const body = otherBody ?? (offer ? sdpOf(call.rtpPort) : '')
     const invite = (cseq, branch, more = []) => withBody([`INVITE ${uri} SIP/2.0`, `Via: ${via()};branch=${branch};rport`, 'Max-Forwards: 70', `From: ${call.local}`, `To: ${call.remote}`, `Call-ID: ${callId}`, `CSeq: ${cseq} INVITE`, `Contact: ${contact}`, ...extra, ...more], body, type)

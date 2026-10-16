@@ -135,6 +135,11 @@ export interface BuildOptions {
     bridge: (tenantId: string) => LiveKitConferenceBridge | undefined
     /** When present, Meet owns rooms, PINs and dial-in; the Gateway acts as a Meet application for the user. */
     meet?: MeetApi
+    /**
+     * The access number of the rooms (step 8, ADR 0018: OpenSIPS's MEET_NUMBER, sent to LiveKit SIP, which asks for a
+     * room's PIN): a direct number may aim at it; it is no extension nor ring group.
+     */
+    accessNumber?: string
     webhookKey: string
     webhookSecret: string
   }
@@ -969,6 +974,8 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         const user = await administrator(req)
         const groups = groupsOf(registry.forTenant(user.tenantId))
         const number = typeof req.body?.number === 'string' ? req.body.number.trim() : ''
+        if (options.conference?.accessNumber && number === options.conference.accessNumber)
+          throw refused('GROUP_NUMBER_RESERVED', `${number} is the access number of the meeting rooms`)
         const group = await exclusive(user.tenantId, async () => {
           const g = await parseGroup(number, req.body, isExtensionOf(user.tenantId))
           await groups.set(g, 'create')
@@ -1019,9 +1026,11 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         await apply(providerTrunks(trunks, options.secretsKey), dids).catch(undo)
         await keep().catch(undo)
       }
-      // A number rings an extension someone holds, or a ring group of the tenant: nothing else; so does a fallback.
+      // A number rings an extension someone holds, or a ring group of the tenant: nothing else; so does a fallback. A
+      // direct number may also aim at the access number of Meet's rooms (step 8), never a fallback.
       const checkTarget = async (tenantId: string, provider: TelephonyProvider, field: string, target: string | undefined, code: string) => {
         if (!target || (await store.getMappingByExtension(tenantId, target))) return
+        if (code === 'DID_TARGET' && options.conference?.accessNumber && target === options.conference.accessNumber && options.conference.bridge(tenantId)) return
         if (provider.listGroups && (await provider.listGroups()).some(g => g.number === target)) return
         throw Object.assign(new Error(`${field}: ${target} is no extension nor ring group of this platform`), { statusCode: 400, code })
       }
@@ -1373,10 +1382,20 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         return reply.code(204).send()
       })
 
+      // The room calls a number at the owner's name (step 8, ADR 0018): their extension, which the SIP server treats as
+      // a call from their phone (rights, caps, the direct number presented). Answered once the call is (201), or with
+      // the SIP status of the failure (409, DIAL_FAILED: `sipStatus`, `sipReason`).
       v1.post<{ Params: { id: string }; Body: { number?: string } }>('/conferences/:id/participants', async (req, reply) => {
-        const { bridge, record } = await owned(req, req.params.id)
-        const participant = await bridge.dialParticipant(record.meetingId, (req.body?.number ?? '').trim())
-        return reply.code(202).send(participant)
+        const { bridge, record, user } = await owned(req, req.params.id)
+        if (!user.extension) throw Object.assign(new Error('You hold no extension: a room calls at the name of whoever asks'), { statusCode: 403, code: 'NO_EXTENSION' })
+        try {
+          const participant = await bridge.dialParticipant(record.meetingId, (req.body?.number ?? '').trim(), { from: user.extension })
+          return reply.code(201).send(participant)
+        } catch (err) {
+          const failed = err as Error & { code?: string; sipStatus?: number; sipReason?: string }
+          if (failed.code !== 'DIAL_FAILED') throw err
+          return reply.code(409).send({ statusCode: 409, code: 'DIAL_FAILED', error: 'Conflict', message: failed.message, sipStatus: failed.sipStatus, sipReason: failed.sipReason })
+        }
       })
 
       const participantAction = (method: 'delete' | 'post', path: string, run: (b: LiveKitConferenceBridge, pid: string) => Promise<void>) =>
