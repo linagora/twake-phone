@@ -4,6 +4,7 @@ import type { SecretProvisioner } from '@twake/telephony-provider-sdk'
 import { CALL_GROUPS_SCHEMA, CallGroups, DISPLAY_NAMES_SCHEMA, type CallGroupsOptions } from './call-groups.js'
 import { CALL_RULES_SCHEMA, CallRules, type CallRulesOptions } from './call-rules.js'
 import { PUSH_TARGETS_SCHEMA, PushTargets, type PushTargetsOptions } from './push-targets.js'
+import { DialOutGrants, type DialOutGrantsOptions } from './dial-out-grants.js'
 import { ACC_EXTERNAL_SQL, OutboundTables, type OutboundTablesOptions } from './outbound.js'
 import { TRUNK_SCHEMA, TrunkTables, type TrunkTablesOptions } from './trunks.js'
 
@@ -74,7 +75,8 @@ CREATE TABLE IF NOT EXISTS acc (
     created TIMESTAMP WITHOUT TIME ZONE DEFAULT NULL,
     caller VARCHAR(64) DEFAULT '' NOT NULL,
     callee VARCHAR(64) DEFAULT '' NOT NULL,
-    dialled VARCHAR(64) DEFAULT '' NOT NULL
+    dialled VARCHAR(64) DEFAULT '' NOT NULL,
+    via VARCHAR(16) DEFAULT '' NOT NULL
 );
 CREATE INDEX IF NOT EXISTS acc_callid_idx ON acc (callid);
 CREATE TABLE IF NOT EXISTS missed_calls (
@@ -90,7 +92,8 @@ CREATE TABLE IF NOT EXISTS missed_calls (
     created TIMESTAMP WITHOUT TIME ZONE DEFAULT NULL,
     caller VARCHAR(64) DEFAULT '' NOT NULL,
     callee VARCHAR(64) DEFAULT '' NOT NULL,
-    dialled VARCHAR(64) DEFAULT '' NOT NULL
+    dialled VARCHAR(64) DEFAULT '' NOT NULL,
+    via VARCHAR(16) DEFAULT '' NOT NULL
 );
 CREATE INDEX IF NOT EXISTS missed_calls_callid_idx ON missed_calls (callid);
 INSERT INTO version (table_name, table_version) VALUES ('acc', ${ACC_TABLE_VERSION}), ('missed_calls', ${MISSED_CALLS_TABLE_VERSION})
@@ -102,8 +105,9 @@ const ACC_EXTRA = "VARCHAR(64) DEFAULT '' NOT NULL"
  * The columns an existing table may lack: those of `acc` and `missed_calls` that OpenSIPS's own scripts do not create
  * (the acc extras of opensips.cfg.tpl), those `call_rules` gained after its first version (the holders; an older
  * row gets an empty tenant, and the first reconcile drops it), the holder of a `subscriber` row (an older row has
- * none: it is never removed, until the session of its holder writes it again), and the life of a `push_targets` row
- * (step 5 first wrote it without: an older row is not alive until the Gateway keeps it so).
+ * none: it is never removed, until the session of its holder writes it again), the life of a `push_targets` row
+ * (step 5 first wrote it without: an older row is not alive until the Gateway keeps it so), and the `via` of a CDR
+ * (step 8: "meet" for a call a room placed).
  */
 export const EXTRA_COLUMNS = [
   ['subscriber', 'holder', 'TEXT'],
@@ -115,6 +119,8 @@ export const EXTRA_COLUMNS = [
   ['missed_calls', 'callee', ACC_EXTRA],
   ['missed_calls', 'dialled', ACC_EXTRA],
   ['missed_calls', 'external', ACC_EXTRA],
+  ['acc', 'via', "VARCHAR(16) DEFAULT '' NOT NULL"],
+  ['missed_calls', 'via', "VARCHAR(16) DEFAULT '' NOT NULL"],
   ['call_rules', 'tenant_id', "TEXT DEFAULT '' NOT NULL"],
   ['call_rules', 'holder', "TEXT DEFAULT '' NOT NULL"],
   ['call_rules', 'forward_always_holder', 'TEXT'],
@@ -233,9 +239,9 @@ export class SubscriberProvisioner implements SecretProvisioner {
     // The triggers that count what the calls to the public network used (step 6b), once `external` is there: created
     // where they lack only, waiting 5 s at most for the lock of `acc`.
     this.problem = undefined
-    if (missing.some(([table, column]) => column === 'external' && (table === 'acc' || table === 'missed_calls')) && !(await this.hasExternal())) {
-      this.problem = 'acc.external is missing: OpenSIPS cannot write the CDRs nor the missed calls, and the caps count nothing'
-      this.log.warn(`OpenSIPS tables: ${this.problem} (add the column as the owner of acc: docker/opensips/trunk.sql)`)
+    if (missing.some(([table, column]) => (column === 'external' || column === 'via') && (table === 'acc' || table === 'missed_calls')) && !(await this.hasExternal())) {
+      this.problem = 'acc.external or acc.via is missing: OpenSIPS cannot write the CDRs nor the missed calls, and the caps count nothing'
+      this.log.warn(`OpenSIPS tables: ${this.problem} (add the columns as the owner of acc: docker/opensips/trunk.sql)`)
     } else if (!(await this.hasUsageTriggers())) {
       await this.inTransaction(ACC_EXTERNAL_SQL.replace(/^BEGIN;\n/, '').replace(/COMMIT;\n$/, '')).catch((err: unknown) => {
         this.problem = 'the triggers of acc that count what the calls to the public network use are missing: the minute and call caps count nothing'
@@ -263,8 +269,8 @@ export class SubscriberProvisioner implements SecretProvisioner {
   }
 
   private async hasExternal() {
-    const { rows } = (await this.pool.query("SELECT count(*)::int AS n FROM information_schema.columns WHERE table_schema = current_schema() AND table_name IN ('acc', 'missed_calls') AND column_name = 'external'")) as { rows: { n: number }[] }
-    return rows[0]?.n === 2
+    const { rows } = (await this.pool.query("SELECT count(*)::int AS n FROM information_schema.columns WHERE table_schema = current_schema() AND table_name IN ('acc', 'missed_calls') AND column_name IN ('external', 'via')")) as { rows: { n: number }[] }
+    return rows[0]?.n === 4
   }
 
   /** `sql` in one transaction (several statements), rolled back on any failure. */
@@ -380,6 +386,11 @@ export class SubscriberProvisioner implements SecretProvisioner {
   /** The `push_targets` of the same database, on the same connections (see PushTargetsOptions). */
   pushTargets(opts: Omit<PushTargetsOptions, 'pool'> = {}) {
     return new PushTargets({ pool: this.pool, ...opts })
+  }
+
+  /** The grants of the calls Meet's rooms place (step 8), in the same database, on the same connections. */
+  dialOutGrants(opts: Omit<DialOutGrantsOptions, 'pool'> = {}) {
+    return new DialOutGrants({ pool: this.pool, ...opts })
   }
 
   /** The trunks and direct numbers of the same database, on the same connections (see TrunkTablesOptions). */

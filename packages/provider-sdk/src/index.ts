@@ -54,6 +54,17 @@ export interface TelephonyProvider {
   setWakeable?(holders: { extension: string; userId: string }[]): Promise<void>
   /** One person's line of `setWakeable`: whether they can be woken now (`on`), the others untouched. */
   setWakeableOne?(holder: { extension: string; userId: string }, on: boolean): Promise<void>
+  /**
+   * Lets a room of Meet call `number` at the name of `extension` once, within `ttlSec` seconds (step 8, ADR 0018): the
+   * SIP server refuses a room's call it was not told of. `token` goes with the call (ConferenceBridgeProvider's
+   * dialParticipant, `grant`); `revoke` withdraws it when the call never reached the SIP server.
+   */
+  grantRoomCall?(grant: { extension: string; number: string; ttlSec?: number }): Promise<{ token: string; revoke(): Promise<void> }>
+  /**
+   * The access number of Meet's rooms as the SIP server has it (step 8): `number` undefined when its rooms are off
+   * there; undefined when it cannot say. The Gateway compares it with its own at its start.
+   */
+  getMeetAccess?(): Promise<{ number?: string } | undefined>
   /** Where the calls of the user's extension go (capability `forwarding`). */
   getForwarding?(user: User): Promise<ForwardingRules>
   /** Replaces those rules; targets are extensions the Gateway checked. */
@@ -102,8 +113,11 @@ export interface MediaProvider {
 export interface ConferenceBridgeProvider {
   createDialIn(meeting: Meeting): Promise<DialInConfiguration>
   removeDialIn(meetingId: string): Promise<void>
-  /** `from`: the extension of whoever asked for the call (step 8): the call is theirs, at their name and with their rights. */
-  dialParticipant(meetingId: string, number: string, options?: { from?: string }): Promise<ConferenceParticipant>
+  /**
+   * `from`: the extension of whoever asked for the call (step 8): the call is theirs, at their name and with their
+   * rights; `grant`: the token the SIP server gave for it (TelephonyProvider's grantRoomCall), carried with the call.
+   */
+  dialParticipant(meetingId: string, number: string, options?: { from?: string; grant?: string }): Promise<ConferenceParticipant>
   disconnectParticipant(participantId: string): Promise<void>
   muteParticipant(participantId: string): Promise<void>
 }

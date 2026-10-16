@@ -2,7 +2,7 @@ import { LiveKitConferenceBridge, MeetApi } from '@twake/conference-livekit'
 import { buildApp } from './app.js'
 import { authenticatorFromEnv } from './auth.js'
 import { parseKey } from './crypto.js'
-import { StoreDirectory, reservedInUse, seedUserMap } from './directory.js'
+import { StoreDirectory, accessNumberInUse, meetAccessMismatch, reservedInUse, seedUserMap } from './directory.js'
 import { DirectorySync, parseInterval } from './directory-sync.js'
 import { ldapDirectoryFromEnv } from './ldap-directory.js'
 import { storedOpensipsFactory, type StoredOpensipsConfig } from './providers.js'
@@ -56,8 +56,13 @@ if (env.OPENSIPS_WS_URL && !(await store.listProviders()).some(p => p.tenantId =
   }
   await store.upsertProvider({ tenantId: tenant, type: 'opensips', config })
 }
+// Meet phone access: one LiveKit for the deployment, enabled when its API credentials are given (step 8, ADR 0018).
+// MEET_NUMBER: the access number OpenSIPS sends to LiveKit SIP, read only then: it is nobody's extension.
+const conferenceOn = !!(env.LIVEKIT_API_KEY && env.LIVEKIT_API_SECRET && env.LIVEKIT_URL)
+const accessNumber = conferenceOn ? env.MEET_NUMBER || '8000' : undefined
+if (accessNumber !== undefined && !/^[1-9][0-9]{1,5}$/.test(accessNumber)) throw new Error('MEET_NUMBER must be two to six digits, not starting with 0')
 // DEV_USER_MAP seeds a mapping once; it never overwrites what an administrator or the directory wrote since.
-await seedUserMap(store, tenant, env.DEV_USER_MAP, message => console.warn(`WARNING: USER_EXTENSIONS (DEV_USER_MAP): ${message}`))
+await seedUserMap(store, tenant, env.DEV_USER_MAP, message => console.warn(`WARNING: USER_EXTENSIONS (DEV_USER_MAP): ${message}`), accessNumber)
 
 const key = env.SECRETS_KEY ? parseKey(env.SECRETS_KEY) : undefined
 
@@ -74,21 +79,23 @@ if (seed && env.TRUNK_PASSWORD) console.warn('TRUNK_PASSWORD: the trunk is in th
 
 const registry = new ProviderRegistry(await store.listProviders(), [storedOpensipsFactory({ store, ...(key ? { key } : {}) })])
 
-// Meet phone access: one LiveKit for the deployment, enabled when its API credentials are given (step 8, ADR 0018).
-// LiveKit SIP sees OpenSIPS only: it takes calls from MEET_INBOUND_ADDRESSES (OpenSIPS's address, comma-separated),
-// places its dial-out calls to MEET_OUTBOUND_ADDRESS (OpenSIPS's socket for it) and answers OpenSIPS's challenge with
-// MEET_SIP_USER and MEET_SIP_PASSWORD, the same as OpenSIPS's. MEET_NUMBER: the access number OpenSIPS sends to it.
-const accessNumber = env.MEET_NUMBER ?? '8000'
-if (!/^[1-9][0-9]{1,5}$/.test(accessNumber)) throw new Error('MEET_NUMBER must be two to six digits, not starting with 0')
-const conference = env.LIVEKIT_API_KEY && env.LIVEKIT_API_SECRET && env.LIVEKIT_URL
+// LiveKit SIP sees OpenSIPS only: it takes calls from MEET_INBOUND_ADDRESSES (OpenSIPS's address, comma-separated:
+// required, LiveKit refuses an inbound trunk without), places its dial-out calls to MEET_OUTBOUND_ADDRESS (OpenSIPS's
+// socket for it) and answers OpenSIPS's challenge with MEET_SIP_USER and MEET_SIP_PASSWORD, the same as OpenSIPS's.
+// MEET_MAX_CALL_SEC: the longest a room's call lasts (LiveKit SIP hangs up then), 7200 s by default, as OpenSIPS's.
+const conference = conferenceOn && accessNumber
   ? (() => {
       const inboundAddresses = (env.MEET_INBOUND_ADDRESSES ?? '').split(',').map(a => a.trim()).filter(Boolean)
+      if (!inboundAddresses.length) throw new Error("MEET_INBOUND_ADDRESSES is required with LIVEKIT_URL: OpenSIPS's address, the only one LiveKit SIP takes calls from")
+      const maxCallSec = Number(env.MEET_MAX_CALL_SEC || 7200)
+      if (!(Number.isInteger(maxCallSec) && maxCallSec >= 60 && maxCallSec <= 86_400)) throw new Error('MEET_MAX_CALL_SEC must be 60 to 86400 seconds')
       const bridge = new LiveKitConferenceBridge({
-        url: env.LIVEKIT_URL,
-        apiKey: env.LIVEKIT_API_KEY,
-        apiSecret: env.LIVEKIT_API_SECRET,
-        dialInNumbers: (env.MEET_DIALIN_NUMBERS ?? accessNumber).split(',').map(e164 => ({ country: env.MEET_DIALIN_COUNTRY ?? 'FR', e164: e164.trim() })),
-        ...(inboundAddresses.length ? { inboundAddresses } : {}),
+        url: env.LIVEKIT_URL!,
+        apiKey: env.LIVEKIT_API_KEY!,
+        apiSecret: env.LIVEKIT_API_SECRET!,
+        dialInNumbers: (env.MEET_DIALIN_NUMBERS || accessNumber).split(',').map(e164 => ({ country: env.MEET_DIALIN_COUNTRY || 'FR', e164: e164.trim() })),
+        inboundAddresses,
+        maxCallSec,
         outboundAddress: need('MEET_OUTBOUND_ADDRESS'),
         ...(env.MEET_SIP_PASSWORD ? { outboundAuth: { username: env.MEET_SIP_USER ?? 'livekit', password: env.MEET_SIP_PASSWORD } } : {}),
         ...(env.MEET_NUMBER_PRIVACY ? { numberPrivacy: env.MEET_NUMBER_PRIVACY as 'show' | 'mask' | 'hide' } : {})
@@ -104,7 +111,7 @@ const conference = env.LIVEKIT_API_KEY && env.LIVEKIT_API_SECRET && env.LIVEKIT_
         })
       }
       prepare()
-      return { bridge: () => bridge, ...(meet ? { meet } : {}), accessNumber, webhookKey: env.LIVEKIT_API_KEY, webhookSecret: env.LIVEKIT_API_SECRET }
+      return { bridge: () => bridge, ...(meet ? { meet } : {}), accessNumber, webhookKey: env.LIVEKIT_API_KEY!, webhookSecret: env.LIVEKIT_API_SECRET! }
     })()
   : undefined
 
@@ -139,7 +146,7 @@ const groupNumbers = async (tenantId: string) => {
   const provider = registry.forTenant(tenantId)
   return provider.listGroups ? (await provider.listGroups()).map(g => g.number) : []
 }
-const directorySync = contacts && env.LDAP_ATTR_EXTENSION ? new DirectorySync({ store, directory: contacts, tenantId: env.LDAP_TENANT ?? tenant, reserved: async t => [...(await groupNumbers(t)), ...(conference ? [accessNumber] : [])] }) : undefined
+const directorySync = contacts && env.LDAP_ATTR_EXTENSION ? new DirectorySync({ store, directory: contacts, tenantId: env.LDAP_TENANT ?? tenant, reserved: async t => [...(await groupNumbers(t)), ...(conference && accessNumber ? [accessNumber] : [])] }) : undefined
 const hstsMaxAge = env.HSTS_MAX_AGE ? Number(env.HSTS_MAX_AGE) : undefined
 if (hstsMaxAge !== undefined && !(Number.isInteger(hstsMaxAge) && hstsMaxAge >= 0)) throw new Error('HSTS_MAX_AGE must be a number of seconds')
 const app = await buildApp(registry, {
@@ -162,4 +169,16 @@ registry.startAll()
 // plan): a call to them goes to the operator, never to whoever has them. Said at each start until changed.
 for (const what of await reservedInUse(store, tenant, await groupNumbers(tenant).catch(() => [])))
   console.warn(`WARNING: ${what} is an emergency number or another short number of the French plan: dialled, it goes to the operator, never there; give it another number`)
+// The access number of Meet's rooms (step 8): nobody's extension nor group; the same here and in OpenSIPS, asked once
+// it can answer (its MI, a little after the start).
+for (const what of await accessNumberInUse(store, tenant, accessNumber, await groupNumbers(tenant).catch(() => [])))
+  console.warn(`WARNING: ${what} is the access number of the meeting rooms (MEET_NUMBER): dialled, it goes to LiveKit SIP, never there; give it another number`)
+setTimeout(() => {
+  if (!registry.serves(tenant)) return
+  void Promise.resolve(registry.forTenant(tenant).getMeetAccess?.())
+    .then(sip => {
+      for (const what of meetAccessMismatch(accessNumber, sip)) console.warn(`WARNING: ${what}`)
+    })
+    .catch((err: unknown) => console.warn(`WARNING: the access number of the meeting rooms not compared with OpenSIPS's: ${err instanceof Error ? err.message : String(err)}`))
+}, 10_000).unref()
 await app.listen({ host: env.HOST ?? '0.0.0.0', port: Number(env.PORT ?? 8080) })

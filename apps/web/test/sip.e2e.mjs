@@ -240,7 +240,19 @@ const bridge = new LiveKitConferenceBridge({
   outboundAuth: { username: MEET_SIP_USER, password: MEET_SIP_PASSWORD },
   ringingTimeoutSec: 20
 })
-const conference = { bridge: () => bridge, accessNumber: MEET_NUMBER, webhookKey: LIVEKIT_API_KEY, webhookSecret: LIVEKIT_API_SECRET }
+// The same, ringing 3 s only: swapped in for the step of a room's call nobody answers.
+const shortBridge = new LiveKitConferenceBridge({
+  url: LIVEKIT_URL,
+  apiKey: LIVEKIT_API_KEY,
+  apiSecret: LIVEKIT_API_SECRET,
+  dialInNumbers: [{ country: 'FR', e164: MEET_NUMBER }],
+  inboundAddresses: [SIP_MEET.split(':')[0]],
+  outboundAddress: SIP_MEET,
+  outboundAuth: { username: MEET_SIP_USER, password: MEET_SIP_PASSWORD },
+  ringingTimeoutSec: 3
+})
+let activeBridge = bridge
+const conference = { bridge: () => activeBridge, accessNumber: MEET_NUMBER, webhookKey: LIVEKIT_API_KEY, webhookSecret: LIVEKIT_API_SECRET }
 // A call with the public network whose person has no window left is ended after 3 s here (30 s by default).
 const gateway = await buildApp(registry, { auth, store, contacts, directorySync, push, secretsKey: key, admin: { adminRole: 'twakephone-admin', adminUsers: new Set() }, conference })
 registry.startAll()
@@ -2317,9 +2329,9 @@ try {
     const nowhere = await operator.call('+33199000250')
     expectEqual((await nowhere.final).status, 404, 'call to a number of no range')
   })
-  // Step 8 (ADR 0018): the phone access to a room, through LiveKit SIP behind OpenSIPS (its only trunk). A room of this
-  // run (no Meet here: any LiveKit room name), its PIN drawn by the Gateway.
-  const ROOM = `e2e-${randomBytes(4).toString('hex')}`
+  // Step 8 (ADR 0018): the phone access to a room, through LiveKit SIP behind OpenSIPS (its only trunk). No Meet here:
+  // the Gateway names the room (twake-...), its PIN drawn by the Gateway.
+  let ROOM
   let pin
   let roomCaller
   /** The room's participants, as its owner reads them (GET /v1/conferences/:id): none while LiveKit has no such room. */
@@ -2343,15 +2355,19 @@ try {
   }
   /** The next call OpenSIPS sends either server of the operator that `test` takes (the first may still be marked down). */
   const invitedAtOperator = test => Promise.any([operator, operator2].map(at => at.invited(test, 30_000).then(call => ({ call, at }))))
-  await step('step 8: Alice opens a room (POST /v1/conferences): the access number and its PIN; Jean dials 8000 from his browser: LiveKit SIP answers through OpenSIPS and asks for the PIN, which he types on the keypad, then #: he is in the room, a phone, his extension its number', async () => {
+  await step('step 8: Alice opens a room (POST /v1/conferences), named by the Gateway (without Meet, nobody claims a room of LiveKit by its name): the access number and its PIN of 10 digits; Jean dials 8000 from his browser: LiveKit SIP answers through OpenSIPS and asks for the PIN, which he types on the keypad, then #: he is in the room, a phone, his extension its number', async () => {
     const api = await asPerson(alice)
     const caps = (await api('GET', '/capabilities')).json()
     expectEqual(caps.conference, { dialIn: true, dialOut: true }, 'conference capabilities')
-    const res = await api('POST', '/conferences', { meetingId: ROOM })
+    const claimed = await api('POST', '/conferences', { meetingId: `e2e-${randomBytes(4).toString('hex')}` })
+    expectEqual(claimed.statusCode, 404, `POST /conferences with a room name of LiveKit ${claimed.body}`)
+    const res = await api('POST', '/conferences', {})
     expectEqual(res.statusCode, 201, `POST /conferences ${res.body}`)
-    const { dialIn } = res.json()
+    const { meetingId, dialIn } = res.json()
+    if (!/^twake-[0-9a-f]{16}$/.test(meetingId ?? '')) throw new Error(`name of the room: ${meetingId}`)
+    ROOM = meetingId
     expectEqual(dialIn.numbers.map(n => n.e164), [MEET_NUMBER], 'the access number shown')
-    if (!/^\d{6}$/.test(dialIn.pin ?? '')) throw new Error(`PIN of the room: ${dialIn.pin}`)
+    if (!/^\d{10}$/.test(dialIn.pin ?? '')) throw new Error(`PIN of the room: ${dialIn.pin}`)
     pin = dialIn.pin
     await dial(jean.page, MEET_NUMBER)
     await connected(jean.page, 'Jean\'s call to 8000 answered')
@@ -2360,16 +2376,21 @@ try {
     const [jeanIn] = await roomHas(1, 'Jean in the room')
     expectEqual(`${jeanIn.kind} ${jeanIn.number}`, 'phone 102', 'Jean in the room')
   })
-  await step('step 8: Bob dials 8000 and types a wrong PIN: LiveKit SIP hangs up; the room still has Jean only', async () => {
+  await step('step 8: Bob dials 8000 and types a wrong PIN: LiveKit SIP hangs up on him (a BYE, once the PIN is typed); the room still has Jean only', async () => {
     const before = await lastEnded(bob.page)
     await dial(bob.page, MEET_NUMBER)
     await connected(bob.page, 'Bob\'s call to 8000 answered')
     await sleep(PROMPT_MS)
-    await typeOnKeypad(bob.page, `${pin === '000000' ? '111111' : '000000'}#`, { shown: false })
-    await until('LiveKit SIP to hang up on Bob', async () => {
-      const ended = await lastEnded(bob.page)
-      return ended && ended.id !== before?.id ? ended : null
+    const wrong = pin === '0000000000' ? '1111111111' : '0000000000'
+    await typeOnKeypad(bob.page, `${wrong}#`, { shown: false })
+    const typedAt = Date.now()
+    const ended = await until('LiveKit SIP to hang up on Bob', async () => {
+      const last = await lastEnded(bob.page)
+      return last && last.id !== before?.id ? last : null
     }, { timeout: 30_000 })
+    // Hung up by the far end (a BYE: no status), not refused nor cut, after the PIN and before any ping could end it.
+    expectEqual(`${ended.endReason} ${ended.endStatus ?? '-'}`, 'hangup -', 'how Bob\'s call to 8000 ended')
+    if (Date.now() - typedAt > 25_000) throw new Error('Bob\'s call to 8000 ended long after the wrong PIN')
     expectEqual((await inRoom()).length, 1, 'people in the room')
   })
   await step('step 8: Alice has the room call Bob (POST /v1/conferences/:id/participants): his browser rings from her extension (the room calls at the name of who asked), he answers, and only then does the Gateway answer (201); Jean and Bob hear each other through the room', async () => {
@@ -2378,6 +2399,8 @@ try {
     const ringing = bob.page.getByTestId('incoming-call')
     await ringing.waitFor({ timeout: 20_000 })
     expectEqual((await calls(bob.page))[0]?.remoteNumber, '101', 'who calls Bob')
+    // Placed at Alice's name, not by her browser: her app shows no call of hers (review n°15).
+    expectEqual((await calls(alice.page)).length, 0, 'calls on Alice\'s page while the room calls at her name')
     await ringing.getByRole('button', { name: 'Répondre' }).click()
     const res = await placing
     expectEqual(`${res.statusCode} ${res.json().kind} ${res.json().number}`, '201 phone 103', `POST /conferences/:id/participants ${res.body}`)
@@ -2427,6 +2450,29 @@ try {
     }
     expectEqual(operator.state.attempts.length + operator2.state.attempts.length, attempts, 'calls the operator was sent')
     expectEqual((await inRoom()).length, 3, 'people in the room')
+  })
+  await step('step 8: Alice has the room call 01 99 00 00 25, which rings and is never answered: LiveKit SIP gives up after its ringing time (CANCEL to the operator) and the Gateway says so (409 DIAL_FAILED with the SIP status), nothing of LiveKit\'s own error', async () => {
+    const api = await asPerson(alice)
+    const servers = [operator, operator2]
+    for (const at of servers) at.state.next.push({ ringOnly: true })
+    activeBridge = shortBridge
+    try {
+      const placing = api('POST', `/conferences/${ROOM}/participants`, { number: '0199000025' })
+      const { call } = await invitedAtOperator(invite => invite.uri === 'sip:+33199000025@operator.example')
+      const res = await placing
+      expectEqual(`${res.statusCode} ${res.json().code}`, '409 DIAL_FAILED', `the room's call nobody answers: ${res.body}`)
+      if (![408, 480, 487].includes(res.json().sipStatus)) throw new Error(`SIP status of the room's call nobody answers: ${res.body}`)
+      if (/livekit|twirp|psrpc/i.test(res.body)) throw new Error(`the Gateway passes LiveKit's error on: ${res.body}`)
+      await until('the CANCEL at the operator', () => (call.state === 'cancelled' ? true : null))
+      expectEqual((await inRoom()).length, 3, 'people in the room')
+    } finally {
+      activeBridge = bridge
+      // The server that was not sent the call keeps no such behaviour for the next steps.
+      for (const at of servers) {
+        const i = at.state.next.findIndex(n => n.ringOnly)
+        if (i >= 0) at.state.next.splice(i, 1)
+      }
+    }
   })
   await step('step 8: everyone leaves the room (the operator, Jean and Bob hang up); Alice closes it (DELETE /v1/conferences/:id) and removes the direct number aimed at 8000', async () => {
     const api = await asPerson(alice)

@@ -100,11 +100,11 @@ describe('SubscriberProvisioner', () => {
     expect(db.queries).toContain('ROLLBACK')
     expect(db.released()).toBe(1)
     expect(warnings).toEqual([
-      expect.stringMatching(/could not add subscriber\.holder, acc\.caller, acc\.callee, acc\.dialled, acc\.external, missed_calls\.caller, .*, call_rules\.forward_noanswer_holder, push_targets\.alive_until \(must be owner of table acc\)/),
-      expect.stringMatching(/acc\.external is missing: OpenSIPS cannot write the CDRs nor the missed calls, and the caps count nothing/)
+      expect.stringMatching(/could not add subscriber\.holder, acc\.caller, acc\.callee, acc\.dialled, acc\.external, missed_calls\.caller, .*, acc\.via, missed_calls\.via, .*, call_rules\.forward_noanswer_holder, push_targets\.alive_until \(must be owner of table acc\)/),
+      expect.stringMatching(/acc\.external or acc\.via is missing: OpenSIPS cannot write the CDRs nor the missed calls, and the caps count nothing/)
     ])
     // Said in the provider's status (DEGRADED).
-    expect(p.schemaProblem).toMatch(/^acc\.external is missing/)
+    expect(p.schemaProblem).toMatch(/^acc\.external or acc\.via is missing/)
     // Without the holder column: the accounts are written without it, and none is removed.
     db.queries.length = 0
     await p.setSipSecret('101', 'x', 'alice')

@@ -162,6 +162,11 @@ services:
       MEET_NUMBER: ${MEET_NUMBER:-8000}
       MEET_SIP_USER: ${MEET_SIP_USER:-livekit}
       MEET_SIP_PASSWORD: ${MEET_SIP_PASSWORD:-twake-meet-dev-only}
+      # The calls to the access number (each one try of a PIN) per caller and for all in 10 minutes, and the longest a
+      # room's call to the public network lasts.
+      MEET_PIN_TRIES: ${MEET_PIN_TRIES:-10}
+      MEET_PIN_TRIES_ALL: ${MEET_PIN_TRIES_ALL:-300}
+      MEET_MAX_CALL_SEC: ${MEET_MAX_CALL_SEC:-7200}
     network_mode: host
     healthcheck:
       test: ["CMD-SHELL", "test -p /tmp/opensips_fifo"]

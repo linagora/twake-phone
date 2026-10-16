@@ -120,6 +120,11 @@ services:
       MEET_NUMBER:
       MEET_SIP_USER:
       MEET_SIP_PASSWORD:
+      # The calls to MEET_NUMBER (each one try of a PIN) per caller and for all callers in 10 minutes (10 and 300 by
+      # default), and the longest a room's call to the public network lasts (7200 s by default).
+      MEET_PIN_TRIES:
+      MEET_PIN_TRIES_ALL:
+      MEET_MAX_CALL_SEC:
     healthcheck:
       # One MI request over UDP (mi_datagram, loopback): healthy once OpenSIPS answers, not once its fifo exists.
       test: ["CMD", "bash", "-c", "exec 3<>/dev/udp/127.0.0.1/8880 && printf '{\"jsonrpc\":\"2.0\",\"method\":\"version\",\"id\":\"health\"}' >&3 && read -r -t 2 -n 1 _ <&3"]
@@ -214,6 +219,7 @@ services:
       MEET_OUTBOUND_ADDRESS:
       MEET_SIP_USER:
       MEET_SIP_PASSWORD:
+      MEET_MAX_CALL_SEC:
       MEET_URL:
       MEET_CLIENT_ID:
       MEET_CLIENT_SECRET:

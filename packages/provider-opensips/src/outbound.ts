@@ -572,9 +572,9 @@ RESET check_function_bodies;
 `
 
 /**
- * The column `acc` and `missed_calls` gain for the caps (`external`: 'out' for a call to the public network, 'emergency'
+ * The columns `acc` and `missed_calls` gain for the caps (`external`: 'out' for a call to the public network, 'emergency'
  * for an emergency call, which counts for nothing; acc writes its extras in both), on a database created before step
- * 6b, and the triggers that count what was used as each CDR is written (twake_outbound_cdr()): only where they lack,
+ * 6b, and for the calls of Meet's rooms (`via`: 'meet', step 8), on one created before step 8, and the triggers that count what was used as each CDR is written (twake_outbound_cdr()): only where they lack,
  * so that no lock is taken on `acc` otherwise, and never waiting more than 5 s for one (OpenSIPS writes its CDRs in
  * its SIP processes: a lock held long would hold the calls). Run by docker/opensips/trunk.sql before OpenSIPS starts,
  * and by the provider at its start. No index on `acc`: nothing reads it during a call.
@@ -588,6 +588,12 @@ BEGIN
   END IF;
   IF to_regclass('missed_calls') IS NOT NULL AND NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'missed_calls' AND column_name = 'external') THEN
     ALTER TABLE missed_calls ADD COLUMN external VARCHAR(64) DEFAULT '' NOT NULL;
+  END IF;
+  IF to_regclass('acc') IS NOT NULL AND NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'acc' AND column_name = 'via') THEN
+    ALTER TABLE acc ADD COLUMN via VARCHAR(16) DEFAULT '' NOT NULL;
+  END IF;
+  IF to_regclass('missed_calls') IS NOT NULL AND NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'missed_calls' AND column_name = 'via') THEN
+    ALTER TABLE missed_calls ADD COLUMN via VARCHAR(16) DEFAULT '' NOT NULL;
   END IF;
   IF to_regclass('acc') IS NOT NULL AND NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'twake_outbound_acc' AND tgrelid = to_regclass('acc')) THEN
     CREATE TRIGGER twake_outbound_acc AFTER INSERT ON acc FOR EACH ROW WHEN (NEW.external = 'out') EXECUTE FUNCTION twake_outbound_cdr();

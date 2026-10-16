@@ -23,6 +23,8 @@
 //   SIP_MEET             its socket for LiveKit SIP (step 8, default 127.0.0.1:5090), which these steps play from the
 //                        loopback (LiveKit SIP's address, MEET_SIP), and from 127.0.0.2 for an address that is not
 //   MEET_SIP_USER, MEET_SIP_PASSWORD, MEET_NUMBER   its MEET_* (default livekit, the stack's development password, 8000)
+//   MEET_MAX_CALL_SEC, MEET_PIN_TRIES, MEET_PIN_TRIES_ALL   its MEET_* (default 7200, 10, 300); the calls to the access
+//                        number of the steps go to LiveKit SIP at MEET_SIP, whatever it answers
 import { execSync } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
 import { createSocket } from 'node:dgram'
@@ -50,6 +52,9 @@ const MEET_SIP_USER = process.env.MEET_SIP_USER ?? 'livekit'
 // The development stack's (docker/docker-compose.sip.yml), as `twake:twake` is its database's: never a real one.
 const MEET_SIP_PASSWORD = process.env.MEET_SIP_PASSWORD ?? 'twake-meet-dev-only'
 const MEET_NUMBER = process.env.MEET_NUMBER ?? '8000'
+const MEET_MAX_CALL_SEC = Number(process.env.MEET_MAX_CALL_SEC ?? 7200)
+const MEET_PIN_TRIES = Number(process.env.MEET_PIN_TRIES ?? 10)
+const MEET_PIN_TRIES_ALL = Number(process.env.MEET_PIN_TRIES_ALL ?? 300)
 const TENANT = 'trunk-sip'
 const LOGIN = '0033199000300'
 const PASSWORD = 'not-a-real-password'
@@ -142,6 +147,9 @@ const room = async (from, { password = MEET_SIP_PASSWORD, bind } = {}) => {
 }
 const db = new pg.Client({ connectionString: DB_URL })
 await db.connect()
+/** The Gateway's grant of one room's call (step 8, DialOutGrants), as the header LiveKit SIP carries it in. */
+const grants = prov.dialOutGrants({ tenantId: TENANT })
+const grantFor = async (extension, number) => `X-Twake-Grant: ${await grants.grant(extension, number)}`
 /** The call `phone` placed, as the operator `op` got it (same Call-ID). */
 const atOperator = (op, call) => op.until('the call at the operator', () => op.state.invites.find(c => c.callId === call.callId), 10_000)
 const busy = op => op.state.next.push({ reply: '486 Busy Here' })
@@ -977,7 +985,8 @@ try {
   })
 
   // Step 8 (ADR 0018): LiveKit SIP sees OpenSIPS only, and OpenSIPS takes from it only what comes from its address, with
-  // its credentials, at the name of one of our accounts; a room's call is that person's call.
+  // its credentials, at the name of one of our accounts, with the Gateway's grant of that very call; a room's call is
+  // that person's call.
   await step('step 8: the socket of LiveKit SIP hears its address only (403 from another), challenges its calls (407) and refuses other credentials', async () => {
     const before = p302.calls.size
     const stranger = await room('301', { bind: '127.0.0.2' })
@@ -989,9 +998,36 @@ try {
     expect('calls 302 got', p302.calls.size === before, `${p302.calls.size - before}`)
   })
 
+  await step('review 8a, n°1: a room\'s call without the Gateway\'s grant of it is refused (403, not-granted), nothing rung nor sent: none, not one, for another number, for another person, used once already, past its time', async () => {
+    p302.st.asleep = true
+    const w302 = await phone('302', { ws: true })
+    const before = w302.calls.size
+    const sent = sentToOperators()
+    const lk = await room('301')
+    const notGranted = (what, call) => expect(what, call.final.status === 403 && header(call.final, 'twake-call-refused') === 'not-granted', `${call.final.first} ${header(call.final, 'twake-call-refused')}`)
+    notGranted('no grant', await lk.dial('302'))
+    notGranted('no grant, to the public network', await lk.dial('0199000024'))
+    notGranted('a grant that is none', await lk.dial('302', { extra: ["X-Twake-Grant: ' OR '1'='1"] }))
+    notGranted('a grant for 303', await lk.dial('302', { extra: [await grantFor('301', '303')] }))
+    notGranted('a grant of 302', await lk.dial('302', { extra: [await grantFor('302', '302')] }))
+    const once = await grantFor('301', '302')
+    const first = await lk.dial('302', { extra: [once] })
+    expect('the call granted', first.final.status === 200, first.final.first)
+    await lk.hangup(first)
+    notGranted('the same grant again', await lk.dial('302', { extra: [once] }))
+    const token = randomBytes(16).toString('hex')
+    await db.query("INSERT INTO dial_out_grants (token, tenant_id, extension, number, expires_at) VALUES ($1, $2, '301', '302', now() - interval '1 second')", [token, TENANT])
+    notGranted('a grant past its time', await lk.dial('302', { extra: [`X-Twake-Grant: ${token}`] }))
+    expect('calls 302 got', w302.calls.size === before + 1, `${w302.calls.size - before}`)
+    expect('calls the operators were sent', sentToOperators() === sent, `${sentToOperators() - sent}`)
+    const rung = [...w302.calls.values()].find(c => c.callId === first.callId)
+    expect('the grant never passed on', !rung?.invite.headers.has('x-twake-grant'), JSON.stringify([...(rung?.invite.headers.keys() ?? [])]))
+    await w302.close()
+  })
+
   await step('step 8: a room calls at the name of one of our accounts (another From: 403), never an emergency number (403, nothing sent) nor its own access number (482)', async () => {
     const nobody = await room('9999')
-    expect('a From that is no account of ours', (await nobody.dial('302')).final.status === 403)
+    expect('a From that is no account of ours, though granted', (await nobody.dial('302', { extra: [await grantFor('9999', '302')] })).final.status === 403)
     const sent = sentToOperators()
     const lk = await room('301')
     const sos = await lk.dial('112')
@@ -1001,25 +1037,52 @@ try {
     expect('the access number from a room', loop.final.status === 482, loop.final.first)
   })
 
-  await step('step 8: a room\'s call to an extension rings it at the name of whoever asked, through rtpengine (plain RTP to LiveKit SIP); the BYE of either side ends it', async () => {
+  await step('step 8: a room\'s call to an extension rings it at the name of whoever asked, shown as a room\'s (review 8a, n°12), through rtpengine (plain RTP to LiveKit SIP); the BYE of either side ends it', async () => {
     // A window of 302 of its own, the only one that answers (the first one's WebSocket was closed by an earlier step).
     p302.st.asleep = true
     const w302 = await phone('302', { ws: true })
     const lk = await room('301')
-    const call = await lk.dial('302')
+    const call = await lk.dial('302', { extra: [await grantFor('301', '302')] })
     expect('answered', call.final.status === 200, call.final.first)
     const rung = await w302.incoming(i => header(i, 'call-id') === call.callId)
-    expect('the From 302 sees', /<sip:301@/.test(header(rung.invite, 'from')), header(rung.invite, 'from'))
+    expect('the From 302 sees', /^"?Meet"? <sip:301@/.test(header(rung.invite, 'from')), header(rung.invite, 'from'))
     expect('the offer 302 got, from rtpengine', /a=ice-ufrag/.test(rung.invite.body) && !rung.invite.body.includes(`m=audio ${call.rtpPort} `), rung.invite.body)
     expect('the answer LiveKit SIP got: plain RTP, no ICE nor DTLS', / RTP\/AVP /.test(call.final.body) && !/a=ice|a=fingerprint/.test(call.final.body) && !call.final.body.includes(`m=audio ${rung.rtpPort} `), call.final.body)
     const bye = await lk.hangup(call)
     expect('the room\'s BYE', bye.status === 200, bye.first)
     await w302.callState(rung, 'ended', 5_000)
-    const again = await lk.dial('302')
+    const again = await lk.dial('302', { extra: [await grantFor('301', '302')] })
     const rungAgain = await w302.incoming(i => header(i, 'call-id') === again.callId)
     const byPhone = await w302.hangup(rungAgain)
     expect('the BYE of 302', byPhone.status === 200, byPhone.first)
     await lk.callState(again, 'ended', 5_000)
+    await w302.close()
+  })
+
+  await step('review 8a, n°16: in a room\'s call, a REFER from either side is refused (403), an INVITE that would replace it too (403, transfer-external), and a request of the call on another socket than its side\'s (403); the call goes on', async () => {
+    p302.st.asleep = true
+    const w302 = await phone('302', { ws: true })
+    const lk = await room('301')
+    const call = await lk.dial('302', { extra: [await grantFor('301', '302')] })
+    expect('answered', call.final.status === 200, call.final.first)
+    const rung = await w302.incoming(i => header(i, 'call-id') === call.callId)
+    const referTo = [`Refer-To: <sip:303@${SIP_DOMAIN}>`]
+    const fromRoom = await lk.request(call, 'REFER', { extra: referTo })
+    expect('a REFER from the room', fromRoom.status === 403, fromRoom.first)
+    const fromPhone = await w302.request(rung, 'REFER', { extra: referTo })
+    expect('a REFER from 302', fromPhone.status === 403, fromPhone.first)
+    const tags = { from: /;tag=([^;>\s]+)/.exec(call.local)?.[1], to: /;tag=([^;>\s]+)/.exec(header(call.final, 'to'))?.[1] }
+    const replacing = await p303.dial('302', { extra: [`Replaces: ${call.callId};to-tag=${tags.to};from-tag=${tags.from}`] })
+    expect('an INVITE that replaces the room\'s call', replacing.final.status === 403 && header(replacing.final, 'twake-call-refused') === 'transfer-external', `${replacing.final.first} ${header(replacing.final, 'twake-call-refused')}`)
+    // The room's side of the call, from the phones' socket (its address is the loopback too).
+    const elsewhere = await sipPhone({ proxy: SIP_UDP, domain: SIP_DOMAIN, user: MEET_SIP_USER, password: MEET_SIP_PASSWORD, from: '301' })
+    phones.push(elsewhere)
+    const wrongSocket = await elsewhere.request({ ...call, cseq: call.cseq + 10 }, 'BYE')
+    expect('the room\'s BYE on the phones\' socket', wrongSocket.status === 403, wrongSocket.first)
+    expect('the call still up', rung.state === 'answered' && call.state === 'answered', `${rung.state} ${call.state}`)
+    const bye = await lk.hangup(call)
+    expect('the room\'s BYE on its own socket', bye.status === 200, bye.first)
+    await w302.callState(rung, 'ended', 5_000)
     await w302.close()
   })
 
@@ -1028,7 +1091,7 @@ try {
     const w302 = await phone('302', { ws: true })
     const lk = await room('301')
     const body = ['v=0', 'o=- 15012345678901234567 15012345678901234567 IN IP4 127.0.0.1', 's=LiveKit', 'c=IN IP4 127.0.0.1', 't=0 0', 'm=audio 31000 RTP/AVP 9 0 8 101', 'a=rtpmap:9 G722/8000', 'a=rtpmap:0 PCMU/8000', 'a=rtpmap:8 PCMA/8000', 'a=rtpmap:101 telephone-event/8000', 'a=fmtp:101 0-16', 'a=ptime:20', 'a=sendrecv', ''].join('\r\n')
-    const call = await lk.dial('302', { body, type: 'application/sdp' })
+    const call = await lk.dial('302', { body, type: 'application/sdp', extra: [await grantFor('301', '302')] })
     expect('answered', call.final.status === 200, call.final.first)
     const rung = await w302.incoming(i => header(i, 'call-id') === call.callId)
     const origin = /^o=\S+ (\d+) (\d+) /m.exec(rung.invite.body)
@@ -1040,22 +1103,58 @@ try {
     await w302.close()
   })
 
-  await step('step 8: a room\'s call to the public network is that of whoever asked: their rights (refused, nothing sent), premium numbers never, their direct number presented, a call of theirs to the public network', async () => {
+  await step(`step 8: a room's call to the public network is that of whoever asked: their rights (refused, nothing sent), premium numbers never, their direct number presented, a call of theirs to the public network, its CDR saying a room placed it (review 8a, n°12), and it lasts MEET_MAX_CALL_SEC (${MEET_MAX_CALL_SEC} s) at most (review 8a, n°5)`, async () => {
     await setOutbound({}, PROFILES, [{ userId: 'u-301', profileId: 'france' }])
     const lk = await room('301')
     const sent = sentToOperators()
-    refused('+442079460123 with "France"', await lk.dial('+442079460123'), 'rights')
+    refused('+442079460123 with "France"', await lk.dial('+442079460123', { extra: [await grantFor('301', '+442079460123')] }), 'rights')
     refused('0899000000', await lk.dial('0899000000'), 'premium')
     expect('calls the operators were sent', sentToOperators() === sent, `${sentToOperators() - sent}`)
-    const call = await lk.dial('0199000024')
+    const call = await lk.dial('0199000024', { extra: [await grantFor('301', '0199000024')] })
     expect('answered', call.final.status === 200, call.final.first)
     const at = (await atOperator(A, call)).invite
     expect('the From at the operator: the direct number of 301', header(at, 'from').includes('<sip:+33199000301@operator.example>'), header(at, 'from'))
     expect('the offer at the operator: plain RTP, its codecs', / RTP\/AVP /.test(at.body) && !/a=ice|a=fingerprint|opus|G722/i.test(at.body), at.body)
     expect('counted among the calls of 301', Number((await mi('profile_get_size', { profile: 'trunk_caller', value: '301' })).result?.Profile?.count ?? 0) === 1)
+    const [left] = await dialogLeft([call.callId])
+    expect('the time it may last', left <= MEET_MAX_CALL_SEC && left > MEET_MAX_CALL_SEC - 30, `${left} s`)
     await lk.hangup(call)
     expect('its CDR', (await cdrOf(call.callId)).external === 'out')
+    const { rows } = await db.query('SELECT caller, via FROM acc WHERE callid = $1', [call.callId])
+    expect('its CDR names the room', rows[0]?.caller === '301' && rows[0]?.via === 'meet', JSON.stringify(rows))
     await setOutbound({}, PROFILES, [])
+  })
+
+  await step(`review 8a, n°2: the calls to the access number, each one try of a room's PIN, are bounded: ${MEET_PIN_TRIES} per caller in 10 minutes, then refused (403, pin-tries) before LiveKit SIP; ${MEET_PIN_TRIES_ALL} for all callers together`, async () => {
+    const tried = async (p, n) => {
+      for (let i = 0; i < n; i++) {
+        const call = await p.dial(MEET_NUMBER)
+        expect(`call ${i + 1} of ${p.user}, to LiveKit SIP`, call.final.status !== 403 || header(call.final, 'twake-call-refused') !== 'pin-tries', call.final.first)
+        if (call.final.status === 200) await p.hangup(call)
+      }
+    }
+    const tooMany = (what, call) => expect(what, call.final.status === 403 && header(call.final, 'twake-call-refused') === 'pin-tries', `${call.final.first} ${header(call.final, 'twake-call-refused')}`)
+    await mi('cache_remove_chunk', { glob: 'pin:*' })
+    try {
+      await tried(p301, MEET_PIN_TRIES)
+      tooMany(`call ${MEET_PIN_TRIES + 1} of 301`, await p301.dial(MEET_NUMBER))
+      // All callers together: what is left of MEET_PIN_TRIES_ALL, from the others, then refused whoever calls.
+      if (MEET_PIN_TRIES_ALL <= MEET_PIN_TRIES * 3) {
+        let left = MEET_PIN_TRIES_ALL - MEET_PIN_TRIES
+        for (const p of [p303, p115]) {
+          const n = Math.min(left, MEET_PIN_TRIES)
+          await tried(p, n)
+          left -= n
+        }
+        // 302, which has not called it yet.
+        p302.st.asleep = true
+        const w302 = await phone('302', { ws: true })
+        tooMany('a call of 302 once the others made all theirs', await w302.dial(MEET_NUMBER))
+        await w302.close()
+      } else console.log(`     (MEET_PIN_TRIES_ALL ${MEET_PIN_TRIES_ALL}: more than three callers can make, not played)`)
+    } finally {
+      await mi('cache_remove_chunk', { glob: 'pin:*' })
+    }
   })
 
   await step(`review 6b, n°5, second review n°4, n°10: OpenSIPS killed and started again (OPENSIPS_RESTART) with calls to the public network in progress: they are still counted, a BYE ends them on both sides with their CDR, and the minutes allotted still end the one they bound; the minutes reserved for a call that was ringing (lost) are released, an emergency call restored ends within ${EMERGENCY_RESTORED_SEC} s`, async () => {
@@ -1117,6 +1216,7 @@ try {
     .catch(err => console.log(`outbound rules not removed: ${err.message}`))
   await db.query("DELETE FROM call_groups WHERE number IN ('3900', '3901', '3902')").catch(() => undefined)
   await db.query("DELETE FROM call_rules WHERE extension = '303'").catch(() => undefined)
+  await db.query('DELETE FROM dial_out_grants WHERE tenant_id = $1', [TENANT]).catch(() => undefined)
   await db.query('DELETE FROM outbound_usage').catch(() => undefined)
   await tables.set([], []).catch(err => console.log(`trunks not removed: ${err.message}`))
   await reload().catch(() => undefined)

@@ -51,9 +51,9 @@ socket=wss:${LISTEN_IP}:${WSS_PORT} as ${SIP_DOMAIN}:${WSS_PORT}
 # The trunk's own socket (step 6, ADR 0016; ARCHITECTURE §13): never 5060 by default (some NATs drop what leaves from
 # it), and no other address declared unless TRUNK_ADVERTISE says so: the operator answers where the packets come from.
 socket=udp:${TRUNK_LISTEN_IP}:${TRUNK_PORT}${TRUNK_SOCKET_AS}
-# The socket of LiveKit SIP (step 8, ADR 0018): it hears LiveKit SIP's address only (MEET_SIP), and nothing at all when
-# Meet is off (MEET_ON 0). On the loopback by default, like the others.
-socket=udp:${MEET_LISTEN_IP}:${MEET_PORT}
+# The socket of LiveKit SIP (step 8, ADR 0018): it hears LiveKit SIP's address only (MEET_SIP). None at all when Meet is
+# off (MEET_ON 0, entrypoint.sh). On the loopback by default, like the others.
+${MEET_SOCKET}
 
 mpath="${OPENSIPS_MPATH}"
 
@@ -192,8 +192,10 @@ loadmodule "cfgutils.so"
 modparam("cfgutils", "shvset", "no4c_until=i:0")
 # The table of step 5 (`push_targets`) likewise: when the database says it is missing, nobody is woken for 30 s.
 modparam("cfgutils", "shvset", "no5_until=i:0")
-# Whether the phone access of Meet's rooms is on (step 8, ADR 0018): MEET_SIP set (entrypoint.sh).
+# Whether the phone access of Meet's rooms is on (step 8, ADR 0018): MEET_SIP set (entrypoint.sh); and its access
+# number. The Gateway reads both through the MI (shv_get) and says at its start when it has another view of them.
 modparam("cfgutils", "shvset", "meet_on=i:${MEET_ON}")
+modparam("cfgutils", "shvset", "meet_number=s:${MEET_NUMBER}")
 
 #### Calls to someone without a window (step 5, ADR 0015): when the extension a call reaches has no registered window
 #### and its holder has a browser to wake (`push_targets`, written by the Gateway for a person with a push
@@ -208,10 +210,11 @@ loadmodule "event_routing.so"
 #### callee (the extension the call reached) and dialled (what the caller dialled) as extra fields: the default ones
 #### only carry tags and the Call-ID. In the database, `external` too (step 6b): "out" for a call to the public
 #### network, which the caps count (a trigger keeps `outbound_usage` as each CDR is written), "emergency" for an
-#### emergency call, which they never do.
+#### emergency call, which they never do; and `via` (step 8): "meet" for a call a room of Meet placed at the name of
+#### `caller`, not their phone.
 loadmodule "acc.so"
 modparam("acc", "db_url", "${OPENSIPS_DB_URL}")
-modparam("acc", "extra_fields", "db: caller; callee; dialled; external")
+modparam("acc", "extra_fields", "db: caller; callee; dialled; external; via")
 modparam("acc", "extra_fields", "evi: caller; callee; dialled")
 
 #### Trunks (step 6, ADR 0016): the Gateway writes the operator's servers (`dispatcher`), the registrations
@@ -662,6 +665,11 @@ route {
 			send_reply(482, "Loop Detected");
 			exit;
 		}
+		# The Gateway's grant of this very call (route[meet_source]), read here and never passed on.
+		$avp(meet_grant) = "";
+		if (is_present_hf("X-Twake-Grant"))
+			$avp(meet_grant) = $hdr(X-Twake-Grant);
+		remove_hf("X-Twake-Grant");
 	} else {
 		if (!proxy_authorize("", "subscriber")) {
 			proxy_challenge("", "auth");
@@ -735,8 +743,10 @@ route {
 	# phone asked whether it is still there (P), the call ended past its longest duration (B). One of our own direct
 	# numbers dialled stays an internal call, without either.
 	create_dialog();
-	if ($var(meet) == 1)
+	if ($var(meet) == 1) {
 		$dlg_val(meet) = "caller";
+		$acc_extra(via) = "meet";
+	}
 
 	# Who calls whom, as dialled (the Request-URI changes with the lookup): for the CDR and the events. `callee` is
 	# where the call goes now (the callee's rules may move it), `dialled` stays what the caller dialled.
@@ -820,15 +830,28 @@ route {
 # - a call to the access number (MEET_NUMBER), from one of our phones or from the operator on a direct number that
 #   aims at it, goes to LiveKit SIP, which asks for the room's PIN (route[meet_call]);
 # - a call a room places (the Gateway's dial-out) answers our challenge with LiveKit SIP's account, names in its From
-#   the person who asked for it, one of our accounts, and is that person's call: an extension or a group as from their
-#   phone, a number of the public network with their rights, caps, volume thresholds and direct number
-#   (route[trunk_out]); never an emergency number nor the access number.
+#   the person who asked for it, one of our accounts, and carries the Gateway's grant of that very call (X-Twake-Grant,
+#   a row of `dial_out_grants` the Gateway wrote just before: that person, that number, single use, a few seconds to
+#   live): LiveKit SIP's account alone, which anyone with an API key of the LiveKit server can read back, makes no call
+#   anyone's. It is then that person's call: an extension or a group as from their phone, a number of the public
+#   network with their rights, caps, volume thresholds and direct number (route[trunk_out]), never longer than
+#   MEET_MAX_CALL_SEC; never an emergency number nor the access number. The callee's phone shows "Meet (<name>)".
+# - a call to the access number is a try of a room's PIN (one per call, LiveKit SIP): MEET_PIN_TRIES per caller in 10
+#   minutes, MEET_PIN_TRIES_ALL for all of them together, refused past that (403, pin-tries).
 # The media through rtpengine, plain RTP on LiveKit SIP's side (route[rtp_flags]).
 
-# A room's call: whoever its From names must be one of our accounts, read without holding this process.
+# A room's call: its grant taken (deleted, so used once), for whoever its From names, one of our accounts, and the
+# number it calls as the Gateway gave it to LiveKit (the Request-URI), read without holding this process. Only the
+# characters of a grant (32 hexadecimal) and of a number get into the query.
 route[meet_source] {
 	$avp(meet_pstn) = $var(pstn);
-	$var(meet_query) = "SELECT 1 FROM subscriber WHERE username = '" + $fU + "'";
+	if (!($avp(meet_grant) =~ "^[0-9a-f]{32}$") || !($rU =~ "^[+]?[0-9*#]{2,20}$")) {
+		xlog("L_NOTICE", "meet: call $ci from $avp(caller) to $rU refused, without a grant\n");
+		append_to_reply("Twake-Call-Refused: not-granted\r\n");
+		t_reply(403, "Not Granted");
+		exit;
+	}
+	$var(meet_query) = "DELETE FROM dial_out_grants g WHERE g.token = '" + $avp(meet_grant) + "' AND g.extension = '" + $fU + "' AND g.number = '" + $rU + "' AND g.expires_at > now() AND EXISTS (SELECT 1 FROM subscriber s WHERE s.username = g.extension) RETURNING 1";
 	async(sql_query_one("$var(meet_query)", "$avp(meet_known)"), meet_source_loaded);
 }
 
@@ -839,12 +862,13 @@ route[meet_source_loaded] {
 		exit;
 	}
 	if ($var(meet_rc) == -2) {
-		xlog("L_NOTICE", "meet: call $ci from $avp(caller), none of our accounts, refused\n");
-		t_reply(403, "Forbidden");
+		xlog("L_NOTICE", "meet: call $ci from $avp(caller) to $rU refused: no grant of the Gateway for it (used, past its time, another person or number), or none of our accounts\n");
+		append_to_reply("Twake-Call-Refused: not-granted\r\n");
+		t_reply(403, "Not Granted");
 		exit;
 	}
 	if ($var(meet_rc) < 0) {
-		xlog("L_WARN", "meet: call $ci from $avp(caller), its account not read ($var(meet_rc))\n");
+		xlog("L_WARN", "meet: call $ci from $avp(caller), its grant not read ($var(meet_rc))\n");
 		t_reply(503, "Service Unavailable");
 		exit;
 	}
@@ -863,6 +887,23 @@ route[meet_call] {
 	if ($dlg_val(meet) == "caller") {
 		xlog("L_NOTICE", "meet: call $ci, a room calling its own access, refused\n");
 		t_reply(482, "Loop Detected");
+		exit;
+	}
+	# A try of a PIN (one per call): counted per caller (the extension, the operator's caller, `anonymous` for all who
+	# hide their number) and for all, over 10 minutes from the first one; past MEET_PIN_TRIES or MEET_PIN_TRIES_ALL,
+	# refused before LiveKit SIP.
+	$var(pin_who) = "other";
+	if ($avp(caller) =~ "^[A-Za-z0-9._+-]{1,64}$")
+		$var(pin_who) = $avp(caller);
+	$var(pin_n) = 0;
+	$var(pin_all) = 0;
+	cache_add("local", "pin:c:$var(pin_who)", 1, 600, $var(pin_n));
+	if ($var(pin_n) <= ${MEET_PIN_TRIES})
+		cache_add("local", "pin:all", 1, 600, $var(pin_all));
+	if ($var(pin_n) > ${MEET_PIN_TRIES} || $var(pin_all) > ${MEET_PIN_TRIES_ALL}) {
+		xlog("L_WARN", "meet: call $ci from $avp(caller) to the access number refused: $var(pin_n) calls of it, $var(pin_all) of all, in 10 minutes\n");
+		append_to_reply("Twake-Call-Refused: pin-tries\r\n");
+		t_reply(403, "Too Many Tries");
 		exit;
 	}
 	$dlg_val(meet) = "callee";
@@ -1168,6 +1209,10 @@ route[trunk_out_send] {
 		$DLG_timeout = $avp(o_max_sec);
 	else
 		$DLG_timeout = ${TRUNK_MAX_CALL_SEC};
+	# A room's call (step 8): MEET_MAX_CALL_SEC at most. Its OPTIONS (P) reach LiveKit SIP, which answers any: a
+	# LiveKit SIP gone in the middle of the call is not noticed before that.
+	if ($dlg_val(meet) == "caller" && $DLG_timeout > ${MEET_MAX_CALL_SEC})
+		$DLG_timeout = ${MEET_MAX_CALL_SEC};
 	$(avp(t_rang)[*]) = NULL;
 	$dlg_val(trunk) = "callee";
 	$dlg_val(codecs) = $avp(t_codecs);
@@ -1897,9 +1942,18 @@ route[caller_name] {
 		uac_replace_from("", "$avp(caller_uri)");
 		return(1);
 	}
-	if ($avp(names_read) != 1)
-		return(-1);
 	if (!($hdr(From) =~ "<"))
+		return(-1);
+	# A room's call (step 8): the callee knows a room calls, at whose name ("Meet (Alice Martin)"; "Meet" alone when
+	# the names cannot be read), not the person's phone.
+	if ($dlg_val(meet) == "caller") {
+		$var(caller_name) = "Meet";
+		if ($avp(names_read) == 1 && $avp(n_caller) != NULL && $avp(n_caller) != "")
+			$var(caller_name) = "Meet (" + $avp(n_caller) + ")";
+		uac_replace_from("$var(caller_name)", "");
+		return(1);
+	}
+	if ($avp(names_read) != 1)
 		return(-1);
 	$var(caller_name) = "";
 	if ($avp(n_caller) != NULL)

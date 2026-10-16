@@ -55,13 +55,17 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
   it('gives LiveKit SIP a socket of its own that hears its address only, nothing when Meet is off, and only the HA1 of its account (step 8)', () => {
     const off = render()
     expect(off.status).toBe(0)
-    expect(off.cfg).toContain('socket=udp:127.0.0.1:5090\n')
+    // No socket at all when Meet is off: nothing hears on its port (review n°17).
+    expect(off.cfg).not.toMatch(/^socket=udp:[^\n]*:5090/m)
+    expect(off.cfg).toContain('# None: Meet is off (MEET_SIP empty).')
     expect(off.cfg).toContain('modparam("cfgutils", "shvset", "meet_on=i:0")')
     expect(off.cfg).toContain('$ru = "sip:8000@meet.invalid";')
     const password = 'not-a-real-secret-0'
     const on = render({ SIP_DOMAIN: 'sip.example.test', MEET_SIP: '192.0.2.20:5080', MEET_SIP_PASSWORD: password, MEET_NUMBER: '7000' })
     expect(on.status, on.stderr).toBe(0)
     expect(on.cfg).toContain('modparam("cfgutils", "shvset", "meet_on=i:1")')
+    expect(on.cfg).toMatch(/^socket=udp:127\.0\.0\.1:5090$/m)
+    expect(on.cfg).toContain('modparam("cfgutils", "shvset", "meet_number=s:7000")')
     expect(on.cfg).toContain('if ($shv(meet_on) != 1 || $si != "192.0.2.20") {')
     expect(on.cfg).toContain('$ru = "sip:7000@192.0.2.20:5080";')
     expect(on.cfg).toContain(`$var(meet_ha1) = "${createHash('md5').update(`livekit:sip.example.test:${password}`).digest('hex')}";`)
@@ -74,12 +78,52 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
       [{ MEET_PORT: '5060' }, /socket of its own/],
       [{ MEET_LISTEN_IP: '0.0.0.0' }, /MEET_LISTEN_IP/],
       [{ MEET_NUMBER: '0800' }, /MEET_NUMBER/],
-      [{ MEET_SIP_USER: "livekit'" }, /MEET_SIP_USER/]
+      [{ MEET_SIP_USER: "livekit'" }, /MEET_SIP_USER/],
+      [{ MEET_PIN_TRIES: '0' }, /MEET_PIN_TRIES/],
+      [{ MEET_PIN_TRIES: 'x' }, /MEET_PIN_TRIES/],
+      [{ MEET_PIN_TRIES: '20', MEET_PIN_TRIES_ALL: '10' }, /MEET_PIN_TRIES_ALL/],
+      [{ MEET_MAX_CALL_SEC: '30' }, /MEET_MAX_CALL_SEC/],
+      [{ MEET_MAX_CALL_SEC: '100000' }, /MEET_MAX_CALL_SEC/]
     ] as [Record<string, string>, RegExp][]) {
       const { status, stderr } = render(env)
       expect(status, JSON.stringify(env)).toBe(1)
       expect(stderr).toMatch(message)
     }
+  })
+
+  it('takes a room call only with the Gateway grant of that very call: used once, for its person and number (step 8, review n°1)', () => {
+    const { cfg } = render({ SIP_DOMAIN: 'sip.example.test', MEET_SIP: '192.0.2.20:5080', MEET_SIP_PASSWORD: 'not-a-real-secret-0' })
+    const section = (name: string, next: string) => cfg.slice(cfg.indexOf(`\n${name} {`), cfg.indexOf(`\n${next} {`))
+    // Read once LiveKit SIP authenticated, never passed on.
+    expect(cfg).toContain('$avp(meet_grant) = $hdr(X-Twake-Grant);')
+    expect(cfg).toContain('remove_hf("X-Twake-Grant");')
+    const source = section('route[meet_source]', 'route[meet_source_loaded]')
+    // Only the characters of a grant and of a number get into the query; anything else is refused before it.
+    expect(source).toContain('if (!($avp(meet_grant) =~ "^[0-9a-f]{32}$") || !($rU =~ "^[+]?[0-9*#]{2,20}$")) {')
+    expect(source.indexOf('t_reply(403, "Not Granted");')).toBeLessThan(source.indexOf('async(sql_query_one('))
+    // Deleted as it is read: used once, before its expiry, for this person and this number only.
+    expect(source).toContain(`"DELETE FROM dial_out_grants g WHERE g.token = '" + $avp(meet_grant) + "' AND g.extension = '" + $fU + "' AND g.number = '" + $rU + "' AND g.expires_at > now() AND EXISTS (SELECT 1 FROM subscriber s WHERE s.username = g.extension) RETURNING 1"`)
+    const loaded = section('route[meet_source_loaded]', 'route[meet_call]')
+    expect(loaded).toContain('if ($var(meet_rc) == -2) {')
+    expect(loaded.indexOf('append_to_reply("Twake-Call-Refused: not-granted\\r\\n");')).toBeLessThan(loaded.indexOf('route(trunk_out);'))
+    // The CDR says the call came from a room.
+    expect(cfg).toContain('$acc_extra(via) = "meet";')
+  })
+
+  it('caps the tries of a PIN per caller and for all, and the length of a room call (step 8, review n°2 and n°5)', () => {
+    const { cfg } = render({ MEET_SIP: '192.0.2.20:5080', MEET_SIP_PASSWORD: 'not-a-real-secret-0', MEET_PIN_TRIES: '4', MEET_PIN_TRIES_ALL: '50', MEET_MAX_CALL_SEC: '1800' })
+    const section = (name: string, next: string) => cfg.slice(cfg.indexOf(`\n${name} {`), cfg.indexOf(`\n${next} {`))
+    const call = section('route[meet_call]', 'failure_route[meet_failed]')
+    expect(call).toContain('cache_add("local", "pin:c:$var(pin_who)", 1, 600, $var(pin_n));')
+    // A caller over its cap does not use up everybody's.
+    expect(call).toContain('if ($var(pin_n) <= 4)\n\t\tcache_add("local", "pin:all", 1, 600, $var(pin_all));')
+    expect(call).toContain('if ($var(pin_n) > 4 || $var(pin_all) > 50) {')
+    expect(call.indexOf('t_reply(403, "Too Many Tries");')).toBeLessThan(call.indexOf('$ru = "sip:8000@192.0.2.20:5080";'))
+    expect(cfg).toContain('if ($dlg_val(meet) == "caller" && $DLG_timeout > 1800)\n\t\t$DLG_timeout = 1800;')
+    // The defaults.
+    const defaults = render({ MEET_SIP: '192.0.2.20:5080', MEET_SIP_PASSWORD: 'not-a-real-secret-0' }).cfg
+    expect(defaults).toContain('if ($var(pin_n) > 10 || $var(pin_all) > 300) {')
+    expect(defaults).toContain('$DLG_timeout > 7200)')
   })
 
   it('announces a call once nothing can refuse it without a transaction: after lookup and rtpengine, just before the relay', () => {
@@ -341,7 +385,7 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
 
   it('keeps what the caller dialled in the CDRs, next to the extension the call reached', () => {
     const { cfg } = render()
-    expect(cfg).toContain('modparam("acc", "extra_fields", "db: caller; callee; dialled; external")')
+    expect(cfg).toContain('modparam("acc", "extra_fields", "db: caller; callee; dialled; external; via")')
     expect(cfg).toContain('modparam("acc", "extra_fields", "evi: caller; callee; dialled")')
     expect(cfg).toContain('$acc_extra(dialled) = $rU;')
     // A number of the public network, in E.164 (step 6); the extension a direct number reaches.
@@ -362,7 +406,9 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(callerName.indexOf('if (!($hdr(From) =~ "<"))')).toBeLessThan(callerName.indexOf('uac_replace_from("$var(caller_name)", "");'))
     // The others: the number a call to the operator presents, in place of the extension, and the caller of a call from
     // the operator as read (step 6).
-    expect(cfg.match(/uac_replace_from\(/g)).toHaveLength(3)
+    // And a room's call (step 8): "Meet", with the name of whom it calls for when read, never the person's phone.
+    expect(cfg.match(/uac_replace_from\(/g)).toHaveLength(4)
+    expect(callerName).toContain('$var(caller_name) = "Meet";\n\t\tif ($avp(names_read) == 1 && $avp(n_caller) != NULL && $avp(n_caller) != "")\n\t\t\t$var(caller_name) = "Meet (" + $avp(n_caller) + ")";')
     expect(callerName).toContain('uac_replace_from("", "$avp(caller_uri)");')
     expect(section('branch_route[trunk_out]', 'route[trunk_number]')).toContain('uac_replace_from("", "sip:$avp(t_from_user)@$avp(t_domain)");')
     // Once the first read resumed (the rules, or the names of a Replaces), before anything rings.
@@ -384,7 +430,7 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     }
     // Names not read: the From is left as the phone sent it (never emptied); a call from the operator excepted, whose
     // From never reaches a browser.
-    expect(callerName.indexOf('if ($avp(names_read) != 1)\n\t\treturn(-1);')).toBeLessThan(callerName.indexOf('uac_replace_from("$var(caller_name)", "");'))
+    expect(callerName.indexOf('if ($avp(names_read) != 1)\n\t\treturn(-1);')).toBeLessThan(callerName.lastIndexOf('uac_replace_from("$var(caller_name)", "");'))
     const onreply = cfg.slice(cfg.indexOf('onreply_route[rtp] {'), cfg.indexOf('route[event_attrs]'))
     expect(onreply.indexOf('remove_hf("P-Asserted-Identity");')).toBeLessThan(onreply.indexOf('append_hf("P-Asserted-Identity: '))
     expect(onreply).toContain('append_hf("P-Asserted-Identity: \\"$var(pai_name)\\" <sip:$var(pai_ext)@$avp(domain)>\\r\\n");')
@@ -883,7 +929,7 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
   })
 
   it('bounds every call with the operator, and ends it with a BYE to both sides at TRUNK_MAX_CALL_SEC', () => {
-    const { cfg } = render({ TRUNK_MAX_CALL_SEC: '7200' })
+    const { cfg } = render({ TRUNK_MAX_CALL_SEC: '7200', MEET_MAX_CALL_SEC: '3600' })
     const section = (name: string, next: string) => cfg.slice(cfg.indexOf(`\n${name} {`), cfg.indexOf(`\n${next} {`))
     // Every INVITE gets its dialog; a call that goes to the operator, its flags once that is known (one of our own
     // direct numbers stays an internal call, route[trunk_out_loaded]).

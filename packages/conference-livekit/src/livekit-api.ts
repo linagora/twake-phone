@@ -29,8 +29,12 @@ export const verifyWebhook = (apiKey: string, apiSecret: string, authorization: 
   }
 }
 
-export type Fetch = (url: string, init: { method: string; headers: Record<string, string>; body?: string }) => Promise<{ ok: boolean; status: number; text(): Promise<string> }>
+export type Fetch = (url: string, init: { method: string; headers: Record<string, string>; body?: string; signal?: AbortSignal }) => Promise<{ ok: boolean; status: number; text(): Promise<string> }>
 
+/**
+ * A request LiveKit refused or did not answer (`status` 0, `twirpCode` 'unavailable': unreachable, or no answer within
+ * the request's time). Its message is LiveKit's, for the logs: the Gateway never shows it to a user.
+ */
 export class LiveKitError extends Error {
   constructor(
     message: string,
@@ -49,7 +53,9 @@ export class LiveKitApi {
     private readonly url: string,
     private readonly apiKey: string,
     private readonly apiSecret: string,
-    private readonly fetchFn: Fetch = (u, i) => fetch(u, i)
+    private readonly fetchFn: Fetch = (u, i) => fetch(u, i),
+    /** How long a request may take by default, in milliseconds: a LiveKit that no longer answers holds nobody's request. */
+    private readonly timeoutMs = 10_000
   ) {}
 
   /** Room-scoped calls need the room name in the grant: LiveKit refuses a wildcard. */
@@ -59,13 +65,23 @@ export class LiveKitApi {
     return { video: { roomCreate: true, roomList: true, roomAdmin: true, roomJoin: true, ...(room ? { room } : {}) }, sip: { admin: true, call: true } }
   }
 
-  async call<T = Record<string, unknown>>(service: 'livekit.RoomService' | 'livekit.SIP', method: string, body: unknown): Promise<T> {
-    const res = await this.fetchFn(`${this.url.replace(/\/$/, '')}/twirp/${service}/${method}`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', authorization: `Bearer ${signToken(this.apiKey, this.apiSecret, this.grants(body))}` },
-      body: JSON.stringify(body)
-    })
-    const text = await res.text()
+  async call<T = Record<string, unknown>>(service: 'livekit.RoomService' | 'livekit.SIP', method: string, body: unknown, options: { timeoutMs?: number } = {}): Promise<T> {
+    const timeoutMs = options.timeoutMs ?? this.timeoutMs
+    let res: Awaited<ReturnType<Fetch>>
+    let text: string
+    const signal = AbortSignal.timeout(timeoutMs)
+    try {
+      res = await this.fetchFn(`${this.url.replace(/\/$/, '')}/twirp/${service}/${method}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${signToken(this.apiKey, this.apiSecret, this.grants(body))}` },
+        body: JSON.stringify(body),
+        signal
+      })
+      text = await res.text()
+    } catch (err) {
+      const why = signal.aborted ? `no answer within ${timeoutMs} ms` : err instanceof Error ? err.message : String(err)
+      throw new LiveKitError(`LiveKit ${method} unreachable: ${why}`, 0, 'unavailable')
+    }
     if (!res.ok) {
       let msg = text
       let code: string | undefined

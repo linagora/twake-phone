@@ -2,7 +2,7 @@ import dgram from 'node:dgram'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { RoutedEvent } from '@twake/telephony-provider-sdk'
 import type { ForwardingRules } from '@twake/telephony-types'
-import { AsyncQueue, OpensipsProvider, SUBSCRIBED_EVENTS, type CallRules, type DndRule, type OutboundTables, type PushTargets, type TrunkTables } from './index.js'
+import { AsyncQueue, OpensipsProvider, SUBSCRIBED_EVENTS, type CallRules, type DialOutGrants, type DndRule, type OutboundTables, type PushTargets, type TrunkTables } from './index.js'
 import { fakeOpensips } from '../test/fake-opensips.js'
 
 const user = { id: 'alice', tenantId: 't', displayName: 'Alice', extension: '101' }
@@ -335,6 +335,38 @@ describe('OpensipsProvider call rules', () => {
     // Without the tables: no trunk on this platform.
     expect((await make().getCapabilities()).trunks).toBe(false)
     await expect(make().setTrunks([trunk], [])).rejects.toMatchObject({ statusCode: 501 })
+  })
+
+  it("grants a room's call through the grants table, or says it cannot (step 8, review n°1)", async () => {
+    const given: unknown[] = []
+    const dialOutGrants = { grant: async (...a: unknown[]) => (given.push(['grant', ...a]), 'ab'.repeat(16)), revoke: async (t: string) => void given.push(['revoke', t]) } as unknown as DialOutGrants
+    const p = new OpensipsProvider({ websocketUrl: 'wss://sip.example.test', domain: 'sip.example.test', sipSecretFor: async () => 's', dialOutGrants })
+    const grant = await p.grantRoomCall({ extension: '101', number: '+33612345678' })
+    expect(grant.token).toBe('ab'.repeat(16))
+    await grant.revoke()
+    expect(given).toEqual([['grant', '101', '+33612345678', undefined], ['revoke', 'ab'.repeat(16)]])
+    // Without the table: no room calls anybody.
+    await expect(make().grantRoomCall({ extension: '101', number: '102' })).rejects.toMatchObject({ statusCode: 501 })
+  })
+
+  it("reads the access number of Meet's rooms OpenSIPS was started with, or says it cannot (step 8, review n°12)", async () => {
+    const sips = await fakeOpensips()
+    cleanups.push(sips.close)
+    const p = new OpensipsProvider({ websocketUrl: 'wss://sip.example.test', domain: 'sip.example.test', sipSecretFor: async () => 's', events: { miUrl: sips.url, timeoutMs: 300 }, logger: { info: () => undefined, warn: () => undefined } })
+    cleanups.push(() => p.close())
+    await p.getCapabilities()
+    await until('the subscription', () => p.getStatus() === 'CONNECTED')
+    sips.state.shv = [{ name: 'meet_on', type: 1, value: 1 }, { name: 'meet_number', type: 2, value: '8000' }, { name: 'other', type: 1, value: 3 }]
+    expect(await p.getMeetAccess()).toEqual({ number: '8000' })
+    sips.state.shv = [{ name: 'meet_on', type: 1, value: 0 }, { name: 'meet_number', type: 2, value: '8000' }]
+    expect(await p.getMeetAccess()).toEqual({})
+    // An OpenSIPS of before step 8: it cannot say.
+    sips.state.shv = [{ name: 'other', type: 1, value: 3 }]
+    expect(await p.getMeetAccess()).toBeUndefined()
+    sips.state.shv = undefined
+    await expect(p.getMeetAccess()).rejects.toThrow()
+    // Without the MI: it cannot say.
+    expect(await make().getMeetAccess()).toBeUndefined()
   })
 
   it('asks OpenSIPS how the trunks are doing (step 7): its servers and registrations, nothing else of its answers', async () => {

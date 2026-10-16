@@ -1,10 +1,10 @@
-import { createHmac, hkdfSync } from 'node:crypto'
+import { createHmac, hkdfSync, randomBytes } from 'node:crypto'
 import Fastify, { type FastifyRequest } from 'fastify'
 import cors from '@fastify/cors'
 import websocket from '@fastify/websocket'
 import swagger from '@fastify/swagger'
 import swaggerUi from '@fastify/swagger-ui'
-import { splitParticipantId, verifyWebhook, type LiveKitConferenceBridge, type MeetApi, type MeetRoom } from '@twake/conference-livekit'
+import { LiveKitError, splitParticipantId, verifyWebhook, type LiveKitConferenceBridge, type MeetApi, type MeetRoom } from '@twake/conference-livekit'
 import type { MediaProvider, TelephonyProvider } from '@twake/telephony-provider-sdk'
 import { EXTENSION_FORMAT, FRAUD_DEFAULTS, OUTBOUND_CAP_DEFAULTS, isReservedNumber, type CallDirection, type DidRange, type Endpoint, type ForwardingRules, type Presence, type PresenceStatus, type RingGroup, type TelephonyEvent, type User } from '@twake/telephony-types'
 import { adminPolicyFromEnv, isAdmin, type AdminPolicy } from './admin.js'
@@ -101,6 +101,8 @@ export interface BuildOptions {
   directorySearchLimiter?: RateLimiter
   /** Push subscriptions given or removed per user (tests inject a tighter one). Default: 20 a minute. */
   pushSubscriptionLimiter?: RateLimiter
+  /** Calls a user's rooms may place (step 8; tests inject a tighter one). Default: 10 a minute. */
+  dialOutLimiter?: RateLimiter
   /**
    * How long someone found without an extension keeps their browsers' subscriptions: removed at the first
    * reconciliation after that (a mapping missing a moment loses nothing). Default: an hour.
@@ -1287,6 +1289,17 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
 
 
       // Phone access to a Meet room (dial-in PIN, dial-out). The owner is the first user who claims the room.
+      // What LiveKit says when it refuses or does not answer stays in the log: the person is told the service is
+      // unavailable (502, CONFERENCE_UNAVAILABLE), never LiveKit's words nor its status.
+      const viaLiveKit = async <T>(run: () => Promise<T>): Promise<T> => {
+        try {
+          return await run()
+        } catch (err) {
+          if (!(err instanceof LiveKitError)) throw err
+          app.log.error({ err: { message: err.message, status: err.status, code: err.twirpCode } }, 'LiveKit request failed')
+          throw Object.assign(new Error('The meeting rooms are unavailable'), { statusCode: 502, code: 'CONFERENCE_UNAVAILABLE' })
+        }
+      }
       const bridgeFor = async (req: FastifyRequest) => {
         const identity = await auth.authenticate(req)
         const user = await resolve(identity)
@@ -1331,7 +1344,9 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
       })
 
       // Opens the phone panel of a room. With Meet configured the room comes from Meet (existing room by slug, or a
-      // new one with `create`), and Meet decides who may see it. Without Meet, any LiveKit room name can be adopted.
+      // new one with `create`), and Meet decides who may see it. Without Meet, the Gateway names the room itself
+      // (`twake-` and 16 random hexadecimal characters, never a name someone else chose: a LiveKit shared with Meet has
+      // Meet's rooms, which nobody may take over from here); `meetingId` reopens one of the person's own rooms only.
       v1.post<{ Body: { meetingId?: string; slug?: string; create?: boolean } }>('/conferences', async (req, reply) => {
         const { user, bridge, email } = await bridgeFor(req)
         const meet = options.conference?.meet
@@ -1352,16 +1367,21 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
             if (!room) throw Object.assign(new Error('Room not found, or not accessible to you'), { statusCode: 404 })
           }
           meetingId = room.id
-        } else if (!MEETING_ID.test(meetingId)) throw bad('invalid meeting id')
+        } else if (req.body?.meetingId !== undefined) {
+          if (!MEETING_ID.test(meetingId)) throw bad('invalid meeting id')
+          const mine = await store.getConference(meetingId)
+          // Another tenant's room, or a name the Gateway never gave, looks exactly like a missing one.
+          if (!mine || mine.tenantId !== user.tenantId) throw Object.assign(new Error('Meeting not found: without Meet, the Gateway names the rooms (POST /conferences without meetingId)'), { statusCode: 404 })
+        } else meetingId = `twake-${randomBytes(8).toString('hex')}`
 
         const record = await store.claimConference({ tenantId: user.tenantId, meetingId, ownerUserId: user.id, createdAt: new Date().toISOString() })
         if (record.tenantId !== user.tenantId || record.ownerUserId !== user.id) throw Object.assign(new Error('Meeting already managed by someone else'), { statusCode: 409 })
         if (room) return reply.code(201).send({ meetingId, slug: room.slug, ...(room.url ? { url: room.url } : {}), dialIn: meetDialIn(room) })
         if (!record.pin) {
-          const dialIn = await bridge.createDialIn({ id: meetingId, tenantId: user.tenantId })
+          const dialIn = await viaLiveKit(() => bridge.createDialIn({ id: meetingId, tenantId: user.tenantId }))
           await store.setConferencePin(meetingId, dialIn.pin ?? null)
           record.pin = dialIn.pin
-        }
+        } else await viaLiveKit(() => bridge.ensureDialIn(meetingId, record.pin!))
         return reply.code(201).send({ meetingId, dialIn: publicDialIn(bridge, record) })
       })
 
@@ -1369,29 +1389,42 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         const { bridge, record, room } = await owned(req, req.params.id)
         if (room) {
           // The PIN and number are Meet's, read back each time so a rotation shows up here.
-          return { meetingId: record.meetingId, slug: room.slug, ...(room.url ? { url: room.url } : {}), dialIn: meetDialIn(room), participants: await bridge.listParticipants(record.meetingId) }
+          return { meetingId: record.meetingId, slug: room.slug, ...(room.url ? { url: room.url } : {}), dialIn: meetDialIn(room), participants: await viaLiveKit(() => bridge.listParticipants(record.meetingId)) }
         }
-        return { meetingId: record.meetingId, dialIn: publicDialIn(bridge, record), participants: await bridge.listParticipants(record.meetingId) }
+        // The PIN shown lets in: the room's rule is made again if LiveKit lost it.
+        if (record.pin) await viaLiveKit(() => bridge.ensureDialIn(record.meetingId, record.pin!))
+        return { meetingId: record.meetingId, dialIn: publicDialIn(bridge, record), participants: await viaLiveKit(() => bridge.listParticipants(record.meetingId)) }
       })
 
       v1.delete<{ Params: { id: string } }>('/conferences/:id', async (req, reply) => {
         const { bridge, record } = await owned(req, req.params.id)
         // Meet owns its dial-in rules: only a Gateway-managed rule is removed here.
-        if (!options.conference?.meet) await bridge.removeDialIn(record.meetingId)
+        if (!options.conference?.meet) await viaLiveKit(() => bridge.removeDialIn(record.meetingId))
         await store.deleteConference(record.meetingId)
         return reply.code(204).send()
       })
 
       // The room calls a number at the owner's name (step 8, ADR 0018): their extension, which the SIP server treats as
-      // a call from their phone (rights, caps, the direct number presented). Answered once the call is (201), or with
-      // the SIP status of the failure (409, DIAL_FAILED: `sipStatus`, `sipReason`).
+      // a call from their phone (rights, caps, the direct number presented), once the SIP server granted that very call
+      // (grantRoomCall: LiveKit's word alone makes no call anyone's). Answered once the call is (201), or with the SIP
+      // status of the failure (409, DIAL_FAILED: `sipStatus`, `sipReason`; 480 when nobody answered); LiveKit refusing
+      // or not answering is 502 (CONFERENCE_UNAVAILABLE). DIAL_OUT_LIMIT (429) past the calls a person's rooms may place.
+      const dialOuts = options.dialOutLimiter ?? new RateLimiter(10, 60_000)
       v1.post<{ Params: { id: string }; Body: { number?: string } }>('/conferences/:id/participants', async (req, reply) => {
         const { bridge, record, user } = await owned(req, req.params.id)
         if (!user.extension) throw Object.assign(new Error('You hold no extension: a room calls at the name of whoever asks'), { statusCode: 403, code: 'NO_EXTENSION' })
+        const number = (req.body?.number ?? '').trim()
+        if (!/^\+?[0-9*#]{2,20}$/.test(number)) throw bad('Invalid phone number')
+        const provider = registry.serves(user.tenantId) ? registry.forTenant(user.tenantId) : undefined
+        if (!provider?.grantRoomCall) throw Object.assign(new Error('The SIP server cannot let a room call'), { statusCode: 501 })
+        if (!dialOuts.allow(ownerKey(user.tenantId, user.id))) return reply.code(429).send({ statusCode: 429, code: 'DIAL_OUT_LIMIT', error: 'Too Many Requests', message: 'Too many calls placed by your rooms: wait a minute' })
+        const grant = await provider.grantRoomCall({ extension: user.extension, number })
         try {
-          const participant = await bridge.dialParticipant(record.meetingId, (req.body?.number ?? '').trim(), { from: user.extension })
+          const participant = await viaLiveKit(() => bridge.dialParticipant(record.meetingId, number, { from: user.extension, grant: grant.token }))
           return reply.code(201).send(participant)
         } catch (err) {
+          // Not taken if the call never reached the SIP server; taken, deleting it changes nothing.
+          await grant.revoke().catch(() => undefined)
           const failed = err as Error & { code?: string; sipStatus?: number; sipReason?: string }
           if (failed.code !== 'DIAL_FAILED') throw err
           return reply.code(409).send({ statusCode: 409, code: 'DIAL_FAILED', error: 'Conflict', message: failed.message, sipStatus: failed.sipStatus, sipReason: failed.sipReason })
@@ -1403,7 +1436,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
           const { bridge, record } = await owned(req, req.params.id)
           // The participant id embeds its room: refuse ids of another room so an owner cannot reach foreign rooms.
           if (splitParticipantId(req.params.pid).room !== record.meetingId) throw bad('participant does not belong to this meeting')
-          await run(bridge, req.params.pid)
+          await viaLiveKit(() => run(bridge, req.params.pid))
           return reply.code(204).send()
         })
       participantAction('delete', '', (b, pid) => b.disconnectParticipant(pid))
