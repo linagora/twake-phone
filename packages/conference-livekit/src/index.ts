@@ -37,11 +37,27 @@ export interface LiveKitConferenceConfig {
   maxCallSec?: number
   /** Hide, mask or show phone numbers of participants (tenant privacy setting). */
   numberPrivacy?: 'show' | 'mask' | 'hide'
+  /**
+   * How long the inbound trunk and a room's rule, once checked at LiveKit, are taken as they were, in milliseconds:
+   * a room read again and again lists LiveKit's trunks and rules once in that time (third review n°7). Default 30 s.
+   */
+  checkTtlMs?: number
   fetch?: Fetch
 }
 
 const TRUNK_IN = 'twake-meet-in'
 const TRUNK_OUT = 'twake-meet-out'
+/** The name of the dispatch rule the Gateway makes for a room. */
+const RULE_PREFIX = 'twake-meet-'
+
+/** A dispatch rule as LiveKit lists it (ListSIPDispatchRule). */
+interface ListedRule {
+  sip_dispatch_rule_id: string
+  name: string
+  trunk_ids?: string[]
+  rule?: { dispatch_rule_direct?: { room_name?: string; pin?: string } }
+}
+const pinOf = (r: ListedRule) => r.rule?.dispatch_rule_direct?.pin ?? ''
 
 /** What a dial-out says when the call did not go through: the SIP status, as the PBX or the callee answered. */
 export interface DialFailure {
@@ -75,6 +91,10 @@ export class LiveKitConferenceBridge implements ConferenceBridgeProvider {
   private outboundTrunkId?: Promise<string>
   /** meetingId -> dispatch rule id (kept so removeDialIn is exact; rebuilt from LiveKit when restarted). */
   private readonly rules = new Map<string, string>()
+  /** When the inbound trunk was last seen at LiveKit (ms since the epoch). */
+  private inboundCheckedAt = 0
+  /** meetingId -> the PIN its rule was last seen with at LiveKit, and when (ensureDialIn). */
+  private readonly checked = new Map<string, { pin: string; at: number }>()
 
   constructor(
     private readonly config: LiveKitConferenceConfig,
@@ -120,10 +140,19 @@ export class LiveKitConferenceBridge implements ConferenceBridgeProvider {
     const cached = this.inboundTrunkId
     if (!cached) return this.ensureInbound()
     const trunk = await cached
-    const list = await this.api.call<{ items?: { sip_trunk_id: string; name: string }[] }>('livekit.SIP', 'ListSIPInboundTrunk', {})
-    if ((list.items ?? []).some(t => t.sip_trunk_id === trunk)) return trunk
+    if (Date.now() - this.inboundCheckedAt < this.ttl) return trunk
+    const list = await this.api.call<{ items?: { sip_trunk_id: string; name: string }[] }>('livekit.SIP', 'ListSIPInboundTrunk', { trunk_ids: [trunk] })
+    if ((list.items ?? []).some(t => t.sip_trunk_id === trunk)) {
+      this.inboundCheckedAt = Date.now()
+      return trunk
+    }
     if (this.inboundTrunkId === cached) this.inboundTrunkId = undefined
+    this.checked.clear()
     return this.ensureInbound()
+  }
+
+  private get ttl() {
+    return this.config.checkTtlMs ?? 30_000
   }
 
   /**
@@ -207,38 +236,63 @@ export class LiveKitConferenceBridge implements ConferenceBridgeProvider {
   private async createRule(meetingId: string, pin: string) {
     const rule = await this.withTrunk('in', trunk =>
       this.api.call<{ sip_dispatch_rule_id: string }>('livekit.SIP', 'CreateSIPDispatchRule', {
-        dispatch_rule: { name: `twake-meet-${meetingId}`, trunk_ids: [trunk], rule: { dispatch_rule_direct: { room_name: meetingId, pin } } }
+        dispatch_rule: { name: `${RULE_PREFIX}${meetingId}`, trunk_ids: [trunk], rule: { dispatch_rule_direct: { room_name: meetingId, pin } } }
       })
     )
     this.rules.set(meetingId, rule.sip_dispatch_rule_id)
   }
 
-  /**
-   * The room's rule with the PIN the Gateway shows (`pin`), created again when LiveKit no longer has it, or has it on a
-   * trunk that is gone (its Redis emptied, deleted by hand): the PIN shown always lets in.
-   */
-  async ensureDialIn(meetingId: string, pin: string): Promise<void> {
-    const trunk = await this.liveInbound()
-    const list = await this.api.call<{ items?: { sip_dispatch_rule_id: string; name: string; trunk_ids?: string[] }[] }>('livekit.SIP', 'ListSIPDispatchRule', {})
-    const found = list.items?.find(r => r.name === `twake-meet-${meetingId}`)
-    if (found && (found.trunk_ids ?? []).includes(trunk)) {
-      this.rules.set(meetingId, found.sip_dispatch_rule_id)
-      return
-    }
-    if (found) await this.api.call('livekit.SIP', 'DeleteSIPDispatchRule', { sip_dispatch_rule_id: found.sip_dispatch_rule_id }).catch(() => {})
-    this.rules.delete(meetingId)
-    await this.createRule(meetingId, pin)
+  /** The rules LiveKit has for the room (by their name), on the trunk given only (LiveKit filters), or on any. */
+  private async roomRules(meetingId: string, trunk?: string): Promise<ListedRule[]> {
+    const list = await this.api.call<{ items?: ListedRule[] }>('livekit.SIP', 'ListSIPDispatchRule', trunk ? { trunk_ids: [trunk] } : {})
+    return (list.items ?? []).filter(r => r.name === `${RULE_PREFIX}${meetingId}`)
   }
 
-  removeDialIn: ConferenceBridgeProvider['removeDialIn'] = async meetingId => {
-    let id = this.rules.get(meetingId)
-    if (!id) {
-      const list = await this.api.call<{ items?: { sip_dispatch_rule_id: string; name: string }[] }>('livekit.SIP', 'ListSIPDispatchRule', {})
-      id = list.items?.find(r => r.name === `twake-meet-${meetingId}`)?.sip_dispatch_rule_id
+  /**
+   * The room's rule with the PIN the Gateway shows (`pin`), and no other: created again when LiveKit no longer has it,
+   * or has it on a trunk that is gone (its Redis emptied, deleted by hand); a rule of the room with another PIN (left
+   * by two reads of a room at once, third review n°5) or a second one deleted. The PIN shown always lets in, and only
+   * it. Checked at LiveKit once in `checkTtlMs` for the same PIN.
+   */
+  async ensureDialIn(meetingId: string, pin: string): Promise<void> {
+    const seen = this.checked.get(meetingId)
+    if (seen && seen.pin === pin && Date.now() - seen.at < this.ttl) return
+    const trunk = await this.liveInbound()
+    const rules = await this.roomRules(meetingId)
+    const keep = rules.find(r => pinOf(r) === pin && (r.trunk_ids ?? []).includes(trunk))
+    for (const r of rules) if (r !== keep) await this.api.call('livekit.SIP', 'DeleteSIPDispatchRule', { sip_dispatch_rule_id: r.sip_dispatch_rule_id }).catch(() => {})
+    if (keep) this.rules.set(meetingId, keep.sip_dispatch_rule_id)
+    else {
+      this.rules.delete(meetingId)
+      await this.createRule(meetingId, pin)
     }
-    if (!id) return
-    await this.api.call('livekit.SIP', 'DeleteSIPDispatchRule', { sip_dispatch_rule_id: id })
+    this.checked.set(meetingId, { pin, at: Date.now() })
+  }
+
+  /** Deletes the room's rules with that PIN (one drawn by a Gateway that lost the race to another, third review n°5). */
+  async dropDialIn(meetingId: string, pin: string): Promise<void> {
+    for (const r of await this.roomRules(meetingId)) {
+      if (pinOf(r) !== pin) continue
+      await this.api.call('livekit.SIP', 'DeleteSIPDispatchRule', { sip_dispatch_rule_id: r.sip_dispatch_rule_id })
+      if (this.rules.get(meetingId) === r.sip_dispatch_rule_id) this.rules.delete(meetingId)
+    }
+    if (this.checked.get(meetingId)?.pin === pin) this.checked.delete(meetingId)
+  }
+
+  /** Every rule of the room goes: none left letting anyone in once it is closed (third review n°5). */
+  removeDialIn: ConferenceBridgeProvider['removeDialIn'] = async meetingId => {
+    for (const r of await this.roomRules(meetingId)) await this.api.call('livekit.SIP', 'DeleteSIPDispatchRule', { sip_dispatch_rule_id: r.sip_dispatch_rule_id })
     this.rules.delete(meetingId)
+    this.checked.delete(meetingId)
+  }
+
+  /**
+   * The rules the Gateway made (named `twake-meet-<room>`), each with its room and PIN, on any trunk: what a sweep at
+   * start reads (third review n°4).
+   */
+  async listDialIns(): Promise<{ meetingId: string; pin: string }[]> {
+    const list = await this.api.call<{ items?: ListedRule[] }>('livekit.SIP', 'ListSIPDispatchRule', {})
+    return (list.items ?? []).filter(r => r.name.startsWith(RULE_PREFIX)).map(r => ({ meetingId: r.name.slice(RULE_PREFIX.length), pin: pinOf(r) }))
   }
 
   /**

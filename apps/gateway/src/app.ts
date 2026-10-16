@@ -10,6 +10,7 @@ import { EXTENSION_FORMAT, FRAUD_DEFAULTS, OUTBOUND_CAP_DEFAULTS, isReservedNumb
 import { adminPolicyFromEnv, isAdmin, type AdminPolicy } from './admin.js'
 import { authenticatorFromEnv, TicketStore, type Authenticator, type Identity } from './auth.js'
 import { MAX_CONTACT_ID, MAX_FAVORITES, MAX_QUERY, MAX_SEARCH, RateLimiter, type ContactDirectory } from './contacts.js'
+import { GATEWAY_ROOM } from './conference-sweep.js'
 import { StoreDirectory, seedUserMap, type UserDirectory } from './directory.js'
 import type { DirectorySync } from './directory-sync.js'
 import { EventBus } from './events.js'
@@ -109,6 +110,13 @@ export interface BuildOptions {
    */
   conferenceLimiter?: RateLimiter
   /**
+   * The rooms open at once (step 8, kept in the database, whatever the Gateways): per person and per tenant; tests
+   * set lower ones. Default: 50 and 1000 (third review n°6).
+   */
+  conferenceCaps?: { perPerson?: number; perTenant?: number }
+  /** Reads of a room per person (GET /conferences/:id: LiveKit asked; tests inject a tighter one). Default: 60 a minute. */
+  conferenceReadLimiter?: RateLimiter
+  /**
    * How long someone found without an extension keeps their browsers' subscriptions: removed at the first
    * reconciliation after that (a mapping missing a moment loses nothing). Default: an hour.
    */
@@ -153,8 +161,6 @@ export interface BuildOptions {
 }
 
 const MEETING_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{2,63}$/
-/** The name the Gateway gives a room without Meet (POST /conferences with `create`). */
-const GATEWAY_ROOM = /^twake-[0-9a-f]{16}$/
 
 const bad = (message: string) => Object.assign(new Error(message), { statusCode: 400 })
 /** A 400 whose `code` the app turns into the person's words (the message stays for the logs and other clients). */
@@ -1350,17 +1356,33 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
       /**
        * The room's rule with the PIN shown, made again if LiveKit lost it. A PIN shorter than PIN_DIGITS (a room opened
        * before the Gateway drew them from crypto: 6 digits of Math.random) is drawn again, its rule with it, the old one
-       * removed (second review n°6).
+       * removed (second review n°6). A room without a PIN (just opened, or its 6-digit one swept at start) gets one too.
+       * One draw at a time per room in this process (the reads of a room at once wait for it), and of two Gateways the
+       * first to write its PIN wins: the other deletes the rule it made and shows the winner's (third review n°5).
+       * ensureDialIn then leaves the room the one rule of the PIN shown.
        */
+      const drawing = new Map<string, Promise<string | undefined>>()
       const keepDialIn = async (bridge: LiveKitConferenceBridge, record: { meetingId: string; tenantId: string; pin?: string }) => {
-        if (!record.pin) return
-        if (record.pin.length >= PIN_DIGITS) return viaLiveKit(() => bridge.ensureDialIn(record.meetingId, record.pin!))
-        const dialIn = await viaLiveKit(async () => {
-          await bridge.removeDialIn(record.meetingId)
-          return bridge.createDialIn({ id: record.meetingId, tenantId: record.tenantId })
-        })
-        await store.setConferencePin(record.meetingId, dialIn.pin ?? null)
-        record.pin = dialIn.pin
+        if (record.pin && record.pin.length >= PIN_DIGITS) return viaLiveKit(() => bridge.ensureDialIn(record.meetingId, record.pin!))
+        let draw = drawing.get(record.meetingId)
+        if (!draw) {
+          const from = record.pin ?? null
+          draw = (async () => {
+            const dialIn = await viaLiveKit(() => bridge.createDialIn({ id: record.meetingId, tenantId: record.tenantId }))
+            if (await store.replaceConferencePin(record.meetingId, from, dialIn.pin ?? null)) {
+              await viaLiveKit(() => bridge.ensureDialIn(record.meetingId, dialIn.pin!))
+              return dialIn.pin
+            }
+            await viaLiveKit(() => bridge.dropDialIn(record.meetingId, dialIn.pin!))
+            const now = (await store.getConference(record.meetingId))?.pin
+            if (now) await viaLiveKit(() => bridge.ensureDialIn(record.meetingId, now))
+            return now
+          })().finally(() => drawing.delete(record.meetingId))
+          drawing.set(record.meetingId, draw)
+        }
+        const pin = await draw
+        if (pin) record.pin = pin
+        else delete record.pin
       }
       const publicDialIn = (bridge: LiveKitConferenceBridge, record: { meetingId: string; pin?: string }) => ({
         numbers: bridge.dialInNumbers,
@@ -1373,8 +1395,14 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
       // (`twake-` and 16 random hexadecimal characters, never a name someone else chose: a LiveKit shared with Meet has
       // Meet's rooms, which nobody may take over from here); `meetingId` reopens one of the person's own rooms only;
       // anything else is 400. A new room is CONFERENCE_LIMIT (429) past the rooms a person may open (second review n°4).
+      // That limit is per process (each Gateway has its own, forgotten when it restarts); the rooms open at once are
+      // bounded in the database, per person and per tenant (third review n°6): 429 CONFERENCE_LIMIT as well.
       const newRooms = options.conferenceLimiter ?? new RateLimiter(20, 3_600_000)
       const tooManyRooms = { statusCode: 429, code: 'CONFERENCE_LIMIT', error: 'Too Many Requests', message: 'Too many rooms opened: wait a while' }
+      const roomsPerPerson = options.conferenceCaps?.perPerson ?? 50
+      const roomsPerTenant = options.conferenceCaps?.perTenant ?? 1000
+      const mayOpen = async (tenantId: string, userId: string) =>
+        newRooms.allow(ownerKey(tenantId, userId)) && (await store.countConferences(tenantId, userId)) < roomsPerPerson && (await store.countConferences(tenantId)) < roomsPerTenant
       v1.post<{ Body: { meetingId?: string; slug?: string; create?: boolean } }>('/conferences', async (req, reply) => {
         const { user, bridge, email } = await bridgeFor(req)
         const meet = options.conference?.meet
@@ -1383,7 +1411,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         if (meet) {
           if (!email) throw bad('Your account has no email: Meet cannot identify you')
           if (req.body?.create) {
-            if (!newRooms.allow(ownerKey(user.tenantId, user.id))) return reply.code(429).send(tooManyRooms)
+            if (!(await mayOpen(user.tenantId, user.id))) return reply.code(429).send(tooManyRooms)
             try {
               room = await meet.createRoom(email)
             } catch (err) {
@@ -1402,23 +1430,21 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
           // Another tenant's room, or a name the Gateway never gave, looks exactly like a missing one.
           if (!mine || mine.tenantId !== user.tenantId || !GATEWAY_ROOM.test(meetingId)) throw Object.assign(new Error('Meeting not found: without Meet, the Gateway names the rooms (POST /conferences with create)'), { statusCode: 404 })
         } else if (req.body?.create === true) {
-          if (!newRooms.allow(ownerKey(user.tenantId, user.id))) return reply.code(429).send(tooManyRooms)
+          if (!(await mayOpen(user.tenantId, user.id))) return reply.code(429).send(tooManyRooms)
           meetingId = `twake-${randomBytes(8).toString('hex')}`
         } else throw bad('Which room: meetingId to reopen one of yours, or create for a new one')
 
         const record = await store.claimConference({ tenantId: user.tenantId, meetingId, ownerUserId: user.id, createdAt: new Date().toISOString() })
         if (record.tenantId !== user.tenantId || record.ownerUserId !== user.id) throw Object.assign(new Error('Meeting already managed by someone else'), { statusCode: 409 })
         if (room) return reply.code(201).send({ meetingId, slug: room.slug, ...(room.url ? { url: room.url } : {}), dialIn: meetDialIn(room) })
-        if (!record.pin) {
-          const dialIn = await viaLiveKit(() => bridge.createDialIn({ id: meetingId, tenantId: user.tenantId }))
-          await store.setConferencePin(meetingId, dialIn.pin ?? null)
-          record.pin = dialIn.pin
-        } else await keepDialIn(bridge, record)
+        await keepDialIn(bridge, record)
         return reply.code(201).send({ meetingId, dialIn: publicDialIn(bridge, record) })
       })
 
-      v1.get<{ Params: { id: string } }>('/conferences/:id', async req => {
-        const { bridge, record, room } = await owned(req, req.params.id)
+      const roomReads = options.conferenceReadLimiter ?? new RateLimiter(60, 60_000)
+      v1.get<{ Params: { id: string } }>('/conferences/:id', async (req, reply) => {
+        const { bridge, record, room, user } = await owned(req, req.params.id)
+        if (!roomReads.allow(ownerKey(user.tenantId, user.id))) return reply.code(429).send({ statusCode: 429, code: 'CONFERENCE_READ_LIMIT', error: 'Too Many Requests', message: 'Too many reads of your rooms: wait a minute' })
         if (room) {
           // The PIN and number are Meet's, read back each time so a rotation shows up here.
           return { meetingId: record.meetingId, slug: room.slug, ...(room.url ? { url: room.url } : {}), dialIn: meetDialIn(room), participants: await viaLiveKit(() => bridge.listParticipants(record.meetingId)) }

@@ -112,7 +112,7 @@ describe('dial-in', () => {
     await stale.bridge.ensureDialIn('m', '0123456789')
     expect(stale.calls.find(c => c.path === 'livekit.SIP/DeleteSIPDispatchRule')!.body.sip_dispatch_rule_id).toBe('OLD')
     expect(stale.calls.some(c => c.path === 'livekit.SIP/CreateSIPDispatchRule')).toBe(true)
-    const kept = make({ 'livekit.SIP/ListSIPInboundTrunk': { items: [{ sip_trunk_id: 'T', name: 'twake-meet-in' }] }, 'livekit.SIP/ListSIPDispatchRule': { items: [{ sip_dispatch_rule_id: 'R1', name: 'twake-meet-m', trunk_ids: ['T'] }] } })
+    const kept = make({ 'livekit.SIP/ListSIPInboundTrunk': { items: [{ sip_trunk_id: 'T', name: 'twake-meet-in' }] }, 'livekit.SIP/ListSIPDispatchRule': { items: [{ sip_dispatch_rule_id: 'R1', name: 'twake-meet-m', trunk_ids: ['T'], rule: { dispatch_rule_direct: { room_name: 'm', pin: '0123456789' } } }] } })
     await kept.bridge.ensureDialIn('m', '0123456789')
     expect(kept.calls.some(c => c.path === 'livekit.SIP/CreateSIPDispatchRule' || c.path === 'livekit.SIP/DeleteSIPDispatchRule')).toBe(false)
   })
@@ -122,9 +122,9 @@ describe('dial-in', () => {
       // T1 at first; gone (the check, then the list before writing it again); T2 from then on.
       'livekit.SIP/ListSIPInboundTrunk': [{ items: [{ sip_trunk_id: 'T1', name: 'twake-meet-in' }] }, {}, {}, { items: [{ sip_trunk_id: 'T2', name: 'twake-meet-in' }] }],
       'livekit.SIP/CreateSIPInboundTrunk': { sip_trunk_id: 'T2' },
-      'livekit.SIP/ListSIPDispatchRule': { items: [{ sip_dispatch_rule_id: 'R1', name: 'twake-meet-m', trunk_ids: ['T1'] }] },
+      'livekit.SIP/ListSIPDispatchRule': { items: [{ sip_dispatch_rule_id: 'R1', name: 'twake-meet-m', trunk_ids: ['T1'], rule: { dispatch_rule_direct: { room_name: 'm', pin: '0123456789' } } }] },
       'livekit.SIP/CreateSIPDispatchRule': { sip_dispatch_rule_id: 'R2' }
-    })
+    }, { checkTtlMs: 0 })
     await bridge.ensureDialIn('m', '0123456789')
     expect(calls.some(c => c.path === 'livekit.SIP/CreateSIPDispatchRule')).toBe(false)
     // LiveKit's Redis emptied: T1 is gone, the rule kept by the list above still names it.
@@ -135,6 +135,34 @@ describe('dial-in', () => {
     // A new room too: on the trunk written again.
     await bridge.createDialIn({ id: 'n', tenantId: 't' })
     expect(calls.filter(c => c.path === 'livekit.SIP/CreateSIPDispatchRule').map(c => c.body.dispatch_rule.trunk_ids)).toEqual([['T2'], ['T2']])
+  })
+
+  it('keeps one rule of a room, with the PIN shown: others of the room deleted, on reading it as when it is closed (third review n°5)', async () => {
+    const rule = (id: string, pin: string, name = 'twake-meet-m') => ({ sip_dispatch_rule_id: id, name, trunk_ids: ['T'], rule: { dispatch_rule_direct: { room_name: 'm', pin } } })
+    const rules = { items: [rule('A', '1111111111'), rule('B', '0123456789'), rule('C', '0123456789'), rule('D', '2222222222'), rule('X', '3333333333', 'twake-meet-other')] }
+    const { bridge, calls } = make({ 'livekit.SIP/ListSIPInboundTrunk': { items: [{ sip_trunk_id: 'T', name: 'twake-meet-in' }] }, 'livekit.SIP/ListSIPDispatchRule': rules })
+    await bridge.ensureDialIn('m', '0123456789')
+    const deleted = () => calls.filter(c => c.path === 'livekit.SIP/DeleteSIPDispatchRule').map(c => c.body.sip_dispatch_rule_id)
+    expect(deleted()).toEqual(['A', 'C', 'D'])
+    expect(calls.some(c => c.path === 'livekit.SIP/CreateSIPDispatchRule')).toBe(false)
+    // Read again at once: LiveKit is not asked again (checkTtlMs, third review n°7).
+    const asked = calls.length
+    await bridge.ensureDialIn('m', '0123456789')
+    expect(calls.length).toBe(asked)
+    // The rule a Gateway that lost the race drew goes alone; a closed room loses every rule of its own.
+    await bridge.dropDialIn('m', '2222222222')
+    expect(deleted().slice(3)).toEqual(['D'])
+    await bridge.removeDialIn('m')
+    expect(deleted().slice(4)).toEqual(['A', 'B', 'C', 'D'])
+    // What a sweep at start reads: the Gateway's rules only, with their room and PIN.
+    const all = make({ 'livekit.SIP/ListSIPDispatchRule': { items: [...rules.items, { sip_dispatch_rule_id: 'M', name: 'meet-room', rule: { dispatch_rule_direct: { room_name: 'x', pin: '9' } } }] } })
+    expect(await all.bridge.listDialIns()).toEqual([
+      { meetingId: 'm', pin: '1111111111' },
+      { meetingId: 'm', pin: '0123456789' },
+      { meetingId: 'm', pin: '0123456789' },
+      { meetingId: 'm', pin: '2222222222' },
+      { meetingId: 'other', pin: '3333333333' }
+    ])
   })
 
   it('lets only the PBX call: the inbound trunk takes its addresses, written again over the one found', async () => {

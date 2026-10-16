@@ -232,6 +232,13 @@ export interface Store {
   claimConference(record: ConferenceRecord): Promise<ConferenceRecord>
   getConference(meetingId: string): Promise<ConferenceRecord | null>
   setConferencePin(meetingId: string, pin: string | null): Promise<void>
+  /**
+   * Sets the room's PIN to `to` only if it is still `from` (null: none): true when it did. Of two Gateways drawing a
+   * new PIN for a room at once, one only wins (third review n°5).
+   */
+  replaceConferencePin(meetingId: string, from: string | null, to: string | null): Promise<boolean>
+  /** The rooms of a tenant, or of one owner in it. */
+  countConferences(tenantId: string, ownerUserId?: string): Promise<number>
   deleteConference(meetingId: string): Promise<void>
 
   /** A person's subscriptions, oldest first. */

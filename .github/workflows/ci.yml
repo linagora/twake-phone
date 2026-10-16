@@ -84,15 +84,16 @@ jobs:
     # Le téléphone d'un appel avec l'opérateur est interrogé (OPTIONS dans l'appel) toutes les 5 s plutôt que 30 : un
     # téléphone parti met fin à l'appel en quelques secondes (e2e). L'appel le plus court que les minutes restantes
     # permettent : 5 s plutôt que 60, pour qu'un plafond de minutes coupe un appel en quelques secondes (trunk.sip.mjs).
-    # Les essais de PIN ratés d'une salle (étape 8) : 3 par appelant (refusé au-delà) et 6 pour tous en 10 minutes
-    # (l'alerte des administrateurs, le plafond de ceux qui masquent leur numéro) plutôt que 10 et 300, pour que
-    # trunk.sip.mjs et l'e2e les jouent en quelques appels.
+    # Les essais de PIN d'une salle (étape 8) : 3 par appelant (refusé au-delà) et 6 pour tous en 10 minutes
+    # (l'alerte des administrateurs, le plafond de ceux qui masquent leur numéro) plutôt que 10 et 300, et 10 appels
+    # simultanés au numéro d'accès plutôt que 100, pour que trunk.sip.mjs et l'e2e les jouent en quelques appels.
     env:
       TRUNK_ADVERTISE: 192.0.2.10:5070
       CALL_PING_SEC: "5"
       TRUNK_MIN_CALL_SEC: "5"
       MEET_PIN_TRIES: "3"
       MEET_PIN_TRIES_ALL: "6"
+      MEET_CALLS_ALL: "10"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

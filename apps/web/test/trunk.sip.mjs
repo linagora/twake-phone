@@ -23,8 +23,10 @@
 //   SIP_MEET             its socket for LiveKit SIP (step 8, default 127.0.0.1:5090), which these steps play from the
 //                        loopback (LiveKit SIP's address, MEET_SIP), and from 127.0.0.2 for an address that is not
 //   MEET_SIP_USER, MEET_SIP_PASSWORD, MEET_NUMBER   its MEET_* (default livekit, the stack's development password, 8000)
-//   MEET_MAX_CALL_SEC, MEET_PIN_TRIES, MEET_PIN_TRIES_ALL   its MEET_* (default 7200, 10, 300); the calls to the access
-//                        number of the steps go to LiveKit SIP at MEET_SIP, whatever it answers
+//   MEET_MAX_CALL_SEC, MEET_PIN_TRIES, MEET_PIN_TRIES_ALL, MEET_CALLS_PER_CALLER, MEET_CALLS_ALL   its MEET_* (default
+//                        7200, 10, 300, 2, 100); the calls to the access number of the steps go to LiveKit SIP at
+//                        MEET_SIP, which must not answer them (as LiveKit SIP without a room's rule: it rings, or not,
+//                        and drops the call)
 import { execSync } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
 import { createSocket } from 'node:dgram'
@@ -55,6 +57,8 @@ const MEET_NUMBER = process.env.MEET_NUMBER ?? '8000'
 const MEET_MAX_CALL_SEC = Number(process.env.MEET_MAX_CALL_SEC ?? 7200)
 const MEET_PIN_TRIES = Number(process.env.MEET_PIN_TRIES ?? 10)
 const MEET_PIN_TRIES_ALL = Number(process.env.MEET_PIN_TRIES_ALL ?? 300)
+const MEET_CALLS_PER_CALLER = Number(process.env.MEET_CALLS_PER_CALLER ?? 2)
+const MEET_CALLS_ALL = Number(process.env.MEET_CALLS_ALL ?? 100)
 const TENANT = 'trunk-sip'
 const LOGIN = '0033199000300'
 const PASSWORD = 'not-a-real-password'
@@ -176,7 +180,7 @@ const PROFILES = [
 ]
 const withCaps = caps => PROFILES.map(p => (p.id === 'world' ? { ...p, caps } : p))
 // What OpenSIPS raises for the administrators, as the Gateway hears it.
-const ALERT_EVENTS = ['E_FRD_WARNING', 'E_FRD_CRITICAL', 'E_TWAKEPHONE_LIMIT', 'E_TWAKEPHONE_RIGHTS', 'E_TWAKEPHONE_EMERGENCY']
+const ALERT_EVENTS = ['E_FRD_WARNING', 'E_FRD_CRITICAL', 'E_TWAKEPHONE_LIMIT', 'E_TWAKEPHONE_RIGHTS', 'E_TWAKEPHONE_EMERGENCY', 'E_TWAKEPHONE_PIN']
 const alerts = []
 const listener = createSocket('udp4')
 listener.on('message', m => {
@@ -1125,19 +1129,58 @@ try {
     await setOutbound({}, PROFILES, [])
   })
 
-  await step(`second review 8a, n°1: a call to the access number that LiveKit SIP does not answer is no failed try of a PIN: ${MEET_PIN_TRIES + 1} of them from 301, and ${MEET_PIN_TRIES_ALL + 1} of all, refuse nobody (the failed tries, counted at the end of a call LiveKit SIP answered, are played by the SIP e2e)`, async () => {
-    // What LiveKit SIP does with each does not matter here (with no rule of a room it may ring, then never answer, or
-    // refuse): a call OpenSIPS let through has no refusal of its own within 3 s, and is cancelled then.
-    const notRefused = async (p, i) => {
-      const call = await p.dial(MEET_NUMBER, { giveUpMs: 3_000 })
-      expect(`call ${i} of ${p.user} to 8000, let through`, !call.final || call.final.status !== 403 || header(call.final, 'twake-call-refused') !== 'pin-tries', call.final?.first)
-      if (call.final?.status === 200) await p.hangup(call)
-    }
+  await step(`third review 8a, n°1, n°2: a call to the access number is a try of a PIN when it comes, given back when LiveKit SIP does not answer it; ${MEET_CALLS_PER_CALLER} calls of one caller at the same time (486, meet-busy), ${MEET_CALLS_ALL} of all (503, meet-full, told); those who hide their number, refused past ${MEET_PIN_TRIES_ALL}, tell the administrators at ${MEET_PIN_TRIES_ALL} (the calls LiveKit SIP answers, and a wrong PIN typed late, are played by the SIP e2e)`, async () => {
+    // LiveKit SIP answers none of these (no room's rule: it rings, or not, and drops the call); OpenSIPS gives each up
+    // after 15 s (408). A call let through has no refusal of OpenSIPS's own.
+    const gone = callIds => until('the end of the calls to 8000', async () => {
+      const dialogs = (await mi('dlg_list')).result?.Dialogs ?? []
+      return callIds.every(id => !dialogs.some(d => d.callid === id))
+    }, 40_000)
+    const heldBy = async p => p.dial(MEET_NUMBER, { giveUpMs: 1_500 })
+    const letThrough = call => !call.final || !header(call.final, 'twake-call-refused')
+    const refusedFor = (what, answer, status, word) => expect(what, answer?.status === status && header(answer, 'twake-call-refused') === word, answer?.first ?? 'no answer')
     await mi('cache_remove_chunk', { glob: 'pin:*' })
+    await tables.set([main, backup], [...dids, { id: 'meet', trunkId: 'backup', first: '+33199000304', last: '+33199000304', target: MEET_NUMBER }])
     try {
-      for (let i = 1; i <= MEET_PIN_TRIES + 1; i++) await notRefused(p301, i)
-      for (let i = MEET_PIN_TRIES + 2; i <= MEET_PIN_TRIES_ALL + 1; i++) await notRefused(p303, i)
+      // A call of 301 nobody answers: its try given back once OpenSIPS gave it up.
+      const first = await heldBy(p301)
+      expect('the call of 301, let through', letThrough(first), first.final?.first)
+      await gone([first.callId])
+      // Two at the same time: the next one is busy, not a try.
+      const held = [p301.dial(MEET_NUMBER, { giveUpMs: 6_000 }), p301.dial(MEET_NUMBER, { giveUpMs: 6_000 })]
+      await sleep(1_500)
+      if (MEET_CALLS_PER_CALLER === 2) refusedFor('the third call of 301 at the same time', (await p301.dial(MEET_NUMBER, { giveUpMs: 3_000 })).final, 486, 'meet-busy')
+      const pair = await Promise.all(held)
+      expect('the two calls of 301, let through', pair.every(letThrough), pair.map(c => c.final?.first).join(', '))
+      await gone(pair.map(c => c.callId))
+      // Given back: as many tries as before, MEET_PIN_TRIES - 2 of them used (a call nobody answered, then two).
+      for (let i = 0; i < MEET_PIN_TRIES - 2; i++) {
+        const call = await heldBy(p301)
+        expect(`call ${i + 1} of 301 after the given back ones`, letThrough(call), call.final?.first)
+        await gone([call.callId])
+      }
+      // Hidden numbers: one count, refused past MEET_PIN_TRIES_ALL; the administrators told at MEET_PIN_TRIES_ALL.
+      alerts.length = 0
+      const hidden = []
+      for (let i = 0; i < MEET_PIN_TRIES_ALL; i++) hidden.push(await C.call('+33199000304', { from: 'anonymous', timeoutMs: 60_000 }))
+      const told = await untilAlert('the alert of the tries of all', (m, p) => m === 'E_TWAKEPHONE_PIN' && p.param === 'pin-tries')
+      expect('the alert', String(told.number) === MEET_NUMBER && Number(told.value) >= MEET_PIN_TRIES_ALL && Number(told.threshold) === MEET_PIN_TRIES_ALL, JSON.stringify(told))
+      refusedFor('one more hidden number', await (await C.call('+33199000304', { from: 'anonymous' })).final, 403, 'pin-tries')
+      for (const call of hidden) await call.cancel()
+      await gone(hidden.map(c => c.callId))
+      // All callers: MEET_CALLS_ALL at the same time, the next one refused, and told.
+      await mi('cache_remove_chunk', { glob: 'pin:*' })
+      alerts.length = 0
+      const many = []
+      for (let i = 0; i < MEET_CALLS_ALL; i++) many.push(await C.call('+33199000304', { from: `+336399820${String(i).padStart(2, '0')}`, timeoutMs: 60_000 }))
+      await sleep(1_000)
+      refusedFor('one call more than MEET_CALLS_ALL', await (await C.call('+33199000304', { from: '+33639982099' })).final, 503, 'meet-full')
+      const full = await untilAlert('the alert of the calls at the same time', (m, p) => m === 'E_TWAKEPHONE_PIN' && p.param === 'calls')
+      expect('the alert of the calls', Number(full.value) === MEET_CALLS_ALL + 1 && Number(full.threshold) === MEET_CALLS_ALL, JSON.stringify(full))
+      for (const call of many) await call.cancel()
+      await gone(many.map(c => c.callId))
     } finally {
+      await tables.set([main, backup], dids)
       await mi('cache_remove_chunk', { glob: 'pin:*' })
     }
   })

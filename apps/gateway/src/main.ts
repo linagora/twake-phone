@@ -1,6 +1,7 @@
 import { LiveKitConferenceBridge, MeetApi } from '@twake/conference-livekit'
 import { buildApp } from './app.js'
 import { authenticatorFromEnv } from './auth.js'
+import { sweepDialIns } from './conference-sweep.js'
 import { parseKey } from './crypto.js'
 import { StoreDirectory, accessNumberInUse, meetAccessMismatch, reservedInUse, seedUserMap } from './directory.js'
 import { DirectorySync, parseInterval } from './directory-sync.js'
@@ -104,11 +105,20 @@ const conference = conferenceOn && accessNumber
       // Meet owns rooms, PINs and dial-in rules when its external API is configured for the Gateway.
       const meet = env.MEET_URL && env.MEET_CLIENT_ID && env.MEET_CLIENT_SECRET ? new MeetApi({ url: env.MEET_URL, clientId: env.MEET_CLIENT_ID, clientSecret: env.MEET_CLIENT_SECRET }) : undefined
       // The trunks LiveKit needs (accept calls to the dial-in number, place dial-out calls). LiveKit may start later.
+      // Then, without Meet, the dispatch rules that let in no room the Gateway serves are deleted (third review n°4).
       const prepare = (attempt = 0): void => {
-        bridge.ensureTrunks().catch(err => {
-          console.error('LiveKit SIP trunks not ready, retrying:', (err as Error).message)
-          if (attempt < 30) setTimeout(() => prepare(attempt + 1), 10_000).unref()
-        })
+        bridge.ensureTrunks().then(
+          () => {
+            if (meet) return
+            sweepDialIns(bridge, store)
+              .then(dropped => dropped.length && console.warn(`LiveKit SIP: ${dropped.length} dial-in rule(s) of no room served deleted: ${dropped.join(', ')}`))
+              .catch((err: unknown) => console.error('LiveKit SIP dial-in rules not swept:', err instanceof Error ? err.message : String(err)))
+          },
+          err => {
+            console.error('LiveKit SIP trunks not ready, retrying:', (err as Error).message)
+            if (attempt < 30) setTimeout(() => prepare(attempt + 1), 10_000).unref()
+          }
+        )
       }
       prepare()
       return { bridge: () => bridge, ...(meet ? { meet } : {}), accessNumber, webhookKey: env.LIVEKIT_API_KEY!, webhookSecret: env.LIVEKIT_API_SECRET! }

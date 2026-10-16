@@ -158,6 +158,18 @@ export class MemoryStore implements Store {
     else c.pin = pin
   }
 
+  async replaceConferencePin(meetingId: string, from: string | null, to: string | null) {
+    const c = this.conferences.get(meetingId)
+    if (!c || (c.pin ?? null) !== from) return false
+    if (to === null) delete c.pin
+    else c.pin = to
+    return true
+  }
+
+  async countConferences(tenantId: string, ownerUserId?: string) {
+    return [...this.conferences.values()].filter(c => c.tenantId === tenantId && (ownerUserId === undefined || c.ownerUserId === ownerUserId)).length
+  }
+
   async deleteConference(meetingId: string) {
     this.conferences.delete(meetingId)
   }

@@ -34,27 +34,66 @@ const providerOf = (grants?: { extension: string; number: string; token: string;
     }
   ])
 
-const setup = async ({ fail, grants = true, dialOutLimiter, conferenceLimiter }: { fail?: { status: number; body: unknown }; grants?: boolean; dialOutLimiter?: RateLimiter; conferenceLimiter?: RateLimiter } = {}) => {
+/** The dispatch rules a fake LiveKit holds (shared by two Gateways in a test): created, listed with their PIN, deleted. */
+const fakeRules = () => {
+  const rules = new Map<string, { name: string; pin: string; trunk: string }>()
+  let next = 0
+  return {
+    rules,
+    add: (name: string, pin: string, trunk = 'T') => {
+      const id = `R${++next}`
+      rules.set(id, { name, pin, trunk })
+      return id
+    },
+    /** The PINs of the rules of a room. */
+    of: (room: string) => [...rules.values()].filter(r => r.name === `twake-meet-${room}`).map(r => r.pin)
+  }
+}
+
+const setup = async ({
+  fail,
+  grants = true,
+  dialOutLimiter,
+  conferenceLimiter,
+  conferenceReadLimiter,
+  conferenceCaps,
+  lk = fakeRules(),
+  store = new MemoryStore(),
+  random = (max: number) => Math.floor(max / 2)
+}: {
+  fail?: { status: number; body: unknown }
+  grants?: boolean
+  dialOutLimiter?: RateLimiter
+  conferenceLimiter?: RateLimiter
+  conferenceReadLimiter?: RateLimiter
+  conferenceCaps?: { perPerson?: number; perTenant?: number }
+  lk?: ReturnType<typeof fakeRules>
+  store?: MemoryStore
+  random?: (max: number) => number
+} = {}) => {
   const calls: string[] = []
-  const rules = new Set<string>()
   const fetch: Fetch = async (url, init) => {
     const path = new URL(url).pathname.replace('/twirp/', '')
     calls.push(`${path} ${init.body}`)
     if (fail && path === 'livekit.SIP/CreateSIPParticipant') return { ok: false, status: fail.status, text: async () => JSON.stringify(fail.body) }
-    if (path === 'livekit.SIP/CreateSIPDispatchRule') rules.add(JSON.parse(init.body ?? '{}').dispatch_rule.name)
+    const body = JSON.parse(init.body ?? '{}')
+    let created: string | undefined
+    if (path === 'livekit.SIP/CreateSIPDispatchRule') created = lk.add(body.dispatch_rule.name, body.dispatch_rule.rule.dispatch_rule_direct.pin, body.dispatch_rule.trunk_ids[0])
+    if (path === 'livekit.SIP/DeleteSIPDispatchRule') lk.rules.delete(body.sip_dispatch_rule_id)
     const out: Record<string, unknown> = {
       'livekit.SIP/ListSIPInboundTrunk': { items: [{ sip_trunk_id: 'T', name: 'twake-meet-in' }] },
-      'livekit.SIP/CreateSIPDispatchRule': { sip_dispatch_rule_id: 'R' },
-      'livekit.SIP/ListSIPDispatchRule': { items: [...rules].map(name => ({ sip_dispatch_rule_id: 'R', name, trunk_ids: ['T'] })) },
+      'livekit.SIP/CreateSIPDispatchRule': { sip_dispatch_rule_id: created },
+      'livekit.SIP/ListSIPDispatchRule': {
+        items: [...lk.rules].map(([id, r]) => ({ sip_dispatch_rule_id: id, name: r.name, trunk_ids: [r.trunk], rule: { dispatch_rule_direct: { room_name: r.name.slice(11), pin: r.pin } } }))
+      },
       'livekit.SIP/CreateSIPOutboundTrunk': { sip_trunk_id: 'O' },
       'livekit.RoomService/ListParticipants': { participants: [{ identity: 'web1', name: 'Bob' }] }
     }
     return { ok: true, status: 200, text: async () => JSON.stringify(out[path] ?? {}) }
   }
-  const bridge = new LiveKitConferenceBridge({ url: 'http://lk', apiKey: 'k', apiSecret: 's', dialInNumbers: [{ country: 'FR', e164: '8000' }], inboundAddresses: ['192.0.2.30'], outboundAddress: 'pbx:5060', fetch }, max => Math.floor(max / 2))
+  const bridge = new LiveKitConferenceBridge({ url: 'http://lk', apiKey: 'k', apiSecret: 's', dialInNumbers: [{ country: 'FR', e164: '8000' }], inboundAddresses: ['192.0.2.30'], outboundAddress: 'pbx:5060', fetch }, random)
   const bus = new EventBus()
   // Alice holds an extension (a room calls at her name); Bob does not.
-  const store = new MemoryStore()
   await store.upsertMapping({ tenantId: 'dev', userId: 'alice', extension: '101' })
   const granted: { extension: string; number: string; token: string; revoked: boolean }[] = []
   const app = await buildApp(providerOf(grants ? granted : undefined), {
@@ -62,6 +101,8 @@ const setup = async ({ fail, grants = true, dialOutLimiter, conferenceLimiter }:
     store,
     ...(dialOutLimiter ? { dialOutLimiter } : {}),
     ...(conferenceLimiter ? { conferenceLimiter } : {}),
+    ...(conferenceReadLimiter ? { conferenceReadLimiter } : {}),
+    ...(conferenceCaps ? { conferenceCaps } : {}),
     conference: { bridge: t => (t === 'off' ? undefined : bridge), accessNumber: '8000', webhookKey: 'k', webhookSecret: 's' }
   })
   const as = (user: string, tenant = 'dev') => ({ 'x-dev-user': user, 'x-dev-tenant': tenant })
@@ -71,7 +112,7 @@ const setup = async ({ fail, grants = true, dialOutLimiter, conferenceLimiter }:
     expect(res.statusCode, res.body).toBe(201)
     return res.json().meetingId as string
   }
-  return { app, calls, bus, as, open, granted, rules, store }
+  return { app, calls, bus, as, open, granted, lk, store, bridge }
 }
 const sentOf = (calls: string[], path: string) => calls.filter(c => c.startsWith(path)).map(c => JSON.parse(c.split(' ').slice(1).join(' ')))
 
@@ -110,11 +151,11 @@ describe('conference endpoints', () => {
   })
 
   it('draws again the PIN of a room opened before the PINs had PIN_DIGITS digits, its old rule removed (second review n°6)', async () => {
-    const { app, as, calls, store, rules } = await setup()
+    const { app, as, calls, store, lk } = await setup()
     const room = 'twake-0123456789abcdef'
     await store.claimConference({ tenantId: 'dev', meetingId: room, ownerUserId: 'alice', createdAt: '2026-10-01T00:00:00.000Z' })
     await store.setConferencePin(room, '123456')
-    rules.add(`twake-meet-${room}`)
+    lk.add(`twake-meet-${room}`, '123456')
     const res = await app.inject({ url: `/api/v1/conferences/${room}`, headers: as('alice') })
     expect(res.statusCode, res.body).toBe(200)
     expect(res.json().dialIn.pin).toMatch(/^\d{10}$/)
@@ -125,6 +166,66 @@ describe('conference endpoints', () => {
     const again = await app.inject({ method: 'POST', url: '/api/v1/conferences', headers: as('alice'), payload: { meetingId: room } })
     expect(again.json().dialIn.pin).toBe(res.json().dialIn.pin)
     expect(sentOf(calls, 'livekit.SIP/CreateSIPDispatchRule')).toHaveLength(1)
+  })
+
+  it('reads of a room at once, on one Gateway or two, leave it one rule and show one PIN; a rule with another PIN is replaced (third review n°5)', async () => {
+    const room = 'twake-0123456789abcdef'
+    const lk = fakeRules()
+    const store = new MemoryStore()
+    let a = 0
+    let b = 0
+    const one = await setup({ lk, store, random: max => (1_000_000_000 + ++a) % max })
+    const two = await setup({ lk, store, random: max => (2_000_000_000 + ++b) % max })
+    await store.claimConference({ tenantId: 'dev', meetingId: room, ownerUserId: 'alice', createdAt: '2026-10-01T00:00:00.000Z' })
+    await store.setConferencePin(room, '123456')
+    lk.add(`twake-meet-${room}`, '123456')
+    const read = (app: typeof one.app) => app.inject({ url: `/api/v1/conferences/${room}`, headers: one.as('alice') })
+    const reads = await Promise.all([read(one.app), read(one.app), read(two.app), read(one.app), read(two.app), read(two.app)])
+    expect(reads.map(r => r.statusCode)).toEqual([200, 200, 200, 200, 200, 200])
+    const shown = new Set(reads.map(r => r.json().dialIn.pin))
+    expect(shown.size).toBe(1)
+    const [pin] = [...shown]
+    expect(pin).toMatch(/^\d{10}$/)
+    expect((await store.getConference(room))?.pin).toBe(pin)
+    expect(lk.of(room)).toEqual([pin])
+    // One draw at a time per room on a Gateway.
+    expect(sentOf(one.calls, 'livekit.SIP/CreateSIPDispatchRule').length + sentOf(two.calls, 'livekit.SIP/CreateSIPDispatchRule').length).toBeLessThanOrEqual(2)
+    // The rule LiveKit has with another PIN than the one shown (left by a race, made by hand) is replaced at the next check.
+    const fresh = await setup({ lk, store })
+    for (const id of [...lk.rules.keys()]) lk.rules.delete(id)
+    lk.add(`twake-meet-${room}`, '9999999999')
+    expect((await read(fresh.app)).json().dialIn.pin).toBe(pin)
+    expect(lk.of(room)).toEqual([pin])
+    // Closed, the room loses every rule of its own.
+    lk.add(`twake-meet-${room}`, '8888888888')
+    expect((await fresh.app.inject({ method: 'DELETE', url: `/api/v1/conferences/${room}`, headers: one.as('alice') })).statusCode).toBe(204)
+    expect(lk.of(room)).toEqual([])
+  })
+
+  it('reads a room again without asking LiveKit each time, at most 60 a minute per person (third review n°6, n°7)', async () => {
+    const { app, as, calls, open } = await setup({ conferenceReadLimiter: new RateLimiter(3, 60_000) })
+    const room = await open()
+    const listed = () => calls.filter(c => c.startsWith('livekit.SIP/List')).length
+    const before = listed()
+    for (let i = 0; i < 3; i++) expect((await app.inject({ url: `/api/v1/conferences/${room}`, headers: as('alice') })).statusCode).toBe(200)
+    expect(listed()).toBe(before)
+    const late = await app.inject({ url: `/api/v1/conferences/${room}`, headers: as('alice') })
+    expect(`${late.statusCode} ${late.json().code}`).toBe('429 CONFERENCE_READ_LIMIT')
+    // Each person their own count.
+    expect((await app.inject({ url: `/api/v1/conferences/${await open('bob')}`, headers: as('bob') })).statusCode).toBe(200)
+  })
+
+  it('bounds the rooms open at once, per person and per tenant, in the database (third review n°6)', async () => {
+    const { app, as, open } = await setup({ conferenceCaps: { perPerson: 2, perTenant: 3 } })
+    const create = (user: string) => app.inject({ method: 'POST', url: '/api/v1/conferences', headers: as(user), payload: { create: true } })
+    const first = await open()
+    await open()
+    expect(`${(await create('alice')).statusCode} ${(await create('alice')).json().code}`).toBe('429 CONFERENCE_LIMIT')
+    await open('bob')
+    expect((await create('carol')).statusCode).toBe(429)
+    // A room closed makes room for another.
+    expect((await app.inject({ method: 'DELETE', url: `/api/v1/conferences/${first}`, headers: as('alice') })).statusCode).toBe(204)
+    await open('carol')
   })
 
   it('without Meet, serves no room it did not name (claimed by its name before), except to close it (second review n°6)', async () => {

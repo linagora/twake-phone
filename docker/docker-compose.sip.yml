@@ -164,12 +164,13 @@ services:
       MEET_NUMBER: ${MEET_NUMBER:-8000}
       MEET_SIP_USER: ${MEET_SIP_USER:-livekit}
       MEET_SIP_PASSWORD: ${MEET_SIP_PASSWORD:-twake-meet-dev-only}
-      # The failed tries of a PIN (a call LiveKit SIP answered that ends within MEET_PIN_FAIL_SEC) after which a caller
-      # is refused for 10 minutes, those of all callers that tell the administrators, and the longest a call with
-      # LiveKit SIP lasts.
+      # The tries of a PIN (each call to MEET_NUMBER LiveKit SIP answers) after which a caller is refused for 10
+      # minutes, those of all callers that tell the administrators, the calls to MEET_NUMBER at the same time of one
+      # caller and of all, and the longest a call with LiveKit SIP lasts.
       MEET_PIN_TRIES: ${MEET_PIN_TRIES:-10}
       MEET_PIN_TRIES_ALL: ${MEET_PIN_TRIES_ALL:-300}
-      MEET_PIN_FAIL_SEC: ${MEET_PIN_FAIL_SEC:-60}
+      MEET_CALLS_PER_CALLER: ${MEET_CALLS_PER_CALLER:-2}
+      MEET_CALLS_ALL: ${MEET_CALLS_ALL:-100}
       MEET_MAX_CALL_SEC: ${MEET_MAX_CALL_SEC:-7200}
     network_mode: host
     healthcheck:

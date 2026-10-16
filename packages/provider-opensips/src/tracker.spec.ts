@@ -607,7 +607,15 @@ describe('CallTracker', () => {
     // Nothing that is no access number.
     tracker.handle('E_TWAKEPHONE_PIN', { number: '+33199000150', value: 301, threshold: 300 })
     tracker.handle('E_TWAKEPHONE_PIN', { value: 301 })
+    tracker.handle('E_TWAKEPHONE_PIN', { param: 'other', number: '8000', value: 301 })
     expect(events).toHaveLength(1)
+    // The calls to it at the same time (third review n°1), and the tries told with their kind.
+    tracker.handle('E_TWAKEPHONE_PIN', { param: 'calls', number: '8000', value: '101', threshold: '100' })
+    tracker.handle('E_TWAKEPHONE_PIN', { param: 'pin-tries', number: '8000', value: '300', threshold: '300' })
+    expect(events.slice(1).map(e => e.event.type === 'alert.raised' && e.event.payload.alert)).toEqual([
+      { kind: 'meet', param: 'meet-calls', scope: 'tenant', number: '8000', value: 101, threshold: 100 },
+      { kind: 'meet', param: 'pin-tries', scope: 'tenant', number: '8000', value: 300, threshold: 300 }
+    ])
   })
 
   it('forgets the emergency calls older than the window, on the clock it was given (review 6b, n°11, n°21)', () => {

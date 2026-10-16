@@ -83,8 +83,10 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
         [{ MEET_PIN_TRIES: '0' }, /MEET_PIN_TRIES/],
         [{ MEET_PIN_TRIES: 'x' }, /MEET_PIN_TRIES/],
         [{ MEET_PIN_TRIES: '20', MEET_PIN_TRIES_ALL: '10' }, /MEET_PIN_TRIES_ALL/],
-        [{ MEET_PIN_FAIL_SEC: '5' }, /MEET_PIN_FAIL_SEC/],
-        [{ MEET_PIN_FAIL_SEC: '601' }, /MEET_PIN_FAIL_SEC/],
+        [{ MEET_CALLS_PER_CALLER: '0' }, /MEET_CALLS_PER_CALLER/],
+        [{ MEET_CALLS_PER_CALLER: '21' }, /MEET_CALLS_PER_CALLER/],
+        [{ MEET_CALLS_PER_CALLER: '5', MEET_CALLS_ALL: '4' }, /MEET_CALLS_ALL/],
+        [{ MEET_CALLS_ALL: '10001' }, /MEET_CALLS_ALL/],
         [{ MEET_MAX_CALL_SEC: '30' }, /MEET_MAX_CALL_SEC/],
         [{ MEET_MAX_CALL_SEC: '100000' }, /MEET_MAX_CALL_SEC/]
       ] as [Record<string, string>, RegExp][]).map(([e, m]) => [{ MEET_SIP: '192.0.2.20:5080', MEET_SIP_PASSWORD: password, ...e }, m])
@@ -94,9 +96,9 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
       expect(stderr).toMatch(message)
     }
     // Meet off: its settings are not read (second review n°10), whatever they say.
-    const offWrong = render({ MEET_PIN_TRIES: 'x', MEET_PIN_TRIES_ALL: '0', MEET_PIN_FAIL_SEC: '1', MEET_MAX_CALL_SEC: '30' })
+    const offWrong = render({ MEET_PIN_TRIES: 'x', MEET_PIN_TRIES_ALL: '0', MEET_CALLS_PER_CALLER: '0', MEET_CALLS_ALL: 'x', MEET_MAX_CALL_SEC: '30' })
     expect(offWrong.status, offWrong.stderr).toBe(0)
-    expect(offWrong.cfg).toContain('$DLG_timeout > 7200)')
+    expect(offWrong.cfg).toContain('modparam("cfgutils", "shvset", "meet_max_sec=i:7200")')
   })
 
   it('takes a room call only with the Gateway grant of that very call: used once, for its person and number (step 8, review n°1)', () => {
@@ -118,36 +120,50 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(cfg).toContain('$acc_extra(via) = "meet";')
   })
 
-  it('counts the failed tries of a PIN per caller, refuses only that caller, tells the administrators of all, and bounds every call with LiveKit SIP (step 8, second review n°1, n°2)', () => {
-    const { cfg } = render({ MEET_SIP: '192.0.2.20:5080', MEET_SIP_PASSWORD: 'not-a-real-secret-0', MEET_PIN_TRIES: '4', MEET_PIN_TRIES_ALL: '50', MEET_PIN_FAIL_SEC: '45', MEET_MAX_CALL_SEC: '1800' })
+  it('counts every call LiveKit SIP answers as a try of its caller, when it comes, caps the calls at the same time, tells the administrators, and bounds every call with LiveKit SIP (step 8, third review n°1, n°2, n°3)', () => {
+    const { cfg } = render({ MEET_SIP: '192.0.2.20:5080', MEET_SIP_PASSWORD: 'not-a-real-secret-0', MEET_PIN_TRIES: '4', MEET_PIN_TRIES_ALL: '50', MEET_CALLS_PER_CALLER: '3', MEET_CALLS_ALL: '40', MEET_MAX_CALL_SEC: '1800' })
     const section = (name: string, next: string) => cfg.slice(cfg.indexOf(`\n${name} {`), cfg.indexOf(`\n${next} {`))
     const call = section('route[meet_call]', 'failure_route[meet_failed]')
-    // A call to the access number reads its caller's failed tries, never counts one itself, never reads those of all.
-    expect(call).toContain('if (!cache_counter_fetch("local", "pin:c:$var(pin_who)", $var(pin_n)))')
-    expect(call).not.toContain('cache_add(')
-    expect(call).not.toContain('pin:all')
-    expect(call).toContain('$var(pin_cap) = 4;\n\tif ($var(pin_who) == "anonymous" || $var(pin_who) == "other")\n\t\t$var(pin_cap) = 50;')
-    expect(call).toContain('if ($var(pin_n) >= $var(pin_cap)) {')
-    expect(call.indexOf('t_reply(403, "Too Many Tries");')).toBeLessThan(call.indexOf('$ru = "sip:8000@192.0.2.20:5080";'))
-    // Every call to it lasts MEET_MAX_CALL_SEC at most, from the operator too.
-    expect(call).toContain('if ($DLG_timeout > 1800)\n\t\t$DLG_timeout = 1800;')
-    expect(cfg).toContain('if ($dlg_val(meet) == "caller" && $DLG_timeout > 1800)\n\t\t$DLG_timeout = 1800;')
-    // A failed try: its BYE, either side, within MEET_PIN_FAIL_SEC of the answer, once.
-    expect(cfg).toContain('if (is_method("BYE") && $dlg_val(meet) == "callee")\n\t\t\troute(meet_bye);')
-    const bye = section('route[meet_bye]', 'route[outbound_policy]')
-    expect(bye).toContain('if ($dlg_val(pin_counted) == "1" || $DLG_lifetime >= 45)\n\t\treturn(1);')
-    expect(bye).toContain('cache_add("local", "pin:c:$var(pin_who)", 1, 600, $var(pin_n));\n\tcache_add("local", "pin:all", 1, 600, $var(pin_all));')
-    // Those of all: an alert, once per 10 minutes, and nobody refused for them.
-    expect(bye).toContain('if ($var(pin_all) <= 50)\n\t\treturn(1);')
-    expect(bye).toContain('cache_add("local", "pin:told", 1, 600, $var(pin_told));\n\tif ($var(pin_told) != 1)\n\t\treturn(1);')
-    expect(bye).toContain('raise_event("E_TWAKEPHONE_PIN", $avp(ev_attr), $avp(ev_val));')
-    expect(bye).not.toContain('t_reply(')
+    const at = (text: string) => {
+      const i = call.indexOf(text)
+      expect(i, text).toBeGreaterThan(0)
+      return i
+    }
+    // The calls at the same time, this one counted in, under a lock; those who hide their number under the cap of all.
+    expect(call).toContain('$var(pin_cap) = 4;\n\t$var(m_cap) = 3;\n\tif ($var(pin_who) == "anonymous" || $var(pin_who) == "other") {\n\t\t$var(pin_cap) = 50;\n\t\t$var(m_cap) = 40;\n\t}')
+    expect(call).toContain('get_static_lock("meet_count");\n\tset_dlg_profile("meet_caller", "$var(pin_who)");\n\tset_dlg_profile("meet_all");\n\tget_profile_size("meet_caller", "$var(pin_who)", $var(m_mine));\n\tget_profile_size("meet_all", , $var(m_all));\n\trelease_static_lock("meet_count");')
+    expect(call).toContain('if ($var(m_all) > 40) {')
+    expect(at('t_reply(503, "Service Unavailable");')).toBeGreaterThan(at('route(meet_alert, "calls", $var(m_all), 40);'))
+    expect(call).toContain('if ($var(m_mine) > $var(m_cap)) {')
+    // A try counted when the call comes (whatever its length), before the refusal: calls at once count each other.
+    expect(call).toContain('cache_add("local", "pin:c:$var(pin_who)", 1, 600, $var(pin_n));\n\tif ($var(pin_n) > $var(pin_cap)) {')
+    expect(at('t_reply(486, "Busy Here");')).toBeLessThan(at('cache_add("local", "pin:c:'))
+    expect(at('t_reply(403, "Too Many Tries");')).toBeLessThan(at('$ru = "sip:8000@192.0.2.20:5080";'))
+    // Those of all: the alert at the threshold (not past it: those who hide their number are refused past it).
+    expect(call).toContain('cache_add("local", "pin:all", 1, 600, $var(pin_all));\n\tif ($var(pin_all) >= 50)\n\t\troute(meet_alert, "pin-tries", $var(pin_all), 50);')
+    // Given back when LiveKit SIP does not answer.
+    const failed = section('failure_route[meet_failed]', 'route[meet_alert]')
+    expect(failed).toContain('cache_sub("local", "pin:c:$avp(pin_who)", 1, 600, $var(left));')
+    expect(failed).toContain('cache_sub("local", "pin:all", 1, 600, $var(left));')
+    // Told once per 10 minutes for each; nobody refused there.
+    const alert = section('route[meet_alert]', 'route[outbound_policy]')
+    expect(alert).toContain('cache_add("local", "pin:told:$param(1)", 1, 600, $var(told));\n\tif ($var(told) != 1)\n\t\treturn(1);')
+    expect(alert).toContain('raise_event("E_TWAKEPHONE_PIN", $avp(ev_attr), $avp(ev_val));')
+    expect(alert).not.toContain('t_reply(')
+    // No count at a BYE any more (a wrong PIN typed late was none).
+    expect(cfg).not.toContain('route(meet_bye)')
+    // Every call to it lasts MEET_MAX_CALL_SEC at most, then BYE to both sides: from a phone too (B; the operator's
+    // calls have it already), and the rooms' calls; the e2e shortens it through the MI.
+    expect(cfg).toContain('modparam("cfgutils", "shvset", "meet_max_sec=i:1800")')
+    expect(call).toContain('if ($dlg_val(trunk) == NULL)\n\t\tcreate_dialog("B");\n\tif ($DLG_timeout > $shv(meet_max_sec))\n\t\t$DLG_timeout = $shv(meet_max_sec);')
+    expect(cfg).toContain('if ($dlg_val(meet) == "caller" && $DLG_timeout > $shv(meet_max_sec))\n\t\t$DLG_timeout = $shv(meet_max_sec);')
+    expect(cfg).toContain('modparam("dialog", "profiles_with_value", "trunk_caller;meet_caller")')
     // The defaults.
     const defaults = render({ MEET_SIP: '192.0.2.20:5080', MEET_SIP_PASSWORD: 'not-a-real-secret-0' }).cfg
-    expect(defaults).toContain('$var(pin_cap) = 10;')
-    expect(defaults).toContain('$DLG_lifetime >= 60)')
-    expect(defaults).toContain('if ($var(pin_all) <= 300)')
-    expect(defaults).toContain('$DLG_timeout > 7200)')
+    expect(defaults).toContain('$var(pin_cap) = 10;\n\t$var(m_cap) = 2;')
+    expect(defaults).toContain('if ($var(m_all) > 100) {')
+    expect(defaults).toContain('if ($var(pin_all) >= 300)')
+    expect(defaults).toContain('modparam("cfgutils", "shvset", "meet_max_sec=i:7200")')
   })
 
   it('announces a call once nothing can refuse it without a transaction: after lookup and rtpengine, just before the relay', () => {
@@ -971,7 +987,8 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     const { cfg } = render({ CALL_PING_SEC: '12' })
     expect(cfg).toContain('modparam("dialog", "options_ping_interval", 12)')
     // Never for an emergency call (B only): the emergency services hang up themselves, a silent phone must not cut them.
-    expect(cfg.replace(/#.*$/gm, '').match(/create_dialog\(("[^"]*")?\)/g)).toEqual(['create_dialog()', 'create_dialog("B")', 'create_dialog("BP")', 'create_dialog("Bp")'])
+    // A phone's call to the access number of Meet's rooms (route[meet_call]): B only, LiveKit SIP is not asked either.
+    expect(cfg.replace(/#.*$/gm, '').match(/create_dialog\(("[^"]*")?\)/g)).toEqual(['create_dialog()', 'create_dialog("B")', 'create_dialog("B")', 'create_dialog("BP")', 'create_dialog("Bp")'])
     expect(render().cfg).toContain('modparam("dialog", "options_ping_interval", 30)')
     expect(render({ CALL_PING_SEC: '5' }).status).toBe(0)
     expect(render({ CALL_PING_SEC: '300' }).status).toBe(0)
@@ -1161,7 +1178,7 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(section('route[default_trunk]', 'timer_route[default_trunk, 15]')).toContain('$(var(dn){s.select,1,|}{s.int}) >= $shv(dn_gen)')
     expect(cfg).toContain('modparam("cfgutils", "shvset", "dn_gen=i:0")')
     // n°10: the emergency calls known as such in the database (their profile), a day at most, 2 h once restored.
-    expect(cfg).toContain('modparam("dialog", "profiles_no_value", "trunk_out;trunk_emergency")')
+    expect(cfg).toContain('modparam("dialog", "profiles_no_value", "trunk_out;trunk_emergency;meet_all")')
     const entry = readFileSync(join(dir, 'entrypoint.sh'), 'utf8')
     expect(entry).toContain(`-c "SELECT twake_outbound_restart(${EMERGENCY_RESTORED_SEC})"`)
     // n°4: before OpenSIPS starts, after the tables are there.

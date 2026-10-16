@@ -161,8 +161,9 @@ modparam("dialog", "default_timeout", 14400)
 modparam("dialog", "options_ping_interval", ${CALL_PING_SEC})
 # The calls to the public network in progress (step 6b, route[outbound_count]): per caller's extension, and all of them
 # (one organisation per OpenSIPS). An emergency call is in neither, but in trunk_emergency: how a restart knows it.
-modparam("dialog", "profiles_with_value", "trunk_caller")
-modparam("dialog", "profiles_no_value", "trunk_out;trunk_emergency")
+# The calls to the access number of Meet's rooms in progress (step 8, route[meet_call]): per caller, and all of them.
+modparam("dialog", "profiles_with_value", "trunk_caller;meet_caller")
+modparam("dialog", "profiles_no_value", "trunk_out;trunk_emergency;meet_all")
 loadmodule "rtpengine.so"
 modparam("rtpengine", "rtpengine_sock", "${RTPENGINE_SOCK}")
 
@@ -196,6 +197,9 @@ modparam("cfgutils", "shvset", "no5_until=i:0")
 # number. The Gateway reads both through the MI (shv_get) and says at its start when it has another view of them.
 modparam("cfgutils", "shvset", "meet_on=i:${MEET_ON}")
 modparam("cfgutils", "shvset", "meet_number=s:${MEET_NUMBER}")
+# The longest a call with LiveKit SIP lasts (MEET_MAX_CALL_SEC): for the calls to come once changed (MI shv_set; the e2e
+# shortens it a moment).
+modparam("cfgutils", "shvset", "meet_max_sec=i:${MEET_MAX_CALL_SEC}")
 
 #### Calls to someone without a window (step 5, ADR 0015): when the extension a call reaches has no registered window
 #### and its holder has a browser to wake (`push_targets`, written by the Gateway for a person with a push
@@ -547,9 +551,6 @@ route {
 		}
 		if (is_method("BYE"))
 			rtpengine_delete();
-		# A call to the access number ending: a failed try of a PIN when it was short (route[meet_bye]).
-		if (is_method("BYE") && $dlg_val(meet) == "callee")
-			route(meet_bye);
 		# Who the parties are was said once, by this script, in the initial INVITE and its answer.
 		remove_hf("P-Asserted-Identity");
 		remove_hf("P-Preferred-Identity");
@@ -839,14 +840,16 @@ route {
 #   anyone's. It is then that person's call: an extension or a group as from their phone, a number of the public
 #   network with their rights, caps, volume thresholds and direct number (route[trunk_out]), never longer than
 #   MEET_MAX_CALL_SEC; never an emergency number nor the access number. The callee's phone shows "Meet (<name>)".
-# - a call to the access number is a try of a room's PIN (one per call, LiveKit SIP). A try that failed is a call
-#   LiveKit SIP answered that ends (either side) within MEET_PIN_FAIL_SEC of its answer (a wrong PIN: LiveKit SIP hangs
-#   up; a caller who gives up): counted per caller over 10 minutes (route[meet_bye]). A caller with MEET_PIN_TRIES of
-#   them is refused (403, pin-tries) for the rest of those 10 minutes; those who hide their number share one count,
-#   refused past MEET_PIN_TRIES_ALL. Nobody else is ever refused for what others tried: MEET_PIN_TRIES_ALL failed tries
-#   of all callers together in 10 minutes tell the administrators (E_TWAKEPHONE_PIN), once per 10 minutes. The counts
-#   are in memory, this OpenSIPS's only, forgotten when it restarts. A call to the access number lasts
-#   MEET_MAX_CALL_SEC at most, as a room's call.
+# - a call to the access number is a try of a room's PIN (one per call, LiveKit SIP): counted for its caller when it
+#   comes, given back if LiveKit SIP does not answer it (route[meet_call], failure_route[meet_failed]), whatever then
+#   happens in it (a right PIN, a wrong one typed at once or after an hour). A caller with MEET_PIN_TRIES of them in 10
+#   minutes is refused (403, pin-tries) for the rest of those 10 minutes; those who hide their number share one count,
+#   refused past MEET_PIN_TRIES_ALL. A caller has MEET_CALLS_PER_CALLER calls to it at the same time at most (486,
+#   meet-busy; those who hide their number together MEET_CALLS_ALL), all callers MEET_CALLS_ALL (503, meet-full). The
+#   administrators are told (E_TWAKEPHONE_PIN, once per 10 minutes for each) when the calls of all callers in 10
+#   minutes reach MEET_PIN_TRIES_ALL (pin-tries) and when MEET_CALLS_ALL are in progress (calls). The counts of 10
+#   minutes are in memory, this OpenSIPS's only, forgotten when it restarts. A call with LiveKit SIP lasts
+#   MEET_MAX_CALL_SEC at most ($shv(meet_max_sec)), then BYE to both sides.
 # The media through rtpengine, plain RTP on LiveKit SIP's side (route[rtp_flags]).
 
 # A room's call: its grant taken (deleted, so used once), for whoever its From names, one of our accounts, and the
@@ -898,30 +901,62 @@ route[meet_call] {
 		t_reply(482, "Loop Detected");
 		exit;
 	}
-	# The failed tries of a PIN of this caller (the extension, the operator's caller; `anonymous` for all who hide
-	# their number) in 10 minutes (route[meet_bye]): MEET_PIN_TRIES of them (MEET_PIN_TRIES_ALL for `anonymous`), and
-	# it is refused before LiveKit SIP. Never for what other callers tried.
+	# Who calls: the extension, the operator's caller; `anonymous` for all who hide their number.
 	$var(pin_who) = "other";
 	if ($avp(caller) =~ "^[A-Za-z0-9._+-]{1,64}$")
 		$var(pin_who) = $avp(caller);
 	$var(pin_cap) = ${MEET_PIN_TRIES};
-	if ($var(pin_who) == "anonymous" || $var(pin_who) == "other")
+	$var(m_cap) = ${MEET_CALLS_PER_CALLER};
+	if ($var(pin_who) == "anonymous" || $var(pin_who) == "other") {
 		$var(pin_cap) = ${MEET_PIN_TRIES_ALL};
+		$var(m_cap) = ${MEET_CALLS_ALL};
+	}
+	# The calls to the access number at the same time, this one counted in, under a lock: of two calls at once, one
+	# counts the other. Its dialog leaves the profiles when it ends, refused or not.
+	get_static_lock("meet_count");
+	set_dlg_profile("meet_caller", "$var(pin_who)");
+	set_dlg_profile("meet_all");
+	get_profile_size("meet_caller", "$var(pin_who)", $var(m_mine));
+	get_profile_size("meet_all", , $var(m_all));
+	release_static_lock("meet_count");
+	if ($var(m_all) > ${MEET_CALLS_ALL}) {
+		xlog("L_WARN", "meet: call $ci from $avp(caller) to the access number refused: $var(m_all) calls to it at the same time\n");
+		route(meet_alert, "calls", $var(m_all), ${MEET_CALLS_ALL});
+		append_to_reply("Twake-Call-Refused: meet-full\r\n");
+		t_reply(503, "Service Unavailable");
+		exit;
+	}
+	if ($var(m_mine) > $var(m_cap)) {
+		xlog("L_NOTICE", "meet: call $ci from $avp(caller) to the access number refused: $var(m_mine) calls of it at the same time\n");
+		append_to_reply("Twake-Call-Refused: meet-busy\r\n");
+		t_reply(486, "Busy Here");
+		exit;
+	}
+	# A try of a PIN, counted now (calls at once count each other), given back if LiveKit SIP does not answer it
+	# (failure_route[meet_failed]): past MEET_PIN_TRIES of this caller in 10 minutes from the first one
+	# (MEET_PIN_TRIES_ALL for `anonymous`), refused before LiveKit SIP. Never for what other callers tried.
 	$var(pin_n) = 0;
-	if (!cache_counter_fetch("local", "pin:c:$var(pin_who)", $var(pin_n)))
-		$var(pin_n) = 0;
-	if ($var(pin_n) >= $var(pin_cap)) {
-		xlog("L_WARN", "meet: call $ci from $avp(caller) to the access number refused: $var(pin_n) failed tries of a PIN in 10 minutes\n");
+	cache_add("local", "pin:c:$var(pin_who)", 1, 600, $var(pin_n));
+	if ($var(pin_n) > $var(pin_cap)) {
+		xlog("L_WARN", "meet: call $ci from $avp(caller) to the access number refused: $var(pin_n) calls of it in 10 minutes\n");
 		append_to_reply("Twake-Call-Refused: pin-tries\r\n");
 		t_reply(403, "Too Many Tries");
 		exit;
 	}
+	$avp(pin_who) = $var(pin_who);
+	# All callers' tries in 10 minutes: at MEET_PIN_TRIES_ALL, the administrators hear it (at the latest when those who
+	# hide their number reach their cap, the same number); nobody is refused for it.
+	$var(pin_all) = 0;
+	cache_add("local", "pin:all", 1, 600, $var(pin_all));
+	if ($var(pin_all) >= ${MEET_PIN_TRIES_ALL})
+		route(meet_alert, "pin-tries", $var(pin_all), ${MEET_PIN_TRIES_ALL});
 	$dlg_val(meet) = "callee";
-	$dlg_val(pin_who) = $var(pin_who);
-	# Never longer than MEET_MAX_CALL_SEC (from the operator: BYE to both sides): LiveKit SIP answers any OPTIONS, a
-	# LiveKit SIP gone in the middle of the call is not noticed otherwise.
-	if ($DLG_timeout > ${MEET_MAX_CALL_SEC})
-		$DLG_timeout = ${MEET_MAX_CALL_SEC};
+	# Never longer than MEET_MAX_CALL_SEC, then BYE to both sides (B; a call from the operator has it already, with its
+	# phone ping): LiveKit SIP answers any OPTIONS, a LiveKit SIP gone in the middle of the call is not noticed otherwise.
+	if ($dlg_val(trunk) == NULL)
+		create_dialog("B");
+	if ($DLG_timeout > $shv(meet_max_sec))
+		$DLG_timeout = $shv(meet_max_sec);
 	$dlg_val(caller_sock) = $socket_in;
 	$dlg_val(callee) = $avp(callee);
 	$dlg_val(dialled) = $avp(dialled);
@@ -934,6 +969,9 @@ route[meet_call] {
 		route(late_offer);
 	t_on_reply("rtp");
 	t_on_failure("meet_failed");
+	# LiveKit SIP answers at once (the PIN is asked once answered) or never (no room's rule: it rings and drops the
+	# call): 15 s, not fr_inv_timeout, before it is given up and its try given back.
+	$T_fr_inv_timeout = 15;
 	route(account_missed);
 	route(calling);
 	if (!t_relay()) {
@@ -944,42 +982,40 @@ route[meet_call] {
 	exit;
 }
 
+# Not answered by LiveKit SIP (refused, busy, given up, nobody answered in time): no try of a PIN, given back.
 failure_route[meet_failed] {
 	if ($avp(rtp_on) != NULL)
 		rtpengine_delete();
+	if ($avp(pin_who) == NULL)
+		return;
+	$var(left) = 0;
+	cache_sub("local", "pin:c:$avp(pin_who)", 1, 600, $var(left));
+	if ($var(left) <= 0)
+		cache_remove("local", "pin:c:$avp(pin_who)");
+	$var(left) = 0;
+	cache_sub("local", "pin:all", 1, 600, $var(left));
+	if ($var(left) <= 0)
+		cache_remove("local", "pin:all");
 }
 
-# The BYE of a call to the access number (either side): ended within MEET_PIN_FAIL_SEC of its answer, it is a failed
-# try of a PIN (a wrong one: LiveKit SIP hangs up; or given up), counted for its caller and for all, over 10 minutes
-# from the first one (route[meet_call]). Past MEET_PIN_TRIES_ALL for all callers, the administrators hear it
-# (E_TWAKEPHONE_PIN), once per 10 minutes; nobody is refused for it.
-route[meet_bye] {
-	if ($dlg_val(pin_counted) == "1" || $DLG_lifetime >= ${MEET_PIN_FAIL_SEC})
+# Tells the administrators (E_TWAKEPHONE_PIN) about the access number: $param(1) "pin-tries" (the tries of all callers
+# in 10 minutes) or "calls" (at the same time), its value $param(2) and threshold $param(3); once per 10 minutes each.
+route[meet_alert] {
+	$var(told) = 0;
+	cache_add("local", "pin:told:$param(1)", 1, 600, $var(told));
+	if ($var(told) != 1)
 		return(1);
-	$dlg_val(pin_counted) = "1";
-	$var(pin_who) = $dlg_val(pin_who);
-	if (!($var(pin_who) =~ "^[A-Za-z0-9._+-]{1,64}$"))
-		$var(pin_who) = "other";
-	$var(pin_n) = 0;
-	$var(pin_all) = 0;
-	cache_add("local", "pin:c:$var(pin_who)", 1, 600, $var(pin_n));
-	cache_add("local", "pin:all", 1, 600, $var(pin_all));
-	xlog("L_NOTICE", "meet: call $ci from $var(pin_who) to the access number ended after $DLG_lifetime s: a failed try of a PIN ($var(pin_n) of it, $var(pin_all) of all, in 10 minutes)\n");
-	if ($var(pin_all) <= ${MEET_PIN_TRIES_ALL})
-		return(1);
-	$var(pin_told) = 0;
-	cache_add("local", "pin:told", 1, 600, $var(pin_told));
-	if ($var(pin_told) != 1)
-		return(1);
-	xlog("L_WARN", "meet: $var(pin_all) failed tries of a PIN in 10 minutes, past MEET_PIN_TRIES_ALL (${MEET_PIN_TRIES_ALL})\n");
+	xlog("L_WARN", "meet: $param(2) $param(1) to the access number, MEET's threshold $param(3)\n");
 	$(avp(ev_attr)[*]) = NULL;
 	$(avp(ev_val)[*]) = NULL;
+	$avp(ev_attr) = "param";
+	$avp(ev_val) = $param(1);
 	$avp(ev_attr) = "number";
 	$avp(ev_val) = "${MEET_NUMBER}";
 	$avp(ev_attr) = "value";
-	$avp(ev_val) = $var(pin_all);
+	$avp(ev_val) = $param(2);
 	$avp(ev_attr) = "threshold";
-	$avp(ev_val) = ${MEET_PIN_TRIES_ALL};
+	$avp(ev_val) = $param(3);
 	raise_event("E_TWAKEPHONE_PIN", $avp(ev_attr), $avp(ev_val));
 	return(1);
 }
@@ -1261,8 +1297,8 @@ route[trunk_out_send] {
 		$DLG_timeout = ${TRUNK_MAX_CALL_SEC};
 	# A room's call (step 8): MEET_MAX_CALL_SEC at most. Its OPTIONS (P) reach LiveKit SIP, which answers any: a
 	# LiveKit SIP gone in the middle of the call is not noticed before that.
-	if ($dlg_val(meet) == "caller" && $DLG_timeout > ${MEET_MAX_CALL_SEC})
-		$DLG_timeout = ${MEET_MAX_CALL_SEC};
+	if ($dlg_val(meet) == "caller" && $DLG_timeout > $shv(meet_max_sec))
+		$DLG_timeout = $shv(meet_max_sec);
 	$(avp(t_rang)[*]) = NULL;
 	$dlg_val(trunk) = "callee";
 	$dlg_val(codecs) = $avp(t_codecs);

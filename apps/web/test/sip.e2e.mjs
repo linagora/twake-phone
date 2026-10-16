@@ -77,6 +77,7 @@ const MEET_NUMBER = process.env.MEET_NUMBER ?? '8000'
 const MEET_PIN_TRIES = Number(process.env.MEET_PIN_TRIES ?? 10)
 const MEET_PIN_TRIES_ALL = Number(process.env.MEET_PIN_TRIES_ALL ?? 300)
 const MEET_MAX_CALL_SEC = Number(process.env.MEET_MAX_CALL_SEC ?? 7200)
+const MEET_CALLS_PER_CALLER = Number(process.env.MEET_CALLS_PER_CALLER ?? 2)
 const TENANT = 'e2e'
 const BROWSER = process.env.BROWSER ?? 'chromium'
 const PRESENCE_MS = Number(process.env.SIP_E2E_PRESENCE_MS) || 3_000
@@ -2428,9 +2429,9 @@ try {
     const voiced = placed.media.stats.voiced
     await until('the room heard at the operator', () => (placed.media.stats.voiced > voiced + 20 ? true : null))
   })
-  await step(`step 8 (second review, n°1 and n°2): callers who present ${MEET_PIN_TRIES_ALL + 1} numbers in turn and hang up at the PIN prompt (failed tries) refuse nobody else, the administrators see the alert (GET /admin/alerts); one number with ${MEET_PIN_TRIES} failed tries is refused (403, pin-tries); a caller with the right PIN still joins the room; the operator's call to 8000 lasts MEET_MAX_CALL_SEC at most, not TRUNK_MAX_CALL_SEC`, async () => {
+  await step(`step 8 (second review, n°1 and n°2): callers who present ${MEET_PIN_TRIES_ALL + 1} numbers in turn and hang up at the PIN prompt (a try each) refuse nobody else, the administrators see the alert (GET /admin/alerts); one number with ${MEET_PIN_TRIES} tries is refused (403, pin-tries); a caller with the right PIN still joins the room; the operator's call to 8000 lasts MEET_MAX_CALL_SEC at most, not TRUNK_MAX_CALL_SEC`, async () => {
     const api = await asPerson(alice)
-    // Hung up at the prompt: LiveKit SIP answered, the call ends within MEET_PIN_FAIL_SEC, a failed try.
+    // Hung up at the prompt: LiveKit SIP answered, a try.
     const shortCall = async from => {
       const call = await operator.call('+33199000150', { from })
       const answer = await call.final
@@ -2465,6 +2466,35 @@ try {
       const dialog = ((await mi('dlg_list')).result?.Dialogs ?? []).find(d => d.callid === roomCaller.callId)
       const left = Number(dialog?.timeout) - Math.floor(Date.now() / 1000)
       if (!(left <= MEET_MAX_CALL_SEC && left > MEET_MAX_CALL_SEC - 600)) throw new Error(`the operator's call to 8000 ends in ${left} s, at most ${MEET_MAX_CALL_SEC} expected`)
+    } finally {
+      await mi('cache_remove_chunk', { glob: 'pin:*' })
+    }
+  })
+  await step(`step 8 (third review, n°1): one number calls the access number ${MEET_CALLS_PER_CALLER} times at once, and once more: busy (486, meet-busy), no try; the first call waits more than a minute before a wrong PIN, which LiveKit SIP hangs up on: it was a try all the same, as the second one; the number is refused once it made ${MEET_PIN_TRIES}`, async () => {
+    await mi('cache_remove_chunk', { glob: 'pin:*' })
+    const from = '+33639981050'
+    const wrong = pin === '0000000000' ? '1111111111' : '0000000000'
+    try {
+      const atOnce = []
+      for (let i = 0; i < MEET_CALLS_PER_CALLER; i++) {
+        const call = await operator.call('+33199000150', { from })
+        expectEqual((await call.final).status, 200, `the answer to call ${i + 1} of ${from}`)
+        atOnce.push(call)
+      }
+      const busy = await (await operator.call('+33199000150', { from })).final
+      expectEqual(`${busy.status} ${busy.headers.get('twake-call-refused')?.[0]}`, '486 meet-busy', `call ${MEET_CALLS_PER_CALLER + 1} at the same time`)
+      expectEqual((await atOnce[1].hangup()).status, 200, 'answer to the BYE of the second call')
+      // More than a minute (the length a try was counted within before), then a wrong PIN: LiveKit SIP hangs up.
+      await sleep(65_000)
+      await atOnce[0].dtmf(`${wrong}#`)
+      await until('LiveKit SIP to hang up on the wrong PIN typed late', () => (atOnce[0].state === 'ended' ? true : null), { timeout: 30_000 })
+      for (let i = MEET_CALLS_PER_CALLER; i < MEET_PIN_TRIES; i++) {
+        const call = await operator.call('+33199000150', { from })
+        expectEqual((await call.final).status, 200, `the answer to try ${i + 1} of ${from}`)
+        await call.hangup()
+      }
+      const refused = await (await operator.call('+33199000150', { from })).final
+      expectEqual(`${refused.status} ${refused.headers.get('twake-call-refused')?.[0]}`, '403 pin-tries', `the call of ${from} after ${MEET_PIN_TRIES} tries`)
     } finally {
       await mi('cache_remove_chunk', { glob: 'pin:*' })
     }
@@ -2519,10 +2549,33 @@ try {
       }
     }
   })
-  await step('step 8: everyone leaves the room (the operator, Jean and Bob hang up); Alice closes it (DELETE /v1/conferences/:id) and removes the direct number aimed at 8000', async () => {
+  await step('step 8 (third review, n°3): a call from a phone to the access number lasts MEET_MAX_CALL_SEC at most, then OpenSIPS ends it on both sides: Jean, back in the room with it shortened a moment (MI shv_set), is told the call ended and leaves the room', async () => {
+    await jean.page.getByRole('button', { name: 'Raccrocher' }).click()
+    await until('the end of Jean\'s call', async () => (await calls(jean.page)).length === 0)
+    await roomHas(2, 'Bob and the operator\'s caller in the room')
+    const before = await lastEnded(jean.page)
+    await mi('shv_set', { name: 'meet_max_sec', type: 'int', value: 25 })
+    try {
+      await dial(jean.page, MEET_NUMBER)
+      await connected(jean.page, 'Jean\'s call to 8000 answered')
+      await sleep(PROMPT_MS)
+      await typeOnKeypad(jean.page, `${pin}#`)
+      await roomHas(3, 'Jean in the room again')
+    } finally {
+      await mi('shv_set', { name: 'meet_max_sec', type: 'int', value: MEET_MAX_CALL_SEC })
+    }
+    // The BYE to Jean's browser (no status: hung up by the far end) and to LiveKit SIP (he leaves the room).
+    const ended = await until('the end of Jean\'s call at MEET_MAX_CALL_SEC', async () => {
+      const last = await lastEnded(jean.page)
+      return last && last.id !== before?.id ? last : null
+    }, { timeout: 40_000 })
+    expectEqual(`${ended.endReason} ${ended.endStatus ?? '-'}`, 'hangup -', 'how Jean\'s call to 8000 ended')
+    await roomHas(2, 'Bob and the operator\'s caller in the room, Jean gone')
+  })
+  await step('step 8: everyone leaves the room (the operator and Bob hang up); Alice closes it (DELETE /v1/conferences/:id) and removes the direct number aimed at 8000', async () => {
     const api = await asPerson(alice)
     expectEqual((await roomCaller.hangup()).status, 200, 'answer to the operator\'s BYE')
-    for (const who of [jean, bob]) {
+    for (const who of [bob]) {
       await who.page.getByRole('button', { name: 'Raccrocher' }).click()
       await until(`the end of the call on ${who.name} side`, async () => (await calls(who.page)).length === 0)
     }

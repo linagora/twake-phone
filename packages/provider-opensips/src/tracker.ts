@@ -345,13 +345,16 @@ export class CallTracker {
         return
       }
       case 'E_TWAKEPHONE_PIN': {
-        // Failed tries of a room's PIN by phone, all callers together, past MEET_PIN_TRIES_ALL in 10 minutes (step 8):
-        // for the administrators, under the access number (nobody's extension).
+        // The access number of the rooms (step 8), for the administrators, under it (nobody's extension): the tries of
+        // a PIN of all callers in 10 minutes at MEET_PIN_TRIES_ALL (pin-tries), or MEET_CALLS_ALL calls to it at the same
+        // time (meet-calls, the next ones refused).
         const number = str(p.number)
         if (!/^[1-9][0-9]{1,5}$/.test(number)) return
+        const param = p.param === undefined ? 'pin-tries' : str(p.param) === 'calls' ? 'meet-calls' : str(p.param)
+        if (param !== 'pin-tries' && param !== 'meet-calls') return
         const value = num(p.value)
         const threshold = num(p.threshold)
-        const alert: TelephonyAlert = { kind: 'meet', param: 'pin-tries', scope: 'tenant', number, ...(value !== undefined ? { value } : {}), ...(threshold !== undefined ? { threshold } : {}) }
+        const alert: TelephonyAlert = { kind: 'meet', param, scope: 'tenant', number, ...(value !== undefined ? { value } : {}), ...(threshold !== undefined ? { threshold } : {}) }
         this.emit(number, { type: 'alert.raised', timestamp: now, payload: { alert } })
         return
       }
