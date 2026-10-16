@@ -156,6 +156,16 @@ const AddParticipantForm = ({ id, run, onClose, onError, making }: { id: string;
 const participantLabel = (p: ConferenceParticipant) => (p.number ? formatNumber(p.number) : (p.displayName ?? p.id))
 
 /**
+ * Who a conference's panel takes as already there at its first read: the two of us when it came out of our call and
+ * its far end (`party`) is found (the others came after, and are told), else everyone then in it.
+ */
+const firstKnown = (participants: ConferenceParticipant[], us: { party?: string; me?: string }) => {
+  const all = new Map(participants.map(p => [p.id, participantLabel(p)] as const))
+  if (!us.party || !participants.some(p => p.number === us.party)) return all
+  return new Map(participants.filter(p => p.number === us.party || (!!us.me && p.number === us.me)).map(p => [p.id, participantLabel(p)] as const))
+}
+
+/**
  * A short chime when someone joins a conference (review 8b, n°2): the room plays none, and a participant nobody sees
  * coming must at least be heard. Nothing when the browser has no sound for the page (it says so elsewhere).
  */
@@ -180,10 +190,13 @@ const chime = () => {
 /**
  * The participants of a conference, read every few seconds and after each action on one. Every participant of the
  * conference sees them (review 8b, n°2); the one who made it (`manage`) also mutes or removes one. Who comes in or
- * leaves after the first read is told (`onNotice`, the panel's status region) with a chime for an arrival. After an
+ * leaves is told (`onNotice`, the panel's status region) with a chime for an arrival. Who is already there at the first
+ * read the panel gets is news too when the conference came out of our call (`party`, the far end of that call): all
+ * but the two of us, however late that read comes (a read refused, slow, or after a quick answer). Without it (a third
+ * participant's panel), or when the far end is not found by its number, the first read is who was there. After an
  * action whose button goes (a participant muted or removed), the focus goes to the list, not to the top of the page.
  */
-const Participants = ({ meetingId, manage, onError, onNotice }: { meetingId: string; manage: boolean; onError: (message: string | null) => void; onNotice: (message: string) => void }) => {
+export const Participants = ({ meetingId, manage, party, onError, onNotice }: { meetingId: string; manage: boolean; party?: string; onError: (message: string | null) => void; onNotice: (message: string) => void }) => {
   const { t } = useT()
   const { client, me } = useGateway()
   const [people, setPeople] = useState<ConferenceParticipant[] | null>(null)
@@ -194,6 +207,9 @@ const Participants = ({ meetingId, manage, onError, onNotice }: { meetingId: str
   const notice = useRef(onNotice)
   // eslint-disable-next-line react-hooks/refs -- the latest callback, read by the reads without restarting them
   notice.current = onNotice
+  const us = useRef<{ party?: string; me?: string }>({})
+  // eslint-disable-next-line react-hooks/refs -- read at the first answer only, without restarting the reads
+  us.current = { ...(party ? { party } : {}), ...(me?.extension ? { me: me.extension } : {}) }
   useEffect(() => {
     let cancelled = false
     const read = () =>
@@ -201,15 +217,13 @@ const Participants = ({ meetingId, manage, onError, onNotice }: { meetingId: str
         c => {
           if (cancelled) return
           const now = new Map(c.participants.map(p => [p.id, participantLabel(p)] as const))
-          const before = known.current
+          const before = known.current ?? firstKnown(c.participants, us.current)
           known.current = now
-          if (before) {
-            const joined = [...now].filter(([id]) => !before.has(id)).map(([, label]) => label)
-            const left = [...before].filter(([id]) => !now.has(id)).map(([, label]) => label)
-            for (const who of joined) notice.current(t('conference.joined', { who }))
-            for (const who of left) notice.current(t('conference.left', { who }))
-            if (joined.length) chime()
-          }
+          const joined = [...now].filter(([id]) => !before.has(id)).map(([, label]) => label)
+          const left = [...before].filter(([id]) => !now.has(id)).map(([, label]) => label)
+          for (const who of joined) notice.current(t('conference.joined', { who }))
+          for (const who of left) notice.current(t('conference.left', { who }))
+          if (joined.length) chime()
           setPeople(c.participants)
         },
         () => undefined
@@ -353,7 +367,7 @@ const ConferenceCall = ({ call, tones, onError, onNotice }: { call: SoftCall; to
         </p>
       ))}
       {tones ? <p className="badge">{t('call.tonesReceived', { tones })}</p> : null}
-      {meetingId ? <Participants meetingId={meetingId} manage={mine} onError={onError} onNotice={onNotice} /> : null}
+      {meetingId ? <Participants meetingId={meetingId} manage={mine} {...(call.conferenceWith ? { party: call.conferenceWith } : {})} onError={onError} onNotice={onNotice} /> : null}
       <div className="actions">
         {connected ? (
           <button type="button" className="btn" aria-pressed={call.muted} onClick={guard(() => call.setMuted(!call.muted))}>
