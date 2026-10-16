@@ -1,7 +1,8 @@
 import { readdir, readFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import pg from 'pg'
-import { ALERT_DEDUP_MS, alertKey, clampLimit, type AlertQuery, type AlertRecord, type StoredAlert, type ConferenceRecord, type DidRecord, type OutboundRecord, type HistoryEntry, type HistoryPage, type HistoryQuery, type MappingSource, type ProviderRecord, type PushSaveResult, type PushSubscriptionRecord, type Store, type TrunkRecord, type UserMapping, type UserPresenceRecord, type VapidKeysRecord } from './types.js'
+import { EMPTY_OUTBOUND, outboundVersion, staleOutbound } from '../outbound.js'
+import { ALERT_DEDUP_MS, alertKey, clampLimit, type AlertQuery, type AlertRecord, type StoredAlert, type ConferenceRecord, type DidRecord, type OutboundHand, type OutboundRecord, type OutboundRules, type HistoryEntry, type HistoryPage, type HistoryQuery, type MappingSource, type ProviderRecord, type PushSaveResult, type PushSubscriptionRecord, type Store, type TrunkRecord, type UserMapping, type UserPresenceRecord, type VapidKeysRecord } from './types.js'
 
 const MIGRATIONS = fileURLToPath(new URL('../../migrations/', import.meta.url))
 
@@ -17,7 +18,19 @@ type PushRow = { tenant_id: string; user_id: string; endpoint: string; p256dh: s
 type TrunkRow = { tenant_id: string; id: string; config: TrunkRecord['config']; password_enc: string | null }
 type DidRow = { tenant_id: string; id: string; trunk_id: string; first_number: string; last_number: string; target: string | null; suffix_digits: number; fallback_target: string | null }
 type OutboundRow = { tenant_id: string; policy: OutboundRecord['policy']; profiles: OutboundRecord['profiles']; assignments: OutboundRecord['assignments'] }
-type AlertRow = { id: string; tenant_id: string; at: Timestamp; last_at: Timestamp; count: number; alert: AlertRecord['alert']; first_alert: AlertRecord['alert'] | null }
+type AlertRow = { id: string; tenant_id: string; at: Timestamp; last_at: Timestamp; count: number; alert: AlertRecord['alert']; first_alert: AlertRecord['alert'] | null; acknowledged_at: Timestamp | null; acknowledged_by: string | null }
+const ALERT_COLUMNS = 'id::text AS id, tenant_id, at, last_at, count, alert, first_alert, acknowledged_at, acknowledged_by'
+const alertOf = (r: AlertRow): StoredAlert => ({
+  id: r.id,
+  tenantId: r.tenant_id,
+  at: new Date(r.at).toISOString(),
+  lastAt: new Date(r.last_at).toISOString(),
+  count: r.count,
+  alert: r.alert,
+  first: r.first_alert ?? r.alert,
+  ...(r.acknowledged_at ? { acknowledgedAt: new Date(r.acknowledged_at).toISOString() } : {}),
+  ...(r.acknowledged_by ? { acknowledgedBy: r.acknowledged_by } : {})
+})
 
 const toEntry = (r: HistoryRow): HistoryEntry => ({
   tenantId: r.tenant_id,
@@ -366,12 +379,58 @@ export class PgStore implements Store {
     return r ? { tenantId: r.tenant_id, policy: r.policy, profiles: r.profiles, assignments: r.assignments } : null
   }
 
-  async setOutbound(o: OutboundRecord) {
-    await this.pool.query(
-      `INSERT INTO outbound_policies (tenant_id, policy, profiles, assignments) VALUES ($1, $2, $3, $4)
-       ON CONFLICT (tenant_id) DO UPDATE SET policy = EXCLUDED.policy, profiles = EXCLUDED.profiles, assignments = EXCLUDED.assignments, updated_at = now()`,
-      [o.tenantId, JSON.stringify(o.policy), JSON.stringify(o.profiles), JSON.stringify(o.assignments)]
-    )
+  /**
+   * Runs `run` in a transaction that holds the tenant's outbound lock, with the rules kept: one writer of the tenant's
+   * rules at a time in the whole database (a lock that holds whatever process writes, with a version or not, and
+   * when there is no row yet). The SIP server is handed rules within it: no long wait of its own (its queries and
+   * its reload have their own bounds), and none of its tables is locked here.
+   */
+  private async inOutboundTurn(tenantId: string, run: (client: pg.PoolClient, kept: OutboundRules) => Promise<void>) {
+    const client = await this.pool.connect()
+    try {
+      await client.query('BEGIN')
+      await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [`outbound_policies|${tenantId}`])
+      const { rows } = await client.query<OutboundRow>('SELECT tenant_id, policy, profiles, assignments FROM outbound_policies WHERE tenant_id = $1', [tenantId])
+      const r = rows[0]
+      await run(client, r ? { policy: r.policy, profiles: r.profiles, assignments: r.assignments } : EMPTY_OUTBOUND)
+      await client.query('COMMIT')
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => undefined)
+      throw err
+    } finally {
+      client.release()
+    }
+  }
+
+  async setOutbound(o: OutboundRecord, expected?: string, hand?: OutboundHand) {
+    const { tenantId: _t, ...rules } = o
+    // Written, then not committed: the SIP server gets back what was kept (the lock is gone by then; rare).
+    let written: OutboundRules | undefined
+    try {
+      await this.inOutboundTurn(o.tenantId, async (client, kept) => {
+        if (expected !== undefined && outboundVersion(kept) !== expected) throw staleOutbound()
+        try {
+          await hand?.(rules, false)
+          await client.query(
+            `INSERT INTO outbound_policies (tenant_id, policy, profiles, assignments) VALUES ($1, $2, $3, $4)
+             ON CONFLICT (tenant_id) DO UPDATE SET policy = EXCLUDED.policy, profiles = EXCLUDED.profiles, assignments = EXCLUDED.assignments, updated_at = now()`,
+            [o.tenantId, JSON.stringify(o.policy), JSON.stringify(o.profiles), JSON.stringify(o.assignments)]
+          )
+        } catch (err) {
+          // Handed, then not kept (the SIP server refused, or the write failed): it gets back what is kept, in the turn.
+          if (hand) await hand(kept, true).catch(() => undefined)
+          throw err
+        }
+        written = kept
+      })
+    } catch (err) {
+      if (hand && written) await hand(written, true).catch(() => undefined)
+      throw err
+    }
+  }
+
+  async holdOutbound(tenantId: string, run: (kept: OutboundRules) => Promise<void>) {
+    await this.inOutboundTurn(tenantId, (_client, kept) => run(kept))
   }
 
   async addAlert(a: AlertRecord) {
@@ -382,8 +441,9 @@ export class PgStore implements Store {
       // One writer per alert at a time: two repeats at once count in one alert, never open two.
       await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [`telephony_alerts|${a.tenantId}|${key}`])
       const repeated = await client.query(
+        // Never into an acknowledged one, even acknowledged while this waited for its row.
         `UPDATE telephony_alerts SET last_at = greatest(last_at, $3::timestamptz), count = count + 1, alert = $4
-         WHERE id = (SELECT id FROM telephony_alerts WHERE tenant_id = $1 AND dedup_key = $2 AND last_at >= $3::timestamptz - make_interval(secs => $5) ORDER BY id DESC LIMIT 1)`,
+         WHERE acknowledged_at IS NULL AND id = (SELECT id FROM telephony_alerts WHERE tenant_id = $1 AND dedup_key = $2 AND last_at >= $3::timestamptz - make_interval(secs => $5) AND acknowledged_at IS NULL ORDER BY id DESC LIMIT 1)`,
         [a.tenantId, key, a.at, JSON.stringify(a.alert), ALERT_DEDUP_MS / 1000]
       )
       if (!repeated.rowCount)
@@ -399,12 +459,28 @@ export class PgStore implements Store {
 
   async listAlerts(tenantId: string, query: AlertQuery = {}): Promise<StoredAlert[]> {
     const { rows } = await this.pool.query<AlertRow>(
-      `SELECT id::text AS id, tenant_id, at, last_at, count, alert, first_alert FROM telephony_alerts
+      `SELECT ${ALERT_COLUMNS} FROM telephony_alerts
        WHERE tenant_id = $1 AND ($2::timestamptz IS NULL OR (last_at, id) < ($2::timestamptz, $3::bigint)) AND ($4::text IS NULL OR alert->>'kind' = $4) AND ($5::text IS NULL OR alert->>'param' = $5)
+         AND ($7::text IS NULL OR ($7 = 'open') = (acknowledged_at IS NULL))
        ORDER BY last_at DESC, id DESC LIMIT $6`,
-      [tenantId, query.before?.lastAt ?? null, query.before?.id ?? null, query.kind ?? null, query.param ?? null, clampLimit(query.limit)]
+      [tenantId, query.before?.lastAt ?? null, query.before?.id ?? null, query.kind ?? null, query.param ?? null, clampLimit(query.limit), query.state ?? null]
     )
-    return rows.map(r => ({ id: r.id, tenantId: r.tenant_id, at: new Date(r.at).toISOString(), lastAt: new Date(r.last_at).toISOString(), count: r.count, alert: r.alert, first: r.first_alert ?? r.alert }))
+    return rows.map(alertOf)
+  }
+
+  async acknowledgeAlert(tenantId: string, id: string, by: string, at: string, seen: string, count: number) {
+    if (!/^[1-9][0-9]{0,17}$/.test(id)) return null
+    // The first acknowledgement stays: who did it, and when. Only as it was seen: a repeat counted since (its row
+    // locked by this update, or updated before it) leaves it open. Times to the millisecond, as they are shown; the
+    // count too, which a repeat always raises (its time may stay: the same millisecond, or one dated before).
+    const { rows } = await this.pool.query<AlertRow>(
+      `UPDATE telephony_alerts SET
+         acknowledged_at = coalesce(acknowledged_at, CASE WHEN date_trunc('milliseconds', last_at) = $5::timestamptz AND count = $6 THEN $3::timestamptz END),
+         acknowledged_by = coalesce(acknowledged_by, CASE WHEN date_trunc('milliseconds', last_at) = $5::timestamptz AND count = $6 THEN $4 END)
+       WHERE tenant_id = $1 AND id = $2::bigint RETURNING ${ALERT_COLUMNS}`,
+      [tenantId, id, at, by, seen, count]
+    )
+    return rows[0] ? alertOf(rows[0]) : null
   }
 
   async purgeAlerts(before: string) {

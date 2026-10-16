@@ -48,6 +48,8 @@ describe('parseTrunk', () => {
       [{ codecs: ['PCMA', 'PCMA'] }, /^codecs/],
       [{ numberFormat: 'local' }, /^numberFormat/],
       [{ defaultNumber: '0199000100' }, /^defaultNumber/],
+      // « +33 (0)1 … » of the business cards: no French number has a 0 after +33 (review 7 n°4).
+      [{ defaultNumber: '+330199000100' }, /^defaultNumber/],
       [{ password: 'two\nlines' }, /^password/],
       [{ password: 'x'.repeat(65) }, /^password/],
       [{ password: undefined }, /registers needs a username and a password/],
@@ -153,6 +155,7 @@ describe('parseDid', () => {
       ['Sales', { trunkId: 'operator', first: '+33199000101', target: '101' }, /^id/],
       ['x', { trunkId: 'other', first: '+33199000101', target: '101' }, /^trunkId/],
       ['x', { trunkId: 'operator', first: '0199000101', target: '101' }, /^first/],
+      ['x', { trunkId: 'operator', first: '+330199000101', target: '101' }, /^first/],
       ['x', { trunkId: 'operator', first: '+33199000109', last: '+33199000101', target: '101' }, /^last/],
       ['x', { trunkId: 'operator', first: '+33199000101', last: '+331990001011', target: '101' }, /^last/],
       ['x', { trunkId: 'operator', first: '+33199000000', last: '+33199099999', suffixDigits: 5 }, /10000 numbers/],
@@ -230,7 +233,7 @@ describe('trunkFromEnv', () => {
 })
 
 describe('trunk routes', () => {
-  const setup = async (opts: { withTrunks?: boolean; key?: Buffer | null; store?: MemoryStore; refuse?: boolean } = {}) => {
+  const setup = async (opts: { withTrunks?: boolean; key?: Buffer | null; store?: MemoryStore; refuse?: boolean; status?: () => Promise<unknown>; statusCacheMs?: number; logged?: unknown[][] } = {}) => {
     process.env.AUTH_MODE = 'dev'
     const store = opts.store ?? new MemoryStore()
     // Who holds the extensions the direct numbers ring (tenant A), and its ring group 200.
@@ -245,6 +248,7 @@ describe('trunk routes', () => {
       subscribe: async function* () {},
       close: async () => {},
       listGroups: async () => [{ number: '200', name: 'Accueil', members: ['101'] }],
+      ...(opts.status ? { getTrunkStatus: opts.status } : {}),
       ...(opts.withTrunks !== false
         ? {
             setTrunks: async (trunks: (Trunk & { password?: string })[], dids: DidRange[]) => {
@@ -266,8 +270,19 @@ describe('trunk routes', () => {
       directory: new StoreDirectory(store),
       tickets: new TicketStore(),
       admin: { adminRole: 'twakephone-admin', adminUsers: new Set() },
-      ...(key ? { secretsKey: key } : {})
+      ...(key ? { secretsKey: key } : {}),
+      ...(opts.statusCacheMs !== undefined ? { trunkStatusCacheMs: opts.statusCacheMs } : {})
     })
+    const logged = opts.logged
+    if (logged) {
+      for (const level of ['warn', 'info'] as const) {
+        const write = app.log[level].bind(app.log)
+        app.log[level] = (...args: Parameters<typeof write>) => {
+          logged.push([level, ...args])
+          return write(...args)
+        }
+      }
+    }
     registry.startAll()
     const as = (user: string, roles?: string, tenant = 'A') => ({ 'x-dev-user': user, 'x-dev-tenant': tenant, ...(roles ? { 'x-dev-roles': roles } : {}) })
     return { app, as, admin: as('root', 'twakephone-admin'), handed, store, key, control }
@@ -305,6 +320,80 @@ describe('trunk routes', () => {
     expect(handed.at(-1)).toEqual({ trunks: [], dids: [] })
     expect(await store.listDids('A')).toEqual([])
     expect((await app.inject({ method: 'DELETE', url: '/api/v1/admin/trunks/operator', headers: admin })).statusCode).toBe(404)
+  })
+
+  it('says how the trunks are doing as the provider tells it, and that it does not know when it cannot tell (step 7)', async () => {
+    const said = [{ id: 'operator', registration: { state: 'registered' }, servers: [{ address: '192.0.2.20', state: 'up' }] }]
+    let answer: () => Promise<unknown> = async () => said
+    const { app, admin, as } = await setup({ status: () => answer(), statusCacheMs: 0 })
+    expect((await app.inject({ url: '/api/v1/admin/trunks/status', headers: as('bob') })).statusCode).toBe(403)
+    expect((await app.inject({ url: '/api/v1/admin/trunks/status', headers: admin })).json()).toEqual({ available: true, items: said })
+    // No control channel: unknown; no answer: unknown too, never an error page for a status.
+    answer = async () => undefined
+    expect((await app.inject({ url: '/api/v1/admin/trunks/status', headers: admin })).json()).toEqual({ available: false, items: [] })
+    answer = async () => {
+      throw new Error('MI timeout')
+    }
+    const failed = await app.inject({ url: '/api/v1/admin/trunks/status', headers: admin })
+    expect(failed.statusCode).toBe(200)
+    expect(failed.json()).toEqual({ available: false, items: [] })
+    // A provider that cannot say at all, and one without trunks.
+    expect((await (await setup()).app.inject({ url: '/api/v1/admin/trunks/status', headers: admin })).json()).toEqual({ available: false, items: [] })
+    expect((await (await setup({ withTrunks: false })).app.inject({ url: '/api/v1/admin/trunks/status', headers: admin })).statusCode).toBe(501)
+  })
+
+  it('reads the state once for every screen open within a few seconds, and logs a failure when it starts and ends (review 7 n°5)', async () => {
+    let reads = 0
+    let fail = false
+    const logged: unknown[][] = []
+    const { app, admin, as } = await setup({
+      logged,
+      status: async () => {
+        reads++
+        if (fail) throw new Error('MI timeout')
+        return [{ id: 'operator', registration: { state: 'registered' }, servers: [] }]
+      }
+    })
+    // Three screens at once, then one more within the window: one read of the SIP server.
+    const answers = await Promise.all([admin, admin, as('carol', 'twakephone-admin')].map(headers => app.inject({ url: '/api/v1/admin/trunks/status', headers })))
+    expect(answers.map(a => a.json().available)).toEqual([true, true, true])
+    expect((await app.inject({ url: '/api/v1/admin/trunks/status', headers: admin })).json().available).toBe(true)
+    expect(reads).toBe(1)
+    // Another tenant has its own state.
+    expect((await app.inject({ url: '/api/v1/admin/trunks/status', headers: as('root', 'twakephone-admin', 'B') })).statusCode).toBe(200)
+    expect(reads).toBe(2)
+    // A trunk saved, or removed, within the window: the next screen reads the state again (review 7 bis, n°7).
+    expect((await app.inject({ method: 'PUT', url: '/api/v1/admin/trunks/operator', headers: admin, payload: trunk })).statusCode).toBe(201)
+    await app.inject({ url: '/api/v1/admin/trunks/status', headers: admin })
+    expect(reads).toBe(3)
+    expect((await app.inject({ method: 'DELETE', url: '/api/v1/admin/trunks/operator', headers: admin })).statusCode).toBe(204)
+    await app.inject({ url: '/api/v1/admin/trunks/status', headers: admin })
+    expect(reads).toBe(4)
+    // Saving one, refused: nothing changed, the state read stays.
+    expect((await app.inject({ method: 'PUT', url: '/api/v1/admin/trunks/operator', headers: admin, payload: { ...trunk, domain: '' } })).statusCode).toBe(400)
+    await app.inject({ url: '/api/v1/admin/trunks/status', headers: admin })
+    expect(reads).toBe(4)
+
+    const { app: failing, admin: root } = await setup({ logged, statusCacheMs: 0, status: async () => (fail ? Promise.reject(new Error('MI timeout')) : []) })
+    fail = true
+    for (let i = 0; i < 4; i++) expect((await failing.inject({ url: '/api/v1/admin/trunks/status', headers: root })).json()).toEqual({ available: false, items: [] })
+    const about = () => logged.filter(l => typeof l[2] === 'string' && l[2].startsWith('trunks: the SIP server')).map(l => l[0])
+    expect(about()).toEqual(['warn'])
+    fail = false
+    for (let i = 0; i < 3; i++) await failing.inject({ url: '/api/v1/admin/trunks/status', headers: root })
+    expect(about()).toEqual(['warn', 'info'])
+    fail = true
+    await failing.inject({ url: '/api/v1/admin/trunks/status', headers: root })
+    expect(about()).toEqual(['warn', 'info', 'warn'])
+  })
+
+  it('says why it refuses one trunk or one range too many, with a code the app puts into words (step 7)', async () => {
+    const { app, admin } = await setup()
+    const { password: _password, ...ip } = { ...trunk, auth: 'ip' }
+    for (let i = 0; i < 8; i++) expect((await app.inject({ method: 'PUT', url: `/api/v1/admin/trunks/t${i}`, headers: admin, payload: ip })).statusCode).toBe(201)
+    const more = await app.inject({ method: 'PUT', url: '/api/v1/admin/trunks/t8', headers: admin, payload: ip })
+    expect(more.statusCode).toBe(409)
+    expect(more.json()).toMatchObject({ code: 'TRUNK_LIMIT' })
   })
 
   it('keeps out whoever is not an administrator, and each tenant to its own trunks', async () => {

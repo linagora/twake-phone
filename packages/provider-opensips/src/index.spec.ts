@@ -337,6 +337,47 @@ describe('OpensipsProvider call rules', () => {
     await expect(make().setTrunks([trunk], [])).rejects.toMatchObject({ statusCode: 501 })
   })
 
+  it('asks OpenSIPS how the trunks are doing (step 7): its servers and registrations, nothing else of its answers', async () => {
+    let sets = [
+      { id: 'operator', setid: 1, aor: 'sip:0033199000100@operator.example' },
+      { id: 'backup', setid: 2, aor: '' }
+    ]
+    const trunks = { set: async () => ({ dispatcher: false, registrant: false }), sets: async () => sets } as unknown as TrunkTables
+    const sips = await fakeOpensips()
+    cleanups.push(sips.close)
+    sips.state.dispatcher.PARTITIONS[0]!.SETS.push(
+      { id: 1, Destinations: [{ URI: 'sip:192.0.2.20:5060', state: 'Active', first_hit_counter: 3, socket: 'udp:127.0.0.1:5070' }, { URI: 'sip:192.0.2.21', state: 'Probing', first_hit_counter: 0 }] },
+      { id: 1001, Destinations: [{ URI: 'sip:192.0.2.30', state: 'Active' }] },
+      { id: 2, Destinations: [{ URI: 'sip:backup.operator.example', state: 'Inactive' }] }
+    )
+    sips.state.registrations.Records.push({ AOR: 'sip:0033199000100@operator.example', expires: 600, state: 'REGISTERED_STATE', enabled: 'yes', binding: 'sip:0033199000100@192.0.2.10:5070' })
+    const p = new OpensipsProvider({ websocketUrl: 'wss://sip.example.test', domain: 'sip.example.test', sipSecretFor: async () => 's', events: { miUrl: sips.url, timeoutMs: 300 }, trunks, logger: quiet })
+    cleanups.push(() => p.close())
+    await until('the subscription', () => p.getStatus() === 'CONNECTED')
+    const status = await p.getTrunkStatus()
+    expect(status).toEqual([
+      { id: 'operator', registration: { state: 'registered' }, servers: [{ address: '192.0.2.20:5060', state: 'up' }, { address: '192.0.2.21', state: 'probing' }] },
+      { id: 'backup', servers: [{ address: 'backup.operator.example', state: 'disabled' }] }
+    ])
+    // Nothing of the address of record, the binding or the sockets goes out.
+    expect(JSON.stringify(status)).not.toMatch(/0033199000100|5070|192\.0\.2\.30/)
+    // Without a trunk that registers, reg_list is not asked; without trunks, nothing is.
+    sets = [{ id: 'backup', setid: 2, aor: '' }]
+    const asked = sips.requests.length
+    await p.getTrunkStatus()
+    expect(sips.requests.slice(asked).map(r => r.method)).toEqual(['ds_list'])
+    sets = []
+    expect(await p.getTrunkStatus()).toEqual([])
+    expect(sips.requests.length).toBe(asked + 1)
+    // OpenSIPS not answering: it fails, not a status made up.
+    sets = [{ id: 'backup', setid: 2, aor: '' }]
+    sips.state.down = true
+    await expect(p.getTrunkStatus()).rejects.toThrow()
+    // Without the MI: unknown; without the tables: no trunk on this platform.
+    expect(await new OpensipsProvider({ websocketUrl: 'wss://sip.example.test', domain: 'sip.example.test', sipSecretFor: async () => 's', trunks }).getTrunkStatus()).toBeUndefined()
+    await expect(make().getTrunkStatus()).rejects.toMatchObject({ statusCode: 501 })
+  })
+
   it('writes the outbound rules where OpenSIPS reads them, and has it reload its thresholds only when they changed (step 6b)', async () => {
     const writes: unknown[] = []
     let changed = { fraud: true }

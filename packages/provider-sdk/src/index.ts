@@ -17,6 +17,7 @@ import type {
   DidRange,
   TelephonyEvent,
   Trunk,
+  TrunkStatus,
   User
 } from '@twake/telephony-types'
 
@@ -72,6 +73,11 @@ export interface TelephonyProvider {
    * provider had. The Gateway checked them (ids, numbers, ranges that do not overlap).
    */
   setTrunks?(trunks: (Trunk & { password?: string })[], dids: DidRange[]): Promise<void>
+  /**
+   * How the tenant's trunks are doing now (step 7): registration and servers, as the SIP server says. Undefined when
+   * the provider cannot ask it (no control channel); throws when it asked and got no answer.
+   */
+  getTrunkStatus?(): Promise<TrunkStatus[] | undefined>
   /**
    * The outbound policy of the tenant, its rights profiles and who has which (capability `outboundPolicy`, step 6b):
    * replaces what the provider had. The Gateway checked them (ids, classes, caps, profiles named that exist).

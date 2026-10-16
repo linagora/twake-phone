@@ -1,0 +1,70 @@
+{
+  "reg_list": {
+    "Records": [
+      {
+        "AOR": "sip:refused@operator.example",
+        "expires": 60,
+        "state": "WRONG_CREDENTIALS_STATE",
+        "enabled": "yes",
+        "last_register_sent": "Fri Oct 16 01:54:00 2026",
+        "registration_t_out": "Fri Oct 16 01:54:50 2026",
+        "registrar": "sip:192.0.2.20:5060",
+        "binding": "sip:refused@192.0.2.10:5070",
+        "socket": "udp:192.0.2.10:5070",
+        "dst_IP": "IPv4",
+        "ip": "192.0.2.20"
+      },
+      {
+        "AOR": "sip:silent@operator.example",
+        "expires": 60,
+        "state": "REGISTER_TIMEOUT_STATE",
+        "enabled": "yes",
+        "last_register_sent": "Fri Oct 16 01:54:00 2026",
+        "registration_t_out": "Fri Oct 16 01:54:51 2026",
+        "registrar": "sip:192.0.2.21:5060",
+        "binding": "sip:silent@192.0.2.10:5070",
+        "socket": "udp:192.0.2.10:5070"
+      },
+      {
+        "AOR": "sip:off@operator.example",
+        "expires": 60,
+        "state": "NOT_REGISTERED_STATE",
+        "enabled": "no",
+        "last_register_sent": "Thu Jan  1 00:00:00 1970",
+        "registration_t_out": "Thu Jan  1 00:00:00 1970",
+        "registrar": "sip:192.0.2.20:5060",
+        "binding": "sip:off@192.0.2.10:5070"
+      },
+      {
+        "AOR": "sip:good@operator.example",
+        "expires": 60,
+        "state": "REGISTERED_STATE",
+        "enabled": "yes",
+        "last_register_sent": "Fri Oct 16 01:54:05 2026",
+        "registration_t_out": "Fri Oct 16 01:54:55 2026",
+        "registrar": "sip:192.0.2.20:5060",
+        "binding": "sip:good@192.0.2.10:5070",
+        "socket": "udp:192.0.2.10:5070",
+        "dst_IP": "IPv4",
+        "ip": "192.0.2.20"
+      }
+    ]
+  },
+  "ds_list": {
+    "PARTITIONS": [
+      {
+        "name": "default",
+        "SETS": [
+          {
+            "id": 1,
+            "Destinations": [
+              { "URI": "sip:192.0.2.20:5060", "state": "Active", "first_hit_counter": 0, "resolved_addresses": ["192.0.2.20:5060"] },
+              { "URI": "sip:192.0.2.21:5060", "state": "Probing", "first_hit_counter": 0, "resolved_addresses": ["192.0.2.21:5060"] },
+              { "URI": "sip:192.0.2.22:5060", "state": "Inactive", "first_hit_counter": 0, "resolved_addresses": ["192.0.2.22:5060"] }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

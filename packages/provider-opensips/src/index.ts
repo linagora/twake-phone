@@ -1,10 +1,10 @@
 import type { MediaProvider, ProviderFactory, RoutedEvent, TelephonyProvider } from '@twake/telephony-provider-sdk'
-import type { Call, Capabilities, DidRange, Endpoint, ForwardingRules, MediaSession, OriginateRequest, OutboundAssignment, OutboundPolicy, OutboundProfile, Presence, ProviderStatus, RingGroup, Trunk, User } from '@twake/telephony-types'
+import type { Call, Capabilities, DidRange, Endpoint, ForwardingRules, MediaSession, OriginateRequest, OutboundAssignment, OutboundPolicy, OutboundProfile, Presence, ProviderStatus, RingGroup, Trunk, TrunkStatus, User } from '@twake/telephony-types'
 import type { CallGroups } from './call-groups.js'
 import type { CallRules } from './call-rules.js'
 import type { PushTargets } from './push-targets.js'
 import type { OutboundTables } from './outbound.js'
-import type { TrunkTables } from './trunks.js'
+import { trunkStatusFrom, type TrunkTables } from './trunks.js'
 import { OpensipsEvents, parseDlgList, parseUlDump, type EventsLogger } from './events.js'
 import { AsyncQueue } from './queue.js'
 import { CallTracker } from './tracker.js'
@@ -16,7 +16,7 @@ export { CallRules, CALL_RULES_SCHEMA, DND_MESSAGE_MAX, NOANSWER_DELAY, type Cal
 export { CallGroups, CALL_GROUPS_SCHEMA, DISPLAY_NAMES_SCHEMA, GROUP_MEMBERS_MAX, NAME_MAX, sipDisplayName, type CallGroupsOptions } from './call-groups.js'
 export { PushTargets, PUSH_TARGETS_SCHEMA, type PushTargetsOptions } from './push-targets.js'
 export { AsyncQueue } from './queue.js'
-export { TrunkTables, TRUNK_SCHEMA, TRUNK_SQL, DEFAULT_TRUNK_SOCKET, SOURCES_SET, DISPATCHER_TABLE_VERSION, DIALPLAN_TABLE_VERSION, REGISTRANT_TABLE_VERSION, codecFlags, projectTrunks, trunkSecret, type TrunkTablesOptions } from './trunks.js'
+export { TrunkTables, TRUNK_SCHEMA, TRUNK_SQL, DEFAULT_TRUNK_SOCKET, SOURCES_SET, DISPATCHER_TABLE_VERSION, DIALPLAN_TABLE_VERSION, REGISTRANT_TABLE_VERSION, codecFlags, projectTrunks, trunkSecret, trunkStatusFrom, type TrunkTablesOptions } from './trunks.js'
 export { OutboundTables, OUTBOUND_SCHEMA, ACC_EXTERNAL_SQL, FRAUD_PROFILE, FRAUD_RULE_INTERNATIONAL, FRAUD_RULE_NATIONAL, FRAUD_TABLE_VERSION, FRAUD_OVERSEAS_PREFIXES, DR_TABLE_VERSIONS, DIALOG_TABLE_VERSION, OUTBOUND_TIME_ZONE, CAP_MAX, PROFILE_ID, fraudRow, projectOutbound, type OutboundTablesOptions } from './outbound.js'
 export { DIALPLAN_RULES, DIALPLAN_SQL, DP_CLASSIFY, DP_INBOUND, DP_NORMALISE, OUTBOUND_ALLOWABLE, OUTBOUND_ALLOWED, classify, countryAllowed, translate, type DialplanRule, type NumberClass } from './numbering.js'
 
@@ -368,6 +368,19 @@ export class OpensipsProvider implements TelephonyProvider, MediaProvider {
       log.warn(`OpenSIPS: trunks written, ${failed.join(', ')} failed: not applied until it reloads them or restarts`)
       throw Object.assign(new Error(`OpenSIPS did not reload the trunks: ${failed.join(', ')}`), { statusCode: 502, code: 'TRUNK_RELOAD_FAILED' })
     }
+  }
+
+  /**
+   * How the tenant's trunks are doing (step 7): OpenSIPS is asked through the MI (`ds_list`, `reg_list`) how it sees
+   * the servers and registrations of the trunks the database holds for the tenant. Undefined without the MI.
+   */
+  async getTrunkStatus(): Promise<TrunkStatus[] | undefined> {
+    if (!this.config.trunks) throw Object.assign(new Error('Trunks are not available on this platform'), { statusCode: 501 })
+    if (!this.events) return undefined
+    const sets = await this.config.trunks.sets()
+    if (!sets.length) return []
+    const [ds, reg] = await Promise.all([this.events.call('ds_list'), sets.some(s => s.aor) ? this.events.call('reg_list') : Promise.resolve(undefined)])
+    return trunkStatusFrom(sets, ds, reg)
   }
 
   /**

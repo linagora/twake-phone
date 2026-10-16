@@ -410,6 +410,12 @@ const asPerson = async who => {
   if (!token) throw new Error(`no access token for ${who.name}`)
   return (method, url, payload) => gateway.inject({ method, url: `/api/v1${url}`, headers: { authorization: `Bearer ${token}` }, ...(payload ? { payload } : {}) })
 }
+/** Opens a part of the administration (step 7) from the main navigation, then the administration's own. */
+const openAdmin = async (page, section) => {
+  await page.getByRole('link', { name: 'Administration' }).click()
+  await page.getByRole('navigation', { name: "Rubriques de l'administration" }).getByRole('link', { name: section, exact: true }).click()
+  await page.getByRole('heading', { level: 2, name: section, exact: true }).waitFor()
+}
 /** The rows of `missed_calls` written since `after` (an id), as "caller>callee code". */
 const missedSince = async after => (await db.query('SELECT caller, callee, sip_code FROM missed_calls WHERE id > $1 ORDER BY id', [after])).rows.map(r => `${r.caller}>${r.callee} ${r.sip_code}`)
 /** The CDRs acc wrote since `after` (an id), as "caller>callee code", once there is one (written at the end of the call). */
@@ -1024,8 +1030,7 @@ try {
     expectEqual(rows.map(r => `${r.extension} ${r.tenant_id} ${r.display_name}`), ['101 e2e Alice Martin', '102 e2e Jean Dupont', '103 e2e Bob Durand', '104 e2e Accueil'], 'display_names rows')
   })
   await step('Alice, an administrator, creates ring group 200 (101, 102, 103) in Administration; an extension, or an account OpenSIPS still has, is no group number; "Nouveau groupe" never replaces one; a group is no forward target, and nobody else may manage groups (403)', async () => {
-    await alice.page.getByRole('link', { name: 'Administration' }).click()
-    await alice.page.getByRole('heading', { level: 2, name: "Groupes d'appel" }).waitFor()
+    await openAdmin(alice.page, "Groupes d'appel")
     // Fills and sends the form; resolves with what the Gateway answered ("status code"), and the words shown.
     const save = async (number, name = 'Accueil commun') => {
       await alice.page.getByLabel('Numéro du groupe').fill(number)
@@ -1037,19 +1042,25 @@ try {
       return `${res.status()} ${res.ok() ? '' : (await res.json()).code}`.trim()
     }
     expectEqual(await save('102'), '409 GROUP_NUMBER_TAKEN', 'creating group 102')
-    await alice.page.getByRole('alert').filter({ hasText: 'Ce numéro est déjà pris' }).waitFor()
+    // Said next to the number (its error, tied to the field), the form saying how many problems it has.
+    await alice.page.locator('#group-number-error').filter({ hasText: 'Ce numéro est déjà pris' }).waitFor()
+    await alice.page.getByRole('alert').filter({ hasText: '1 erreur' }).waitFor()
     // An account an older Gateway left in subscriber (nobody's extension any more): OpenSIPS would route 106 as an
     // extension, so no group gets it either (the provider checks subscriber).
     await db.query("INSERT INTO subscriber (username, domain, password, ha1, ha1_sha256, ha1_sha512t256) VALUES ('106', '', '', 'x', 'x', 'x') ON CONFLICT DO NOTHING")
     expectEqual(await save('106'), '409 GROUP_NUMBER_TAKEN', 'creating group 106')
-    await alice.page.getByRole('alert').filter({ hasText: 'Ce numéro est déjà pris' }).waitFor()
+    // Said next to the number (its error, tied to the field), the form saying how many problems it has.
+    await alice.page.locator('#group-number-error').filter({ hasText: 'Ce numéro est déjà pris' }).waitFor()
+    await alice.page.getByRole('alert').filter({ hasText: '1 erreur' }).waitFor()
     expectEqual((await db.query("SELECT 1 FROM call_groups WHERE number = '106'")).rows.length, 0, 'call_groups rows of 106')
     expectEqual(await save('200'), '201', 'creating group 200')
     await alice.page.getByRole('status').filter({ hasText: 'Groupe 200 enregistré.' }).waitFor()
     await alice.page.getByRole('list', { name: 'Groupes existants' }).getByText('101, 102, 103').waitFor()
     // The creation form again, with the same number: refused, the group stays as it was.
     expectEqual(await save('200', 'Autre chose'), '409 GROUP_EXISTS', 'creating group 200 again')
-    await alice.page.getByRole('alert').filter({ hasText: 'Un groupe de votre organisation a déjà ce numéro' }).waitFor()
+    await alice.page.locator('#group-number-error').filter({ hasText: 'Un groupe de votre organisation a déjà ce numéro' }).waitFor()
+    // The focus on the field in error.
+    await alice.page.waitForFunction(() => document.activeElement?.id === 'group-number', undefined, { timeout: 5_000 })
     const { rows } = await db.query("SELECT tenant_id, name, members FROM call_groups WHERE number = '200'")
     expectEqual(rows, [{ tenant_id: TENANT, name: 'Accueil commun', members: ['101', '102', '103'] }], 'the group OpenSIPS reads')
     await alice.page.getByLabel('Numéro du groupe').fill('')
@@ -1582,7 +1593,7 @@ try {
     } finally {
       await paul.context.close()
     }
-    await alice.page.getByRole('link', { name: 'Administration' }).click()
+    await openAdmin(alice.page, "Groupes d'appel")
     await alice.page.getByLabel('Numéro du groupe').fill('105')
     await alice.page.getByLabel('Nom affiché').fill('Support')
     await alice.page.getByLabel('Postes membres').fill('101')
@@ -1595,7 +1606,7 @@ try {
     await alice.page.getByText('Appel de Accueil (104) pris sur un autre poste ou abandonné.').waitFor()
   })
   await step('Alice deletes ring groups 105 and 200 in Administration, each once she confirmed: a call to 200 is a number nobody has again', async () => {
-    await alice.page.getByRole('link', { name: 'Administration' }).click()
+    await openAdmin(alice.page, "Groupes d'appel")
     // Not without a confirmation: "Non, garder" keeps the group.
     await alice.page.getByRole('button', { name: 'Supprimer le groupe 200' }).click()
     await alice.page.getByRole('group', { name: 'Supprimer le groupe 200 ?' }).getByRole('button', { name: 'Non, garder' }).click()
@@ -1937,25 +1948,62 @@ try {
     numberFormat: 'e164',
     defaultNumber: '+33199000100'
   }
-  await step('Alice, an administrator, sets the trunk to the operator (two servers) and its direct numbers (PUT /admin/trunks, /admin/dids): OpenSIPS registers to the first one (challenged, 401) at the address it announces, and probes both (OPTIONS); the password is never shown again', async () => {
+  await step('Alice, an administrator, sets the trunk to the operator (two servers) and its direct numbers in Administration (step 7, no console): OpenSIPS registers to the first one (challenged, 401) at the address it announces, and probes both (OPTIONS); the screen shows it registered; the password is never shown again', async () => {
     const api = await asPerson(alice)
-    const trunk = await api('PUT', '/admin/trunks/operator', trunkBody)
-    expectEqual(trunk.statusCode, 201, 'PUT /admin/trunks/operator')
-    expectEqual(trunk.json().hasPassword, true, 'hasPassword')
+    const page = alice.page
+    await openAdmin(page, 'Trunks')
+    await page.getByRole('textbox', { name: 'Identifiant', exact: true }).fill('operator')
+    await page.getByLabel('Nom affiché').fill(trunkBody.name)
+    await page.getByLabel("Domaine SIP de l'opérateur").fill(trunkBody.domain)
+    await page.getByLabel("Serveurs de l'opérateur").fill(trunkBody.proxies.join(', '))
+    await page.getByLabel("Identifiant chez l'opérateur").fill(TRUNK_LOGIN)
+    await page.getByLabel('Mot de passe', { exact: true }).fill(TRUNK_PASSWORD)
+    await page.getByLabel('Numéro présenté par défaut').fill('01 99 00 01 00')
+    const saved = page.waitForResponse(r => r.request().method() === 'PUT' && r.url().endsWith('/admin/trunks/operator'))
+    await page.getByRole('button', { name: 'Enregistrer le trunk' }).click()
+    const trunk = await saved
+    expectEqual(trunk.status(), 201, 'PUT /admin/trunks/operator')
+    expectEqual((await trunk.json()).hasPassword, true, 'hasPassword')
+    await page.getByRole('status').filter({ hasText: 'Trunk operator enregistré.' }).waitFor()
+    // What the screen sent: the trunk as an administrator would write it to the API, the number in E.164.
+    const sorted = o => JSON.stringify(Object.fromEntries(Object.entries(o).sort(([a], [b]) => a.localeCompare(b))))
+    expectEqual(sorted(JSON.parse(trunk.request().postData())), sorted({ ...trunkBody, allowed: ['fixed', 'mobile', 'freephone', 'standard-rate'] }), 'trunk sent by the screen')
     // The staff's direct numbers: +33 1 99 00 01 0x rings extension 10x. A range whose last digits make an emergency
-    // number (+33 1 99 00 01 12 would ring 112) is refused, naming them.
+    // number (+33 1 99 00 01 12 would ring 112) is refused before it is sent, naming them; the Gateway refuses it too.
+    await openAdmin(page, 'Numéros directs')
+    await page.getByText("Aucun numéro direct pour l'instant.").waitFor()
+    await page.getByRole('textbox', { name: 'Identifiant', exact: true }).fill('staff')
+    await page.getByLabel('Numéro (ou premier de la plage)').fill('+33 1 99 00 01 00')
+    await page.getByLabel('Dernier numéro de la plage').fill('+33 1 99 00 01 99')
+    await page.getByLabel('Le poste qui finit par les derniers chiffres du numéro appelé').check()
+    await page.getByRole('button', { name: 'Enregistrer les numéros directs' }).click()
+    await page.locator('#did-suffixDigits-error').filter({ hasText: '112' }).waitFor()
     const reserved = await api('PUT', '/admin/dids/staff', { trunkId: 'operator', first: '+33199000100', last: '+33199000199', suffixDigits: 3 })
     expectEqual(`${reserved.statusCode} ${reserved.json().code}`, '400 DID_RESERVED', 'PUT /admin/dids/staff over 112')
-    const dids = await api('PUT', '/admin/dids/staff', { trunkId: 'operator', first: '+33199000100', last: '+33199000109', suffixDigits: 3 })
-    expectEqual(dids.statusCode, 201, 'PUT /admin/dids/staff')
+    await page.getByLabel('Dernier numéro de la plage').fill('+33 1 99 00 01 09')
+    const didSaved = page.waitForResponse(r => r.request().method() === 'PUT' && r.url().endsWith('/admin/dids/staff'))
+    await page.getByRole('button', { name: 'Enregistrer les numéros directs' }).click()
+    expectEqual((await didSaved).status(), 201, 'PUT /admin/dids/staff')
+    await page.getByRole('list', { name: 'Numéros directs existants' }).getByText('+33199000100 à +33199000109').waitFor()
     const listed = await api('GET', '/admin/trunks')
     if (listed.body.includes(TRUNK_PASSWORD)) throw new Error('GET /admin/trunks shows the password')
+    // Bob is no administrator: the Gateway refuses him the trunks, their state and the direct numbers.
+    const asBob = await asPerson(bob)
+    for (const [method, url] of [['GET', '/admin/trunks'], ['GET', '/admin/trunks/status'], ['GET', '/admin/dids'], ['GET', '/admin/users'], ['DELETE', '/admin/dids/staff']])
+      expectEqual((await asBob(method, url)).statusCode, 403, `${method} ${url} as Bob`)
     const [registration] = await operator.registered(1, 30_000)
     if (!registration.aor.includes(`sip:${TRUNK_LOGIN}@operator.example`)) throw new Error(`registered as ${registration.aor}`)
     // TRUNK_ADVERTISE: the operator is told the address OpenSIPS announces, in the binding and the Via.
     if (TRUNK_ADVERTISE && !(registration.contact.includes(TRUNK_ADVERTISE) && registration.via.includes(TRUNK_ADVERTISE))) throw new Error(`registered from ${registration.via}, binding ${registration.contact}`)
     await Promise.all([operator.probed(1, 40_000), operator2.probed(1, 40_000)])
     expectEqual(operator2.state.registrations.length, 0, 'registrations at the second server')
+    // The screen says so, as OpenSIPS does (reg_list, ds_list): registered, both servers reachable.
+    await openAdmin(page, 'Trunks')
+    const trunks = page.getByRole('list', { name: 'Trunks existants' })
+    await trunks.getByText('Enregistré', { exact: true }).waitFor({ timeout: 30_000 })
+    for (const address of trunkBody.proxies) await trunks.getByText(`Serveur ${address} : Joignable`).waitFor({ timeout: 30_000 })
+    await trunks.getByText('enregistré (jamais affiché)').waitFor()
+    if ((await page.content()).includes(TRUNK_PASSWORD)) throw new Error('the trunk screen shows the password')
   })
   await step('Alice dials 06 39 98 00 01, a number of Mayotte (0639): overseas numbers are not allowed on the trunk by default, refused before the operator (403, overseas)', async () => {
     const attempts = operator.state.attempts.length + operator2.state.attempts.length
@@ -1966,9 +2014,17 @@ try {
   })
   let mobileCall, mobileAcc, mobileAt
   await step('Alice allows the overseas numbers on the trunk and dials 06 39 98 00 01 again: the first server (priority) is sent +33639980001 at its domain (Request-URI and To) from her direct number +33 1 99 00 01 01 (challenged, 407), nothing names OpenSIPS; plain G.711; both sides hear each other; her keypad tones reach the operator as RFC 4733 events', async () => {
-    const api = await asPerson(alice)
-    const allowed = await api('PUT', '/admin/trunks/operator', { ...trunkBody, allowed: ['fixed', 'mobile', 'freephone', 'standard-rate', 'overseas'] })
-    expectEqual(allowed.statusCode, 200, 'PUT /admin/trunks/operator (allowed)')
+    // Changed on its screen, without typing the password again: the one kept still answers the operator's challenges.
+    await openAdmin(alice.page, 'Trunks')
+    await alice.page.getByRole('button', { name: 'Modifier le trunk operator' }).click()
+    await alice.page.getByRole('group', { name: 'Appels permis' }).getByLabel('Outre-mer').check()
+    const saved = alice.page.waitForResponse(r => r.request().method() === 'PUT' && r.url().endsWith('/admin/trunks/operator'))
+    await alice.page.getByRole('button', { name: 'Enregistrer le trunk' }).click()
+    const allowed = await saved
+    expectEqual(allowed.status(), 200, 'PUT /admin/trunks/operator (allowed)')
+    expectEqual(JSON.parse(allowed.request().postData()).password, undefined, 'no password sent when it is kept')
+    expectEqual(JSON.stringify((await allowed.json()).allowed), JSON.stringify(['fixed', 'mobile', 'freephone', 'standard-rate', 'overseas']), 'allowed classes')
+    await alice.page.getByRole('status').filter({ hasText: 'Trunk operator enregistré.' }).waitFor()
     const before = operator.state.challenged
     const second = operator2.state.attempts.length
     mobileAcc = await lastId('acc')

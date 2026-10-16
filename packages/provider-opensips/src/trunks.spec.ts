@@ -4,7 +4,7 @@ import pg from 'pg'
 import type { DidRange, Trunk } from '@twake/telephony-types'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { SUBSCRIBER_SCHEMA, SUBSCRIBER_SQL, type Queryable } from './subscriber.js'
-import { DEFAULT_TRUNK_SOCKET, SOURCES_SET, TRUNK_SCHEMA, TRUNK_SQL, TrunkTables, codecFlags, projectTrunks, trunkSecret } from './trunks.js'
+import { DEFAULT_TRUNK_SOCKET, SOURCES_SET, TRUNK_SCHEMA, TRUNK_SQL, TrunkTables, codecFlags, projectTrunks, trunkSecret, trunkStatusFrom } from './trunks.js'
 
 // Fictional numbers only (ARCEP's ranges for fiction); the operator's names are reserved for documentation (RFC 2606).
 const OPERATOR: Trunk & { password: string } = {
@@ -151,6 +151,66 @@ const scriptQuery = (name: string, vars: Record<string, string>) => {
   })
 }
 
+describe('trunkStatusFrom', () => {
+  const sets = [{ id: 'operator', setid: 1, aor: 'sip:login@operator.example' }]
+  const ds = (state: string) => ({ PARTITIONS: [{ name: 'default', SETS: [{ id: 1, Destinations: [{ URI: 'sip:sbc1.operator.example:5060', state }] }] }] })
+  const reg = (state: string, enabled = 'yes') => ({ Records: [{ AOR: 'sip:login@operator.example', state, enabled }] })
+
+  it("says each of uac_registrant's states in the words of the contract", () => {
+    const states: [string, string][] = [
+      ['REGISTERED_STATE', 'registered'],
+      ['REGISTERING_STATE', 'registering'],
+      ['AUTHENTICATING_STATE', 'registering'],
+      ['NOT_REGISTERED_STATE', 'unregistered'],
+      ['UNREGISTERING_STATE', 'unregistered'],
+      ['AUTHENTICATING_UNREGISTER_STATE', 'unregistered'],
+      ['WRONG_CREDENTIALS_STATE', 'refused'],
+      ['REGISTER_TIMEOUT_STATE', 'timeout'],
+      ['REGISTRAR_ERROR_STATE', 'error'],
+      ['INTERNAL_ERROR_STATE', 'error']
+    ]
+    for (const [state, said] of states) expect(trunkStatusFrom(sets, ds('Active'), reg(state))[0]!.registration, state).toEqual({ state: said })
+    expect(trunkStatusFrom(sets, ds('Active'), reg('REGISTERED_STATE', 'no'))[0]!.registration).toEqual({ state: 'disabled' })
+    // A state of a later OpenSIPS, or no record (not loaded yet): no registration said rather than a wrong one.
+    expect(trunkStatusFrom(sets, ds('Active'), reg('SOMETHING_NEW'))[0]!.registration).toBeUndefined()
+    expect(trunkStatusFrom(sets, ds('Active'), { Records: [] })[0]!.registration).toBeUndefined()
+  })
+
+  it("says each of dispatcher's states, and leaves out what it cannot read", () => {
+    expect(trunkStatusFrom(sets, ds('Active'), undefined)[0]!.servers).toEqual([{ address: 'sbc1.operator.example:5060', state: 'up' }])
+    expect(trunkStatusFrom(sets, ds('Probing'), undefined)[0]!.servers).toEqual([{ address: 'sbc1.operator.example:5060', state: 'probing' }])
+    expect(trunkStatusFrom(sets, ds('Inactive'), undefined)[0]!.servers).toEqual([{ address: 'sbc1.operator.example:5060', state: 'disabled' }])
+    expect(trunkStatusFrom(sets, ds('Weird'), undefined)[0]!.servers).toEqual([])
+    expect(trunkStatusFrom(sets, null, null)).toEqual([{ id: 'operator', servers: [] }])
+  })
+
+  it('reads what a real OpenSIPS 3.6 answers for a refused, a silent, a disabled and a registered trunk (review 7 n°10)', () => {
+    // Captured from OpenSIPS 3.6.9 (uac_registrant, dispatcher, MI over a datagram) with a registrar refusing every
+    // login, one that never answers, a registrant disabled in its table (state 1) and one accepted; servers: one
+    // answering OPTIONS, one never answering (state 2, probing), one disabled in the table (state 1). Only the
+    // addresses were replaced by documentation ones (RFC 5737, RFC 2606), nothing else of the answers.
+    const { reg_list: regList, ds_list: dsList } = JSON.parse(readFileSync(new URL('../test/opensips-3.6-trunk-status.json', import.meta.url), 'utf8')) as { reg_list: unknown; ds_list: unknown }
+    const trunk = (id: string, aor: string) => ({ id, setid: 1, aor })
+    const said = trunkStatusFrom(
+      [trunk('refused', 'sip:refused@operator.example'), trunk('silent', 'sip:silent@operator.example'), trunk('off', 'sip:off@operator.example'), trunk('good', 'sip:good@operator.example'), trunk('ip', '')],
+      dsList,
+      regList
+    )
+    expect(said.map(t => [t.id, t.registration?.state])).toEqual([
+      ['refused', 'refused'],
+      ['silent', 'timeout'],
+      ['off', 'disabled'],
+      ['good', 'registered'],
+      ['ip', undefined]
+    ])
+    expect(said[0]!.servers).toEqual([
+      { address: '192.0.2.20:5060', state: 'up' },
+      { address: '192.0.2.21:5060', state: 'probing' },
+      { address: '192.0.2.22:5060', state: 'disabled' }
+    ])
+  })
+})
+
 // Against a real PostgreSQL (TEST_DATABASE_URL): the SQL itself, and the queries of opensips.cfg.tpl on what it writes.
 if (process.env.TEST_DATABASE_URL) {
   describe('TrunkTables on PostgreSQL', () => {
@@ -181,6 +241,9 @@ if (process.env.TEST_DATABASE_URL) {
       expect(await tables.set([{ ...OPERATOR, registerExpires: 300 }], DIDS)).toEqual({ dispatcher: false, registrant: true })
       const reg = await pool.query('SELECT aor, binding_uri, expiry, forced_socket, state FROM registrant')
       expect(reg.rows).toEqual([{ aor: 'sip:0033199000100@sip.operator.example', binding_uri: 'sip:0033199000100@192.0.2.1:5070', expiry: 300, forced_socket: 'udp:192.0.2.1:5070', state: 0 }])
+      // Step 7: the set and address of record of each trunk, which the status read from OpenSIPS is matched against.
+      expect(await tables.sets()).toEqual([{ id: 'operator', setid: 1, aor: 'sip:0033199000100@sip.operator.example' }])
+      expect(await new TrunkTables({ pool, ready, tenantId: 'spec-B' }).sets()).toEqual([])
       // No trunk any more: everything of the tenant goes.
       expect(await tables.set([], [])).toEqual({ dispatcher: true, registrant: true })
       for (const t of ['trunks', 'dids', 'dispatcher', 'registrant']) expect((await pool.query(`SELECT count(*)::int AS n FROM ${t}`)).rows[0].n, t).toBe(0)

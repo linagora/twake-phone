@@ -1,9 +1,8 @@
 import { useCallback, useEffect, useState } from 'react'
 import type { DirectoryAdmin, SyncReport } from '@twake/telephony-client'
-import { useGateway } from '../gateway.js'
-import type { Key } from '../i18n/index.js'
-import { useT } from '../i18n/useT.js'
-import { RingGroups } from './RingGroups.js'
+import { useGateway } from '../../gateway.js'
+import type { Key } from '../../i18n/index.js'
+import { useT } from '../../i18n/useT.js'
 
 type T = (key: Key, params?: Record<string, string | number>) => string
 
@@ -50,10 +49,10 @@ const Report = ({ report }: { report: SyncReport }) => {
   )
 }
 
-/** The directory source and its synchronisation into the extensions, and the ring groups. Administrators only; the Gateway decides who. */
-export const Admin = () => {
+/** The directory source and its synchronisation into the extensions. Administrators only (Admin); the Gateway decides who. */
+export const Accounts = () => {
   const { t, lang } = useT()
-  const { client, me, meError, refreshMe } = useGateway()
+  const { client, me, refreshMe } = useGateway()
   const admin = me?.features?.admin === true
   const [data, setData] = useState<DirectoryAdmin | null>(null)
   const [error, setError] = useState<{ status?: string; reason: string } | null>(null)
@@ -100,29 +99,12 @@ export const Admin = () => {
     }
   }
 
-  if (!me) {
-    return (
-      <>
-        <h1>{t('admin.title')}</h1>
-        {meError ? <p className="alert alert-error" role="alert">{t('admin.error', { reason: meError })}</p> : <p role="status">{t('admin.loading')}</p>}
-      </>
-    )
-  }
-  if (!admin) {
-    return (
-      <>
-        <h1>{t('admin.title')}</h1>
-        <p className="alert" role="alert">{t('admin.forbidden')}</p>
-      </>
-    )
-  }
   const source = data?.source
   const attributes = Object.entries(source?.attributes ?? {})
   const last = data?.sync.last
   const formatDate = (iso: string) => new Date(iso).toLocaleString(lang === 'fr' ? 'fr-FR' : 'en-GB')
   return (
     <>
-      <h1>{t('admin.title')}</h1>
       {error ? <p className="alert alert-error" role="alert">{error.status === '501' ? t('admin.noDirectory') : t('admin.error', { reason: error.reason })}</p> : null}
       {source ? (
         <section className="card" aria-labelledby="source">
@@ -199,7 +181,6 @@ export const Admin = () => {
           )}
         </section>
       ) : null}
-      <RingGroups />
     </>
   )
 }

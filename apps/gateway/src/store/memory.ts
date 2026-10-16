@@ -1,4 +1,5 @@
-import { clampLimit, isDeclined, isMissed, type HistoryEntry, type HistoryPage, type HistoryQuery, type ConferenceRecord, type AlertRecord, type AlertQuery, type DidRecord, type OutboundRecord, ALERT_DEDUP_MS, alertKey, type ProviderRecord, type StoredAlert, type PushSaveResult, type PushSubscriptionRecord, type Store, type TrunkRecord, type UserMapping, type UserPresenceRecord, type VapidKeysRecord } from './types.js'
+import { clampLimit, isDeclined, isMissed, type HistoryEntry, type HistoryPage, type HistoryQuery, type ConferenceRecord, type AlertRecord, type AlertQuery, type DidRecord, type OutboundHand, type OutboundRecord, type OutboundRules, ALERT_DEDUP_MS, alertKey, type ProviderRecord, type StoredAlert, type PushSaveResult, type PushSubscriptionRecord, type Store, type TrunkRecord, type UserMapping, type UserPresenceRecord, type VapidKeysRecord } from './types.js'
+import { EMPTY_OUTBOUND, outboundVersion, staleOutbound } from '../outbound.js'
 
 const key = (...parts: string[]) => parts.join('\u0000')
 
@@ -240,14 +241,45 @@ export class MemoryStore implements Store {
     return r ? structuredClone(r) : null
   }
 
-  async setOutbound(record: OutboundRecord) {
-    this.outbound.set(record.tenantId, structuredClone(record))
+  /** One turn per tenant for its outbound rules, as PostgreSQL's advisory lock gives. */
+  private outboundTurns = new Map<string, Promise<unknown>>()
+  private inOutboundTurn<T>(tenantId: string, run: () => Promise<T>): Promise<T> {
+    const next = (this.outboundTurns.get(tenantId) ?? Promise.resolve()).then(run)
+    const settled = next.catch(() => undefined)
+    this.outboundTurns.set(tenantId, settled)
+    void settled.then(() => {
+      if (this.outboundTurns.get(tenantId) === settled) this.outboundTurns.delete(tenantId)
+    })
+    return next
+  }
+
+  async setOutbound(record: OutboundRecord, expected?: string, hand?: OutboundHand) {
+    await this.inOutboundTurn(record.tenantId, async () => {
+      const kept = this.outbound.get(record.tenantId)
+      const before: OutboundRules = kept ? { policy: kept.policy, profiles: kept.profiles, assignments: kept.assignments } : EMPTY_OUTBOUND
+      if (expected !== undefined && outboundVersion(before) !== expected) throw staleOutbound()
+      if (hand) {
+        const { tenantId: _t, ...rules } = record
+        await hand(structuredClone(rules), false).catch(async (err: unknown) => {
+          await hand(structuredClone(before), true).catch(() => undefined)
+          throw err
+        })
+      }
+      this.outbound.set(record.tenantId, structuredClone(record))
+    })
+  }
+
+  async holdOutbound(tenantId: string, run: (kept: OutboundRules) => Promise<void>) {
+    await this.inOutboundTurn(tenantId, async () => {
+      const kept = this.outbound.get(tenantId)
+      await run(kept ? structuredClone({ policy: kept.policy, profiles: kept.profiles, assignments: kept.assignments }) : EMPTY_OUTBOUND)
+    })
   }
 
   async addAlert(record: AlertRecord) {
     const key = alertKey(record.alert)
     const since = new Date(Date.parse(record.at) - ALERT_DEDUP_MS).toISOString()
-    const open = this.alerts.filter(a => a.tenantId === record.tenantId && alertKey(a.alert) === key && a.lastAt >= since).at(-1)
+    const open = this.alerts.filter(a => a.tenantId === record.tenantId && alertKey(a.alert) === key && a.lastAt >= since && !a.acknowledgedAt).at(-1)
     if (open) {
       if (record.at > open.lastAt) open.lastAt = record.at
       open.count++
@@ -262,10 +294,17 @@ export class MemoryStore implements Store {
     const order = (a: StoredAlert, b: StoredAlert) => Date.parse(b.lastAt) - Date.parse(a.lastAt) || Number(b.id) - Number(a.id)
     const cursor = query.before ? ({ lastAt: query.before.lastAt, id: query.before.id } as StoredAlert) : undefined
     return this.alerts
-      .filter(a => a.tenantId === tenantId && (!cursor || order(cursor, a) < 0) && (!query.kind || a.alert.kind === query.kind) && (!query.param || a.alert.param === query.param))
+      .filter(a => a.tenantId === tenantId && (!cursor || order(cursor, a) < 0) && (!query.kind || a.alert.kind === query.kind) && (!query.param || a.alert.param === query.param) && (!query.state || (query.state === 'open') === !a.acknowledgedAt))
       .sort(order)
       .slice(0, clampLimit(query.limit))
       .map(a => structuredClone(a))
+  }
+
+  async acknowledgeAlert(tenantId: string, id: string, by: string, at: string, seen: string, count: number) {
+    const alert = this.alerts.find(a => a.tenantId === tenantId && a.id === id)
+    if (!alert) return null
+    if (!alert.acknowledgedAt && Date.parse(alert.lastAt) === Date.parse(seen) && alert.count === count) Object.assign(alert, { acknowledgedAt: at, acknowledgedBy: by })
+    return structuredClone(alert)
   }
 
   async purgeAlerts(before: string) {

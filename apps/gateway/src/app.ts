@@ -18,9 +18,9 @@ import { ENDED_TTL_SEC, MISSED_TTL_SEC, type PushMessage, type WebPush } from '.
 import type { ProviderRegistry } from './registry.js'
 import { securityHeadersFor, type SecurityOptions } from './security.js'
 import { MAX_DIDS, MAX_TRUNKS, TRUNK_ID, defaultTrunk, parseDid, parseTrunk, providerTrunks, publicDid, publicTrunk, trunkRecord } from './trunks.js'
-import { EMPTY_OUTBOUND, PROFILE_ID, parseOutbound, type Outbound } from './outbound.js'
+import { EMPTY_OUTBOUND, PROFILE_ID, outboundVersion, parseOutbound, staleOutbound, type Outbound } from './outbound.js'
 import { MemoryStore } from './store/memory.js'
-import { ALERT_RETENTION_DAYS, clampLimit, isMissed, type HistoryEntry, type HistoryQuery, type Store, type TrunkRecord, type UserPresenceRecord } from './store/types.js'
+import { ALERT_RETENTION_DAYS, clampLimit, isMissed, type HistoryEntry, type HistoryQuery, type Store, type StoredAlert, type TrunkRecord, type UserPresenceRecord } from './store/types.js'
 
 /** What the SIP server raises for the administrators (TelephonyAlert). */
 const ALERT_KINDS = ['fraud-warning', 'fraud-critical', 'limit', 'rights', 'emergency'] as const
@@ -37,6 +37,20 @@ const pseudonymizer = (secretsKey: Buffer | undefined) => {
 }
 /** The cursor of a page of alerts (`next`, `before`): the last repeat (ms) and id of the last alert of the page. */
 const ALERT_CURSOR = /^([0-9]{1,15})-([1-9][0-9]{0,17})$/
+/**
+ * An alert as the API shows it: its last repeat's fields, what the first one said (`first`: its value and number), and
+ * its acknowledgement (step 7).
+ */
+const publicAlert = ({ id, at, lastAt, count, alert, first, acknowledgedAt, acknowledgedBy }: StoredAlert) => ({
+  id,
+  at,
+  lastAt,
+  count,
+  ...alert,
+  first: { ...(first.value !== undefined ? { value: first.value } : {}), ...(first.number ? { number: first.number } : {}) },
+  ...(acknowledgedAt ? { acknowledgedAt } : {}),
+  ...(acknowledgedBy ? { acknowledgedBy } : {})
+})
 
 const STATUSES: PresenceStatus[] = ['available', 'busy', 'away', 'dnd', 'offline']
 const DIRECTIONS: CallDirection[] = ['inbound', 'outbound']
@@ -106,6 +120,11 @@ export interface BuildOptions {
   push?: WebPush
   /** How often the alerts past their retention are removed (step 6b). Default: every hour. */
   alertPurgeIntervalMs?: number
+  /**
+   * How long the state of a tenant's trunks is kept (step 7): every open Trunks screen reads it every few seconds, each
+   * read costs the SIP server a query and a control message. Default 2.5 s.
+   */
+  trunkStatusCacheMs?: number
   /**
    * The key the passwords of the trunks are encrypted with (SECRETS_KEY, step 6). Absent: a trunk can be kept without
    * a password only.
@@ -284,6 +303,10 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
   const tickets = options.tickets ?? new TicketStore()
   const historyWriteMs = options.historyWriteTimeoutMs ?? HISTORY_WRITE_MS
   const turnMaxMs = options.turnMaxMs ?? TURN_MAX_MS
+  const trunkStatusMs = options.trunkStatusCacheMs ?? 2_500
+  /** The last read of the state of each tenant's trunks, and the tenants whose SIP server did not answer it. */
+  const trunkStatus = new Map<string, { at: number; answer: Promise<{ available: boolean; items: unknown[] }> }>()
+  const trunkStatusFailing = new Set<string>()
   let directory = options.directory
   if (!directory) {
     // Dev convenience: a bare in-memory gateway maps users from DEV_USER_MAP.
@@ -494,10 +517,8 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
     for (let attempt = 0; !closing; attempt++) {
       try {
         if (!(await provider.getCapabilities()).outboundPolicy) return
-        await inTurn(tenantId, async () => {
-          const o = await outboundFor(tenantId)
-          await provider.setOutboundPolicy!(o.policy, o.profiles, o.assignments)
-        })
+        // In the store's turn for these rules: a change another Gateway makes meanwhile is handed after this one.
+        await inTurn(tenantId, () => store.holdOutbound(tenantId, o => provider.setOutboundPolicy!(o.policy, o.profiles, o.assignments)))
         return
       } catch (err) {
         if (closing) return
@@ -1009,6 +1030,34 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         trunksOf(registry.forTenant(user.tenantId))
         return { items: (await store.listTrunks(user.tenantId)).map(publicTrunk) }
       })
+      // How each trunk is doing now (step 7): its registration and servers, as the SIP server says. `available`: false
+      // when the provider cannot say (no control channel) or did not answer (logged): the screen says it does not know.
+      v1.get('/admin/trunks/status', async req => {
+        const user = await administrator(req)
+        const provider = registry.forTenant(user.tenantId)
+        trunksOf(provider)
+        if (!provider.getTrunkStatus) return { available: false, items: [] }
+        const tenantId = user.tenantId
+        const kept = trunkStatus.get(tenantId)
+        if (kept && Date.now() - kept.at < trunkStatusMs) return kept.answer
+        // One read for every screen open within the window (the reads under way included); a failure is logged
+        // when it starts and when it ends, not at every read of every open screen.
+        const answer = (async () => {
+          try {
+            const items = await provider.getTrunkStatus!()
+            if (trunkStatusFailing.delete(tenantId)) app.log.info({ tenantId }, 'trunks: the SIP server says how they are doing again')
+            return items ? { available: true, items } : { available: false, items: [] }
+          } catch (err) {
+            if (!trunkStatusFailing.has(tenantId)) {
+              trunkStatusFailing.add(tenantId)
+              app.log.warn({ err, tenantId }, 'trunks: the SIP server did not say how they are doing')
+            }
+            return { available: false, items: [] }
+          }
+        })()
+        trunkStatus.set(tenantId, { at: Date.now(), answer })
+        return answer
+      })
       v1.put<{ Params: { id: string } }>('/admin/trunks/:id', async (req, reply) => {
         const user = await administrator(req)
         const apply = trunksOf(registry.forTenant(user.tenantId))
@@ -1017,7 +1066,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         const { record, created } = await inTurn(user.tenantId, async () => {
           const records = await store.listTrunks(user.tenantId)
           const current = records.find(t => t.id === id)
-          if (!current && records.length >= MAX_TRUNKS) throw Object.assign(new Error(`At most ${MAX_TRUNKS} trunks`), { statusCode: 409 })
+          if (!current && records.length >= MAX_TRUNKS) throw Object.assign(new Error(`At most ${MAX_TRUNKS} trunks`), { statusCode: 409, code: 'TRUNK_LIMIT' })
           const parsed = parseTrunk(req.body, current)
           // The default trunk stays so unless another one is made the default: a change that does not say `default`
           // keeps the mark; `default: false` on the default trunk is refused, it would hand the number of everyone
@@ -1041,6 +1090,8 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
           await changeTrunks(user.tenantId, apply, next, dids, () => store.upsertTrunks([...unmarked, record]))
           return { record, created: !current }
         })
+        // The state read before the change is no longer theirs: the screen reads it again at once.
+        trunkStatus.delete(user.tenantId)
         return reply.code(created ? 201 : 200).send(publicTrunk(record))
       })
       v1.delete<{ Params: { id: string } }>('/admin/trunks/:id', async (req, reply) => {
@@ -1056,6 +1107,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
           const dids = (await store.listDids(user.tenantId)).filter(d => d.trunkId !== req.params.id).map(publicDid)
           await changeTrunks(user.tenantId, apply, records.filter(t => t.id !== req.params.id), dids, () => store.deleteTrunk(user.tenantId, req.params.id))
         })
+        trunkStatus.delete(user.tenantId)
         return reply.code(204).send()
       })
       v1.get('/admin/dids', async req => {
@@ -1071,7 +1123,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
           const records = await store.listTrunks(user.tenantId)
           const dids = (await store.listDids(user.tenantId)).map(publicDid)
           const current = dids.find(d => d.id === req.params.id)
-          if (!current && dids.length >= MAX_DIDS) throw Object.assign(new Error(`At most ${MAX_DIDS} ranges of direct numbers`), { statusCode: 409 })
+          if (!current && dids.length >= MAX_DIDS) throw Object.assign(new Error(`At most ${MAX_DIDS} ranges of direct numbers`), { statusCode: 409, code: 'DID_LIMIT' })
           const did = parseDid(req.params.id, req.body, records, dids)
           await checkTarget(user.tenantId, provider, 'target', did.target, 'DID_TARGET')
           await checkTarget(user.tenantId, provider, 'fallbackTarget', did.fallbackTarget, 'FALLBACK_TARGET')
@@ -1092,29 +1144,25 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
       })
 
       // The rules of the calls to the public network (capability `outboundPolicy`, ADR 0017): administrators only, one
-      // change at a time per tenant, applied as the trunks are: the provider first, then the store; either failing,
-      // the provider is handed back what it had. Emergency calls are outside all of it.
+      // change at a time per tenant, in the store's turn for them (whatever Gateway writes): the version checked, then
+      // the provider handed the change, then the store keeps it; the provider failing, or the store, the provider is
+      // handed back what the store keeps. A change refused never reaches the provider (review 7 ter, n°9). Emergency
+      // calls are outside all of it.
       const outboundOf = (provider: TelephonyProvider) => {
         if (!provider.setOutboundPolicy) throw Object.assign(new Error('Outbound rules are not available on this platform'), { statusCode: 501 })
         return provider.setOutboundPolicy.bind(provider)
       }
-      const changeOutbound = async (tenantId: string, apply: ReturnType<typeof outboundOf>, next: Outbound) => {
-        const before = await outboundFor(tenantId)
-        const undo = (err: unknown) =>
-          apply(before.policy, before.profiles, before.assignments).then(
-            () => {
-              throw err
-            },
-            (undoErr: unknown) => {
-              app.log.error({ err: undoErr, tenantId }, 'outbound rules: the previous ones could not be handed back to the provider')
-              throw err
-            }
-          )
-        await apply(next.policy, next.profiles, next.assignments).catch(undo)
-        await store.setOutbound({ tenantId, ...next }).catch(undo)
-      }
+      // `expected`: the version the change was made from; kept only if the store still holds it (checked as it writes).
+      const changeOutbound = (tenantId: string, apply: ReturnType<typeof outboundOf>, next: Outbound, expected?: string) =>
+        store.setOutbound({ tenantId, ...next }, expected, (rules, undo) =>
+          apply(rules.policy, rules.profiles, rules.assignments).catch((err: unknown) => {
+            if (undo) app.log.error({ err, tenantId }, 'outbound rules: the previous ones could not be handed back to the provider')
+            throw err
+          })
+        )
       // What holds when an administrator says nothing (ADR 0017): shown with what they said.
-      const outboundView = (o: Outbound) => ({ ...o, defaults: { fraud: FRAUD_DEFAULTS, caps: OUTBOUND_CAP_DEFAULTS } })
+      // `version`: what to send back with a change, so that it is refused if the setting changed since (OUTBOUND_STALE).
+      const outboundView = (o: Outbound) => ({ ...o, version: outboundVersion(o), defaults: { fraud: FRAUD_DEFAULTS, caps: OUTBOUND_CAP_DEFAULTS } })
       v1.get('/admin/outbound', async req => {
         const user = await administrator(req)
         outboundOf(registry.forTenant(user.tenantId))
@@ -1124,7 +1172,16 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         const user = await administrator(req)
         const apply = outboundOf(registry.forTenant(user.tenantId))
         const next = parseOutbound(req.body)
-        await inTurn(user.tenantId, () => changeOutbound(user.tenantId, apply, next))
+        // The version read (the screens always send it): the setting is replaced only if it is still the one read. A
+        // script that means to replace it whole, whatever it is, sends none.
+        const version = (req.body as { version?: unknown }).version
+        if (version !== undefined && typeof version !== 'string') throw Object.assign(new Error('version: the version of GET /admin/outbound'), { statusCode: 400, code: 'OUTBOUND_INVALID' })
+        await inTurn(user.tenantId, async () => {
+          // Checked first (nothing handed to the provider for nothing), then again by the store as it writes: the turn
+          // of this process ends after turnMaxMs, and another Gateway may write too (review 7 bis, n°2).
+          if (version !== undefined && outboundVersion(await outboundFor(user.tenantId)) !== version) throw staleOutbound()
+          await changeOutbound(user.tenantId, apply, next, version)
+        })
         return outboundView(next)
       })
       // One person's profile (`profileId`, or null: the default one).
@@ -1132,21 +1189,35 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         const user = await administrator(req)
         const apply = outboundOf(registry.forTenant(user.tenantId))
         const userId = req.params.userId
-        const body = req.body as { profileId?: unknown } | undefined
+        const body = req.body as { profileId?: unknown; version?: unknown } | undefined
         const profileId = body?.profileId
         if (profileId !== null && (typeof profileId !== 'string' || !PROFILE_ID.test(profileId))) throw Object.assign(new Error('profileId: one of the profiles, or null'), { statusCode: 400, code: 'OUTBOUND_INVALID' })
+        // The version the screen shows (the app always sends it): refused if the setting changed since, this person's
+        // profile included (review 7 ter, n°3). A script sends none.
+        const version = body?.version
+        if (version !== undefined && typeof version !== 'string') throw Object.assign(new Error('version: the version of GET /admin/outbound'), { statusCode: 400, code: 'OUTBOUND_INVALID' })
         return inTurn(user.tenantId, async () => {
           const current = await outboundFor(user.tenantId)
+          if (version !== undefined && outboundVersion(current) !== version) throw staleOutbound()
           const assignments = current.assignments.filter(a => a.userId !== userId)
           const next = parseOutbound({ ...current, assignments: profileId ? [...assignments, { userId, profileId }] : assignments })
-          await changeOutbound(user.tenantId, apply, next)
-          return { userId, profileId: profileId ?? null }
+          await changeOutbound(user.tenantId, apply, next, outboundVersion(current))
+          // The whole setting as it is now, with its version (review 7 bis, n°1): a screen shows all of it, never a
+          // version of the server grafted onto what it read before.
+          return { userId, profileId: profileId ?? null, ...outboundView(next) }
         })
+      })
+      // The people who hold an extension (step 7), by user id: whom a rights profile is given to, where a direct
+      // number or a fallback may ring. What the mappings say (the directory synchronisation writes them), nothing more.
+      v1.get('/admin/users', async req => {
+        const user = await administrator(req)
+        const mappings = await store.listMappings(user.tenantId)
+        return { items: mappings.map(m => ({ userId: m.userId, extension: m.extension, ...(m.displayName ? { displayName: m.displayName } : {}), ...(m.department ? { department: m.department } : {}) })) }
       })
       // The alerts, the latest repeated first, a page at a time (`next`: the `before` of the next page), of one kind
       // or param if asked. Each one once while it repeats: `count` times, the last at `lastAt` (its fields those of the
       // last), the first at `at` (`first`: its value and number).
-      v1.get<{ Querystring: { limit?: string; before?: string; kind?: string; param?: string } }>('/admin/alerts', async req => {
+      v1.get<{ Querystring: { limit?: string; before?: string; kind?: string; param?: string; state?: string } }>('/admin/alerts', async req => {
         const user = await administrator(req)
         const q = req.query
         const bad = (message: string) => Object.assign(new Error(message), { statusCode: 400, code: 'ALERTS_QUERY' })
@@ -1154,16 +1225,33 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         if (q.before !== undefined && !cursor) throw bad('before: the `next` of a previous page')
         if (q.kind !== undefined && !(ALERT_KINDS as readonly string[]).includes(q.kind)) throw bad(`kind: one of ${ALERT_KINDS.join(', ')}`)
         if (q.param !== undefined && !/^[A-Za-z-]{1,32}$/.test(q.param)) throw bad('param: a threshold, a cap or a class of numbers')
+        if (q.state !== undefined && q.state !== 'open' && q.state !== 'acknowledged') throw bad('state: open or acknowledged')
         const asked = q.limit === undefined ? 50 : Number(q.limit)
         if (!Number.isInteger(asked)) throw bad('limit: a whole number')
         const limit = clampLimit(asked)
         const before = cursor ? { lastAt: new Date(Number(cursor[1])).toISOString(), id: cursor[2]! } : undefined
-        const items = await store.listAlerts(user.tenantId, { limit, ...(before ? { before } : {}), ...(q.kind ? { kind: q.kind as (typeof ALERT_KINDS)[number] } : {}), ...(q.param ? { param: q.param } : {}) })
+        const items = await store.listAlerts(user.tenantId, { limit, ...(before ? { before } : {}), ...(q.kind ? { kind: q.kind as (typeof ALERT_KINDS)[number] } : {}), ...(q.param ? { param: q.param } : {}), ...(q.state ? { state: q.state } : {}) })
         const last = items.at(-1)
         return {
-          items: items.map(({ id, at, lastAt, count, alert, first }) => ({ id, at, lastAt, count, ...alert, first: { ...(first.value !== undefined ? { value: first.value } : {}), ...(first.number ? { number: first.number } : {}) } })),
+          items: items.map(publicAlert),
           ...(last && items.length === limit ? { next: `${Date.parse(last.lastAt)}-${last.id}` } : {})
         }
+      })
+      // An administrator has seen it (step 7): kept with who and when; a repeat from then on opens a new alert.
+      // `lastAt`: its last repeat as they saw it. Repeated since, it stays open (409 ALERT_CHANGED): what came after
+      // is never acknowledged unseen.
+      v1.post<{ Params: { id: string } }>('/admin/alerts/:id/acknowledge', async req => {
+        const user = await administrator(req)
+        const body = req.body as { lastAt?: unknown; count?: unknown } | undefined
+        const seen = body?.lastAt
+        if (typeof seen !== 'string' || !/^\d{4}-\d{2}-\d{2}T[0-9:.]+Z$/.test(seen) || Number.isNaN(Date.parse(seen)))
+          throw Object.assign(new Error('lastAt: the lastAt of the alert as listed'), { statusCode: 400, code: 'ALERT_INVALID' })
+        const count = body?.count
+        if (!Number.isInteger(count) || (count as number) < 1) throw Object.assign(new Error('count: the count of the alert as listed'), { statusCode: 400, code: 'ALERT_INVALID' })
+        const alert = await store.acknowledgeAlert(user.tenantId, req.params.id, user.id, new Date().toISOString(), new Date(seen).toISOString(), count as number)
+        if (!alert) throw notFound('alert')
+        if (!alert.acknowledgedAt) throw Object.assign(new Error('The alert repeated since it was listed: list it again'), { statusCode: 409, code: 'ALERT_CHANGED' })
+        return publicAlert(alert)
       })
 
       // Right to erasure of one's own call history.

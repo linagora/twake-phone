@@ -141,6 +141,13 @@ export interface OutboundRecord {
   profiles: OutboundProfile[]
   assignments: OutboundAssignment[]
 }
+/** The rules of a record, without its tenant. */
+export type OutboundRules = Omit<OutboundRecord, 'tenantId'>
+/**
+ * Hands rules to the SIP server: the new ones (`undo` false), or, once they could not be kept, those kept before
+ * (`undo` true).
+ */
+export type OutboundHand = (rules: OutboundRules, undo: boolean) => Promise<void>
 
 /** What the SIP server raised for the administrators (step 6b): when, and what. */
 export interface AlertRecord {
@@ -160,6 +167,9 @@ export interface StoredAlert extends AlertRecord {
   lastAt: string
   count: number
   first: TelephonyAlert
+  /** When an administrator acknowledged it, and who (step 7): a repeat after that opens a new alert. */
+  acknowledgedAt?: string
+  acknowledgedBy?: string
 }
 
 /** Where a page of alerts starts: after this one (its last repeat and id). */
@@ -174,6 +184,8 @@ export interface AlertQuery {
   before?: AlertCursor
   kind?: TelephonyAlert['kind']
   param?: string
+  /** Those not acknowledged yet (`open`), or those acknowledged. */
+  state?: 'open' | 'acknowledged'
 }
 
 /** How long the alerts are kept (from their last repeat): purged by the Gateway every hour (purgeAlerts). */
@@ -257,12 +269,28 @@ export interface Store {
 
   /** The outbound rules of a tenant; null when none was ever set. */
   getOutbound(tenantId: string): Promise<OutboundRecord | null>
-  /** Replaces them whole. */
-  setOutbound(record: OutboundRecord): Promise<void>
-  /** Keeps an alert: a repeat of an open one (same alertKey, within ALERT_DEDUP_MS of its last) counts in it. */
+  /**
+   * Replaces them whole, one writer of the tenant's rules at a time whatever process writes (with a version or not).
+   * With `expected`, only if what is kept is still that version (outboundVersion; none kept: the version of
+   * EMPTY_OUTBOUND): 409 OUTBOUND_STALE otherwise, and nothing handed. `hand`, in the same turn, after the check and
+   * before the write: the new rules; when it fails, or the write does, the rules kept before (then the error).
+   * The SIP server is thus only ever handed what the store keeps, in the order it keeps it.
+   */
+  setOutbound(record: OutboundRecord, expected?: string, hand?: OutboundHand): Promise<void>
+  /** Runs `run` with the rules kept (EMPTY_OUTBOUND when none), in the same turn as setOutbound: none written meanwhile. */
+  holdOutbound(tenantId: string, run: (kept: OutboundRules) => Promise<void>): Promise<void>
+  /** Keeps an alert: a repeat of an open one (same alertKey, within ALERT_DEDUP_MS of its last, not acknowledged) counts in it. */
   addAlert(record: AlertRecord): Promise<void>
   /** The alerts of a tenant, the latest repeated first, `limit` at most (clamped as a page). */
   listAlerts(tenantId: string, query?: AlertQuery): Promise<StoredAlert[]>
+  /**
+   * Marks an alert of the tenant acknowledged, by `by` at `at` (ISO), if it is still as the administrator saw it: its
+   * last repeat at `seen` (ISO) and `count` repeats. Repeated since (even within the same millisecond, or a repeat
+   * dated before the last one), it stays open (returned without `acknowledgedAt`: they look again).
+   * Its repeats open a new one once it is acknowledged. The alert as kept then (the first acknowledgement stays),
+   * null when the tenant has none of that id.
+   */
+  acknowledgeAlert(tenantId: string, id: string, by: string, at: string, seen: string, count: number): Promise<StoredAlert | null>
   /** Removes the alerts of every tenant whose last repeat is before `before` (ISO); how many. */
   purgeAlerts(before: string): Promise<number>
 
