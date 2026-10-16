@@ -1,10 +1,12 @@
-// The trunk to the operator as OpenSIPS's script runs it (step 6a, ADR 0016), without a browser: SIP phones of this
-// process (sip-phone.mjs, over UDP and over a WebSocket) and simulated operators (sip-trunk.mjs, which send 100 Trying
-// first as real ones do) against the SIP stack (docker/docker-compose.sip.yml, or OpenSIPS and rtpengine started by
-// hand), with the trunks written by the OpenSIPS provider (TrunkTables). What each step proves is what the script
-// does with the messages, not the text of the script. Fictional numbers only (ARCEP reserves 01 99 00 xx xx and
-// 06 39 98 xx xx for fiction; Ofcom 020 7946 0xxx). Its accounts (115, 301 to 303) and trunks are removed at the end:
-// the e2e of the browsers (sip.e2e.mjs) runs on the same stack afterwards.
+// The trunk to the operator as OpenSIPS's script runs it (step 6a, ADR 0016), and the rules of the calls to the public
+// network (step 6b, ADR 0017: rights profiles, caps, volume thresholds, fallback inside), without a browser: SIP
+// phones of this process (sip-phone.mjs, over UDP and over a WebSocket) and simulated operators (sip-trunk.mjs, which
+// send 100 Trying first as real ones do) against the SIP stack (docker/docker-compose.sip.yml, or OpenSIPS and
+// rtpengine started by hand), with the trunks and the outbound rules written by the OpenSIPS provider (TrunkTables,
+// OutboundTables). What each step proves is what the script does with the messages, not the text of the script.
+// Fictional numbers only (ARCEP reserves 01 99 00 xx xx and 06 39 98 xx xx for fiction; Ofcom 020 7946 0xxx). Its
+// accounts (115, 301 to 303), trunks and outbound rules are removed at the end, the default thresholds put back: the
+// e2e of the browsers (sip.e2e.mjs) runs on the same stack afterwards.
 //
 //   SIP_UDP, SIP_WS      UDP and WS sockets of OpenSIPS (default 127.0.0.1:5060, ws://127.0.0.1:8088)
 //   SIP_TRUNK            its trunk socket (default 127.0.0.1:5070); TRUNK_ADVERTISE what it announces there, if anything
@@ -15,9 +17,14 @@
 //   CALL_PING_TIMEOUT_SEC its CALL_PING_TIMEOUT_SEC (default 15): how long a phone may be silent and keep its call
 //   TRUNK_MAX_CALL_SEC   its TRUNK_MAX_CALL_SEC (default 14400)
 //   RTPENGINE_NG         rtpengine's control socket (default 127.0.0.1:22222): whether a call's media is freed
+//   TRUNK_MIN_CALL_SEC   its TRUNK_MIN_CALL_SEC (default 60): the shortest call the minutes left allow
+//   OPENSIPS_RESTART     a shell command that kills OpenSIPS (SIGKILL) and starts it again; unset, the step of the
+//                        restart is skipped
+import { execSync } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
 import { createSocket } from 'node:dgram'
 import pg from 'pg'
+import { EMERGENCY_RESTORED_SEC } from '../../../packages/provider-opensips/dist/outbound.js'
 import { SubscriberProvisioner } from '../../../packages/provider-opensips/dist/subscriber.js'
 import { sipPhone } from './sip-phone.mjs'
 import { plainRtp, startOperator } from './sip-trunk.mjs'
@@ -33,6 +40,8 @@ const PING_SEC = Number(process.env.CALL_PING_SEC ?? 30)
 const PING_TIMEOUT_SEC = Number(process.env.CALL_PING_TIMEOUT_SEC ?? 15)
 const RTPENGINE_NG = process.env.RTPENGINE_NG ?? '127.0.0.1:22222'
 const MAX_CALL_SEC = Number(process.env.TRUNK_MAX_CALL_SEC ?? 14400)
+const MIN_CALL_SEC = Number(process.env.TRUNK_MIN_CALL_SEC ?? 60)
+const RESTART = process.env.OPENSIPS_RESTART ?? ''
 const TENANT = 'trunk-sip'
 const LOGIN = '0033199000300'
 const PASSWORD = 'not-a-real-password'
@@ -87,8 +96,9 @@ const prov = new SubscriberProvisioner({ databaseUrl: DB_URL, realm: SIP_DOMAIN 
 await prov.ensureSchema()
 const secret = ext => `secret-${ext}-${randomBytes(4).toString('hex')}`
 const secrets = Object.fromEntries(['115', '301', '302', '303'].map(e => [e, secret(e)]))
-// 115 is the account of an extension kept from before step 6a: an emergency number (the SAMU social).
-for (const [ext, s] of Object.entries(secrets)) await prov.setSipSecret(ext, s)
+// 115 is the account of an extension kept from before step 6a: an emergency number (the SAMU social). Each account's
+// holder is the user `u-<ext>`: whom a rights profile is given to (step 6b).
+for (const [ext, s] of Object.entries(secrets)) await prov.setSipSecret(ext, s, `u-${ext}`)
 const nat = TRUNK_ADVERTISE ? { [TRUNK_ADVERTISE.includes(':') ? TRUNK_ADVERTISE : `${TRUNK_ADVERTISE}:${SIP_TRUNK.split(':')[1]}`]: SIP_TRUNK } : {}
 const A = await startOperator({ opensips: SIP_TRUNK, user: LOGIN, password: PASSWORD, nat })
 const B = await startOperator({ opensips: SIP_TRUNK, user: LOGIN, password: PASSWORD, nat, challenge: 'www' })
@@ -124,7 +134,91 @@ const pingWait = (PING_SEC * 2 + PING_TIMEOUT_SEC + 12) * 1000
 const shortSilenceMs = 6_500
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 
+// Step 6b. The outbound rules of the tenant; until its steps, volume thresholds that never trip (every one 0, none),
+// so that the steps of 6a, which call the operator often, are not refused for it.
+const outbound = prov.outboundTables({ tenantId: TENANT })
+const FRAUD_PARAMS = ['callsPerMinute', 'dailyAttempts', 'concurrentCalls', 'sequentialCalls', 'callSeconds']
+const NO_THRESHOLD = Object.fromEntries(FRAUD_PARAMS.map(p => [p, {}]))
+const RELAXED = { national: NO_THRESHOLD, international: NO_THRESHOLD }
+const setOutbound = async (policy, profiles = [], assignments = []) => {
+  const { fraud } = await outbound.set({ fraud: RELAXED, ...policy }, profiles, assignments)
+  if (fraud) expect('fraud_reload', (await mi('fraud_reload')).result === 'OK')
+}
+const PROFILES = [
+  { id: 'internal', allowed: [] },
+  { id: 'france', allowed: ['fixed', 'mobile', 'freephone'] },
+  { id: 'world', allowed: ['fixed', 'mobile', 'freephone', 'standard-rate', 'international'] }
+]
+const withCaps = caps => PROFILES.map(p => (p.id === 'world' ? { ...p, caps } : p))
+// What OpenSIPS raises for the administrators, as the Gateway hears it.
+const ALERT_EVENTS = ['E_FRD_WARNING', 'E_FRD_CRITICAL', 'E_TWAKEPHONE_LIMIT', 'E_TWAKEPHONE_RIGHTS', 'E_TWAKEPHONE_EMERGENCY']
+const alerts = []
+const listener = createSocket('udp4')
+listener.on('message', m => {
+  try {
+    alerts.push(JSON.parse(m.toString()))
+  } catch {
+    // not an event
+  }
+})
+await new Promise(resolve => listener.bind(0, '127.0.0.1', resolve))
+const alertAddress = `udp:127.0.0.1:${listener.address().port}`
+const untilAlert = async (what, test, timeoutMs = 5_000) => {
+  const end = Date.now() + timeoutMs
+  for (;;) {
+    const found = alerts.find(a => test(a.method, a.params ?? {}))
+    if (found) return found.params
+    if (Date.now() > end) throw new Error(`no ${what}: ${JSON.stringify(alerts.map(a => [a.method, a.params]))}`)
+    await sleep(100)
+  }
+}
+/** A call refused for `word` (Twake-Call-Refused), 403. */
+const refused = (what, call, word) => expect(what, call.final.status === 403 && header(call.final, 'twake-call-refused') === word, `${call.final.first} ${header(call.final, 'twake-call-refused')}`)
+const sentToOperators = () => [A, B, C].reduce((n, op) => n + op.state.attempts.length, 0)
+// The calls of the steps of 6b hung up after an answer: their CDR is written at the end of the dialog, just after the
+// BYE; what the caps count waits for each.
+const hungUp = []
+const hangupOut = async (phone, call) => {
+  await phone.hangup(call)
+  hungUp.push(call.callId)
+}
+/** What an extension used today (outbound_usage, kept as the CDRs are written: theirs all written first). */
+const usage = async ext => {
+  for (const id of hungUp.splice(0)) await cdrOf(id)
+  const row = (await db.query("SELECT calls, seconds FROM outbound_usage WHERE scope = 'user' AND subject = $1 AND period = 'd' AND start = (now() AT TIME ZONE 'Europe/Paris')::date", [ext])).rows[0]
+  return { calls: Number(row?.calls ?? 0), seconds: Number(row?.seconds ?? 0) }
+}
+/** What an extension used today, as if its earlier calls had. */
+const seedUsage = (ext, calls, seconds) =>
+  db.query("INSERT INTO outbound_usage (scope, subject, period, start, calls, seconds) VALUES ('user', $1, 'd', (now() AT TIME ZONE 'Europe/Paris')::date, $2, $3) ON CONFLICT (scope, subject, period, start) DO UPDATE SET calls = EXCLUDED.calls, seconds = EXCLUDED.seconds", [ext, calls, seconds])
+/** How many seconds each call (by Call-ID) has left before its dialog ends it (dlg_list). */
+const dialogLeft = async callIds => {
+  const dialogs = (await mi('dlg_list')).result?.Dialogs ?? []
+  const now = Math.floor(Date.now() / 1000)
+  return callIds.map(id => {
+    const d = dialogs.find(x => x.callid === id)
+    if (!d) throw new Error(`no dialog ${id}`)
+    return Number(d.timeout) - now
+  })
+}
+const until = async (what, fn, timeoutMs) => {
+  const end = Date.now() + timeoutMs
+  for (;;) {
+    const v = await fn()
+    if (v) return v
+    if (Date.now() > end) throw new Error(`no ${what}`)
+    await sleep(100)
+  }
+}
+const cdrOf = callId => until('the CDR', async () => (await db.query('SELECT external, duration FROM acc WHERE callid = $1', [callId])).rows[0], 5_000)
+/** The calls to the public network in progress (dialog profile trunk_out). */
+const outCalls = async () => Number((await mi('profile_get_size', { profile: 'trunk_out' })).result?.Profile?.count ?? 0)
+
 try {
+  await db.query('DELETE FROM outbound_usage')
+  await db.query('DELETE FROM outbound_reservations')
+  await setOutbound({})
+  for (const e of ALERT_EVENTS) await mi('event_subscribe', [e, alertAddress, 900])
   await tables.set([main, backup], dids)
   await reload()
   await A.registered(1, 30_000)
@@ -419,7 +513,8 @@ try {
       const call = await p301.dial('112')
       const at = await atOperator(A, call)
       expect('Request-URI at the operator', at.invite.uri === 'sip:112@operator.example', at.invite.uri)
-      expect('From', header(at.invite, 'from').includes('<sip:+33199000300@operator.example>'), header(at.invite, 'from'))
+      // Review 6b, n°2: its caller's own direct number on that trunk (read with it), not the trunk's.
+      expect('From', header(at.invite, 'from').includes('<sip:+33199000301@operator.example>'), header(at.invite, 'from'))
     } finally {
       await locker.query('ROLLBACK').catch(() => undefined)
       await locker.end()
@@ -439,7 +534,7 @@ try {
     expect('the emergency call', left(sos.callId) > MAX_CALL_SEC + 3600, `${left(sos.callId)} s left`)
     expect('the other call', left(other.callId) <= MAX_CALL_SEC, `${left(other.callId)} s left`)
     await p301.hangup(sos)
-    await p301.hangup(other)
+    await hangupOut(p301, other)
   })
 
   await step('review 3, n°2: the trunk of the caller\'s direct number refuses an emergency call (403): it goes through the default trunk', async () => {
@@ -482,8 +577,448 @@ try {
       for (const op of [A, B]) await mi('ds_set_state', { state: 'a', group: 1, address: `sip:${op.address}` })
     }
   })
+
+  // Step 6b (ADR 0017): rights, caps, volume thresholds, fallback.
+  await step('6b, FR-H3: a rights profile "internal calls only" refuses every external call (403, rights), nothing sent, and the administrators hear it (E_TWAKEPHONE_RIGHTS); an emergency call still goes, and is told (E_TWAKEPHONE_EMERGENCY); someone without a profile has the trunk\'s rights', async () => {
+    await setOutbound({}, PROFILES, [{ userId: 'u-301', profileId: 'internal' }])
+    alerts.length = 0
+    const sent = sentToOperators()
+    for (const number of ['0199000020', '0805980020', '+442079460123']) refused(`${number}`, await p301.dial(number), 'rights')
+    expect('calls the operators were sent', sentToOperators() === sent, `${sentToOperators() - sent}`)
+    const rights = await untilAlert('rights alert', (m, p) => m === 'E_TWAKEPHONE_RIGHTS' && p.number === '+442079460123')
+    expect('the rights alert', rights.caller === '301' && rights.param === 'international', JSON.stringify(rights))
+    busy(A)
+    const sos = await p301.dial('112')
+    expect('112 at the operator', (await atOperator(A, sos)).invite.uri === 'sip:112@operator.example')
+    const told = await untilAlert('emergency event', (m, p) => m === 'E_TWAKEPHONE_EMERGENCY' && p.callid === sos.callId)
+    expect('the emergency event', told.caller === '301' && told.number === '112', JSON.stringify(told))
+    busy(C)
+    expect('303 (no profile) at the operator', (await atOperator(C, await p303.dial('0199000021'))).invite.uri === 'sip:+33199000021@backup.example')
+  })
+
+  await step('6b, FR-H3: a profile "France" calls numbers in France, not abroad though the trunk may (rights); "world" calls abroad; a default profile applies to whoever has none', async () => {
+    await setOutbound({}, PROFILES, [{ userId: 'u-301', profileId: 'france' }])
+    busy(A)
+    await atOperator(A, await p301.dial('0199000023'))
+    refused('+442079460123 with "France"', await p301.dial('+442079460123'), 'rights')
+    await setOutbound({}, PROFILES, [{ userId: 'u-301', profileId: 'world' }])
+    busy(A)
+    expect('+442079460123 with "world"', (await atOperator(A, await p301.dial('+442079460123'))).invite.uri === 'sip:+442079460123@operator.example')
+    await setOutbound({ defaultProfile: 'internal' }, PROFILES, [{ userId: 'u-301', profileId: 'world' }])
+    refused('303 under the default profile', await p303.dial('0199000022'), 'rights')
+    busy(A)
+    await atOperator(A, await p301.dial('0199000022'))
+  })
+
+  await step('review 6b, n°2: the rules of step 6b cannot be read (their tables locked): 112 keeps the trunk and the direct number of its caller (303: backup, +33199000303); another call is refused at once for that reason (503, policy-unavailable), nothing sent', async () => {
+    await setOutbound({}, PROFILES, [])
+    busy(C)
+    const locker = new pg.Client({ connectionString: DB_URL })
+    await locker.connect()
+    try {
+      await locker.query('BEGIN')
+      await locker.query('LOCK TABLE outbound_settings IN ACCESS EXCLUSIVE MODE')
+      const started = Date.now()
+      const sos = await p303.dial('112')
+      const at = await atOperator(C, sos)
+      expect('112 at the trunk of its direct number', at.invite.uri === 'sip:112@backup.example', at.invite.uri)
+      expect('its own number', header(at.invite, 'from').includes('<sip:+33199000303@backup.example>'), header(at.invite, 'from'))
+      expect('at once', Date.now() - started < 900, `${Date.now() - started} ms`)
+      // Refused by the backup (486), it was answered by the default trunk: hung up (second review 6b, n°10: never
+      // left to be restored at every start).
+      if (sos.final.status === 200) await p303.hangup(sos)
+      const sent = sentToOperators()
+      const call = await p303.dial('0199000024')
+      expect('another call', call.final.status === 503 && header(call.final, 'twake-call-refused') === 'policy-unavailable', `${call.final.first} ${header(call.final, 'twake-call-refused')}`)
+      expect('calls the operators were sent', sentToOperators() === sent)
+    } finally {
+      await locker.query('ROLLBACK').catch(() => undefined)
+      await locker.end()
+    }
+  })
+
+  await step('second review 6b, n°1: the database out of reach for longer than a minute (the trunks locked 65 s, longer than the direct numbers were kept before): 112 still presents the direct number of its caller as last read (301: +33199000301), not the trunk\'s', async () => {
+    const locker = new pg.Client({ connectionString: DB_URL })
+    await locker.connect()
+    try {
+      await locker.query('BEGIN')
+      await locker.query('LOCK TABLE trunks IN ACCESS EXCLUSIVE MODE')
+      await sleep(65_000)
+      const sos = await p301.dial('112')
+      const at = await atOperator(A, sos)
+      expect('112 at the operator', at.invite.uri === 'sip:112@operator.example', at.invite.uri)
+      expect('the direct number of 301', header(at.invite, 'from').includes('<sip:+33199000301@operator.example>'), header(at.invite, 'from'))
+      if (sos.final.status === 200) await p301.hangup(sos)
+    } finally {
+      await locker.query('ROLLBACK').catch(() => undefined)
+      await locker.end()
+    }
+  })
+
+  await step('second review 6b, n°2: what the caps count locked (outbound_usage, as a VACUUM FULL or an ALTER would): the BYE of a call to the public network has its CDR written at once, a 112 from another phone meanwhile is answered at once; what the call used is counted by the next CDR', async () => {
+    await setOutbound({}, PROFILES, [{ userId: 'u-301', profileId: 'world' }])
+    const before = await usage('301')
+    const call = await p301.dial('0199000080')
+    expect('the call', call.final.status === 200, call.final.first)
+    const locker = new pg.Client({ connectionString: DB_URL })
+    await locker.connect()
+    try {
+      await locker.query('BEGIN')
+      await locker.query('LOCK TABLE outbound_usage IN EXCLUSIVE MODE')
+      let started = Date.now()
+      const bye = await p301.hangup(call)
+      expect('the BYE', bye.status === 200, bye.first)
+      expect('its CDR', (await cdrOf(call.callId)).external === 'out')
+      expect('written at once', Date.now() - started < 2_000, `${Date.now() - started} ms`)
+      started = Date.now()
+      const sos = await p303.dial('112', { timeoutMs: 10_000 })
+      expect('112 from 303', sos.final.status === 200, sos.final.first)
+      expect('answered at once', Date.now() - started < 2_000, `${Date.now() - started} ms`)
+      await p303.hangup(sos)
+    } finally {
+      await locker.query('ROLLBACK').catch(() => undefined)
+      await locker.end()
+    }
+    const next = await p301.dial('0199000081')
+    expect('the next call', next.final.status === 200, next.final.first)
+    await hangupOut(p301, next)
+    const after = await usage('301')
+    expect('both counted', after.calls === before.calls + 2, `${after.calls} calls, ${before.calls} before`)
+    await setOutbound({}, PROFILES, [])
+  })
+
+  await step('review 6b, n°15: no CDR is read during a call: with the CDRs locked (acc), a call to the public network still reaches the operator at once', async () => {
+    busy(A)
+    const locker = new pg.Client({ connectionString: DB_URL })
+    await locker.connect()
+    try {
+      await locker.query('BEGIN')
+      await locker.query('LOCK TABLE acc IN ACCESS EXCLUSIVE MODE')
+      const started = Date.now()
+      const at = await atOperator(A, await p301.dial('0199000025'))
+      expect('at the operator', at.invite.uri === 'sip:+33199000025@operator.example', at.invite.uri)
+      expect('at once', Date.now() - started < 900, `${Date.now() - started} ms`)
+    } finally {
+      await locker.query('ROLLBACK').catch(() => undefined)
+      await locker.end()
+    }
+  })
+
+  await step('review 6b, n°6: before any setting, a person has two external calls at a time: a third is refused (403, limit, concurrent); 112 still goes', async () => {
+    await setOutbound({}, PROFILES, [])
+    alerts.length = 0
+    const first = await p301.dial('0199000026')
+    const second = await p301.dial('0199000027')
+    expect('two calls', first.final.status === 200 && second.final.status === 200, `${first.final.first} ${second.final.first}`)
+    const third = await p301.dial('0199000028')
+    if (third.final.status === 200) await hangupOut(p301, third)
+    refused('a third one', third, 'limit')
+    const alert = await untilAlert('limit alert', (m, p) => m === 'E_TWAKEPHONE_LIMIT' && p.caller === '301')
+    expect('the alert', alert.param === 'concurrent' && alert.scope === 'user', JSON.stringify(alert))
+    const sos = await p301.dial('112')
+    expect('112 meanwhile', sos.final.status === 200, sos.final.first)
+    await p301.hangup(sos)
+    await hangupOut(p301, first)
+    await hangupOut(p301, second)
+  })
+
+  await step('6b, FR-D7: a cap of external calls at a time for the organisation: 303 is refused while 301 is in one (scope tenant), and calls once it ended', async () => {
+    await setOutbound({ caps: { concurrent: (await outCalls()) + 1 } }, PROFILES, [{ userId: 'u-301', profileId: 'world' }])
+    alerts.length = 0
+    const first = await p301.dial('0199000033')
+    expect('the first call', first.final.status === 200, first.final.first)
+    refused('303 meanwhile', await p303.dial('0199000034'), 'limit')
+    const alert = await untilAlert('limit alert', (m, p) => m === 'E_TWAKEPHONE_LIMIT' && p.caller === '303')
+    expect('the alert', alert.param === 'concurrent' && alert.scope === 'tenant', JSON.stringify(alert))
+    await hangupOut(p301, first)
+    busy(C)
+    await atOperator(C, await p303.dial('0199000034'))
+  })
+
+  await step('review 6b, n°10: two calls at once under a cap of one call at a time: one goes, the other is refused, every time (never both)', async () => {
+    await setOutbound({}, withCaps({ concurrent: 1 }), [{ userId: 'u-301', profileId: 'world' }])
+    const rounds = []
+    for (let i = 0; i < 8; i++) {
+      const calls = await Promise.all([p301.dial(`01990001${20 + 2 * i}`), p301.dial(`01990001${21 + 2 * i}`)])
+      const ok = calls.filter(c => c.final.status === 200)
+      rounds.push(calls.map(c => `${c.final.status}${header(c.final, 'twake-call-refused') ? ` ${header(c.final, 'twake-call-refused')}` : ''}`).join('/'))
+      for (const c of ok) await hangupOut(p301, c)
+      expect(`round ${i + 1}`, ok.length === 1 && calls.some(c => header(c.final, 'twake-call-refused') === 'limit'), rounds.join(', '))
+    }
+  })
+
+  /** The seconds reserved for a call (by Call-ID) under a minute cap, 0 when none. */
+  const reservedFor = async callId => Number((await db.query('SELECT seconds FROM outbound_reservations WHERE call_key = md5($1)', [callId])).rows[0]?.seconds ?? 0)
+  const near = (got, want) => Math.abs(got - want) <= 3
+
+  await step('review 6b, n°4, second review n°3, n°5: two calls of one person at the same instant, ten times, 600 s left and a critical duration of 200 s: both go every time, each allotted and reserving 200 s (the least of its share and of its critical duration, shared in PostgreSQL whatever order they reach it); a cap lifted meanwhile does not lengthen them (n°12)', async () => {
+    const critical = 200
+    await setOutbound({ fraud: { national: { ...NO_THRESHOLD, callSeconds: { critical } }, international: NO_THRESHOLD } }, withCaps({ concurrent: 2, dailyMinutes: 10 }), [{ userId: 'u-301', profileId: 'world' }])
+    const rounds = []
+    for (let i = 0; i < 10; i++) {
+      for (const id of hungUp.splice(0)) await cdrOf(id)
+      await seedUsage('301', 0, 0)
+      const calls = await Promise.all([p301.dial(`01990004${10 + 2 * i}`), p301.dial(`01990004${11 + 2 * i}`)])
+      const ok = calls.filter(c => c.final.status === 200)
+      const left = ok.length ? await dialogLeft(ok.map(c => c.callId)) : []
+      const reserved = await Promise.all(ok.map(c => reservedFor(c.callId)))
+      rounds.push(`${calls.map(c => `${c.final.status}${header(c.final, 'twake-call-refused') ? ` ${header(c.final, 'twake-call-refused')}` : ''}`).join('/')} [${left.join('+')} s, ${reserved.join('+')} reserved]`)
+      const fine = ok.length === 2 && left.every(s => near(s, critical)) && reserved.every(s => s === critical)
+      if (fine && i === 9) {
+        await setOutbound({ fraud: { national: { ...NO_THRESHOLD, callSeconds: { critical } }, international: NO_THRESHOLD } }, withCaps({ concurrent: null, dailyMinutes: null }), [{ userId: 'u-301', profileId: 'world' }])
+        const after = await dialogLeft(ok.map(c => c.callId))
+        expect('not lengthened', after[0] <= left[0] && after[1] <= left[1], `${after.join(', ')} s left, ${left.join(', ')} before`)
+      }
+      for (const c of ok) await hangupOut(p301, c)
+      expect(`round ${i + 1}`, fine, rounds.join(', '))
+    }
+    await setOutbound({}, PROFILES, [])
+  })
+
+  await step(`second review 6b, n°5: with no setting at all (the default caps and thresholds), a call alone in France is allotted, and reserves, the least of TRUNK_MAX_CALL_SEC (${MAX_CALL_SEC} s), 4 h and the 300 minutes of a person; one abroad meanwhile 1 h at most, and half of what the first leaves`, async () => {
+    for (const id of hungUp.splice(0)) await cdrOf(id)
+    await setOutbound({ fraud: {} }, [], [])
+    await seedUsage('115', 0, 0)
+    const first = await p115.dial('0199000082')
+    expect('the call in France', first.final.status === 200, first.final.first)
+    const second = await p115.dial('+442079460125')
+    expect('the call abroad', second.final.status === 200, `${second.final.first} ${header(second.final, 'twake-call-refused')}`)
+    const want = [Math.min(MAX_CALL_SEC, 14_400, 300 * 60)]
+    want.push(Math.min(MAX_CALL_SEC, 3_600, Math.floor((300 * 60 - want[0]) / 2)))
+    const left = await dialogLeft([first.callId, second.callId])
+    const reserved = [await reservedFor(first.callId), await reservedFor(second.callId)]
+    await hangupOut(p115, first)
+    await hangupOut(p115, second)
+    expect('allotted', near(left[0], want[0]) && near(left[1], want[1]), `${left.join(', ')} s, ${want.join(', ')} expected`)
+    expect('reserved', reserved[0] === want[0] && reserved[1] === want[1], `${reserved.join(', ')} s, ${want.join(', ')} expected`)
+    await setOutbound({}, PROFILES, [])
+  })
+
+  await step(`6b, FR-D7: a cap of external minutes a day: a call ends when it is reached (${MIN_CALL_SEC + 5} s left: cut then), the next one is refused (limit, dailyMinutes)`, async () => {
+    for (const id of hungUp.splice(0)) await cdrOf(id)
+    await seedUsage('301', 0, 600 - (MIN_CALL_SEC + 5))
+    await setOutbound({}, withCaps({ concurrent: 1, dailyMinutes: 10 }), [{ userId: 'u-301', profileId: 'world' }])
+    alerts.length = 0
+    const call = await p301.dial('0199000050')
+    expect('the call', call.final.status === 200, call.final.first)
+    const started = Date.now()
+    await p301.callState(call, 'ended', (MIN_CALL_SEC + 20) * 1000)
+    const lasted = (Date.now() - started) / 1000
+    expect('cut when the minutes are reached', lasted > MIN_CALL_SEC + 3 && lasted < MIN_CALL_SEC + 9, `${lasted} s`)
+    await A.callState(await atOperator(A, call), 'ended', 5_000)
+    // Its CDR written (at the end of the dialog, just after the BYEs): the seconds it used count from then on.
+    expect('its CDR', (await cdrOf(call.callId)).duration >= MIN_CALL_SEC + 3)
+    const next = await p301.dial('0199000051')
+    if (next.final.status === 200) await hangupOut(p301, next)
+    refused('the next one', next, 'limit')
+    const alert = await untilAlert('limit alert', (m, p) => m === 'E_TWAKEPHONE_LIMIT' && p.caller === '301')
+    expect('the alert', alert.param === 'dailyMinutes' && alert.scope === 'user', JSON.stringify(alert))
+  })
+
+  await step('6b, FR-D7: a cap of external calls a day: the answered calls of the day count (as their CDR is written), an emergency call never; reached, refused (limit, dailyCalls); raised, released', async () => {
+    const used = (await usage('301')).calls
+    await setOutbound({}, withCaps({ dailyCalls: used + 1 }), [{ userId: 'u-301', profileId: 'world' }])
+    alerts.length = 0
+    const sos = await p301.dial('112')
+    expect('112', sos.final.status === 200, sos.final.first)
+    await hangupOut(p301, sos)
+    expect('the CDR of 112', (await cdrOf(sos.callId)).external === 'emergency')
+    expect('112 counts for nothing', (await usage('301')).calls === used)
+    const call = await p301.dial('0199000040')
+    expect('the last call of the day', call.final.status === 200, call.final.first)
+    await hangupOut(p301, call)
+    expect('its CDR', (await cdrOf(call.callId)).external === 'out')
+    expect('counted', (await usage('301')).calls === used + 1)
+    refused('the next one', await p301.dial('0199000041'), 'limit')
+    const alert = await untilAlert('limit alert', (m, p) => m === 'E_TWAKEPHONE_LIMIT' && p.caller === '301')
+    expect('the alert', alert.param === 'dailyCalls' && alert.scope === 'user', JSON.stringify(alert))
+    busy(A)
+    await atOperator(A, await p301.dial('112'))
+    await setOutbound({}, withCaps({ dailyCalls: used + 2 }), [{ userId: 'u-301', profileId: 'world' }])
+    busy(A)
+    await atOperator(A, await p301.dial('0199000042'))
+  })
+
+  await step('6b, FR-D7: the volume thresholds (fraud_detection): the second call in a row to one number raises a warning and goes, the third is refused (403, fraud) with a critical alert; 112 still goes', async () => {
+    await setOutbound({ fraud: { national: { ...NO_THRESHOLD, sequentialCalls: { warning: 2, critical: 3 } }, international: NO_THRESHOLD } }, PROFILES, [{ userId: 'u-301', profileId: 'world' }])
+    alerts.length = 0
+    for (let i = 1; i <= 2; i++) {
+      busy(C)
+      await atOperator(C, await p303.dial('0199000060'))
+    }
+    const warning = await untilAlert('warning', (m, p) => m === 'E_FRD_WARNING' && p.user === '303')
+    expect('the warning', warning.param === 'sequential-calls' && Number(warning.value) === 2 && Number(warning.threshold) === 2 && warning.called_number === '33199000060', JSON.stringify(warning))
+    const sent = sentToOperators()
+    refused('the third call', await p303.dial('0199000060'), 'fraud')
+    expect('calls the operators were sent', sentToOperators() === sent)
+    const critical = await untilAlert('critical alert', (m, p) => m === 'E_FRD_CRITICAL' && p.user === '303')
+    expect('the critical alert', critical.param === 'sequential-calls' && Number(critical.value) === 3, JSON.stringify(critical))
+    // Refused by its trunk (486), an emergency call goes again through the default one (route[emergency_fallback]).
+    busy(C)
+    busy(A)
+    const sos = await p303.dial('112')
+    expect('112', (await atOperator(C, sos)).invite.uri === 'sip:112@backup.example')
+    await atOperator(A, sos)
+    await setOutbound({}, PROFILES, [])
+  })
+
+  await step('review 6b, n°1, n°3, n°9: a call from the operator to a direct number nobody takes rings its fallback inside (the number\'s own, else its trunk\'s: an extension or a ring group), counted as any call; never after a decline, a "do not disturb", a CANCEL, nor for a number nobody holds (404)', async () => {
+    // Registered for 300 s at the start: registered again, the steps before took longer than that.
+    for (const p of [p301, p303]) expect(`registration of ${p.user} again`, (await p.register()) === 200)
+    await db.query("INSERT INTO call_groups (number, tenant_id, name, members) VALUES ('3900', $1, 'Accueil', '{301,302}'), ('3901', $1, 'Standard', '{301}') ON CONFLICT (number) DO UPDATE SET members = EXCLUDED.members", [TENANT])
+    const grp = { id: 'grp', trunkId: 'main', first: '+33199000304', last: '+33199000304', target: '3901', fallbackTarget: '303' }
+    await tables.set([{ ...main, fallbackTarget: '3900' }, backup], [dids[0], { ...dids[1], fallbackTarget: '301' }, grp])
+    const rang = (p, callId) => p.until(`the call ${callId}`, () => [...p.calls.values()].find(c => c.callId === callId && c.invite), 8_000)
+    const notRang = (p, callId) => ![...p.calls.values()].some(c => c.callId === callId && c.invite)
+    // A number of a range nobody holds (300): not found, no fallback.
+    const nobody = await (await A.call('+33199000300')).final
+    expect('a number of nobody', nobody.status === 404, nobody.first)
+    // The desk (303) busy: its number's own fallback, 301, rings and answers.
+    p303.st.answerWith = '486 Busy Here'
+    try {
+      const placed = await C.call('+33199000303')
+      const answered = await placed.final
+      expect('the desk busy: the fallback answers', answered.status === 200, answered.first)
+      expect('the desk rung first', !!(await rang(p303, placed.callId)))
+      expect('301 rung', !!(await rang(p301, placed.callId)))
+      await C.request(placed, 'BYE')
+      expect('its CDR', !!(await cdrOf(placed.callId)))
+    } finally {
+      p303.st.answerWith = '200 OK'
+    }
+    // Declined (603): the caller hears it, nothing else rings.
+    p303.st.answerWith = '603 Decline'
+    try {
+      const placed = await C.call('+33199000303')
+      const declined = await placed.final
+      expect('declined', declined.status === 603, declined.first)
+      await sleep(500)
+      expect('301 not rung after a decline', notRang(p301, placed.callId))
+    } finally {
+      p303.st.answerWith = '200 OK'
+    }
+    // Cancelled by the caller while it rings: nothing else rings.
+    p303.st.answerDelayMs = 4_000
+    try {
+      const placed = await C.call('+33199000303')
+      await rang(p303, placed.callId)
+      await placed.cancel()
+      const cancelled = await placed.final
+      expect('cancelled', cancelled.status === 487, cancelled.first)
+      await sleep(500)
+      expect('301 not rung after a CANCEL', notRang(p301, placed.callId))
+    } finally {
+      p303.st.answerDelayMs = 200
+    }
+    // "Do not disturb" on the desk: its refusal, never the fallback.
+    await db.query("INSERT INTO call_rules (extension, tenant_id, dnd) VALUES ('303', $1, true) ON CONFLICT (extension) DO UPDATE SET dnd = true, dnd_until = NULL", [TENANT])
+    try {
+      const placed = await C.call('+33199000303')
+      const dnd = await placed.final
+      expect('do not disturb', dnd.status === 480, dnd.first)
+      await sleep(500)
+      expect('301 not rung during a "do not disturb"', notRang(p301, placed.callId))
+    } finally {
+      await db.query("DELETE FROM call_rules WHERE extension = '303'")
+    }
+    // 302 cannot be reached (its window went, above): its trunk's fallback, the group 3900, rings (301 answers).
+    const away = await A.call('+33199000302')
+    const taken = await away.final
+    expect('302 unreachable: the group of the fallback answers', taken.status === 200, taken.first)
+    expect('301 rung as a member', !!(await rang(p301, away.callId)))
+    await A.request(away, 'BYE')
+    // A group every phone of which declines: declined, its own fallback (303) never rung.
+    p301.st.answerWith = '603 Decline'
+    try {
+      const placed = await A.call('+33199000304')
+      const declined = await placed.final
+      expect('the group declined', declined.status === 603, declined.first)
+      await sleep(500)
+      expect('303 not rung after the group declined', notRang(p303, placed.callId))
+    } finally {
+      p301.st.answerWith = '200 OK'
+    }
+    await tables.set([main, backup], dids)
+  })
+
+  await step('second review 6b, n°9: the fallback of a direct number is a ring group that holds its target (303 busy, the group 3902 of 303 and 301): 301 rings and answers, 303 is never rung again', async () => {
+    await db.query("INSERT INTO call_groups (number, tenant_id, name, members) VALUES ('3902', $1, 'Accueil et bureau', '{303,301}') ON CONFLICT (number) DO UPDATE SET members = EXCLUDED.members", [TENANT])
+    await tables.set([main, backup], [dids[0], { ...dids[1], fallbackTarget: '3902' }])
+    p303.st.answerWith = '486 Busy Here'
+    try {
+      const placed = await C.call('+33199000303')
+      const answered = await placed.final
+      expect('the group answers', answered.status === 200, answered.first)
+      expect('301 rung', [...p301.calls.values()].some(c => c.callId === placed.callId && c.invite))
+      const invites = p303.st.received.filter(m => m.method === 'INVITE' && header(m, 'call-id') === placed.callId).length
+      expect('303 rung once', invites === 1, `${invites} INVITEs`)
+      await C.request(placed, 'BYE')
+    } finally {
+      p303.st.answerWith = '200 OK'
+      await tables.set([main, backup], dids)
+    }
+  })
+
+  await step(`review 6b, n°5, second review n°4, n°10: OpenSIPS killed and started again (OPENSIPS_RESTART) with calls to the public network in progress: they are still counted, a BYE ends them on both sides with their CDR, and the minutes allotted still end the one they bound; the minutes reserved for a call that was ringing (lost) are released, an emergency call restored ends within ${EMERGENCY_RESTORED_SEC} s`, async () => {
+    if (!RESTART) {
+      console.log('     (skipped: OPENSIPS_RESTART is not set)')
+      return
+    }
+    for (const id of hungUp.splice(0)) await cdrOf(id)
+    const bound = MIN_CALL_SEC + 15
+    await seedUsage('301', 0, 600 - bound)
+    await setOutbound({}, withCaps({ concurrent: 1, dailyMinutes: 10 }), [{ userId: 'u-301', profileId: 'world' }])
+    const free = await p303.dial('0199000070')
+    const capped = await p301.dial('0199000071')
+    expect('two calls', free.final.status === 200 && capped.final.status === 200, `${free.final.first} ${capped.final.first}`)
+    const placedAt = Date.now()
+    const atC = await atOperator(C, free)
+    const atA = await atOperator(A, capped)
+    const sos = await p301.dial('112')
+    expect('112', sos.final.status === 200, sos.final.first)
+    // A call of 303 (no profile: the default caps, its minutes reserved) that rings at the operator when OpenSIPS dies.
+    C.state.next.push({ ringOnly: true })
+    const ringing = p303.dial('0199000072', { timeoutMs: 25_000 }).catch(() => undefined)
+    const atRing = await C.until('the call ringing at the operator', () => C.state.invites.find(c => c.invite.uri === 'sip:+33199000072@backup.example'), 10_000)
+    expect('its minutes reserved', (await reservedFor(atRing.callId)) > 0)
+    // Written to the database every 5 s (dialog's db_update_period).
+    await sleep(7_000)
+    execSync(RESTART, { stdio: 'inherit', shell: '/bin/sh' })
+    await until('OpenSIPS back (its MI)', () => mi('version').then(() => true, () => false), 60_000)
+    for (const p of [p301, p303]) expect(`registration of ${p.user} again`, (await p.register()) === 200)
+    expect('the calls in progress still counted', (await outCalls()) >= 2, `${await outCalls()}`)
+    expect('the minutes of the call lost released', (await reservedFor(atRing.callId)) === 0)
+    expect('those of the capped call kept', (await reservedFor(capped.callId)) === bound)
+    const [sosLeft] = await dialogLeft([sos.callId])
+    expect(`the emergency call restored, within ${EMERGENCY_RESTORED_SEC} s`, sosLeft <= EMERGENCY_RESTORED_SEC + 2 && sosLeft > EMERGENCY_RESTORED_SEC - 120, `${sosLeft} s left`)
+    const sosBye = await p301.hangup(sos)
+    expect('the BYE of 112 after the restart', sosBye.status === 200, sosBye.first)
+    const bye = await p303.hangup(free)
+    expect('the BYE after the restart', bye.status === 200, bye.first)
+    await C.callState(atC, 'ended', 5_000)
+    expect('its CDR', (await cdrOf(free.callId)).external === 'out')
+    await A.callState(atA, 'ended', (bound + 20) * 1000)
+    const lasted = (Date.now() - placedAt) / 1000
+    expect('the capped call ended when its minutes were', lasted > bound - 3 && lasted < bound + 12, `${lasted} s`)
+    expect('its CDR', (await cdrOf(capped.callId)).external === 'out')
+    await ringing
+    await setOutbound({}, PROFILES, [])
+  })
 } finally {
   for (const p of phones) await p.close().catch(() => undefined)
+  for (const e of ALERT_EVENTS) await mi('event_subscribe', [e, alertAddress, 0]).catch(() => undefined)
+  listener.close()
+  // The default thresholds back, the tenant's rules removed: the Gateway of the browsers' e2e (another tenant) writes its own.
+  await outbound
+    .set({}, [], [])
+    .then(() => db.query('DELETE FROM outbound_users WHERE tenant_id = $1', [TENANT]))
+    .then(() => db.query('DELETE FROM outbound_profiles WHERE tenant_id = $1', [TENANT]))
+    .then(() => db.query('DELETE FROM outbound_settings WHERE tenant_id = $1', [TENANT]))
+    .then(() => mi('fraud_reload'))
+    .catch(err => console.log(`outbound rules not removed: ${err.message}`))
+  await db.query("DELETE FROM call_groups WHERE number IN ('3900', '3901', '3902')").catch(() => undefined)
+  await db.query("DELETE FROM call_rules WHERE extension = '303'").catch(() => undefined)
+  await db.query('DELETE FROM outbound_usage').catch(() => undefined)
   await tables.set([], []).catch(err => console.log(`trunks not removed: ${err.message}`))
   await reload().catch(() => undefined)
   for (const ext of Object.keys(secrets)) await prov.removeSipSecret(ext).catch(() => undefined)

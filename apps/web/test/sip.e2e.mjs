@@ -1,4 +1,4 @@
-// End to end of steps 3 to 6a (calls, transfers, what the Gateway hears from OpenSIPS, forwards and "do not
+// End to end of steps 3 to 6b (calls, transfers, what the Gateway hears from OpenSIPS, forwards and "do not
 // disturb", ring groups, calls to someone without a window of the app, calls to and from the public network through
 // a trunk to an operator this process simulates, apps/web/test/sip-trunk.mjs): people call and transfer each other from
 // their browsers through OpenSIPS and rtpengine; the Gateway
@@ -2116,6 +2116,63 @@ try {
       await alice.page.getByText(text).waitFor()
     }
     expectEqual(operator.state.attempts.length + operator2.state.attempts.length, attempts, 'calls the operator was sent')
+  })
+  // Step 6b (ADR 0017): rights profiles and caps, as an administrator sets them (the screen comes at step 7).
+  const PROFILES = [
+    { id: 'internal', allowed: [] },
+    { id: 'france', allowed: ['fixed', 'mobile', 'freephone', 'standard-rate', 'overseas'] }
+  ]
+  // This test dials numbers of Mayotte (0639), the same one twenty times or so and up to six in a minute; the overseas
+  // numbers have the thresholds of international ones (review 6b, n°14): six calls in a minute, or fifteen in a row to
+  // one number, are refused (fraud). Raised here for those two only: the thresholds are proven by trunk.sip.mjs.
+  const FRAUD = { international: { callsPerMinute: { warning: 30, critical: 60 }, sequentialCalls: { warning: 50, critical: 100 } } }
+  await step('step 6b: Alice gives Bob the rights profile "internal calls only" (PUT /admin/outbound): his call to 06 39 98 00 03 is refused before the operator (403, rights) and the app tells him why; given "France" (PUT /admin/outbound/users/bdurand), the same call reaches the operator', async () => {
+    const api = await asPerson(alice)
+    const put = await api('PUT', '/admin/outbound', { policy: { fraud: FRAUD }, profiles: PROFILES, assignments: [{ userId: 'bdurand', profileId: 'internal' }] })
+    expectEqual(put.statusCode, 200, `PUT /admin/outbound ${put.body}`)
+    const attempts = operator.state.attempts.length + operator2.state.attempts.length
+    const ended = await dialUntilEnded(bob.page, '06 39 98 00 03')
+    expectEqual(`${ended.endStatus} ${ended.endReason} ${ended.endRefusal}`, '403 refused rights', 'how the call to 06 39 98 00 03 ended')
+    await bob.page.getByText("Vos droits d'appel ne permettent pas d'appeler ce type de numéro").waitFor()
+    expectEqual(operator.state.attempts.length + operator2.state.attempts.length, attempts, 'calls the operator was sent')
+    const given = await api('PUT', '/admin/outbound/users/bdurand', { profileId: 'france' })
+    expectEqual(given.statusCode, 200, `PUT /admin/outbound/users/bdurand ${given.body}`)
+    operator.state.next.push({ reply: '486 Busy Here' })
+    const busy = await dialUntilEnded(bob.page, '06 39 98 00 03')
+    await operator.invited(invite => invite.uri === 'sip:+33639980003@operator.example')
+    expectEqual(busy.endStatus, 486, 'how the call ended (the operator busy)')
+  })
+  await step('step 6b: an organisation cap of one external call at a time: while Alice is in a call with the operator, Bob\'s call is refused (403, limit) and he is told why; the administrators see the alert (GET /admin/alerts); his 112 still reaches the operator; once Alice hangs up, his call goes', async () => {
+    const api = await asPerson(alice)
+    const put = await api('PUT', '/admin/outbound', { policy: { caps: { concurrent: 1 }, fraud: FRAUD }, profiles: PROFILES, assignments: [{ userId: 'bdurand', profileId: 'france' }] })
+    expectEqual(put.statusCode, 200, `PUT /admin/outbound ${put.body}`)
+    await dial(alice.page, '06 39 98 00 04')
+    const call = await operator.invited(invite => invite.uri === 'sip:+33639980004@operator.example')
+    await alice.page.getByText('En communication avec +33 6 39 98 00 04').waitFor()
+    const ended = await dialUntilEnded(bob.page, '06 39 98 00 05')
+    expectEqual(`${ended.endStatus} ${ended.endReason} ${ended.endRefusal}`, '403 refused limit', 'how the call to 06 39 98 00 05 ended')
+    await bob.page.getByText("Le plafond d'appels vers l'extérieur est atteint").waitFor()
+    const alert = await until('the alert for the administrators', async () => {
+      const res = await api('GET', '/admin/alerts')
+      return res.json().items.find(a => a.kind === 'limit' && a.number === '+33639980005') ?? null
+    })
+    expectEqual(`${alert.param} ${alert.scope} ${alert.extension} ${alert.userId}`, 'concurrent tenant 103 bdurand', 'the alert')
+    // Review 6b, n°7: kept once while it repeats (count, lastAt), a page at a time.
+    expectEqual(`${alert.count >= 1} ${typeof alert.lastAt} ${typeof alert.id}`, 'true string string', 'the alert as kept')
+    const defaults = (await api('GET', '/admin/outbound')).json().defaults
+    expectEqual(JSON.stringify(defaults.caps), JSON.stringify({ user: { concurrent: 2, dailyMinutes: 300 }, tenant: { concurrent: 20, dailyMinutes: 3000 } }), 'the default caps shown')
+    operator.state.next.push({ reply: '486 Busy Here' })
+    const sos = await dialUntilEnded(bob.page, '112')
+    await operator.invited(invite => invite.uri === 'sip:112@operator.example' && (invite.headers.get('from')?.[0] ?? '').includes('<sip:+33199000103@operator.example>'))
+    expectEqual(`${sos.endStatus} ${sos.endRefusal}`, '503 emergency', 'how the call to 112 ended (the operator busy)')
+    await alice.page.getByRole('button', { name: 'Raccrocher' }).click()
+    await operator.callState(call, 'ended')
+    operator.state.next.push({ reply: '486 Busy Here' })
+    const again = await dialUntilEnded(bob.page, '06 39 98 00 05')
+    await operator.invited(invite => invite.uri === 'sip:+33639980005@operator.example')
+    expectEqual(again.endStatus, 486, 'how the call ended once Alice hung up (the operator busy)')
+    const reset = await api('PUT', '/admin/outbound', { policy: { fraud: FRAUD } })
+    expectEqual(reset.statusCode, 200, 'PUT /admin/outbound (no profile)')
   })
   await step('the first server out of order (503 at once): the call goes to the second one (challenged, 401), which answers; once the first one rang, its 503 ends the call (no second call to the person); its own Twake-Call-Refused never reaches the app; a challenge it repeats ends the call as "no trunk", never asked of the browser', async () => {
     operator.state.next.push({ reply: '503 Service Unavailable' })

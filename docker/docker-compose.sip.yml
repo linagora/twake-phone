@@ -9,7 +9,7 @@
 #   OPENSIPS_WS_URL=wss://127.0.0.1:8089 SIP_DOMAIN=127.0.0.1 OPENSIPS_DB_URL=postgres://twake:twake@127.0.0.1:54320/twake ...
 #
 # Ports: 5060/udp SIP, 5070/udp the trunk to the operator (step 6; simulated by the e2e), 8088 WS, 8089 WSS,
-# 22222/udp rtpengine control, 22223/udp its DTMF report, 30000-30100/udp RTP, 54320 PostgreSQL.
+# 22222/udp rtpengine control, 22223/udp its DTMF report, 30000-30400/udp RTP (100 calls, each one held 30 s after its end), 54320 PostgreSQL.
 services:
   postgres:
     image: postgres:16
@@ -34,7 +34,7 @@ services:
       RTPENGINE_INTERFACE: ${RTPENGINE_INTERFACE:-127.0.0.1}
       RTPENGINE_LISTEN: 127.0.0.1:22222
       RTPENGINE_PORT_MIN: "30000"
-      RTPENGINE_PORT_MAX: "30100"
+      RTPENGINE_PORT_MAX: "30400"
       # Tones detected in the media, reported to the e2e (apps/web/test/sip.e2e.mjs) as JSON over UDP.
       RTPENGINE_DTMF_LOG: ${RTPENGINE_DTMF_LOG:-127.0.0.1:22223}
     network_mode: host
@@ -72,6 +72,8 @@ services:
       # A call with the operator ends by itself after this long (seconds, 60 to 86400), a BYE to both sides; an
       # emergency call excepted.
       TRUNK_MAX_CALL_SEC: ${TRUNK_MAX_CALL_SEC:-14400}
+      # The shortest call the minutes left of a cap allow (seconds, 1 to 600): less left, the call is refused.
+      TRUNK_MIN_CALL_SEC: ${TRUNK_MIN_CALL_SEC:-60}
       # Every this long (seconds, 5 to 300), the phone in a call with the operator is sent an OPTIONS in the call: one
       # that does not answer it any more (its page closed, put to sleep, its network gone) has the call ended.
       CALL_PING_SEC: ${CALL_PING_SEC:-30}

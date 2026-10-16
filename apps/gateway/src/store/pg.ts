@@ -1,7 +1,7 @@
 import { readdir, readFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import pg from 'pg'
-import { clampLimit, type ConferenceRecord, type DidRecord, type HistoryEntry, type HistoryPage, type HistoryQuery, type MappingSource, type ProviderRecord, type PushSaveResult, type PushSubscriptionRecord, type Store, type TrunkRecord, type UserMapping, type UserPresenceRecord, type VapidKeysRecord } from './types.js'
+import { ALERT_DEDUP_MS, alertKey, clampLimit, type AlertQuery, type AlertRecord, type StoredAlert, type ConferenceRecord, type DidRecord, type OutboundRecord, type HistoryEntry, type HistoryPage, type HistoryQuery, type MappingSource, type ProviderRecord, type PushSaveResult, type PushSubscriptionRecord, type Store, type TrunkRecord, type UserMapping, type UserPresenceRecord, type VapidKeysRecord } from './types.js'
 
 const MIGRATIONS = fileURLToPath(new URL('../../migrations/', import.meta.url))
 
@@ -15,7 +15,9 @@ type PresenceRow = { tenant_id: string; user_id: string; status: UserPresenceRec
 type ConferenceRow = { tenant_id: string; meeting_id: string; owner_user_id: string; pin: string | null; created_at: Timestamp }
 type PushRow = { tenant_id: string; user_id: string; endpoint: string; p256dh: string; auth: string; created_at: Timestamp }
 type TrunkRow = { tenant_id: string; id: string; config: TrunkRecord['config']; password_enc: string | null }
-type DidRow = { tenant_id: string; id: string; trunk_id: string; first_number: string; last_number: string; target: string | null; suffix_digits: number }
+type DidRow = { tenant_id: string; id: string; trunk_id: string; first_number: string; last_number: string; target: string | null; suffix_digits: number; fallback_target: string | null }
+type OutboundRow = { tenant_id: string; policy: OutboundRecord['policy']; profiles: OutboundRecord['profiles']; assignments: OutboundRecord['assignments'] }
+type AlertRow = { id: string; tenant_id: string; at: Timestamp; last_at: Timestamp; count: number; alert: AlertRecord['alert']; first_alert: AlertRecord['alert'] | null }
 
 const toEntry = (r: HistoryRow): HistoryEntry => ({
   tenantId: r.tenant_id,
@@ -339,22 +341,75 @@ export class PgStore implements Store {
       first: r.first_number,
       last: r.last_number,
       ...(r.target !== null ? { target: r.target } : {}),
-      ...(r.suffix_digits ? { suffixDigits: r.suffix_digits } : {})
+      ...(r.suffix_digits ? { suffixDigits: r.suffix_digits } : {}),
+      ...(r.fallback_target !== null ? { fallbackTarget: r.fallback_target } : {})
     }))
   }
 
   async upsertDid(d: DidRecord) {
     await this.pool.query(
-      `INSERT INTO direct_numbers (tenant_id, id, trunk_id, first_number, last_number, target, suffix_digits) VALUES ($1, $2, $3, $4, $5, $6, $7)
+      `INSERT INTO direct_numbers (tenant_id, id, trunk_id, first_number, last_number, target, suffix_digits, fallback_target) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
        ON CONFLICT (tenant_id, id) DO UPDATE SET trunk_id = EXCLUDED.trunk_id, first_number = EXCLUDED.first_number, last_number = EXCLUDED.last_number,
-         target = EXCLUDED.target, suffix_digits = EXCLUDED.suffix_digits`,
-      [d.tenantId, d.id, d.trunkId, d.first, d.last, d.target ?? null, d.suffixDigits ?? 0]
+         target = EXCLUDED.target, suffix_digits = EXCLUDED.suffix_digits, fallback_target = EXCLUDED.fallback_target`,
+      [d.tenantId, d.id, d.trunkId, d.first, d.last, d.target ?? null, d.suffixDigits ?? 0, d.fallbackTarget ?? null]
     )
   }
 
   async deleteDid(tenantId: string, id: string) {
     const r = await this.pool.query('DELETE FROM direct_numbers WHERE tenant_id = $1 AND id = $2', [tenantId, id])
     return (r.rowCount ?? 0) > 0
+  }
+
+  async getOutbound(tenantId: string): Promise<OutboundRecord | null> {
+    const { rows } = await this.pool.query<OutboundRow>('SELECT tenant_id, policy, profiles, assignments FROM outbound_policies WHERE tenant_id = $1', [tenantId])
+    const r = rows[0]
+    return r ? { tenantId: r.tenant_id, policy: r.policy, profiles: r.profiles, assignments: r.assignments } : null
+  }
+
+  async setOutbound(o: OutboundRecord) {
+    await this.pool.query(
+      `INSERT INTO outbound_policies (tenant_id, policy, profiles, assignments) VALUES ($1, $2, $3, $4)
+       ON CONFLICT (tenant_id) DO UPDATE SET policy = EXCLUDED.policy, profiles = EXCLUDED.profiles, assignments = EXCLUDED.assignments, updated_at = now()`,
+      [o.tenantId, JSON.stringify(o.policy), JSON.stringify(o.profiles), JSON.stringify(o.assignments)]
+    )
+  }
+
+  async addAlert(a: AlertRecord) {
+    const key = alertKey(a.alert)
+    const client = await this.pool.connect()
+    try {
+      await client.query('BEGIN')
+      // One writer per alert at a time: two repeats at once count in one alert, never open two.
+      await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [`telephony_alerts|${a.tenantId}|${key}`])
+      const repeated = await client.query(
+        `UPDATE telephony_alerts SET last_at = greatest(last_at, $3::timestamptz), count = count + 1, alert = $4
+         WHERE id = (SELECT id FROM telephony_alerts WHERE tenant_id = $1 AND dedup_key = $2 AND last_at >= $3::timestamptz - make_interval(secs => $5) ORDER BY id DESC LIMIT 1)`,
+        [a.tenantId, key, a.at, JSON.stringify(a.alert), ALERT_DEDUP_MS / 1000]
+      )
+      if (!repeated.rowCount)
+        await client.query('INSERT INTO telephony_alerts (tenant_id, at, last_at, count, dedup_key, alert, first_alert) VALUES ($1, $2, $2, 1, $3, $4, $4)', [a.tenantId, a.at, key, JSON.stringify(a.alert)])
+      await client.query('COMMIT')
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => undefined)
+      throw err
+    } finally {
+      client.release()
+    }
+  }
+
+  async listAlerts(tenantId: string, query: AlertQuery = {}): Promise<StoredAlert[]> {
+    const { rows } = await this.pool.query<AlertRow>(
+      `SELECT id::text AS id, tenant_id, at, last_at, count, alert, first_alert FROM telephony_alerts
+       WHERE tenant_id = $1 AND ($2::timestamptz IS NULL OR (last_at, id) < ($2::timestamptz, $3::bigint)) AND ($4::text IS NULL OR alert->>'kind' = $4) AND ($5::text IS NULL OR alert->>'param' = $5)
+       ORDER BY last_at DESC, id DESC LIMIT $6`,
+      [tenantId, query.before?.lastAt ?? null, query.before?.id ?? null, query.kind ?? null, query.param ?? null, clampLimit(query.limit)]
+    )
+    return rows.map(r => ({ id: r.id, tenantId: r.tenant_id, at: new Date(r.at).toISOString(), lastAt: new Date(r.last_at).toISOString(), count: r.count, alert: r.alert, first: r.first_alert ?? r.alert }))
+  }
+
+  async purgeAlerts(before: string) {
+    const r = await this.pool.query('DELETE FROM telephony_alerts WHERE last_at < $1', [before])
+    return r.rowCount ?? 0
   }
 
   async close() {

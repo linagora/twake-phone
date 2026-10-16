@@ -434,6 +434,27 @@ describe('trunk routes', () => {
     expect(await store.listDids('A')).toEqual([])
   })
 
+  it('takes as a fallback an extension someone holds or a ring group, on the trunk or a range, never one that does not exist nor the number\'s own target (review 6b, n°1)', async () => {
+    const { app, admin, handed } = await setup()
+    expect((await app.inject({ method: 'PUT', url: '/api/v1/admin/trunks/operator', headers: admin, payload: { ...trunk, fallbackTarget: '200' } })).statusCode).toBe(201)
+    expect(handed.at(-1)!.trunks[0]).toMatchObject({ fallbackTarget: '200' })
+    const nobody = await app.inject({ method: 'PUT', url: '/api/v1/admin/trunks/operator', headers: admin, payload: { ...trunk, fallbackTarget: '199' } })
+    expect(nobody.statusCode).toBe(400)
+    expect(nobody.json()).toMatchObject({ code: 'FALLBACK_TARGET' })
+    const outside = await app.inject({ method: 'PUT', url: '/api/v1/admin/trunks/operator', headers: admin, payload: { ...trunk, fallbackTarget: '+33199000199' } })
+    expect(outside.statusCode).toBe(400)
+    expect(outside.json()).toMatchObject({ code: 'TRUNK_INVALID' })
+    expect((await app.inject({ method: 'PUT', url: '/api/v1/admin/dids/desk', headers: admin, payload: { trunkId: 'operator', first: '+33199000101', target: '101', fallbackTarget: '102' } })).statusCode).toBe(201)
+    expect(handed.at(-1)!.dids).toEqual([{ id: 'desk', trunkId: 'operator', first: '+33199000101', last: '+33199000101', target: '101', fallbackTarget: '102' }])
+    const loop = await app.inject({ method: 'PUT', url: '/api/v1/admin/dids/desk', headers: admin, payload: { trunkId: 'operator', first: '+33199000101', target: '101', fallbackTarget: '101' } })
+    expect(loop.statusCode).toBe(409)
+    expect(loop.json()).toMatchObject({ code: 'FALLBACK_LOOP' })
+    const missing = await app.inject({ method: 'PUT', url: '/api/v1/admin/dids/desk', headers: admin, payload: { trunkId: 'operator', first: '+33199000101', target: '101', fallbackTarget: '198' } })
+    expect(missing.statusCode).toBe(400)
+    expect(missing.json()).toMatchObject({ code: 'FALLBACK_TARGET' })
+    expect(handed.at(-1)!.dids[0]).toMatchObject({ fallbackTarget: '102' })
+  })
+
   it('hands the provider the trunks the store kept as soon as it starts', async () => {
     const key = randomBytes(32)
     const store = new MemoryStore()

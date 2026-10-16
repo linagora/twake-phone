@@ -30,6 +30,10 @@ const REFUSAL_KEY: Record<NonNullable<SoftCall['endRefusal']>, Key> = {
   overseas: 'call.endedRefusedOverseas',
   invalid: 'call.endedRefusedInvalid',
   'no-trunk': 'call.endedRefusedNoTrunk',
+  rights: 'call.endedRefusedRights',
+  limit: 'call.endedRefusedLimit',
+  fraud: 'call.endedRefusedFraud',
+  'policy-unavailable': 'call.endedRefusedPolicyUnavailable',
   'not-allowed': 'call.endedRefusedNotAllowed'
 }
 

@@ -4,6 +4,7 @@ import type { SecretProvisioner } from '@twake/telephony-provider-sdk'
 import { CALL_GROUPS_SCHEMA, CallGroups, DISPLAY_NAMES_SCHEMA, type CallGroupsOptions } from './call-groups.js'
 import { CALL_RULES_SCHEMA, CallRules, type CallRulesOptions } from './call-rules.js'
 import { PUSH_TARGETS_SCHEMA, PushTargets, type PushTargetsOptions } from './push-targets.js'
+import { ACC_EXTERNAL_SQL, OutboundTables, type OutboundTablesOptions } from './outbound.js'
 import { TRUNK_SCHEMA, TrunkTables, type TrunkTablesOptions } from './trunks.js'
 
 // Everything about OpenSIPS's `subscriber` table (module auth_db) lives here: the Gateway only sees a SecretProvisioner.
@@ -109,9 +110,11 @@ export const EXTRA_COLUMNS = [
   ['acc', 'caller', ACC_EXTRA],
   ['acc', 'callee', ACC_EXTRA],
   ['acc', 'dialled', ACC_EXTRA],
+  ['acc', 'external', ACC_EXTRA],
   ['missed_calls', 'caller', ACC_EXTRA],
   ['missed_calls', 'callee', ACC_EXTRA],
   ['missed_calls', 'dialled', ACC_EXTRA],
+  ['missed_calls', 'external', ACC_EXTRA],
   ['call_rules', 'tenant_id', "TEXT DEFAULT '' NOT NULL"],
   ['call_rules', 'holder', "TEXT DEFAULT '' NOT NULL"],
   ['call_rules', 'forward_always_holder', 'TEXT'],
@@ -126,7 +129,7 @@ const addColumn = ([table, column, definition]: (typeof EXTRA_COLUMNS)[number]) 
  * docker/opensips/subscriber.sql: the schema then the extra columns, plainly (it runs once, when the Compose stack
  * creates the database, as its owner).
  */
-export const SUBSCRIBER_SQL = `${SUBSCRIBER_SCHEMA.trimEnd()}\n${EXTRA_COLUMNS.map(addColumn).join('\n')}\n`
+export const SUBSCRIBER_SQL = `${SUBSCRIBER_SCHEMA.trimEnd()}\n${EXTRA_COLUMNS.map(addColumn).join('\n')}\n${ACC_EXTERNAL_SQL}`
 
 /** How long adding a missing column may wait for its lock (an acc table busy with CDR inserts) before giving up. */
 const ALTER_LOCK_TIMEOUT = '2s'
@@ -180,6 +183,8 @@ export class SubscriberProvisioner implements SecretProvisioner {
   private readonly removedBound: { min: number; ratio: number }
   /** Whether `subscriber` has its `holder` column (one that could not be added: accounts written without, none removed). */
   private holderColumn = true
+  /** What is wrong with OpenSIPS's tables (schemaProblem). */
+  private problem: string | undefined
 
   constructor(opts: SubscriberProvisionerOptions) {
     if (!opts.realm) throw new Error('SubscriberProvisioner needs the SIP realm')
@@ -225,10 +230,54 @@ export class SubscriberProvisioner implements SecretProvisioner {
       )
       if (added) this.holderColumn = true
     }
+    // The triggers that count what the calls to the public network used (step 6b), once `external` is there: created
+    // where they lack only, waiting 5 s at most for the lock of `acc`.
+    this.problem = undefined
+    if (missing.some(([table, column]) => column === 'external' && (table === 'acc' || table === 'missed_calls')) && !(await this.hasExternal())) {
+      this.problem = 'acc.external is missing: OpenSIPS cannot write the CDRs nor the missed calls, and the caps count nothing'
+      this.log.warn(`OpenSIPS tables: ${this.problem} (add the column as the owner of acc: docker/opensips/trunk.sql)`)
+    } else if (!(await this.hasUsageTriggers())) {
+      await this.inTransaction(ACC_EXTERNAL_SQL.replace(/^BEGIN;\n/, '').replace(/COMMIT;\n$/, '')).catch((err: unknown) => {
+        this.problem = 'the triggers of acc that count what the calls to the public network use are missing: the minute and call caps count nothing'
+        this.log.warn(`OpenSIPS tables: ${this.problem} (${err instanceof Error ? err.message : String(err)})`)
+      })
+    }
     const { rows } = (await this.pool.query("SELECT table_name, table_version FROM version WHERE table_name IN ('subscriber', 'acc', 'missed_calls')")) as { rows: { table_name: string; table_version: number }[] }
     for (const [table, expected] of [['subscriber', SUBSCRIBER_TABLE_VERSION], ['acc', ACC_TABLE_VERSION], ['missed_calls', MISSED_CALLS_TABLE_VERSION]] as const) {
       const version = rows.find(r => r.table_name === table)?.table_version
       if (version !== expected) throw new Error(`${table} table version ${version} in the database, ${expected} expected`)
+    }
+  }
+
+  /**
+   * What is wrong with OpenSIPS's tables, for the provider's status (DEGRADED): `acc.external` missing (no CDR is
+   * written), or the triggers that count the use of the caps. Undefined when nothing is, or before ensureSchema().
+   */
+  get schemaProblem(): string | undefined {
+    return this.problem
+  }
+
+  private async hasUsageTriggers() {
+    const { rows } = (await this.pool.query("SELECT count(*)::int AS n FROM pg_trigger WHERE (tgname = 'twake_outbound_acc' AND tgrelid = to_regclass('acc')) OR (tgname = 'twake_outbound_missed' AND tgrelid = to_regclass('missed_calls'))")) as { rows: { n: number }[] }
+    return rows[0]?.n === 2
+  }
+
+  private async hasExternal() {
+    const { rows } = (await this.pool.query("SELECT count(*)::int AS n FROM information_schema.columns WHERE table_schema = current_schema() AND table_name IN ('acc', 'missed_calls') AND column_name = 'external'")) as { rows: { n: number }[] }
+    return rows[0]?.n === 2
+  }
+
+  /** `sql` in one transaction (several statements), rolled back on any failure. */
+  private async inTransaction(sql: string) {
+    const client = this.pool.connect ? await this.pool.connect() : undefined
+    const q = client ?? this.pool
+    try {
+      await q.query(`BEGIN;\n${sql}COMMIT;`)
+    } catch (err) {
+      await q.query('ROLLBACK').catch(() => undefined)
+      throw err
+    } finally {
+      client?.release()
     }
   }
 
@@ -336,6 +385,11 @@ export class SubscriberProvisioner implements SecretProvisioner {
   /** The trunks and direct numbers of the same database, on the same connections (see TrunkTablesOptions). */
   trunkTables(opts: Omit<TrunkTablesOptions, 'pool'> = {}) {
     return new TrunkTables({ pool: this.pool, ...opts })
+  }
+
+  /** The outbound policy of the same database (step 6b), on the same connections. */
+  outboundTables(opts: Omit<OutboundTablesOptions, 'pool'> = {}) {
+    return new OutboundTables({ pool: this.pool, ...opts })
   }
 
   async close() {

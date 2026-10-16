@@ -5,7 +5,7 @@
 #   ./init.sh phone.example.org you@example.org --demo      (without --demo: your own SSO and LDAP, see .env)
 #   docker compose up -d --build --wait --wait-timeout 600   (.env says COMPOSE_PROFILES=demo with --demo)
 #
-# Public ports: 80/tcp and 443/tcp (Caddy), and the RTP range 30000-30100/udp (rtpengine). Everything else listens on
+# Public ports: 80/tcp and 443/tcp (Caddy), and the RTP range 30000-30999/udp (rtpengine). Everything else listens on
 # the loopback: host networking for the services that talk to each other and to the browsers' media, loopback port
 # mappings for the demo ones.
 name: twakephone
@@ -65,8 +65,11 @@ services:
       # "<private>!<public>" when the machine only has a private one behind a 1:1 NAT (most cloud providers).
       RTPENGINE_INTERFACE: "${RTPENGINE_INTERFACE:?RTPENGINE_INTERFACE is required (the public IP or private!public)}"
       RTPENGINE_LISTEN: 127.0.0.1:22222
+      # About 4 ports a call to the public network (2 for the browser, 2 for the operator), each kept 30 s after its end:
+      # some 200 calls at once. rtpengine reserves none for the emergency calls: the organisation's cap of calls to the
+      # public network at the same time (20 by default, ADR 0017) keeps the room they need.
       RTPENGINE_PORT_MIN: "30000"
-      RTPENGINE_PORT_MAX: "30100"
+      RTPENGINE_PORT_MAX: "30999"
     healthcheck:
       test: ["CMD-SHELL", "rtpengine-ctl -ip 127.0.0.1 -port 9900 list numsessions >/dev/null 2>&1"]
       interval: 2s
@@ -101,6 +104,8 @@ services:
       # A call with the operator ends by itself after this long (seconds, 60 to 86400; 4 hours by default), an
       # emergency call excepted.
       TRUNK_MAX_CALL_SEC:
+      # The shortest call the minutes left of a cap allow (seconds, 1 to 600, 60 by default): less left, it is refused.
+      TRUNK_MIN_CALL_SEC:
       # How often the phone in a call with the operator is asked whether it is still there (an OPTIONS in the call;
       # seconds, 5 to 300, 30 by default): one that no longer answers has the call ended. Never an emergency call.
       CALL_PING_SEC:
@@ -189,6 +194,7 @@ services:
       TRUNK_ALLOWED:
       TRUNK_COUNTRIES:
       TRUNK_DIDS:
+      TRUNK_FALLBACK_TARGET:
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/ready').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"]
       start_period: 120s

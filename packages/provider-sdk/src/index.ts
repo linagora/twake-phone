@@ -8,6 +8,9 @@ import type {
   MediaSession,
   Meeting,
   OriginateRequest,
+  OutboundAssignment,
+  OutboundPolicy,
+  OutboundProfile,
   Presence,
   ProviderStatus,
   RingGroup,
@@ -69,6 +72,11 @@ export interface TelephonyProvider {
    * provider had. The Gateway checked them (ids, numbers, ranges that do not overlap).
    */
   setTrunks?(trunks: (Trunk & { password?: string })[], dids: DidRange[]): Promise<void>
+  /**
+   * The outbound policy of the tenant, its rights profiles and who has which (capability `outboundPolicy`, step 6b):
+   * replaces what the provider had. The Gateway checked them (ids, classes, caps, profiles named that exist).
+   */
+  setOutboundPolicy?(policy: OutboundPolicy, profiles: OutboundProfile[], assignments: OutboundAssignment[]): Promise<void>
   originate(request: OriginateRequest): Promise<Call>
   /** Releases connections and stops event streams. */
   close(): Promise<void>

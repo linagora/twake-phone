@@ -1,4 +1,4 @@
-import { clampLimit, isDeclined, isMissed, type HistoryEntry, type HistoryPage, type HistoryQuery, type ConferenceRecord, type DidRecord, type ProviderRecord, type PushSaveResult, type PushSubscriptionRecord, type Store, type TrunkRecord, type UserMapping, type UserPresenceRecord, type VapidKeysRecord } from './types.js'
+import { clampLimit, isDeclined, isMissed, type HistoryEntry, type HistoryPage, type HistoryQuery, type ConferenceRecord, type AlertRecord, type AlertQuery, type DidRecord, type OutboundRecord, ALERT_DEDUP_MS, alertKey, type ProviderRecord, type StoredAlert, type PushSaveResult, type PushSubscriptionRecord, type Store, type TrunkRecord, type UserMapping, type UserPresenceRecord, type VapidKeysRecord } from './types.js'
 
 const key = (...parts: string[]) => parts.join('\u0000')
 
@@ -28,6 +28,9 @@ export class MemoryStore implements Store {
   private vapid: VapidKeysRecord | null = null
   private trunks: TrunkRecord[] = []
   private dids = new Map<string, DidRecord>()
+  private outbound = new Map<string, OutboundRecord>()
+  private alerts: StoredAlert[] = []
+  private alertId = 0
 
   constructor(private readonly now: () => number = Date.now) {}
 
@@ -133,7 +136,7 @@ export class MemoryStore implements Store {
   }
 
   async setSipSecret(tenantId: string, userId: string, secretEnc: string) {
-    this.secrets.set(key(tenantId, userId), { secretEnc, rotatedAt: new Date().toISOString() })
+    this.secrets.set(key(tenantId, userId), { secretEnc, rotatedAt: new Date(this.now()).toISOString() })
   }
 
   async claimConference(record: ConferenceRecord) {
@@ -230,6 +233,46 @@ export class MemoryStore implements Store {
 
   async deleteDid(tenantId: string, id: string) {
     return this.dids.delete(key(tenantId, id))
+  }
+
+  async getOutbound(tenantId: string) {
+    const r = this.outbound.get(tenantId)
+    return r ? structuredClone(r) : null
+  }
+
+  async setOutbound(record: OutboundRecord) {
+    this.outbound.set(record.tenantId, structuredClone(record))
+  }
+
+  async addAlert(record: AlertRecord) {
+    const key = alertKey(record.alert)
+    const since = new Date(Date.parse(record.at) - ALERT_DEDUP_MS).toISOString()
+    const open = this.alerts.filter(a => a.tenantId === record.tenantId && alertKey(a.alert) === key && a.lastAt >= since).at(-1)
+    if (open) {
+      if (record.at > open.lastAt) open.lastAt = record.at
+      open.count++
+      open.alert = structuredClone(record.alert)
+      return
+    }
+    this.alerts.push({ ...structuredClone(record), id: String(++this.alertId), lastAt: record.at, count: 1, first: structuredClone(record.alert) })
+  }
+
+  async listAlerts(tenantId: string, query: AlertQuery = {}) {
+    // The latest repeated first, the newest opened among those of the same instant.
+    const order = (a: StoredAlert, b: StoredAlert) => Date.parse(b.lastAt) - Date.parse(a.lastAt) || Number(b.id) - Number(a.id)
+    const cursor = query.before ? ({ lastAt: query.before.lastAt, id: query.before.id } as StoredAlert) : undefined
+    return this.alerts
+      .filter(a => a.tenantId === tenantId && (!cursor || order(cursor, a) < 0) && (!query.kind || a.alert.kind === query.kind) && (!query.param || a.alert.param === query.param))
+      .sort(order)
+      .slice(0, clampLimit(query.limit))
+      .map(a => structuredClone(a))
+  }
+
+  async purgeAlerts(before: string) {
+    const kept = this.alerts.filter(a => a.lastAt >= before)
+    const purged = this.alerts.length - kept.length
+    this.alerts = kept
+    return purged
   }
 
   async close() {}

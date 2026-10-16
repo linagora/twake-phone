@@ -153,5 +153,12 @@ umask 077
   echo "# TRUNK_DIDS="
 } > .env
 echo "Wrote $(pwd)/.env (media address $interface)."
+echo "Firewall (machine and cloud): open 80/tcp, 443/tcp and 30000-30999/udp (the media), nothing else."
+# The media range is about 200 calls at a time, internal calls included (they go through rtpengine too, under no cap):
+# beyond, a call has no audio, an emergency call too (README, "Relier un opérateur", point 2).
+echo "The media range holds about 200 calls at a time, internal ones included: widen it (compose.yml) for more."
+if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active' && ! ufw status 2>/dev/null | grep -q '30000:30999/udp'; then
+  echo "Warning: ufw is active and does not allow 30000:30999/udp: calls would have no audio (ufw allow 30000:30999/udp)." >&2
+fi
 [ $demo = 0 ] || echo "Demo accounts alice (administrator), bob and carole: their passwords are ALICE_PASSWORD, BOB_PASSWORD and CAROLE_PASSWORD in .env."
 echo "Next: docker compose up -d --build --wait --wait-timeout 600"

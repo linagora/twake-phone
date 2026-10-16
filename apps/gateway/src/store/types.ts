@@ -1,4 +1,4 @@
-import type { CallDirection, CallState, DidRange, PresenceStatus, Trunk } from '@twake/telephony-types'
+import type { CallDirection, CallState, DidRange, OutboundAssignment, OutboundPolicy, OutboundProfile, PresenceStatus, TelephonyAlert, Trunk } from '@twake/telephony-types'
 
 export interface ProviderRecord {
   tenantId: string
@@ -134,6 +134,55 @@ export interface DidRecord extends DidRange {
   tenantId: string
 }
 
+/** The rules of a tenant's calls to the public network (step 6b, ADR 0017), as an administrator set them. */
+export interface OutboundRecord {
+  tenantId: string
+  policy: OutboundPolicy
+  profiles: OutboundProfile[]
+  assignments: OutboundAssignment[]
+}
+
+/** What the SIP server raised for the administrators (step 6b): when, and what. */
+export interface AlertRecord {
+  tenantId: string
+  at: string
+  alert: TelephonyAlert
+}
+
+/**
+ * An alert as kept: one per kind, param, scope and extension while it repeats (`count` times, the last at `lastAt`,
+ * what the last one said in `alert`, what the first one said in `first`), a new one past ALERT_DEDUP_MS of silence.
+ * Listed by their last repeat, the latest first (second review 6b, n°8: an attack that goes on for days stays on
+ * top), `id` breaking ties.
+ */
+export interface StoredAlert extends AlertRecord {
+  id: string
+  lastAt: string
+  count: number
+  first: TelephonyAlert
+}
+
+/** Where a page of alerts starts: after this one (its last repeat and id). */
+export interface AlertCursor {
+  lastAt: string
+  id: string
+}
+
+/** A page of the alerts of a tenant: `before` the last one of the page before, of one `kind` or `param`, `limit` at most. */
+export interface AlertQuery {
+  limit?: number
+  before?: AlertCursor
+  kind?: TelephonyAlert['kind']
+  param?: string
+}
+
+/** How long the alerts are kept (from their last repeat): purged by the Gateway every hour (purgeAlerts). */
+export const ALERT_RETENTION_DAYS = 90
+/** An alert that repeats within this time of its last one counts in it, instead of a new one. */
+export const ALERT_DEDUP_MS = 3_600_000
+/** What makes two alerts the same one. */
+export const alertKey = (a: TelephonyAlert) => [a.kind, a.param, a.scope ?? '', a.extension ?? ''].join('|')
+
 export interface Store {
   listProviders(): Promise<ProviderRecord[]>
   upsertProvider(record: ProviderRecord): Promise<void>
@@ -205,6 +254,17 @@ export interface Store {
   /** Adds or replaces a range; its trunk must exist in the tenant (else it throws). */
   upsertDid(record: DidRecord): Promise<void>
   deleteDid(tenantId: string, id: string): Promise<boolean>
+
+  /** The outbound rules of a tenant; null when none was ever set. */
+  getOutbound(tenantId: string): Promise<OutboundRecord | null>
+  /** Replaces them whole. */
+  setOutbound(record: OutboundRecord): Promise<void>
+  /** Keeps an alert: a repeat of an open one (same alertKey, within ALERT_DEDUP_MS of its last) counts in it. */
+  addAlert(record: AlertRecord): Promise<void>
+  /** The alerts of a tenant, the latest repeated first, `limit` at most (clamped as a page). */
+  listAlerts(tenantId: string, query?: AlertQuery): Promise<StoredAlert[]>
+  /** Removes the alerts of every tenant whose last repeat is before `before` (ISO); how many. */
+  purgeAlerts(before: string): Promise<number>
 
   close(): Promise<void>
 }

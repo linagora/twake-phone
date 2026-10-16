@@ -82,10 +82,12 @@ jobs:
     # OpenSIPS annonce au trunk une adresse de documentation (TEST-NET-1), comme derrière un NAT : l'opérateur simulé
     # la reçoit (enregistrement, Via, Record-Route) et la ramène vers la socket du trunk (docker-compose.sip.yml, e2e).
     # Le téléphone d'un appel avec l'opérateur est interrogé (OPTIONS dans l'appel) toutes les 5 s plutôt que 30 : un
-    # téléphone parti met fin à l'appel en quelques secondes (e2e).
+    # téléphone parti met fin à l'appel en quelques secondes (e2e). L'appel le plus court que les minutes restantes
+    # permettent : 5 s plutôt que 60, pour qu'un plafond de minutes coupe un appel en quelques secondes (trunk.sip.mjs).
     env:
       TRUNK_ADVERTISE: 192.0.2.10:5070
       CALL_PING_SEC: "5"
+      TRUNK_MIN_CALL_SEC: "5"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -127,11 +129,13 @@ jobs:
         run: microsoft-edge --version || npx playwright-core install msedge
       # Le trunk tel que le script d'OpenSIPS le traite, sans navigateur (téléphones SIP et opérateurs simulés en
       # Node) : une fois, il ne dépend d'aucun navigateur.
+      # OpenSIPS y est tué (SIGKILL) puis relancé pendant des appels : ils doivent survivre (revue 6b, n°5).
       - name: Trunk SIP (téléphones et opérateurs simulés, sans navigateur)
         if: matrix.browser == 'chromium'
         run: node apps/web/test/trunk.sip.mjs
         env:
           OPENSIPS_DB_URL: postgres://twake:twake@127.0.0.1:54320/twake
+          OPENSIPS_RESTART: docker compose -f docker/docker-compose.sip.yml kill -s KILL opensips && docker compose -f docker/docker-compose.sip.yml up -d --wait --wait-timeout 120 opensips
       - name: e2e SIP (trois personnes dans ${{ matrix.browser }}, micro simulé, OpenSIPS et rtpengine en Docker)
         run: node apps/web/test/sip.e2e.mjs
         env:
@@ -183,7 +187,7 @@ jobs:
           read -r eph_lo eph_hi < /proc/sys/net/ipv4/ip_local_port_range
           exposed=$(awk -v lo="$eph_lo" -v hi="$eph_hi" '{ addr = $2; port = addr; sub(/.*:/, "", port); sub(/:[^:]*$/, "", addr)
                            if (addr ~ /^(127\.|\[::1\]$)/) next
-                           if (port == 80 || port == 443 || ($1 == "udp" && port >= 30000 && port <= 30100)) next
+                           if (port == 80 || port == 443 || ($1 == "udp" && port >= 30000 && port <= 30999)) next
                            if ($1 == "udp" && (addr == "0.0.0.0" || addr == "*") && port + 0 >= lo + 0 && port + 0 <= hi + 0 && $3 ~ /^users:\(\("opensips",/) next
                            print }' "$RUNNER_TEMP/listen-new")
           if [ -n "$exposed" ]; then echo "Exposed beyond the loopback:"; echo "$exposed"; exit 1; fi

@@ -97,6 +97,8 @@ export const parseTrunk = (body: unknown, current?: Pick<TrunkRecord, 'passwordE
   if (b.default !== undefined && typeof b.default !== 'boolean') throw invalid('default: true or false')
   const defaultNumber = text(b, 'defaultNumber', v => E164.test(v), 'an E.164 number (+ then 7 to 15 digits)')
   if (!defaultNumber) throw invalid('defaultNumber: the number presented by those without a direct number is required')
+  // Step 6b (FR-C8): who rings inside when a call to one of its direct numbers does not go through.
+  const fallbackTarget = fallback(b)
   let password: string | null | undefined
   if (b.password === null) password = null
   else if (b.password !== undefined) {
@@ -122,7 +124,8 @@ export const parseTrunk = (body: unknown, current?: Pick<TrunkRecord, 'passwordE
       ...(allowed ? { allowed } : {}),
       ...(countries ? { countries } : {}),
       ...(b.default ? { default: true } : {}),
-      defaultNumber
+      defaultNumber,
+      ...(fallbackTarget ? { fallbackTarget } : {})
     },
     password
   }
@@ -142,6 +145,14 @@ const reservedSuffixes = (first: string, last: string, digits: number): string[]
 
 /** Whether two ranges share a number. */
 const overlap = (a: Pick<DidRange, 'first' | 'last'>, b: Pick<DidRange, 'first' | 'last'>) => a.first.length === b.first.length && a.first <= b.last && b.first <= a.last
+
+/**
+ * The fallback of a trunk or a range of direct numbers (step 6b, FR-C8, `fallbackTarget`): an extension or a ring group
+ * of the internal plan, rung inside when a call to a direct number is not answered, finds every phone busy, or cannot
+ * reach one; never a number outside (the operator's own forward, set at the operator, is for that: ADR 0017).
+ */
+const fallback = (b: Record<string, unknown>) =>
+  text(b, 'fallbackTarget', v => EXTENSION_FORMAT.test(v) && !RESERVED_NUMBER.test(v), 'an extension or a ring group (2 to 6 digits, the first not 0, not a short number of the French plan)')
 
 /**
  * A range of direct numbers as an administrator writes it (PUT /admin/dids/:id), checked against the trunks and the
@@ -174,7 +185,10 @@ export const parseDid = (id: string, body: unknown, trunks: readonly Pick<TrunkR
   }
   const clash = others.find(o => o.id !== id && overlap(o, { first, last }))
   if (clash) throw Object.assign(new Error(`${clash.first}${clash.last !== clash.first ? ` to ${clash.last}` : ''} (${clash.id}) has some of these numbers already`), { statusCode: 409, code: 'DID_OVERLAP' })
-  return { id, trunkId: b.trunkId, first, last, ...(target ? { target } : {}), ...(suffixDigits ? { suffixDigits } : {}) }
+  // Its own fallback (step 6b), in place of its trunk's: never where the number rings already.
+  const fallbackTarget = fallback(b)
+  if (fallbackTarget && fallbackTarget === target) throw Object.assign(new Error(`fallbackTarget: ${fallbackTarget} is where the number rings already`), { statusCode: 409, code: 'FALLBACK_LOOP' })
+  return { id, trunkId: b.trunkId, first, last, ...(target ? { target } : {}), ...(suffixDigits ? { suffixDigits } : {}), ...(fallbackTarget ? { fallbackTarget } : {}) }
 }
 
 /** A trunk as the API shows it: never its password, whether it has one. */
@@ -214,7 +228,8 @@ export const providerTrunks = (records: readonly TrunkRecord[], key: Buffer | un
  * (comma-separated), TRUNK_USERNAME, TRUNK_PASSWORD, TRUNK_REALM, TRUNK_REGISTRAR, TRUNK_EXPIRES, TRUNK_CODECS
  * (PCMA,PCMU by default), TRUNK_NUMBER_FORMAT, TRUNK_ASSERT_IDENTITY=1, TRUNK_ALLOWED (comma-separated classes:
  * fixed, mobile, freephone, standard-rate by default; overseas, international on demand), TRUNK_COUNTRIES (with
- * international: the country codes it calls, comma-separated); TRUNK_DIDS, comma-separated
+ * international: the country codes it calls, comma-separated), TRUNK_FALLBACK_TARGET (step 6b: an extension or a ring
+ * group); TRUNK_DIDS, comma-separated
  * `FIRST[..LAST]=TARGET` where TARGET is an extension or a group, or `last:N` for the extension made of the last N
  * digits of the number called. Undefined without TRUNK_DOMAIN; throws on anything invalid (named).
  */
@@ -244,7 +259,8 @@ export const trunkFromEnv = (env: NodeJS.ProcessEnv): { id: string; parsed: Retu
       ...(env.TRUNK_ASSERT_IDENTITY === '1' ? { assertIdentity: true } : {}),
       ...(env.TRUNK_ALLOWED ? { allowed: csv(env.TRUNK_ALLOWED) } : {}),
       ...(env.TRUNK_COUNTRIES ? { countries: csv(env.TRUNK_COUNTRIES) } : {}),
-      defaultNumber: env.TRUNK_DEFAULT_NUMBER
+      defaultNumber: env.TRUNK_DEFAULT_NUMBER,
+      ...(env.TRUNK_FALLBACK_TARGET ? { fallbackTarget: env.TRUNK_FALLBACK_TARGET } : {})
     })
   } catch (err) {
     return at('TRUNK_*')(err)

@@ -2,7 +2,7 @@ import dgram from 'node:dgram'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { RoutedEvent } from '@twake/telephony-provider-sdk'
 import type { ForwardingRules } from '@twake/telephony-types'
-import { AsyncQueue, OpensipsProvider, SUBSCRIBED_EVENTS, type CallRules, type DndRule, type PushTargets, type TrunkTables } from './index.js'
+import { AsyncQueue, OpensipsProvider, SUBSCRIBED_EVENTS, type CallRules, type DndRule, type OutboundTables, type PushTargets, type TrunkTables } from './index.js'
 import { fakeOpensips } from '../test/fake-opensips.js'
 
 const user = { id: 'alice', tenantId: 't', displayName: 'Alice', extension: '101' }
@@ -335,6 +335,78 @@ describe('OpensipsProvider call rules', () => {
     // Without the tables: no trunk on this platform.
     expect((await make().getCapabilities()).trunks).toBe(false)
     await expect(make().setTrunks([trunk], [])).rejects.toMatchObject({ statusCode: 501 })
+  })
+
+  it('writes the outbound rules where OpenSIPS reads them, and has it reload its thresholds only when they changed (step 6b)', async () => {
+    const writes: unknown[] = []
+    let changed = { fraud: true }
+    const outbound = { set: async (...args: unknown[]) => (writes.push(args), changed) } as unknown as OutboundTables
+    const trunks = { set: async () => ({ dispatcher: false, registrant: false }) } as unknown as TrunkTables
+    const sips = await fakeOpensips()
+    cleanups.push(sips.close)
+    const warnings: string[] = []
+    const p = new OpensipsProvider({ websocketUrl: 'wss://sip.example.test', domain: 'sip.example.test', sipSecretFor: async () => 's', events: { miUrl: sips.url, timeoutMs: 300 }, trunks, outbound, logger: { info: () => undefined, warn: m => void warnings.push(m) } })
+    cleanups.push(() => p.close())
+    expect((await p.getCapabilities()).outboundPolicy).toBe(true)
+    await until('the subscription', () => p.getStatus() === 'CONNECTED')
+    const reloads = () => sips.requests.map(r => r.method).filter(m => m === 'fraud_reload')
+    const profiles = [{ id: 'national', allowed: ['fixed' as const, 'mobile' as const] }]
+    await p.setOutboundPolicy({ defaultProfile: 'national' }, profiles, [{ userId: 'alice', profileId: 'national' }])
+    expect(writes).toEqual([[{ defaultProfile: 'national' }, profiles, [{ userId: 'alice', profileId: 'national' }]]])
+    expect(reloads()).toHaveLength(1)
+    // Profiles, caps, who has which: read call by call, nothing to reload.
+    changed = { fraud: false }
+    await p.setOutboundPolicy({}, profiles, [])
+    expect(reloads()).toHaveLength(1)
+    // OpenSIPS not answering: written, not applied (502), asked again at the next change whatever it changes.
+    sips.state.down = true
+    changed = { fraud: true }
+    await expect(p.setOutboundPolicy({}, [], [])).rejects.toMatchObject({ statusCode: 502, code: 'OUTBOUND_RELOAD_FAILED' })
+    expect(warnings.at(-1)).toMatch(/^OpenSIPS: thresholds written, fraud_reload failed/)
+    sips.state.down = false
+    changed = { fraud: false }
+    await p.setOutboundPolicy({}, [], [])
+    expect(reloads().length).toBeGreaterThanOrEqual(2)
+    const after = reloads().length
+    await p.setOutboundPolicy({}, [], [])
+    expect(reloads()).toHaveLength(after)
+    // Without the tables, or without trunks: no outbound rules on this platform.
+    expect((await make().getCapabilities()).outboundPolicy).toBe(false)
+    await expect(make().setOutboundPolicy({}, [], [])).rejects.toMatchObject({ statusCode: 501 })
+  })
+
+  it('subscribes to the thresholds and caps of the calls to the public network, and hands their alerts on, never as a call', async () => {
+    const sips = await fakeOpensips()
+    cleanups.push(sips.close)
+    const p = new OpensipsProvider({ websocketUrl: 'wss://sip.example.test', domain: 'sip.example.test', sipSecretFor: async () => 's', events: { miUrl: sips.url }, logger: quiet })
+    cleanups.push(() => p.close())
+    const got: RoutedEvent[] = []
+    void (async () => {
+      for await (const e of p.subscribe()) got.push(e)
+    })()
+    await until('the subscription', () => p.getStatus() === 'CONNECTED')
+    for (const e of ['E_FRD_WARNING', 'E_FRD_CRITICAL', 'E_TWAKEPHONE_LIMIT', 'E_TWAKEPHONE_RIGHTS', 'E_TWAKEPHONE_EMERGENCY']) expect(sips.subscriptions.map(s => s.event)).toContain(e)
+    sips.push('E_FRD_CRITICAL', { param: 'total-calls', value: 500, threshold: 500, user: '101', called_number: '442079460123', rule_id: 2, profile_id: 1 })
+    sips.push('E_TWAKEPHONE_LIMIT', { caller: '102', number: '+33639980001', param: 'dailyMinutes', scope: 'tenant', callid: 'x1' })
+    // Review 6b, n°11: a number outside the caller's rights, and emergency calls in a row (the third raises it).
+    sips.push('E_TWAKEPHONE_RIGHTS', { caller: '103', number: '+442079460123', param: 'international', callid: 'x2' })
+    for (const id of ['e1', 'e2', 'e3']) sips.push('E_TWAKEPHONE_EMERGENCY', { caller: '104', number: '112', callid: id })
+    await until('the alerts', () => got.filter(e => e.event.type === 'alert.raised').length === 4)
+    expect(got.map(e => [e.extension, e.event.type === 'alert.raised' ? e.event.payload.alert : e.event.type])).toEqual([
+      ['101', { kind: 'fraud-critical', param: 'dailyAttempts', scope: 'user', value: 500, threshold: 500, extension: '101', number: '+442079460123' }],
+      ['102', { kind: 'limit', param: 'dailyMinutes', scope: 'tenant', extension: '102', number: '+33639980001' }],
+      ['103', { kind: 'rights', param: 'international', scope: 'user', extension: '103', number: '+442079460123' }],
+      ['104', { kind: 'emergency', param: 'burst', scope: 'user', value: 3, threshold: 3, extension: '104', number: '112' }]
+    ])
+  })
+
+  it('says it is degraded while OpenSIPS\'s tables cannot count what the caps need, and why (review 6b)', () => {
+    let problem: string | undefined = 'acc.external is missing'
+    const p = new OpensipsProvider({ websocketUrl: 'wss://sip.example.test', domain: 'sip.example.test', sipSecretFor: async () => 's', schemaProblem: () => problem, logger: quiet })
+    expect(p.getStatus()).toBe('DEGRADED')
+    expect(p.getStatusReason()).toBe('acc.external is missing')
+    problem = undefined
+    expect(p.getStatus()).toBe('CONNECTED')
   })
 
   it('writes who can be woken where OpenSIPS reads it, only while it hears the events that say whom to wake', async () => {

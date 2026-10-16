@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto'
-import { TRUNK_COUNTRY, TRUNK_COUNTRY_EXCLUDED, TRUNK_OUTBOUND_CLASSES, TRUNK_OUTBOUND_DEFAULT, type DidRange, type Trunk } from '@twake/telephony-types'
+import { TRUNK_COUNTRY, TRUNK_COUNTRY_EXCLUDED, TRUNK_OUTBOUND_CLASSES, TRUNK_OUTBOUND_DEFAULT, isValidExtension, type DidRange, type Trunk } from '@twake/telephony-types'
 import { DIALPLAN_SQL } from './numbering.js'
+import { ACC_EXTERNAL_SQL, OUTBOUND_SCHEMA } from './outbound.js'
 import type { Queryable } from './subscriber.js'
 
 // Everything about the trunks in OpenSIPS's database lives here (step 6, ADR 0016). The Gateway keeps the trunks and
@@ -20,11 +21,11 @@ export const REGISTRANT_TABLE_VERSION = 3
  * with what the script needs for an outbound call (where, as whom, how numbers are written, which codecs, the number
  * presented by default, the kinds of numbers it may call as `,fixed,mobile,`, the country codes of the international
  * ones as `,32,44,`) and `setid`, its set of `dispatcher` (its servers; the other addresses its calls may come from are
- * in set `setid + SOURCES_SET`, which no call is ever sent to).
- * `dids`: the direct numbers, a range of E.164 numbers
- * of the same length, to an extension or group (`target`) or to the extension that ends with their last
- * `suffix_digits` digits. `tenant_id` is whose they are: OpenSIPS does not read it, and one tenant only may have trunks
- * in a database (TrunkTables refuses a second one).
+ * in set `setid + SOURCES_SET`, which no call is ever sent to), and the fallback of its direct numbers (step 6b,
+ * `fallback`: an extension or a ring group, '' none). `dids`: the direct numbers, a range of E.164 numbers of the same
+ * length, to an extension or group (`target`) or to the extension that ends with their last `suffix_digits` digits,
+ * and their own fallback. `tenant_id` is whose they are: OpenSIPS does not read it, and one tenant only may have trunks
+ * in a database (TrunkTables refuses a second one). Then the tables of the outbound policy (outbound.ts, step 6b).
  * Run as a whole by docker/opensips/entrypoint.sh before OpenSIPS starts (a database created before step 6 has none
  * of these tables, and OpenSIPS would not start without them) and at each start of the Gateway.
  */
@@ -99,7 +100,9 @@ CREATE TABLE IF NOT EXISTS dids (
     suffix_digits SMALLINT DEFAULT 0 NOT NULL
 );
 CREATE INDEX IF NOT EXISTS dids_first_number_idx ON dids (first_number);
-${DIALPLAN_SQL}`
+ALTER TABLE trunks ADD COLUMN IF NOT EXISTS fallback VARCHAR(16) DEFAULT '' NOT NULL;
+ALTER TABLE dids ADD COLUMN IF NOT EXISTS fallback VARCHAR(16) DEFAULT '' NOT NULL;
+${OUTBOUND_SCHEMA}${DIALPLAN_SQL}`
 
 /**
  * docker/opensips/trunk.sql, which entrypoint.sh runs before each start of OpenSIPS (psql): the tables its modules
@@ -113,7 +116,7 @@ CREATE TABLE IF NOT EXISTS version (
     CONSTRAINT version_t_name_idx UNIQUE (table_name)
 );
 ${TRUNK_SCHEMA.trim()}
-`
+${ACC_EXTERNAL_SQL}`
 
 /**
  * The set of `dispatcher` that holds the other addresses a trunk's calls may come from (`sources`): its own set plus
@@ -156,6 +159,14 @@ interface Projection {
 const invalid = (message: string) => Object.assign(new Error(message), { statusCode: 400 })
 
 /**
+ * A fallback (FR-C8) is an extension or a ring group of the organisation, rung inside: the internal plan, never a
+ * number that goes out (the operator's own forward is set at the operator, ADR 0017).
+ */
+const checkFallback = (target: string, what: string) => {
+  if (!isValidExtension(target)) throw invalid(`${what}: the fallback is an extension or a ring group (2 to 6 digits, the first not 0, not a short number of the French plan)`)
+}
+
+/**
  * Rows of the four tables for these trunks and numbers, the first trunk the one of those without a direct number;
  * throws on anything that could not go into them. `advertise` (`host[:port]`, TRUNK_ADVERTISE of entrypoint.sh): the
  * address OpenSIPS announces on the trunk socket, which the registrations bind to.
@@ -188,7 +199,9 @@ export const projectTrunks = (trunks: (Trunk & { password?: string })[], dids: D
     const countries = t.countries ?? []
     if (!countries.every(c => TRUNK_COUNTRY.test(c) && !TRUNK_COUNTRY_EXCLUDED.test(c))) throw invalid(`Trunk ${t.id}: countries are country codes of one to three digits or areas of the North American plan (1876), neither France nor its overseas ones, nor a code of no country`)
     if (allowed.includes('international') !== countries.length > 0) throw invalid(`Trunk ${t.id}: international numbers are called to the countries listed only (countries), and countries go with international`)
-    out.trunks.push([t.id, setid, position, t.domain, t.numberFormat, t.assertIdentity ? 1 : 0, username, secret, t.realm ?? '', codecFlags(t.codecs), t.defaultNumber, aor, `,${allowed.join(',')},`, countries.length ? `,${countries.join(',')},` : ''])
+    const fallback = t.fallbackTarget ?? ''
+    if (fallback) checkFallback(fallback, `Trunk ${t.id}`)
+    out.trunks.push([t.id, setid, position, t.domain, t.numberFormat, t.assertIdentity ? 1 : 0, username, secret, t.realm ?? '', codecFlags(t.codecs), t.defaultNumber, aor, `,${allowed.join(',')},`, countries.length ? `,${countries.join(',')},` : '', fallback])
     // The operator's servers, in order, each probed with OPTIONS (probe_mode 1): it keeps the NAT open towards each
     // (ARCHITECTURE §13). The dispatcher tries the highest priority first (algorithm 8): the first server has the
     // highest. Its other addresses: in a set of their own that no call is sent to (SOURCES_SET), never probed, only
@@ -202,12 +215,16 @@ export const projectTrunks = (trunks: (Trunk & { password?: string })[], dids: D
     }
   })
   for (const d of dids) {
-    if (!trunks.some(t => t.id === d.trunkId)) throw invalid(`Direct number ${d.first}: no trunk ${d.trunkId}`)
+    const trunk = trunks.find(t => t.id === d.trunkId)
+    if (!trunk) throw invalid(`Direct number ${d.first}: no trunk ${d.trunkId}`)
     if (!E164.test(d.first) || !E164.test(d.last) || d.first.length !== d.last.length || d.first > d.last) throw invalid(`Direct numbers ${d.first} to ${d.last} are no range of E.164 numbers`)
     const target = d.target ?? ''
     const suffix = d.suffixDigits ?? 0
     if (suffix ? target || suffix < 2 || suffix > 6 : !SIP_USER.test(target)) throw invalid(`Direct number ${d.first}: a target or a number of digits`)
-    out.dids.push([d.id.slice(0, 64), d.trunkId, d.first, d.last, target, suffix])
+    const fallback = d.fallbackTarget ?? ''
+    if (fallback) checkFallback(fallback, `Direct number ${d.first}`)
+    if (fallback && fallback === target) throw invalid(`Direct number ${d.first}: the fallback is where the number rings already`)
+    out.dids.push([d.id.slice(0, 64), d.trunkId, d.first, d.last, target, suffix, fallback])
   }
   return out
 }
@@ -246,8 +263,8 @@ export class TrunkTables {
   private async current(q: Queryable): Promise<Projection> {
     const rows = async (text: string) => (((await q.query(text, [this.tenantId])) as { rows?: Record<string, unknown>[] } | undefined)?.rows ?? []).map(r => Object.values(r))
     return {
-      trunks: await rows('SELECT id, setid, position, domain, number_format, assert_identity, auth_username, auth_password, auth_realm, codec_flags, default_number, reg_aor, allowed, countries FROM trunks WHERE tenant_id = $1 ORDER BY position'),
-      dids: await rows('SELECT id, trunk_id, first_number, last_number, target, suffix_digits FROM dids WHERE tenant_id = $1 ORDER BY first_number, id'),
+      trunks: await rows('SELECT id, setid, position, domain, number_format, assert_identity, auth_username, auth_password, auth_realm, codec_flags, default_number, reg_aor, allowed, countries, fallback FROM trunks WHERE tenant_id = $1 ORDER BY position'),
+      dids: await rows('SELECT id, trunk_id, first_number, last_number, target, suffix_digits, fallback FROM dids WHERE tenant_id = $1 ORDER BY first_number, id'),
       dispatcher: await rows(`SELECT setid, destination, socket, state, probe_mode, weight, priority, attrs, description FROM dispatcher WHERE ${OF_TENANT} ORDER BY setid, priority DESC, id`),
       registrant: await rows("SELECT registrar, proxy, aor, username, password, binding_uri, expiry, forced_socket FROM registrant WHERE aor IN (SELECT reg_aor FROM trunks WHERE tenant_id = $1 AND reg_aor <> '') ORDER BY id")
     }
@@ -291,10 +308,10 @@ export class TrunkTables {
       await q.query('DELETE FROM trunks WHERE tenant_id = $1', [this.tenantId])
       for (const r of wanted.trunks)
         await q.query(
-          'INSERT INTO trunks (tenant_id, id, setid, position, domain, number_format, assert_identity, auth_username, auth_password, auth_realm, codec_flags, default_number, reg_aor, allowed, countries) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)',
+          'INSERT INTO trunks (tenant_id, id, setid, position, domain, number_format, assert_identity, auth_username, auth_password, auth_realm, codec_flags, default_number, reg_aor, allowed, countries, fallback) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)',
           [this.tenantId, ...r]
         )
-      for (const r of wanted.dids) await q.query('INSERT INTO dids (tenant_id, id, trunk_id, first_number, last_number, target, suffix_digits) VALUES ($1, $2, $3, $4, $5, $6, $7)', [this.tenantId, ...r])
+      for (const r of wanted.dids) await q.query('INSERT INTO dids (tenant_id, id, trunk_id, first_number, last_number, target, suffix_digits, fallback) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)', [this.tenantId, ...r])
       for (const r of wanted.dispatcher) await q.query('INSERT INTO dispatcher (setid, destination, socket, state, probe_mode, weight, priority, attrs, description) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)', r)
       for (const r of wanted.registrant) await q.query('INSERT INTO registrant (registrar, proxy, aor, username, password, binding_URI, expiry, forced_socket) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)', r)
       await q.query('COMMIT')

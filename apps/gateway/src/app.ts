@@ -1,3 +1,4 @@
+import { createHmac, hkdfSync } from 'node:crypto'
 import Fastify, { type FastifyRequest } from 'fastify'
 import cors from '@fastify/cors'
 import websocket from '@fastify/websocket'
@@ -5,7 +6,7 @@ import swagger from '@fastify/swagger'
 import swaggerUi from '@fastify/swagger-ui'
 import { splitParticipantId, verifyWebhook, type LiveKitConferenceBridge, type MeetApi, type MeetRoom } from '@twake/conference-livekit'
 import type { MediaProvider, TelephonyProvider } from '@twake/telephony-provider-sdk'
-import { EXTENSION_FORMAT, isReservedNumber, type CallDirection, type DidRange, type Endpoint, type ForwardingRules, type Presence, type PresenceStatus, type RingGroup, type TelephonyEvent, type User } from '@twake/telephony-types'
+import { EXTENSION_FORMAT, FRAUD_DEFAULTS, OUTBOUND_CAP_DEFAULTS, isReservedNumber, type CallDirection, type DidRange, type Endpoint, type ForwardingRules, type Presence, type PresenceStatus, type RingGroup, type TelephonyEvent, type User } from '@twake/telephony-types'
 import { adminPolicyFromEnv, isAdmin, type AdminPolicy } from './admin.js'
 import { authenticatorFromEnv, TicketStore, type Authenticator, type Identity } from './auth.js'
 import { MAX_CONTACT_ID, MAX_FAVORITES, MAX_QUERY, MAX_SEARCH, RateLimiter, type ContactDirectory } from './contacts.js'
@@ -17,8 +18,25 @@ import { ENDED_TTL_SEC, MISSED_TTL_SEC, type PushMessage, type WebPush } from '.
 import type { ProviderRegistry } from './registry.js'
 import { securityHeadersFor, type SecurityOptions } from './security.js'
 import { MAX_DIDS, MAX_TRUNKS, TRUNK_ID, defaultTrunk, parseDid, parseTrunk, providerTrunks, publicDid, publicTrunk, trunkRecord } from './trunks.js'
+import { EMPTY_OUTBOUND, PROFILE_ID, parseOutbound, type Outbound } from './outbound.js'
 import { MemoryStore } from './store/memory.js'
-import { isMissed, type HistoryEntry, type HistoryQuery, type Store, type TrunkRecord, type UserPresenceRecord } from './store/types.js'
+import { ALERT_RETENTION_DAYS, clampLimit, isMissed, type HistoryEntry, type HistoryQuery, type Store, type TrunkRecord, type UserPresenceRecord } from './store/types.js'
+
+/** What the SIP server raises for the administrators (TelephonyAlert). */
+const ALERT_KINDS = ['fraud-warning', 'fraud-critical', 'limit', 'rights', 'emergency'] as const
+/** An extension as the log names it: the same short hash for the same tenant and extension, never the extension. */
+/**
+ * The extension of an alert in the log (second review 6b, n°7): a keyed hash (HMAC-SHA-256, with a key the Gateway
+ * derives from SECRETS_KEY), the same for one extension of one tenant, that the log alone does not give back (a plain
+ * hash of 2 to 6 digits is reversed by trying them all). Without SECRETS_KEY, none: the extension is left out.
+ */
+const pseudonymizer = (secretsKey: Buffer | undefined) => {
+  if (!secretsKey) return undefined
+  const key = Buffer.from(hkdfSync('sha256', secretsKey, Buffer.alloc(0), 'twake-phone: extensions in the log', 32))
+  return (tenantId: string, extension: string) => createHmac('sha256', key).update(`${tenantId}\u0000${extension}`).digest('hex').slice(0, 16)
+}
+/** The cursor of a page of alerts (`next`, `before`): the last repeat (ms) and id of the last alert of the page. */
+const ALERT_CURSOR = /^([0-9]{1,15})-([1-9][0-9]{0,17})$/
 
 const STATUSES: PresenceStatus[] = ['available', 'busy', 'away', 'dnd', 'offline']
 const DIRECTIONS: CallDirection[] = ['inbound', 'outbound']
@@ -86,6 +104,8 @@ export interface BuildOptions {
    * provider can hold a call for them (capability `push`). Absent: the endpoints say it is not available.
    */
   push?: WebPush
+  /** How often the alerts past their retention are removed (step 6b). Default: every hour. */
+  alertPurgeIntervalMs?: number
   /**
    * The key the passwords of the trunks are encrypted with (SECRETS_KEY, step 6). Absent: a trunk can be kept without
    * a password only.
@@ -260,6 +280,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
   const store = options.store ?? new MemoryStore()
   const auth = options.auth ?? authenticatorFromEnv(process.env)
   const admin = options.admin ?? adminPolicyFromEnv(process.env)
+  const pseudonym = pseudonymizer(options.secretsKey)
   const tickets = options.tickets ?? new TicketStore()
   const historyWriteMs = options.historyWriteTimeoutMs ?? HISTORY_WRITE_MS
   const turnMaxMs = options.turnMaxMs ?? TURN_MAX_MS
@@ -335,6 +356,17 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
   // everyone's business in the tenant (the directory shows it); a call is its two parties' only. One event that
   // fails (the directory or the database down a moment) is logged and skipped: the stream goes on.
   const deliver = async (tenantId: string, extension: string, event: TelephonyEvent) => {
+    // For the administrators, never the person (step 6b): kept and logged, whoever holds the extension.
+    if (event.type === 'alert.raised') {
+      const userId = await within(dir.userIdForExtension(tenantId, extension), historyWriteMs, 'alert user').catch(() => undefined)
+      const alert = { ...event.payload.alert, ...(userId ? { userId } : {}) }
+      // The log says what and how much, never whom nor the number called: the extension as a hash only (the same one
+      // across lines, to follow it), the rest in the store, for the administrators.
+      const { kind, param, scope, value, threshold } = alert
+      app.log.warn({ tenantId, alert: { kind, param, scope, value, threshold, ...(alert.extension && pseudonym ? { ext: pseudonym(tenantId, alert.extension) } : {}) } }, `telephony alert: ${kind} ${param}`)
+      await within(store.addAlert({ tenantId, at: event.timestamp, alert }), historyWriteMs, 'alert write').catch(err => app.log.error({ err, tenantId }, 'could not record the alert'))
+      return
+    }
     const userId = await dir.userIdForExtension(tenantId, extension)
     if (!userId) return
     // A call held for someone without a window: their browsers are woken (not awaited: the stream goes on).
@@ -447,6 +479,30 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         if (closing) return
         const delay = RESTORE_RETRY_MS[Math.min(attempt, RESTORE_RETRY_MS.length - 1)]!
         app.log.error({ err, tenantId }, `trunks not handed to the provider, retrying in ${delay / 1000} s`)
+        await new Promise(resolve => setTimeout(resolve, delay).unref())
+      }
+    }
+  }
+  // The outbound rules the store keeps (step 6b, ADR 0017): handed to the provider when it starts, as the trunks; none
+  // kept, the empty ones (no profile, no cap, the default thresholds).
+  const outboundFor = async (tenantId: string): Promise<Outbound> => {
+    const r = await store.getOutbound(tenantId)
+    return r ? { policy: r.policy, profiles: r.profiles, assignments: r.assignments } : EMPTY_OUTBOUND
+  }
+  const restoreOutbound = async (tenantId: string, provider: TelephonyProvider) => {
+    if (!provider.setOutboundPolicy) return
+    for (let attempt = 0; !closing; attempt++) {
+      try {
+        if (!(await provider.getCapabilities()).outboundPolicy) return
+        await inTurn(tenantId, async () => {
+          const o = await outboundFor(tenantId)
+          await provider.setOutboundPolicy!(o.policy, o.profiles, o.assignments)
+        })
+        return
+      } catch (err) {
+        if (closing) return
+        const delay = RESTORE_RETRY_MS[Math.min(attempt, RESTORE_RETRY_MS.length - 1)]!
+        app.log.error({ err, tenantId }, `outbound rules not handed to the provider, retrying in ${delay / 1000} s`)
         await new Promise(resolve => setTimeout(resolve, delay).unref())
       }
     }
@@ -572,6 +628,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
     started.set(tenantId, provider)
     void restorePresences(tenantId, provider)
     void restoreTrunks(tenantId, provider)
+    void restoreOutbound(tenantId, provider)
     void (async () => {
       for await (const { extension, event } of provider.subscribe()) {
         try {
@@ -582,8 +639,22 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
       }
     })().catch(err => app.log.error({ err }, 'provider event stream failed'))
   }
+  // The alerts past their retention go every hour (and once at start), whoever they belong to (step 6b).
+  const purgeAlerts = () =>
+    store.purgeAlerts(new Date(Date.now() - ALERT_RETENTION_DAYS * 86_400_000).toISOString()).then(
+      n => {
+        if (n) app.log.info({ purged: n }, 'alerts past their retention removed')
+      },
+      err => app.log.error({ err }, 'alerts not purged')
+    )
+  const alertPurge = setInterval(() => void purgeAlerts(), options.alertPurgeIntervalMs ?? 3_600_000)
+  alertPurge.unref()
+  app.addHook('onReady', async () => {
+    void purgeAlerts()
+  })
   app.addHook('onClose', async () => {
     closing = true
+    clearInterval(alertPurge)
     await registry.closeAll()
     await store.close()
   })
@@ -927,6 +998,12 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         await apply(providerTrunks(trunks, options.secretsKey), dids).catch(undo)
         await keep().catch(undo)
       }
+      // A number rings an extension someone holds, or a ring group of the tenant: nothing else; so does a fallback.
+      const checkTarget = async (tenantId: string, provider: TelephonyProvider, field: string, target: string | undefined, code: string) => {
+        if (!target || (await store.getMappingByExtension(tenantId, target))) return
+        if (provider.listGroups && (await provider.listGroups()).some(g => g.number === target)) return
+        throw Object.assign(new Error(`${field}: ${target} is no extension nor ring group of this platform`), { statusCode: 400, code })
+      }
       v1.get('/admin/trunks', async req => {
         const user = await administrator(req)
         trunksOf(registry.forTenant(user.tenantId))
@@ -949,6 +1026,8 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
           if (given === undefined && current?.config.default) parsed.config = { ...parsed.config, default: true }
           if (given === false && current && defaultTrunk(records)?.id === id)
             throw Object.assign(new Error('This is the default trunk: make another one the default instead'), { statusCode: 409, code: 'TRUNK_DEFAULT' })
+          const dids = (await store.listDids(user.tenantId)).map(publicDid)
+          await checkTarget(user.tenantId, registry.forTenant(user.tenantId), 'fallbackTarget', parsed.config.fallbackTarget, 'FALLBACK_TARGET')
           const record = trunkRecord(user.tenantId, id, parsed, current, options.secretsKey)
           // One default trunk: the one marked now, the others no longer.
           const unmark = (t: TrunkRecord): TrunkRecord => {
@@ -959,7 +1038,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
           const updated = (t: TrunkRecord) => (t.id === id ? record : (unmarked.find(u => u.id === t.id) ?? t))
           const next = current ? records.map(updated) : [...records.map(updated), record]
           // The marks moved together, or not at all.
-          await changeTrunks(user.tenantId, apply, next, (await store.listDids(user.tenantId)).map(publicDid), () => store.upsertTrunks([...unmarked, record]))
+          await changeTrunks(user.tenantId, apply, next, dids, () => store.upsertTrunks([...unmarked, record]))
           return { record, created: !current }
         })
         return reply.code(created ? 201 : 200).send(publicTrunk(record))
@@ -994,9 +1073,8 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
           const current = dids.find(d => d.id === req.params.id)
           if (!current && dids.length >= MAX_DIDS) throw Object.assign(new Error(`At most ${MAX_DIDS} ranges of direct numbers`), { statusCode: 409 })
           const did = parseDid(req.params.id, req.body, records, dids)
-          // A number rings an extension someone holds, or a ring group of the tenant: nothing else.
-          if (did.target && !(await store.getMappingByExtension(user.tenantId, did.target)) && !(provider.listGroups && (await provider.listGroups()).some(g => g.number === did.target)))
-            throw Object.assign(new Error(`target: ${did.target} is no extension nor ring group of this platform`), { statusCode: 400, code: 'DID_TARGET' })
+          await checkTarget(user.tenantId, provider, 'target', did.target, 'DID_TARGET')
+          await checkTarget(user.tenantId, provider, 'fallbackTarget', did.fallbackTarget, 'FALLBACK_TARGET')
           await changeTrunks(user.tenantId, apply, records, current ? dids.map(d => (d.id === did.id ? did : d)) : [...dids, did], () => store.upsertDid({ tenantId: user.tenantId, ...did }))
           return { did, created: !current }
         })
@@ -1011,6 +1089,81 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
           await changeTrunks(user.tenantId, apply, await store.listTrunks(user.tenantId), dids.filter(d => d.id !== req.params.id), () => store.deleteDid(user.tenantId, req.params.id))
         })
         return reply.code(204).send()
+      })
+
+      // The rules of the calls to the public network (capability `outboundPolicy`, ADR 0017): administrators only, one
+      // change at a time per tenant, applied as the trunks are: the provider first, then the store; either failing,
+      // the provider is handed back what it had. Emergency calls are outside all of it.
+      const outboundOf = (provider: TelephonyProvider) => {
+        if (!provider.setOutboundPolicy) throw Object.assign(new Error('Outbound rules are not available on this platform'), { statusCode: 501 })
+        return provider.setOutboundPolicy.bind(provider)
+      }
+      const changeOutbound = async (tenantId: string, apply: ReturnType<typeof outboundOf>, next: Outbound) => {
+        const before = await outboundFor(tenantId)
+        const undo = (err: unknown) =>
+          apply(before.policy, before.profiles, before.assignments).then(
+            () => {
+              throw err
+            },
+            (undoErr: unknown) => {
+              app.log.error({ err: undoErr, tenantId }, 'outbound rules: the previous ones could not be handed back to the provider')
+              throw err
+            }
+          )
+        await apply(next.policy, next.profiles, next.assignments).catch(undo)
+        await store.setOutbound({ tenantId, ...next }).catch(undo)
+      }
+      // What holds when an administrator says nothing (ADR 0017): shown with what they said.
+      const outboundView = (o: Outbound) => ({ ...o, defaults: { fraud: FRAUD_DEFAULTS, caps: OUTBOUND_CAP_DEFAULTS } })
+      v1.get('/admin/outbound', async req => {
+        const user = await administrator(req)
+        outboundOf(registry.forTenant(user.tenantId))
+        return outboundView(await outboundFor(user.tenantId))
+      })
+      v1.put('/admin/outbound', async req => {
+        const user = await administrator(req)
+        const apply = outboundOf(registry.forTenant(user.tenantId))
+        const next = parseOutbound(req.body)
+        await inTurn(user.tenantId, () => changeOutbound(user.tenantId, apply, next))
+        return outboundView(next)
+      })
+      // One person's profile (`profileId`, or null: the default one).
+      v1.put<{ Params: { userId: string } }>('/admin/outbound/users/:userId', async req => {
+        const user = await administrator(req)
+        const apply = outboundOf(registry.forTenant(user.tenantId))
+        const userId = req.params.userId
+        const body = req.body as { profileId?: unknown } | undefined
+        const profileId = body?.profileId
+        if (profileId !== null && (typeof profileId !== 'string' || !PROFILE_ID.test(profileId))) throw Object.assign(new Error('profileId: one of the profiles, or null'), { statusCode: 400, code: 'OUTBOUND_INVALID' })
+        return inTurn(user.tenantId, async () => {
+          const current = await outboundFor(user.tenantId)
+          const assignments = current.assignments.filter(a => a.userId !== userId)
+          const next = parseOutbound({ ...current, assignments: profileId ? [...assignments, { userId, profileId }] : assignments })
+          await changeOutbound(user.tenantId, apply, next)
+          return { userId, profileId: profileId ?? null }
+        })
+      })
+      // The alerts, the latest repeated first, a page at a time (`next`: the `before` of the next page), of one kind
+      // or param if asked. Each one once while it repeats: `count` times, the last at `lastAt` (its fields those of the
+      // last), the first at `at` (`first`: its value and number).
+      v1.get<{ Querystring: { limit?: string; before?: string; kind?: string; param?: string } }>('/admin/alerts', async req => {
+        const user = await administrator(req)
+        const q = req.query
+        const bad = (message: string) => Object.assign(new Error(message), { statusCode: 400, code: 'ALERTS_QUERY' })
+        const cursor = q.before === undefined ? undefined : ALERT_CURSOR.exec(q.before)
+        if (q.before !== undefined && !cursor) throw bad('before: the `next` of a previous page')
+        if (q.kind !== undefined && !(ALERT_KINDS as readonly string[]).includes(q.kind)) throw bad(`kind: one of ${ALERT_KINDS.join(', ')}`)
+        if (q.param !== undefined && !/^[A-Za-z-]{1,32}$/.test(q.param)) throw bad('param: a threshold, a cap or a class of numbers')
+        const asked = q.limit === undefined ? 50 : Number(q.limit)
+        if (!Number.isInteger(asked)) throw bad('limit: a whole number')
+        const limit = clampLimit(asked)
+        const before = cursor ? { lastAt: new Date(Number(cursor[1])).toISOString(), id: cursor[2]! } : undefined
+        const items = await store.listAlerts(user.tenantId, { limit, ...(before ? { before } : {}), ...(q.kind ? { kind: q.kind as (typeof ALERT_KINDS)[number] } : {}), ...(q.param ? { param: q.param } : {}) })
+        const last = items.at(-1)
+        return {
+          items: items.map(({ id, at, lastAt, count, alert, first }) => ({ id, at, lastAt, count, ...alert, first: { ...(first.value !== undefined ? { value: first.value } : {}), ...(first.number ? { number: first.number } : {}) } })),
+          ...(last && items.length === limit ? { next: `${Date.parse(last.lastAt)}-${last.id}` } : {})
+        }
       })
 
       // Right to erasure of one's own call history.

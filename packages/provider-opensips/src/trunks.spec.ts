@@ -38,7 +38,7 @@ describe('projectTrunks', () => {
   it("writes the operator's servers in order, probed, its other addresses only recognised, and the registration", () => {
     const p = projectTrunks([OPERATOR], DIDS, 'udp:192.0.2.1:5070')
     const ha1 = `0x${createHash('md5').update('0033199000100:operator.example:not-a-real-password').digest('hex')}`
-    expect(p.trunks).toEqual([['operator', 1, 0, 'sip.operator.example', 'international-00', 0, '0033199000100', ha1, 'operator.example', 'codec-strip-all codec-except-PCMA codec-except-PCMU codec-except-telephone-event', '+33199000100', 'sip:0033199000100@sip.operator.example', ',fixed,mobile,freephone,standard-rate,', '']])
+    expect(p.trunks).toEqual([['operator', 1, 0, 'sip.operator.example', 'international-00', 0, '0033199000100', ha1, 'operator.example', 'codec-strip-all codec-except-PCMA codec-except-PCMU codec-except-telephone-event', '+33199000100', 'sip:0033199000100@sip.operator.example', ',fixed,mobile,freephone,standard-rate,', '', '']])
     // The dispatcher tries the highest priority first (algorithm 8): the first server gets the calls, the second one
     // takes over. The other addresses: in a set of their own that no call is sent to (ds_select_dst is only ever given
     // a trunk's own set), never probed: with every server down, a call fails at once rather than going to one of them.
@@ -60,8 +60,8 @@ describe('projectTrunks', () => {
     // Registered from the trunk socket, with no other address declared (ARCHITECTURE §13), through the first server.
     expect(p.registrant).toEqual([['sip:sip.operator.example', 'sip:sbc1.operator.example:5060', 'sip:0033199000100@sip.operator.example', '0033199000100', ha1, 'sip:0033199000100@192.0.2.1:5070', 600, 'udp:192.0.2.1:5070']])
     expect(p.dids).toEqual([
-      ['d2', 'operator', '+33199000110', '+33199000119', '', 3],
-      ['d1', 'operator', '+33199000101', '+33199000101', '101', 0]
+      ['d2', 'operator', '+33199000110', '+33199000119', '', 3, ''],
+      ['d1', 'operator', '+33199000101', '+33199000101', '101', 0, '']
     ])
   })
 
@@ -162,6 +162,8 @@ if (process.env.TEST_DATABASE_URL) {
     const ready = async () => undefined
     beforeAll(async () => {
       await pool.query('DROP SCHEMA IF EXISTS spec_trunks CASCADE; CREATE SCHEMA spec_trunks')
+      // The tables the outbound rules read too (`subscriber`, `acc`: step 6b), as the Compose stack creates them.
+      await pool.query(SUBSCRIBER_SQL)
       await pool.query(TRUNK_SQL)
       // Twice: what entrypoint.sh does at each start.
       await pool.query(TRUNK_SQL)
@@ -250,7 +252,12 @@ if (process.env.TEST_DATABASE_URL) {
       await tables.set([OPERATOR, { ...OPERATOR, id: 'backup', auth: 'ip', defaultNumber: '+33199000200' }], DIDS)
       // route[trunk_in], as the script builds it: the Request-URI's number first, then the To's (the To's first when
       // the Request-URI names the login a trunk registers with).
-      const inbound = async (n1: string, n2: string, ruUser = '') => (await pool.query(scriptQuery('did_query', { n1, n2, ru_user: ruUser }))).rows[0] as Record<string, unknown> | undefined
+      const DND = { dnd_sql: 'SELECT 1 FROM call_rules r WHERE r.extension = ', dnd_now: ' AND r.dnd AND (r.dnd_until IS NULL OR r.dnd_until > now())' }
+      const didRow = async (n1: string, n2: string, ruUser = '') => (await pool.query({ text: scriptQuery('did_query', { n1, n2, ru_user: ruUser, ...DND }), rowMode: 'array' })).rows[0] as unknown[] | undefined
+      const inbound = async (n1: string, n2: string, ruUser = '') => {
+        const row = await didRow(n1, n2, ruUser)
+        return row ? { target: row[0] } : undefined
+      }
       expect(await inbound('+33199000101', '')).toMatchObject({ target: '101' })
       expect(await inbound('', '+33199000113')).toMatchObject({ target: '113' })
       expect(await inbound('+33199000100', '+33199000113')).toMatchObject({ target: '113' })
@@ -262,6 +269,8 @@ if (process.env.TEST_DATABASE_URL) {
       // first trunk and its own; what it may call; and, for a number called that is one of ours, what it rings.
       const outbound = async (ext: string, called = '+33639980001') => (await pool.query(scriptQuery('trunk_query', { ext, called }))).rows[0] as Record<string, unknown> | undefined
       expect(await outbound('101')).toMatchObject({ setid: 1, presented: '+33199000101', number_format: 'international-00', allowed: ',fixed,mobile,freephone,standard-rate,', internal: null })
+      // Nothing of step 6b in it (review 6b, n°2): the rights and caps are a query of their own, never an emergency call's.
+      expect(Object.keys((await outbound('101'))!)).not.toContain('rights')
       expect(await outbound('115')).toMatchObject({ setid: 1, presented: '+33199000115' })
       expect(await outbound('102')).toMatchObject({ setid: 1, presented: '+33199000100' })
       expect(await outbound('1150')).toMatchObject({ presented: '+33199000100' })
@@ -275,6 +284,32 @@ if (process.env.TEST_DATABASE_URL) {
       await tables.set([{ ...OPERATOR, allowed: ['international'], countries: ['44'] }], DIDS)
       expect(await outbound('101', '+442079460123')).toMatchObject({ allowed: ',international,', countries: ',44,' })
       await tables.set([], [])
+    })
+
+    it('reads with a direct number called its fallback inside: the number\'s own, else its trunk\'s, what it is, and whether the number is anyone\'s (review 6b, n°1, n°9)', async () => {
+      const tables = new TrunkTables({ pool, ready, tenantId: 'spec-A' })
+      await tables.set([{ ...OPERATOR, fallbackTarget: '300' }], [DIDS[0]!, { ...DIDS[1]!, fallbackTarget: '113' }])
+      await pool.query("INSERT INTO subscriber (username, domain) VALUES ('101', ''), ('113', ''), ('114', '')")
+      await pool.query("INSERT INTO call_groups (number, tenant_id, name, members) VALUES ('300', 'spec-A', 'Accueil', '{113,114,115}')")
+      try {
+        const DND = { dnd_sql: 'SELECT 1 FROM call_rules r WHERE r.extension = ', dnd_now: ' AND r.dnd AND (r.dnd_until IS NULL OR r.dnd_until > now())' }
+        const did = async (n: string) => {
+          const row = (await pool.query({ text: scriptQuery('did_query', { n1: n, n2: '', ru_user: '', ...DND }), rowMode: 'array' })).rows[0] as unknown[]
+          return { target: row[0], fallback: row[2], kind: row[3], members: row[4], assigned: row[5] }
+        }
+        expect(await did('+33199000101')).toEqual({ target: '101', fallback: '113', kind: 'extension', members: '', assigned: 1 })
+        // The trunk's: a group, its members in their order.
+        expect(await did('+33199000113')).toEqual({ target: '113', fallback: '300', kind: 'group', members: '113|114|115', assigned: 1 })
+        // A number of the range nobody holds: not found (404), no fallback rung.
+        expect(await did('+33199000110')).toMatchObject({ target: '110', assigned: 0 })
+        // "Do not disturb": an extension in it is no fallback; a member in it is not rung.
+        await pool.query("INSERT INTO call_rules (extension, tenant_id, dnd) VALUES ('113', 'spec-A', true), ('114', 'spec-A', true)")
+        expect(await did('+33199000101')).toMatchObject({ fallback: '113', kind: '' })
+        expect(await did('+33199000113')).toMatchObject({ kind: 'group', members: '115' })
+      } finally {
+        await pool.query("DELETE FROM call_rules WHERE extension IN ('113', '114'); DELETE FROM call_groups WHERE number = '300'; DELETE FROM subscriber WHERE username IN ('101', '113', '114')")
+        await tables.set([], [])
+      }
     })
 
     it("keeps each tenant to its own rows, and refuses trunks to a second tenant of the same database", async () => {
