@@ -2667,6 +2667,26 @@ try {
     await until('Alice seeing Jean resume the call', async () => ((await calls(alice.page))[0]?.remoteHold === false ? true : null))
     // Each one mutes their microphone: the calls of the conference start so.
     for (const who of [alice, jean]) await who.page.getByRole('button', { name: 'Couper le micro' }).click()
+    // The race of the announcement, forced: the panels of Alice and Jean get no read of the room until Bob is in it,
+    // so their first read finds him there already. He is told all the same (an arrival after their own calls).
+    const roomRead = /\/api\/v1\/conferences\/twake-call-[0-9a-f]{16}(\?|$)/
+    const refuseReads = route =>
+      route.request().method() === 'GET'
+        ? route.fulfill({ status: 429, contentType: 'application/json', headers: { 'access-control-allow-origin': '*' }, body: JSON.stringify({ statusCode: 429, code: 'CONFERENCE_READ_LIMIT', message: 'held by the e2e' }) })
+        : route.fallback()
+    for (const who of [alice, jean]) await who.page.route(roomRead, refuseReads)
+    // Every text the status region shows from now on, in each window: no announcement is lost by being replaced.
+    for (const who of [alice, jean, bob])
+      await who.page.evaluate(() => {
+        const seen = (window.__statusTexts = [])
+        const look = () => {
+          const text = document.querySelector('[data-testid="call-status"]')?.textContent ?? ''
+          if (text && seen.at(-1) !== text) seen.push(text)
+        }
+        new MutationObserver(look).observe(document.body, { childList: true, subtree: true, characterData: true })
+        look()
+      })
+    const statusTexts = who => who.page.evaluate(() => window.__statusTexts ?? [])
     await alice.page.getByRole('button', { name: 'Ajouter un participant' }).click()
     await alice.page.getByLabel('Participant à ajouter (poste ou numéro)').fill('103')
     await alice.page.getByRole('button', { name: 'Appeler et ajouter' }).click()
@@ -2690,12 +2710,19 @@ try {
     await ringing.waitFor({ timeout: 30_000 })
     expectEqual((await calls(bob.page))[0]?.remoteNumber, '101', 'who calls Bob')
     await ringing.getByRole('button', { name: 'Répondre' }).click()
+    await until('Bob in the conference', async () => ((await calls(bob.page))[0]?.state === 'connected' ? true : null), { timeout: 30_000 })
+    for (const who of [alice, jean]) await who.page.unroute(roomRead, refuseReads)
     await alice.page.getByTestId('conference-participant').nth(2).waitFor({ timeout: 20_000 })
     const shown = await alice.page.getByTestId('conference-participant').allTextContents()
     expectEqual(shown.length, 3, `the participants Alice sees: ${JSON.stringify(shown)}`)
     for (const button of ['Retirer 102 de la conférence', 'Retirer 103 de la conférence', 'Terminer pour tous', 'Quitter la conférence']) await alice.page.getByRole('button', { name: button }).waitFor()
     CONFERENCE = await until('the room of the conference, kept for Alice', async () => (await store.listConferences(TENANT, 'amartin')).find(r => /^twake-call-[0-9a-f]{16}$/.test(r.meetingId))?.meetingId ?? null)
     expectEqual((await inConference()).map(p => `${p.kind} ${p.number}`).sort().join(', '), 'phone 101, phone 102, phone 103', 'the room of the conference')
+    // When each came in, by the Gateway's clock (it dials every call of the room and writes when): there for everyone,
+    // in milliseconds, Bob after the two others.
+    const came = Object.fromEntries((await inConference()).map(p => [p.number, p.joinedAt]))
+    expectEqual(Object.values(came).every(at => Number.isSafeInteger(at) && at > 1e12), true, `when each came in: ${JSON.stringify(came)}`)
+    expectEqual(came['103'] > Math.max(came['101'], came['102']), true, `Bob after the others: ${JSON.stringify(came)}`)
     // Bob's call names the room of the conference (Twake-Conference): he sees who is in it, as Jean does; neither acts on anyone.
     const [bobs] = await calls(bob.page)
     expectEqual(`${bobs?.room} ${bobs?.conferenceRoom === CONFERENCE}`, 'conference true', `Bob's call of the conference ${JSON.stringify(bobs)}`)
@@ -2706,6 +2733,13 @@ try {
     }
     // Whoever is in it is told who came, in a region read out.
     for (const who of [alice, jean]) await who.page.getByTestId('call-status').getByText('103 a rejoint la conférence.').waitFor({ timeout: 20_000 })
+    // Only Bob, ever: neither party of the call it began with, nor oneself; and Bob, who came last, of nobody.
+    for (const who of [alice, jean]) {
+      const told = await statusTexts(who)
+      expectEqual(told.some(text => /10[12] a rejoint/.test(text)), false, `what ${who.name} was told: ${JSON.stringify(told)}`)
+    }
+    const toldBob = await statusTexts(bob)
+    expectEqual(toldBob.some(text => /a rejoint|a quitté/.test(text)), false, `what Bob was told: ${JSON.stringify(toldBob)}`)
     for (const who of [alice, jean]) await who.page.getByTestId('conference').getByRole('button', { name: 'Rétablir le micro' }).click()
     // Each one hears the others, through the room.
     await bothHearEachOther(alice, jean)

@@ -452,6 +452,19 @@ export interface ConferenceParticipant {
   /** Honours the tenant privacy setting: show | mask | hide. */
   number?: string
   muted: boolean
+  /**
+   * When it came into the room, in milliseconds since the epoch: to compare with another participant's of the same
+   * list only, never with the browser's clock. One clock for a whole list: the Gateway's, which writes when it dials
+   * each call of a call's room, else the conference server's milliseconds; none on any participant when neither is
+   * there for all (whole seconds would make two calls placed within a second look simultaneous). A call the room places
+   * is in it from its dialling, ringing included.
+   */
+  joinedAt?: number
+  /**
+   * The reader's own call (step 8b): GET /conferences/:id with its SIP Call-ID in the X-Twake-Call header. Whoever
+   * came in after it is news to them.
+   */
+  you?: boolean
 }
 
 export type TelephonyEvent =

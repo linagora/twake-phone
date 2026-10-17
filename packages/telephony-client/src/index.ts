@@ -568,9 +568,13 @@ export class TelephonyClient {
     return this.request<CallConference>(`/calls/${encodeURIComponent(callId)}/conference`, { method: 'POST', body: JSON.stringify({ join }) })
   }
 
-  /** The participants of a call's conference (GET /conferences/:id, as its maker reads it). */
-  getCallConference(meetingId: string) {
-    return this.request<CallConference>(`/conferences/${encodeURIComponent(meetingId)}`)
+  /**
+   * The participants of a call's conference (GET /conferences/:id). `call`: the SIP Call-ID of the reader's own call
+   * in it (header X-Twake-Call, out of the URL that proxies write in their logs), whose participant comes back marked
+   * `you`.
+   */
+  getCallConference(meetingId: string, { call }: { call?: string } = {}) {
+    return this.request<CallConference>(`/conferences/${encodeURIComponent(meetingId)}`, call ? { headers: { 'x-twake-call': call } } : {})
   }
 
   /** Ends a call's conference for everyone in it (« Terminer pour tous »). */

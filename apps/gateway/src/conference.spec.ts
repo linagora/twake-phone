@@ -87,7 +87,8 @@ const setup = async ({
         items: [...lk.rules].map(([id, r]) => ({ sip_dispatch_rule_id: id, name: r.name, trunk_ids: [r.trunk], rule: { dispatch_rule_direct: { room_name: r.name.slice(11), pin: r.pin } } }))
       },
       'livekit.SIP/CreateSIPOutboundTrunk': { sip_trunk_id: 'O' },
-      'livekit.RoomService/ListParticipants': { participants: [{ identity: 'web1', name: 'Bob' }] }
+      // Its Call-ID, as LiveKit SIP would write it for a call: the header of a call's room means nothing here.
+      'livekit.RoomService/ListParticipants': { participants: [{ identity: 'web1', name: 'Bob', attributes: { 'sip.callIDFull': 'pin@192.0.2.30' } }] }
     }
     return { ok: true, status: 200, text: async () => JSON.stringify(out[path] ?? {}) }
   }
@@ -274,6 +275,9 @@ describe('conference endpoints', () => {
     const room = await open()
     const read = await app.inject({ url: `/api/v1/conferences/${room}`, headers: as('alice') })
     expect(read.json().participants).toMatchObject([{ id: `${room}:web1`, kind: 'web' }])
+    // A room with a PIN is no call's room (step 8b): the Call-ID of a reader's call marks nobody in it.
+    const withCall = await app.inject({ url: `/api/v1/conferences/${room}`, headers: { ...as('alice'), 'x-twake-call': 'pin@192.0.2.30' } })
+    expect(withCall.json().participants[0]).not.toHaveProperty('you')
 
     const dial = await app.inject({ method: 'POST', url: `/api/v1/conferences/${room}/participants`, headers: as('alice'), payload: { number: '+33612345678' } })
     expect(dial.statusCode).toBe(201)
