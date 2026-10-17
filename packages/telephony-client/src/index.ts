@@ -83,6 +83,11 @@ export interface HistoryItem {
    * not be reached).
    */
   sources?: string[]
+  /**
+   * Known from the operator alone, and forwarded there to the fallback number (second review 10b, n°4): the platform
+   * could not be reached, the phone did not ring; missed, whoever took it at the fallback.
+   */
+  forwardedToFallback?: boolean
 }
 
 /**
@@ -116,18 +121,32 @@ export interface OperatorLineRead {
   error?: OperatorProblem
 }
 
+/**
+ * A removal of the forwards of a line at the operator not done yet (second review 10b, n°1): kept by the Gateway and
+ * tried again at each round until the operator has it, whatever became of the trunk that asked it.
+ */
+export interface OperatorRemoval {
+  line: string
+  since: string
+  trunkId?: string
+  triedAt?: string
+  error?: OperatorProblem
+}
+
 /** The operator of the trunks, as the administration shows it (GET /admin/operator). */
 export interface OperatorStatus {
   configured: boolean
   operator?: string
   trunks?: { id: string; lines: OperatorLine[] }[]
+  /** The removals at the operator still owed. */
+  removals?: OperatorRemoval[]
   cdrs?: {
     readAt?: string
     read?: number
     /** The lines whose records could not be read, and why. */
     lines?: { line: string; error: OperatorProblem }[]
     since: string
-    stats: { total: number; matched: number; orphan: number; unmatchedInbound: number; unmatchedOutbound: number; forwarded: number; pending: number; invalid: number }
+    stats: { total: number; matched: number; orphan: number; unmatchedInbound: number; unmatchedOutbound: number; forwarded: number; pending: number; invalid: number; erased: number }
   }
 }
 
@@ -396,14 +415,21 @@ export class TelephonyClient {
     return this.request<{ items: OperatorLineRead[] }>('/admin/operator/lines', { method: 'POST', body: JSON.stringify({ lines }) })
   }
 
-  /** The trunk no longer asks a fallback at the operator, and the forwards of its lines are removed there. */
+  /**
+   * The trunk no longer asks a fallback at the operator, and the forwards of its lines are removed there. `pending`:
+   * the removals the operator does not have yet (202), tried again at each round.
+   */
   removeOperatorFallback(trunkId: string) {
-    return this.request<Trunk>(`/admin/trunks/${encodeURIComponent(trunkId)}/operator/fallback`, { method: 'DELETE' })
+    return this.request<{ trunk: Trunk; pending: OperatorRemoval[] }>(`/admin/trunks/${encodeURIComponent(trunkId)}/operator/fallback`, { method: 'DELETE' })
   }
 
-  /** Removes a trunk and its direct numbers (409 TRUNK_DEFAULT: the default trunk while another one is left). */
-  async deleteTrunk(id: string) {
-    await this.request<void>(`/admin/trunks/${encodeURIComponent(id)}`, { method: 'DELETE' })
+  /**
+   * Removes a trunk and its direct numbers (409 TRUNK_DEFAULT: the default trunk while another one is left). Returns
+   * the removals of its fallback at the operator not done yet (202), none when all is done.
+   */
+  async deleteTrunk(id: string): Promise<OperatorRemoval[]> {
+    const res = await this.request<{ pending?: OperatorRemoval[] } | undefined>(`/admin/trunks/${encodeURIComponent(id)}`, { method: 'DELETE' })
+    return res?.pending ?? []
   }
 
   listDids() {

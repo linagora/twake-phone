@@ -21,17 +21,24 @@ Le trunk SIP vers OVHcloud (ADR 0016) porte les appels, mais deux choses se règ
 - Elle relit la ligne juste après l'avoir écrite. Ce qui est relu est comparé champ par champ à ce qui est demandé : nature, numéro, délai. Si OVH n'a pas gardé le réglage, ou l'a refusé, la ligne est dite `refused` et n'est plus réécrite avant le prochain enregistrement du trunk.
 - Elle relit la ligne toutes les 10 minutes. Elle la remet si elle a été changée dans le manager, même pour un seul champ (un numéro, la messagerie à la place du numéro), et le dit dans le journal et à l'écran.
 - Elle n'écrit que les champs de renvoi des options de la ligne (`forwardBackup*`, `forwardNoReply*`).
-- Le premier renvoi tenu remplace ce qui est réglé dans le manager. L'écran le lit et le montre d'abord (`POST /admin/operator/lines`, lecture seule), puis demande de cocher le remplacement.
-- « Retirer le renvoi chez l'opérateur » (`DELETE /admin/trunks/:id/operator/fallback`) le retire des lignes, et le trunk n'en demande plus. La suppression d'un trunk qui en tenait un fait de même.
+- Le premier renvoi tenu remplace ce qui est réglé dans le manager, comme celui d'une ligne ajoutée à un trunk qui en tient déjà un. L'écran lit et montre d'abord ce qu'ont ces lignes (`POST /admin/operator/lines`, lecture seule, relu quand la liste change), puis demande de cocher le remplacement.
+- « Retirer le renvoi chez l'opérateur » (`DELETE /admin/trunks/:id/operator/fallback`) le retire des lignes, et le trunk n'en demande plus. Le bouton reste là tant qu'une ligne du trunk a été lue avec un renvoi, même trunk décoché. La suppression d'un trunk qui en tenait un fait de même, comme une ligne retirée d'un trunk qui en tient un (l'écran le dit avant l'enregistrement).
+
+**Le retrait est tenu.** Il est d'abord écrit en base (`operator_state` `remove:<ligne>` : depuis quand, quel trunk, dernier essai, erreur), puis tenté. Il n'est effacé qu'une fois la ligne relue sans renvoi, ou si un trunk redemande un repli sur cette ligne. Tant qu'il reste dû :
+- chaque relevé le rejoue en premier, même pour un trunk supprimé ;
+- la route répond 202 avec ce qui reste dû (`pending`), 200 seulement quand OVH l'a ; la suppression du trunk répond 202 de même, 204 sinon ;
+- l'écran dit « pas encore retiré » et liste les retraits dus (`GET /admin/operator`, `removals`).
+
+Un relevé en cours ne remet jamais un repli retiré. Sur une passerelle, les relevés, les enregistrements et les retraits d'une organisation passent l'un après l'autre. Entre passerelles, la configuration des trunks est relue juste avant chaque `PUT`, et encore après : un repli qui n'est plus demandé à ce moment est aussitôt retiré, et le retrait est gardé dû.
 
 Les refus :
-- Le numéro de repli n'est jamais un numéro direct de l'organisation (dans les deux sens), ni une ligne ou le numéro d'un trunk : 409 `OPERATOR_FALLBACK_LOOP`.
+- Le numéro de repli n'est jamais un numéro direct de l'organisation, ni une ligne ou le numéro d'un trunk ; à l'inverse, une plage de numéros directs, une ligne ou le numéro d'un trunk n'est jamais le numéro de repli d'un autre trunk : 409 `OPERATOR_FALLBACK_LOOP`.
 - Une ligne n'a qu'un renvoi : deux trunks qui en demandent deux sur la même ligne sont refusés (409 `OPERATOR_LINE_SHARED`). Chaque relevé lit chaque ligne une fois, quels que soient les trunks qui la nomment. Une ligne demandée deux fois autrement (une base d'avant la règle) n'est pas écrite : l'écran dit `conflict`.
 - Un renvoi n'est demandé que là où un opérateur est configuré : 409 `OPERATOR_NONE`.
 
 **Pas de bascule pilotée à la panne.** Le renvoi sur indisponibilité d'OVH (`forwardBackup`) renvoie de lui-même quand le trunk ne répond plus, même passerelle arrêtée ; une bascule écrite par la passerelle à la panne resterait posée si elle tombait à son tour. `trunk.degraded` et `trunk.recovered` (ADR 0020) disent donc seulement ce qui est posé chez OVH, relu s'il date de plus d'une minute. Le champ `fallback` en donne `on_unavailable` et `on_no_answer` : `number`, `voicemail`, `fax`, `other`, `none`, ou `mixed` quand les lignes diffèrent. Il donne aussi `no_answer_after_sec`, jamais le numéro. L'outil abonné sait ainsi où arrivent les appelants pendant la panne.
 
-**Les CDR d'OVH** sont relevés toutes les 10 minutes sur les dernières 48 h, par la passerelle qui tient le bail des événements (ADR 0020) :
+**Les CDR d'OVH** sont relevés toutes les 10 minutes sur les dernières 48 h, par la passerelle qui tient le bail des événements (ADR 0020). Sans `SECRETS_KEY`, il n'y a ni hub ni bail : chaque passerelle fait alors ses relevés.
 - Ils sont lus dans `voiceConsumption`, et aussi dans `previousVoiceConsumption` quand la fenêtre déborde sur le mois de facturation précédent (chacun une fois).
 - Le relevé se fait ligne par ligne. Une ligne en erreur n'arrête pas les autres ; son erreur est donnée à part (`cdrs.lines`).
 - Chaque CDR est lu une fois. Il y en a 500 au plus par relevé, partagés entre les lignes à tour de rôle.
@@ -50,11 +57,13 @@ Les règles d'appariement :
 - Un CDR pour un appel et un appel pour un CDR ; le plus proche l'emporte. Un appel d'un groupe, une entrée par membre, est un appel.
 - Les CDR restants sont ensuite rapprochés sans la condition de durée, ou d'un appel où la plateforme a vu `anonymous` : un appel renvoyé par OVH sur non-réponse est manqué ici et décroché là-bas, et un appelant masqué ici a son numéro chez OVH.
 - Un renvoi placé par OVH (`wayType` `transfer`) est compté à part.
+- Un appel entrant qu'OVH seul a eu, et qu'il a renvoyé au repli (un `transfer` de la même ligne, dont l'appelant est le numéro direct appelé, dans les 11 minutes), est écrit manqué, 0 s, et « renvoyé au numéro de repli » (`forwardedToFallback`) : le téléphone n'a pas sonné.
 
-Un appel entrant qu'OVH a eu et la plateforme non entre dans l'historique de la personne du numéro direct appelé (sa cible, ou le poste de ses derniers chiffres ; pas un groupe), d'identifiant `ovh:<ligne>:<id>`. Trois exceptions :
+Un appel entrant qu'OVH a eu et la plateforme non entre dans l'historique de la personne du numéro direct appelé (sa cible, ou le poste de ses derniers chiffres ; pas un groupe), d'identifiant `ovh:<ligne>:<id>`. Quatre exceptions :
 - la plateforme a, à ce moment, un appel de cette personne ;
-- la personne a effacé son historique depuis cet appel. Les effacements sont datés par personne (`history_erasures`) ; c'est vérifié aussi dans la transaction qui l'écrirait, sous le verrou de l'effacement ;
-- la lecture de l'historique a dépassé sa limite. `GET /calls/history` dit d'où vient chaque entrée (`sources` : `["opensips"]`, `["opensips", "ovh"]` ou `["ovh"]`). `GET /admin/operator` donne, aux administrateurs, ce qui est posé sur chaque ligne et ce que sont devenus les CDR des 7 derniers jours, sans leurs numéros ; `POST /admin/operator/sync` relève tout de suite (2 par minute, 429 `OPERATOR_RATE`). Effacer son historique (`DELETE /me/history`) efface aussi les numéros de deux sortes de CDR : ceux rapprochés de ses appels, et ceux de ses numéros directs d'avant l'effacement. Ceux qui ne sont pas encore rapprochés sont réglés tout de suite, sans entrer dans l'historique.
+- le numéro direct, ou le poste, a changé de mains depuis l'appel (`number_changes`, gardé 4 jours) : l'appel n'était pas au titulaire d'aujourd'hui ;
+- la personne a effacé son historique depuis cet appel, ou ce numéro a été effacé avec l'historique de son titulaire d'alors. Les effacements sont datés par personne, avec leurs numéros (`history_erasures`) ; c'est vérifié aussi dans la transaction qui l'écrirait, sous le verrou de l'effacement ;
+- la lecture de l'historique a dépassé sa limite. `GET /calls/history` dit d'où vient chaque entrée (`sources` : `["opensips"]`, `["opensips", "ovh"]` ou `["ovh"]`). `GET /admin/operator` donne, aux administrateurs, ce qui est posé sur chaque ligne et ce que sont devenus les CDR des 7 derniers jours, sans leurs numéros ; `POST /admin/operator/sync` relève tout de suite (2 par minute, 429 `OPERATOR_RATE`). Effacer son historique (`DELETE /me/history`), sous le verrou de l'effacement, efface aussi les numéros des CDR rapprochés de ses appels, et ceux des CDR de ses numéros directs d'avant l'effacement. Les CDR pas encore rapprochés qu'une de ses entrées prendrait (même sens, même numéro distant, à 60 s près : un appel sortant présenté avec le numéro du trunk, par exemple) perdent leurs numéros aussi. Tous ces CDR sont réglés `erased`, sans entrer dans l'historique. Les heures des entrées effacées sont gardées 4 jours, sans numéro (`history_erased_calls`) : un CDR relevé plus tard qu'aucune entrée ne prend, et qui tombe sur l'une d'elles, est réglé `erased` lui aussi.
 
 **Ce que la plateforme sait de son opérateur est en base** (`operator_state`) :
 - l'état de chaque ligne : lu, demandé, posé le, remis le, erreur, refusé ;
@@ -63,16 +72,18 @@ Un appel entrant qu'OVH a eu et la plateforme non entre dans l'historique de la 
 
 Toutes les passerelles le montrent pareil, et il est gardé après un redémarrage : une remise après un changement dans le manager est encore dite comme telle.
 
-`POST /admin/operator/sync` est compté en base (2 par minute pour l'organisation). La passerelle qui tient le bail fait le relevé : une autre le lui demande par la base, puis attend sa fin (30 s au plus).
+`POST /admin/operator/sync` est compté en base (2 par minute pour l'organisation). La passerelle qui tient le bail fait le relevé : une autre le lui demande par la base, puis attend sa fin (30 s au plus). Un relevé qui échoue (aucune ligne lue) répond 502 `OPERATOR_ROUND`, un relevé pas fini à temps 504 `OPERATOR_ROUND` ; la demande est marquée répondue, avec son erreur, et n'est pas relancée.
 
-**Alertes** (`operator`) : OVH refuse les clés (`unauthorized`) ou leurs droits (`forbidden`) deux relevés de suite, ou moins de 99 % des CDR réglés depuis 7 jours sont rapprochés (`reconciliation`, dès 20 CDR, FR-D4).
+**Alertes** (`operator`), chacune une fois, quand elle se produit (l'état est en base) :
+- OVH refuse les clés (`unauthorized`) ou leurs droits (`forbidden`) au deuxième relevé de suite ;
+- le taux de rapprochement des 7 derniers jours passe sous 99 % (`reconciliation`, FR-D4). Il est calculé sur les CDR que la plateforme aurait dû avoir (rapprochés et sans correspondance), dès 20. Les orphelins (la panne a déjà `trunk.degraded`), les renvois, les effacés et les illisibles n'y comptent pas. Acquittée, elle n'est relevée de nouveau qu'après être repassée au-dessus.
 
 ## Conséquences
 
 - Le renvoi de repli ne se règle plus dans le manager d'OVH, mais dans l'écran Trunks ; un trunk sans renvoi demandé laisse le manager maître.
-- L'historique dit ce que l'opérateur a vu, et l'administration le taux de rapprochement (rapprochés sur relevés, renvois et CDR pas encore rapprochés à part).
+- L'historique dit ce que l'opérateur a vu, et l'administration le taux de rapprochement (rapprochés sur rapprochés et sans correspondance ; les orphelins, les renvois, les effacés, les illisibles et les CDR pas encore rapprochés à part).
 - Une organisation, un compte de facturation OVH, par l'environnement : plusieurs organisations, chacune son compte en base (chiffré par `SECRETS_KEY`), attendent qu'on en ait besoin. Une ligne OVH partagée entre organisations n'est pas prévue.
-- L'état des lignes et des relevés est en base (`operator_state`) : la même réponse quelle que soit la passerelle, et après un redémarrage. Une passerelle qui ne tient pas le bail ne relève jamais ; elle demande le relevé à celle qui le tient.
+- L'état des lignes et des relevés est en base (`operator_state`) : la même réponse quelle que soit la passerelle, et après un redémarrage. Avec `SECRETS_KEY`, une passerelle qui ne tient pas le bail ne fait pas les relevés ; elle les demande à celle qui le tient. Sans, chaque passerelle fait les siens. Dans les deux cas, ce qu'une requête d'administrateur écrit ou lit chez OVH (enregistrement d'un trunk, retrait, lecture des lignes) part de la passerelle qui la reçoit : d'où la relecture des trunks avant et après chaque `PUT`, et les retraits gardés dus.
 - La migration `016` ajoute une colonne calculée à `call_history` : sur un gros historique, elle réécrit la table, et les écritures attendent (le kit pilote le dit).
 
 ## Alternatives écartées

@@ -84,6 +84,18 @@ describe('OVHcloud as the operator of the trunks', () => {
     expect(await ovh.getCdr(LINE, String(after))).toMatchObject({ startedAt: '2026-11-01T08:00:00.000Z', durationSec: 7 })
   })
 
+  it('reads the previous billing period for a day past the first of the month, in UTC: a period that ends later there (ovh-ca) is read whole (second review 10b, n°10)', async () => {
+    const { f, ovh } = await setup()
+    // The month ends at midnight in Montréal, 05:00 in UTC; the window starts 2 hours into the UTC month.
+    f.state.monthStart = Date.parse('2026-11-01T00:00:00-05:00')
+    const late = f.addConsumption(ACCOUNT, LINE, { calling: '0033612345678', called: '0033972000001', creationDatetime: '2026-11-01T03:00:00+00:00', duration: 42, wayType: 'incoming' })
+    expect(await ovh.listCdrIds(LINE, '2026-11-01T02:00:00.000Z', '2026-11-03T02:00:00.000Z')).toEqual([String(late)])
+    // Past the day: the current period only.
+    f.requests.length = 0
+    await ovh.listCdrIds(LINE, '2026-11-02T00:00:01.000Z', '2026-11-04T00:00:01.000Z')
+    expect(f.requests.some(r => r.path.endsWith('/previousVoiceConsumption'))).toBe(false)
+  })
+
   it('keeps a record it cannot read as a call as such: a date without its offset, an unknown way (review 10b, n°19 and n°20)', async () => {
     const { f, ovh } = await setup()
     const local = f.addConsumption(ACCOUNT, LINE, { calling: '0033612345678', called: '0033972000001', creationDatetime: '2026-10-17T10:00:05', duration: 42, wayType: 'incoming' })

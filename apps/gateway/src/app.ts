@@ -20,7 +20,7 @@ import { ENDED_TTL_SEC, MISSED_TTL_SEC, type PushMessage, type WebPush } from '.
 import type { ProviderRegistry } from './registry.js'
 import { securityHeadersFor, type SecurityOptions } from './security.js'
 import { TrunkWatch } from './trunk-health.js'
-import { OperatorSync, askKey, eraseOperatorNumbers } from './operator.js'
+import { OperatorRoundError, OperatorSync, askKey, erasedNumbersOf, type OperatorRemoval } from './operator.js'
 import { e164Of } from './e164.js'
 import { encrypt } from './crypto.js'
 import { newWebhookSecret, parseWebhookDomains } from './webhook-delivery.js'
@@ -372,7 +372,9 @@ const publicEntry = (e: HistoryEntry) => ({
   missed: isMissed(e),
   ...(e.conference ? { conference: true } : {}),
   // Where it is known from (step 10b): the SIP server, its operator's record reconciled with it, or that record alone.
-  sources: e.operatorOnly && e.operator ? [e.operator] : e.operator ? ['opensips', e.operator] : ['opensips']
+  sources: e.operatorOnly && e.operator ? [e.operator] : e.operator ? ['opensips', e.operator] : ['opensips'],
+  // Forwarded at the operator to the fallback, the platform out of reach (second review 10b, n°4): missed here.
+  ...(e.operatorForwarded ? { forwardedToFallback: true } : {})
 })
 
 export const buildApp = async (registry: ProviderRegistry, options: BuildOptions = {}) => {
@@ -1330,6 +1332,14 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
           const own = [...others, { config: parsed.config }].flatMap(t => [...(t.config.operator?.lines ?? []).map(e164Of), ...(t.config.defaultNumber ? [e164Of(t.config.defaultNumber)] : [])])
           if (atOperator?.number && own.includes(e164Of(atOperator.number)))
             throw Object.assign(new Error(`operator.fallback.number: ${atOperator.number} is a line or the number of a trunk of this platform`), { statusCode: 409, code: 'OPERATOR_FALLBACK_LOOP' })
+          // The other way round (second review 10b, n°7): its lines and its number are never the fallback another trunk keeps.
+          const mine = [...(parsed.config.operator?.lines ?? []).map(e164Of), ...(parsed.config.defaultNumber ? [e164Of(parsed.config.defaultNumber)] : [])]
+          const looping = others.find(t => t.config.operator?.fallback?.number && mine.includes(e164Of(t.config.operator.fallback.number)))
+          if (looping)
+            throw Object.assign(new Error(`${looping.config.operator!.fallback!.number} is the fallback trunk ${looping.id} keeps at the operator: it cannot be a line or the number of a trunk`), {
+              statusCode: 409,
+              code: 'OPERATOR_FALLBACK_LOOP'
+            })
           // One fallback a line (review 10b, n°5): another trunk that keeps another one on a line of this one is refused.
           const shared = atOperator && others.find(t => t.config.operator?.fallback && askKey(t.config.operator.fallback) !== askKey(atOperator) && t.config.operator.lines.some(l => parsed.config.operator!.lines.includes(l)))
           if (shared)
@@ -1350,11 +1360,19 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         // The state read before the change is no longer theirs: the screen reads it again at once.
         trunkStatus.delete(user.tenantId)
         // Its lines at the operator (step 10b), read, and its fallback set there, now: the screen says how it went
-        // (GET /admin/operator). A failure leaves the trunk saved; the next round tries again.
+        // (GET /admin/operator). A failure leaves the trunk saved; the next round tries again. The lines it no longer
+        // names lose the fallback it kept there (second review 10b, n°8), as owed until done (n°1).
+        const dropped = before?.config.operator?.fallback ? before.config.operator.lines.filter(l => !record.config.operator?.lines.includes(l)) : []
         if (operatorSync && (record.config.operator || before?.config.operator))
-          await within(operatorSync.applyTrunk(user.tenantId, id), OPERATOR_APPLY_MS, 'operator').catch((err: unknown) => req.log.warn({ err }, 'operator: the trunk not handed to the operator'))
+          await within(operatorSync.applyTrunk(user.tenantId, id, dropped), OPERATOR_APPLY_MS, 'operator').catch((err: unknown) => req.log.warn({ err }, 'operator: the trunk not handed to the operator'))
         return reply.code(created ? 201 : 200).send(publicTrunk(record))
       })
+      /** Removes the forwards of `lines` at the operator, and says what is owed still (all of them, past OPERATOR_APPLY_MS). */
+      const removing = async (tenantId: string, lines: readonly string[], trunkId: string, log: FastifyRequest['log']): Promise<OperatorRemoval[]> =>
+        within(operatorSync!.removeForwards(tenantId, lines, trunkId), OPERATOR_APPLY_MS, 'operator').catch(async (err: unknown) => {
+          log.warn({ err }, 'operator: the forwards of the trunk not removed at the operator yet')
+          return (await operatorSync!.removals(tenantId)).filter(r => lines.includes(r.line))
+        })
       v1.delete<{ Params: { id: string } }>('/admin/trunks/:id', async (req, reply) => {
         const user = await administrator(req)
         const apply = trunksOf(registry.forTenant(user.tenantId))
@@ -1371,16 +1389,24 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
           return current
         })
         trunkStatus.delete(user.tenantId)
-        // The forwards it kept at the operator go with it (review 10b, n°13), where no other trunk keeps one.
-        if (operatorSync && gone.config.operator)
-          await within(gone.config.operator.fallback ? operatorSync.removeForwards(user.tenantId, gone.config.operator.lines) : operatorSync.applyTrunk(user.tenantId, gone.id), OPERATOR_APPLY_MS, 'operator').catch((err: unknown) =>
-            req.log.warn({ err }, 'operator: the forwards of the trunk not removed at the operator')
-          )
+        // The forwards it kept at the operator go with it (review 10b, n°13), where no other trunk keeps one: owed
+        // until done, whatever became of it (second review n°1). Not done yet: 202, and what is owed.
+        if (operatorSync && gone.config.operator) {
+          const pending = gone.config.operator.fallback
+            ? await removing(user.tenantId, gone.config.operator.lines, gone.id, req.log)
+            : await within(operatorSync.applyTrunk(user.tenantId, gone.id), OPERATOR_APPLY_MS, 'operator').then(
+                () => [],
+                (err: unknown) => (req.log.warn({ err }, 'operator: the lines of the trunk not read at the operator'), [])
+              )
+          if (pending.length) return reply.code(202).send({ pending })
+        }
         return reply.code(204).send()
       })
       // The fallback a trunk keeps at the operator removed there, on an administrator's word (review 10b, n°13): the
-      // trunk no longer asks one, and the forwards of its lines go (those no other trunk keeps one on), read back.
-      v1.delete<{ Params: { id: string } }>('/admin/trunks/:id/operator/fallback', async req => {
+      // trunk no longer asks one, and the forwards of its lines go (those no other trunk keeps one on), read back,
+      // whether the trunk asked one still or not (second review n°8: one left there). 200 once the operator has it;
+      // 202 with what is owed still, done at the next rounds (n°1).
+      v1.delete<{ Params: { id: string } }>('/admin/trunks/:id/operator/fallback', async (req, reply) => {
         const user = await administrator(req)
         const apply = trunksOf(registry.forTenant(user.tenantId))
         if (!operatorSync?.serves(user.tenantId)) throw Object.assign(new Error('No operator is configured for this organisation'), { statusCode: 409, code: 'OPERATOR_NONE' })
@@ -1396,8 +1422,8 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
           await changeTrunks(user.tenantId, apply, records.map(t => (t.id === record.id ? record : t)), dids, () => store.upsertTrunks([record]))
           return record
         })
-        await within(operatorSync.removeForwards(user.tenantId, record.config.operator!.lines), OPERATOR_APPLY_MS, 'operator').catch((err: unknown) => req.log.warn({ err }, 'operator: the forwards of the trunk not removed at the operator'))
-        return publicTrunk(record)
+        const pending = await removing(user.tenantId, record.config.operator!.lines, record.id, req.log)
+        return reply.code(pending.length ? 202 : 200).send({ trunk: publicTrunk(record), pending })
       })
       // The operator of the trunks (step 10b, ADR 0021), administrators only: whether there is one, each trunk's lines
       // there (their fallback as last read, whether it is as asked, when it was set or put back, how it failed), and
@@ -1414,7 +1440,21 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         if (!operatorSync?.serves(user.tenantId)) throw Object.assign(new Error('No operator is configured for this organisation'), { statusCode: 409, code: 'OPERATOR_NONE' })
         // Counted in the store (every Gateway), and run by the Gateway that leads (review 10b, n°8).
         if (!(await store.takeOperatorQuota(user.tenantId, 'sync', 60_000, OPERATOR_SYNCS_PER_MINUTE))) return operatorRate(reply)
-        await operatorSync.roundNow(user.tenantId, OPERATOR_ROUND_MS).catch((err: unknown) => req.log.warn({ err }, 'operator: round not done'))
+        // A round that failed, or did not end in time, is said (second review 10b, n°6): 502 or 504 OPERATOR_ROUND.
+        const failed = await operatorSync.roundNow(user.tenantId, OPERATOR_ROUND_MS).then(
+          () => undefined,
+          (err: unknown) => {
+            req.log.warn({ err }, 'operator: round not done')
+            return err
+          }
+        )
+        if (failed)
+          return reply.code(failed instanceof OperatorRoundError && failed.timeout ? 504 : 502).send({
+            statusCode: failed instanceof OperatorRoundError && failed.timeout ? 504 : 502,
+            code: 'OPERATOR_ROUND',
+            error: failed instanceof OperatorRoundError && failed.timeout ? 'Gateway Timeout' : 'Bad Gateway',
+            message: failed instanceof OperatorRoundError && failed.timeout ? 'The operator was not read in time' : 'The operator could not be read'
+          })
         return { configured: true, ...(await operatorSync.status(user.tenantId)) }
       })
       // What is set at the operator on lines now, read only (review 10b, n°13): the screen shows it before a first
@@ -1733,10 +1773,9 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         const user = await whoIs(req)
         forgetPresence(user.tenantId, user.id)
         await store.eraseWebhookSubject(user.tenantId, user.id)
-        const deleted = await store.deleteHistory(user.tenantId, user.id)
         // The operator's records of their direct numbers lose their numbers, and those not reconciled yet never enter
-        // their history again (review 10b, n°1; a record read later neither: reconciled after their erasure).
-        await eraseOperatorNumbers(store, user.tenantId, user.id, (await store.historyErasedAt(user.tenantId, user.id)) ?? new Date().toISOString())
+        // anybody's history (review 10b, n°1; a record read later neither, whoever holds the number then: n°3).
+        const deleted = await store.deleteHistory(user.tenantId, user.id, await erasedNumbersOf(store, user.tenantId, user.id))
         return reply.send({ deleted })
       })
 

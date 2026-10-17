@@ -40,6 +40,8 @@ export interface HistoryEntry {
   operatorCdr?: string
   /** Known from the operator's record only (the platform never had the call: received while it could not be reached). */
   operatorOnly?: boolean
+  /** Known from the operator alone, and forwarded by it to the fallback (second review 10b, n°4): missed here. */
+  operatorForwarded?: boolean
 }
 
 /**
@@ -59,12 +61,13 @@ export interface OperatorCdrRecord extends Omit<OperatorCdr, 'calling' | 'called
 /**
  * What became of a record of the operator: reconciled with the call `callId` of the history (`matched`: every
  * person's entry of it), entered alone in a person's history (`orphan`: `entry`, a call the platform never had),
- * neither (`unmatched`), a forward the operator placed (`forwarded`), or no call it could read (`invalid`, settled as
- * it is kept). `erase`: its numbers go (the person whose call it was erased their history since, review 10b, n°1).
+ * neither (`unmatched`), a forward the operator placed (`forwarded`), no call it could read (`invalid`, settled as
+ * it is kept), or a call erased with someone's history (`erased`, its numbers gone, second review 10b, n°5). `erase`:
+ * its numbers go, whatever it became (the person whose call it was erased their history since, review 10b, n°1).
  */
 export interface OperatorCdrOutcome {
   id: string
-  outcome: 'matched' | 'orphan' | 'unmatched' | 'forwarded' | 'invalid'
+  outcome: 'matched' | 'orphan' | 'unmatched' | 'forwarded' | 'invalid' | 'erased'
   callId?: string
   entry?: HistoryEntry
   erase?: true
@@ -97,6 +100,15 @@ export interface OperatorCdrStats {
   forwarded: number
   pending: number
   invalid: number
+  /** Calls erased with someone's history (second review 10b, n°5): neither reconciled nor missed. */
+  erased: number
+}
+
+/** When an erased entry of the history was, by way, without any number (second review 10b, n°2). */
+export interface ErasedCall {
+  direction: CallDirection
+  startedAt: string
+  endedAt: string
 }
 
 /** A missed call: inbound, never answered, and not declined by the user (state `missed`, not `rejected`). */
@@ -561,13 +573,27 @@ export interface Store {
   addHistory(entry: HistoryEntry): Promise<void>
   listHistory(tenantId: string, userId: string, query?: HistoryQuery): Promise<HistoryPage>
   /**
-   * Deletes the history of a user (retention, right to erasure), and the numbers of the operator's records of their
-   * calls (kept as read, without them: never read again), and keeps when (historyErasedAt: a record of the operator
-   * read later never brings a call of before back, review 10b, n°1). Returns the number of rows of history.
+   * Deletes the history of a user (retention, right to erasure), in one transaction under the lock of their history,
+   * and keeps when, with their direct numbers `numbers` (E.164) then (historyErasedAt, numbersErasedAt: a record of
+   * the operator read later never brings a call of before back, review 10b, n°1). The operator's records of their
+   * calls lose their numbers (kept as read, never read again): those reconciled with their entries, those to or from
+   * `numbers` that started before, and those not reconciled yet that one of their entries would take (same way, same
+   * number, the same window as matchCdrs: second review n°2); those not reconciled yet are settled `erased`. When
+   * their entries were is kept a few days, without a number (erasedCalls). Returns the number of rows of history.
    */
-  deleteHistory(tenantId: string, userId: string): Promise<number>
+  deleteHistory(tenantId: string, userId: string, numbers?: readonly string[]): Promise<number>
   /** When the user last erased their history (deleteHistory), if they did. */
   historyErasedAt(tenantId: string, userId: string): Promise<string | undefined>
+  /** When each of `numbers` was last erased with the history of whom it rang (second review 10b, n°3), those that were. */
+  numbersErasedAt(tenantId: string, numbers: readonly string[]): Promise<Map<string, string>>
+  /** The erased entries (deleteHistory) that started from `from` to `to`, by way, without any number. */
+  erasedCalls(tenantId: string, from: string, to: string): Promise<ErasedCall[]>
+  /**
+   * When an extension, or the range of direct numbers `number` (E.164) is in, last changed hands (second review 10b,
+   * n°3): a mapping deleted or given another extension, a range changed or deleted, or either taken again after.
+   * Undefined when neither did in the last days.
+   */
+  numberChangedAt(tenantId: string, extension: string, number: string): Promise<string | undefined>
 
   /** Which of these ids of the operator's records (step 10b) the store keeps already. */
   knownOperatorCdrs(tenantId: string, operator: string, ids: readonly string[]): Promise<string[]>
@@ -580,12 +606,8 @@ export interface Store {
    * by way, number and time (review 10b, n°3), however long the history of the tenant.
    */
   historyNear(tenantId: string, query: HistoryNearQuery): Promise<HistoryEntry[]>
-  /**
-   * Erases the numbers of the operator's records to or from one of `numbers` (E.164) that started before `before`
-   * (a person who erased their history: their direct numbers), and settles those not reconciled yet as `unmatched`.
-   * Returns how many records lost their numbers.
-   */
-  eraseOperatorCdrNumbers(tenantId: string, numbers: readonly string[], before: string): Promise<number>
+  /** The forwards the operator placed (records `forwarded`) on `line` that started from `from` to `to`, whatever became of them. */
+  operatorForwardsNear(tenantId: string, operator: string, line: string, from: string, to: string): Promise<OperatorCdrRecord[]>
   /**
    * Keeps what became of records, in one transaction, the first word kept: a record already settled is left as it
    * is; `matched` links each entry of its call that no record has yet (none: the record is `unmatched`); `orphan`
@@ -594,8 +616,11 @@ export interface Store {
   settleOperatorCdrs(tenantId: string, operator: string, outcomes: readonly OperatorCdrOutcome[]): Promise<void>
   /** The records of the operator that started from `since` on, by outcome. */
   operatorCdrStats(tenantId: string, operator: string, since: string): Promise<OperatorCdrStats>
-  /** Removes the records that started before `before` (retention), every tenant. */
-  purgeOperatorCdrs(before: string): Promise<number>
+  /**
+   * Removes the records that started before `before` (retention), every tenant; and the times of erased calls and of
+   * changes of hands (erasedCalls, numberChangedAt) from before `keptBefore`, when given.
+   */
+  purgeOperatorCdrs(before: string, keptBefore?: string): Promise<number>
   /**
    * What the platform knows of its operator for a tenant (review 10b, n°8: the same for every Gateway, kept across a
    * restart): the state of each line, of the last read of the records, a round asked. JSON values, by key.

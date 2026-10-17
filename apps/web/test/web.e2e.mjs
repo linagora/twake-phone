@@ -674,22 +674,62 @@ try {
     await records.getByRole('status').getByText("L'opérateur a été relu.").waitFor()
     await until(async () => (await api('/admin/operator')).json().cdrs?.stats.pending === 0 && (await api('/admin/operator')).json().cdrs?.stats.total === 3, 'the records read and settled')
     const stats = (await api('/admin/operator')).json().cdrs.stats
-    expectEqual(JSON.stringify(stats), JSON.stringify({ total: 3, matched: 1, orphan: 1, unmatchedInbound: 0, unmatchedOutbound: 0, forwarded: 1, pending: 0, invalid: 0 }), 'what became of the records')
-    // One in two of the calls the platform should have had (OVH's forward aside): the one OVH alone received.
-    await records.locator('div', { has: page.getByText('Taux de rapprochement', { exact: true }) }).getByRole('definition').getByText(/^50\s%$/).waitFor()
+    expectEqual(JSON.stringify(stats), JSON.stringify({ total: 3, matched: 1, orphan: 1, unmatchedInbound: 0, unmatchedOutbound: 0, forwarded: 1, pending: 0, invalid: 0, erased: 0 }), 'what became of the records')
+    // All the calls the platform could have had (second review 10b, n°5): the one OVH alone received while it could not
+    // be reached, and OVH's forward of it, aside.
+    await records.locator('div', { has: page.getByText('Taux de rapprochement', { exact: true }) }).getByRole('definition').getByText(/^100\s%$/).waitFor()
     for (const [label, n] of [["Rapprochés de l'historique", '1'], ["Reçus par l'opérateur seul", '1'], ["Renvoyés par l'opérateur", '1']])
       await records.locator('div', { has: page.getByText(label, { exact: true }) }).getByRole('definition').getByText(n, { exact: true }).waitFor()
     // In the history, as GET /calls/history gives it: where each call is known from.
     const items = await history()
     expectEqual(JSON.stringify(items.find(i => i.id === call.id)?.sources), JSON.stringify(['opensips', 'ovh']), 'the missed call reconciled')
     const orphan = items.find(i => i.id === `ovh:${OVH_LINE}:${alone}`)
-    expectEqual(JSON.stringify([orphan?.remoteNumber, orphan?.direction, orphan?.durationSec, orphan?.answered, JSON.stringify(orphan?.sources)]), JSON.stringify(['+33639980002', 'inbound', 42, true, '["ovh"]']), 'the call only OVH had')
+    // Forwarded by OVH to the fallback (second review 10b, n°4): missed here, whoever took it there.
+    expectEqual(
+      JSON.stringify([orphan?.remoteNumber, orphan?.direction, orphan?.durationSec, orphan?.answered, orphan?.missed, orphan?.forwardedToFallback, JSON.stringify(orphan?.sources)]),
+      JSON.stringify(['+33639980002', 'inbound', 0, false, true, true, '["ovh"]']),
+      'the call only OVH had, forwarded to the fallback'
+    )
     expectEqual(items.length, 2, 'the forward is in nobody’s history')
     // And on Alice's screen.
     await page.getByRole('link', { name: 'Récents' }).click()
     const rows = page.locator('ul.list > li')
     await rows.filter({ hasText: '+33 6 39 98 00 01' }).getByText("Confirmé par l'opérateur").waitFor()
-    await rows.filter({ hasText: '+33 6 39 98 00 02' }).getByText("Reçu par l'opérateur seul").waitFor()
+    const forwarded = rows.filter({ hasText: '+33 6 39 98 00 02' })
+    await forwarded.getByText("Reçu par l'opérateur seul").waitFor()
+    await forwarded.getByText('Renvoyé au numéro de repli').waitFor()
+    await forwarded.getByText('Manqué', { exact: true }).waitFor()
+  })
+  await step('the fallback removed while OVH does not answer: said not removed yet, kept, and removed once OVH answers again (second review 10b, n°1)', async () => {
+    await page.getByRole('link', { name: 'Administration' }).click()
+    await subnav.getByRole('link', { name: 'Trunks', exact: true }).click()
+    await trunkList.getByText(LINE_SET).waitFor()
+    const puts = ovh.requests.filter(r => r.method === 'PUT').length
+    ovh.state.down = true
+    try {
+      await trunkList.getByRole('button', { name: "Retirer le renvoi de repli du trunk operator chez l'opérateur" }).click()
+      await trunkList.getByRole('button', { name: 'Oui, retirer' }).click()
+      await page.getByRole('alert').getByText(`Le trunk operator ne tient plus de renvoi de repli, mais l'opérateur ne l'a pas encore retiré de ${OVH_LINE} : la plateforme réessaie à chaque relevé.`).waitFor()
+      expectEqual(ovh.options(OVH_ACCOUNT, OVH_LINE).forwardBackup, true, 'still at OVH')
+      const status = (await api('/admin/operator')).json()
+      expectEqual(JSON.stringify(status.removals?.map(r => [r.line, r.trunkId])), JSON.stringify([[OVH_LINE, 'operator']]), 'the removal kept')
+      // Shown, with the button to try again, whatever a round reads meanwhile.
+      await page.getByRole('list', { name: "Renvois pas encore retirés chez l'opérateur" }).getByText(new RegExp(`^Ligne ${OVH_LINE} : à retirer depuis le`)).waitFor()
+      await trunkList.getByRole('button', { name: "Retirer le renvoi de repli du trunk operator chez l'opérateur" }).waitFor()
+      await new Promise(r => setTimeout(r, 2500))
+      expectEqual(ovh.options(OVH_ACCOUNT, OVH_LINE).forwardBackup, true, 'nothing done while OVH is down')
+    } finally {
+      ovh.state.down = false
+    }
+    // OVH back: the next round removes it, reads the line without a forward, and lets the removal go.
+    await until(() => !ovh.options(OVH_ACCOUNT, OVH_LINE).forwardBackup && !ovh.options(OVH_ACCOUNT, OVH_LINE).forwardNoReply, 'the fallback removed at OVH')
+    await until(async () => !(await api('/admin/operator')).json().removals, 'the removal done')
+    // Refused while OVH was down, then written once.
+    expectEqual(JSON.stringify(ovh.requests.filter(r => r.method === 'PUT').slice(puts).map(r => r.status).filter(s => s === 200)), JSON.stringify([200]), 'written once OVH answers')
+    await page.getByRole('button', { name: "Actualiser l'état" }).click()
+    await trunkList.getByText(`Ligne ${OVH_LINE} : aucun renvoi · renvoi réglé hors de la plateforme`).waitFor()
+    expectEqual(await page.getByRole('list', { name: "Renvois pas encore retirés chez l'opérateur" }).count(), 0, 'no removal shown')
+    expectEqual(await trunkList.getByRole('button', { name: "Retirer le renvoi de repli du trunk operator chez l'opérateur" }).count(), 0, 'nothing left to remove')
   })
   await step('in English, the refusals of the Gateway read in English too', async () => {
     await page.getByRole('link', { name: 'Réglages' }).click()

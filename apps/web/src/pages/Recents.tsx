@@ -72,6 +72,8 @@ export const Recents = () => {
                 <span className={`badge${it.missed ? ' missed' : ''}`}>{recentLabel(it, t)}</span>
                 {/* Step 10b: a call the operator recorded, reconciled with ours, or that reached only it (the platform out). */}
                 {it.sources?.includes('opensips') === false ? <span className="badge"> · {t('recents.operatorOnly')}</span> : it.sources && it.sources.length > 1 ? <span className="badge"> · {t('recents.reconciled')}</span> : null}
+                {/* Forwarded there to the fallback number (second review 10b, n°4): missed here, taken there perhaps. */}
+                {it.forwardedToFallback ? <span className="badge"> · {t('recents.forwardedToFallback')}</span> : null}
               </span>
               <time dateTime={it.startedAt}>{when.format(new Date(it.startedAt))}</time>
             </li>

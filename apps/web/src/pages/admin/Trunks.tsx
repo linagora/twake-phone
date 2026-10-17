@@ -1,9 +1,22 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react'
-import { TRUNK_CODECS, TRUNK_OUTBOUND_CLASSES, formatNumber, type OperatorForward, type OperatorLine, type OperatorLineForwards, type OperatorLineRead, type OperatorStatus, type Trunk, type TrunkNumberFormat, type TrunkStatus } from '@twake/telephony-client'
+import {
+  TRUNK_CODECS,
+  TRUNK_OUTBOUND_CLASSES,
+  formatNumber,
+  type OperatorForward,
+  type OperatorLine,
+  type OperatorLineForwards,
+  type OperatorLineRead,
+  type OperatorRemoval,
+  type OperatorStatus,
+  type Trunk,
+  type TrunkNumberFormat,
+  type TrunkStatus
+} from '@twake/telephony-client'
 import { TargetList } from '../../admin/TargetList.js'
 import { targetLabel, useTargets } from '../../admin/targets.js'
 import { CheckBox, CheckGroup, ConfirmDelete, NoteLine, ProblemSummary, Section, SelectField, TextField, useFocusLater, useProblem, useRefresh, type Note } from '../../admin/ui.js'
-import { TRUNK_FIELDS, checkTrunk, emptyTrunk, refusalStatus, trunkForm, trunkRefusal, type Problems, type TrunkField, type TrunkForm } from '../../admin/validate.js'
+import { TRUNK_FIELDS, checkTrunk, droppedOperatorLines, emptyTrunk, newOperatorLines, refusalStatus, trunkForm, trunkRefusal, type Problems, type TrunkField, type TrunkForm } from '../../admin/validate.js'
 import { useGateway } from '../../gateway.js'
 import type { Key } from '../../i18n/index.js'
 import { useT } from '../../i18n/useT.js'
@@ -13,6 +26,8 @@ import { useT } from '../../i18n/useT.js'
  * few seconds); never in a hidden tab (useRefresh).
  */
 export const STATUS_POLL_MS = 5_000
+/** How long after the lines of the form last changed what the operator has on them is read again. */
+const PREVIEW_DELAY_MS = 300
 const FORMATS: TrunkNumberFormat[] = ['e164', 'e164-no-plus', 'international-00', 'national']
 const statusOf = (err: unknown) => (err as { status?: unknown } | null)?.status
 
@@ -60,7 +75,7 @@ const OperatorLines = ({ lines }: { lines: OperatorLine[] }) => {
     <ul className="plain" aria-label={t('admin.operator.lines')}>
       {lines.map(l => (
         <li key={l.line}>
-          {t('admin.operator.line', { line: l.line })} : {l.readAt ? forwardsOf(l.forwards, t) : t('admin.operator.notRead')}
+          {t('admin.operator.line', { line: l.line, forwards: l.readAt ? forwardsOf(l.forwards, t) : t('admin.operator.notRead') })}
           {' · '}
           {l.rejected ? (
             <span className="state state-error">{t('admin.operator.rejected')}</span>
@@ -80,16 +95,40 @@ const OperatorLines = ({ lines }: { lines: OperatorLine[] }) => {
   )
 }
 
+/**
+ * The removals at the operator not done yet (second review 10b, n°1): kept by the Gateway, whatever became of their
+ * trunk, and tried again at each round until it reads the line without a forward.
+ */
+const Removals = ({ removals }: { removals: OperatorRemoval[] }) => {
+  const { t, lang } = useT()
+  const at = new Intl.DateTimeFormat(lang, { dateStyle: 'short', timeStyle: 'short' })
+  return (
+    <div className="field">
+      <p>{t('admin.operator.removals')}</p>
+      <ul className="plain" aria-label={t('admin.operator.removals')}>
+        {removals.map(r => (
+          <li key={r.line}>
+            {t('admin.operator.removal', { line: r.line, since: at.format(new Date(r.since)) })}
+            {r.error ? <span className="state state-error"> · {t(`admin.operator.err.${r.error}` as Key)}</span> : null}
+          </li>
+        ))}
+      </ul>
+      <p className="muted">{t('admin.operator.removalsHelp')}</p>
+    </div>
+  )
+}
+
 /** The records of calls the operator keeps (step 10b): when last read, and what became of those of the last days. */
 const OperatorRecords = ({ status, onSync, busy }: { status: OperatorStatus; onSync: () => void; busy: boolean }) => {
   const { t, lang } = useT()
   const at = new Intl.DateTimeFormat(lang, { dateStyle: 'short', timeStyle: 'short' })
   const cdrs = status.cdrs
   const stats = cdrs?.stats
-  // The share of the calls OVH recorded that the platform had too (FR-D4): its forwards, those not settled yet and
-  // those it could not read aside.
-  const settled = stats ? stats.total - stats.forwarded - stats.pending - stats.invalid : 0
-  const rate = stats && settled > 0 ? new Intl.NumberFormat(lang, { style: 'percent', maximumFractionDigits: 1 }).format(stats.matched / settled) : '–'
+  // The share of the calls OVH recorded that the platform had too (FR-D4), over those it could have had (second review
+  // 10b, n°5): those received while it was down (orphans), its forwards, those erased with a history, those not settled
+  // yet and those it could not read aside.
+  const reconcilable = stats ? stats.matched + stats.unmatchedInbound + stats.unmatchedOutbound : 0
+  const rate = stats && reconcilable > 0 ? new Intl.NumberFormat(lang, { style: 'percent', maximumFractionDigits: 1 }).format(stats.matched / reconcilable) : '–'
   const rows: [Key, number | string][] = stats
     ? [
         ['admin.operator.statRate', rate],
@@ -99,12 +138,14 @@ const OperatorRecords = ({ status, onSync, busy }: { status: OperatorStatus; onS
         ['admin.operator.statUnmatched', stats.unmatchedInbound + stats.unmatchedOutbound],
         ['admin.operator.statForwarded', stats.forwarded],
         ['admin.operator.statPending', stats.pending],
-        ['admin.operator.statInvalid', stats.invalid]
+        ['admin.operator.statInvalid', stats.invalid],
+        ['admin.operator.statErased', stats.erased]
       ]
     : []
   return (
     <>
       <p>{t('admin.operator.help')}</p>
+      {status.removals?.length ? <Removals removals={status.removals} /> : null}
       <p>
         {cdrs?.readAt ? t('admin.operator.readAt', { at: at.format(new Date(cdrs.readAt)), count: cdrs.read ?? 0 }) : t('admin.operator.notYet')}
       </p>
@@ -117,6 +158,7 @@ const OperatorRecords = ({ status, onSync, busy }: { status: OperatorStatus; onS
           ))}
         </ul>
       ) : null}
+      {stats ? <p className="muted">{t('admin.operator.statRateHint')}</p> : null}
       {stats ? (
         <dl className="facts facts-compact" aria-label={t('admin.operator.stats', { since: at.format(new Date(cdrs.since)) })}>
           {rows.map(([key, n]) => (
@@ -158,7 +200,8 @@ export const Trunks = () => {
   const [syncing, setSyncing] = useState(false)
   const [operatorNote, setOperatorNote] = useState<Note>(null)
   // What the operator has on the lines of the form now, shown before a first fallback replaces it (review 10b, n°13).
-  const [atOperator, setAtOperator] = useState<OperatorLineRead[] | null>(null)
+  // Kept with the lines it was read for: shown only while they are the lines asked (second review 10b, n°9).
+  const [atOperator, setAtOperator] = useState<{ key: string; items: OperatorLineRead[] } | null>(null)
   const [reading, setReading] = useState(false)
 
   // Only the answer to the last read is shown: one asked by the button never comes after a later one.
@@ -198,21 +241,44 @@ export const Trunks = () => {
     setProblems({})
     setAtOperator(null)
   }
-  // A first fallback replaces what the operator's manager set: read first, shown, replaced on the administrator's word.
-  const firstFallback = form.fallbackManaged && !editing?.operator?.fallback
-  const readAtOperator = async (linesText = form.operatorLines) => {
-    const lines = linesText.split(',').map(l => l.trim()).filter(Boolean)
-    if (!lines.length) return setAtOperator(null)
-    setReading(true)
-    try {
-      setAtOperator((await client.readOperatorLines(lines)).items)
-    } catch (err) {
-      setAtOperator(null)
-      setNote({ kind: 'error', text: say(trunkRefusal(err).problem)! })
-    } finally {
-      setReading(false)
-    }
-  }
+  // A fallback replaces what the operator's manager set on the lines it does not keep yet, all of them for a first one,
+  // those added to the trunk otherwise (second review 10b, n°9): read first, shown, replaced on the administrator's word.
+  const replaced = newOperatorLines(form, editing)
+  const replacedKey = replaced.join(',')
+  const dropped = droppedOperatorLines(form, editing)
+  // Only the answer to the last read is shown, of the lines asked last.
+  const previewed = useRef(0)
+  const readAtOperator = useCallback(
+    async (lines: string[]) => {
+      const n = ++previewed.current
+      if (!lines.length) return setAtOperator(null)
+      setReading(true)
+      try {
+        const read = (await client.readOperatorLines(lines)).items
+        if (n === previewed.current) setAtOperator({ key: lines.join(','), items: read })
+      } catch (err) {
+        if (n !== previewed.current) return
+        setAtOperator(null)
+        setNote({ kind: 'error', text: say(trunkRefusal(err).problem)! })
+      } finally {
+        if (n === previewed.current) setReading(false)
+      }
+    },
+    [client, say]
+  )
+  const preview = atOperator?.key === replacedKey ? atOperator.items : null
+  // Read again whenever those lines change (ticked, a line added or taken off), a moment after the typing stops.
+  useEffect(() => {
+    if (!replacedKey) return
+    const timer = setTimeout(() => void readAtOperator(replacedKey.split(',')), PREVIEW_DELAY_MS)
+    return () => clearTimeout(timer)
+  }, [replacedKey, readAtOperator])
+  // The lines or the fallback changed: the word given for other lines no longer holds.
+  const setLines = <K extends 'operatorLines' | 'fallbackManaged'>(key: K) => (value: TrunkForm[K]) =>
+    setForm(f => {
+      const next = { ...f, [key]: value }
+      return newOperatorLines(next, editing).join(',') === newOperatorLines(f, editing).join(',') ? next : { ...next, replaceConfirmed: false }
+    })
 
   const save = async (e: FormEvent) => {
     e.preventDefault()
@@ -253,7 +319,9 @@ export const Trunks = () => {
       setOperator(await client.syncOperator())
       setOperatorNote({ kind: 'ok', text: t('admin.operator.synced') })
     } catch (err) {
+      // Not read (OPERATOR_ROUND, second review 10b, n°6), or a moment ago already: what is shown is the last round's.
       setOperatorNote({ kind: 'error', text: say(trunkRefusal(err).problem)! })
+      void readStatus()
     } finally {
       setSyncing(false)
     }
@@ -273,9 +341,14 @@ export const Trunks = () => {
     setNote(null)
     setBusy(true)
     try {
-      await client.deleteTrunk(trunk.id)
-      // The row goes, its buttons with it: the focus goes to what is said.
-      setNote({ kind: 'ok', text: t('admin.trunk.deleted', { id: trunk.id }), focus: true })
+      const pending = await client.deleteTrunk(trunk.id)
+      // The row goes, its buttons with it: the focus goes to what is said. A forward the operator did not remove yet
+      // is said so (second review 10b, n°1), never as removed.
+      setNote(
+        pending.length
+          ? { kind: 'error', text: t('admin.trunk.deletedPending', { id: trunk.id, lines: pending.map(r => r.line).join(', ') }), focus: true }
+          : { kind: 'ok', text: t('admin.trunk.deleted', { id: trunk.id }), focus: true }
+      )
       if (editing?.id === trunk.id) reset()
     } catch (err) {
       setNote({ kind: 'error', text: say(trunkRefusal(err).problem)!, focus: true })
@@ -291,8 +364,12 @@ export const Trunks = () => {
     setNote(null)
     setBusy(true)
     try {
-      await client.removeOperatorFallback(trunk.id)
-      setNote({ kind: 'ok', text: t('admin.operator.removed', { id: trunk.id }), focus: true })
+      const { pending } = await client.removeOperatorFallback(trunk.id)
+      setNote(
+        pending.length
+          ? { kind: 'error', text: t('admin.operator.removedPending', { id: trunk.id, lines: pending.map(r => r.line).join(', ') }), focus: true }
+          : { kind: 'ok', text: t('admin.operator.removed', { id: trunk.id }), focus: true }
+      )
       if (editing?.id === trunk.id) reset()
     } catch (err) {
       setNote({ kind: 'error', text: say(trunkRefusal(err).problem)!, focus: true })
@@ -315,6 +392,16 @@ export const Trunks = () => {
   const isCurrentDefault = !!editing && def?.id === editing.id
   const count = Object.keys(problems).length
   const classLabel = (c: string) => t(`admin.class.${c}` as Key)
+  /**
+   * Whether there is something of the trunk to remove at the operator (second review 10b, n°8): the fallback it asks,
+   * a forward its lines were last read with (one left there once unticked), or a removal of them not done yet.
+   */
+  const removable = (trunk: Trunk) => {
+    if (!operator?.configured || !trunk.operator?.lines.length) return false
+    if (trunk.operator.fallback) return true
+    const lines = operator.trunks?.find(o => o.id === trunk.id)?.lines ?? []
+    return lines.some(l => !!l.forwards?.onUnavailable || !!l.forwards?.onNoAnswer) || !!operator.removals?.some(r => trunk.operator!.lines.includes(r.line))
+  }
   return (
     <>
       <Section id="trunks" title={t('admin.nav.trunks')}>
@@ -378,10 +465,10 @@ export const Trunks = () => {
                   <button type="button" className="btn" onClick={() => edit(trunk)} disabled={busy} aria-label={t('admin.trunk.edit', { id: trunk.id })}>
                     {t('admin.edit')}
                   </button>
-                  {operator?.configured && trunk.operator?.fallback ? (
+                  {removable(trunk) ? (
                     <ConfirmDelete
                       label={t('admin.operator.removeOf', { id: trunk.id })}
-                      question={t('admin.operator.removeConfirm', { id: trunk.id })}
+                      question={t(trunk.operator?.fallback ? 'admin.operator.removeConfirm' : 'admin.operator.removeConfirmSet', { id: trunk.id })}
                       action="admin.operator.remove"
                       yes="admin.operator.removeYes"
                       tone="plain"
@@ -459,32 +546,34 @@ export const Trunks = () => {
           <TargetList id="trunk-targets" targets={targets} />
           <fieldset className="field">
             <legend>{t('admin.trunk.operator')}</legend>
-            <TextField id="trunk-operatorLines" label={t('admin.trunk.operatorLines')} hint={t('admin.trunk.operatorLinesHint')} value={form.operatorLines} onChange={set('operatorLines')} error={field('operatorLines')} disabled={busy} />
+            <TextField id="trunk-operatorLines" label={t('admin.trunk.operatorLines')} hint={t('admin.trunk.operatorLinesHint')} value={form.operatorLines} onChange={setLines('operatorLines')} error={field('operatorLines')} disabled={busy} />
             <CheckBox
               id="trunk-fallbackManaged"
               label={t('admin.trunk.fallbackManaged')}
               hint={t(operator?.configured ? 'admin.trunk.fallbackManagedHint' : 'admin.trunk.fallbackManagedNone')}
               checked={form.fallbackManaged}
-              onChange={v => {
-                set('fallbackManaged')(v)
-                if (v && !editing?.operator?.fallback) void readAtOperator()
-              }}
+              onChange={setLines('fallbackManaged')}
               // Without an operator the Gateway refuses it; one kept from before can still be let go.
               disabled={busy || (!operator?.configured && !form.fallbackManaged)}
             />
-            {firstFallback ? (
+            {dropped.length ? <p className="badge">{t('admin.trunk.operatorDropped', { lines: dropped.join(', ') })}</p> : null}
+            {editing?.operator?.fallback && !form.fallbackManaged && !dropped.length ? <p className="badge">{t('admin.trunk.fallbackLeft', { lines: editing.operator.lines.join(', ') })}</p> : null}
+            {replaced.length ? (
               <div className="field">
-                <p>{t('admin.trunk.operatorNow')}</p>
-                {atOperator ? (
-                  <ul className="plain" aria-label={t('admin.trunk.operatorNow')}>
-                    {atOperator.map(l => (
-                      <li key={l.line}>
-                        {t('admin.operator.line', { line: l.line })} : {l.error ? <span className="state state-error">{t(`admin.operator.err.${l.error}` as Key)}</span> : forwardsOf(l.forwards, t)}
-                      </li>
-                    ))}
-                  </ul>
-                ) : null}
-                <button type="button" className="btn" onClick={() => void readAtOperator()} disabled={busy || reading} aria-busy={reading}>
+                <p>{t(editing?.operator?.fallback ? 'admin.trunk.operatorNowNew' : 'admin.trunk.operatorNow')}</p>
+                {/* Announced once read (n°17). */}
+                <div role="status">
+                  {preview ? (
+                    <ul className="plain" aria-label={t('admin.trunk.operatorNow')}>
+                      {preview.map(l => (
+                        <li key={l.line} className={l.error ? 'state state-error' : undefined}>
+                          {t('admin.operator.line', { line: l.line, forwards: l.error ? t(`admin.operator.err.${l.error}` as Key) : forwardsOf(l.forwards, t) })}
+                        </li>
+                      ))}
+                    </ul>
+                  ) : null}
+                </div>
+                <button type="button" className="btn" onClick={() => void readAtOperator(replaced)} disabled={busy || reading} aria-busy={reading}>
                   {t('admin.trunk.readOperator')}
                 </button>
                 <CheckBox id="trunk-replaceConfirmed" label={t('admin.trunk.replaceConfirmed')} hint={t('admin.trunk.replaceHint')} checked={form.replaceConfirmed} onChange={set('replaceConfirmed')} error={field('replaceConfirmed')} disabled={busy} />

@@ -13,7 +13,7 @@ if (process.env.TEST_DATABASE_URL) {
     const store = new PgStore(process.env.TEST_DATABASE_URL!)
     await store.migrate()
     const pool = (store as unknown as { pool: { query(sql: string): Promise<unknown> } }).pool
-    await pool.query('TRUNCATE provider_configs, user_mappings, call_history, sip_credentials, conferences, favorites, user_presence, push_subscriptions, vapid_keys, trunk_configs, direct_numbers, outbound_policies, telephony_alerts, webhook_subscriptions, webhook_deliveries, webhook_domains, webhook_state, webhook_sends, webhook_leases, operator_cdrs, operator_state, history_erasures RESTART IDENTITY')
+    await pool.query('TRUNCATE provider_configs, user_mappings, call_history, sip_credentials, conferences, favorites, user_presence, push_subscriptions, vapid_keys, trunk_configs, direct_numbers, outbound_policies, telephony_alerts, webhook_subscriptions, webhook_deliveries, webhook_domains, webhook_state, webhook_sends, webhook_leases, operator_cdrs, operator_state, history_erasures, history_erased_calls, number_changes RESTART IDENTITY')
     return store
   })
 
@@ -295,6 +295,59 @@ if (process.env.TEST_DATABASE_URL) {
           await server.end()
         }
       }, 30_000)
+  })
+
+  describe('PgStore, the history of a person and the records of the operator (second review 10b)', () => {
+    it('erases a history under its lock: an orphan settled meanwhile waits for it, then sees it (n°10)', async () => {
+      const store = new PgStore(process.env.TEST_DATABASE_URL!)
+      await store.migrate()
+      const other = new pg.Client({ connectionString: process.env.TEST_DATABASE_URL })
+      await other.connect()
+      try {
+        // Another transaction holds the lock of jean's history (a settlement of the operator's records under way).
+        await other.query('BEGIN')
+        await other.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', ['call_history|locked|jean'])
+        let done = false
+        const erasing = store.deleteHistory('locked', 'jean').then(() => (done = true))
+        await new Promise(r => setTimeout(r, 300))
+        expect(done).toBe(false)
+        await other.query('COMMIT')
+        await erasing
+        expect(await store.historyErasedAt('locked', 'jean')).toBeDefined()
+      } finally {
+        await other.query('ROLLBACK').catch(() => undefined)
+        await other.end()
+        await store.close()
+      }
+    })
+
+    it('pages the entries near a record at the millisecond, whatever the precision they were written with (n°13)', async () => {
+      const store = new PgStore(process.env.TEST_DATABASE_URL!)
+      await store.migrate()
+      const pool = (store as unknown as { pool: pg.Pool }).pool
+      try {
+        await pool.query("DELETE FROM call_history WHERE tenant_id = 'micro'")
+        // 25 entries at the same millisecond, apart by microseconds (written by SQL, not by the Gateway).
+        await pool.query(
+          `INSERT INTO call_history (tenant_id, user_id, call_id, direction, remote_number, started_at, duration_sec, state, answered)
+           SELECT 'micro', 'u' || lpad(i::text, 2, '0'), 'c', 'inbound', '+33612345678', timestamptz '2026-10-05T10:00:00.000Z' + (i || ' microseconds')::interval, 0, 'missed', false
+             FROM generate_series(1, 25) AS i`
+        )
+        const seen: string[] = []
+        let after: { startedAt: string; callId: string; userId: string } | undefined
+        for (let page = 0; page < 10; page++) {
+          const got = await store.historyNear('micro', { direction: 'inbound', remotes: ['+33612345678'], from: '2026-10-05T09:00:00.000Z', to: '2026-10-05T11:00:00.000Z', limit: 10, ...(after ? { after } : {}) })
+          seen.push(...got.map(e => e.userId))
+          if (got.length < 10) break
+          const last = got.at(-1)!
+          after = { startedAt: last.startedAt, callId: last.callId, userId: last.userId }
+        }
+        expect(seen).toEqual(Array.from({ length: 25 }, (_, i) => `u${String(i + 1).padStart(2, '0')}`))
+      } finally {
+        await pool.query("DELETE FROM call_history WHERE tenant_id = 'micro'")
+        await store.close()
+      }
+    })
   })
 
   describe('PgStore, trunks written together', () => {

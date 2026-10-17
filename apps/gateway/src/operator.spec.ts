@@ -1,14 +1,14 @@
 import { randomBytes } from 'node:crypto'
 import { afterEach, describe, expect, it } from 'vitest'
 import { OvhOperator } from '@twake/provider-ovh'
-import type { ProviderFactory, TelephonyProvider } from '@twake/telephony-provider-sdk'
+import type { OperatorProvider, ProviderFactory, TelephonyProvider } from '@twake/telephony-provider-sdk'
 import type { DidRange, Trunk, TrunkInput } from '@twake/telephony-types'
 import { pilotRules, startFakeOvh, type FakeOvh } from '../../../packages/provider-ovh/test/fake-ovh.mjs'
 import { buildApp } from './app.js'
 import { TicketStore } from './auth.js'
 import { StoreDirectory } from './directory.js'
 import { EventBus } from './events.js'
-import { OperatorSync, eraseOperatorNumbers, matchesFallback } from './operator.js'
+import { OperatorSync, erasedNumbersOf, matchesFallback } from './operator.js'
 import { ProviderRegistry } from './registry.js'
 import { MemoryStore } from './store/memory.js'
 import type { TrunkRecord } from './store/types.js'
@@ -234,8 +234,8 @@ describe('what the platform keeps in step with the operator', () => {
     // Received while the platform could not be reached, read, pending: then Jean erases his history.
     f.addConsumption(ACCOUNT, LINE, { calling: '0033639980001', called: '0033199000101', creationDatetime: '2026-10-17T13:30:00+02:00', duration: 12, wayType: 'incoming' })
     await sync.round('A')
-    expect(await store.deleteHistory('A', 'jean')).toBe(0)
-    expect(await eraseOperatorNumbers(store, 'A', 'jean', (await store.historyErasedAt('A', 'jean'))!)).toBe(1)
+    expect(await erasedNumbersOf(store, 'A', 'jean')).toEqual(['+33199000101'])
+    expect(await store.deleteHistory('A', 'jean', await erasedNumbersOf(store, 'A', 'jean'))).toBe(0)
     // Listed late by OVH (its API was down), of a call before the erasure.
     advance(61_000)
     f.addConsumption(ACCOUNT, LINE, { calling: '0033639980002', called: '0033199000101', creationDatetime: '2026-10-17T13:40:00+02:00', duration: 0, wayType: 'incoming' })
@@ -248,7 +248,7 @@ describe('what the platform keeps in step with the operator', () => {
     advance(61_000)
     await sync.round('A')
     expect((await store.listHistory('A', 'jean')).items.map(e => e.remoteNumber)).toEqual(['+33639980003'])
-    expect((await sync.status('A'))?.cdrs.stats).toMatchObject({ total: 3, orphan: 1, unmatchedInbound: 2, pending: 0 })
+    expect((await sync.status('A'))?.cdrs.stats).toMatchObject({ total: 3, orphan: 1, erased: 2, unmatchedInbound: 0, pending: 0 })
     // Neither keeps a number of his.
     const kept = JSON.stringify([...(store as unknown as { operatorCdrs: Map<string, unknown> }).operatorCdrs.values()])
     expect([kept.includes('39980001'), kept.includes('39980002'), kept.includes('39980003')]).toEqual([false, false, true])
@@ -317,22 +317,59 @@ describe('what the platform keeps in step with the operator', () => {
     }
   })
 
-  it('raises an alert when the operator refuses its keys round after round, and when fewer than 99 % of the records are reconciled (review 10b, n°12)', async () => {
+  it('raises an alert when the operator refuses its keys round after round, and when fewer than 99 % of the records are reconciled, each once as it happens (review 10b, n°12; second review n°5)', async () => {
     const { f, store, sync, advance } = await setup()
     const refusing = new OperatorSync({ store, operators: new Map([['A', new OvhOperator({ ...f.credentials, consumerKey: 'revoked', baseUrl: f.url, billingAccount: ACCOUNT })]]), now: () => Date.parse(T) })
     await store.upsertTrunks([{ tenantId: 'A', id: 'main', config: config({ operator: { lines: [LINE] } }) }])
-    await refusing.round('A')
+    // Nothing read at the operator: the round says so (second review n°6).
+    await expect(refusing.round('A')).rejects.toThrow('operator: not read (unauthorized)')
     expect(await store.listAlerts('A')).toEqual([])
-    await refusing.round('A')
-    expect((await store.listAlerts('A')).map(a => [a.alert.kind, a.alert.param, a.alert.value])).toEqual([['operator', 'unauthorized', 2]])
-    // 20 calls to a group the platform never had: none reconciled.
+    await expect(refusing.round('A')).rejects.toThrow()
+    expect((await store.listAlerts('A')).map(a => [a.alert.kind, a.alert.param, a.alert.value, a.count])).toEqual([['operator', 'unauthorized', 2, 1]])
+    // Refused still: not raised again (acknowledged, it would stay so).
+    await expect(refusing.round('A')).rejects.toThrow()
+    expect((await store.listAlerts('A')).map(a => a.count)).toEqual([1])
+    // 19 calls to a group the platform never had: none reconciled, too few to tell.
     await store.upsertDid({ tenantId: 'A', id: 'group', trunkId: 'main', first: '+33199000102', last: '+33199000102', target: '200' })
-    for (let i = 0; i < 20; i++) f.addConsumption(ACCOUNT, LINE, { calling: '0033639980003', called: '0033199000102', creationDatetime: `2026-10-17T1${i % 4}:${10 + i}:00+02:00`, duration: 12, wayType: 'incoming' })
+    const call = (i: number) => f.addConsumption(ACCOUNT, LINE, { calling: '0033639980003', called: '0033199000102', creationDatetime: `2026-10-17T1${i % 4}:${10 + i}:00+02:00`, duration: 12, wayType: 'incoming' })
+    for (let i = 0; i < 19; i++) call(i)
+    await sync.round('A')
+    advance(61_000)
+    await sync.round('A')
+    expect((await store.listAlerts('A')).find(a => a.alert.param === 'reconciliation')).toBeUndefined()
+    // The twentieth: under 99 % of 20, an alert.
+    call(19)
     await sync.round('A')
     advance(61_000)
     await sync.round('A')
     const reconciled = (await store.listAlerts('A')).find(a => a.alert.param === 'reconciliation')
     expect(reconciled?.alert).toEqual({ kind: 'operator', param: 'reconciliation', scope: 'tenant', value: 0, threshold: 99 })
+    // Under it still at the next rounds: not raised again.
+    await sync.round('A')
+    await sync.round('A')
+    expect((await store.listAlerts('A')).find(a => a.alert.param === 'reconciliation')?.count).toBe(1)
+  })
+
+  it('leaves out of the rate the calls erased with a history and those received while the platform could not be reached (second review 10b, n°5)', async () => {
+    const { f, store, sync, advance } = await setup()
+    await store.upsertTrunks([{ tenantId: 'A', id: 'main', config: config({ operator: { lines: [LINE] } }) }])
+    await store.upsertDid({ tenantId: 'A', id: 'desk', trunkId: 'main', first: '+33199000101', last: '+33199000101', target: '101' })
+    await store.upsertMapping({ tenantId: 'A', userId: 'jean', extension: '101' })
+    // 25 calls the platform had, reconciled; one it never had (the trunk out); one of a history erased since.
+    for (let i = 0; i < 25; i++) {
+      const at = new Date(Date.parse('2026-10-17T08:00:00.000Z') + i * 120_000).toISOString()
+      await store.addHistory({ tenantId: 'A', userId: 'jean', callId: `c${i}`, direction: 'inbound', remoteNumber: '+33639980003', startedAt: at, endedAt: at, durationSec: 0, state: 'missed', answered: false })
+      f.addConsumption(ACCOUNT, LINE, { calling: '0033639980003', called: '0033199000101', creationDatetime: at.replace('Z', '+00:00'), duration: 0, wayType: 'incoming' })
+    }
+    f.addConsumption(ACCOUNT, LINE, { calling: '0033639980004', called: '0033199000101', creationDatetime: '2026-10-17T11:00:00+00:00', duration: 0, wayType: 'incoming' })
+    await store.addHistory({ tenantId: 'A', userId: 'bob', callId: 'gone', direction: 'outbound', remoteNumber: '+33639980005', startedAt: '2026-10-17T11:10:00.000Z', endedAt: '2026-10-17T11:11:00.000Z', durationSec: 60, state: 'ended', answered: true })
+    f.addConsumption(ACCOUNT, LINE, { calling: '0033199000100', called: '0033639980005', creationDatetime: '2026-10-17T11:10:02+00:00', duration: 58, wayType: 'outgoing' })
+    await sync.round('A')
+    await store.deleteHistory('A', 'bob')
+    advance(61_000)
+    await sync.round('A')
+    expect((await sync.status('A'))?.cdrs.stats).toMatchObject({ matched: 25, orphan: 1, erased: 1, unmatchedInbound: 0, unmatchedOutbound: 0 })
+    expect(await store.listAlerts('A')).toEqual([])
   })
 
   it('tells a trunk event where each forward sends the calls on every line, read again when old, never a number (review 10b, n°4)', async () => {
@@ -341,6 +378,10 @@ describe('what the platform keeps in step with the operator', () => {
       { tenantId: 'A', id: 'main', config: config({ operator: { lines: [LINE, LINE2], fallback: ASKED } }) },
       { tenantId: 'A', id: 'bare', config: config() }
     ])
+    // Never read: nothing to tell; read (a trunk event only reads, never writes: second review n°1), what is there.
+    expect(await sync.fallbackOf('A', 'main')).toEqual({ on_unavailable: 'none', on_no_answer: 'none' })
+    expect(f.requests.filter(r => r.method === 'PUT')).toEqual([])
+    await sync.round('A')
     expect(await sync.fallbackOf('A', 'main')).toEqual({ on_unavailable: 'number', on_no_answer: 'number', no_answer_after_sec: 150 })
     expect(await sync.fallbackOf('A', 'bare')).toBeUndefined()
     expect(await sync.fallbackOf('B', 'main')).toBeUndefined()
@@ -388,6 +429,200 @@ describe('what the platform keeps in step with the operator', () => {
     expect([f.options(ACCOUNT, LINE), f.options(ACCOUNT, LINE2)].map(o => [o!.forwardBackup, o!.forwardNoReply])).toEqual([[false, false], [false, false]])
     // The line no trunk names is forgotten; the other one is read, no longer managed.
     expect((await sync.status('A'))?.trunks[0]!.lines).toEqual([{ line: LINE, forwards: {}, managed: false, readAt: T, appliedAt: T }])
+  })
+
+  /** `ovh`, whose first call of `method` is held once it has run (`after`) or before (`before`) until `release`. */
+  const holding = (ovh: OperatorProvider, method: 'getForwards' | 'setFallback', when: 'before' | 'after') => {
+    let release!: () => void
+    let reached!: () => void
+    const held = new Promise<void>(r => (release = r))
+    const at = new Promise<void>(r => (reached = r))
+    let once = false
+    const operator = new Proxy(ovh, {
+      get: (target, key) => {
+        const v = Reflect.get(target, key) as unknown
+        if (typeof v !== 'function') return v
+        if (key !== method) return (v as (...a: unknown[]) => unknown).bind(target)
+        return async (...args: unknown[]) => {
+          const first = !once
+          once = true
+          if (first && when === 'before') {
+            reached()
+            await held
+          }
+          const got = await (v as (...a: unknown[]) => Promise<unknown>).apply(target, args)
+          if (first && when === 'after') {
+            reached()
+            await held
+          }
+          return got
+        }
+      }
+    })
+    return { operator, at, release: () => release() }
+  }
+
+  it('keeps a removal owed until the operator has it: replayed at each round, whatever became of its trunk (second review 10b, n°1)', async () => {
+    const { f, store, sync } = await setup()
+    await store.upsertTrunks([{ tenantId: 'A', id: 'main', config: config({ operator: { lines: [LINE], fallback: ASKED } }) }])
+    await sync.round('A')
+    expect(f.options(ACCOUNT, LINE)!.forwardBackup).toBe(true)
+    // OVH does not answer: owed, said, and the fallback still there.
+    await store.upsertTrunks([{ tenantId: 'A', id: 'main', config: config({ operator: { lines: [LINE] } }) }])
+    f.state.down = true
+    expect(await sync.removeForwards('A', [LINE], 'main')).toEqual([{ line: LINE, since: T, trunkId: 'main', triedAt: T, error: 'unreachable' }])
+    // The trunk deleted meanwhile: the removal stays owed, shown.
+    await store.deleteTrunk('A', 'main')
+    await sync.round('A')
+    expect(f.options(ACCOUNT, LINE)!.forwardBackup).toBe(true)
+    expect(await sync.status('A')).toMatchObject({ trunks: [], removals: [{ line: LINE, trunkId: 'main', error: 'unreachable' }] })
+    // Back: the next round removes it, reads it back, and owes nothing more.
+    f.state.down = false
+    await sync.round('A')
+    expect([f.options(ACCOUNT, LINE)!.forwardBackup, f.options(ACCOUNT, LINE)!.forwardNoReply]).toEqual([false, false])
+    expect((await sync.status('A'))?.removals).toBeUndefined()
+    const puts = f.requests.filter(r => r.method === 'PUT').length
+    await sync.round('A')
+    expect(f.requests.filter(r => r.method === 'PUT')).toHaveLength(puts)
+    // A removal owed on a line asked again: the fallback asked is kept.
+    await store.upsertTrunks([{ tenantId: 'A', id: 'main', config: config({ operator: { lines: [LINE] } }) }])
+    f.state.down = true
+    await sync.removeForwards('A', [LINE], 'main')
+    f.state.down = false
+    await store.upsertTrunks([{ tenantId: 'A', id: 'main', config: config({ operator: { lines: [LINE], fallback: ASKED } }) }])
+    await sync.round('A')
+    expect(f.options(ACCOUNT, LINE)!.forwardBackup).toBe(true)
+    expect((await sync.status('A'))?.removals).toBeUndefined()
+  })
+
+  it('never puts back a fallback removed while a round of another Gateway was under way, before it wrote or as it wrote (second review 10b, n°1)', async () => {
+    for (const [method, when] of [['getForwards', 'after'], ['setFallback', 'before']] as const) {
+      const { f, ovh, store, sync, logger } = await setup()
+      await store.upsertTrunks([{ tenantId: 'A', id: 'main', config: config({ operator: { lines: [LINE], fallback: ASKED } }) }])
+      // Gateway A reads the line (nothing there yet), and is held before it writes, or as its write goes.
+      const held = holding(ovh, method, when)
+      const a = new OperatorSync({ store, operators: new Map([['A', held.operator]]), logger, now: () => Date.parse(T) })
+      const round = a.round('A')
+      await held.at
+      // Gateway B meanwhile: the fallback removed on an administrator's word, done.
+      await store.upsertTrunks([{ tenantId: 'A', id: 'main', config: config({ operator: { lines: [LINE] } }) }])
+      expect(await sync.removeForwards('A', [LINE], 'main')).toEqual([])
+      held.release()
+      await round
+      // What A wrote, if anything, is removed again: nothing left at OVH, nothing owed, the line read as it is.
+      expect([method, f.options(ACCOUNT, LINE)!.forwardBackup, f.options(ACCOUNT, LINE)!.forwardNoReply]).toEqual([method, false, false])
+      expect(await sync.status('A')).toMatchObject({ trunks: [{ id: 'main', lines: [{ line: LINE, managed: false, forwards: {} }] }] })
+      expect((await sync.status('A'))?.removals).toBeUndefined()
+      await a.round('A')
+      expect(f.options(ACCOUNT, LINE)!.forwardBackup).toBe(false)
+    }
+  })
+
+  it('removes at the operator the fallback a trunk kept on a line it no longer names (second review 10b, n°8)', async () => {
+    const { f, store, sync } = await setup()
+    await store.upsertTrunks([{ tenantId: 'A', id: 'main', config: config({ operator: { lines: [LINE, LINE2], fallback: ASKED } }) }])
+    await sync.applyTrunk('A', 'main')
+    expect([f.options(ACCOUNT, LINE)!.forwardBackup, f.options(ACCOUNT, LINE2)!.forwardBackup]).toEqual([true, true])
+    await store.upsertTrunks([{ tenantId: 'A', id: 'main', config: config({ operator: { lines: [LINE], fallback: ASKED } }) }])
+    expect(await sync.applyTrunk('A', 'main', [LINE2])).toEqual([])
+    expect([f.options(ACCOUNT, LINE)!.forwardBackup, f.options(ACCOUNT, LINE2)!.forwardBackup]).toEqual([true, false])
+  })
+
+  it('answers a round asked even when it failed, with why, and runs it once (second review 10b, n°6 and n°11)', async () => {
+    let t = Date.parse(T)
+    const { f, ovh } = await fakeOvh()
+    const store = new MemoryStore(() => t)
+    await store.upsertTrunks([{ tenantId: 'A', id: 'main', config: config({ operator: { lines: [LINE] } }) }])
+    const leader = new OperatorSync({ store, operators: new Map([['A', ovh]]), leading: () => true, now: () => t, firstMs: 3_600_000, everyMs: 3_600_000, askedPollMs: 20 })
+    const other = new OperatorSync({ store, operators: new Map([['A', ovh]]), leading: () => false, now: () => t })
+    f.state.down = true
+    leader.start()
+    try {
+      t += 1_000
+      await expect(other.roundNow('A', 5_000)).rejects.toThrow('operator: not read (unreachable)')
+      // Answered: not run again at each look of the leader.
+      const asked = f.requests.length
+      await new Promise(r => setTimeout(r, 150))
+      expect(f.requests).toHaveLength(asked)
+      // The leader itself, asked: the same.
+      await expect(leader.roundNow('A', 5_000)).rejects.toThrow('operator: not read (unreachable)')
+      // Not in time: said so.
+      const late = new OperatorSync({ store, operators: new Map([['A', ovh]]), leading: () => false, now: () => t })
+      await leader.stop()
+      await expect(late.roundNow('A', 300)).rejects.toMatchObject({ timeout: true })
+    } finally {
+      await leader.stop()
+    }
+  })
+
+  it('stops reading the entries of a number past its pages, and then writes no entry of its own: that call may be among those not read (second review 10b, n°10)', async () => {
+    const { f, store, sync, advance } = await setup(undefined, { nearPage: 2, nearPages: 2 })
+    await store.upsertTrunks([{ tenantId: 'A', id: 'main', config: config({ operator: { lines: [LINE] } }) }])
+    await store.upsertDid({ tenantId: 'A', id: 'desk', trunkId: 'main', first: '+33199000101', last: '+33199000101', target: '101' })
+    await store.upsertMapping({ tenantId: 'A', userId: 'jean', extension: '101' })
+    // Five calls of that caller to others in the hour before: more than 2 pages of 2.
+    for (let i = 0; i < 5; i++) {
+      const at = new Date(Date.parse('2026-10-17T09:00:00.000Z') + i * 600_000).toISOString()
+      await store.addHistory({ tenantId: 'A', userId: `agent-${i}`, callId: `old-${i}`, direction: 'inbound', remoteNumber: MOBILE, startedAt: at, endedAt: at, durationSec: 0, state: 'missed', answered: false })
+    }
+    f.addConsumption(ACCOUNT, LINE, { calling: '0033639980001', called: '0033199000101', creationDatetime: '2026-10-17T12:00:00+02:00', duration: 30, wayType: 'incoming' })
+    await sync.round('A')
+    advance(61_000)
+    await sync.round('A')
+    expect((await store.listHistory('A', 'jean')).items).toEqual([])
+    expect((await sync.status('A'))?.cdrs.stats).toMatchObject({ orphan: 0, unmatchedInbound: 1 })
+  })
+
+  it('never enters a record in the history of whom its number rings now when the number changed hands since the call, nor keeps the numbers of a holder who erased them (second review 10b, n°3)', async () => {
+    const { f, store, sync, advance, at } = await setup()
+    await store.upsertTrunks([{ tenantId: 'A', id: 'main', config: config({ operator: { lines: [LINE] } }) }])
+    await store.upsertDid({ tenantId: 'A', id: 'desk', trunkId: 'main', first: '+33199000101', last: '+33199000102', suffixDigits: 3 })
+    await store.upsertMapping({ tenantId: 'A', userId: 'jean', extension: '101' })
+    await store.upsertMapping({ tenantId: 'A', userId: 'paul', extension: '102' })
+    // Jean erases his history, leaves; Carol takes his extension. Paul leaves; Lea takes his.
+    await store.deleteHistory('A', 'jean', await erasedNumbersOf(store, 'A', 'jean'))
+    await store.deleteMapping('A', 'jean')
+    await store.upsertMapping({ tenantId: 'A', userId: 'carol', extension: '101' })
+    await store.deleteMapping('A', 'paul')
+    await store.upsertMapping({ tenantId: 'A', userId: 'lea', extension: '102' })
+    // Calls of before, listed late by OVH: to Jean's number, to Paul's.
+    f.addConsumption(ACCOUNT, LINE, { calling: '0033639980002', called: '0033199000101', creationDatetime: '2026-10-17T13:30:00+02:00', duration: 0, wayType: 'incoming' })
+    f.addConsumption(ACCOUNT, LINE, { calling: '0033639980003', called: '0033199000102', creationDatetime: '2026-10-17T13:31:00+02:00', duration: 0, wayType: 'incoming' })
+    await sync.round('A')
+    advance(61_000)
+    await sync.round('A')
+    expect((await store.listHistory('A', 'carol')).items).toEqual([])
+    expect((await store.listHistory('A', 'lea')).items).toEqual([])
+    expect((await sync.status('A'))?.cdrs.stats).toMatchObject({ orphan: 0, erased: 1, unmatchedInbound: 1 })
+    const kept = JSON.stringify([...(store as unknown as { operatorCdrs: Map<string, unknown> }).operatorCdrs.values()])
+    expect([kept.includes('39980002'), kept.includes('39980003')]).toEqual([false, true])
+    // A call to Lea once hers: in her history.
+    advance(600_000)
+    f.addConsumption(ACCOUNT, LINE, { calling: '0033639980004', called: '0033199000102', creationDatetime: new Date(at() - 60_000).toISOString().replace('Z', '+00:00'), duration: 0, wayType: 'incoming' })
+    await sync.round('A')
+    advance(61_000)
+    await sync.round('A')
+    expect((await store.listHistory('A', 'lea')).items.map(e => e.remoteNumber)).toEqual(['+33639980004'])
+  })
+
+  it('writes a call the operator alone had and forwarded to the fallback as missed, forwarded (second review 10b, n°4)', async () => {
+    const { f, store, sync, advance } = await setup()
+    await store.upsertTrunks([{ tenantId: 'A', id: 'main', config: config({ operator: { lines: [LINE] } }) }])
+    await store.upsertDid({ tenantId: 'A', id: 'desk', trunkId: 'main', first: '+33199000101', last: '+33199000101', target: '101' })
+    await store.upsertMapping({ tenantId: 'A', userId: 'jean', extension: '101' })
+    // The call in, then its forward from the number called to the fallback, answered there.
+    f.addConsumption(ACCOUNT, LINE, { calling: '0033639980002', called: '0033199000101', creationDatetime: '2026-10-17T13:30:00+02:00', duration: 42, wayType: 'incoming' })
+    f.addConsumption(ACCOUNT, LINE, { calling: '0033199000101', called: '0033639980001', creationDatetime: '2026-10-17T13:30:01+02:00', duration: 41, wayType: 'transfer' })
+    // Another, not forwarded: answered at the operator (its voicemail, say), as it says.
+    f.addConsumption(ACCOUNT, LINE, { calling: '0033639980003', called: '0033199000101', creationDatetime: '2026-10-17T13:40:00+02:00', duration: 20, wayType: 'incoming' })
+    await sync.round('A')
+    advance(61_000)
+    await sync.round('A')
+    expect((await store.listHistory('A', 'jean')).items.map(e => [e.remoteNumber, e.state, e.answered, e.durationSec, e.operatorForwarded ?? false])).toEqual([
+      ['+33639980003', 'ended', true, 20, false],
+      ['+33639980002', 'missed', false, 0, true]
+    ])
+    expect((await sync.status('A'))?.cdrs.stats).toMatchObject({ orphan: 2, forwarded: 1 })
   })
 })
 
@@ -500,7 +735,7 @@ describe('the routes of the operator', () => {
     expect(f.options(ACCOUNT, LINE)).toMatchObject({ forwardBackup: true, forwardBackupNature: 'number' })
     // Removed on demand: the trunk no longer asks one, and the forwards go.
     const removed = await app.inject({ method: 'DELETE', url: '/api/v1/admin/trunks/main/operator/fallback', headers: admin })
-    expect([removed.statusCode, removed.json().operator]).toEqual([200, { lines: [LINE] }])
+    expect([removed.statusCode, removed.json().trunk.operator, removed.json().pending]).toEqual([200, { lines: [LINE] }, []])
     expect([f.options(ACCOUNT, LINE)!.forwardBackup, f.options(ACCOUNT, LINE)!.forwardNoReply]).toEqual([false, false])
     expect((await app.inject({ url: '/api/v1/admin/operator', headers: admin })).json().trunks[0].lines[0]).toMatchObject({ managed: false, forwards: {} })
     expect((await app.inject({ method: 'DELETE', url: '/api/v1/admin/trunks/nope/operator/fallback', headers: admin })).statusCode).toBe(404)
@@ -510,6 +745,72 @@ describe('the routes of the operator', () => {
     expect(f.options(ACCOUNT, LINE)!.forwardBackup).toBe(true)
     expect((await app.inject({ method: 'DELETE', url: '/api/v1/admin/trunks/main', headers: admin })).statusCode).toBe(204)
     expect([f.options(ACCOUNT, LINE)!.forwardBackup, f.options(ACCOUNT, LINE)!.forwardNoReply]).toEqual([false, false])
+    await app.close()
+  })
+
+  it('says a removal the operator does not have yet (202), shows it owed, trunk deleted or not, and has it done at the next round (second review 10b, n°1)', async () => {
+    const { app, f, admin } = await setup()
+    expect((await app.inject({ method: 'PUT', url: '/api/v1/admin/trunks/main', headers: admin, payload: { ...trunk, operator: { lines: [LINE], fallback: ASKED } } })).statusCode).toBe(201)
+    // OVH in trouble: the trunk no longer asks one, the removal is owed, and said so.
+    f.state.down = true
+    const removed = await app.inject({ method: 'DELETE', url: '/api/v1/admin/trunks/main/operator/fallback', headers: admin })
+    expect([removed.statusCode, removed.json().trunk.operator, removed.json().pending]).toEqual([202, { lines: [LINE] }, [expect.objectContaining({ line: LINE, trunkId: 'main', error: 'unreachable' })]])
+    expect(f.options(ACCOUNT, LINE)!.forwardBackup).toBe(true)
+    expect((await app.inject({ url: '/api/v1/admin/operator', headers: admin })).json().removals).toEqual([expect.objectContaining({ line: LINE, trunkId: 'main' })])
+    f.state.down = false
+    expect((await app.inject({ method: 'POST', url: '/api/v1/admin/operator/sync', headers: admin })).statusCode).toBe(200)
+    expect([f.options(ACCOUNT, LINE)!.forwardBackup, f.options(ACCOUNT, LINE)!.forwardNoReply]).toEqual([false, false])
+    expect((await app.inject({ url: '/api/v1/admin/operator', headers: admin })).json().removals).toBeUndefined()
+    // Deleted with its fallback, OVH in trouble: 202, owed with no trunk left, done once OVH answers.
+    expect((await app.inject({ method: 'PUT', url: '/api/v1/admin/trunks/main', headers: admin, payload: { ...trunk, operator: { lines: [LINE], fallback: ASKED } } })).statusCode).toBe(200)
+    f.state.down = true
+    const gone = await app.inject({ method: 'DELETE', url: '/api/v1/admin/trunks/main', headers: admin })
+    expect([gone.statusCode, gone.json().pending]).toEqual([202, [expect.objectContaining({ line: LINE, trunkId: 'main', error: 'unreachable' })]])
+    const owed = (await app.inject({ url: '/api/v1/admin/operator', headers: admin })).json()
+    expect([owed.trunks, owed.removals]).toEqual([[], [expect.objectContaining({ line: LINE, trunkId: 'main' })]])
+    f.state.down = false
+    expect((await app.inject({ method: 'POST', url: '/api/v1/admin/operator/sync', headers: admin })).statusCode).toBe(200)
+    expect(f.options(ACCOUNT, LINE)!.forwardBackup).toBe(false)
+    expect((await app.inject({ url: '/api/v1/admin/operator', headers: admin })).json().removals).toBeUndefined()
+    await app.close()
+  })
+
+  it('removes on demand what is left on the lines of a trunk that asks no fallback, and the fallback of a line it no longer names (second review 10b, n°8)', async () => {
+    const { app, f, admin } = await setup()
+    expect((await app.inject({ method: 'PUT', url: '/api/v1/admin/trunks/main', headers: admin, payload: { ...trunk, operator: { lines: [LINE, LINE2], fallback: ASKED } } })).statusCode).toBe(201)
+    // A line no longer named: its fallback goes with it.
+    expect((await app.inject({ method: 'PUT', url: '/api/v1/admin/trunks/main', headers: admin, payload: { ...trunk, operator: { lines: [LINE], fallback: ASKED } } })).statusCode).toBe(200)
+    expect([f.options(ACCOUNT, LINE)!.forwardBackup, f.options(ACCOUNT, LINE2)!.forwardBackup]).toEqual([true, false])
+    // Unticked: left there; removed on demand still.
+    expect((await app.inject({ method: 'PUT', url: '/api/v1/admin/trunks/main', headers: admin, payload: { ...trunk, operator: { lines: [LINE] } } })).statusCode).toBe(200)
+    expect(f.options(ACCOUNT, LINE)!.forwardBackup).toBe(true)
+    const removed = await app.inject({ method: 'DELETE', url: '/api/v1/admin/trunks/main/operator/fallback', headers: admin })
+    expect([removed.statusCode, removed.json().pending]).toEqual([200, []])
+    expect([f.options(ACCOUNT, LINE)!.forwardBackup, f.options(ACCOUNT, LINE)!.forwardNoReply]).toEqual([false, false])
+    await app.close()
+  })
+
+  it('says a round asked that could not read the operator: 502 OPERATOR_ROUND, not a status as if read (second review 10b, n°6)', async () => {
+    const { app, f, admin } = await setup()
+    expect((await app.inject({ method: 'PUT', url: '/api/v1/admin/trunks/main', headers: admin, payload: { ...trunk, operator: { lines: [LINE] } } })).statusCode).toBe(201)
+    f.state.down = true
+    const failed = await app.inject({ method: 'POST', url: '/api/v1/admin/operator/sync', headers: admin })
+    expect([failed.statusCode, failed.json().code]).toEqual([502, 'OPERATOR_ROUND'])
+    f.state.down = false
+    expect((await app.inject({ method: 'POST', url: '/api/v1/admin/operator/sync', headers: admin })).statusCode).toBe(200)
+    await app.close()
+  })
+
+  it('refuses a trunk whose line or number is the fallback another trunk keeps at the operator (second review 10b, n°7)', async () => {
+    const { app, admin } = await setup()
+    expect((await app.inject({ method: 'PUT', url: '/api/v1/admin/trunks/main', headers: admin, payload: { ...trunk, operator: { lines: [LINE], fallback: { number: '+33199000300', onUnavailable: true } } } })).statusCode).toBe(201)
+    const refused = async (over: Partial<TrunkInput>) => {
+      const r = await app.inject({ method: 'PUT', url: '/api/v1/admin/trunks/second', headers: admin, payload: { ...trunk, ...over } })
+      return [r.statusCode, r.json().code]
+    }
+    expect(await refused({ defaultNumber: '+33199000300' })).toEqual([409, 'OPERATOR_FALLBACK_LOOP'])
+    expect(await refused({ defaultNumber: '+33199000400', operator: { lines: ['0033199000300'] } })).toEqual([409, 'OPERATOR_FALLBACK_LOOP'])
+    expect(await refused({ defaultNumber: '+33199000400', operator: { lines: [LINE2] } })).toEqual([201, undefined])
     await app.close()
   })
 
@@ -546,7 +847,7 @@ describe('the routes of the operator', () => {
     expect((await app.inject({ method: 'DELETE', url: '/api/v1/me/history', headers: as('jean') })).json()).toEqual({ deleted: 0 })
     await app.inject({ method: 'POST', url: '/api/v1/admin/operator/sync', headers: admin })
     expect((await app.inject({ url: '/api/v1/calls/history', headers: as('jean') })).json().items).toEqual([])
-    expect((await app.inject({ url: '/api/v1/admin/operator', headers: admin })).json().cdrs.stats).toMatchObject({ total: 1, unmatchedInbound: 1, orphan: 0 })
+    expect((await app.inject({ url: '/api/v1/admin/operator', headers: admin })).json().cdrs.stats).toMatchObject({ total: 1, erased: 1, unmatchedInbound: 0, orphan: 0 })
     expect(JSON.stringify([...(store as unknown as { operatorCdrs: Map<string, unknown> }).operatorCdrs.values()])).not.toContain('39980001')
     await app.close()
   })

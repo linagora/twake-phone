@@ -13,7 +13,7 @@ const MIGRATIONS = fileURLToPath(new URL('../../migrations/', import.meta.url))
 type Timestamp = Date | string
 type ProviderRow = { tenant_id: string; site: string; type: string; config: unknown }
 type MappingRow = { tenant_id: string; user_id: string; extension: string; display_name: string | null; department: string | null; source: MappingSource; synced_at: Timestamp | null }
-type HistoryRow = { tenant_id: string; user_id: string; call_id: string; direction: HistoryEntry['direction']; remote_number: string; started_at: Timestamp; ended_at: Timestamp | null; duration_sec: number; state: HistoryEntry['state']; answered: boolean; conference: boolean; operator: string | null; operator_cdr: string | null; operator_only: boolean }
+type HistoryRow = { tenant_id: string; user_id: string; call_id: string; direction: HistoryEntry['direction']; remote_number: string; started_at: Timestamp; ended_at: Timestamp | null; duration_sec: number; state: HistoryEntry['state']; answered: boolean; conference: boolean; operator: string | null; operator_cdr: string | null; operator_only: boolean; operator_forwarded: boolean }
 type OperatorCdrRow = { tenant_id: string; operator: string; id: string; line: string; direction: HistoryEntry['direction']; forwarded: boolean; calling: string | null; called: string | null; started_at: Timestamp; duration_sec: number; outcome: OperatorCdrRecord['outcome'] | null; call_id: string | null; user_id: string | null; invalid: string | null }
 type PresenceRow = { tenant_id: string; user_id: string; status: UserPresenceRecord['status']; since: Timestamp; until: Timestamp | null; message: string | null }
 type ConferenceRow = { tenant_id: string; meeting_id: string; owner_user_id: string; pin: string | null; created_at: Timestamp }
@@ -128,7 +128,8 @@ const toEntry = (r: HistoryRow): HistoryEntry => ({
   ...(r.conference ? { conference: true } : {}),
   ...(r.operator ? { operator: r.operator } : {}),
   ...(r.operator_cdr ? { operatorCdr: r.operator_cdr } : {}),
-  ...(r.operator_only ? { operatorOnly: true } : {})
+  ...(r.operator_only ? { operatorOnly: true } : {}),
+  ...(r.operator_forwarded ? { operatorForwarded: true } : {})
 })
 
 const toOperatorCdr = (r: OperatorCdrRow): OperatorCdrRecord => ({
@@ -150,6 +151,9 @@ const toOperatorCdr = (r: OperatorCdrRow): OperatorCdrRecord => ({
 
 /** The advisory lock of a person's history: their erasure, and an entry known from the operator alone (review 10b, n°1). */
 const historyLock = (tenantId: string, userId: string) => `call_history|${tenantId}|${userId}`
+
+/** The window of matchCdrs (RECONCILE_EARLY_MS, RECONCILE_LATE_MS), in SQL: an erased entry would take a record in it. */
+const NEAR_WINDOW = "c.started_at >= h.started_at - interval '60 seconds' AND c.started_at <= coalesce(h.ended_at, h.started_at) + interval '60 seconds'"
 
 /** A deadlock's victim (40P01) or a serialization failure (40001): rolled back whole, safe to run again. */
 const retryable = (err: unknown) => {
@@ -254,12 +258,24 @@ export class PgStore implements Store {
   }
 
   async upsertMapping(m: UserMapping) {
-    await this.pool.query(
-      `INSERT INTO user_mappings (tenant_id, user_id, extension, display_name, department, source, synced_at) VALUES ($1, $2, $3, $4, $5, $6, $7)
-       ON CONFLICT (tenant_id, user_id) DO UPDATE SET extension = EXCLUDED.extension, display_name = EXCLUDED.display_name,
-         department = EXCLUDED.department, source = EXCLUDED.source, synced_at = EXCLUDED.synced_at`,
-      [m.tenantId, m.userId, m.extension, m.displayName ?? null, m.department ?? null, m.source ?? 'manual', m.syncedAt ?? null]
-    )
+    await this.inTransaction(async client => {
+      const { rows } = await client.query<{ extension: string }>('SELECT extension FROM user_mappings WHERE tenant_id = $1 AND user_id = $2 FOR UPDATE', [m.tenantId, m.userId])
+      await client.query(
+        `INSERT INTO user_mappings (tenant_id, user_id, extension, display_name, department, source, synced_at) VALUES ($1, $2, $3, $4, $5, $6, $7)
+         ON CONFLICT (tenant_id, user_id) DO UPDATE SET extension = EXCLUDED.extension, display_name = EXCLUDED.display_name,
+           department = EXCLUDED.department, source = EXCLUDED.source, synced_at = EXCLUDED.synced_at`,
+        [m.tenantId, m.userId, m.extension, m.displayName ?? null, m.department ?? null, m.source ?? 'manual', m.syncedAt ?? null]
+      )
+      const before = rows[0]?.extension
+      if (before === m.extension) return
+      // The extension it had changes hands (second review 10b, n°3); the one it takes too, when someone held it lately.
+      if (before !== undefined) await client.query("INSERT INTO number_changes (tenant_id, kind, first_number, last_number) VALUES ($1, 'extension', $2, $2)", [m.tenantId, before])
+      await client.query(
+        `INSERT INTO number_changes (tenant_id, kind, first_number, last_number)
+         SELECT $1, 'extension', $2, $2 WHERE EXISTS (SELECT 1 FROM number_changes WHERE tenant_id = $1 AND kind = 'extension' AND first_number = $2)`,
+        [m.tenantId, m.extension]
+      )
+    })
   }
 
   async listMappings(tenantId: string) {
@@ -270,6 +286,11 @@ export class PgStore implements Store {
   async deleteMapping(tenantId: string, userId: string) {
     // What was told of their presence goes with them (it is kept otherwise, whatever its age).
     await this.inTransaction(async client => {
+      // Its extension changes hands (second review 10b, n°3).
+      await client.query(
+        "INSERT INTO number_changes (tenant_id, kind, first_number, last_number) SELECT tenant_id, 'extension', extension, extension FROM user_mappings WHERE tenant_id = $1 AND user_id = $2",
+        [tenantId, userId]
+      )
       await client.query('DELETE FROM user_mappings WHERE tenant_id = $1 AND user_id = $2', [tenantId, userId])
       await client.query('DELETE FROM webhook_state WHERE tenant_id = $1 AND subject = $2', [tenantId, `presence:${userId}`])
     })
@@ -277,9 +298,9 @@ export class PgStore implements Store {
 
   async addHistory(e: HistoryEntry, client: pg.Pool | pg.PoolClient = this.pool) {
     await client.query(
-      `INSERT INTO call_history (tenant_id, user_id, call_id, direction, remote_number, started_at, ended_at, duration_sec, state, answered, conference, operator, operator_cdr, operator_only)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) ON CONFLICT DO NOTHING`,
-      [e.tenantId, e.userId, e.callId, e.direction, e.remoteNumber, e.startedAt, e.endedAt ?? null, e.durationSec, e.state, e.answered, e.conference === true, e.operator ?? null, e.operatorCdr ?? null, e.operatorOnly === true]
+      `INSERT INTO call_history (tenant_id, user_id, call_id, direction, remote_number, started_at, ended_at, duration_sec, state, answered, conference, operator, operator_cdr, operator_only, operator_forwarded)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) ON CONFLICT DO NOTHING`,
+      [e.tenantId, e.userId, e.callId, e.direction, e.remoteNumber, e.startedAt, e.endedAt ?? null, e.durationSec, e.state, e.answered, e.conference === true, e.operator ?? null, e.operatorCdr ?? null, e.operatorOnly === true, e.operatorForwarded === true]
     )
   }
 
@@ -306,18 +327,39 @@ export class PgStore implements Store {
     return { items, ...(rows.length > limit ? { next: items.at(-1)!.startedAt } : {}) }
   }
 
-  async deleteHistory(tenantId: string, userId: string) {
+  async deleteHistory(tenantId: string, userId: string, numbers: readonly string[] = []) {
     return this.inTransaction(async client => {
       // When, kept with the erasure: an orphan settled meanwhile waits for it, and sees it (settleOperatorCdrs).
       await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [historyLock(tenantId, userId)])
       await client.query(
-        'INSERT INTO history_erasures (tenant_id, user_id, erased_at) VALUES ($1, $2, now()) ON CONFLICT (tenant_id, user_id) DO UPDATE SET erased_at = EXCLUDED.erased_at',
+        `INSERT INTO history_erasures (tenant_id, user_id, erased_at, numbers) VALUES ($1, $2, now(), $3::text[])
+         ON CONFLICT (tenant_id, user_id) DO UPDATE SET erased_at = EXCLUDED.erased_at, numbers = EXCLUDED.numbers`,
+        [tenantId, userId, [...numbers]]
+      )
+      // The operator's records of their calls keep no number of them (kept as read, never read again): reconciled with
+      // their entries; to or from their direct numbers before now; not reconciled yet, one of their entries would take
+      // (second review 10b, n°2: an outbound call presented with a trunk's number). Those not reconciled: `erased`.
+      await client.query(
+        `UPDATE operator_cdrs SET calling = NULL, called = NULL WHERE tenant_id = $1 AND (user_id = $2 OR call_id IN (SELECT call_id FROM call_history WHERE tenant_id = $1 AND user_id = $2))`,
         [tenantId, userId]
       )
-      // The operator's records of their calls keep no number of them (kept as read, never read again).
+      if (numbers.length)
+        await client.query(
+          `UPDATE operator_cdrs SET calling = NULL, called = NULL, outcome = coalesce(outcome, 'erased')
+            WHERE tenant_id = $1 AND started_at < now() AND (calling = ANY($2::text[]) OR called = ANY($2::text[]))`,
+          [tenantId, [...numbers]]
+        )
       await client.query(
-        `UPDATE operator_cdrs SET calling = NULL, called = NULL
-          WHERE tenant_id = $1 AND (user_id = $2 OR call_id IN (SELECT call_id FROM call_history WHERE tenant_id = $1 AND user_id = $2))`,
+        `UPDATE operator_cdrs c SET calling = NULL, called = NULL, outcome = 'erased'
+          WHERE c.tenant_id = $1 AND c.outcome IS NULL AND EXISTS (
+            SELECT 1 FROM call_history h WHERE h.tenant_id = $1 AND h.user_id = $2 AND h.direction = c.direction
+              AND h.remote_e164 = e164_of(CASE WHEN c.direction = 'inbound' THEN c.calling ELSE c.called END) AND ${NEAR_WINDOW})`,
+        [tenantId, userId]
+      )
+      // When they were, without a number: a record read later that no other entry takes is erased too.
+      await client.query(
+        `INSERT INTO history_erased_calls (tenant_id, direction, started_at, ended_at)
+         SELECT tenant_id, direction, started_at, coalesce(ended_at, started_at) FROM call_history WHERE tenant_id = $1 AND user_id = $2`,
         [tenantId, userId]
       )
       const r = await client.query('DELETE FROM call_history WHERE tenant_id = $1 AND user_id = $2', [tenantId, userId])
@@ -328,6 +370,32 @@ export class PgStore implements Store {
   async historyErasedAt(tenantId: string, userId: string) {
     const { rows } = await this.pool.query<{ erased_at: Timestamp }>('SELECT erased_at FROM history_erasures WHERE tenant_id = $1 AND user_id = $2', [tenantId, userId])
     return rows[0] ? new Date(rows[0].erased_at).toISOString() : undefined
+  }
+
+  async numbersErasedAt(tenantId: string, numbers: readonly string[]) {
+    if (!numbers.length) return new Map<string, string>()
+    const { rows } = await this.pool.query<{ number: string; at: Timestamp }>(
+      'SELECT n AS number, max(e.erased_at) AS at FROM history_erasures e, unnest(e.numbers) AS n WHERE e.tenant_id = $1 AND n = ANY($2::text[]) GROUP BY n',
+      [tenantId, [...numbers]]
+    )
+    return new Map(rows.map(r => [r.number, new Date(r.at).toISOString()]))
+  }
+
+  async erasedCalls(tenantId: string, from: string, to: string) {
+    const { rows } = await this.pool.query<{ direction: HistoryEntry['direction']; started_at: Timestamp; ended_at: Timestamp }>(
+      'SELECT direction, started_at, ended_at FROM history_erased_calls WHERE tenant_id = $1 AND started_at >= $2 AND started_at <= $3',
+      [tenantId, from, to]
+    )
+    return rows.map(r => ({ direction: r.direction, startedAt: new Date(r.started_at).toISOString(), endedAt: new Date(r.ended_at).toISOString() }))
+  }
+
+  async numberChangedAt(tenantId: string, extension: string, number: string) {
+    const { rows } = await this.pool.query<{ at: Timestamp | null }>(
+      `SELECT max(changed_at) AS at FROM number_changes WHERE tenant_id = $1
+          AND ((kind = 'extension' AND first_number = $2) OR (kind = 'did' AND length(first_number) = length($3) AND first_number <= $3 AND last_number >= $3))`,
+      [tenantId, extension, number]
+    )
+    return rows[0]?.at ? new Date(rows[0].at).toISOString() : undefined
   }
 
   async knownOperatorCdrs(tenantId: string, operator: string, ids: readonly string[]) {
@@ -357,26 +425,26 @@ export class PgStore implements Store {
 
   async historyNear(tenantId: string, q: HistoryNearQuery) {
     // By way, number (call_history_near, remote_e164 as e164Of writes it) or person (call_history_by_user), and time.
+    // Ordered at the millisecond, as the cursor is written (second review 10b, n°13: a start in microseconds, written
+    // by SQL, never brings the same page back).
     const { rows } = await this.pool.query<HistoryRow>(
       `SELECT * FROM call_history
         WHERE tenant_id = $1 AND direction = $2 AND started_at >= $3 AND started_at <= $4 AND NOT operator_only
           AND ($5::text[] IS NULL OR remote_e164 = ANY($5::text[])) AND ($6::text IS NULL OR user_id = $6)
           AND ($7 OR operator_cdr IS NULL)
-          AND ($9::timestamptz IS NULL OR (started_at, call_id COLLATE "C", user_id COLLATE "C") > ($9::timestamptz, $10::text COLLATE "C", $11::text COLLATE "C"))
-        ORDER BY started_at, call_id COLLATE "C", user_id COLLATE "C" LIMIT $8`,
+          AND ($9::timestamptz IS NULL OR (date_trunc('milliseconds', started_at), call_id COLLATE "C", user_id COLLATE "C") > ($9::timestamptz, $10::text COLLATE "C", $11::text COLLATE "C"))
+        ORDER BY date_trunc('milliseconds', started_at), call_id COLLATE "C", user_id COLLATE "C" LIMIT $8`,
       [tenantId, q.direction, q.from, q.to, q.remotes ? [...q.remotes] : null, q.userId ?? null, q.reconciled === true, q.limit, q.after?.startedAt ?? null, q.after?.callId ?? null, q.after?.userId ?? null]
     )
     return rows.map(toEntry)
   }
 
-  async eraseOperatorCdrNumbers(tenantId: string, numbers: readonly string[], before: string) {
-    if (!numbers.length) return 0
-    const r = await this.pool.query(
-      `UPDATE operator_cdrs SET calling = NULL, called = NULL, outcome = coalesce(outcome, 'unmatched')
-        WHERE tenant_id = $1 AND started_at < $3 AND (calling = ANY($2::text[]) OR called = ANY($2::text[]))`,
-      [tenantId, [...numbers], before]
+  async operatorForwardsNear(tenantId: string, operator: string, line: string, from: string, to: string) {
+    const { rows } = await this.pool.query<OperatorCdrRow>(
+      'SELECT * FROM operator_cdrs WHERE tenant_id = $1 AND operator = $2 AND line = $3 AND forwarded AND started_at >= $4 AND started_at <= $5 ORDER BY started_at, id',
+      [tenantId, operator, line, from, to]
     )
-    return r.rowCount ?? 0
+    return rows.map(toOperatorCdr)
   }
 
   async settleOperatorCdrs(tenantId: string, operator: string, outcomes: readonly OperatorCdrOutcome[]) {
@@ -396,9 +464,9 @@ export class PgStore implements Store {
         const { rowCount } = await client.query('SELECT 1 FROM operator_cdrs WHERE tenant_id = $1 AND operator = $2 AND id = $3 AND outcome IS NULL FOR UPDATE', [tenantId, operator, o.id])
         if (!rowCount) continue
         const after = o.outcome === 'orphan' && o.entry ? erased.get(o.entry.userId) : undefined
-        const erase = o.erase === true || (after !== undefined && after >= o.entry!.startedAt)
+        const erase = o.erase === true || o.outcome === 'erased' || (after !== undefined && after >= o.entry!.startedAt)
         if (erase) await client.query('UPDATE operator_cdrs SET calling = NULL, called = NULL WHERE tenant_id = $1 AND operator = $2 AND id = $3', [tenantId, operator, o.id])
-        let outcome: OperatorCdrRecord['outcome'] = o.outcome === 'forwarded' || o.outcome === 'invalid' ? o.outcome : 'unmatched'
+        let outcome: OperatorCdrRecord['outcome'] = o.outcome === 'forwarded' || o.outcome === 'invalid' ? o.outcome : erase ? 'erased' : 'unmatched'
         let callId: string | null = null
         let userId: string | null = null
         if (erase && o.outcome !== 'matched') {
@@ -423,18 +491,22 @@ export class PgStore implements Store {
       'SELECT outcome, direction, count(*) AS n FROM operator_cdrs WHERE tenant_id = $1 AND operator = $2 AND started_at >= $3 GROUP BY outcome, direction',
       [tenantId, operator, since]
     )
-    const stats: OperatorCdrStats = { total: 0, matched: 0, orphan: 0, unmatchedInbound: 0, unmatchedOutbound: 0, forwarded: 0, pending: 0, invalid: 0 }
+    const stats: OperatorCdrStats = { total: 0, matched: 0, orphan: 0, unmatchedInbound: 0, unmatchedOutbound: 0, forwarded: 0, pending: 0, invalid: 0, erased: 0 }
     for (const r of rows) {
       const n = Number(r.n)
       stats.total += n
       if (!r.outcome) stats.pending += n
       else if (r.outcome === 'unmatched') stats[r.direction === 'inbound' ? 'unmatchedInbound' : 'unmatchedOutbound'] += n
-      else if (r.outcome === 'matched' || r.outcome === 'orphan' || r.outcome === 'forwarded' || r.outcome === 'invalid') stats[r.outcome] += n
+      else if (r.outcome === 'matched' || r.outcome === 'orphan' || r.outcome === 'forwarded' || r.outcome === 'invalid' || r.outcome === 'erased') stats[r.outcome] += n
     }
     return stats
   }
 
-  async purgeOperatorCdrs(before: string) {
+  async purgeOperatorCdrs(before: string, keptBefore?: string) {
+    if (keptBefore) {
+      await this.pool.query('DELETE FROM history_erased_calls WHERE started_at < $1', [keptBefore])
+      await this.pool.query('DELETE FROM number_changes WHERE changed_at < $1', [keptBefore])
+    }
     let purged = 0
     for (;;) {
       const r = await this.pool.query('DELETE FROM operator_cdrs WHERE ctid IN (SELECT ctid FROM operator_cdrs WHERE started_at < $1 LIMIT $2)', [before, PURGE_BATCH])
@@ -680,8 +752,15 @@ export class PgStore implements Store {
   }
 
   async deleteTrunk(tenantId: string, id: string) {
-    const r = await this.pool.query('DELETE FROM trunk_configs WHERE tenant_id = $1 AND id = $2', [tenantId, id])
-    return (r.rowCount ?? 0) > 0
+    return this.inTransaction(async client => {
+      // Its direct numbers go with it: they change hands (second review 10b, n°3).
+      await client.query(
+        "INSERT INTO number_changes (tenant_id, kind, first_number, last_number) SELECT tenant_id, 'did', first_number, last_number FROM direct_numbers WHERE tenant_id = $1 AND trunk_id = $2",
+        [tenantId, id]
+      )
+      const r = await client.query('DELETE FROM trunk_configs WHERE tenant_id = $1 AND id = $2', [tenantId, id])
+      return (r.rowCount ?? 0) > 0
+    })
   }
 
   async listDids(tenantId: string): Promise<DidRecord[]> {
@@ -699,17 +778,32 @@ export class PgStore implements Store {
   }
 
   async upsertDid(d: DidRecord) {
-    await this.pool.query(
-      `INSERT INTO direct_numbers (tenant_id, id, trunk_id, first_number, last_number, target, suffix_digits, fallback_target) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-       ON CONFLICT (tenant_id, id) DO UPDATE SET trunk_id = EXCLUDED.trunk_id, first_number = EXCLUDED.first_number, last_number = EXCLUDED.last_number,
-         target = EXCLUDED.target, suffix_digits = EXCLUDED.suffix_digits, fallback_target = EXCLUDED.fallback_target`,
-      [d.tenantId, d.id, d.trunkId, d.first, d.last, d.target ?? null, d.suffixDigits ?? 0, d.fallbackTarget ?? null]
-    )
+    await this.inTransaction(async client => {
+      const { rows } = await client.query<DidRow>('SELECT * FROM direct_numbers WHERE tenant_id = $1 AND id = $2 FOR UPDATE', [d.tenantId, d.id])
+      await client.query(
+        `INSERT INTO direct_numbers (tenant_id, id, trunk_id, first_number, last_number, target, suffix_digits, fallback_target) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         ON CONFLICT (tenant_id, id) DO UPDATE SET trunk_id = EXCLUDED.trunk_id, first_number = EXCLUDED.first_number, last_number = EXCLUDED.last_number,
+           target = EXCLUDED.target, suffix_digits = EXCLUDED.suffix_digits, fallback_target = EXCLUDED.fallback_target`,
+        [d.tenantId, d.id, d.trunkId, d.first, d.last, d.target ?? null, d.suffixDigits ?? 0, d.fallbackTarget ?? null]
+      )
+      const before = rows[0]
+      if (before && before.first_number === d.first && before.last_number === d.last && before.target === (d.target ?? null) && before.suffix_digits === (d.suffixDigits ?? 0)) return
+      // What it rang changes hands (second review 10b, n°3); the numbers it takes too, when they changed hands lately.
+      if (before) await client.query("INSERT INTO number_changes (tenant_id, kind, first_number, last_number) VALUES ($1, 'did', $2, $3)", [d.tenantId, before.first_number, before.last_number])
+      await client.query(
+        `INSERT INTO number_changes (tenant_id, kind, first_number, last_number)
+         SELECT $1, 'did', $2, $3 WHERE EXISTS (SELECT 1 FROM number_changes WHERE tenant_id = $1 AND kind = 'did' AND length(first_number) = length($2) AND first_number <= $3 AND last_number >= $2)`,
+        [d.tenantId, d.first, d.last]
+      )
+    })
   }
 
   async deleteDid(tenantId: string, id: string) {
-    const r = await this.pool.query('DELETE FROM direct_numbers WHERE tenant_id = $1 AND id = $2', [tenantId, id])
-    return (r.rowCount ?? 0) > 0
+    return this.inTransaction(async client => {
+      await client.query("INSERT INTO number_changes (tenant_id, kind, first_number, last_number) SELECT tenant_id, 'did', first_number, last_number FROM direct_numbers WHERE tenant_id = $1 AND id = $2", [tenantId, id])
+      const r = await client.query('DELETE FROM direct_numbers WHERE tenant_id = $1 AND id = $2', [tenantId, id])
+      return (r.rowCount ?? 0) > 0
+    })
   }
 
   async getOutbound(tenantId: string): Promise<OutboundRecord | null> {

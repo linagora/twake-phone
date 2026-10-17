@@ -197,6 +197,23 @@ const listOf = (text: string, max: number, check: (v: string) => boolean, proble
 }
 
 /**
+ * The lines of the form whose settings at the operator a fallback replaces when saved (second review 10b, n°9): all of
+ * them for a first fallback, those added to a trunk that keeps one already. To be read first, and confirmed.
+ */
+export const newOperatorLines = (f: TrunkForm, current: Trunk | null | undefined): string[] => {
+  if (!f.fallbackManaged) return []
+  const kept = current?.operator?.fallback ? current.operator.lines : []
+  return splitList(f.operatorLines).filter(l => !kept.includes(l))
+}
+
+/** The lines a trunk that keeps a fallback no longer names: they lose that forward at the operator when saved (n°8). */
+export const droppedOperatorLines = (f: TrunkForm, current: Trunk | null | undefined): string[] => {
+  if (!current?.operator?.fallback) return []
+  const lines = splitList(f.operatorLines)
+  return current.operator.lines.filter(l => !lines.includes(l))
+}
+
+/**
  * The trunk as the Gateway takes it (PUT /admin/trunks/:id), or what is wrong. `current`: the trunk being changed (its
  * password is kept unless a new one is typed or its removal asked); `ids`: those of the other trunks.
  */
@@ -244,8 +261,9 @@ export const checkTrunk = (f: TrunkForm, ctx: { current?: Trunk; ids: readonly s
   const lines = listOf(f.operatorLines, 16, v => OPERATOR_LINE.test(v), p('admin.trunk.err.operatorLines'))
   if (lines.problem) problems.operatorLines = lines.problem
   else if (f.fallbackManaged && !lines.items) problems.operatorLines = p('admin.trunk.err.operatorLinesNeeded')
-  // A first fallback replaces what the operator's manager set on the lines: never without the administrator's word.
-  if (f.fallbackManaged && !ctx.current?.operator?.fallback && !f.replaceConfirmed) problems.replaceConfirmed = p('admin.trunk.err.replaceConfirmed')
+  // A first fallback replaces what the operator's manager set on the lines, as one on a line added to a trunk that keeps
+  // one already (second review 10b, n°9): never without the administrator's word.
+  if (newOperatorLines(f, ctx.current).length && !f.replaceConfirmed) problems.replaceConfirmed = p('admin.trunk.err.replaceConfirmed')
   const operatorNumber = normaliseNumber(f.operatorNumber)
   const forwards = f.fallbackManaged && (f.onUnavailable || f.onNoAnswer)
   if (forwards && !E164.test(operatorNumber)) problems.operatorNumber = p('admin.trunk.err.operatorNumber')
@@ -495,7 +513,8 @@ const GENERAL: Record<string, Key> = {
   OPERATOR_FALLBACK_LOOP: 'admin.err.operatorLoop',
   OPERATOR_LINE_SHARED: 'admin.err.operatorLineShared',
   OPERATOR_NO_LINES: 'admin.err.operatorNoLines',
-  OPERATOR_RATE: 'admin.err.operatorRate'
+  OPERATOR_RATE: 'admin.err.operatorRate',
+  OPERATOR_ROUND: 'admin.err.operatorRound'
 }
 
 /** The words of GENERAL that name a number. */
