@@ -18,6 +18,26 @@ if (process.env.TEST_DATABASE_URL) {
   })
 
   describe('PgStore, the claim of the webhook queue under a backlog', () => {
+    // The time of the claim kept to the microsecond: read into a Date, it fell to the start of its millisecond, before
+    // a delivery queued later in that millisecond, left out (second review 10b: one of two just queued, 20 in 300).
+    it('claims a delivery queued in the same millisecond as the claim, earlier in it', async () => {
+      const store = new PgStore(process.env.TEST_DATABASE_URL!)
+      await store.migrate()
+      const tenant = `micro-${Date.now()}`
+      const id = `wh_${Date.now().toString(16).padStart(16, '0').slice(-16)}`
+      const now = new Date().toISOString()
+      try {
+        await store.addWebhookSubscription({ tenantId: tenant, id, url: 'https://crm.example.org/in', events: ['call.missed'], enabled: true, secretEnc: 'enc', failures: 0, createdAt: now, updatedAt: now }, 20)
+        await store.enqueueWebhookEvent(tenant, 'evt_1', 'call.missed', '{}', '2020-01-01T10:00:00.000100Z')
+        await store.enqueueWebhookEvent(tenant, 'evt_2', 'call.missed', '{}', '2020-01-01T10:00:00.000500Z')
+        const claimed = await store.claimWebhookDeliveries(10, { perSubscription: 10, perTenant: 10, maxAttempts: 9 }, { now: '2020-01-01T10:00:00.000900Z', leaseUntil: '2020-01-01T10:01:00.000900Z' })
+        expect(claimed.filter(d => d.tenantId === tenant).map(d => d.eventId).sort()).toEqual(['evt_1', 'evt_2'])
+      } finally {
+        await store.deleteWebhookSubscription(tenant, id)
+        await store.close()
+      }
+    })
+
     it('costs what is claimed, not what waits: 100 000 pending deliveries, half of them paused, a claim within a bound', async () => {
       const store = new PgStore(process.env.TEST_DATABASE_URL!)
       await store.migrate()

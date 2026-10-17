@@ -1143,8 +1143,11 @@ export class PgStore implements Store {
     if (limit <= 0) return []
     const claim = randomBytes(12).toString('hex')
     return this.inTransaction(async client => {
-      const { rows: times } = await client.query<{ now: Date; lease: Date }>(
-        "SELECT coalesce($1::timestamptz, now()) AS now, coalesce($2::timestamptz, coalesce($1::timestamptz, now()) + $3 * interval '1 millisecond') AS lease",
+      // Kept as the database writes them, to the microsecond: read into a Date (milliseconds), the time of the claim
+      // would fall before a delivery queued in its last millisecond, left out of a claim it is due for (second review
+      // 10b: one of two deliveries just queued claimed, 20 times in 300 on a fast database).
+      const { rows: times } = await client.query<{ now: string; lease: string }>(
+        "SELECT coalesce($1::timestamptz, now())::text AS now, coalesce($2::timestamptz, coalesce($1::timestamptz, now()) + $3 * interval '1 millisecond')::text AS lease",
         [at?.now ?? null, at?.leaseUntil ?? null, caps.leaseMs ?? 60_000]
       )
       const { now, lease } = times[0]!
