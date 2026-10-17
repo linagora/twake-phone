@@ -14,6 +14,7 @@ import { Numbers } from './pages/admin/Numbers.js'
 import { Rights } from './pages/admin/Rights.js'
 import { RingGroups } from './pages/admin/RingGroups.js'
 import { Trunks } from './pages/admin/Trunks.js'
+import { Webhooks } from './pages/admin/Webhooks.js'
 import { Dialer } from './pages/Dialer.js'
 import { ContactPage } from './pages/ContactPage.js'
 import { Directory } from './pages/Directory.js'
@@ -50,6 +51,7 @@ const Gate = ({ config }: { config: AppConfig }) => {
                   <Route path="rights" element={<Rights />} />
                   <Route path="limits" element={<Limits />} />
                   <Route path="alerts" element={<Alerts />} />
+                  <Route path="webhooks" element={<Webhooks />} />
                   <Route path="*" element={<Navigate to="/admin" replace />} />
                 </Route>
                 <Route path="*" element={<Navigate to="/" replace />} />

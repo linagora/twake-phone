@@ -5,17 +5,22 @@ const ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789
 /** Random alphanumeric secret (no modulo bias: randomInt is uniform). */
 export const generateSecret = (length = 24): string => Array.from({ length }, () => ALPHABET[randomInt(ALPHABET.length)]).join('')
 
-/** AES-256-GCM. Output: base64(iv | tag | ciphertext). */
-export const encrypt = (plain: string, key: Buffer): string => {
+/**
+ * AES-256-GCM. Output: base64(iv | tag | ciphertext). `aad`: what the value belongs to (authenticated, not stored): a
+ * value copied to another row, whose `aad` differs, does not decrypt.
+ */
+export const encrypt = (plain: string, key: Buffer, aad?: string): string => {
   const iv = randomBytes(12)
   const cipher = createCipheriv('aes-256-gcm', key, iv)
+  if (aad !== undefined) cipher.setAAD(Buffer.from(aad, 'utf8'))
   const body = Buffer.concat([cipher.update(plain, 'utf8'), cipher.final()])
   return Buffer.concat([iv, cipher.getAuthTag(), body]).toString('base64')
 }
 
-export const decrypt = (encoded: string, key: Buffer): string => {
+export const decrypt = (encoded: string, key: Buffer, aad?: string): string => {
   const raw = Buffer.from(encoded, 'base64')
   const decipher = createDecipheriv('aes-256-gcm', key, raw.subarray(0, 12))
+  if (aad !== undefined) decipher.setAAD(Buffer.from(aad, 'utf8'))
   decipher.setAuthTag(raw.subarray(12, 28))
   return Buffer.concat([decipher.update(raw.subarray(28)), decipher.final()]).toString('utf8')
 }

@@ -255,7 +255,26 @@ export const ProblemSummary = ({ count }: { count: number }) => {
  * A delete button that asks first: "Delete X?" then yes or no, in a group named by the question (the yes button gets
  * the focus, Escape or no puts it back on the delete button; after yes, the page puts it on what it says).
  */
-export const ConfirmDelete = ({ label, question, onConfirm, disabled, yes = 'admin.confirm.yes', no = 'admin.confirm.no' }: { label: string; question: string; onConfirm: () => void; disabled?: boolean; yes?: Key; no?: Key }) => {
+export const ConfirmDelete = ({
+  label,
+  question,
+  onConfirm,
+  disabled,
+  yes = 'admin.confirm.yes',
+  no = 'admin.confirm.no',
+  action = 'admin.delete',
+  tone = 'danger'
+}: {
+  label: string
+  question: string
+  onConfirm: () => void
+  disabled?: boolean
+  yes?: Key
+  no?: Key
+  /** The button that asks: Delete unless said (a new secret, which also undoes something, asks the same way). */
+  action?: Key
+  tone?: 'danger' | 'plain'
+}) => {
   const { t } = useT()
   const [asking, setAsking] = useState(false)
   const button = useRef<HTMLButtonElement>(null)
@@ -271,8 +290,8 @@ export const ConfirmDelete = ({ label, question, onConfirm, disabled, yes = 'adm
   }
   if (!asking)
     return (
-      <button ref={button} type="button" className="btn btn-danger" onClick={() => setAsking(true)} disabled={disabled} aria-label={label}>
-        {t('admin.delete')}
+      <button ref={button} type="button" className={tone === 'danger' ? 'btn btn-danger' : 'btn'} onClick={() => setAsking(true)} disabled={disabled} aria-label={label}>
+        {t(action)}
       </button>
     )
   return (

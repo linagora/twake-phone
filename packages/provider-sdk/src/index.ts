@@ -32,6 +32,11 @@ export interface TelephonyProvider {
   getStatus(): ProviderStatus
   /** Why the status is not CONNECTED, in a few words without addresses or secrets (it may be shown unauthenticated). */
   getStatusReason?(): string | undefined
+  /**
+   * Whether the provider hears its events now: false while its stream is down (the Gateway leaves telling the changes
+   * of state to another one that hears them, ADR 0020). Absent: it has no stream to lose.
+   */
+  eventsConnected?(): boolean
   getCapabilities(): Promise<Capabilities>
   getPresence(user: User): Promise<Presence>
   setPresence(user: User, presence: Presence): Promise<void>

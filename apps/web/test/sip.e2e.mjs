@@ -47,8 +47,10 @@ import { storedOpensipsFactory } from '../../gateway/dist/providers.js'
 import { ProviderRegistry } from '../../gateway/dist/registry.js'
 import { SubscriberProvisioner } from '../../../packages/provider-opensips/dist/subscriber.js'
 import { MemoryStore } from '../../gateway/dist/store/memory.js'
+import { parseNetworks } from '../../gateway/dist/webhook-delivery.js'
 import { BASE_DN, PEOPLE, READER_DN, READER_PASSWORD, startLdapMock } from '../../gateway/test/ldap-mock.mjs'
 import { startPushService } from '../../gateway/test/push-service.mjs'
+import { startWebhookReceiver } from '../../gateway/test/webhook-receiver.mjs'
 import { startOidcMock } from './oidc-mock.mjs'
 import { serveApp } from '../server/serve.mjs'
 import { sipUa } from './sip-ua.mjs'
@@ -263,7 +265,22 @@ const shortBridge = new LiveKitConferenceBridge({
 let activeBridge = bridge
 const conference = { bridge: () => activeBridge, accessNumber: MEET_NUMBER, webhookKey: LIVEKIT_API_KEY, webhookSecret: LIVEKIT_API_SECRET }
 // A call with the public network whose person has no window left is ended after 3 s here (30 s by default).
-const gateway = await buildApp(registry, { auth, store, contacts, directorySync, push, secretsKey: key, admin: { adminRole: 'twakephone-admin', adminUsers: new Set() }, conference })
+// Step 10a: the tool an administrator subscribes to the webhooks, on this host (the operator opens the loopback to
+// the deliveries and allows http and its port: WEBHOOK_PRIVATE_NETWORKS, WEBHOOK_ALLOW_HTTP=1, WEBHOOK_PORTS); the
+// trunks read every 2 s.
+const receiver = await startWebhookReceiver()
+const gateway = await buildApp(registry, {
+  auth,
+  store,
+  contacts,
+  directorySync,
+  push,
+  secretsKey: key,
+  admin: { adminRole: 'twakephone-admin', adminUsers: new Set() },
+  conference,
+  webhooks: { policy: { allowHttp: true, ports: [Number(new URL(receiver.url).port)] }, open: parseNetworks('127.0.0.1/32'), retryBaseMs: 1_000 },
+  trunkWatchMs: 2_000
+})
 // LiveKit's webhooks as the Gateway answered them: signed with its key, each one 204.
 const livekitWebhooks = []
 gateway.addHook('onResponse', async (req, reply) => {
@@ -612,7 +629,18 @@ try {
     await alice.page.getByTestId('presence-102').filter({ hasText: 'Disponible' }).waitFor({ timeout: PRESENCE_MS })
     await jean.page.getByTestId('presence-101').filter({ hasText: 'Disponible' }).waitFor({ timeout: PRESENCE_MS })
   })
-  await step('Alice calls Jean and gives up while it rings: a missed call for Jean, in his Récents and in missed_calls (487)', async () => {
+  await step('step 10a: Alice, an administrator, subscribes a tool of the organisation to the missed calls and the trunks degraded (its domain allowed first); a test reaches it, signed', async () => {
+    const api = await asPerson(alice)
+    expectEqual((await api('PUT', '/webhooks/domains', { domains: ['127.0.0.1'] })).statusCode, 200, 'PUT /webhooks/domains')
+    const made = await api('POST', '/webhooks', { url: `${receiver.url}/twakephone`, events: ['call.missed', 'trunk.degraded'], description: 'CRM' })
+    expectEqual(made.statusCode, 201, 'POST /webhooks')
+    receiver.secret = made.json().secret
+    expectEqual((await api('POST', `/webhooks/${made.json().id}/test`)).statusCode, 202, 'POST /webhooks/:id/test')
+    const test = await receiver.waitFor(e => e?.type === 'webhook.test', 'webhook.test')
+    expectEqual(test.verified, true, 'signature of the test')
+  })
+  await step('Alice calls Jean and gives up while it rings: a missed call for Jean, in his Récents and in missed_calls (487), and a signed call.missed for the tool', async () => {
+    const delivered = receiver.received.length
     await dial(alice.page, '102')
     await jean.page.getByTestId('incoming-call').waitFor()
     await alice.page.getByRole('button', { name: 'Raccrocher' }).click()
@@ -621,6 +649,12 @@ try {
     expectEqual((await recents(alice.page, 5)).slice(0, 2), ['102: Sortant', '102: Entrant'], "Alice's newest recent calls")
     const missed = await db.query("SELECT caller, callee, sip_code FROM missed_calls WHERE sip_code = '487' AND id > $1", [since.missed_calls])
     expectEqual(missed.rows.map(r => `${r.caller}>${r.callee}`), ['101>102'], 'cancelled call in missed_calls')
+    // The tool hears it from the Gateway: who called whom, for whom, signed with the secret it was shown.
+    const hook = await receiver.waitFor((e, d) => e?.type === 'call.missed' && receiver.received.indexOf(d) >= delivered, 'call.missed')
+    expectEqual(hook.verified, true, 'signature of call.missed')
+    const c = hook.event.call
+    expectEqual(JSON.stringify([c.direction, c.from, c.to, c.user, c.extension, c.outcome, c.duration_sec]), JSON.stringify(['inbound', '101', '102', 'jdupont', '102', 'missed', 0]), 'the missed call as the tool reads it')
+    expectEqual(hook.headers['idempotency-key'], hook.event.id, 'idempotency key')
   })
   await step('Alice gives up while OpenSIPS still reads the rules of 102 (a slow database): 487, a missed call for Jean, nobody left in a call', async () => {
     const missedFrom = await lastId('missed_calls')
@@ -2331,6 +2365,11 @@ try {
       expectEqual(ended.endStatus, 486, 'how the call ended (the second server busy)')
       if (Date.now() - started > 4_000) throw new Error(`the call waited ${Date.now() - started} ms: the dead server was tried first`)
       expectEqual(operator.state.attempts.length, attempts, 'calls the dead server was sent')
+      // Step 10a: what OpenSIPS knows of the trunk, read by the Gateway, told to the tool once: trunk.degraded.
+      const hook = await receiver.waitFor(e => e?.type === 'trunk.degraded' && e.trunk.servers.some(x => x.address === operator.address && x.state === 'probing'), 'trunk.degraded', 30_000)
+      expectEqual(hook.verified, true, 'signature of trunk.degraded')
+      if (!['degraded', 'down'].includes(hook.event.trunk.state)) throw new Error(`trunk.degraded: state ${hook.event.trunk.state}`)
+      expectEqual(hook.event.trunk.id, 'operator', 'the trunk degraded')
     } finally {
       operator.state.dead = false
     }
@@ -2850,6 +2889,7 @@ try {
   await dtmf?.stop()
   await operator.close()
   await operator2.close()
+  await receiver.stop()
   await db.end()
 }
 process.exit(failed ? 1 : 0)
