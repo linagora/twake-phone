@@ -596,7 +596,11 @@ describe('the webhook hub', () => {
   })
 
   it('takes no lease back after it stopped, however late the renewal under way ends (review 10a, second, n°6)', async () => {
-    const store = await setup()
+    // A clock a millisecond further at each reading, the store's too: the hub's reckoning of it comes out exact, its
+    // window open at once (never a fraction of a millisecond late, which would put off what it tells).
+    let t = Date.parse('2026-01-05T09:00:00.000Z')
+    const now = () => t++
+    const store = await setup({}, now)
     const clock = store.clock.bind(store)
     const slowClock = gate()
     let reads = 0
@@ -605,7 +609,7 @@ describe('the webhook hub', () => {
       return clock()
     }
     let leads = 0
-    const { hub } = hubOn(store, () => 204, { stateLeaseMs: 60_000 })
+    const { hub } = hubOn(store, () => 204, { stateLeaseMs: 60_000, now })
     hub.onLead(() => void leads++)
     await hub.renewLease()
     expect([hub.leading, leads]).toEqual([true, 1])

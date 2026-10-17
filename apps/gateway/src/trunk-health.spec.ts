@@ -30,7 +30,12 @@ describe('the watch over the trunks', () => {
   const ONE_OUT = [{ address: '192.0.2.10:5060', state: 'probing' as const }, { address: '192.0.2.11:5060', state: 'up' as const }]
   const ALL_OUT = [{ address: '192.0.2.10:5060', state: 'probing' as const }, { address: '192.0.2.11:5060', state: 'probing' as const }]
   const setup = async (confirm = 2) => {
-    const store = new MemoryStore()
+    // One clock for the store and the Gateways, a millisecond further at each reading: the hub's reckoning of the
+    // database's clock comes out exact, never a fraction of a millisecond behind the lease it just took (which would
+    // keep it from telling for that long, the first reads unwritten).
+    let t = Date.parse('2026-01-05T09:00:00.000Z')
+    const now = () => t++
+    const store = new MemoryStore(now)
     let writes = 0
     const write = store.setWebhookState.bind(store)
     store.setWebhookState = (...args) => {
@@ -43,11 +48,11 @@ describe('the watch over the trunks', () => {
     let status: TrunkStatus[] | undefined = [trunk(UP)]
     let names = new Map([['tr1', 'Opérateur principal']])
     const gateway = async (tenants = ['acme'], stateLeaseMs = 60_000, takesOver = false) => {
-      const hub = new WebhookHub({ store, key: randomBytes(32), logger: quiet, stateLeaseMs })
+      const hub = new WebhookHub({ store, key: randomBytes(32), logger: quiet, stateLeaseMs, now })
       await hub.renewLease()
       // Taking over from a Gateway that held the lease: once what that one could still write is done (a third of it).
       for (let i = 0; takesOver && i < 100 && !hub.leading; i++) {
-        await new Promise(r => setTimeout(r, 20))
+        t += 20
         await hub.renewLease()
       }
       const watch = new TrunkWatch({
@@ -62,7 +67,7 @@ describe('the watch over the trunks', () => {
       return { hub, watch }
     }
     const told = async () => (await store.listWebhookDeliveries('acme', 'wh_00000000000000c1')).reverse().map(d => JSON.parse(d.body) as TrunkEvent)
-    return { store, told, gateway, subscribe, writes: () => writes, set: (s: TrunkStatus[] | undefined) => (status = s), setNames: (n: Map<string, string>) => (names = n) }
+    return { store, now, told, gateway, subscribe, writes: () => writes, set: (s: TrunkStatus[] | undefined) => (status = s), setNames: (n: Map<string, string>) => (names = n) }
   }
   type TrunkEvent = Extract<WebhookEvent, { type: 'trunk.degraded' | 'trunk.recovered' }>
   const steps = (events: TrunkEvent[]) => events.map(e => [e.type, e.trunk.state, e.trunk.previous])
@@ -200,9 +205,9 @@ describe('the watch over the trunks', () => {
   })
 
   it('reads several tenants at a time, and says when a round runs over the next one', async () => {
-    const { store } = await setup()
+    const { store, now } = await setup()
     const warned: string[] = []
-    const hub = new WebhookHub({ store, key: randomBytes(32), logger: quiet, stateLeaseMs: 60_000 })
+    const hub = new WebhookHub({ store, key: randomBytes(32), logger: quiet, stateLeaseMs: 60_000, now })
     await hub.renewLease()
     let reading = 0
     let most = 0
