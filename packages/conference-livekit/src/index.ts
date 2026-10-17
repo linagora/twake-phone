@@ -99,7 +99,9 @@ export class LiveKitConferenceBridge implements ConferenceBridgeProvider {
   constructor(
     private readonly config: LiveKitConferenceConfig,
     /** A whole number from 0 to `max` excluded: crypto's randomInt (a test seam). */
-    private readonly random: (max: number) => number = max => randomInt(0, max)
+    private readonly random: (max: number) => number = max => randomInt(0, max),
+    /** The Gateway's clock, in milliseconds since the epoch: when it dials a call of a room (a test seam). */
+    private readonly now: () => number = Date.now
   ) {
     if (!config.inboundAddresses?.some(a => a.trim())) throw new Error("LiveKit SIP needs the addresses it takes calls from (the PBX's): LiveKit refuses an inbound trunk without them")
     this.api = new LiveKitApi(config.url, config.apiKey, config.apiSecret, config.fetch, REQUEST_TIMEOUT_MS)
@@ -309,6 +311,9 @@ export class LiveKitConferenceBridge implements ConferenceBridgeProvider {
     // conference's room, whose numbers of the public network are masked; the number is in the attributes.
     const identity = `phone-${[0, 1].map(() => this.random(2 ** 40).toString(16).padStart(10, '0')).join('')}`
     const ringingSec = this.config.ringingTimeoutSec ?? 30
+    // When the Gateway dials it, in milliseconds (third review of the conference notice, n°2): the time a call of the
+    // room came in (it is in the room from its dialling), whatever the precision of the LiveKit it talks to.
+    const attributes = { 'twake.kind': 'phone', 'twake.number': number, 'twake.dialedAt': String(this.now()) }
     let answered: { sip_call_id?: unknown } | undefined
     try {
       answered = await this.withTrunk('out', trunk =>
@@ -323,7 +328,7 @@ export class LiveKitConferenceBridge implements ConferenceBridgeProvider {
             room_name: meetingId,
             participant_identity: identity,
             participant_name: this.display(number),
-            participant_attributes: { 'twake.kind': 'phone', 'twake.number': number },
+            participant_attributes: attributes,
             wait_until_answered: true,
             ringing_timeout: `${ringingSec}s`,
             max_call_duration: `${this.config.maxCallSec ?? 7200}s`
@@ -339,7 +344,7 @@ export class LiveKitConferenceBridge implements ConferenceBridgeProvider {
     // The id LiveKit gave the call (`SCL_…`): LiveKit SIP writes it as the From tag of its INVITE, which the PBX keeps
     // with the grant the call took (review 8b, n°3).
     const sipCallId = typeof answered?.sip_call_id === 'string' && answered.sip_call_id ? answered.sip_call_id : undefined
-    return { ...this.toParticipant(meetingId, { identity, name: this.display(number), attributes: { 'twake.kind': 'phone', 'twake.number': number } }), ...(sipCallId ? { sipCallId } : {}) }
+    return { ...this.toParticipant(meetingId, { identity, name: this.display(number), attributes }), ...(sipCallId ? { sipCallId } : {}) }
   }
 
   /**
@@ -408,10 +413,26 @@ export class LiveKitConferenceBridge implements ConferenceBridgeProvider {
     return new Set((res.rooms ?? []).flatMap(r => (r.name && names.includes(r.name) ? [r.name] : [])))
   }
 
-  /** Participants currently in the room (web and phone), numbers filtered by the privacy setting. */
-  async listParticipants(meetingId: string): Promise<ConferenceParticipant[]> {
+  /**
+   * Participants currently in the room (web and phone), numbers filtered by the privacy setting, each with when it came
+   * in (`joinedAt`, in milliseconds, on one clock for the whole list: a call the room places is in it from its
+   * dialling, ringing included). `you`: the
+   * SIP Call-ID of the reader's own call (sip.callIDFull), whose participant is marked `you`: it tells nothing of the
+   * others' calls, and nothing to whoever does not have that Call-ID already.
+   */
+  async listParticipants(meetingId: string, { you }: { you?: string } = {}): Promise<ConferenceParticipant[]> {
     const res = await this.api.call<{ participants?: LkParticipant[] }>('livekit.RoomService', 'ListParticipants', { room: meetingId })
-    return (res.participants ?? []).map(p => this.toParticipant(meetingId, p))
+    const participants = res.participants ?? []
+    // The Gateway's clock when every participant has its time (the calls of a call's room, all dialled by it), else
+    // LiveKit's milliseconds when every one has them (64-bit numbers come as strings), else none: never two clocks in a
+    // list, and never LiveKit's whole seconds (joined_at), where a call placed within the second of another's looks
+    // there before it (third review of the conference notice, n°2).
+    const clocks: ((p: LkParticipant) => unknown)[] = [p => p.attributes?.['twake.dialedAt'], p => p.joined_at_ms]
+    const times = clocks.map(at => participants.map(p => Number(at(p) ?? 0))).find(ts => ts.every(t => Number.isSafeInteger(t) && t > 0))
+    return participants.map((p, i) => {
+      const participant = { ...this.toParticipant(meetingId, p), ...(times ? { joinedAt: times[i]! } : {}) }
+      return you && p.attributes?.['sip.callIDFull'] === you ? { ...participant, you: true } : participant
+    })
   }
 
   /** Maps a LiveKit webhook event to a Twake conference event, or undefined for events we do not expose. */
@@ -470,4 +491,5 @@ interface LkParticipant {
   kind?: number | string
   attributes?: Record<string, string>
   tracks?: { sid?: string; type?: string | number; muted?: boolean }[]
+  joined_at_ms?: string | number
 }

@@ -223,6 +223,18 @@ describe('dial-out and moderation', () => {
     expect(p.id).not.toContain('612345678')
   })
 
+  it("writes when the Gateway dials a call, in milliseconds by its own clock, in the call's attributes (third review of the notice, n°2)", async () => {
+    const lk = fakeLiveKit({ 'livekit.SIP/ListSIPOutboundTrunk': { items: [{ sip_trunk_id: 'O', name: 'twake-meet-out' }] } })
+    const config = { url: 'http://lk', apiKey: 'k', apiSecret: 's', dialInNumbers: [], inboundAddresses: ['192.0.2.30'], outboundAddress: 'pbx:5060', fetch: lk.fetch }
+    const bridge = new LiveKitConferenceBridge(config, max => Math.floor(0.5 * max), () => 1792171400123)
+    await bridge.dialParticipant('room', '102', { from: '101' })
+    expect(lk.calls.find(c => c.path === 'livekit.SIP/CreateSIPParticipant')!.body.participant_attributes).toEqual({
+      'twake.kind': 'phone',
+      'twake.number': '102',
+      'twake.dialedAt': '1792171400123'
+    })
+  })
+
   it('carries the SIP server\'s grant of the call and bounds its length (review n°1, n°5)', async () => {
     const { bridge, calls } = make({ 'livekit.SIP/ListSIPOutboundTrunk': { items: [{ sip_trunk_id: 'O', name: 'twake-meet-out' }] } }, { maxCallSec: 600 })
     await bridge.dialParticipant('room', '0199000024', { from: '101', grant: '0123456789abcdef0123456789abcdef' })
@@ -371,6 +383,62 @@ describe('dial-out and moderation', () => {
       { id: 'twake-call-0123456789abcdef:web-1', number: '' }
     ])
     expect(calls[0]).toMatchObject({ path: 'livekit.RoomService/ListParticipants', body: { room: 'twake-call-0123456789abcdef' } })
+  })
+
+  it("says when each participant came in, on one clock in milliseconds, and which one is the reader's own call (step 8b)", async () => {
+    const list = async (participants: unknown[], you?: string) => {
+      const { bridge } = make({ 'livekit.RoomService/ListParticipants': { participants } })
+      return (await bridge.listParticipants('twake-call-0123456789abcdef', you ? { you } : {})).map(p => [p.joinedAt, p.you])
+    }
+    const phone = (number: string, more: Record<string, unknown> = {}, attributes: Record<string, string> = {}) => ({
+      identity: `phone-${number}`,
+      ...more,
+      attributes: { 'twake.kind': 'phone', 'twake.number': number, ...attributes }
+    })
+    // Every call dialled by the Gateway: its time wins over LiveKit's, whatever LiveKit's precision.
+    expect(
+      await list(
+        [
+          phone('101', { joined_at: '1792171400', joined_at_ms: '1792171400250' }, { 'twake.dialedAt': '1792171400100', 'sip.callIDFull': 'a1b2@192.0.2.30' }),
+          phone('102', { joined_at: '1792171400' }, { 'twake.dialedAt': '1792171400900', 'sip.callIDFull': 'c3d4@192.0.2.30' })
+        ],
+        'c3d4@192.0.2.30'
+      )
+    ).toEqual([
+      [1792171400100, undefined],
+      [1792171400900, true]
+    ])
+    // One without it: LiveKit's milliseconds for all (64-bit numbers as strings or numbers), never two clocks in a list.
+    expect(
+      await list([
+        phone('101', { joined_at_ms: '1792171400250' }, { 'twake.dialedAt': '1792171400100' }),
+        phone('102', { joined_at_ms: 1792171403999 }),
+        { identity: 'web-1', joined_at_ms: '1792171404000', attributes: {} }
+      ])
+    ).toEqual([
+      [1792171400250, undefined],
+      [1792171403999, undefined],
+      [1792171404000, undefined]
+    ])
+    // LiveKit's whole seconds only, for one or for all: none (third review of the notice, n°2), nor with zero or nothing.
+    expect(await list([phone('101', { joined_at: '1792171400' }), phone('102', { joined_at: '1792171400' })])).toEqual([
+      [undefined, undefined],
+      [undefined, undefined]
+    ])
+    expect(await list([phone('101', { joined_at_ms: '1792171400250' }), phone('102', { joined_at: 1792171401 })])).toEqual([
+      [undefined, undefined],
+      [undefined, undefined]
+    ])
+    expect(
+      await list([
+        { identity: 'web-1', attributes: {} },
+        { identity: 'web-2', joined_at: '0', joined_at_ms: '0', attributes: { 'twake.dialedAt': 'soon' } }
+      ])
+    ).toEqual([
+      [undefined, undefined],
+      [undefined, undefined]
+    ])
+    expect(await list([phone('101', {}, { 'sip.callIDFull': 'a1b2@192.0.2.30' })], 'other@192.0.2.30')).toEqual([[undefined, undefined]])
   })
 
   it('tells which of some rooms LiveKit has (ListRooms, step 8b), asking nothing for none', async () => {

@@ -224,6 +224,18 @@ jobs:
           PILOT_URL: https://twakephone.test
           PILOT_RESOLVE: 127.0.0.1
           PILOT_INSECURE: '1'
+      # Le Call-ID qu'un panneau de conférence envoie (X-Twake-Call) ne reste dans aucun journal de Caddy : celui des
+      # accès, et celui des erreurs, où va une requête que la passerelle ne reçoit pas (502 pendant qu'elle redémarre).
+      - name: Caddy ne journalise pas X-Twake-Call, même en 502
+        working-directory: docker/pilot
+        run: |
+          probe() { curl -sk -o /dev/null -w '%{http_code}' -H 'X-Twake-Call: logprobe@192.0.2.96' https://twakephone.test/api/v1/conferences/logprobe; }
+          up=$(probe); docker compose stop gateway; down=$(probe); docker compose start gateway
+          echo "Gateway up: $up, stopped: $down"
+          test "$down" = 502
+          docker compose logs --no-color caddy > "$RUNNER_TEMP/caddy.log"
+          grep -q -E 'http\.log\.error.*conferences/logprobe' "$RUNNER_TEMP/caddy.log" || { echo "No error log line for the 502"; exit 1; }
+          if grep -i -e 'logprobe@' -e 'x-twake-call' "$RUNNER_TEMP/caddy.log"; then echo "X-Twake-Call in Caddy's logs"; exit 1; fi
       # Un second démarrage sur les mêmes volumes (royaume déjà importé, base et annuaire déjà là), comme après un
       # redémarrage de la machine.
       - name: Arrêt et second démarrage du kit, e2e rejoué
