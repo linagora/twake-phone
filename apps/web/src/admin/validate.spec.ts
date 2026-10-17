@@ -124,6 +124,16 @@ describe('the trunk form (step 7)', () => {
     expect(checkTrunk({ ...operator, countries: '32' }, { ids: [] }).problems.countries?.key).toBe('admin.trunk.err.countriesWithout')
   })
 
+  it('asks the word of the administrator before a first fallback at the operator replaces what is set there (review 10b, n°13)', () => {
+    const managed: TrunkForm = { ...operator, operatorLines: '0033199000100', fallbackManaged: true, operatorNumber: '+33639980001', onUnavailable: true }
+    expect(checkTrunk(managed, { ids: [] }).problems).toEqual({ replaceConfirmed: { key: 'admin.trunk.err.replaceConfirmed' } })
+    expect(checkTrunk({ ...managed, replaceConfirmed: true }, { ids: [] }).input?.operator).toEqual({ lines: ['0033199000100'], fallback: { number: '+33639980001', onUnavailable: true } })
+    // Kept already: nothing more to confirm; none asked: neither.
+    expect(checkTrunk(managed, { current: { ...kept, operator: { lines: ['0033199000100'], fallback: { number: '+33639980001', onUnavailable: true } } }, ids: ['operator'] }).problems).toEqual({})
+    expect(checkTrunk({ ...managed, fallbackManaged: false }, { ids: [] }).problems).toEqual({})
+    expect(trunkRefusal(refused(409, 'OPERATOR_LINE_SHARED', 'operator.lines: trunk b keeps another fallback on 0033199000100: one fallback a line'))).toEqual({ field: 'form', problem: { key: 'admin.err.operatorLineShared' } })
+  })
+
   it('refuses what the Gateway refuses: a short number as fallback, a bad port, a period out of bounds', () => {
     const { problems } = checkTrunk({ ...operator, fallbackTarget: '112', proxies: 'sip.example:70000', registerExpires: '30', codecs: [] }, { ids: [] })
     expect(Object.keys(problems).sort()).toEqual(['codecs', 'fallbackTarget', 'proxies', 'registerExpires'])

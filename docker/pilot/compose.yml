@@ -246,7 +246,7 @@ services:
       WEBHOOK_DENY_NETWORKS:
       # OVHcloud, the operator of the trunks (step 10b, ADR 0021): the keys of an application and its consumer key,
       # and the billing account whose lines carry the trunks (all four, or none: no operator). OVH_ENDPOINT: ovh-eu by
-      # default, ovh-ca or ovh-us. Kept in .env only, never in the database.
+      # default, ovh-ca or ovh-us, nothing else (no URL; alone, it stops the Gateway). Kept in .env only, never in the database.
       OVH_APPLICATION_KEY:
       OVH_APPLICATION_SECRET:
       OVH_CONSUMER_KEY:

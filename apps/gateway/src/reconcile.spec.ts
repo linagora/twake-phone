@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { e164Of, extensionOfDid, matchCdrs } from './reconcile.js'
+import { directNumbersOf, e164Of, extensionOfDid, matchCdrs } from './reconcile.js'
 import type { HistoryEntry, OperatorCdrRecord } from './store/types.js'
 
 // Fictional numbers only (ARCEP: 01 99 00 xx xx, 06 39 98 xx xx).
@@ -59,5 +59,35 @@ describe('the reconciliation of the operator records with the history', () => {
     expect(extensionOfDid(dids, '0199000135')).toBe('135')
     expect(extensionOfDid(dids, '+33199000140')).toBeUndefined()
     expect(extensionOfDid(dids, '+3319900013')).toBeUndefined()
+  })
+
+  it('pairs what the first pass left when loose: durations apart (forwarded on no answer), a caller the platform did not see (review 10b, n°17)', () => {
+    const missed = call('c1', { durationSec: 0, answered: false, state: 'missed', endedAt: '2026-10-17T10:00:30.000Z' })
+    // Missed here, answered at the operator (it forwarded it on no answer): two calls for the first pass, one loose.
+    expect(matchCdrs([cdr('r1', { durationSec: 95 })], [missed]).size).toBe(0)
+    expect(matchCdrs([cdr('r1', { durationSec: 95 })], [missed], { loose: true })).toEqual(new Map([['r1', 'c1']]))
+    // A hidden caller: `anonymous` here, a number there; inbound only, and never a call already paired.
+    const hidden = call('c2', { remoteNumber: 'anonymous' })
+    expect(matchCdrs([cdr('r2')], [hidden]).size).toBe(0)
+    expect(matchCdrs([cdr('r2')], [hidden], { loose: true })).toEqual(new Map([['r2', 'c2']]))
+    expect(matchCdrs([cdr('r2', { direction: 'outbound', called: '+33639980001' })], [call('c3', { direction: 'outbound', remoteNumber: 'anonymous' })], { loose: true }).size).toBe(0)
+    expect(matchCdrs([cdr('r2')], [hidden], { loose: true, taken: new Set(['c2']) }).size).toBe(0)
+    // Never a record that is no call, even loose.
+    expect(matchCdrs([cdr('r3', { invalid: 'wayType conference' })], [call('c1')], { loose: true }).size).toBe(0)
+  })
+
+  it('finds the direct numbers that ring an extension: the ranges aimed at it, the numbers of a range whose last digits make it (review 10b, n°1)', () => {
+    const dids = [
+      { id: 'desk', trunkId: 't', first: '+33199000101', last: '+33199000101', target: '101' },
+      { id: 'pair', trunkId: 't', first: '+33199000150', last: '+33199000151', target: '101' },
+      { id: 'sales', trunkId: 't', first: '+33199000130', last: '+33199000139', suffixDigits: 3 },
+      { id: 'wide', trunkId: 't', first: '+33199001100', last: '+33199003299', suffixDigits: 2 },
+      { id: 'group', trunkId: 't', first: '+33199000102', last: '+33199000102', target: '200' }
+    ]
+    expect(directNumbersOf(dids, '101').sort()).toEqual(['+33199000101', '+33199000150', '+33199000151'])
+    expect(directNumbersOf(dids, '135')).toEqual(['+33199000135'])
+    expect(directNumbersOf(dids, '140')).toEqual([])
+    expect(directNumbersOf(dids, '42')).toEqual(['+33199001142', '+33199001242', '+33199001342', '+33199001442', '+33199001542', '+33199001642', '+33199001742', '+33199001842', '+33199001942', '+33199002042', '+33199002142', '+33199002242', '+33199002342', '+33199002442', '+33199002542', '+33199002642', '+33199002742', '+33199002842', '+33199002942', '+33199003042', '+33199003142', '+33199003242'])
+    for (const n of directNumbersOf(dids, '135')) expect(extensionOfDid(dids, n)).toBe('135')
   })
 })

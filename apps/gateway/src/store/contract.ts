@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { OperatorCdr } from '@twake/telephony-types'
-import { WEBHOOK_STATE_ROLE, type HistoryEntry, type Store, type WebhookDeliveryRecord, type WebhookSubscriptionRecord } from './types.js'
+import { WEBHOOK_STATE_ROLE, type HistoryEntry, type HistoryNearQuery, type Store, type WebhookDeliveryRecord, type WebhookSubscriptionRecord } from './types.js'
 import { EMPTY_OUTBOUND, outboundVersion } from '../outbound.js'
 
 const entry = (over: Partial<HistoryEntry>): HistoryEntry => ({
@@ -171,7 +171,8 @@ export const storeContract = (name: string, make: () => Promise<Store>) =>
       await s.addHistory(entry({ userId: 'bob', callId: 'g1', direction: 'inbound' }))
       await s.addHistory(entry({ callId: 'c2', startedAt: '2026-10-05T11:00:00.000Z' }))
       await s.addHistory(entry({ tenantId: 'B', callId: 'g1' }))
-      expect((await s.unreconciledHistory('A', '2026-10-05T09:00:00.000Z', '2026-10-05T10:30:00.000Z', 10)).map(e => `${e.userId} ${e.callId}`).sort()).toEqual(['alice g1', 'bob g1'])
+      const near = (over: Partial<HistoryNearQuery> = {}) => s.historyNear('A', { direction: 'inbound', from: '2026-10-05T09:00:00.000Z', to: '2026-10-05T10:30:00.000Z', limit: 10, ...over })
+      expect((await near()).map(e => `${e.userId} ${e.callId}`)).toEqual(['alice g1', 'bob g1'])
       await s.addOperatorCdrs('A', 'ovh', [cdr('m'), cdr('m2'), cdr('o'), cdr('u', { direction: 'outbound' }), cdr('f', { forwarded: true }), cdr('gone')])
       const orphan = entry({ userId: 'carol', callId: 'ovh:o', direction: 'inbound', state: 'missed', answered: false, durationSec: 0 })
       await s.settleOperatorCdrs('A', 'ovh', [
@@ -190,10 +191,15 @@ export const storeContract = (name: string, make: () => Promise<Store>) =>
       expect((await s.listHistory('A', 'bob')).items[0]).toMatchObject({ callId: 'g1', operator: 'ovh', operatorCdr: 'm' })
       expect((await s.listHistory('A', 'carol')).items).toEqual([{ ...orphan, tenantId: 'A', operator: 'ovh', operatorCdr: 'o', operatorOnly: true }])
       expect((await s.listHistory('B', 'alice')).items[0]?.operatorCdr).toBeUndefined()
-      expect((await s.unreconciledHistory('A', '2026-10-05T09:00:00.000Z', '2026-10-05T12:00:00.000Z', 10)).map(e => e.callId)).toEqual(['c2'])
+      // Reconciled: no longer near a record, unless asked; c2 is outbound.
+      expect(await near({ to: '2026-10-05T12:00:00.000Z' })).toEqual([])
+      expect((await near({ reconciled: true })).map(e => `${e.userId} ${e.callId}`)).toEqual(['alice g1', 'bob g1'])
+      expect((await near({ direction: 'outbound', to: '2026-10-05T12:00:00.000Z' })).map(e => e.callId)).toEqual(['c2'])
+      // Known from the operator alone: never near a record.
+      expect((await near({ userId: 'carol', reconciled: true })).map(e => e.callId)).toEqual([])
       expect((await s.pendingOperatorCdrs('A', 'ovh', soon, 10)).map(r => r.id)).toEqual(['gone'])
-      expect(await s.operatorCdrStats('A', 'ovh', '2026-10-05T00:00:00.000Z')).toEqual({ total: 6, matched: 1, orphan: 1, unmatchedInbound: 1, unmatchedOutbound: 1, forwarded: 1, pending: 1 })
-      expect(await s.operatorCdrStats('A', 'ovh', '2026-10-06T00:00:00.000Z')).toEqual({ total: 0, matched: 0, orphan: 0, unmatchedInbound: 0, unmatchedOutbound: 0, forwarded: 0, pending: 0 })
+      expect(await s.operatorCdrStats('A', 'ovh', '2026-10-05T00:00:00.000Z')).toEqual({ total: 6, matched: 1, orphan: 1, unmatchedInbound: 1, unmatchedOutbound: 1, forwarded: 1, pending: 1, invalid: 0 })
+      expect(await s.operatorCdrStats('A', 'ovh', '2026-10-06T00:00:00.000Z')).toEqual({ total: 0, matched: 0, orphan: 0, unmatchedInbound: 0, unmatchedOutbound: 0, forwarded: 0, pending: 0, invalid: 0 })
       expect((await s.operatorCdrStats('B', 'ovh', '2026-10-05T00:00:00.000Z')).total).toBe(0)
       await s.close()
     })
@@ -218,6 +224,105 @@ export const storeContract = (name: string, make: () => Promise<Store>) =>
       expect(await s.purgeOperatorCdrs('2026-02-01T00:00:00.000Z')).toBe(1)
       expect((await s.knownOperatorCdrs('A', 'ovh', ['old', 'fresh'])).sort()).toEqual(['fresh'])
       expect((await s.operatorCdrStats('A', 'ovh', '2026-01-01T00:00:00.000Z')).total).toBe(4)
+      await s.close()
+    })
+
+    it('reads the entries a record may be of by its number in E.164 or by person, by pages, however long the history (review 10b, n°3)', async () => {
+      const s = await make()
+      // The numbers as the SIP server wrote them; the same number in E.164.
+      await s.addHistory(entry({ callId: 'a1', direction: 'inbound', remoteNumber: '06 12 34 56 78', startedAt: '2026-10-05T10:00:00.000Z' }))
+      await s.addHistory(entry({ userId: 'bob', callId: 'a1', direction: 'inbound', remoteNumber: '06 12 34 56 78', startedAt: '2026-10-05T10:00:00.000Z' }))
+      await s.addHistory(entry({ callId: 'a2', direction: 'inbound', remoteNumber: '0033612345678', startedAt: '2026-10-05T10:00:00.000Z' }))
+      await s.addHistory(entry({ callId: 'a3', direction: 'inbound', remoteNumber: '+33612345678', startedAt: '2026-10-05T10:05:00.000Z' }))
+      await s.addHistory(entry({ callId: 'x', direction: 'inbound', remoteNumber: '+33698765432', startedAt: '2026-10-05T10:01:00.000Z' }))
+      await s.addHistory(entry({ callId: 'h', direction: 'inbound', remoteNumber: 'anonymous', startedAt: '2026-10-05T10:02:00.000Z' }))
+      await s.addHistory(entry({ tenantId: 'B', callId: 'a1', direction: 'inbound', remoteNumber: '+33612345678' }))
+      const q: HistoryNearQuery = { direction: 'inbound', remotes: ['+33612345678'], from: '2026-10-05T09:00:00.000Z', to: '2026-10-05T11:00:00.000Z', limit: 2 }
+      const first = await s.historyNear('A', q)
+      expect(first.map(e => `${e.userId} ${e.callId}`)).toEqual(['alice a1', 'bob a1'])
+      const last = first.at(-1)!
+      const second = await s.historyNear('A', { ...q, after: { startedAt: last.startedAt, callId: last.callId, userId: last.userId } })
+      expect(second.map(e => `${e.userId} ${e.callId}`)).toEqual(['alice a2', 'alice a3'])
+      const end = second.at(-1)!
+      expect(await s.historyNear('A', { ...q, after: { startedAt: end.startedAt, callId: end.callId, userId: end.userId } })).toEqual([])
+      expect((await s.historyNear('A', { ...q, remotes: ['anonymous', '+33698765432'], limit: 10 })).map(e => e.callId)).toEqual(['x', 'h'])
+      expect((await s.historyNear('A', { ...q, remotes: undefined, userId: 'bob', limit: 10 })).map(e => e.callId)).toEqual(['a1'])
+      expect((await s.historyNear('A', { ...q, to: '2026-10-05T10:04:59.000Z', limit: 10 })).map(e => e.callId)).toEqual(['a1', 'a1', 'a2'])
+      expect(await s.historyNear('A', { ...q, direction: 'outbound', limit: 10 })).toEqual([])
+      await s.close()
+    })
+
+    it('never brings back a call of a person who erased their history: kept when, an orphan of before settled without it, the records of their numbers erased (review 10b, n°1)', async () => {
+      const s = await make()
+      const soon = new Date(Date.now() + 60_000).toISOString()
+      const cdr = (id: string, over: Partial<OperatorCdr> = {}): OperatorCdr => ({ id, line: 'l1', direction: 'inbound', calling: '+33612345678', called: '+33972000001', startedAt: '2026-10-05T10:00:00.000Z', durationSec: 60, ...over })
+      expect(await s.historyErasedAt('A', 'alice')).toBeUndefined()
+      await s.addHistory(entry({ callId: 'c1', direction: 'inbound' }))
+      await s.addOperatorCdrs('A', 'ovh', [cdr('before'), cdr('pending'), cdr('other', { called: '+33972000002' }), cdr('out', { direction: 'outbound', calling: '+33972000001', called: '+33698765432' }), cdr('later', { startedAt: new Date(Date.now() + 3_600_000).toISOString() })])
+      const t0 = Date.now()
+      expect(await s.deleteHistory('A', 'alice')).toBe(1)
+      const erased = await s.historyErasedAt('A', 'alice')
+      expect(Math.abs(Date.parse(erased!) - t0)).toBeLessThan(60_000)
+      expect(await s.historyErasedAt('A', 'bob')).toBeUndefined()
+      expect(await s.historyErasedAt('B', 'alice')).toBeUndefined()
+      // An orphan of a call from before the erasure, whatever the caller says: in nobody's history, without its numbers.
+      await s.settleOperatorCdrs('A', 'ovh', [{ id: 'before', outcome: 'orphan', entry: entry({ callId: 'ovh:before', direction: 'inbound', remoteNumber: '+33612345678' }) }])
+      expect((await s.listHistory('A', 'alice')).items).toEqual([])
+      // The records of their direct number that started before: their numbers go, the pending ones settled.
+      // (`before` has none left; `later` started after.)
+      expect(await s.eraseOperatorCdrNumbers('A', ['+33972000001'], erased!)).toBe(2)
+      expect(await s.eraseOperatorCdrNumbers('A', [], erased!)).toBe(0)
+      expect((await s.pendingOperatorCdrs('A', 'ovh', soon, 10)).map(r => [r.id, r.calling ?? null])).toEqual([
+        ['other', '+33612345678'],
+        ['later', '+33612345678']
+      ])
+      expect((await s.operatorCdrStats('A', 'ovh', '2026-10-01T00:00:00.000Z'))).toMatchObject({ total: 5, unmatchedInbound: 2, unmatchedOutbound: 1, orphan: 0, pending: 2 })
+      // Asked to erase them when settled: so.
+      await s.settleOperatorCdrs('A', 'ovh', [{ id: 'other', outcome: 'unmatched', erase: true }])
+      expect((await s.pendingOperatorCdrs('A', 'ovh', soon, 10)).map(r => r.id)).toEqual(['later'])
+      // Erased again later: the date moves.
+      await new Promise(r => setTimeout(r, 5))
+      await s.deleteHistory('A', 'alice')
+      expect((await s.historyErasedAt('A', 'alice'))! > erased!).toBe(true)
+      await s.close()
+    })
+
+    it('keeps a record that is no call as read, settled invalid, counted apart (review 10b, n°19 and n°20)', async () => {
+      const s = await make()
+      const soon = new Date(Date.now() + 60_000).toISOString()
+      await s.addOperatorCdrs('A', 'ovh', [{ id: 'bad', line: 'l1', direction: 'inbound', calling: '', called: '', startedAt: '2026-10-05T10:00:00.000Z', durationSec: 0, invalid: 'wayType conference' }])
+      expect(await s.pendingOperatorCdrs('A', 'ovh', soon, 10)).toEqual([{ tenantId: 'A', operator: 'ovh', id: 'bad', line: 'l1', direction: 'inbound', calling: '', called: '', startedAt: '2026-10-05T10:00:00.000Z', durationSec: 0, invalid: 'wayType conference' }])
+      await s.settleOperatorCdrs('A', 'ovh', [{ id: 'bad', outcome: 'invalid' }])
+      expect(await s.pendingOperatorCdrs('A', 'ovh', soon, 10)).toEqual([])
+      expect(await s.operatorCdrStats('A', 'ovh', '2026-10-01T00:00:00.000Z')).toMatchObject({ total: 1, invalid: 1, unmatchedInbound: 0 })
+      await s.close()
+    })
+
+    it('keeps what the platform knows of its operator for every Gateway, by tenant and key, and counts a quota whatever Gateway asks (review 10b, n°8)', async () => {
+      const s = await make()
+      expect(await s.getOperatorState('A', 'cdrs')).toBeUndefined()
+      await s.putOperatorState('A', 'line:0033972000002', { readAt: '2026-10-05T10:00:00.000Z', forwards: {} })
+      await s.putOperatorState('A', 'line:0033972000001', { inSync: true })
+      await s.putOperatorState('A', 'cdrs', { read: 3 })
+      await s.putOperatorState('B', 'line:0033972000001', { inSync: false })
+      await s.putOperatorState('A', 'line:0033972000001', { inSync: false, error: 'refused' })
+      expect(await s.getOperatorState('A', 'line:0033972000001')).toEqual({ inSync: false, error: 'refused' })
+      expect(await s.listOperatorState('A', 'line:')).toEqual([
+        { key: 'line:0033972000001', value: { inSync: false, error: 'refused' } },
+        { key: 'line:0033972000002', value: { readAt: '2026-10-05T10:00:00.000Z', forwards: {} } }
+      ])
+      await s.deleteOperatorState('A', 'line:0033972000002')
+      expect((await s.listOperatorState('A', 'line:')).map(x => x.key)).toEqual(['line:0033972000001'])
+      expect(await s.getOperatorState('B', 'cdrs')).toBeUndefined()
+      expect(await s.takeOperatorQuota('A', 'sync', 60_000, 2)).toBe(true)
+      expect(await s.takeOperatorQuota('A', 'sync', 60_000, 2)).toBe(true)
+      expect(await s.takeOperatorQuota('A', 'sync', 60_000, 2)).toBe(false)
+      expect(await s.takeOperatorQuota('A', 'read', 60_000, 2)).toBe(true)
+      expect(await s.takeOperatorQuota('B', 'sync', 60_000, 2)).toBe(true)
+      // Past the window, counted again.
+      await new Promise(r => setTimeout(r, 30))
+      expect(await s.takeOperatorQuota('A', 'sync', 20, 2)).toBe(true)
+      expect((await s.listOperatorState('A', 'line:')).map(x => x.key)).toEqual(['line:0033972000001'])
       await s.close()
     })
 

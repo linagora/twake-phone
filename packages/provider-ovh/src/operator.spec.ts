@@ -7,10 +7,11 @@ import { OvhOperator } from './operator.js'
 const ACCOUNT = 'ab12345-ovh-1'
 const LINE = '0033972000001'
 const fakes: FakeOvh[] = []
+const NOW = Date.parse('2026-10-17T12:00:00.000Z')
 const setup = async (lines: Record<string, object> = { [LINE]: {}, '0033972000002': {} }) => {
   const f = await startFakeOvh({ accounts: { [ACCOUNT]: { lines } } })
   fakes.push(f)
-  return { f, ovh: new OvhOperator({ ...f.credentials, endpoint: f.url, billingAccount: ACCOUNT }) }
+  return { f, ovh: new OvhOperator({ ...f.credentials, baseUrl: f.url, billingAccount: ACCOUNT, now: () => NOW }) }
 }
 afterEach(async () => {
   for (const f of fakes.splice(0)) await f.stop()
@@ -21,36 +22,41 @@ describe('OVHcloud as the operator of the trunks', () => {
     expect(toOvhNumber('+33612345678')).toBe('0033612345678')
     expect(() => toOvhNumber('0612345678')).toThrow()
     expect(['0033612345678', '0612345678', '+33612345678', '0032 2 555 01 00', 'anonymous', '3179'].map(fromOvhNumber)).toEqual(['+33612345678', '+33612345678', '+33612345678', '+3225550100', 'anonymous', '3179'])
-  })
-
-  it('lists the lines of its billing account', async () => {
-    const { ovh } = await setup()
-    expect(await ovh.listLines()).toEqual([LINE, '0033972000002'])
     expect(() => new OvhOperator({ applicationKey: 'a', applicationSecret: 's', consumerKey: 'c', billingAccount: '../me' })).toThrow(/billing account/)
   })
 
-  it('sets the fallback on unavailability and on no answer to one number, reads it back, and removes it; nothing else of the line', async () => {
+  it('sets the fallback on unavailability and on no answer to one number, reads each forward back, and removes them; nothing else of the line', async () => {
     const { f, ovh } = await setup({ [LINE]: { options: { forwardBusy: true, forwardBusyNumber: '0033100000000', displayNumber: '0033972000001' } } })
-    expect(await ovh.getFallback(LINE)).toEqual({ onUnavailable: false })
+    expect(await ovh.getForwards(LINE)).toEqual({})
     await ovh.setFallback(LINE, { number: '+33612345678', onUnavailable: true, noAnswerAfterSec: 150 })
     expect(f.requests.at(-1)!.body).toEqual({ forwardBackup: true, forwardBackupNature: 'number', forwardBackupNumber: '0033612345678', forwardNoReply: true, forwardNoReplyDelay: 150, forwardNoReplyNature: 'number', forwardNoReplyNumber: '0033612345678' })
     expect(f.options(ACCOUNT, LINE)).toMatchObject({ forwardBusy: true, forwardBusyNumber: '0033100000000', displayNumber: '0033972000001' })
-    expect(await ovh.getFallback(LINE)).toEqual({ number: '+33612345678', onUnavailable: true, noAnswerAfterSec: 150 })
+    expect(await ovh.getForwards(LINE)).toEqual({ onUnavailable: { nature: 'number', number: '+33612345678' }, onNoAnswer: { nature: 'number', number: '+33612345678', afterSec: 150 } })
     await ovh.setFallback(LINE, { number: '+33612345678', onUnavailable: true })
-    expect(await ovh.getFallback(LINE)).toEqual({ number: '+33612345678', onUnavailable: true })
+    expect(await ovh.getForwards(LINE)).toEqual({ onUnavailable: { nature: 'number', number: '+33612345678' } })
     await ovh.setFallback(LINE, { onUnavailable: false })
     expect(f.requests.at(-1)!.body).toEqual({ forwardBackup: false, forwardNoReply: false })
-    expect(await ovh.getFallback(LINE)).toEqual({ onUnavailable: false })
+    expect(await ovh.getForwards(LINE)).toEqual({})
     await expect(ovh.setFallback(LINE, { onUnavailable: true })).rejects.toThrow(/number/)
   })
 
-  it('reads a fallback set otherwise in the manager as it is: two numbers, or a voicemail, are no number of one fallback', async () => {
+  it('reads each forward set in the manager as it is: two numbers, the voicemail, a fax, something unknown (review 10b, n°4 and n°15)', async () => {
     const { ovh } = await setup({
       [LINE]: { options: { forwardBackup: true, forwardBackupNumber: '0033612345678', forwardNoReply: true, forwardNoReplyDelay: 30, forwardNoReplyNumber: '0033698765432' } },
-      '0033972000002': { options: { forwardBackup: true, forwardBackupNature: 'voicemail' } }
+      '0033972000002': { options: { forwardBackup: true, forwardBackupNature: 'voicemail', forwardBackupNumber: '0033612345678', forwardNoReply: true, forwardNoReplyDelay: 150, forwardNoReplyNumber: '0033612345678' } },
+      '0033972000003': { options: { forwardBackup: true, forwardBackupNature: 'fax', forwardNoReply: true, forwardNoReplyNature: 'telepathy' } }
     })
-    expect(await ovh.getFallback(LINE)).toEqual({ onUnavailable: true, noAnswerAfterSec: 30 })
-    expect(await ovh.getFallback('0033972000002')).toEqual({ onUnavailable: true })
+    expect(await ovh.getForwards(LINE)).toEqual({ onUnavailable: { nature: 'number', number: '+33612345678' }, onNoAnswer: { nature: 'number', number: '+33698765432', afterSec: 30 } })
+    // Its number stays written for the voicemail, but the calls go to the voicemail.
+    expect(await ovh.getForwards('0033972000002')).toEqual({ onUnavailable: { nature: 'voicemail' }, onNoAnswer: { nature: 'number', number: '+33612345678', afterSec: 150 } })
+    expect(await ovh.getForwards('0033972000003')).toEqual({ onUnavailable: { nature: 'fax' }, onNoAnswer: { nature: 'other', afterSec: 20 } })
+  })
+
+  it('has a delay OVH refuses refused, its words in the error (review 10b, n°16)', async () => {
+    const { f, ovh } = await setup()
+    f.state.acceptDelay = sec => sec <= 120
+    await expect(ovh.setFallback(LINE, { number: '+33612345678', onUnavailable: true, noAnswerAfterSec: 150 })).rejects.toMatchObject({ code: 'refused', message: `OVH PUT /telephony/${ACCOUNT}/line/${LINE}/options: 400 INVALID_PARAMETER Invalid value for forwardNoReplyDelay` })
+    expect(await ovh.getForwards(LINE)).toEqual({})
   })
 
   it('lists the records of calls of a line over a period, and reads each in E.164, its way, its start and its duration', async () => {
@@ -64,12 +70,35 @@ describe('OVHcloud as the operator of the trunks', () => {
     expect(await ovh.getCdr(LINE, String(outbound))).toMatchObject({ direction: 'outbound', calling: '+33972000001', called: '+33198765432', durationSec: 0 })
     expect(await ovh.getCdr(LINE, String(forward))).toMatchObject({ direction: 'inbound', forwarded: true })
     expect(await ovh.getCdr(LINE, '1')).toBeUndefined()
+    // Only the current period is asked away from the turn of the month.
+    expect(f.requests.some(r => r.path.endsWith('/previousVoiceConsumption'))).toBe(false)
   })
 
-  it('comes from the environment with its four variables, or not at all', () => {
+  it('reads the records of the previous billing period too at the turn of the month, each once (review 10b, n°9)', async () => {
+    const { f, ovh } = await setup()
+    f.state.monthStart = Date.parse('2026-10-31T23:00:00+01:00')
+    const before = f.addConsumption(ACCOUNT, LINE, { calling: '0033612345678', called: '0033972000001', creationDatetime: '2026-10-31T22:00:00+01:00', duration: 42, wayType: 'incoming' })
+    const after = f.addConsumption(ACCOUNT, LINE, { calling: '0033612345678', called: '0033972000001', creationDatetime: '2026-11-01T09:00:00+01:00', duration: 7, wayType: 'incoming' })
+    expect((await ovh.listCdrIds(LINE, '2026-10-30T12:00:00.000Z', '2026-11-01T12:00:00.000Z')).sort()).toEqual([String(before), String(after)].sort())
+    expect(await ovh.getCdr(LINE, String(before))).toMatchObject({ startedAt: '2026-10-31T21:00:00.000Z', durationSec: 42 })
+    expect(await ovh.getCdr(LINE, String(after))).toMatchObject({ startedAt: '2026-11-01T08:00:00.000Z', durationSec: 7 })
+  })
+
+  it('keeps a record it cannot read as a call as such: a date without its offset, an unknown way (review 10b, n°19 and n°20)', async () => {
+    const { f, ovh } = await setup()
+    const local = f.addConsumption(ACCOUNT, LINE, { calling: '0033612345678', called: '0033972000001', creationDatetime: '2026-10-17T10:00:05', duration: 42, wayType: 'incoming' })
+    const odd = f.addConsumption(ACCOUNT, LINE, { calling: '0033612345678', called: '0033972000001', creationDatetime: '2026-10-17T10:00:05+02:00', duration: 42, wayType: 'conference' })
+    expect(await ovh.getCdr(LINE, String(local))).toEqual({ id: String(local), line: LINE, direction: 'inbound', calling: '', called: '', startedAt: '2026-10-17T12:00:00.000Z', durationSec: 0, invalid: 'creationDatetime without its offset' })
+    expect(await ovh.getCdr(LINE, String(odd))).toMatchObject({ invalid: 'wayType conference', calling: '', called: '' })
+  })
+
+  it('comes from the environment with its four variables, or not at all, at one of the three entry points (review 10b, n°11 and n°24)', () => {
+    const keys = { OVH_APPLICATION_KEY: 'a', OVH_APPLICATION_SECRET: 's', OVH_CONSUMER_KEY: 'c', OVH_BILLING_ACCOUNT: ACCOUNT }
     expect(ovhOperatorFromEnv({})).toBeUndefined()
     expect(() => ovhOperatorFromEnv({ OVH_APPLICATION_KEY: 'a' })).toThrow('OVH_APPLICATION_SECRET, OVH_CONSUMER_KEY, OVH_BILLING_ACCOUNT: required with OVH_APPLICATION_KEY')
-    expect(ovhOperatorFromEnv({ OVH_APPLICATION_KEY: 'a', OVH_APPLICATION_SECRET: 's', OVH_CONSUMER_KEY: 'c', OVH_BILLING_ACCOUNT: ACCOUNT })?.id).toBe('ovh')
-    expect(() => ovhOperatorFromEnv({ OVH_APPLICATION_KEY: 'a', OVH_APPLICATION_SECRET: 's', OVH_CONSUMER_KEY: 'c', OVH_BILLING_ACCOUNT: ACCOUNT, OVH_ENDPOINT: 'nowhere' })).toThrow(/endpoint/)
+    expect(() => ovhOperatorFromEnv({ OVH_ENDPOINT: 'ovh-ca' })).toThrow('OVH_ENDPOINT: given without')
+    expect(ovhOperatorFromEnv(keys)?.id).toBe('ovh')
+    expect(ovhOperatorFromEnv({ ...keys, OVH_ENDPOINT: 'ovh-us' })?.id).toBe('ovh')
+    for (const OVH_ENDPOINT of ['nowhere', 'http://169.254.169.254/latest', 'https://eu.api.ovh.com/1.0']) expect(() => ovhOperatorFromEnv({ ...keys, OVH_ENDPOINT })).toThrow('OVH_ENDPOINT: ovh-eu, ovh-ca or ovh-us')
   })
 })

@@ -239,8 +239,11 @@ export interface TelephonyAlert {
    * n°3), a room's call whose grant another call took (`call-diverted`: ended), or LiveKit's outbound trunk found
    * pointed elsewhere than the SIP server (`trunk-changed`: written back, the call not placed). `webhook`: raised by
    * the Gateway's webhook hub (step 10a), a subscription disabled after failing for a day in a row (`param` 'disabled').
+   * `operator`: raised by the Gateway (step 10b, review n°12): the operator refuses its keys (`unauthorized`) or their
+   * rights (`forbidden`) round after round, or the records of calls reconciled fall under FR-D4's 99 %
+   * (`reconciliation`, `value` the percentage, `threshold` 99).
    */
-  kind: 'fraud-warning' | 'fraud-critical' | 'limit' | 'rights' | 'emergency' | 'meet' | 'webhook'
+  kind: 'fraud-warning' | 'fraud-critical' | 'limit' | 'rights' | 'emergency' | 'meet' | 'webhook' | 'operator'
   param: string
   scope?: 'user' | 'tenant'
   value?: number
@@ -343,6 +346,24 @@ export const OPERATOR_NO_ANSWER_MIN_SEC = 120
 /** And at most this (s). */
 export const OPERATOR_NO_ANSWER_MAX_SEC = 600
 
+/** Where a forward set at the operator sends the calls: a number, the line's voicemail, a fax, or something else. */
+export type OperatorForwardNature = 'number' | 'voicemail' | 'fax' | 'other'
+
+/** One forward set at the operator, as read there: where it sends the calls, and the number for `number`. */
+export interface OperatorForward {
+  nature: OperatorForwardNature
+  number?: string
+}
+
+/**
+ * What a line forwards at the operator, as read there (review 10b, n°4: each forward as it is, never folded into one
+ * fallback): on unavailability (`onUnavailable`) and on no answer after `afterSec` (`onNoAnswer`). Absent: off.
+ */
+export interface OperatorLineForwards {
+  onUnavailable?: OperatorForward
+  onNoAnswer?: OperatorForward & { afterSec: number }
+}
+
 /**
  * A record of a call by the operator (CDR, step 10b): on one of its lines (`line`), in E.164 where the number is one
  * (`anonymous`, a short number... as the operator wrote them otherwise), started at `startedAt`, `durationSec` in
@@ -358,6 +379,11 @@ export interface OperatorCdr {
   durationSec: number
   /** A forward the operator placed itself (to the fallback number, ADR 0017): the platform never saw it. */
   forwarded?: true
+  /**
+   * The operator's record could not be read as a call (a date without its offset, an unknown way): kept so as not to
+   * read it again, never reconciled (`startedAt` is then when it was read). Why, in a few words.
+   */
+  invalid?: string
 }
 
 /** What an administrator writes: the trunk without its id, with a password to keep (or to change, or `null` to remove). */
@@ -589,12 +615,20 @@ export interface WebhookCall {
 }
 
 /**
- * The fallback forward set at the operator for a trunk's lines (step 10b), as last read there: whether the callers
- * reach it while the platform cannot be reached (`on_unavailable`), or when nobody answers (`no_answer_after_sec`).
- * Never its number. Absent when the trunk's operator is not known (no lines, no operator configured) or was never read.
+ * Where the operator sends a trunk's calls for one of its forwards, as last read on every line of the trunk: to a
+ * number, the voicemail, a fax, somewhere else (`other`), nowhere (`none`: off), or not the same on every line (`mixed`).
+ */
+export type WebhookForwardTarget = OperatorForwardNature | 'none' | 'mixed'
+
+/**
+ * The fallback forwards set at the operator for a trunk's lines (step 10b), as last read there: where the callers go
+ * while the platform cannot be reached (`on_unavailable`), and when nobody answers (`on_no_answer`, after
+ * `no_answer_after_sec`, the longest of the lines). Never a number. Absent when the trunk's operator is not known (no
+ * lines, no operator configured) or a line was never read.
  */
 export interface WebhookTrunkFallback {
-  on_unavailable: boolean
+  on_unavailable: WebhookForwardTarget
+  on_no_answer: WebhookForwardTarget
   no_answer_after_sec?: number
 }
 

@@ -1,4 +1,4 @@
-import type { Call, Capabilities, ConferenceParticipant, Contact, DialInConfiguration, DidRange, ForwardingRules, FraudRule, MediaSession, OperatorFallback, OutboundAssignment, OutboundCaps, OutboundPolicy, OutboundProfile, Presence, PresenceStatus, RingGroup, TelephonyAlert, TelephonyEvent, Trunk, TrunkInput, TrunkStatus, WebhookEventType } from '@twake/telephony-types'
+import type { Call, Capabilities, ConferenceParticipant, Contact, DialInConfiguration, DidRange, ForwardingRules, FraudRule, MediaSession, OperatorLineForwards, OutboundAssignment, OutboundCaps, OutboundPolicy, OutboundProfile, Presence, PresenceStatus, RingGroup, TelephonyAlert, TelephonyEvent, Trunk, TrunkInput, TrunkStatus, WebhookEventType } from '@twake/telephony-types'
 
 export type {
   Contact,
@@ -8,6 +8,9 @@ export type {
   FraudRule,
   FraudThreshold,
   OperatorFallback,
+  OperatorForward,
+  OperatorForwardNature,
+  OperatorLineForwards,
   OutboundAssignment,
   OutboundCaps,
   OutboundPolicy,
@@ -82,22 +85,34 @@ export interface HistoryItem {
   sources?: string[]
 }
 
-/** Why the operator could not be read or written (OperatorErrorCode of the Gateway). */
-export type OperatorProblem = 'unauthorized' | 'forbidden' | 'not-found' | 'refused' | 'rate' | 'unreachable'
+/**
+ * Why the operator could not be read or written (OperatorErrorCode of the Gateway), or why a line is not kept as
+ * asked: two trunks ask two fallbacks of it (`conflict`).
+ */
+export type OperatorProblem = 'unauthorized' | 'forbidden' | 'not-found' | 'refused' | 'rate' | 'unreachable' | 'conflict'
 
-/** One line of a trunk at the operator, as the Gateway last saw it (step 10b). */
+/** One line of a trunk at the operator, as the platform last saw it (step 10b). */
 export interface OperatorLine {
   line: string
-  /** The fallback set there (as read, or written). */
-  fallback?: OperatorFallback
-  /** The trunk asks the Gateway to keep its fallback there. */
+  /** The forwards set there, each as it is (to a number, the voicemail...), as last read. */
+  forwards?: OperatorLineForwards
+  /** A trunk asks the Gateway to keep its fallback there. */
   managed: boolean
-  /** What is there is what is asked. */
+  /** What is there is what is asked (absent: not read since it was asked). */
   inSync?: boolean
   readAt?: string
   appliedAt?: string
   /** When the Gateway found it changed there (the manager) and put it back. */
   restoredAt?: string
+  error?: OperatorProblem
+  /** The operator did not keep what was asked: not written again until the trunk is saved. */
+  rejected?: true
+}
+
+/** What is set at the operator on a line now (POST /admin/operator/lines), or why it could not be read. */
+export interface OperatorLineRead {
+  line: string
+  forwards?: OperatorLineForwards
   error?: OperatorProblem
 }
 
@@ -109,9 +124,10 @@ export interface OperatorStatus {
   cdrs?: {
     readAt?: string
     read?: number
-    error?: OperatorProblem
+    /** The lines whose records could not be read, and why. */
+    lines?: { line: string; error: OperatorProblem }[]
     since: string
-    stats: { total: number; matched: number; orphan: number; unmatchedInbound: number; unmatchedOutbound: number; forwarded: number; pending: number }
+    stats: { total: number; matched: number; orphan: number; unmatchedInbound: number; unmatchedOutbound: number; forwarded: number; pending: number; invalid: number }
   }
 }
 
@@ -373,6 +389,16 @@ export class TelephonyClient {
   /** Reads the operator now (429 OPERATOR_RATE: a moment ago already). */
   syncOperator() {
     return this.request<OperatorStatus>('/admin/operator/sync', { method: 'POST' })
+  }
+
+  /** What is set at the operator on these lines now, read only (shown before a first fallback replaces it). */
+  readOperatorLines(lines: string[]) {
+    return this.request<{ items: OperatorLineRead[] }>('/admin/operator/lines', { method: 'POST', body: JSON.stringify({ lines }) })
+  }
+
+  /** The trunk no longer asks a fallback at the operator, and the forwards of its lines are removed there. */
+  removeOperatorFallback(trunkId: string) {
+    return this.request<Trunk>(`/admin/trunks/${encodeURIComponent(trunkId)}/operator/fallback`, { method: 'DELETE' })
   }
 
   /** Removes a trunk and its direct numbers (409 TRUNK_DEFAULT: the default trunk while another one is left). */

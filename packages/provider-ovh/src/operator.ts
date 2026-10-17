@@ -1,4 +1,4 @@
-import type { OperatorCdr, OperatorFallback } from '@twake/telephony-types'
+import type { OperatorCdr, OperatorFallback, OperatorForward, OperatorForwardNature, OperatorLineForwards } from '@twake/telephony-types'
 import { OperatorError, type OperatorProvider } from '@twake/telephony-provider-sdk'
 import { OvhClient, type OvhClientOptions } from './client.js'
 import { fromOvhNumber, toOvhNumber } from './numbers.js'
@@ -46,33 +46,30 @@ export class OvhOperator implements OperatorProvider {
   readonly id = 'ovh'
   private readonly client: OvhClient
   private readonly account: string
+  private readonly now: () => number
 
   constructor(options: OvhOperatorOptions) {
     if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(options.billingAccount ?? '')) throw new Error('OVH billing account: letters, digits and . _ - (as the manager shows it, ab12345-ovh-1)')
     this.client = options.client ?? new OvhClient(options)
     this.account = segment(options.billingAccount)
+    this.now = options.now ?? Date.now
   }
 
   private line(line: string) {
     return `/telephony/${this.account}/line/${segment(line)}`
   }
 
-  async listLines(): Promise<string[]> {
-    const lines = await this.client.request<unknown>('GET', `/telephony/${this.account}/line`)
-    if (!Array.isArray(lines)) throw new OperatorError('unreachable', 'OVH GET /telephony/…/line: not a list')
-    return lines.filter((l): l is string => typeof l === 'string')
-  }
-
-  async getFallback(line: string): Promise<OperatorFallback> {
+  /** Each forward of a line as it is: to a number, the voicemail, a fax, or elsewhere (review 10b, n°4). */
+  async getForwards(line: string): Promise<OperatorLineForwards> {
     const o = (await this.client.request<OvhLineForwards | undefined>('GET', `${this.line(line)}/options`)) ?? {}
-    const backup = o.forwardBackup && o.forwardBackupNature === 'number' && o.forwardBackupNumber ? fromOvhNumber(o.forwardBackupNumber) : undefined
-    const noReply = o.forwardNoReply && o.forwardNoReplyNature === 'number' && o.forwardNoReplyNumber ? fromOvhNumber(o.forwardNoReplyNumber) : undefined
-    // Two forwards to two numbers, or one elsewhere (a voicemail): no number of one fallback; told as it is.
-    const number = backup && noReply && backup !== noReply ? undefined : (backup ?? noReply)
+    if (typeof o !== 'object') throw new OperatorError('unreachable', 'OVH GET /telephony/…/options: not an object')
+    const forward = (nature: unknown, number: unknown): OperatorForward => {
+      const n: OperatorForwardNature = nature === 'number' || nature === 'voicemail' || nature === 'fax' ? nature : 'other'
+      return n === 'number' && typeof number === 'string' && number ? { nature: n, number: fromOvhNumber(number) } : { nature: n }
+    }
     return {
-      ...(number ? { number } : {}),
-      onUnavailable: !!o.forwardBackup,
-      ...(o.forwardNoReply && typeof o.forwardNoReplyDelay === 'number' ? { noAnswerAfterSec: o.forwardNoReplyDelay } : {})
+      ...(o.forwardBackup ? { onUnavailable: forward(o.forwardBackupNature, o.forwardBackupNumber) } : {}),
+      ...(o.forwardNoReply ? { onNoAnswer: { ...forward(o.forwardNoReplyNature, o.forwardNoReplyNumber), afterSec: typeof o.forwardNoReplyDelay === 'number' ? o.forwardNoReplyDelay : 0 } } : {})
     }
   }
 
@@ -89,31 +86,64 @@ export class OvhOperator implements OperatorProvider {
     await this.client.request('PUT', `${this.line(line)}/options`, { body })
   }
 
+  private consumption(line: string, previous: boolean) {
+    return `/telephony/${this.account}/service/${segment(line)}/${previous ? 'previousVoiceConsumption' : 'voiceConsumption'}`
+  }
+
+  /**
+   * The ids of the records dated from `from` to `to`: those of the current billing period (`voiceConsumption`), and,
+   * when the window starts within a day of the first of the month or before, those of the previous one
+   * (`previousVoiceConsumption`, review 10b, n°9: a record moves there at the turn of the month), each once.
+   */
   async listCdrIds(line: string, from: string, to: string): Promise<string[]> {
-    const ids = await this.client.request<unknown>('GET', `/telephony/${this.account}/service/${segment(line)}/voiceConsumption`, { query: { 'creationDatetime.from': from, 'creationDatetime.to': to } })
-    if (!Array.isArray(ids)) throw new OperatorError('unreachable', 'OVH GET /telephony/…/voiceConsumption: not a list')
-    return ids.filter(id => typeof id === 'number' || typeof id === 'string').map(String)
+    const query = { 'creationDatetime.from': from, 'creationDatetime.to': to }
+    const end = new Date(to)
+    const monthStart = Date.UTC(end.getUTCFullYear(), end.getUTCMonth(), 1)
+    const lists = [this.client.request<unknown>('GET', this.consumption(line, false), { query })]
+    if (Date.parse(from) < monthStart + 86_400_000)
+      lists.push(
+        this.client.request<unknown>('GET', this.consumption(line, true), { query }).catch((err: unknown) => {
+          // No previous period yet (a line taken this month).
+          if (err instanceof OperatorError && err.code === 'not-found') return []
+          throw err
+        })
+      )
+    const ids = new Set<string>()
+    for (const list of await Promise.all(lists)) {
+      if (!Array.isArray(list)) throw new OperatorError('unreachable', 'OVH GET /telephony/…/voiceConsumption: not a list')
+      for (const id of list) if (typeof id === 'number' || typeof id === 'string') ids.add(String(id))
+    }
+    return [...ids]
   }
 
   async getCdr(line: string, id: string): Promise<OperatorCdr | undefined> {
     let c: OvhVoiceConsumption | undefined
-    try {
-      c = await this.client.request<OvhVoiceConsumption>('GET', `/telephony/${this.account}/service/${segment(line)}/voiceConsumption/${segment(id)}`)
-    } catch (err) {
-      if (err instanceof OperatorError && err.code === 'not-found') return undefined
-      throw err
+    for (const previous of [false, true]) {
+      try {
+        c = await this.client.request<OvhVoiceConsumption>('GET', `${this.consumption(line, previous)}/${segment(id)}`)
+        break
+      } catch (err) {
+        // Not in this period: in the previous one, or gone.
+        if (!(err instanceof OperatorError && err.code === 'not-found')) throw err
+      }
     }
-    const started = Date.parse(c?.creationDatetime ?? '')
-    if (!c || Number.isNaN(started)) return undefined
+    if (!c || typeof c !== 'object') return undefined
+    const kept = String(c.consumptionId ?? id)
+    const invalid = (why: string): OperatorCdr => ({ id: kept, line, direction: 'inbound', calling: '', called: '', startedAt: new Date(this.now()).toISOString(), durationSec: 0, invalid: why })
+    // A date without its offset would be read at this host's hour (review 10b, n°19): one or two hours off.
+    const at = typeof c.creationDatetime === 'string' ? c.creationDatetime : ''
+    if (!/(?:Z|[+-]\d{2}:?\d{2})$/i.test(at) || Number.isNaN(Date.parse(at))) return invalid('creationDatetime without its offset')
+    // The ways OVH documents, nothing else taken for a call (review 10b, n°20); a transfer is a forward OVH placed
+    // (to a fallback number): an incoming call the platform never had.
     const way = c.wayType
+    if (way !== 'incoming' && way !== 'outgoing' && way !== 'transfer') return invalid(`wayType ${String(way).slice(0, 32)}`)
     return {
-      id: String(c.consumptionId ?? id),
+      id: kept,
       line,
-      // A transfer is a forward OVH placed (to a fallback number): an incoming call the platform never had.
       direction: way === 'outgoing' ? 'outbound' : 'inbound',
       calling: fromOvhNumber(c.calling ?? ''),
       called: fromOvhNumber(c.called ?? ''),
-      startedAt: new Date(started).toISOString(),
+      startedAt: new Date(Date.parse(at)).toISOString(),
       durationSec: Math.max(0, Math.round(Number(c.duration) || 0)),
       ...(way === 'transfer' ? { forwarded: true as const } : {})
     }

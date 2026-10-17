@@ -142,13 +142,25 @@ Les outils de l'organisation (CRM, supervision, ticketing) s'abonnent aux évén
 Sans ces variables, rien ne change : le renvoi se règle dans le manager d'OVH, l'historique ne connaît que ce qu'OpenSIPS a vu. Avec, la passerelle tient le renvoi de repli de chaque ligne du trunk chez OVH et rapproche ses CDR de l'historique (ADR 0021).
 
 1. Créer une application pour la plateforme : <https://eu.api.ovh.com/createApp/> (`ca.api.ovh.com` au Canada, `api.us.ovhcloud.com` aux États-Unis). Elle donne une clé d'application et son secret.
-2. Demander un jeton consommateur avec les seuls droits utiles, puis ouvrir la `validationUrl` de la réponse, se connecter au compte OVH qui a les lignes et choisir une durée de validité ; le `consumerKey` de la réponse est le jeton :
+2. Demander un jeton consommateur avec les seuls droits que la passerelle utilise, bornés au groupe de facturation (`<groupe>`, tel que le manager le nomme). Ouvrir ensuite la `validationUrl` de la réponse, se connecter au compte OVH qui a les lignes et choisir une durée de validité. Le `consumerKey` de la réponse est le jeton :
 
    ```sh
    curl -sS -X POST https://eu.api.ovh.com/1.0/auth/credential \
      -H "X-Ovh-Application: <clé d'application>" -H 'Content-Type: application/json' \
-     -d '{"accessRules": [{"method": "GET", "path": "/telephony"}, {"method": "GET", "path": "/telephony/*"}, {"method": "PUT", "path": "/telephony/*/line/*/options"}]}'
+     -d '{"accessRules": [
+       {"method": "GET", "path": "/telephony/<groupe>/line/*/options"},
+       {"method": "PUT", "path": "/telephony/<groupe>/line/*/options"},
+       {"method": "GET", "path": "/telephony/<groupe>/service/*/voiceConsumption"},
+       {"method": "GET", "path": "/telephony/<groupe>/service/*/voiceConsumption/*"},
+       {"method": "GET", "path": "/telephony/<groupe>/service/*/previousVoiceConsumption"},
+       {"method": "GET", "path": "/telephony/<groupe>/service/*/previousVoiceConsumption/*"}
+     ]}'
    ```
+
+   - `previousVoiceConsumption` : les appels du mois de facturation précédent. Ils sont lus pendant les 48 h qui suivent le changement de mois.
+   - **Risque résiduel du `PUT`** : OVH ne borne pas un droit à certains champs. Un jeton qui fuit permet donc d'écrire toutes les options des lignes du groupe, et pas seulement les renvois que la passerelle écrit (`forwardBackup*`, `forwardNoReply*`). Il permet par exemple un renvoi inconditionnel vers un numéro surtaxé, ou un autre numéro présenté.
+   - Pour limiter ce risque, garder le jeton dans le seul `.env` de la passerelle et choisir une durée de validité courte, **30 jours** au pilote. Le renouveler avant son terme : un jeton expiré lève une alerte « Opérateur des trunks » au deuxième relevé refusé (Administration > Alertes).
+   - Révoquer un jeton qui a pu fuir, dans le manager (« Mes applications ») ou par `DELETE /me/api/credential/<id>`.
 
 3. Dans le `.env` (jamais ailleurs : ni en base, ni dans un dépôt), puis `docker compose up -d gateway` :
 
@@ -157,12 +169,33 @@ Sans ces variables, rien ne change : le renvoi se règle dans le manager d'OVH, 
    | `OVH_APPLICATION_KEY`, `OVH_APPLICATION_SECRET` | la clé de l'application et son secret |
    | `OVH_CONSUMER_KEY` | le jeton consommateur |
    | `OVH_BILLING_ACCOUNT` | le groupe de facturation de la téléphonie, tel que le manager le nomme |
-   | `OVH_ENDPOINT` | `ovh-eu` (par défaut), `ovh-ca` ou `ovh-us` |
+   | `OVH_ENDPOINT` | `ovh-eu` (par défaut), `ovh-ca` ou `ovh-us`, rien d'autre (pas d'URL) |
 
-   Les quatre premières ou aucune : une partie seulement empêche la passerelle de démarrer, en nommant ce qui manque. Le journal du démarrage dit le groupe de facturation servi, jamais une clé.
-4. Dans Administration > Trunks, modifier le trunk : « Lignes chez l'opérateur » (les noms de service des lignes dans le manager, `0033…`), puis « Tenir le renvoi de repli chez l'opérateur » : le numéro de repli (jamais un numéro direct de la plateforme), sur indisponibilité et/ou sur non-réponse après plus de 120 s (le numéro direct puis son repli intérieur sonnent d'abord, 60 s chacun). L'écran dit pour chaque ligne le renvoi posé chez OVH, et quand il a été remis après un changement dans le manager. Décoché, la passerelle n'écrit rien chez OVH.
+   - Les quatre premières variables vont ensemble, ou aucune. Une partie seulement empêche la passerelle de démarrer, en nommant ce qui manque. `OVH_ENDPOINT` seul aussi, de même qu'une autre valeur que les trois entrées d'OVH.
+   - Le journal du démarrage dit le groupe de facturation servi, jamais une clé.
+   - **Migration** : au premier démarrage avec l'étape 10b, la base gagne la table des CDR et des index sur l'historique (`015`), puis une colonne calculée du numéro distant en E.164 (`016`). Sur un gros historique, cette colonne réécrit la table `call_history`, et les index de `015` sont créés sans `CONCURRENTLY`. Les écritures de l'historique attendent pendant ce temps : faire la mise à jour hors des heures d'appels.
+4. Dans Administration > Trunks, modifier le trunk :
+   - « Lignes chez l'opérateur » : les noms de service des lignes dans le manager, `0033…`.
+   - Puis « Tenir le renvoi de repli chez l'opérateur ». L'écran lit d'abord ce qui est réglé sur ces lignes chez OVH et le montre. Il demande de cocher « Remplacer ce qui est réglé chez l'opérateur » avant d'enregistrer.
+   - Le numéro de repli : jamais un numéro direct de la plateforme, ni une ligne ou le numéro d'un trunk.
+   - Le renvoi sur indisponibilité et/ou sur non-réponse après plus de 120 s (le numéro direct puis son repli intérieur sonnent d'abord, 60 s chacun).
+   - Une ligne n'a qu'un renvoi : deux trunks qui en demandent deux sur la même ligne sont refusés (409).
+   - L'écran dit pour chaque ligne chaque renvoi posé chez OVH, tel qu'il est (vers un numéro, la messagerie…), et quand il a été remis après un changement dans le manager.
+   - La passerelle relit la ligne après l'avoir écrite. Si OVH n'a pas gardé le réglage (un délai refusé ou arrondi), l'écran le dit et rien n'est réécrit avant le prochain enregistrement du trunk.
+   - Décoché, la passerelle n'écrit plus rien chez OVH : ce qui est posé reste. « Retirer le renvoi chez l'opérateur » (avec confirmation) l'enlève des lignes, de même que la suppression du trunk.
 
-Ensuite, toutes les 10 minutes, la passerelle qui tient le bail des états relit le renvoi de chaque ligne (et le remet s'il a été changé) et les CDR des 48 dernières heures. Les Récents montrent « Confirmé par l'opérateur » sur un appel rapproché, et « Reçu par l'opérateur seul » pour un appel qu'OVH a eu pendant une panne. La section « Relevés de l'opérateur » de l'écran Trunks donne le taux de rapprochement des 7 derniers jours et relit OVH à la demande (2 fois par minute). `trunk.degraded` et `trunk.recovered` disent alors si les appelants arrivent au repli pendant la panne (`fallback`, sans le numéro). La passerelle ne bascule rien à la panne : c'est le renvoi sur indisponibilité d'OVH qui le fait, même passerelle arrêtée. Les CDR sont gardés 90 jours.
+Ensuite, toutes les 10 minutes, la passerelle qui tient le bail des états fait un relevé :
+- Elle relit les renvois de chaque ligne, et les remet s'ils ont été changés.
+- Elle lit les CDR des 48 dernières heures, ligne par ligne : une ligne en erreur n'empêche pas de lire les autres, et l'écran dit laquelle.
+- Ce qu'elle sait est en base : toutes les passerelles le montrent pareil, et il est gardé après un redémarrage.
+
+Ce que l'on voit ensuite :
+- Les Récents montrent « Confirmé par l'opérateur » sur un appel rapproché, et « Reçu par l'opérateur seul » pour un appel qu'OVH a eu pendant une panne. Un appel d'avant un effacement de l'historique n'y revient jamais.
+- La section « Relevés de l'opérateur » de l'écran Trunks donne le taux de rapprochement des 7 derniers jours. Elle relit OVH à la demande, 2 fois par minute pour l'organisation, quelle que soit la passerelle qui reçoit la demande.
+- Une alerte « Opérateur des trunks » est levée quand OVH refuse les clés ou leurs droits deux relevés de suite, ou quand moins de 99 % des CDR sont rapprochés (FR-D4).
+- `trunk.degraded` et `trunk.recovered` disent alors où vont les appelants pendant la panne (`fallback` : `on_unavailable` et `on_no_answer`, vers un numéro, la messagerie…, sans le numéro).
+
+La passerelle ne bascule rien à la panne : c'est le renvoi sur indisponibilité d'OVH qui le fait, même passerelle arrêtée. Les CDR sont gardés 90 jours.
 
 ## Exploiter
 

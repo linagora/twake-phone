@@ -139,6 +139,13 @@ export const parseTrunk = (body: unknown, current?: Pick<TrunkRecord, 'passwordE
 const OPERATOR_LINE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/
 export const MAX_OPERATOR_LINES = 16
 
+/** Lines at the operator as a trunk names them: 1 to MAX_OPERATOR_LINES service names, each once. */
+export const parseOperatorLines = (v: unknown): string[] => {
+  const lines = list({ 'operator.lines': v }, 'operator.lines', MAX_OPERATOR_LINES, l => OPERATOR_LINE.test(l), "lines at the operator (their service names: letters, digits and . _ -, 64 at most)")
+  if (!lines) throw invalid('operator.lines: at least one line at the operator')
+  return lines
+}
+
 /**
  * What a trunk says of its operator (step 10b, ADR 0021): `lines`, 1 to MAX_OPERATOR_LINES service names, each once;
  * `fallback` (absent: left as set at the operator), the number (E.164) the operator forwards to, on unavailability
@@ -148,8 +155,7 @@ const operatorOf = (v: unknown): TrunkOperator | undefined => {
   if (v === undefined || v === null) return undefined
   if (typeof v !== 'object' || Array.isArray(v)) throw invalid('operator: an object, its lines and its fallback')
   const o = v as Record<string, unknown>
-  const lines = list({ 'operator.lines': o.lines }, 'operator.lines', MAX_OPERATOR_LINES, l => OPERATOR_LINE.test(l), "lines at the operator (their service names: letters, digits and . _ -, 64 at most)")
-  if (!lines) throw invalid('operator.lines: at least one line at the operator')
+  const lines = parseOperatorLines(o.lines)
   if (o.fallback === undefined || o.fallback === null) return { lines }
   if (typeof o.fallback !== 'object' || Array.isArray(o.fallback)) throw invalid('operator.fallback: an object')
   const f = o.fallback as Record<string, unknown>

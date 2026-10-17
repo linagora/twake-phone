@@ -2,14 +2,16 @@ import { createHash } from 'node:crypto'
 import { OperatorError, type OperatorErrorCode } from '@twake/telephony-provider-sdk'
 
 /**
- * The OVHcloud API's entry points (the documentation's names). Any other value of `endpoint` is taken as the URL of
- * the API itself, up to its version (`https://…/1.0`): the fake server of the tests.
+ * The OVHcloud API's entry points (the documentation's names), the only ones `endpoint` takes (review 10b, n°11): the
+ * keys never go anywhere else. The tests name their fake server's URL with `baseUrl`, never from the environment.
  */
-export const OVH_ENDPOINTS: Readonly<Record<string, string>> = {
+export const OVH_ENDPOINTS = {
   'ovh-eu': 'https://eu.api.ovh.com/1.0',
   'ovh-ca': 'https://ca.api.ovh.com/1.0',
   'ovh-us': 'https://api.us.ovhcloud.com/1.0'
-}
+} as const
+export type OvhEndpoint = keyof typeof OVH_ENDPOINTS
+export const isOvhEndpoint = (v: string): v is OvhEndpoint => Object.prototype.hasOwnProperty.call(OVH_ENDPOINTS, v)
 
 /** A request's bound: an API that does not answer in that time is `unreachable`. */
 export const OVH_TIMEOUT_MS = 10_000
@@ -24,10 +26,14 @@ export interface OvhCredentials {
 }
 
 export interface OvhClientOptions extends OvhCredentials {
-  /** `ovh-eu` by default (OVH_ENDPOINTS), or the URL of the API. */
-  endpoint?: string
+  /** `ovh-eu` by default (OVH_ENDPOINTS). */
+  endpoint?: OvhEndpoint
   timeoutMs?: number
-  /** Test seams. */
+  /**
+   * Test seams: `baseUrl`, the URL of a fake API (`http` only on the loopback), in the place of `endpoint`; `fetch`
+   * and `now`.
+   */
+  baseUrl?: string
   fetch?: typeof fetch
   now?: () => number
 }
@@ -81,8 +87,10 @@ export class OvhClient {
 
   constructor(private readonly options: OvhClientOptions) {
     const endpoint = options.endpoint ?? 'ovh-eu'
-    this.base = (OVH_ENDPOINTS[endpoint] ?? endpoint).replace(/\/+$/, '')
-    if (!/^https?:\/\/[^/]+\/.+/.test(this.base)) throw new Error('OVH endpoint: ovh-eu, ovh-ca, ovh-us or the URL of the API (https://…/1.0)')
+    if (!isOvhEndpoint(endpoint)) throw new Error('OVH endpoint: ovh-eu, ovh-ca or ovh-us')
+    this.base = (options.baseUrl ?? OVH_ENDPOINTS[endpoint]).replace(/\/+$/, '')
+    if (options.baseUrl !== undefined && !/^(https:\/\/[^/]+|http:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d+)?)\/.+/.test(this.base))
+      throw new Error('OVH baseUrl (tests): https://…/1.0, or http on the loopback')
     for (const k of ['applicationKey', 'applicationSecret', 'consumerKey'] as const) if (!options[k]) throw new Error(`OVH ${k} is required`)
     this.fetchFn = options.fetch ?? fetch
     this.now = options.now ?? Date.now
@@ -92,7 +100,7 @@ export class OvhClient {
   /** OVH's clock now, in seconds (`/auth/time`, unsigned). */
   async time(): Promise<number> {
     const res = await this.send('GET', `${this.base}/auth/time`, {}, undefined, '/auth/time')
-    const text = await res.text()
+    const text = await res.text().catch(() => '')
     const sec = Number(text)
     if (!res.ok || !Number.isInteger(sec)) throw new OperatorError('unreachable', `OVH GET /auth/time: answered ${res.status}`)
     return sec
@@ -140,19 +148,31 @@ export class OvhClient {
         ...(body ? { 'Content-Type': 'application/json' } : {})
       }
       const res = await this.send(method, url, headers, body || undefined, path)
-      const text = await res.text().catch(() => '')
+      // A body cut (the time out while it comes, the connection lost) is no answer (review 10b, n°6), never an empty one.
+      let text: string
+      try {
+        text = await res.text()
+      } catch {
+        throw new OperatorError('unreachable', `OVH ${method} ${path}: answer cut`)
+      }
       let json: unknown
+      let parsed = true
       try {
         json = text ? JSON.parse(text) : undefined
       } catch {
-        json = undefined
+        parsed = false
       }
-      if (res.ok) return json as T
+      if (res.ok) {
+        // A 2xx that is no JSON (a proxy's page...) is not OVH's answer: never read as "nothing set".
+        if (!parsed) throw new OperatorError('unreachable', `OVH ${method} ${path}: ${res.status} not JSON`)
+        return json as T
+      }
       const refusal = json && typeof json === 'object' ? (json as OvhRefusal) : undefined
       const words = wordsOf(refusal)
       const errorCode = typeof refusal?.errorCode === 'string' ? refusal.errorCode.slice(0, 64) : ''
-      // Out of time: this clock drifted from OVH's since the gap was read. Read again once, then the request again.
-      if (attempt === 0 && (res.status === 400 || res.status === 401) && /time/i.test(`${words} ${errorCode}`)) continue
+      // Out of time (OVH's QUERY_TIME_OUT, "Query out of time", nothing else: review 10b, n°18): this clock drifted
+      // from OVH's since the gap was read. Read again once, then the request again; out of time again: refused.
+      if (attempt === 0 && res.status === 400 && (errorCode === 'QUERY_TIME_OUT' || /^Query out of time\b/.test(words))) continue
       throw new OperatorError(codeFor(res.status, errorCode), `OVH ${method} ${path}: ${res.status}${errorCode ? ` ${errorCode}` : ''}${words ? ` ${words}` : ''}`)
     }
   }

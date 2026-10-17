@@ -1,6 +1,6 @@
 import { randomBytes } from 'node:crypto'
 import { describe, expect, it } from 'vitest'
-import type { TrunkStatus, WebhookEvent } from '@twake/telephony-types'
+import type { TrunkStatus, WebhookEvent, WebhookTrunkFallback } from '@twake/telephony-types'
 import { MemoryStore } from './store/memory.js'
 import { TrunkWatch, trunkHealthOf, type TrunkWatchOptions } from './trunk-health.js'
 import { WebhookHub } from './webhooks.js'
@@ -118,7 +118,7 @@ describe('the watch over the trunks', () => {
   it('tells with the change whether the fallback is set at the operator (step 10b), and nothing of it when that cannot be read', async () => {
     const { told, gateway, set, setFallback } = await setup()
     let asked = 0
-    let answer: () => Promise<{ on_unavailable: boolean; no_answer_after_sec?: number } | undefined> = async () => ({ on_unavailable: true, no_answer_after_sec: 150 })
+    let answer: () => Promise<WebhookTrunkFallback | undefined> = async () => ({ on_unavailable: 'number', on_no_answer: 'voicemail', no_answer_after_sec: 150 })
     setFallback((tenantId, trunkId) => {
       asked++
       expect([tenantId, trunkId]).toEqual(['acme', 'tr1'])
@@ -129,7 +129,7 @@ describe('the watch over the trunks', () => {
     await w.tick()
     expect(asked).toBe(0)
     await w.tick()
-    expect((await told())[0]!.trunk.fallback).toEqual({ on_unavailable: true, no_answer_after_sec: 150 })
+    expect((await told())[0]!.trunk.fallback).toEqual({ on_unavailable: 'number', on_no_answer: 'voicemail', no_answer_after_sec: 150 })
     answer = async () => {
       throw new Error('operator: no answer in time')
     }

@@ -3,7 +3,7 @@ import { readdir, readFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import pg from 'pg'
 import { EMPTY_OUTBOUND, outboundVersion, staleOutbound } from '../outbound.js'
-import { ALERT_DEDUP_MS, alertKey, clampLimit, type AlertQuery, type AlertRecord, type StoredAlert, type ConferenceRecord, type DidRecord, type OutboundHand, type OutboundRecord, type OutboundRules, type HistoryEntry, type HistoryPage, type HistoryQuery, type OperatorCdrOutcome, type OperatorCdrRecord, type OperatorCdrStats, type MappingSource, type ProviderRecord, type PushSaveResult, type PushSubscriptionRecord, type Store, type TrunkRecord, type UserMapping, type UserPresenceRecord, type VapidKeysRecord, type ClaimedDelivery, type WebhookAttemptResult, type WebhookClaimCaps, type WebhookClaimTime, allocateClaims, claimOrder, type WebhookDeliveryQuery, type WebhookLease, type WebhookSendQuota, type WebhookDeliveryRecord, type WebhookHealth, type WebhookQueueOptions, type WebhookStateChange, type WebhookStateEvent, type WebhookSubscriptionRecord, WEBHOOK_STATE_ROLE } from './types.js'
+import { ALERT_DEDUP_MS, alertKey, clampLimit, type AlertQuery, type AlertRecord, type StoredAlert, type ConferenceRecord, type DidRecord, type OutboundHand, type OutboundRecord, type OutboundRules, type HistoryEntry, type HistoryNearQuery, type HistoryPage, type HistoryQuery, type OperatorCdrOutcome, type OperatorCdrRecord, type OperatorCdrStats, type MappingSource, type ProviderRecord, type PushSaveResult, type PushSubscriptionRecord, type Store, type TrunkRecord, type UserMapping, type UserPresenceRecord, type VapidKeysRecord, type ClaimedDelivery, type WebhookAttemptResult, type WebhookClaimCaps, type WebhookClaimTime, allocateClaims, claimOrder, type WebhookDeliveryQuery, type WebhookLease, type WebhookSendQuota, type WebhookDeliveryRecord, type WebhookHealth, type WebhookQueueOptions, type WebhookStateChange, type WebhookStateEvent, type WebhookSubscriptionRecord, WEBHOOK_STATE_ROLE } from './types.js'
 import type { OperatorCdr, WebhookEventType } from '@twake/telephony-types'
 
 const MIGRATIONS = fileURLToPath(new URL('../../migrations/', import.meta.url))
@@ -14,7 +14,7 @@ type Timestamp = Date | string
 type ProviderRow = { tenant_id: string; site: string; type: string; config: unknown }
 type MappingRow = { tenant_id: string; user_id: string; extension: string; display_name: string | null; department: string | null; source: MappingSource; synced_at: Timestamp | null }
 type HistoryRow = { tenant_id: string; user_id: string; call_id: string; direction: HistoryEntry['direction']; remote_number: string; started_at: Timestamp; ended_at: Timestamp | null; duration_sec: number; state: HistoryEntry['state']; answered: boolean; conference: boolean; operator: string | null; operator_cdr: string | null; operator_only: boolean }
-type OperatorCdrRow = { tenant_id: string; operator: string; id: string; line: string; direction: HistoryEntry['direction']; forwarded: boolean; calling: string | null; called: string | null; started_at: Timestamp; duration_sec: number; outcome: OperatorCdrRecord['outcome'] | null; call_id: string | null; user_id: string | null }
+type OperatorCdrRow = { tenant_id: string; operator: string; id: string; line: string; direction: HistoryEntry['direction']; forwarded: boolean; calling: string | null; called: string | null; started_at: Timestamp; duration_sec: number; outcome: OperatorCdrRecord['outcome'] | null; call_id: string | null; user_id: string | null; invalid: string | null }
 type PresenceRow = { tenant_id: string; user_id: string; status: UserPresenceRecord['status']; since: Timestamp; until: Timestamp | null; message: string | null }
 type ConferenceRow = { tenant_id: string; meeting_id: string; owner_user_id: string; pin: string | null; created_at: Timestamp }
 type PushRow = { tenant_id: string; user_id: string; endpoint: string; p256dh: string; auth: string; created_at: Timestamp }
@@ -142,10 +142,14 @@ const toOperatorCdr = (r: OperatorCdrRow): OperatorCdrRecord => ({
   startedAt: new Date(r.started_at).toISOString(),
   durationSec: r.duration_sec,
   ...(r.forwarded ? { forwarded: true as const } : {}),
+  ...(r.invalid !== null ? { invalid: r.invalid } : {}),
   ...(r.outcome ? { outcome: r.outcome } : {}),
   ...(r.call_id ? { callId: r.call_id } : {}),
   ...(r.user_id ? { userId: r.user_id } : {})
 })
+
+/** The advisory lock of a person's history: their erasure, and an entry known from the operator alone (review 10b, n°1). */
+const historyLock = (tenantId: string, userId: string) => `call_history|${tenantId}|${userId}`
 
 /** A deadlock's victim (40P01) or a serialization failure (40001): rolled back whole, safe to run again. */
 const retryable = (err: unknown) => {
@@ -304,6 +308,12 @@ export class PgStore implements Store {
 
   async deleteHistory(tenantId: string, userId: string) {
     return this.inTransaction(async client => {
+      // When, kept with the erasure: an orphan settled meanwhile waits for it, and sees it (settleOperatorCdrs).
+      await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [historyLock(tenantId, userId)])
+      await client.query(
+        'INSERT INTO history_erasures (tenant_id, user_id, erased_at) VALUES ($1, $2, now()) ON CONFLICT (tenant_id, user_id) DO UPDATE SET erased_at = EXCLUDED.erased_at',
+        [tenantId, userId]
+      )
       // The operator's records of their calls keep no number of them (kept as read, never read again).
       await client.query(
         `UPDATE operator_cdrs SET calling = NULL, called = NULL
@@ -315,6 +325,11 @@ export class PgStore implements Store {
     })
   }
 
+  async historyErasedAt(tenantId: string, userId: string) {
+    const { rows } = await this.pool.query<{ erased_at: Timestamp }>('SELECT erased_at FROM history_erasures WHERE tenant_id = $1 AND user_id = $2', [tenantId, userId])
+    return rows[0] ? new Date(rows[0].erased_at).toISOString() : undefined
+  }
+
   async knownOperatorCdrs(tenantId: string, operator: string, ids: readonly string[]) {
     if (!ids.length) return []
     const { rows } = await this.pool.query<{ id: string }>('SELECT id FROM operator_cdrs WHERE tenant_id = $1 AND operator = $2 AND id = ANY($3::text[])', [tenantId, operator, ids])
@@ -324,11 +339,11 @@ export class PgStore implements Store {
   async addOperatorCdrs(tenantId: string, operator: string, cdrs: readonly OperatorCdr[]) {
     if (!cdrs.length) return
     await this.pool.query(
-      `INSERT INTO operator_cdrs (tenant_id, operator, id, line, direction, forwarded, calling, called, started_at, duration_sec)
-       SELECT $1, $2, c.id, c.line, c.direction, c.forwarded, c.calling, c.called, c.started_at, c.duration_sec
-         FROM jsonb_to_recordset($3::jsonb) AS c(id text, line text, direction text, forwarded boolean, calling text, called text, started_at timestamptz, duration_sec integer)
+      `INSERT INTO operator_cdrs (tenant_id, operator, id, line, direction, forwarded, calling, called, started_at, duration_sec, invalid)
+       SELECT $1, $2, c.id, c.line, c.direction, c.forwarded, c.calling, c.called, c.started_at, c.duration_sec, c.invalid
+         FROM jsonb_to_recordset($3::jsonb) AS c(id text, line text, direction text, forwarded boolean, calling text, called text, started_at timestamptz, duration_sec integer, invalid text)
        ON CONFLICT DO NOTHING`,
-      [tenantId, operator, JSON.stringify(cdrs.map(c => ({ id: c.id, line: c.line, direction: c.direction, forwarded: c.forwarded === true, calling: c.calling, called: c.called, started_at: c.startedAt, duration_sec: c.durationSec })))]
+      [tenantId, operator, JSON.stringify(cdrs.map(c => ({ id: c.id, line: c.line, direction: c.direction, forwarded: c.forwarded === true, calling: c.calling, called: c.called, started_at: c.startedAt, duration_sec: c.durationSec, invalid: c.invalid ?? null })))]
     )
   }
 
@@ -340,25 +355,55 @@ export class PgStore implements Store {
     return rows.map(toOperatorCdr)
   }
 
-  async unreconciledHistory(tenantId: string, from: string, to: string, limit: number) {
+  async historyNear(tenantId: string, q: HistoryNearQuery) {
+    // By way, number (call_history_near, remote_e164 as e164Of writes it) or person (call_history_by_user), and time.
     const { rows } = await this.pool.query<HistoryRow>(
-      'SELECT * FROM call_history WHERE tenant_id = $1 AND operator_cdr IS NULL AND NOT operator_only AND started_at >= $2 AND started_at <= $3 ORDER BY started_at LIMIT $4',
-      [tenantId, from, to, limit]
+      `SELECT * FROM call_history
+        WHERE tenant_id = $1 AND direction = $2 AND started_at >= $3 AND started_at <= $4 AND NOT operator_only
+          AND ($5::text[] IS NULL OR remote_e164 = ANY($5::text[])) AND ($6::text IS NULL OR user_id = $6)
+          AND ($7 OR operator_cdr IS NULL)
+          AND ($9::timestamptz IS NULL OR (started_at, call_id COLLATE "C", user_id COLLATE "C") > ($9::timestamptz, $10::text COLLATE "C", $11::text COLLATE "C"))
+        ORDER BY started_at, call_id COLLATE "C", user_id COLLATE "C" LIMIT $8`,
+      [tenantId, q.direction, q.from, q.to, q.remotes ? [...q.remotes] : null, q.userId ?? null, q.reconciled === true, q.limit, q.after?.startedAt ?? null, q.after?.callId ?? null, q.after?.userId ?? null]
     )
     return rows.map(toEntry)
+  }
+
+  async eraseOperatorCdrNumbers(tenantId: string, numbers: readonly string[], before: string) {
+    if (!numbers.length) return 0
+    const r = await this.pool.query(
+      `UPDATE operator_cdrs SET calling = NULL, called = NULL, outcome = coalesce(outcome, 'unmatched')
+        WHERE tenant_id = $1 AND started_at < $3 AND (calling = ANY($2::text[]) OR called = ANY($2::text[]))`,
+      [tenantId, [...numbers], before]
+    )
+    return r.rowCount ?? 0
   }
 
   async settleOperatorCdrs(tenantId: string, operator: string, outcomes: readonly OperatorCdrOutcome[]) {
     if (!outcomes.length) return
     await this.inTransaction(async client => {
+      // Never in the history of a person who erased it since the call (review 10b, n°1): each person's erasure is
+      // waited for (deleteHistory holds the same lock), then read; the locks taken in one order, before any row's.
+      const users = [...new Set(outcomes.flatMap(o => (o.outcome === 'orphan' && o.entry ? [o.entry.userId] : [])))].sort()
+      const erased = new Map<string, string>()
+      for (const u of users) {
+        await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [historyLock(tenantId, u)])
+        const { rows } = await client.query<{ erased_at: Timestamp }>('SELECT erased_at FROM history_erasures WHERE tenant_id = $1 AND user_id = $2', [tenantId, u])
+        if (rows[0]) erased.set(u, new Date(rows[0].erased_at).toISOString())
+      }
       for (const o of outcomes) {
         // The first word kept: a record another Gateway settled meanwhile is left as it is.
         const { rowCount } = await client.query('SELECT 1 FROM operator_cdrs WHERE tenant_id = $1 AND operator = $2 AND id = $3 AND outcome IS NULL FOR UPDATE', [tenantId, operator, o.id])
         if (!rowCount) continue
-        let outcome: OperatorCdrRecord['outcome'] = o.outcome === 'forwarded' ? 'forwarded' : 'unmatched'
+        const after = o.outcome === 'orphan' && o.entry ? erased.get(o.entry.userId) : undefined
+        const erase = o.erase === true || (after !== undefined && after >= o.entry!.startedAt)
+        if (erase) await client.query('UPDATE operator_cdrs SET calling = NULL, called = NULL WHERE tenant_id = $1 AND operator = $2 AND id = $3', [tenantId, operator, o.id])
+        let outcome: OperatorCdrRecord['outcome'] = o.outcome === 'forwarded' || o.outcome === 'invalid' ? o.outcome : 'unmatched'
         let callId: string | null = null
         let userId: string | null = null
-        if (o.outcome === 'matched' && o.callId) {
+        if (erase && o.outcome !== 'matched') {
+          // Kept as read, without a number, and in nobody's history.
+        } else if (o.outcome === 'matched' && o.callId) {
           const linked = await client.query(
             'UPDATE call_history SET operator = $3, operator_cdr = $4 WHERE tenant_id = $1 AND call_id = $2 AND operator_cdr IS NULL AND NOT operator_only',
             [tenantId, o.callId, operator, o.id]
@@ -378,13 +423,13 @@ export class PgStore implements Store {
       'SELECT outcome, direction, count(*) AS n FROM operator_cdrs WHERE tenant_id = $1 AND operator = $2 AND started_at >= $3 GROUP BY outcome, direction',
       [tenantId, operator, since]
     )
-    const stats: OperatorCdrStats = { total: 0, matched: 0, orphan: 0, unmatchedInbound: 0, unmatchedOutbound: 0, forwarded: 0, pending: 0 }
+    const stats: OperatorCdrStats = { total: 0, matched: 0, orphan: 0, unmatchedInbound: 0, unmatchedOutbound: 0, forwarded: 0, pending: 0, invalid: 0 }
     for (const r of rows) {
       const n = Number(r.n)
       stats.total += n
       if (!r.outcome) stats.pending += n
       else if (r.outcome === 'unmatched') stats[r.direction === 'inbound' ? 'unmatchedInbound' : 'unmatchedOutbound'] += n
-      else if (r.outcome === 'matched' || r.outcome === 'orphan' || r.outcome === 'forwarded') stats[r.outcome] += n
+      else if (r.outcome === 'matched' || r.outcome === 'orphan' || r.outcome === 'forwarded' || r.outcome === 'invalid') stats[r.outcome] += n
     }
     return stats
   }
@@ -396,6 +441,48 @@ export class PgStore implements Store {
       purged += r.rowCount ?? 0
       if ((r.rowCount ?? 0) < PURGE_BATCH) return purged
     }
+  }
+
+  async getOperatorState(tenantId: string, key: string): Promise<unknown> {
+    const { rows } = await this.pool.query<{ value: unknown }>('SELECT value FROM operator_state WHERE tenant_id = $1 AND key = $2', [tenantId, key])
+    return rows[0]?.value
+  }
+
+  async listOperatorState(tenantId: string, prefix: string) {
+    const { rows } = await this.pool.query<{ key: string; value: unknown }>(
+      "SELECT key, value FROM operator_state WHERE tenant_id = $1 AND left(key, length($2)) = $2 ORDER BY key COLLATE \"C\"",
+      [tenantId, prefix]
+    )
+    return rows
+  }
+
+  async putOperatorState(tenantId: string, key: string, value: unknown) {
+    await this.pool.query(
+      'INSERT INTO operator_state (tenant_id, key, value, updated_at) VALUES ($1, $2, $3::jsonb, now()) ON CONFLICT (tenant_id, key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()',
+      [tenantId, key, JSON.stringify(value)]
+    )
+  }
+
+  async deleteOperatorState(tenantId: string, key: string) {
+    await this.pool.query('DELETE FROM operator_state WHERE tenant_id = $1 AND key = $2', [tenantId, key])
+  }
+
+  async takeOperatorQuota(tenantId: string, key: string, windowMs: number, max: number) {
+    return this.inTransaction(async client => {
+      // The uses of the last window, in operator_state under `quota:<key>`: one Gateway counts at a time.
+      const k = `quota:${key}`
+      await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [`operator_quota|${tenantId}|${k}`])
+      const { rows } = await client.query<{ value: unknown; now: Timestamp }>('SELECT (SELECT value FROM operator_state WHERE tenant_id = $1 AND key = $2) AS value, now() AS now', [tenantId, k])
+      const now = new Date(rows[0]!.now).getTime()
+      const used = (Array.isArray(rows[0]?.value) ? (rows[0].value as unknown[]) : []).filter((at): at is number => typeof at === 'number' && at > now - windowMs)
+      if (used.length >= max) return false
+      used.push(now)
+      await client.query(
+        'INSERT INTO operator_state (tenant_id, key, value, updated_at) VALUES ($1, $2, $3::jsonb, now()) ON CONFLICT (tenant_id, key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()',
+        [tenantId, k, JSON.stringify(used)]
+      )
+      return true
+    })
   }
 
   async listFavorites(tenantId: string, userId: string) {

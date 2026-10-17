@@ -143,7 +143,16 @@ const receiver = await startWebhookReceiver()
 const OVH_ACCOUNT = 'zz00000-fake-1'
 const OVH_LINE = '0033199000100'
 const ovh = await startFakeOvh({ accounts: { [OVH_ACCOUNT]: { lines: { [OVH_LINE]: {} } } } })
-const ovhOperator = new OvhOperator({ ...ovh.credentials, endpoint: ovh.url, billingAccount: OVH_ACCOUNT })
+// The fake answers on the loopback: a URL of a test only (in production, ovh-eu, ovh-ca or ovh-us).
+const ovhOperator = new OvhOperator({ ...ovh.credentials, baseUrl: ovh.url, billingAccount: OVH_ACCOUNT })
+// What the Gateway logs, kept to be read (review 10b, n°22: never an OVH key in it), and shown as it comes.
+const logged = []
+const logStream = {
+  write: line => {
+    logged.push(line)
+    process.stdout.write(line)
+  }
+}
 const gateway = await buildApp(new ProviderRegistry(providers, [memoryPlatform]), {
   auth,
   store,
@@ -154,6 +163,7 @@ const gateway = await buildApp(new ProviderRegistry(providers, [memoryPlatform])
   webhooks: { policy: { allowHttp: true, ports: [Number(new URL(receiver.url).port)] }, open: parseNetworks('127.0.0.1/32'), retryBaseMs: 300, pollMs: 100 },
   trunkWatchMs: 300,
   operators: new Map([['e2e', ovhOperator]]),
+  logStream,
   operatorSyncMs: 1000,
   operatorSettleMs: 0
 })
@@ -521,12 +531,17 @@ try {
   // Step 10b: the operator of the trunk, through its API (the fake OVH above).
   const trunkList = page.getByRole('list', { name: 'Trunks existants' })
   const LINE_SET = `Ligne ${OVH_LINE} : renvoi sur indisponibilité vers +33 6 39 98 00 09 ; renvoi après 150 s sans réponse vers +33 6 39 98 00 09 · renvoi de repli en place`
-  await step('the administrator gives the trunk its line at OVH and keeps the fallback there: OVH is sent the forwards, signed, and the screen says they are in place', async () => {
+  const okPuts = () => ovh.requests.filter(r => r.method === 'PUT' && r.status === 200)
+  await step('the administrator gives the trunk its line at OVH and keeps the fallback there: what OVH has is shown first, OVH is sent the forwards, signed, read back, and the screen says they are in place', async () => {
     await subnav.getByRole('link', { name: 'Trunks', exact: true }).click()
     await page.getByRole('button', { name: 'Modifier le trunk operator' }).click()
     await page.getByRole('textbox', { name: "Lignes chez l'opérateur" }).fill(OVH_LINE)
+    // What someone set in the OVH manager: the forward on unavailability to the voicemail.
+    Object.assign(ovh.options(OVH_ACCOUNT, OVH_LINE), { forwardBackup: true, forwardBackupNature: 'voicemail' })
     // Offered because this platform has the keys of an OVH application (OVH_* in production).
     await page.getByRole('checkbox', { name: "Tenir le renvoi de repli chez l'opérateur" }).check()
+    // A first fallback: what OVH has on the line is read and shown, to be replaced on the administrator's word.
+    await page.getByRole('list', { name: "Réglé chez l'opérateur maintenant" }).getByText(`Ligne ${OVH_LINE} : renvoi sur indisponibilité vers la messagerie`).waitFor()
     await page.getByRole('textbox', { name: 'Numéro de repli', exact: true }).fill('06 39 98 00 09')
     expectEqual(await page.getByRole('checkbox', { name: 'Sur indisponibilité (la plateforme ne répond plus)' }).isChecked(), true, 'forward on unavailability by default')
     await page.getByRole('checkbox', { name: 'Sur non-réponse', exact: true }).check()
@@ -535,12 +550,25 @@ try {
     await delay.fill('120')
     await page.getByRole('button', { name: 'Enregistrer le trunk' }).click()
     await page.locator('#trunk-noAnswerAfterSec-error').getByText('Un nombre de secondes de 121 à 600.').waitFor()
+    await page.locator('#trunk-replaceConfirmed-error').getByText("Cochez cette case pour remplacer ce qui est réglé chez l'opérateur sur ces lignes.").waitFor()
     expectEqual(ovh.requests.filter(r => r.method === 'PUT').length, 0, 'nothing sent to OVH')
+    await page.getByRole('checkbox', { name: "Remplacer ce qui est réglé chez l'opérateur sur ces lignes" }).check()
+    // OVH refuses this delay (400 INVALID_PARAMETER): the screen says so, and it is not sent again on its own.
+    ovh.state.acceptDelay = sec => sec !== 150
     await delay.fill('150')
     await page.getByRole('button', { name: 'Enregistrer le trunk' }).click()
     await page.getByRole('status').getByText('Trunk operator enregistré.').waitFor()
+    await trunkList.getByText(`Ligne ${OVH_LINE} : renvoi sur indisponibilité vers la messagerie · l'opérateur n'a pas gardé ce réglage : enregistrez le trunk pour réessayer`).waitFor()
+    expectEqual(JSON.stringify(ovh.requests.filter(r => r.method === 'PUT').map(r => r.status)), JSON.stringify([400]), 'refused by OVH')
+    await new Promise(r => setTimeout(r, 2500))
+    expectEqual(ovh.requests.filter(r => r.method === 'PUT').length, 1, 'not sent again on its own')
+    // Taken by OVH this time: saved again, sent again.
+    ovh.state.acceptDelay = undefined
+    await page.getByRole('button', { name: 'Modifier le trunk operator' }).click()
+    await page.getByRole('button', { name: 'Enregistrer le trunk' }).click()
+    await page.getByRole('status').getByText('Trunk operator enregistré.').waitFor()
     // What OVH was sent: its forwards on unavailability and on no answer (the options of the line), signed.
-    const puts = ovh.requests.filter(r => r.method === 'PUT')
+    const puts = okPuts()
     expectEqual(puts.length, 1, 'one change at OVH')
     expectEqual(puts[0].path, `/telephony/${OVH_ACCOUNT}/line/${OVH_LINE}/options`, 'the options of the line')
     expectEqual(puts[0].signed, true, 'signed')
@@ -551,20 +579,23 @@ try {
     expectEqual(JSON.stringify(Object.fromEntries(Object.keys(forwards).map(k => [k, options[k]]))), JSON.stringify(forwards), 'the forwards OVH has')
     expectEqual(ovh.requests.filter(r => r.path !== '/auth/time' && !r.signed).length, 0, 'every call signed')
     await trunkList.getByText(LINE_SET).waitFor()
-    // The keys of the application never leave the Gateway.
-    for (const body of [(await api('/admin/operator')).body, (await api('/admin/trunks')).body, await page.content()])
-      for (const key of [ovh.credentials.applicationSecret, ovh.credentials.consumerKey]) if (body.includes(key)) throw new Error('an OVH key is shown')
+    // The keys of the application never leave the Gateway, nor are they logged (review 10b, n°22).
+    for (const body of [(await api('/admin/operator')).body, (await api('/admin/trunks')).body, await page.content(), logged.join('')])
+      for (const key of [ovh.credentials.applicationKey, ovh.credentials.applicationSecret, ovh.credentials.consumerKey]) if (body.includes(key)) throw new Error('an OVH key is shown')
   })
   await step('changed in the OVH manager, the fallback is put back on its own, and the screen says so', async () => {
     // What a person does in the manager: the forwards off.
     Object.assign(ovh.options(OVH_ACCOUNT, OVH_LINE), { forwardBackup: false, forwardNoReply: false, forwardNoReplyDelay: 20 })
     await until(() => ovh.options(OVH_ACCOUNT, OVH_LINE).forwardBackup && ovh.options(OVH_ACCOUNT, OVH_LINE).forwardNoReplyDelay === 150, 'the fallback put back at OVH')
-    expectEqual(ovh.requests.filter(r => r.method === 'PUT').length, 2, 'put back once')
+    expectEqual(okPuts().length, 2, 'put back once')
     await trunkList.getByText(LINE_SET).waitFor()
     await trunkList.getByText("changé chez l'opérateur, remis en place le").waitFor()
     // Then left as it is: nothing more to change.
     await new Promise(r => setTimeout(r, 2500))
-    expectEqual(ovh.requests.filter(r => r.method === 'PUT').length, 2, 'nothing more sent')
+    expectEqual(okPuts().length, 2, 'nothing more sent')
+    // Said in the log of the Gateway, without a key (the log is read: review 10b, n°22).
+    if (!logged.some(l => l.includes('the fallback was changed at the operator, put back as asked'))) throw new Error('the put back is not in the log')
+    for (const key of [ovh.credentials.applicationKey, ovh.credentials.applicationSecret, ovh.credentials.consumerKey]) if (logged.join('').includes(key)) throw new Error('an OVH key is logged')
     await subnav.getByRole('link', { name: 'Webhooks' }).click()
     await page.getByRole('heading', { level: 2, name: 'Webhooks' }).waitFor()
   })
@@ -577,7 +608,7 @@ try {
       expectEqual(JSON.stringify([t.id, t.name, t.state, t.previous]), JSON.stringify(['operator', 'Opérateur', 'degraded', 'up']), 'the trunk')
       expectEqual(JSON.stringify(t.servers), JSON.stringify([{ address: 'sip1.operator.example', state: 'up' }, { address: '192.0.2.10:5060', state: 'probing' }]), 'its servers')
       // Step 10b: the callers still reach the fallback OVH holds (its number never told).
-      expectEqual(JSON.stringify(t.fallback), JSON.stringify({ on_unavailable: true, no_answer_after_sec: 150 }), 'its fallback at the operator')
+      expectEqual(JSON.stringify(t.fallback), JSON.stringify({ on_unavailable: 'number', on_no_answer: 'number', no_answer_after_sec: 150 }), 'its fallback at the operator')
       await new Promise(r => setTimeout(r, 3000))
       expectEqual(receiver.received.filter(d => d.event?.type === 'trunk.degraded').length, 1, 'told once')
     } finally {
@@ -587,7 +618,7 @@ try {
     expectEqual(recovered.verified, true, 'trunk.recovered signature')
     const t = recovered.event.trunk
     expectEqual(JSON.stringify([t.id, t.state, t.previous]), JSON.stringify(['operator', 'up', 'degraded']), 'the trunk recovered')
-    expectEqual(JSON.stringify(t.fallback), JSON.stringify({ on_unavailable: true, no_answer_after_sec: 150 }), 'its fallback at the operator, recovered')
+    expectEqual(JSON.stringify(t.fallback), JSON.stringify({ on_unavailable: 'number', on_no_answer: 'number', no_answer_after_sec: 150 }), 'its fallback at the operator, recovered')
   })
   await step('a tool that answers 500 is sent the event again until it answers 2xx; the log says so, and a delivery is replayed', async () => {
     const before = receiver.received.length
@@ -631,11 +662,11 @@ try {
     const history = async () => (await api('/calls/history')).json().items
     await until(async () => (await history()).some(i => i.id === call.id), 'the missed call in the history')
     ovh.addConsumption(OVH_ACCOUNT, OVH_LINE, { calling: '0033639980001', called: '0033199000101', creationDatetime: ovhDate(Date.parse(call.startedAt) + 1000), duration: 0, wayType: 'incoming' })
-    // A call to Alice's direct number twenty minutes ago that only OVH had (the platform could not be reached), and
-    // one OVH forwarded to the fallback number.
+    // A call to Alice's direct number twenty minutes ago that only OVH had (the platform could not be reached): OVH
+    // forwarded it to the fallback number, two records as OVH writes them, the call in, then its forward.
     const earlier = Date.now() - 20 * 60_000
     const alone = ovh.addConsumption(OVH_ACCOUNT, OVH_LINE, { calling: '0033639980002', called: '0033199000101', creationDatetime: ovhDate(earlier), duration: 42, wayType: 'incoming' })
-    ovh.addConsumption(OVH_ACCOUNT, OVH_LINE, { calling: '0033639980003', called: '0033639980009', creationDatetime: ovhDate(earlier + 5000), duration: 30, wayType: 'transfer' })
+    ovh.addConsumption(OVH_ACCOUNT, OVH_LINE, { calling: '0033199000101', called: '0033639980009', creationDatetime: ovhDate(earlier + 1000), duration: 41, wayType: 'transfer' })
     // Read by the next round, or when the administrator asks.
     await subnav.getByRole('link', { name: 'Trunks', exact: true }).click()
     const records = page.getByRole('region', { name: "Relevés de l'opérateur" })
@@ -643,7 +674,7 @@ try {
     await records.getByRole('status').getByText("L'opérateur a été relu.").waitFor()
     await until(async () => (await api('/admin/operator')).json().cdrs?.stats.pending === 0 && (await api('/admin/operator')).json().cdrs?.stats.total === 3, 'the records read and settled')
     const stats = (await api('/admin/operator')).json().cdrs.stats
-    expectEqual(JSON.stringify(stats), JSON.stringify({ total: 3, matched: 1, orphan: 1, unmatchedInbound: 0, unmatchedOutbound: 0, forwarded: 1, pending: 0 }), 'what became of the records')
+    expectEqual(JSON.stringify(stats), JSON.stringify({ total: 3, matched: 1, orphan: 1, unmatchedInbound: 0, unmatchedOutbound: 0, forwarded: 1, pending: 0, invalid: 0 }), 'what became of the records')
     // One in two of the calls the platform should have had (OVH's forward aside): the one OVH alone received.
     await records.locator('div', { has: page.getByText('Taux de rapprochement', { exact: true }) }).getByRole('definition').getByText(/^50\s%$/).waitFor()
     for (const [label, n] of [["Rapprochés de l'historique", '1'], ["Reçus par l'opérateur seul", '1'], ["Renvoyés par l'opérateur", '1']])
@@ -728,7 +759,9 @@ try {
       ['PUT', '/webhooks/domains', { domains: ['evil.example'] }],
       ['POST', '/webhooks', { url: 'https://evil.example/in', events: ['call.missed'] }],
       ['GET', '/admin/operator'],
-      ['POST', '/admin/operator/sync']
+      ['POST', '/admin/operator/sync'],
+      ['POST', '/admin/operator/lines', { lines: ['0033199000100'] }],
+      ['DELETE', '/admin/trunks/operator/operator/fallback']
     ]) {
       const res = await gateway.inject({ method, url: `/api/v1${url}`, headers: { authorization: `Bearer ${bob}` }, ...(payload ? { payload } : {}) })
       expectEqual(res.statusCode, 403, `${method} ${url} as Bob`)

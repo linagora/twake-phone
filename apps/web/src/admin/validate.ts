@@ -114,6 +114,8 @@ export interface TrunkForm {
   /** Step 10b: its lines at the operator, and the fallback the Gateway keeps there (`fallbackManaged`). */
   operatorLines: string
   fallbackManaged: boolean
+  /** The administrator saw what is set at the operator and replaces it (review 10b, n°13): asked before a first fallback. */
+  replaceConfirmed: boolean
   operatorNumber: string
   onUnavailable: boolean
   onNoAnswer: boolean
@@ -121,7 +123,7 @@ export interface TrunkForm {
 }
 export type TrunkField = Exclude<keyof TrunkForm, 'removePassword' | 'isDefault' | 'assertIdentity' | 'numberFormat' | 'auth' | 'fallbackManaged' | 'onUnavailable' | 'onNoAnswer'> | 'form'
 /** The fields in the order of the form: the first one in error gets the focus. */
-export const TRUNK_FIELDS: TrunkField[] = ['id', 'name', 'domain', 'proxies', 'sources', 'username', 'password', 'realm', 'registrar', 'registerExpires', 'codecs', 'defaultNumber', 'allowed', 'countries', 'fallbackTarget', 'operatorLines', 'operatorNumber', 'noAnswerAfterSec']
+export const TRUNK_FIELDS: TrunkField[] = ['id', 'name', 'domain', 'proxies', 'sources', 'username', 'password', 'realm', 'registrar', 'registerExpires', 'codecs', 'defaultNumber', 'allowed', 'countries', 'fallbackTarget', 'operatorLines', 'replaceConfirmed', 'operatorNumber', 'noAnswerAfterSec']
 /** The service name of a line at the operator (the Gateway's rule). */
 const OPERATOR_LINE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/
 /** The delay of a forward on no answer the form offers first: past the 120 s of the target and the fallback inside. */
@@ -150,6 +152,7 @@ export const emptyTrunk = (): TrunkForm => ({
   fallbackTarget: '',
   operatorLines: '',
   fallbackManaged: false,
+  replaceConfirmed: false,
   operatorNumber: '',
   onUnavailable: true,
   onNoAnswer: false,
@@ -180,6 +183,7 @@ export const trunkForm = (t: Trunk): TrunkForm => ({
   fallbackTarget: t.fallbackTarget ?? '',
   operatorLines: (t.operator?.lines ?? []).join(', '),
   fallbackManaged: !!t.operator?.fallback,
+  replaceConfirmed: false,
   operatorNumber: t.operator?.fallback?.number ?? '',
   onUnavailable: t.operator?.fallback ? t.operator.fallback.onUnavailable : true,
   onNoAnswer: t.operator?.fallback?.noAnswerAfterSec !== undefined,
@@ -240,6 +244,8 @@ export const checkTrunk = (f: TrunkForm, ctx: { current?: Trunk; ids: readonly s
   const lines = listOf(f.operatorLines, 16, v => OPERATOR_LINE.test(v), p('admin.trunk.err.operatorLines'))
   if (lines.problem) problems.operatorLines = lines.problem
   else if (f.fallbackManaged && !lines.items) problems.operatorLines = p('admin.trunk.err.operatorLinesNeeded')
+  // A first fallback replaces what the operator's manager set on the lines: never without the administrator's word.
+  if (f.fallbackManaged && !ctx.current?.operator?.fallback && !f.replaceConfirmed) problems.replaceConfirmed = p('admin.trunk.err.replaceConfirmed')
   const operatorNumber = normaliseNumber(f.operatorNumber)
   const forwards = f.fallbackManaged && (f.onUnavailable || f.onNoAnswer)
   if (forwards && !E164.test(operatorNumber)) problems.operatorNumber = p('admin.trunk.err.operatorNumber')
@@ -487,6 +493,8 @@ const GENERAL: Record<string, Key> = {
   WEBHOOK_DOMAINS: 'admin.webhooks.err.domains',
   OPERATOR_NONE: 'admin.err.operatorNone',
   OPERATOR_FALLBACK_LOOP: 'admin.err.operatorLoop',
+  OPERATOR_LINE_SHARED: 'admin.err.operatorLineShared',
+  OPERATOR_NO_LINES: 'admin.err.operatorNoLines',
   OPERATOR_RATE: 'admin.err.operatorRate'
 }
 

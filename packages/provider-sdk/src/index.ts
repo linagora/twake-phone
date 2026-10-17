@@ -9,6 +9,7 @@ import type {
   Meeting,
   OperatorCdr,
   OperatorFallback,
+  OperatorLineForwards,
   OriginateRequest,
   OutboundAssignment,
   OutboundPolicy,
@@ -194,15 +195,16 @@ export interface CallParties {
 export interface OperatorProvider {
   /** `ovh`, the source named in the history. */
   readonly id: string
-  /** The service names of the lines the account has (those a trunk may name). */
-  listLines(): Promise<string[]>
-  /** The fallback forward set on a line now. */
-  getFallback(line: string): Promise<OperatorFallback>
-  /** Sets it: `number` E.164; both off removes the forward. Nothing else of the line is touched. */
+  /** The forwards set on a line now, each as it is (to a number, the voicemail...). */
+  getForwards(line: string): Promise<OperatorLineForwards>
+  /** Sets them to one fallback: `number` E.164; both off removes the forwards. Nothing else of the line is touched. */
   setFallback(line: string, fallback: OperatorFallback): Promise<void>
-  /** The ids of the line's records of calls (CDR) dated from `from` to `to` (ISO 8601). */
+  /**
+   * The ids of the line's records of calls (CDR) dated from `from` to `to` (ISO 8601), all of them (however many
+   * pages, whatever billing period they are in), each once.
+   */
   listCdrIds(line: string, from: string, to: string): Promise<string[]>
-  /** One of them; undefined when the operator no longer has it. */
+  /** One of them; undefined when the operator no longer has it; `invalid` when it cannot be read as a call. */
   getCdr(line: string, id: string): Promise<OperatorCdr | undefined>
 }
 

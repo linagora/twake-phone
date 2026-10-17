@@ -1,8 +1,9 @@
 import type { OperatorCdr } from '@twake/telephony-types'
-import { clampLimit, isDeclined, isMissed, type HistoryEntry, type HistoryPage, type HistoryQuery, type OperatorCdrOutcome, type OperatorCdrRecord, type OperatorCdrStats, type ConferenceRecord, type AlertRecord, type AlertQuery, type DidRecord, type OutboundHand, type OutboundRecord, type OutboundRules, ALERT_DEDUP_MS, alertKey, type ProviderRecord, type StoredAlert, type PushSaveResult, type PushSubscriptionRecord, type Store, type TrunkRecord, type UserMapping, type UserPresenceRecord, type VapidKeysRecord, type ClaimedDelivery, type WebhookAttemptResult, type WebhookClaimCaps, type WebhookClaimTime, allocateClaims, type WebhookDeliveryQuery, type WebhookLease, type WebhookSendQuota, type WebhookDeliveryRecord, type WebhookQueueOptions, type WebhookStateChange, type WebhookStateEvent, type WebhookSubscriptionRecord, WEBHOOK_STATE_ROLE } from './types.js'
+import { clampLimit, isDeclined, isMissed, type HistoryEntry, type HistoryNearQuery, type HistoryPage, type HistoryQuery, type OperatorCdrOutcome, type OperatorCdrRecord, type OperatorCdrStats, type ConferenceRecord, type AlertRecord, type AlertQuery, type DidRecord, type OutboundHand, type OutboundRecord, type OutboundRules, ALERT_DEDUP_MS, alertKey, type ProviderRecord, type StoredAlert, type PushSaveResult, type PushSubscriptionRecord, type Store, type TrunkRecord, type UserMapping, type UserPresenceRecord, type VapidKeysRecord, type ClaimedDelivery, type WebhookAttemptResult, type WebhookClaimCaps, type WebhookClaimTime, allocateClaims, type WebhookDeliveryQuery, type WebhookLease, type WebhookSendQuota, type WebhookDeliveryRecord, type WebhookQueueOptions, type WebhookStateChange, type WebhookStateEvent, type WebhookSubscriptionRecord, WEBHOOK_STATE_ROLE } from './types.js'
 import type { WebhookEventType } from '@twake/telephony-types'
 import { randomBytes } from 'node:crypto'
 import { EMPTY_OUTBOUND, outboundVersion, staleOutbound } from '../outbound.js'
+import { e164Of } from '../e164.js'
 
 const key = (...parts: string[]) => parts.join('\u0000')
 type MemoryDelivery = WebhookDeliveryRecord & { claim?: string; subjectUser?: string; eraseBody?: boolean }
@@ -19,6 +20,10 @@ export const matchesHistory = (e: HistoryEntry, q: HistoryQuery): boolean => {
   if (q.before && e.startedAt >= q.before) return false
   return true
 }
+
+/** The order of historyNear: by start, call, then person. */
+const nearOrder = (a: Pick<HistoryEntry, 'startedAt' | 'callId' | 'userId'>, b: Pick<HistoryEntry, 'startedAt' | 'callId' | 'userId'>) =>
+  a.startedAt !== b.startedAt ? (a.startedAt < b.startedAt ? -1 : 1) : a.callId !== b.callId ? (a.callId < b.callId ? -1 : 1) : a.userId === b.userId ? 0 : a.userId < b.userId ? -1 : 1
 
 /** In-memory store for tests and single-process development. Same contract as PgStore. */
 export class MemoryStore implements Store {
@@ -46,6 +51,11 @@ export class MemoryStore implements Store {
   private claimedAt = new Map<string, string>()
   /** The operator's records of calls (step 10b), and when each was read (ms). */
   private operatorCdrs = new Map<string, OperatorCdrRecord & { readAt: number }>()
+  /** When each person last erased their history (review 10b, n°1). */
+  private erasures = new Map<string, string>()
+  /** What the platform knows of its operator (review 10b, n°8), as JSON; the uses counted of each quota (ms). */
+  private operatorState = new Map<string, string>()
+  private operatorQuota = new Map<string, number[]>()
 
   constructor(private readonly now: () => number = Date.now) {}
 
@@ -102,6 +112,7 @@ export class MemoryStore implements Store {
   }
 
   async deleteHistory(tenantId: string, userId: string) {
+    this.erasures.set(key(tenantId, userId), new Date(this.now()).toISOString())
     const calls = new Set<string>()
     for (const e of this.history.values()) if (e.tenantId === tenantId && e.userId === userId) calls.add(e.callId)
     // The operator's records of their calls keep no number of them (kept as read, never read again).
@@ -119,6 +130,10 @@ export class MemoryStore implements Store {
     return n
   }
 
+  async historyErasedAt(tenantId: string, userId: string) {
+    return this.erasures.get(key(tenantId, userId))
+  }
+
   async knownOperatorCdrs(tenantId: string, operator: string, ids: readonly string[]) {
     return ids.filter(id => this.operatorCdrs.has(key(tenantId, operator, id)))
   }
@@ -126,7 +141,7 @@ export class MemoryStore implements Store {
   async addOperatorCdrs(tenantId: string, operator: string, cdrs: readonly OperatorCdr[]) {
     for (const c of cdrs) {
       const k = key(tenantId, operator, c.id)
-      if (!this.operatorCdrs.has(k)) this.operatorCdrs.set(k, { ...c, tenantId, operator, readAt: this.now() })
+      if (!this.operatorCdrs.has(k)) this.operatorCdrs.set(k, { ...structuredClone(c), tenantId, operator, readAt: this.now() })
     }
   }
 
@@ -139,18 +154,54 @@ export class MemoryStore implements Store {
       .map(({ readAt: _at, ...r }) => ({ ...r }))
   }
 
-  async unreconciledHistory(tenantId: string, from: string, to: string, limit: number) {
+  async historyNear(tenantId: string, q: HistoryNearQuery) {
+    const remotes = q.remotes && new Set(q.remotes)
     return [...this.history.values()]
-      .filter(e => e.tenantId === tenantId && !e.operatorCdr && !e.operatorOnly && e.startedAt >= from && e.startedAt <= to)
-      .sort((a, b) => (a.startedAt < b.startedAt ? -1 : 1))
-      .slice(0, limit)
+      .filter(
+        e =>
+          e.tenantId === tenantId &&
+          e.direction === q.direction &&
+          !e.operatorOnly &&
+          (q.reconciled || !e.operatorCdr) &&
+          (!q.userId || e.userId === q.userId) &&
+          (!remotes || remotes.has(e164Of(e.remoteNumber))) &&
+          e.startedAt >= q.from &&
+          e.startedAt <= q.to &&
+          (!q.after || nearOrder(e, q.after) > 0)
+      )
+      .sort(nearOrder)
+      .slice(0, q.limit)
       .map(e => ({ ...e }))
+  }
+
+  async eraseOperatorCdrNumbers(tenantId: string, numbers: readonly string[], before: string) {
+    const wanted = new Set(numbers)
+    let n = 0
+    for (const r of this.operatorCdrs.values()) {
+      if (r.tenantId !== tenantId || r.startedAt >= before) continue
+      if (!(r.calling && wanted.has(r.calling)) && !(r.called && wanted.has(r.called))) continue
+      delete r.calling
+      delete r.called
+      r.outcome ??= 'unmatched'
+      n++
+    }
+    return n
   }
 
   async settleOperatorCdrs(tenantId: string, operator: string, outcomes: readonly OperatorCdrOutcome[]) {
     for (const o of outcomes) {
       const r = this.operatorCdrs.get(key(tenantId, operator, o.id))
       if (!r || r.outcome) continue
+      // Never in the history of a person who erased it since the call (review 10b, n°1), whatever the caller said.
+      const erased = o.outcome === 'orphan' && o.entry ? this.erasures.get(key(tenantId, o.entry.userId)) : undefined
+      if (o.erase || (erased && erased >= o.entry!.startedAt)) {
+        delete r.calling
+        delete r.called
+        if (o.outcome !== 'matched') {
+          r.outcome = o.outcome === 'forwarded' || o.outcome === 'invalid' ? o.outcome : 'unmatched'
+          continue
+        }
+      }
       if (o.outcome === 'matched' && o.callId) {
         const entries = [...this.history.values()].filter(e => e.tenantId === tenantId && e.callId === o.callId && !e.operatorCdr && !e.operatorOnly)
         if (!entries.length) {
@@ -162,12 +213,12 @@ export class MemoryStore implements Store {
       } else if (o.outcome === 'orphan' && o.entry) {
         await this.addHistory({ ...o.entry, tenantId, operator, operatorCdr: o.id, operatorOnly: true })
         Object.assign(r, { outcome: 'orphan', callId: o.entry.callId, userId: o.entry.userId })
-      } else r.outcome = o.outcome === 'forwarded' ? 'forwarded' : 'unmatched'
+      } else r.outcome = o.outcome === 'forwarded' || o.outcome === 'invalid' ? o.outcome : 'unmatched'
     }
   }
 
   async operatorCdrStats(tenantId: string, operator: string, since: string): Promise<OperatorCdrStats> {
-    const stats: OperatorCdrStats = { total: 0, matched: 0, orphan: 0, unmatchedInbound: 0, unmatchedOutbound: 0, forwarded: 0, pending: 0 }
+    const stats: OperatorCdrStats = { total: 0, matched: 0, orphan: 0, unmatchedInbound: 0, unmatchedOutbound: 0, forwarded: 0, pending: 0, invalid: 0 }
     for (const r of this.operatorCdrs.values()) {
       if (r.tenantId !== tenantId || r.operator !== operator || r.startedAt < since) continue
       stats.total++
@@ -186,6 +237,36 @@ export class MemoryStore implements Store {
       n++
     }
     return n
+  }
+
+  async getOperatorState(tenantId: string, k: string): Promise<unknown> {
+    const v = this.operatorState.get(key(tenantId, k))
+    return v === undefined ? undefined : JSON.parse(v)
+  }
+
+  async listOperatorState(tenantId: string, prefix: string) {
+    return [...this.operatorState]
+      .map(([k, v]) => ({ k: k.split('\u0000'), v }))
+      .filter(({ k }) => k[0] === tenantId && k[1]!.startsWith(prefix))
+      .map(({ k, v }) => ({ key: k[1]!, value: JSON.parse(v) as unknown }))
+      .sort((a, b) => (a.key < b.key ? -1 : 1))
+  }
+
+  async putOperatorState(tenantId: string, k: string, value: unknown) {
+    this.operatorState.set(key(tenantId, k), JSON.stringify(value))
+  }
+
+  async deleteOperatorState(tenantId: string, k: string) {
+    this.operatorState.delete(key(tenantId, k))
+  }
+
+  async takeOperatorQuota(tenantId: string, k: string, windowMs: number, max: number) {
+    const t = this.now()
+    const used = (this.operatorQuota.get(key(tenantId, k)) ?? []).filter(at => at > t - windowMs)
+    const ok = used.length < max
+    if (ok) used.push(t)
+    this.operatorQuota.set(key(tenantId, k), used)
+    return ok
   }
 
   async listFavorites(tenantId: string, userId: string) {
