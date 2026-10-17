@@ -1,4 +1,4 @@
-import type { TrunkHealth, TrunkStatus, WebhookEventType } from '@twake/telephony-types'
+import type { TrunkHealth, TrunkStatus, WebhookEventType, WebhookTrunkFallback } from '@twake/telephony-types'
 import { randomEventId, type PublishedWebhookEvent } from './webhook-events.js'
 
 /** Registration states that leave the trunk without calls: the operator refused it, never answered, or it lapsed. */
@@ -34,6 +34,11 @@ export interface TrunkWatchOptions {
    * telling: one told degraded then removed while another Gateway told is still told recovered.
    */
   told?: (tenantId: string) => Promise<{ subject: string; state: string }[]>
+  /**
+   * The fallback set at the operator for the trunk's lines (step 10b, OperatorSync.fallbackOf), told with its changes:
+   * undefined when not known. A failure leaves it out.
+   */
+  fallback?: (tenantId: string, trunkId: string) => Promise<WebhookTrunkFallback | undefined>
   /** Whether this Gateway tells the changes of state now (WebhookHub.leading): the others read nothing. */
   leading: () => boolean
   /** Tells a change of state once (WebhookHub.publishChange). */
@@ -131,11 +136,13 @@ export class TrunkWatch {
     const describe = async (status: TrunkStatus | undefined, id: string) => {
       names ??= await this.options.names(tenantId)
       const name = names.get(id)
+      const fallback = await this.options.fallback?.(tenantId, id).catch(() => undefined)
       return {
         id,
         ...(name ? { name } : {}),
         ...(status?.registration ? { registration: status.registration.state } : {}),
-        servers: (status?.servers ?? []).map(s => ({ address: s.address, state: s.state }))
+        servers: (status?.servers ?? []).map(s => ({ address: s.address, state: s.state })),
+        ...(fallback ? { fallback } : {})
       }
     }
     for (const status of statuses) {

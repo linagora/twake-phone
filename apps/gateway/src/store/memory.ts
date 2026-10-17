@@ -1,4 +1,5 @@
-import { clampLimit, isDeclined, isMissed, type HistoryEntry, type HistoryPage, type HistoryQuery, type ConferenceRecord, type AlertRecord, type AlertQuery, type DidRecord, type OutboundHand, type OutboundRecord, type OutboundRules, ALERT_DEDUP_MS, alertKey, type ProviderRecord, type StoredAlert, type PushSaveResult, type PushSubscriptionRecord, type Store, type TrunkRecord, type UserMapping, type UserPresenceRecord, type VapidKeysRecord, type ClaimedDelivery, type WebhookAttemptResult, type WebhookClaimCaps, type WebhookClaimTime, allocateClaims, type WebhookDeliveryQuery, type WebhookLease, type WebhookSendQuota, type WebhookDeliveryRecord, type WebhookQueueOptions, type WebhookStateChange, type WebhookStateEvent, type WebhookSubscriptionRecord, WEBHOOK_STATE_ROLE } from './types.js'
+import type { OperatorCdr } from '@twake/telephony-types'
+import { clampLimit, isDeclined, isMissed, type HistoryEntry, type HistoryPage, type HistoryQuery, type OperatorCdrOutcome, type OperatorCdrRecord, type OperatorCdrStats, type ConferenceRecord, type AlertRecord, type AlertQuery, type DidRecord, type OutboundHand, type OutboundRecord, type OutboundRules, ALERT_DEDUP_MS, alertKey, type ProviderRecord, type StoredAlert, type PushSaveResult, type PushSubscriptionRecord, type Store, type TrunkRecord, type UserMapping, type UserPresenceRecord, type VapidKeysRecord, type ClaimedDelivery, type WebhookAttemptResult, type WebhookClaimCaps, type WebhookClaimTime, allocateClaims, type WebhookDeliveryQuery, type WebhookLease, type WebhookSendQuota, type WebhookDeliveryRecord, type WebhookQueueOptions, type WebhookStateChange, type WebhookStateEvent, type WebhookSubscriptionRecord, WEBHOOK_STATE_ROLE } from './types.js'
 import type { WebhookEventType } from '@twake/telephony-types'
 import { randomBytes } from 'node:crypto'
 import { EMPTY_OUTBOUND, outboundVersion, staleOutbound } from '../outbound.js'
@@ -43,6 +44,8 @@ export class MemoryStore implements Store {
   private leases = new Map<string, { holder: string; until: number; heard: number; writeFrom: number; writeUntil: number }>()
   /** When deliveries were last taken of each subscription (claimWebhookDeliveries). */
   private claimedAt = new Map<string, string>()
+  /** The operator's records of calls (step 10b), and when each was read (ms). */
+  private operatorCdrs = new Map<string, OperatorCdrRecord & { readAt: number }>()
 
   constructor(private readonly now: () => number = Date.now) {}
 
@@ -99,10 +102,87 @@ export class MemoryStore implements Store {
   }
 
   async deleteHistory(tenantId: string, userId: string) {
+    const calls = new Set<string>()
+    for (const e of this.history.values()) if (e.tenantId === tenantId && e.userId === userId) calls.add(e.callId)
+    // The operator's records of their calls keep no number of them (kept as read, never read again).
+    for (const r of this.operatorCdrs.values()) {
+      if (r.tenantId !== tenantId || !(r.userId === userId || (r.callId && calls.has(r.callId)))) continue
+      delete r.calling
+      delete r.called
+    }
     let n = 0
     for (const [k, e] of this.history) {
       if (e.tenantId !== tenantId || e.userId !== userId) continue
       this.history.delete(k)
+      n++
+    }
+    return n
+  }
+
+  async knownOperatorCdrs(tenantId: string, operator: string, ids: readonly string[]) {
+    return ids.filter(id => this.operatorCdrs.has(key(tenantId, operator, id)))
+  }
+
+  async addOperatorCdrs(tenantId: string, operator: string, cdrs: readonly OperatorCdr[]) {
+    for (const c of cdrs) {
+      const k = key(tenantId, operator, c.id)
+      if (!this.operatorCdrs.has(k)) this.operatorCdrs.set(k, { ...c, tenantId, operator, readAt: this.now() })
+    }
+  }
+
+  async pendingOperatorCdrs(tenantId: string, operator: string, readBefore: string, limit: number) {
+    const before = Date.parse(readBefore)
+    return [...this.operatorCdrs.values()]
+      .filter(r => r.tenantId === tenantId && r.operator === operator && !r.outcome && r.readAt < before)
+      .sort((a, b) => (a.startedAt < b.startedAt ? -1 : a.startedAt > b.startedAt ? 1 : a.id < b.id ? -1 : 1))
+      .slice(0, limit)
+      .map(({ readAt: _at, ...r }) => ({ ...r }))
+  }
+
+  async unreconciledHistory(tenantId: string, from: string, to: string, limit: number) {
+    return [...this.history.values()]
+      .filter(e => e.tenantId === tenantId && !e.operatorCdr && !e.operatorOnly && e.startedAt >= from && e.startedAt <= to)
+      .sort((a, b) => (a.startedAt < b.startedAt ? -1 : 1))
+      .slice(0, limit)
+      .map(e => ({ ...e }))
+  }
+
+  async settleOperatorCdrs(tenantId: string, operator: string, outcomes: readonly OperatorCdrOutcome[]) {
+    for (const o of outcomes) {
+      const r = this.operatorCdrs.get(key(tenantId, operator, o.id))
+      if (!r || r.outcome) continue
+      if (o.outcome === 'matched' && o.callId) {
+        const entries = [...this.history.values()].filter(e => e.tenantId === tenantId && e.callId === o.callId && !e.operatorCdr && !e.operatorOnly)
+        if (!entries.length) {
+          r.outcome = 'unmatched'
+          continue
+        }
+        for (const e of entries) Object.assign(e, { operator, operatorCdr: o.id })
+        Object.assign(r, { outcome: 'matched', callId: o.callId })
+      } else if (o.outcome === 'orphan' && o.entry) {
+        await this.addHistory({ ...o.entry, tenantId, operator, operatorCdr: o.id, operatorOnly: true })
+        Object.assign(r, { outcome: 'orphan', callId: o.entry.callId, userId: o.entry.userId })
+      } else r.outcome = o.outcome === 'forwarded' ? 'forwarded' : 'unmatched'
+    }
+  }
+
+  async operatorCdrStats(tenantId: string, operator: string, since: string): Promise<OperatorCdrStats> {
+    const stats: OperatorCdrStats = { total: 0, matched: 0, orphan: 0, unmatchedInbound: 0, unmatchedOutbound: 0, forwarded: 0, pending: 0 }
+    for (const r of this.operatorCdrs.values()) {
+      if (r.tenantId !== tenantId || r.operator !== operator || r.startedAt < since) continue
+      stats.total++
+      if (!r.outcome) stats.pending++
+      else if (r.outcome === 'unmatched') stats[r.direction === 'inbound' ? 'unmatchedInbound' : 'unmatchedOutbound']++
+      else stats[r.outcome]++
+    }
+    return stats
+  }
+
+  async purgeOperatorCdrs(before: string) {
+    let n = 0
+    for (const [k, r] of this.operatorCdrs) {
+      if (r.startedAt >= before) continue
+      this.operatorCdrs.delete(k)
       n++
     }
     return n

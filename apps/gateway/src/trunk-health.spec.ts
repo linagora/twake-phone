@@ -2,7 +2,7 @@ import { randomBytes } from 'node:crypto'
 import { describe, expect, it } from 'vitest'
 import type { TrunkStatus, WebhookEvent } from '@twake/telephony-types'
 import { MemoryStore } from './store/memory.js'
-import { TrunkWatch, trunkHealthOf } from './trunk-health.js'
+import { TrunkWatch, trunkHealthOf, type TrunkWatchOptions } from './trunk-health.js'
 import { WebhookHub } from './webhooks.js'
 
 const quiet = { info: () => undefined, warn: () => undefined, error: () => undefined }
@@ -47,6 +47,7 @@ describe('the watch over the trunks', () => {
     await subscribe()
     let status: TrunkStatus[] | undefined = [trunk(UP)]
     let names = new Map([['tr1', 'Opérateur principal']])
+    let fallback: TrunkWatchOptions['fallback']
     const gateway = async (tenants = ['acme'], stateLeaseMs = 60_000, takesOver = false) => {
       const hub = new WebhookHub({ store, key: randomBytes(32), logger: quiet, stateLeaseMs, now })
       await hub.renewLease()
@@ -62,12 +63,13 @@ describe('the watch over the trunks', () => {
         read: async () => status,
         names: async () => names,
         told: tenantId => store.listWebhookStates(tenantId, 'trunk:'),
+        ...(fallback ? { fallback } : {}),
         confirm
       })
       return { hub, watch }
     }
     const told = async () => (await store.listWebhookDeliveries('acme', 'wh_00000000000000c1')).reverse().map(d => JSON.parse(d.body) as TrunkEvent)
-    return { store, now, told, gateway, subscribe, writes: () => writes, set: (s: TrunkStatus[] | undefined) => (status = s), setNames: (n: Map<string, string>) => (names = n) }
+    return { store, now, told, gateway, subscribe, writes: () => writes, set: (s: TrunkStatus[] | undefined) => (status = s), setNames: (n: Map<string, string>) => (names = n), setFallback: (f: TrunkWatchOptions['fallback']) => (fallback = f) }
   }
   type TrunkEvent = Extract<WebhookEvent, { type: 'trunk.degraded' | 'trunk.recovered' }>
   const steps = (events: TrunkEvent[]) => events.map(e => [e.type, e.trunk.state, e.trunk.previous])
@@ -111,6 +113,31 @@ describe('the watch over the trunks', () => {
     ])
     expect(events[3]!.trunk.registration).toBe('refused')
     expect(events[2]!.trunk.servers).toEqual(UP)
+  })
+
+  it('tells with the change whether the fallback is set at the operator (step 10b), and nothing of it when that cannot be read', async () => {
+    const { told, gateway, set, setFallback } = await setup()
+    let asked = 0
+    let answer: () => Promise<{ on_unavailable: boolean; no_answer_after_sec?: number } | undefined> = async () => ({ on_unavailable: true, no_answer_after_sec: 150 })
+    setFallback((tenantId, trunkId) => {
+      asked++
+      expect([tenantId, trunkId]).toEqual(['acme', 'tr1'])
+      return answer()
+    })
+    const { watch: w } = await gateway()
+    set([trunk(ALL_OUT)])
+    await w.tick()
+    expect(asked).toBe(0)
+    await w.tick()
+    expect((await told())[0]!.trunk.fallback).toEqual({ on_unavailable: true, no_answer_after_sec: 150 })
+    answer = async () => {
+      throw new Error('operator: no answer in time')
+    }
+    set([trunk(UP)])
+    await w.tick()
+    await w.tick()
+    const back = (await told())[1]!
+    expect([back.type, 'fallback' in back.trunk]).toEqual(['trunk.recovered', false])
   })
 
   it('tells a partial recovery (down to degraded), and a trunk no longer watched as recovered, removed (review 10a, second, n°16)', async () => {

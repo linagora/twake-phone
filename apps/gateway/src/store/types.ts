@@ -1,4 +1,4 @@
-import type { CallDirection, CallState, DidRange, OutboundAssignment, OutboundPolicy, OutboundProfile, PresenceStatus, TelephonyAlert, Trunk, WebhookEventType } from '@twake/telephony-types'
+import type { CallDirection, CallState, DidRange, OperatorCdr, OutboundAssignment, OutboundPolicy, OutboundProfile, PresenceStatus, TelephonyAlert, Trunk, WebhookEventType } from '@twake/telephony-types'
 
 export interface ProviderRecord {
   tenantId: string
@@ -35,6 +35,48 @@ export interface HistoryEntry {
   answered: boolean
   /** A conference's call (step 8b, ADR 0019): the room called the person in the place of a call of theirs. */
   conference?: boolean
+  /** The operator whose record of the call (`operatorCdr`, its id there) was reconciled with it (step 10b, ADR 0021). */
+  operator?: string
+  operatorCdr?: string
+  /** Known from the operator's record only (the platform never had the call: received while it could not be reached). */
+  operatorOnly?: boolean
+}
+
+/**
+ * A record of a call by the operator as the store keeps it (step 10b): `calling` and `called` gone once the person
+ * whose call it was erased their history. Once reconciled, its `outcome` (OperatorCdrOutcome).
+ */
+export interface OperatorCdrRecord extends Omit<OperatorCdr, 'calling' | 'called'> {
+  tenantId: string
+  operator: string
+  calling?: string
+  called?: string
+  outcome?: OperatorCdrOutcome['outcome']
+  callId?: string
+  userId?: string
+}
+
+/**
+ * What became of a record of the operator: reconciled with the call `callId` of the history (`matched`: every
+ * person's entry of it), entered alone in a person's history (`orphan`: `entry`, a call the platform never had),
+ * neither (`unmatched`), or a forward the operator placed (`forwarded`).
+ */
+export interface OperatorCdrOutcome {
+  id: string
+  outcome: 'matched' | 'orphan' | 'unmatched' | 'forwarded'
+  callId?: string
+  entry?: HistoryEntry
+}
+
+/** The records of the operator since a date, by what became of them; `unmatched` split by way (an outbound one the platform never placed is worth a look). */
+export interface OperatorCdrStats {
+  total: number
+  matched: number
+  orphan: number
+  unmatchedInbound: number
+  unmatchedOutbound: number
+  forwarded: number
+  pending: number
 }
 
 /** A missed call: inbound, never answered, and not declined by the user (state `missed`, not `rejected`). */
@@ -498,8 +540,33 @@ export interface Store {
   /** Idempotent on (tenant, user, callId). */
   addHistory(entry: HistoryEntry): Promise<void>
   listHistory(tenantId: string, userId: string, query?: HistoryQuery): Promise<HistoryPage>
-  /** Deletes the history of a user (retention, right to erasure). Returns the number of rows. */
+  /**
+   * Deletes the history of a user (retention, right to erasure), and the numbers of the operator's records of their
+   * calls (kept as read, without them: never read again). Returns the number of rows of history.
+   */
   deleteHistory(tenantId: string, userId: string): Promise<number>
+
+  /** Which of these ids of the operator's records (step 10b) the store keeps already. */
+  knownOperatorCdrs(tenantId: string, operator: string, ids: readonly string[]): Promise<string[]>
+  /** Keeps the records not kept yet (idempotent on the operator's id), dated as read now. */
+  addOperatorCdrs(tenantId: string, operator: string, cdrs: readonly OperatorCdr[]): Promise<void>
+  /** The records not reconciled yet that were read before `readBefore`, oldest first, `limit` at most. */
+  pendingOperatorCdrs(tenantId: string, operator: string, readBefore: string, limit: number): Promise<OperatorCdrRecord[]>
+  /**
+   * The entries of every person of the tenant whose call started from `from` to `to` and that no operator's record
+   * was reconciled with yet (none known from an operator's record alone), oldest first, `limit` at most.
+   */
+  unreconciledHistory(tenantId: string, from: string, to: string, limit: number): Promise<HistoryEntry[]>
+  /**
+   * Keeps what became of records, in one transaction, the first word kept: a record already settled is left as it
+   * is; `matched` links each entry of its call that no record has yet (none: the record is `unmatched`); `orphan`
+   * adds its entry (none added when it is there already).
+   */
+  settleOperatorCdrs(tenantId: string, operator: string, outcomes: readonly OperatorCdrOutcome[]): Promise<void>
+  /** The records of the operator that started from `since` on, by outcome. */
+  operatorCdrStats(tenantId: string, operator: string, since: string): Promise<OperatorCdrStats>
+  /** Removes the records that started before `before` (retention), every tenant. */
+  purgeOperatorCdrs(before: string): Promise<number>
 
   /** Favourite contacts of a user, oldest first. Ids are the directory's; the store never interprets them. */
   listFavorites(tenantId: string, userId: string): Promise<string[]>

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react'
-import { TRUNK_CODECS, TRUNK_OUTBOUND_CLASSES, type Trunk, type TrunkNumberFormat, type TrunkStatus } from '@twake/telephony-client'
+import { TRUNK_CODECS, TRUNK_OUTBOUND_CLASSES, formatNumber, type OperatorFallback, type OperatorLine, type OperatorStatus, type Trunk, type TrunkNumberFormat, type TrunkStatus } from '@twake/telephony-client'
 import { TargetList } from '../../admin/TargetList.js'
 import { targetLabel, useTargets } from '../../admin/targets.js'
 import { CheckBox, CheckGroup, ConfirmDelete, NoteLine, ProblemSummary, Section, SelectField, TextField, useFocusLater, useProblem, useRefresh, type Note } from '../../admin/ui.js'
@@ -38,6 +38,86 @@ const TrunkState = ({ status, available }: { status: TrunkStatus | undefined; av
   )
 }
 
+/** What a fallback at the operator forwards, in words: on unavailability, on no answer after a delay, or nothing. */
+const forwardsOf = (fb: OperatorFallback | undefined, t: ReturnType<typeof useT>['t']) => {
+  const out: string[] = []
+  if (fb?.number && fb.onUnavailable) out.push(t('admin.operator.forwardUnavailable', { number: formatNumber(fb.number) }))
+  if (fb?.number && fb.noAnswerAfterSec !== undefined) out.push(t('admin.operator.forwardNoAnswer', { number: formatNumber(fb.number), sec: fb.noAnswerAfterSec }))
+  return out.length ? out.join(' ; ') : t('admin.operator.noForward')
+}
+
+/** A trunk's lines at the operator (step 10b): the forwards set there and whether they are the ones asked. */
+const OperatorLines = ({ lines }: { lines: OperatorLine[] }) => {
+  const { t, lang } = useT()
+  const at = new Intl.DateTimeFormat(lang, { dateStyle: 'short', timeStyle: 'short' })
+  return (
+    <ul className="plain" aria-label={t('admin.operator.lines')}>
+      {lines.map(l => (
+        <li key={l.line}>
+          {t('admin.operator.line', { line: l.line })} : {l.readAt || l.appliedAt ? forwardsOf(l.fallback, t) : t('admin.operator.notRead')}
+          {' · '}
+          {l.error ? (
+            <span className="state state-error">{t(`admin.operator.err.${l.error}` as Key)}</span>
+          ) : !l.managed ? (
+            <span>{t('admin.operator.notManaged')}</span>
+          ) : l.inSync ? (
+            <span className="state state-up">{t('admin.operator.inSync')}</span>
+          ) : (
+            <span>{t('admin.operator.pending')}</span>
+          )}
+          {l.restoredAt ? <> · {t('admin.operator.restored', { at: at.format(new Date(l.restoredAt)) })}</> : null}
+        </li>
+      ))}
+    </ul>
+  )
+}
+
+/** The records of calls the operator keeps (step 10b): when last read, and what became of those of the last days. */
+const OperatorRecords = ({ status, onSync, busy }: { status: OperatorStatus; onSync: () => void; busy: boolean }) => {
+  const { t, lang } = useT()
+  const at = new Intl.DateTimeFormat(lang, { dateStyle: 'short', timeStyle: 'short' })
+  const cdrs = status.cdrs
+  const stats = cdrs?.stats
+  // The share of the calls OVH recorded that the platform had too (FR-D4): its forwards and those not settled yet aside.
+  const settled = stats ? stats.total - stats.forwarded - stats.pending : 0
+  const rate = stats && settled > 0 ? new Intl.NumberFormat(lang, { style: 'percent', maximumFractionDigits: 1 }).format(stats.matched / settled) : '–'
+  const rows: [Key, number | string][] = stats
+    ? [
+        ['admin.operator.statRate', rate],
+        ['admin.operator.statTotal', stats.total],
+        ['admin.operator.statMatched', stats.matched],
+        ['admin.operator.statOrphan', stats.orphan],
+        ['admin.operator.statUnmatched', stats.unmatchedInbound + stats.unmatchedOutbound],
+        ['admin.operator.statForwarded', stats.forwarded],
+        ['admin.operator.statPending', stats.pending]
+      ]
+    : []
+  return (
+    <>
+      <p>{t('admin.operator.help')}</p>
+      <p>
+        {cdrs?.readAt ? t('admin.operator.readAt', { at: at.format(new Date(cdrs.readAt)), count: cdrs.read ?? 0 }) : t('admin.operator.notYet')}
+        {cdrs?.error ? <> · <span className="state state-error">{t(`admin.operator.err.${cdrs.error}` as Key)}</span></> : null}
+      </p>
+      {stats ? (
+        <dl className="facts facts-compact" aria-label={t('admin.operator.stats', { since: at.format(new Date(cdrs.since)) })}>
+          {rows.map(([key, n]) => (
+            <div key={key}>
+              <dt>{t(key)}</dt>
+              <dd>{n}</dd>
+            </div>
+          ))}
+        </dl>
+      ) : null}
+      <p>
+        <button type="button" className="btn" onClick={onSync} disabled={busy} aria-busy={busy}>
+          {t('admin.operator.sync')}
+        </button>
+      </p>
+    </>
+  )
+}
+
 /**
  * The trunks to the operator (step 7, FR-D2; ADR 0016): listed with how they are doing (registration, servers),
  * created, changed and removed. The password is write-only: never shown, kept when left empty, removed on demand.
@@ -56,6 +136,9 @@ export const Trunks = () => {
   const [problems, setProblems] = useState<Problems<TrunkField>>({})
   const [busy, setBusy] = useState(false)
   const [note, setNote] = useState<Note>(null)
+  const [operator, setOperator] = useState<OperatorStatus | null>(null)
+  const [syncing, setSyncing] = useState(false)
+  const [operatorNote, setOperatorNote] = useState<Note>(null)
 
   // Only the answer to the last read is shown: one asked by the button never comes after a later one.
   const asked = useRef(0)
@@ -64,7 +147,15 @@ export const Trunks = () => {
     const show = (s: { available: boolean; items: TrunkStatus[] }) => {
       if (n === asked.current) setStatus(s)
     }
-    return client.getTrunkStatus().then(show, () => show({ available: false, items: [] }))
+    // Its operator (step 10b) with it: what is set at the lines, what became of the records (read from the Gateway's
+    // memory and base, never from the operator).
+    const operatorRead = client.getOperatorStatus().then(
+      o => {
+        if (n === asked.current) setOperator(o)
+      },
+      () => undefined
+    )
+    return Promise.all([client.getTrunkStatus().then(show, () => show({ available: false, items: [] })), operatorRead]).then(() => undefined)
   }, [client])
   const load = useCallback(() => {
     client.listTrunks().then(
@@ -114,6 +205,20 @@ export const Trunks = () => {
       }
     } finally {
       setBusy(false)
+    }
+  }
+
+  const syncOperator = async () => {
+    setOperatorNote(null)
+    setSyncing(true)
+    try {
+      ++asked.current
+      setOperator(await client.syncOperator())
+      setOperatorNote({ kind: 'ok', text: t('admin.operator.synced') })
+    } catch (err) {
+      setOperatorNote({ kind: 'error', text: say(trunkRefusal(err).problem)! })
+    } finally {
+      setSyncing(false)
     }
   }
 
@@ -212,6 +317,7 @@ export const Trunks = () => {
                     ) : null}
                   </dl>
                   <TrunkState status={status.items.find(s => s.id === trunk.id)} available={status.available} />
+                  {operator?.trunks?.find(o => o.id === trunk.id)?.lines.length ? <OperatorLines lines={operator.trunks.find(o => o.id === trunk.id)!.lines} /> : null}
                 </div>
                 <div className="actions actions-end">
                   <button type="button" className="btn" onClick={() => edit(trunk)} disabled={busy} aria-label={t('admin.trunk.edit', { id: trunk.id })}>
@@ -280,6 +386,27 @@ export const Trunks = () => {
           />
           <TextField id="trunk-fallbackTarget" label={t('admin.trunk.fallbackTarget')} hint={t('admin.trunk.fallbackTargetHint')} inputMode="numeric" value={form.fallbackTarget} onChange={set('fallbackTarget')} error={field('fallbackTarget')} disabled={busy} maxLength={6} list="trunk-targets" />
           <TargetList id="trunk-targets" targets={targets} />
+          <fieldset className="field">
+            <legend>{t('admin.trunk.operator')}</legend>
+            <TextField id="trunk-operatorLines" label={t('admin.trunk.operatorLines')} hint={t('admin.trunk.operatorLinesHint')} value={form.operatorLines} onChange={set('operatorLines')} error={field('operatorLines')} disabled={busy} />
+            <CheckBox
+              id="trunk-fallbackManaged"
+              label={t('admin.trunk.fallbackManaged')}
+              hint={t(operator?.configured ? 'admin.trunk.fallbackManagedHint' : 'admin.trunk.fallbackManagedNone')}
+              checked={form.fallbackManaged}
+              onChange={set('fallbackManaged')}
+              // Without an operator the Gateway refuses it; one kept from before can still be let go.
+              disabled={busy || (!operator?.configured && !form.fallbackManaged)}
+            />
+            {form.fallbackManaged ? (
+              <>
+                <TextField id="trunk-operatorNumber" label={t('admin.trunk.operatorNumber')} hint={t('admin.trunk.operatorNumberHint')} type="tel" inputMode="tel" value={form.operatorNumber} onChange={set('operatorNumber')} error={field('operatorNumber')} disabled={busy} maxLength={24} />
+                <CheckBox id="trunk-onUnavailable" label={t('admin.trunk.onUnavailable')} hint={t('admin.trunk.onUnavailableHint')} checked={form.onUnavailable} onChange={set('onUnavailable')} disabled={busy} />
+                <CheckBox id="trunk-onNoAnswer" label={t('admin.trunk.onNoAnswer')} checked={form.onNoAnswer} onChange={set('onNoAnswer')} disabled={busy} />
+                <TextField id="trunk-noAnswerAfterSec" label={t('admin.trunk.noAnswerAfterSec')} hint={t('admin.trunk.noAnswerAfterSecHint')} inputMode="numeric" value={form.noAnswerAfterSec} onChange={set('noAnswerAfterSec')} error={field('noAnswerAfterSec')} disabled={busy || !form.onNoAnswer} maxLength={3} />
+              </>
+            ) : null}
+          </fieldset>
           <div className="actions actions-start">
             <button type="submit" className="btn btn-primary" disabled={busy} aria-busy={busy}>
               {t('admin.trunk.save')}
@@ -293,6 +420,12 @@ export const Trunks = () => {
         </form>
         <NoteLine note={note} />
       </Section>
+      {operator?.configured ? (
+        <Section id="operator" title={t('admin.operator.title')}>
+          <OperatorRecords status={operator} onSync={() => void syncOperator()} busy={syncing} />
+          <NoteLine note={operatorNote} />
+        </Section>
+      ) : null}
     </>
   )
 }

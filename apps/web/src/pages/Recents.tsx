@@ -70,6 +70,8 @@ export const Recents = () => {
                 <strong>{it.conference && it.remoteNumber === me?.extension ? t('recents.conferenceMine') : it.remoteNumber === 'anonymous' ? t('call.hiddenNumber') : formatNumber(it.remoteNumber)}</strong>
                 <br />
                 <span className={`badge${it.missed ? ' missed' : ''}`}>{recentLabel(it, t)}</span>
+                {/* Step 10b: a call the operator recorded, reconciled with ours, or that reached only it (the platform out). */}
+                {it.sources?.includes('opensips') === false ? <span className="badge"> · {t('recents.operatorOnly')}</span> : it.sources && it.sources.length > 1 ? <span className="badge"> · {t('recents.reconciled')}</span> : null}
               </span>
               <time dateTime={it.startedAt}>{when.format(new Date(it.startedAt))}</time>
             </li>

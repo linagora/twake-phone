@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+import type { OperatorCdr } from '@twake/telephony-types'
 import { WEBHOOK_STATE_ROLE, type HistoryEntry, type Store, type WebhookDeliveryRecord, type WebhookSubscriptionRecord } from './types.js'
 import { EMPTY_OUTBOUND, outboundVersion } from '../outbound.js'
 
@@ -138,6 +139,85 @@ export const storeContract = (name: string, make: () => Promise<Store>) =>
       expect(await s.deleteHistory('A', 'alice')).toBe(1)
       expect((await s.listHistory('A', 'alice')).items).toEqual([])
       expect((await s.listHistory('B', 'alice')).items).toHaveLength(1)
+      await s.close()
+    })
+
+    it('keeps each record of the operator once, and hands those to reconcile once read a while, oldest first (step 10b)', async () => {
+      const s = await make()
+      const cdr = (id: string, startedAt: string, over: Partial<OperatorCdr> = {}): OperatorCdr => ({ id, line: '0033972000001', direction: 'inbound', calling: '+33612345678', called: '+33972000001', startedAt, durationSec: 30, ...over })
+      await s.addOperatorCdrs('A', 'ovh', [cdr('2', '2026-10-05T10:05:00.000Z'), cdr('1', '2026-10-05T10:00:00.000Z', { forwarded: true })])
+      // Read again: kept as first read.
+      await s.addOperatorCdrs('A', 'ovh', [cdr('1', '2026-10-05T11:00:00.000Z', { durationSec: 1 })])
+      await s.addOperatorCdrs('B', 'ovh', [cdr('1', '2026-10-05T10:00:00.000Z')])
+      expect((await s.knownOperatorCdrs('A', 'ovh', ['1', '3', '2'])).sort()).toEqual(['1', '2'])
+      expect(await s.knownOperatorCdrs('A', 'other', ['1'])).toEqual([])
+      expect(await s.knownOperatorCdrs('A', 'ovh', [])).toEqual([])
+      expect(await s.pendingOperatorCdrs('A', 'ovh', '2000-01-01T00:00:00.000Z', 10)).toEqual([])
+      const pending = await s.pendingOperatorCdrs('A', 'ovh', new Date(Date.now() + 60_000).toISOString(), 10)
+      expect(pending).toEqual([
+        { tenantId: 'A', operator: 'ovh', ...cdr('1', '2026-10-05T10:00:00.000Z', { forwarded: true }) },
+        { tenantId: 'A', operator: 'ovh', ...cdr('2', '2026-10-05T10:05:00.000Z') }
+      ])
+      expect(await s.pendingOperatorCdrs('A', 'ovh', new Date(Date.now() + 60_000).toISOString(), 1)).toHaveLength(1)
+      await s.close()
+    })
+
+    it('settles what became of each record of the operator once, links every entry of a call, adds an entry known from it alone, and counts them (step 10b)', async () => {
+      const s = await make()
+      const soon = new Date(Date.now() + 60_000).toISOString()
+      const cdr = (id: string, over: Partial<OperatorCdr> = {}): OperatorCdr => ({ id, line: 'l1', direction: 'inbound', calling: '+33612345678', called: '+33972000001', startedAt: '2026-10-05T10:00:00.000Z', durationSec: 60, ...over })
+      // A call that rang two people (a group), and another one.
+      await s.addHistory(entry({ callId: 'g1', direction: 'inbound' }))
+      await s.addHistory(entry({ userId: 'bob', callId: 'g1', direction: 'inbound' }))
+      await s.addHistory(entry({ callId: 'c2', startedAt: '2026-10-05T11:00:00.000Z' }))
+      await s.addHistory(entry({ tenantId: 'B', callId: 'g1' }))
+      expect((await s.unreconciledHistory('A', '2026-10-05T09:00:00.000Z', '2026-10-05T10:30:00.000Z', 10)).map(e => `${e.userId} ${e.callId}`).sort()).toEqual(['alice g1', 'bob g1'])
+      await s.addOperatorCdrs('A', 'ovh', [cdr('m'), cdr('m2'), cdr('o'), cdr('u', { direction: 'outbound' }), cdr('f', { forwarded: true }), cdr('gone')])
+      const orphan = entry({ userId: 'carol', callId: 'ovh:o', direction: 'inbound', state: 'missed', answered: false, durationSec: 0 })
+      await s.settleOperatorCdrs('A', 'ovh', [
+        { id: 'm', outcome: 'matched', callId: 'g1' },
+        // Another record for the same call: it has one already.
+        { id: 'm2', outcome: 'matched', callId: 'g1' },
+        { id: 'o', outcome: 'orphan', entry: orphan },
+        { id: 'u', outcome: 'unmatched' },
+        { id: 'f', outcome: 'forwarded' }
+      ])
+      // Settled again (another Gateway, a round run twice): the first word stays.
+      await s.settleOperatorCdrs('A', 'ovh', [{ id: 'm', outcome: 'unmatched' }, { id: 'o', outcome: 'orphan', entry: { ...orphan, callId: 'ovh:o2' } }])
+      const alice = (await s.listHistory('A', 'alice')).items
+      expect(alice.find(e => e.callId === 'g1')).toMatchObject({ operator: 'ovh', operatorCdr: 'm' })
+      expect(alice.find(e => e.callId === 'c2')?.operatorCdr).toBeUndefined()
+      expect((await s.listHistory('A', 'bob')).items[0]).toMatchObject({ callId: 'g1', operator: 'ovh', operatorCdr: 'm' })
+      expect((await s.listHistory('A', 'carol')).items).toEqual([{ ...orphan, tenantId: 'A', operator: 'ovh', operatorCdr: 'o', operatorOnly: true }])
+      expect((await s.listHistory('B', 'alice')).items[0]?.operatorCdr).toBeUndefined()
+      expect((await s.unreconciledHistory('A', '2026-10-05T09:00:00.000Z', '2026-10-05T12:00:00.000Z', 10)).map(e => e.callId)).toEqual(['c2'])
+      expect((await s.pendingOperatorCdrs('A', 'ovh', soon, 10)).map(r => r.id)).toEqual(['gone'])
+      expect(await s.operatorCdrStats('A', 'ovh', '2026-10-05T00:00:00.000Z')).toEqual({ total: 6, matched: 1, orphan: 1, unmatchedInbound: 1, unmatchedOutbound: 1, forwarded: 1, pending: 1 })
+      expect(await s.operatorCdrStats('A', 'ovh', '2026-10-06T00:00:00.000Z')).toEqual({ total: 0, matched: 0, orphan: 0, unmatchedInbound: 0, unmatchedOutbound: 0, forwarded: 0, pending: 0 })
+      expect((await s.operatorCdrStats('B', 'ovh', '2026-10-05T00:00:00.000Z')).total).toBe(0)
+      await s.close()
+    })
+
+    it('erases the numbers of the records of the operator with the history of the person whose calls they were, and purges the old ones (step 10b)', async () => {
+      const s = await make()
+      const soon = new Date(Date.now() + 60_000).toISOString()
+      const cdr = (id: string, startedAt = '2026-10-05T10:00:00.000Z'): OperatorCdr => ({ id, line: 'l1', direction: 'inbound', calling: '+33612345678', called: '+33972000001', startedAt, durationSec: 60 })
+      await s.addHistory(entry({ callId: 'c1', direction: 'inbound' }))
+      await s.addHistory(entry({ userId: 'bob', callId: 'c2', direction: 'inbound' }))
+      await s.addOperatorCdrs('A', 'ovh', [cdr('m'), cdr('o'), cdr('b'), cdr('old', '2026-01-01T00:00:00.000Z')])
+      await s.settleOperatorCdrs('A', 'ovh', [
+        { id: 'm', outcome: 'matched', callId: 'c1' },
+        { id: 'o', outcome: 'orphan', entry: entry({ callId: 'ovh:o', direction: 'inbound' }) },
+        { id: 'b', outcome: 'matched', callId: 'c2' }
+      ])
+      expect(await s.deleteHistory('A', 'alice')).toBe(2)
+      // Still known (never read again), without the numbers; bob's untouched.
+      expect((await s.knownOperatorCdrs('A', 'ovh', ['m', 'o', 'b'])).sort()).toEqual(['b', 'm', 'o'])
+      await s.addOperatorCdrs('A', 'ovh', [cdr('fresh')])
+      expect(await s.pendingOperatorCdrs('A', 'ovh', soon, 10)).toMatchObject([{ id: 'old', calling: '+33612345678' }, { id: 'fresh', calling: '+33612345678' }])
+      expect(await s.purgeOperatorCdrs('2026-02-01T00:00:00.000Z')).toBe(1)
+      expect((await s.knownOperatorCdrs('A', 'ovh', ['old', 'fresh'])).sort()).toEqual(['fresh'])
+      expect((await s.operatorCdrStats('A', 'ovh', '2026-01-01T00:00:00.000Z')).total).toBe(4)
       await s.close()
     })
 

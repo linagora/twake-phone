@@ -1,6 +1,8 @@
 import {
   EXTENSION_FORMAT,
   FRAUD_PARAMS,
+  OPERATOR_NO_ANSWER_MAX_SEC,
+  OPERATOR_NO_ANSWER_MIN_SEC,
   OUTBOUND_CAPS,
   RESERVED_NUMBER,
   TRUNK_COUNTRY,
@@ -109,10 +111,21 @@ export interface TrunkForm {
   isDefault: boolean
   defaultNumber: string
   fallbackTarget: string
+  /** Step 10b: its lines at the operator, and the fallback the Gateway keeps there (`fallbackManaged`). */
+  operatorLines: string
+  fallbackManaged: boolean
+  operatorNumber: string
+  onUnavailable: boolean
+  onNoAnswer: boolean
+  noAnswerAfterSec: string
 }
-export type TrunkField = Exclude<keyof TrunkForm, 'removePassword' | 'isDefault' | 'assertIdentity' | 'numberFormat' | 'auth'> | 'form'
+export type TrunkField = Exclude<keyof TrunkForm, 'removePassword' | 'isDefault' | 'assertIdentity' | 'numberFormat' | 'auth' | 'fallbackManaged' | 'onUnavailable' | 'onNoAnswer'> | 'form'
 /** The fields in the order of the form: the first one in error gets the focus. */
-export const TRUNK_FIELDS: TrunkField[] = ['id', 'name', 'domain', 'proxies', 'sources', 'username', 'password', 'realm', 'registrar', 'registerExpires', 'codecs', 'defaultNumber', 'allowed', 'countries', 'fallbackTarget']
+export const TRUNK_FIELDS: TrunkField[] = ['id', 'name', 'domain', 'proxies', 'sources', 'username', 'password', 'realm', 'registrar', 'registerExpires', 'codecs', 'defaultNumber', 'allowed', 'countries', 'fallbackTarget', 'operatorLines', 'operatorNumber', 'noAnswerAfterSec']
+/** The service name of a line at the operator (the Gateway's rule). */
+const OPERATOR_LINE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/
+/** The delay of a forward on no answer the form offers first: past the 120 s of the target and the fallback inside. */
+export const NO_ANSWER_DEFAULT_SEC = 150
 
 export const emptyTrunk = (): TrunkForm => ({
   id: '',
@@ -134,7 +147,13 @@ export const emptyTrunk = (): TrunkForm => ({
   countries: '',
   isDefault: false,
   defaultNumber: '',
-  fallbackTarget: ''
+  fallbackTarget: '',
+  operatorLines: '',
+  fallbackManaged: false,
+  operatorNumber: '',
+  onUnavailable: true,
+  onNoAnswer: false,
+  noAnswerAfterSec: String(NO_ANSWER_DEFAULT_SEC)
 })
 
 /** A trunk the Gateway listed, in the form (never a password: the field stays empty, `hasPassword` says one is kept). */
@@ -158,7 +177,13 @@ export const trunkForm = (t: Trunk): TrunkForm => ({
   countries: (t.countries ?? []).join(', '),
   isDefault: !!t.default,
   defaultNumber: t.defaultNumber,
-  fallbackTarget: t.fallbackTarget ?? ''
+  fallbackTarget: t.fallbackTarget ?? '',
+  operatorLines: (t.operator?.lines ?? []).join(', '),
+  fallbackManaged: !!t.operator?.fallback,
+  operatorNumber: t.operator?.fallback?.number ?? '',
+  onUnavailable: t.operator?.fallback ? t.operator.fallback.onUnavailable : true,
+  onNoAnswer: t.operator?.fallback?.noAnswerAfterSec !== undefined,
+  noAnswerAfterSec: String(t.operator?.fallback?.noAnswerAfterSec ?? NO_ANSWER_DEFAULT_SEC)
 })
 
 const listOf = (text: string, max: number, check: (v: string) => boolean, problem: Problem): { items?: string[]; problem?: Problem } => {
@@ -210,7 +235,21 @@ export const checkTrunk = (f: TrunkForm, ctx: { current?: Trunk; ids: readonly s
   if (!E164.test(defaultNumber)) problems.defaultNumber = p('admin.trunk.err.defaultNumber')
   const fallbackTarget = f.fallbackTarget.trim()
   if (fallbackTarget && !internalTarget(fallbackTarget)) problems.fallbackTarget = p('admin.trunk.err.fallbackTarget')
+  // Step 10b: the lines at the operator; the fallback there, a number on unavailability and/or after a delay past the
+  // 120 s the number and its fallback inside ring first.
+  const lines = listOf(f.operatorLines, 16, v => OPERATOR_LINE.test(v), p('admin.trunk.err.operatorLines'))
+  if (lines.problem) problems.operatorLines = lines.problem
+  else if (f.fallbackManaged && !lines.items) problems.operatorLines = p('admin.trunk.err.operatorLinesNeeded')
+  const operatorNumber = normaliseNumber(f.operatorNumber)
+  const forwards = f.fallbackManaged && (f.onUnavailable || f.onNoAnswer)
+  if (forwards && !E164.test(operatorNumber)) problems.operatorNumber = p('admin.trunk.err.operatorNumber')
+  const delay = f.noAnswerAfterSec.trim()
+  if (f.fallbackManaged && f.onNoAnswer && !wholeNumber(delay, OPERATOR_NO_ANSWER_MIN_SEC + 1, OPERATOR_NO_ANSWER_MAX_SEC))
+    problems.noAnswerAfterSec = p('admin.trunk.err.noAnswerAfterSec', { min: OPERATOR_NO_ANSWER_MIN_SEC + 1, max: OPERATOR_NO_ANSWER_MAX_SEC })
   if (Object.keys(problems).length) return { problems }
+  const fallback = f.fallbackManaged
+    ? { ...(forwards ? { number: operatorNumber } : {}), onUnavailable: f.onUnavailable, ...(f.onNoAnswer ? { noAnswerAfterSec: Number(delay) } : {}) }
+    : undefined
   return {
     problems,
     input: {
@@ -232,6 +271,7 @@ export const checkTrunk = (f: TrunkForm, ctx: { current?: Trunk; ids: readonly s
       ...(f.isDefault ? { default: true } : {}),
       defaultNumber,
       ...(fallbackTarget ? { fallbackTarget } : {}),
+      ...(lines.items ? { operator: { lines: lines.items, ...(fallback ? { fallback } : {}) } } : {}),
       ...(typed ? { password: typed } : f.removePassword && ctx.current?.hasPassword ? { password: null } : {})
     }
   }
@@ -444,7 +484,10 @@ const GENERAL: Record<string, Key> = {
   WEBHOOK_PENDING: 'admin.webhooks.err.pending',
   WEBHOOK_DISABLED: 'admin.webhooks.err.disabled',
   WEBHOOK_BACKLOG: 'admin.webhooks.err.backlog',
-  WEBHOOK_DOMAINS: 'admin.webhooks.err.domains'
+  WEBHOOK_DOMAINS: 'admin.webhooks.err.domains',
+  OPERATOR_NONE: 'admin.err.operatorNone',
+  OPERATOR_FALLBACK_LOOP: 'admin.err.operatorLoop',
+  OPERATOR_RATE: 'admin.err.operatorRate'
 }
 
 /** The words of GENERAL that name a number. */
@@ -494,6 +537,9 @@ export const trunkRefusal = (err: unknown) =>
   refusalOf<TrunkField>(err, (field, code, detail) => {
     if (code === 'FALLBACK_TARGET') return { field: 'fallbackTarget', problem: p('admin.err.targetUnknown') }
     if (field === 'countries') return { field: 'countries', problem: p('admin.trunk.err.countries') }
+    if (field === 'operator.lines') return { field: 'operatorLines', problem: p('admin.trunk.err.operatorLines') }
+    if (field === 'operator.fallback.number') return { field: 'operatorNumber', problem: p('admin.trunk.err.operatorNumber') }
+    if (field === 'operator.fallback.noAnswerAfterSec') return { field: 'noAnswerAfterSec', problem: p('admin.trunk.err.noAnswerAfterSec', { min: OPERATOR_NO_ANSWER_MIN_SEC + 1, max: OPERATOR_NO_ANSWER_MAX_SEC }) }
     if ((TRUNK_FIELDS as string[]).includes(field)) return { field: field as TrunkField, problem: p(`admin.trunk.err.${field}` as Key) }
     if (code === 'TRUNK_INVALID' && /^a trunk that registers/.test(detail)) return { field: 'password', problem: p('admin.trunk.err.registerNeeds') }
     return undefined

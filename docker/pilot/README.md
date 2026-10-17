@@ -135,6 +135,35 @@ Les outils de l'organisation (CRM, supervision, ticketing) s'abonnent aux évén
 - La migration 014 remet d'aplomb une base de recette qui a joué une version antérieure de la migration 013, depuis n'importe quelle tête de la branche de l'étape (`69fb72e` à `3427359`), au schéma d'une base créée à neuf : il n'y a plus à la recréer. Une passerelle qui attend le verrou des migrations le dit dans son journal toutes les 10 s.
 - Le journal des livraisons est gardé 30 jours ; une livraison sans réponse 2xx est retentée 8 fois, sur environ deux heures.
 
+## OVHcloud par son API : renvoi de repli et CDR (étape 10b)
+
+**Non vérifié contre le vrai OVH** : le client est écrit d'après la documentation publique de l'API d'OVHcloud et testé contre un faux serveur. Au premier branchement, regarder le journal de la passerelle (`operator:`) et l'écran Trunks.
+
+Sans ces variables, rien ne change : le renvoi se règle dans le manager d'OVH, l'historique ne connaît que ce qu'OpenSIPS a vu. Avec, la passerelle tient le renvoi de repli de chaque ligne du trunk chez OVH et rapproche ses CDR de l'historique (ADR 0021).
+
+1. Créer une application pour la plateforme : <https://eu.api.ovh.com/createApp/> (`ca.api.ovh.com` au Canada, `api.us.ovhcloud.com` aux États-Unis). Elle donne une clé d'application et son secret.
+2. Demander un jeton consommateur avec les seuls droits utiles, puis ouvrir la `validationUrl` de la réponse, se connecter au compte OVH qui a les lignes et choisir une durée de validité ; le `consumerKey` de la réponse est le jeton :
+
+   ```sh
+   curl -sS -X POST https://eu.api.ovh.com/1.0/auth/credential \
+     -H "X-Ovh-Application: <clé d'application>" -H 'Content-Type: application/json' \
+     -d '{"accessRules": [{"method": "GET", "path": "/telephony"}, {"method": "GET", "path": "/telephony/*"}, {"method": "PUT", "path": "/telephony/*/line/*/options"}]}'
+   ```
+
+3. Dans le `.env` (jamais ailleurs : ni en base, ni dans un dépôt), puis `docker compose up -d gateway` :
+
+   | Variable | Valeur |
+   |---|---|
+   | `OVH_APPLICATION_KEY`, `OVH_APPLICATION_SECRET` | la clé de l'application et son secret |
+   | `OVH_CONSUMER_KEY` | le jeton consommateur |
+   | `OVH_BILLING_ACCOUNT` | le groupe de facturation de la téléphonie, tel que le manager le nomme |
+   | `OVH_ENDPOINT` | `ovh-eu` (par défaut), `ovh-ca` ou `ovh-us` |
+
+   Les quatre premières ou aucune : une partie seulement empêche la passerelle de démarrer, en nommant ce qui manque. Le journal du démarrage dit le groupe de facturation servi, jamais une clé.
+4. Dans Administration > Trunks, modifier le trunk : « Lignes chez l'opérateur » (les noms de service des lignes dans le manager, `0033…`), puis « Tenir le renvoi de repli chez l'opérateur » : le numéro de repli (jamais un numéro direct de la plateforme), sur indisponibilité et/ou sur non-réponse après plus de 120 s (le numéro direct puis son repli intérieur sonnent d'abord, 60 s chacun). L'écran dit pour chaque ligne le renvoi posé chez OVH, et quand il a été remis après un changement dans le manager. Décoché, la passerelle n'écrit rien chez OVH.
+
+Ensuite, toutes les 10 minutes, la passerelle qui tient le bail des états relit le renvoi de chaque ligne (et le remet s'il a été changé) et les CDR des 48 dernières heures. Les Récents montrent « Confirmé par l'opérateur » sur un appel rapproché, et « Reçu par l'opérateur seul » pour un appel qu'OVH a eu pendant une panne. La section « Relevés de l'opérateur » de l'écran Trunks donne le taux de rapprochement des 7 derniers jours et relit OVH à la demande (2 fois par minute). `trunk.degraded` et `trunk.recovered` disent alors si les appelants arrivent au repli pendant la panne (`fallback`, sans le numéro). La passerelle ne bascule rien à la panne : c'est le renvoi sur indisponibilité d'OVH qui le fait, même passerelle arrêtée. Les CDR sont gardés 90 jours.
+
 ## Exploiter
 
 | Quoi | Comment |

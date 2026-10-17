@@ -306,8 +306,58 @@ export interface Trunk {
    * unreachable, ADR 0017), never here.
    */
   fallbackTarget?: string
+  /** What the Gateway knows of the trunk at its operator (step 10b, ADR 0021): its lines there, the fallback it keeps there. */
+  operator?: TrunkOperator
   /** Read only. */
   hasPassword?: boolean
+}
+
+/**
+ * A trunk at its operator (step 10b, ADR 0021): the operator's lines that carry its calls, by the name of their
+ * service there (OVHcloud: as its manager shows it, `0033972000000`; one line for a trunk offer, or one per number),
+ * whose records of calls (CDR) are read and reconciled with the history, and the fallback the Gateway keeps there.
+ */
+export interface TrunkOperator {
+  lines: string[]
+  /**
+   * The forward the operator applies to the calls of these lines (its own, ADR 0017: the one that works when the
+   * platform cannot be reached), which the Gateway sets there and puts back when someone changed it in the
+   * operator's manager. Absent: the Gateway leaves what is set there untouched.
+   */
+  fallback?: OperatorFallback
+}
+
+/**
+ * The fallback forward of an operator's line: `number` (E.164, required when one of the two is on) is called when
+ * the platform cannot be reached (`onUnavailable`) and when nobody answered within `noAnswerAfterSec` (more than
+ * OPERATOR_NO_ANSWER_MIN_SEC: the fallback inside rings first, ADR 0017). Both off: no forward.
+ */
+export interface OperatorFallback {
+  number?: string
+  onUnavailable: boolean
+  noAnswerAfterSec?: number
+}
+
+/** The delay of a forward on no answer at the operator is more than this (s): the target and the fallback inside ring 60 s each first (ADR 0017). */
+export const OPERATOR_NO_ANSWER_MIN_SEC = 120
+/** And at most this (s). */
+export const OPERATOR_NO_ANSWER_MAX_SEC = 600
+
+/**
+ * A record of a call by the operator (CDR, step 10b): on one of its lines (`line`), in E.164 where the number is one
+ * (`anonymous`, a short number... as the operator wrote them otherwise), started at `startedAt`, `durationSec` in
+ * communication (0: not answered).
+ */
+export interface OperatorCdr {
+  id: string
+  line: string
+  direction: CallDirection
+  calling: string
+  called: string
+  startedAt: string
+  durationSec: number
+  /** A forward the operator placed itself (to the fallback number, ADR 0017): the platform never saw it. */
+  forwarded?: true
 }
 
 /** What an administrator writes: the trunk without its id, with a password to keep (or to change, or `null` to remove). */
@@ -530,8 +580,22 @@ export interface WebhookCall {
   outcome?: WebhookCallOutcome
   /** A conference's call (step 8b): the room called this person. */
   conference?: true
-  /** Where TwakePhone knows the call from: `opensips` now, `ovh` too once its CDRs are reconciled (step 10b). */
+  /**
+   * Where TwakePhone knows the call from: `opensips`, the SIP server, as it happens. The operator's records come
+   * later (step 10b: read every 10 minutes) and are reconciled in the history (`GET /calls/history`, its `sources`),
+   * not told again.
+   */
   source: string[]
+}
+
+/**
+ * The fallback forward set at the operator for a trunk's lines (step 10b), as last read there: whether the callers
+ * reach it while the platform cannot be reached (`on_unavailable`), or when nobody answers (`no_answer_after_sec`).
+ * Never its number. Absent when the trunk's operator is not known (no lines, no operator configured) or was never read.
+ */
+export interface WebhookTrunkFallback {
+  on_unavailable: boolean
+  no_answer_after_sec?: number
 }
 
 /** A trunk's health as the Gateway reads it (step 10a): `down` when no call goes through it, `degraded` when one of its servers is out. */
@@ -558,6 +622,7 @@ export type WebhookEvent =
         previous?: TrunkHealth
         registration?: TrunkRegistrationState
         servers: { address: string; state: TrunkServerState }[]
+        fallback?: WebhookTrunkFallback
       }
     })
   /**
@@ -574,6 +639,7 @@ export type WebhookEvent =
         removed?: true
         registration?: TrunkRegistrationState
         servers: { address: string; state: TrunkServerState }[]
+        fallback?: WebhookTrunkFallback
       }
     })
   /** What an administrator sends from the administration to check a subscription. */

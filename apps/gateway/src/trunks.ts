@@ -1,4 +1,4 @@
-import { EXTENSION_FORMAT, RESERVED_NUMBER, TRUNK_CODECS, TRUNK_COUNTRY, TRUNK_COUNTRY_EXCLUDED, TRUNK_OUTBOUND_CLASSES, type DidRange, type Trunk, type TrunkAuth, type TrunkCodec, type TrunkNumberFormat, type TrunkOutboundClass } from '@twake/telephony-types'
+import { EXTENSION_FORMAT, OPERATOR_NO_ANSWER_MAX_SEC, OPERATOR_NO_ANSWER_MIN_SEC, RESERVED_NUMBER, TRUNK_CODECS, TRUNK_COUNTRY, TRUNK_COUNTRY_EXCLUDED, TRUNK_OUTBOUND_CLASSES, type DidRange, type Trunk, type TrunkAuth, type TrunkCodec, type TrunkNumberFormat, type TrunkOperator, type TrunkOutboundClass } from '@twake/telephony-types'
 import { decrypt, encrypt } from './crypto.js'
 import type { DidRecord, TrunkRecord } from './store/types.js'
 
@@ -100,6 +100,8 @@ export const parseTrunk = (body: unknown, current?: Pick<TrunkRecord, 'passwordE
   if (!defaultNumber) throw invalid('defaultNumber: the number presented by those without a direct number is required')
   // Step 6b (FR-C8): who rings inside when a call to one of its direct numbers does not go through.
   const fallbackTarget = fallback(b)
+  // Step 10b (ADR 0021): its lines at the operator, and the fallback the Gateway keeps there.
+  const operator = operatorOf(b.operator)
   let password: string | null | undefined
   if (b.password === null) password = null
   else if (b.password !== undefined) {
@@ -126,11 +128,48 @@ export const parseTrunk = (body: unknown, current?: Pick<TrunkRecord, 'passwordE
       ...(countries ? { countries } : {}),
       ...(b.default ? { default: true } : {}),
       defaultNumber,
-      ...(fallbackTarget ? { fallbackTarget } : {})
+      ...(fallbackTarget ? { fallbackTarget } : {}),
+      ...(operator ? { operator } : {})
     },
     password
   }
 }
+
+/** The service name of a line at the operator (OVHcloud: `0033972000000`, as its manager shows it). */
+const OPERATOR_LINE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/
+export const MAX_OPERATOR_LINES = 16
+
+/**
+ * What a trunk says of its operator (step 10b, ADR 0021): `lines`, 1 to MAX_OPERATOR_LINES service names, each once;
+ * `fallback` (absent: left as set at the operator), the number (E.164) the operator forwards to, on unavailability
+ * and on no answer after more than OPERATOR_NO_ANSWER_MIN_SEC seconds (the fallback inside rings first, ADR 0017).
+ */
+const operatorOf = (v: unknown): TrunkOperator | undefined => {
+  if (v === undefined || v === null) return undefined
+  if (typeof v !== 'object' || Array.isArray(v)) throw invalid('operator: an object, its lines and its fallback')
+  const o = v as Record<string, unknown>
+  const lines = list({ 'operator.lines': o.lines }, 'operator.lines', MAX_OPERATOR_LINES, l => OPERATOR_LINE.test(l), "lines at the operator (their service names: letters, digits and . _ -, 64 at most)")
+  if (!lines) throw invalid('operator.lines: at least one line at the operator')
+  if (o.fallback === undefined || o.fallback === null) return { lines }
+  if (typeof o.fallback !== 'object' || Array.isArray(o.fallback)) throw invalid('operator.fallback: an object')
+  const f = o.fallback as Record<string, unknown>
+  if (typeof f.onUnavailable !== 'boolean') throw invalid('operator.fallback.onUnavailable: true or false')
+  let noAnswerAfterSec: number | undefined
+  if (f.noAnswerAfterSec !== undefined && f.noAnswerAfterSec !== null) {
+    const d = f.noAnswerAfterSec
+    if (!Number.isInteger(d) || (d as number) > OPERATOR_NO_ANSWER_MAX_SEC || (d as number) < 1) throw invalid(`operator.fallback.noAnswerAfterSec: seconds, ${OPERATOR_NO_ANSWER_MAX_SEC} at most`)
+    // The target of the number and the fallback inside ring 60 s each: a forward at the operator before would take
+    // the call from them (ADR 0017).
+    if ((d as number) <= OPERATOR_NO_ANSWER_MIN_SEC) throw Object.assign(new Error(`operator.fallback.noAnswerAfterSec: more than ${OPERATOR_NO_ANSWER_MIN_SEC} s, the time the number and its fallback inside ring first`), { statusCode: 400, code: 'OPERATOR_FALLBACK_DELAY' })
+    noAnswerAfterSec = d as number
+  }
+  const number = text({ 'operator.fallback.number': f.number }, 'operator.fallback.number', v => E164.test(v), 'an E.164 number (+ then 7 to 15 digits, no 0 after +33)')
+  if ((f.onUnavailable || noAnswerAfterSec !== undefined) && !number) throw invalid('operator.fallback.number: the number the operator forwards to is required')
+  return { lines, fallback: { ...(number ? { number } : {}), onUnavailable: f.onUnavailable, ...(noAnswerAfterSec !== undefined ? { noAnswerAfterSec } : {}) } }
+}
+
+/** Whether `number` is one of the direct numbers (a fallback there would ring itself). */
+export const inDids = (dids: readonly Pick<DidRange, 'first' | 'last'>[], number: string) => dids.some(d => d.first.length === number.length && d.first <= number && number <= d.last)
 
 /** The reserved numbers (RESERVED_NUMBER) that the last `digits` digits of the numbers first to last make. */
 const reservedSuffixes = (first: string, last: string, digits: number): string[] => {

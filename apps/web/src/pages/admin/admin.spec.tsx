@@ -81,6 +81,8 @@ const client = (over: Record<string, unknown> = {}) =>
     getTrunkStatus: vi.fn(async () => ({ available: true, items: [{ id: 'operator', registration: { state: 'registered' }, servers: [{ address: 'sip.operator.example', state: 'up' }] }] })),
     setTrunk: vi.fn(),
     deleteTrunk: vi.fn(),
+    getOperatorStatus: vi.fn(async () => ({ configured: false })),
+    syncOperator: vi.fn(),
     listDids: vi.fn(async () => ({ items: [] as DidRange[] })),
     setDid: vi.fn(),
     deleteDid: vi.fn(),
@@ -326,6 +328,72 @@ describe('the administration screens (step 7)', () => {
     await submit($('form'))
     await flush()
     expect(setTrunk).toHaveBeenCalledWith('operator', expect.objectContaining({ auth: 'ip', password: null }))
+  })
+
+  it('keeps the fallback at the operator from the trunk form, checks its delay, and shows each line and the records (step 10b)', async () => {
+    const setTrunk = vi.fn(async () => trunk)
+    const status = {
+      configured: true,
+      operator: 'ovh',
+      trunks: [{ id: 'operator', lines: [{ line: '0033199000100', managed: true, inSync: true, readAt: '2026-10-17T10:00:00.000Z', restoredAt: '2026-10-17T10:00:00.000Z', fallback: { number: '+33639980001', onUnavailable: true, noAnswerAfterSec: 150 } }] }],
+      cdrs: { readAt: '2026-10-17T10:00:00.000Z', read: 3, since: '2026-10-10T10:00:00.000Z', stats: { total: 3, matched: 1, orphan: 1, unmatchedInbound: 0, unmatchedOutbound: 0, forwarded: 1, pending: 0 } }
+    }
+    const syncOperator = vi.fn(async () => {
+      throw refused(429, 'OPERATOR_RATE', 'The operator was read a moment ago: wait a minute')
+    })
+    admin({ setTrunk, getOperatorStatus: vi.fn(async () => status), syncOperator })
+    await render('/admin/trunks', <Trunks />)
+    const line = $('[aria-label="Lignes chez l\'opérateur"]')?.textContent
+    expect(line).toContain('Ligne 0033199000100 : renvoi sur indisponibilité vers +33 6 39 98 00 01 ; renvoi après 150 s sans réponse vers +33 6 39 98 00 01 · renvoi de repli en place')
+    expect(line).toContain("changé chez l'opérateur, remis en place le")
+    expect($('[aria-labelledby="operator"]')?.textContent).toContain("Reçus par l'opérateur seul1")
+    // Of the calls OVH recorded, those the platform should have had (its forward aside): one in two reconciled.
+    expect($('[aria-labelledby="operator"]')?.textContent).toMatch(/Taux de rapprochement50\s%/)
+    click(button(host, "Relire l'opérateur maintenant"))
+    await flush()
+    expect(syncOperator).toHaveBeenCalledTimes(1)
+    expect($('[aria-labelledby="operator"]')?.textContent).toContain('patientez une minute')
+
+    click($('[aria-label="Modifier le trunk operator"]'))
+    await flush()
+    type($('#trunk-operatorLines'), '0033199000100')
+    click($('#trunk-fallbackManaged'))
+    // Unavailability by default; on no answer, the delay must leave the 120 s of the inside first.
+    expect(($('#trunk-onUnavailable') as HTMLInputElement).checked).toBe(true)
+    click($('#trunk-onNoAnswer'))
+    type($('#trunk-noAnswerAfterSec'), '120')
+    await submit($('form'))
+    expect(setTrunk).not.toHaveBeenCalled()
+    expect($('#trunk-operatorNumber-error')?.textContent).toContain('format international')
+    expect($('#trunk-noAnswerAfterSec-error')?.textContent).toContain('de 121 à 600')
+    expect(document.activeElement?.id).toBe('trunk-operatorNumber')
+    type($('#trunk-operatorNumber'), '06 39 98 00 01')
+    type($('#trunk-noAnswerAfterSec'), '150')
+    await submit($('form'))
+    await flush()
+    expect(setTrunk).toHaveBeenCalledWith('operator', expect.objectContaining({ operator: { lines: ['0033199000100'], fallback: { number: '+33639980001', onUnavailable: true, noAnswerAfterSec: 150 } } }))
+  })
+
+  it('offers no fallback at the operator without one, and puts the refusal of a direct number on the form (step 10b)', async () => {
+    const setTrunk = vi.fn(async () => {
+      throw refused(409, 'OPERATOR_FALLBACK_LOOP', 'operator.fallback.number: +33199000101 is one of the direct numbers of this platform')
+    })
+    admin({ setTrunk })
+    await render('/admin/trunks', <Trunks />)
+    expect($('#operator')).toBeNull()
+    expect(($('#trunk-fallbackManaged') as HTMLInputElement).disabled).toBe(true)
+    expect($('#trunk-fallbackManaged-hint')?.textContent).toContain("Aucun accès à l'API de l'opérateur")
+    // Lines alone: their records are reconciled, the fallback left as it is there.
+    click($('[aria-label="Modifier le trunk operator"]'))
+    await flush()
+    type($('#trunk-operatorLines'), '0033199000100, 0033199000100')
+    await submit($('form'))
+    expect($('#trunk-operatorLines-error')?.textContent).toContain('sans doublon')
+    type($('#trunk-operatorLines'), '0033199000100')
+    await submit($('form'))
+    await flush()
+    expect(setTrunk).toHaveBeenCalledWith('operator', expect.objectContaining({ operator: { lines: ['0033199000100'] } }))
+    expect(text()).toContain('numéro direct de la plateforme')
   })
 
   it("shows the whole setting an assignment made, another administrator's change included, and sends that with its version (review 7 n°1, 11; review 7 bis n°1)", async () => {

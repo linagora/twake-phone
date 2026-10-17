@@ -1,4 +1,4 @@
-import type { Call, Capabilities, ConferenceParticipant, Contact, DialInConfiguration, DidRange, ForwardingRules, FraudRule, MediaSession, OutboundAssignment, OutboundCaps, OutboundPolicy, OutboundProfile, Presence, PresenceStatus, RingGroup, TelephonyAlert, TelephonyEvent, Trunk, TrunkInput, TrunkStatus, WebhookEventType } from '@twake/telephony-types'
+import type { Call, Capabilities, ConferenceParticipant, Contact, DialInConfiguration, DidRange, ForwardingRules, FraudRule, MediaSession, OperatorFallback, OutboundAssignment, OutboundCaps, OutboundPolicy, OutboundProfile, Presence, PresenceStatus, RingGroup, TelephonyAlert, TelephonyEvent, Trunk, TrunkInput, TrunkStatus, WebhookEventType } from '@twake/telephony-types'
 
 export type {
   Contact,
@@ -7,6 +7,7 @@ export type {
   ForwardingRules,
   FraudRule,
   FraudThreshold,
+  OperatorFallback,
   OutboundAssignment,
   OutboundCaps,
   OutboundPolicy,
@@ -18,6 +19,7 @@ export type {
   TrunkCodec,
   TrunkInput,
   TrunkNumberFormat,
+  TrunkOperator,
   TrunkOutboundClass,
   TrunkRegistrationState,
   TrunkServerState,
@@ -30,6 +32,8 @@ export {
   EXTENSION_FORMAT,
   FRAUD_DEFAULTS,
   FRAUD_PARAMS,
+  OPERATOR_NO_ANSWER_MAX_SEC,
+  OPERATOR_NO_ANSWER_MIN_SEC,
   OUTBOUND_CAPS,
   OUTBOUND_CAP_DEFAULTS,
   RESERVED_NUMBER,
@@ -70,6 +74,45 @@ export interface HistoryItem {
   missed: boolean
   /** A conference's call (step 8b): the room called the person in the place of a call of theirs. */
   conference?: boolean
+  /**
+   * Where the call is known from (step 10b): `opensips`, the SIP server; with the operator (`ovh`) when its record of
+   * the call was reconciled with it; the operator alone for a call the platform never had (received while it could
+   * not be reached).
+   */
+  sources?: string[]
+}
+
+/** Why the operator could not be read or written (OperatorErrorCode of the Gateway). */
+export type OperatorProblem = 'unauthorized' | 'forbidden' | 'not-found' | 'refused' | 'rate' | 'unreachable'
+
+/** One line of a trunk at the operator, as the Gateway last saw it (step 10b). */
+export interface OperatorLine {
+  line: string
+  /** The fallback set there (as read, or written). */
+  fallback?: OperatorFallback
+  /** The trunk asks the Gateway to keep its fallback there. */
+  managed: boolean
+  /** What is there is what is asked. */
+  inSync?: boolean
+  readAt?: string
+  appliedAt?: string
+  /** When the Gateway found it changed there (the manager) and put it back. */
+  restoredAt?: string
+  error?: OperatorProblem
+}
+
+/** The operator of the trunks, as the administration shows it (GET /admin/operator). */
+export interface OperatorStatus {
+  configured: boolean
+  operator?: string
+  trunks?: { id: string; lines: OperatorLine[] }[]
+  cdrs?: {
+    readAt?: string
+    read?: number
+    error?: OperatorProblem
+    since: string
+    stats: { total: number; matched: number; orphan: number; unmatchedInbound: number; unmatchedOutbound: number; forwarded: number; pending: number }
+  }
 }
 
 export interface HistoryFilter {
@@ -320,6 +363,16 @@ export class TelephonyClient {
   /** Creates or replaces a trunk; `password` absent keeps the one kept, `null` removes it. Refusals carry a `code`. */
   setTrunk(id: string, trunk: TrunkInput) {
     return this.request<Trunk>(`/admin/trunks/${encodeURIComponent(id)}`, { method: 'PUT', body: JSON.stringify(trunk) })
+  }
+
+  /** The operator of the trunks (step 10b): its lines, their fallback, the records of calls reconciled. */
+  getOperatorStatus() {
+    return this.request<OperatorStatus>('/admin/operator')
+  }
+
+  /** Reads the operator now (429 OPERATOR_RATE: a moment ago already). */
+  syncOperator() {
+    return this.request<OperatorStatus>('/admin/operator/sync', { method: 'POST' })
   }
 
   /** Removes a trunk and its direct numbers (409 TRUNK_DEFAULT: the default trunk while another one is left). */
