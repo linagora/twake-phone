@@ -27,6 +27,8 @@ export const contentSecurityPolicy = ({ gatewayUrl, oidcAuthority, frameAncestor
     "script-src 'self'",
     "style-src 'self'",
     "img-src 'self' data:",
+    // The recordings of the mailbox (step 11a), fetched with the person's token and played from a blob: URL.
+    "media-src 'self' blob:",
     "font-src 'self'",
     `connect-src ${connect.join(' ')}`,
     // The service worker of the notifications (public/sw.js, step 5): ours only.

@@ -61,7 +61,7 @@ export class MemoryStore implements Store {
   private deliveries: MemoryDelivery[] = []
   private webhookState = new Map<string, { state: string; since: string }>()
   private webhookSends = new Map<string, { subscriptionId: string; at: number }[]>()
-  private leases = new Map<string, { holder: string; until: number; heard: number; writeFrom: number; writeUntil: number }>()
+  private leases = new Map<string, { holder: string; until: number; heard: number; writeFrom: number; writeUntil: number; generation: number }>()
   /** When deliveries were last taken of each subscription (claimWebhookDeliveries). */
   private claimedAt = new Map<string, string>()
   /** The operator's records of calls (step 10b), and when each was read (ms). */
@@ -931,8 +931,9 @@ export class MemoryStore implements Store {
     if (lease && lease.holder !== holder && lease.until > now && !(heard > lease.heard)) return null
     const margin = Math.floor(ms / 3)
     const writeFrom = !lease ? now : lease.holder === holder ? lease.writeFrom : Math.max(now, Math.min(lease.writeUntil, now) + margin)
-    this.leases.set(role, { holder, until: now + ms, heard, writeFrom, writeUntil: now + ms - margin })
-    return { writeFrom: new Date(writeFrom).toISOString() }
+    const generation = (lease?.generation ?? 0) + (lease && lease.holder === holder && lease.until > now ? 0 : 1)
+    this.leases.set(role, { holder, until: now + ms, heard, writeFrom, writeUntil: now + ms - margin, generation })
+    return { writeFrom: new Date(writeFrom).toISOString(), writeUntil: new Date(now + ms - margin).toISOString(), generation }
   }
 
   async listWebhookStates(tenantId: string, prefix: string) {

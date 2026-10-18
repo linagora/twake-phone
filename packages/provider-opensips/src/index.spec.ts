@@ -437,6 +437,39 @@ describe('OpensipsProvider call rules', () => {
     expect(await make().getMeetAccess()).toBeUndefined()
   })
 
+  it('reads whether OpenSIPS sends calls to the mailboxes, or says it cannot (step 11a)', async () => {
+    const sips = await fakeOpensips()
+    cleanups.push(sips.close)
+    const p = new OpensipsProvider({ websocketUrl: 'wss://sip.example.test', domain: 'sip.example.test', sipSecretFor: async () => 's', events: { miUrl: sips.url, timeoutMs: 300 }, logger: { info: () => undefined, warn: () => undefined } })
+    cleanups.push(() => p.close())
+    await p.getCapabilities()
+    await until('the subscription', () => p.getStatus() === 'CONNECTED')
+    sips.state.shv = [{ name: 'wazo_on', type: 1, value: 1 }, { name: 'meet_on', type: 1, value: 0 }]
+    expect(await p.getVoicemailAccess()).toBe(true)
+    sips.state.shv = [{ name: 'wazo_on', type: 1, value: 0 }]
+    expect(await p.getVoicemailAccess()).toBe(false)
+    // The shape of other versions of OpenSIPS, read as well.
+    sips.state.shvAs = 'VARs'
+    expect(await p.getVoicemailAccess()).toBe(false)
+    sips.state.shv = [{ name: 'wazo_on', type: 1, value: 1 }]
+    expect(await p.getVoicemailAccess()).toBe(true)
+    sips.state.shvAs = 'lists'
+    // An OpenSIPS of before step 11a: it cannot say.
+    sips.state.shv = [{ name: 'meet_on', type: 1, value: 1 }]
+    expect(await p.getVoicemailAccess()).toBeUndefined()
+    expect(await make().getVoicemailAccess()).toBeUndefined()
+    // With the longest call to a mailbox, as the Gateway compares it at its start.
+    sips.state.shv = [{ name: 'wazo_on', type: 1, value: 1 }, { name: 'vm_max_sec', type: 1, value: 120 }]
+    expect(await p.getVoicemailSettings()).toEqual({ on: true, maxCallSec: 120 })
+    sips.state.shv = [{ name: 'wazo_on', type: 1, value: 0 }]
+    expect(await p.getVoicemailSettings()).toEqual({ on: false })
+    sips.state.shv = [{ name: 'wazo_on', type: 1, value: 1 }, { name: 'vm_max_sec', type: 1, value: 'x' }]
+    expect(await p.getVoicemailSettings()).toEqual({ on: true })
+    sips.state.shv = [{ name: 'meet_on', type: 1, value: 1 }]
+    expect(await p.getVoicemailSettings()).toBeUndefined()
+    expect(await make().getVoicemailSettings()).toBeUndefined()
+  })
+
   it('asks OpenSIPS how the trunks are doing (step 7): its servers and registrations, nothing else of its answers', async () => {
     let sets = [
       { id: 'operator', setid: 1, aor: 'sip:0033199000100@operator.example' },
@@ -526,7 +559,7 @@ describe('OpensipsProvider call rules', () => {
       for await (const e of p.subscribe()) got.push(e)
     })()
     await until('the subscription', () => p.getStatus() === 'CONNECTED')
-    for (const e of ['E_FRD_WARNING', 'E_FRD_CRITICAL', 'E_TWAKEPHONE_LIMIT', 'E_TWAKEPHONE_RIGHTS', 'E_TWAKEPHONE_EMERGENCY', 'E_TWAKEPHONE_PIN']) expect(sips.subscriptions.map(s => s.event)).toContain(e)
+    for (const e of ['E_FRD_WARNING', 'E_FRD_CRITICAL', 'E_TWAKEPHONE_LIMIT', 'E_TWAKEPHONE_RIGHTS', 'E_TWAKEPHONE_EMERGENCY', 'E_TWAKEPHONE_PIN', 'E_TWAKEPHONE_VMCAP']) expect(sips.subscriptions.map(s => s.event)).toContain(e)
     sips.push('E_FRD_CRITICAL', { param: 'total-calls', value: 500, threshold: 500, user: '101', called_number: '442079460123', rule_id: 2, profile_id: 1 })
     sips.push('E_TWAKEPHONE_LIMIT', { caller: '102', number: '+33639980001', param: 'dailyMinutes', scope: 'tenant', callid: 'x1' })
     // Review 6b, n°11: a number outside the caller's rights, and emergency calls in a row (the third raises it).

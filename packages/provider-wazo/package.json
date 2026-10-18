@@ -1,0 +1,19 @@
+{
+  "name": "@twake/provider-wazo",
+  "version": "0.1.0",
+  "description": "Wazo Platform provider of the TwakePhone Gateway: the mailboxes of the people of the platform (wazo-confd), their messages (wazo-calld) and the events of a new one (wazo-websocketd).",
+  "license": "AGPL-3.0",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -b"
+  },
+  "dependencies": {
+    "@twake/telephony-provider-sdk": "*",
+    "@twake/telephony-types": "*"
+  }
+}

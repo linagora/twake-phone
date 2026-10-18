@@ -1,0 +1,17 @@
+# wazo-websocketd (ADR 0022): Wazo's events over a WebSocket, where provider-wazo hears the new messages.
+debug: false
+websocket:
+  listen: 127.0.0.1
+  port: 9502
+auth:
+  host: 127.0.0.1
+  port: 9497
+  prefix: null
+  https: false
+  key_file: /var/lib/wazo-auth-keys/wazo-websocketd-key.yml
+bus:
+  host: 127.0.0.1
+  port: 5672
+  # The bus account of this stack (RABBITMQ_DEFAULT_USER and _PASS of docker-compose.sip.yml), not RabbitMQ's guest.
+  username: wazo
+  password: twake-wazo-dev-only-bus

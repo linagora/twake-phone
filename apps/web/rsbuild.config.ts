@@ -12,6 +12,8 @@ const CSP = [
   "script-src 'self'",
   "style-src 'self'",
   "img-src 'self' data:",
+  // The recordings of the mailbox (step 11a), fetched with the person's token and played from a blob: URL.
+  "media-src 'self' blob:",
   "font-src 'self'",
   // The SIP WebSocket's origin is runtime configuration, hence `wss:` here; the server's header narrows it to CONNECT_SRC.
   // A local Gateway without TLS is reached over http and its event stream over ws (browsers do not take one for the other).

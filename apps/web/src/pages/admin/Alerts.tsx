@@ -6,8 +6,8 @@ import { useGateway } from '../../gateway.js'
 import type { Key } from '../../i18n/index.js'
 import { useT } from '../../i18n/useT.js'
 
-const KINDS: NonNullable<AlertFilter['kind']>[] = ['fraud-warning', 'fraud-critical', 'limit', 'rights', 'emergency', 'meet', 'webhook', 'operator']
-const PARAMS = [...FRAUD_PARAMS, ...OUTBOUND_CAPS, ...TRUNK_OUTBOUND_CLASSES, 'premium', 'burst', 'pin-tries', 'meet-calls', 'call-diverted', 'trunk-changed', 'disabled', 'unauthorized', 'forbidden', 'reconciliation', 'removal-changed', 'removal-gone', 'removal-late']
+const KINDS: NonNullable<AlertFilter['kind']>[] = ['fraud-warning', 'fraud-critical', 'limit', 'rights', 'emergency', 'meet', 'webhook', 'operator', 'voicemail']
+const PARAMS = [...FRAUD_PARAMS, ...OUTBOUND_CAPS, ...TRUNK_OUTBOUND_CLASSES, 'premium', 'burst', 'pin-tries', 'meet-calls', 'call-diverted', 'trunk-changed', 'disabled', 'unauthorized', 'forbidden', 'reconciliation', 'removal-changed', 'removal-gone', 'removal-late', 'sync-failing', 'sync-fenced', 'boxes-refused', 'hidden-calls', 'hidden-hour', 'hidden-all', 'calls-all', 'held-back', 'held-back-remove']
 const PAGE = 25
 /** How long after an answer the first page is read again while shown: a repeat counted meanwhile is seen (review 7 n°2). */
 export const ALERTS_REFRESH_MS = 30_000
@@ -21,7 +21,9 @@ const INITIAL = { kind: ALL, param: ALL, state: 'open' }
  * Gateway sent it (review 8b, n°3: its grant taken by another call, or LiveKit's trunk pointed elsewhere), or a webhook
  * subscription disabled after a day of failed deliveries (review 10a, n°1) or with too many waiting (second review, n°12),
  * or the operator of the trunks refusing its keys or reconciling too few calls (review 10b, n°12), or a removal of a
- * forward there left as changed, let go, or late (third review 10b, n°2 and n°4).
+ * forward there left as changed, let go, or late, or the mailboxes not synchronised
+ * with the voicemail server for a while, some it keeps refusing, or the callers with no
+ * number at the cap of a mailbox.
  */
 const paramKey = (alert: Pick<AdminAlert, 'kind' | 'param'>): Key | undefined => {
   if ((FRAUD_PARAMS as readonly string[]).includes(alert.param)) return `admin.fraud.${alert.param}` as Key
@@ -41,6 +43,19 @@ const paramKey = (alert: Pick<AdminAlert, 'kind' | 'param'>): Key | undefined =>
   if (alert.param === 'removal-changed') return 'admin.alert.operatorRemovalChanged'
   if (alert.param === 'removal-gone') return 'admin.alert.operatorRemovalGone'
   if (alert.param === 'removal-late') return 'admin.alert.operatorRemovalLate'
+  // The mailboxes not synchronised for a while, or their writes refused by the SIP server's database (its fence), some
+  // the voicemail server keeps refusing; a cap of the calls to the mailboxes reached: by the callers with no number at
+  // a mailbox or at all of them, or by all callers.
+  if (alert.param === 'sync-failing') return 'admin.alert.voicemailSyncFailing'
+  if (alert.param === 'sync-fenced') return 'admin.alert.voicemailSyncFenced'
+  if (alert.param === 'boxes-refused') return 'admin.alert.voicemailBoxesRefused'
+  if (alert.param === 'hidden-calls') return 'admin.alert.voicemailHiddenCalls'
+  if (alert.param === 'hidden-hour') return 'admin.alert.voicemailHiddenHour'
+  if (alert.param === 'hidden-all') return 'admin.alert.voicemailHiddenAll'
+  if (alert.param === 'calls-all') return 'admin.alert.voicemailCallsAll'
+  // Too many mailboxes set aside or removed at once: held back until an administrator confirms.
+  if (alert.param === 'held-back') return 'admin.alert.voicemailHeldBack'
+  if (alert.param === 'held-back-remove') return 'admin.alert.voicemailHeldBackRemove'
   if ((TRUNK_OUTBOUND_CLASSES as readonly string[]).includes(alert.param) || alert.param === 'premium') return `admin.class.${alert.param}` as Key
   return undefined
 }
@@ -206,8 +221,11 @@ export const Alerts = () => {
     const key = paramKey(a)
     const name = key ? t(key) : a.param
     const scope = a.kind === 'limit' && a.scope ? ` (${t(a.scope === 'tenant' ? 'admin.alert.scopeTenant' : 'admin.alert.scopeUser')})` : ''
-    const value = a.value !== undefined && a.threshold !== undefined ? ` : ${t('admin.alert.valueOf', { value: a.value, threshold: a.threshold })}` : ''
-    return `${name}${scope}${value}`
+    // A value with no threshold said as it is (the minutes a synchronisation fails, the mailboxes refused).
+    const value = a.value === undefined ? '' : a.threshold !== undefined ? ` : ${t('admin.alert.valueOf', { value: a.value, threshold: a.threshold })}` : ` : ${a.value}`
+    // A set-aside held back: the new holders left without a mailbox meanwhile, and the voicemail off for everyone.
+    const held = `${a.waiting ? ` ; ${t('admin.alert.voicemailWaiting', { waiting: a.waiting })}` : ''}${a.noneReached ? ` ; ${t('admin.alert.voicemailOff')}` : ''}`
+    return `${name}${scope}${value}${held}`
   }
   const opt = (value: string, label: string) => ({ value, label })
   return (

@@ -101,6 +101,221 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(offWrong.cfg).toContain('modparam("cfgutils", "shvset", "meet_max_sec=i:7200")')
   })
 
+  it("gives Wazo's Asterisk a socket of its own that hears its address only, takes no call from it, and reads no mailbox when Wazo is off (step 11a)", () => {
+    const off = render()
+    expect(off.status).toBe(0)
+    expect(off.cfg).not.toMatch(/^socket=udp:[^\n]*:5095/m)
+    expect(off.cfg).toContain('# None: Wazo is off (WAZO_SIP empty).')
+    expect(off.cfg).toContain('modparam("cfgutils", "shvset", "wazo_on=i:0")')
+    expect(off.cfg).toContain('$ru = "sip:" + $avp(dialled) + "@wazo.invalid";')
+    const on = render({ WAZO_SIP: '192.0.2.30:5100' })
+    expect(on.status, on.stderr).toBe(0)
+    expect(on.cfg).toContain('modparam("cfgutils", "shvset", "wazo_on=i:1")')
+    expect(on.cfg).toMatch(/^socket=udp:127\.0\.0\.1:5095$/m)
+    expect(on.cfg).toContain('if ($shv(wazo_on) != 1 || $si != "192.0.2.30") {')
+    expect(on.cfg).toContain('$ru = "sip:" + $avp(dialled) + "@192.0.2.30:5100";')
+    expect(on.cfg).toContain('$socket_out = "udp:127.0.0.1:5095";')
+    // Nothing it sends out of a call to a mailbox goes anywhere: keepalives answered, the rest refused.
+    const initial = on.cfg.slice(on.cfg.indexOf('if ($var(wazo) == 1) {\n\t\tif (is_method("ACK"))'))
+    expect(initial.slice(0, initial.indexOf('\n\t}\n'))).toContain('send_reply(403, "Forbidden");')
+    // In a call, its side is the mailbox's (upstream), only that side speaks from there, and it never transfers.
+    expect(on.cfg).toContain('if ($dlg_val(voicemail) == "1" && is_direction("upstream"))')
+    expect(on.cfg).toContain('if ($var(from_wazo) != $var(wazo) || ($dlg_val(voicemail) == "1" && is_method("REFER"))) {')
+    // Which mailbox and greeting: only this script says it (removed from what a phone or the operator sends), in each
+    // of the two routes the calls come in by, before anything else reads them: within the route itself, not in a route
+    // written after it.
+    const routeBody = (header: string) => {
+      const at = on.cfg.indexOf(`\n${header} {\n`)
+      expect(at, header).toBeGreaterThan(0)
+      const end = on.cfg.slice(at + 1).search(/\n(route|failure_route|onreply_route|branch_route|local_route|startup_route|timer_route|event_route|error_route)(\[[^\]]*\])? \{\n/)
+      return on.cfg.slice(at, at + 1 + end)
+    }
+    for (const header of ['route', 'route[trunk_in]']) {
+      const body = routeBody(header)
+      for (const name of ['X-Twake-Mailbox', 'X-Twake-Voicemail']) {
+        expect(body.match(new RegExp(`\\n\\tremove_hf\\("${name}"\\);\\n`, 'g')), `${header} ${name}`).toHaveLength(1)
+        // Before the first of the routes it calls that could take the call to a mailbox.
+        const removed = body.indexOf(`remove_hf("${name}");`)
+        const first = body.search(/route\((rules_next|meet_call|did_fallback|voicemail)/)
+        if (first >= 0) expect(removed, `${header} ${name}`).toBeLessThan(first)
+      }
+    }
+    // The mailbox is read with the first rules only while Wazo is on and the table is there (route[read_failed]).
+    expect(on.cfg).toContain(`$var(vm_col) = ", (SELECT v.mailbox FROM voicemail_boxes v WHERE v.extension = '" + $rU + "' AND v.mailbox ~ '^[0-9]{1,40}@[A-Za-z0-9_-]{1,79}$')";`)
+    expect(on.cfg).toContain('if ($shv(wazo_on) == 1 && $shv(no11_until) <= $Ts) {')
+    expect(on.cfg).toContain('if ($avp(q11) == 1 && route(table_11_missing)) {\n\t\t$shv(no11_until) = $Ts + 30;')
+    // Twelve SIP processes with Wazo's socket for the connections the database must take.
+    expect(readFileSync(join(dir, 'entrypoint.sh'), 'utf8')).toContain('sip_processes=$((10 + 2 * WAZO_ON))')
+    for (const [env, message] of [
+      [{ WAZO_SIP: 'wazo.example.test:5100' }, /WAZO_SIP must be the IPv4 address and port/],
+      [{ WAZO_SIP: '192.0.2.30' }, /WAZO_SIP must be the IPv4 address and port/],
+      [{ WAZO_SIP: '192.0.2.30:99999' }, /WAZO_SIP must be the IPv4 address and port/],
+      [{ WAZO_SIP: '0.0.0.0:5100' }, /WAZO_SIP must be the IPv4 address and port/],
+      [{ WAZO_PORT: '5060' }, /socket of its own/],
+      [{ WAZO_PORT: '5090' }, /socket of its own/],
+      [{ WAZO_PORT: 'x' }, /WAZO_PORT/],
+      [{ WAZO_LISTEN_IP: '0.0.0.0' }, /WAZO_LISTEN_IP/]
+    ] as [Record<string, string>, RegExp][]) {
+      const { status, stderr } = render(env)
+      expect(status, JSON.stringify(env)).toBe(1)
+      expect(stderr).toMatch(message)
+    }
+  })
+
+  it('sends a call nothing else takes to the mailbox of the extension dialled, after the forwards, and gives the original refusal when it does not answer (step 11a)', () => {
+    const { cfg } = render({ WAZO_SIP: '192.0.2.30:5100' })
+    const section = (name: string, next: string) => cfg.slice(cfg.indexOf(`\n${name} {`), cfg.indexOf(`\n${next} {`))
+    const vm = section('route[voicemail]', 'route[voicemail_undo]')
+    // Never for a ring group, a room's or a conference's call, a Replaces, a call to oneself or one cancelled.
+    expect(vm).toContain('if ($shv(wazo_on) != 1 || $shv(wazo_mute_until) > $Ts || $avp(vm_box) == NULL || $avp(vm_used) != NULL || $avp(group) != NULL || $dlg_val(meet) != NULL || $avp(conference) != NULL)')
+    expect(vm).toContain('if (is_present_hf("Replaces") || t_was_cancelled() || $avp(dialled) == $avp(caller) || !($avp(dialled) =~ "^[0-9]{1,40}$"))')
+    // Once per call; the mailbox and the greeting in headers only this script writes; acc's callee the extension dialled.
+    expect(vm.indexOf('$avp(vm_used) = 1;')).toBeLessThan(vm.indexOf('t_relay()'))
+    expect(vm).toContain('append_hf("X-Twake-Mailbox: $avp(vm_box)\\r\\n");')
+    expect(vm).toContain('append_hf("X-Twake-Voicemail: $param(1)\\r\\n");')
+    // Whatever a caller sent of them goes before they are written.
+    for (const name of ['X-Twake-Mailbox', 'X-Twake-Voicemail']) {
+      expect(vm.indexOf(`remove_hf("${name}");`), name).toBeGreaterThan(0)
+      expect(vm.indexOf(`remove_hf("${name}");`), name).toBeLessThan(vm.indexOf(`append_hf("${name}: `))
+    }
+    // The headers appended are not undone by remove_hf: the undo does not pretend to.
+    expect(section('route[voicemail_undo]', 'failure_route[voicemail_failed]')).not.toContain('remove_hf(')
+    // Bounded as Meet is: pins on the invariants only (the behaviour of the caps is proven by the SIP e2e, against
+    // OpenSIPS itself): the calls of a caller, of those with no number at a mailbox and at all of them, and of all at
+    // the same time, and those of a caller to one mailbox in an hour, all read and counted under one lock; counted in
+    // the hour only once the call has its place, counted out when the mailbox does not take it.
+    expect(cfg).toContain('modparam("dialog", "profiles_with_value", "trunk_caller;meet_caller;vm_caller")')
+    expect(cfg).toContain('modparam("dialog", "profiles_no_value", "trunk_out;trunk_emergency;meet_all;vm_all;vm_hidden")')
+    const room = vm.slice(vm.indexOf('get_static_lock("vm_count");'), vm.indexOf('release_static_lock("vm_count");'))
+    const order = ['get_profile_size("vm_caller"', 'get_profile_size("vm_all"', 'get_profile_size("vm_hidden"', 'cache_add("local", "vm:h:', 'set_dlg_profile("vm_caller"', 'set_dlg_profile("vm_all")', 'set_dlg_profile("vm_hidden")']
+    for (const [i, step] of order.entries()) {
+      expect(room.indexOf(step), step).toBeGreaterThan(0)
+      if (i) expect(room.indexOf(order[i - 1]!), step).toBeLessThan(room.indexOf(step))
+    }
+    expect(room).toContain('$var(vm_nobody) < $shv(vm_hidden_all)')
+    expect(vm.split('cache_add(').length).toBe(2)
+    expect(vm.indexOf('release_static_lock("vm_count");')).toBeLessThan(vm.indexOf('t_relay()'))
+    // Counted by a keyed print of the number, never the number (a profile is written in `dialog`, shown by the MI); by
+    // the person's mailbox, whatever extension reaches it.
+    expect(vm).toContain('{s.sha256_hmac,$shv(vm_key)}')
+    expect(vm).not.toMatch(/\$var\(vm_who\) = \$avp\((caller|vm_real)\)/)
+    expect(room).toContain('"vm:h:$var(vm_who):$avp(vm_box)"')
+    expect(vm).not.toContain(':$avp(dialled)", 1, 3600')
+    expect(cfg.split('$avp(vm_real)').length).toBe(6)
+    // The administrators told of each cap reached, once per 10 minutes.
+    for (const param of ['hidden-hour', 'hidden-calls', 'hidden-all', 'calls-all']) expect(vm, param).toContain(`route(voicemail_alert, "${param}", `)
+    const vmAlert = section('route[voicemail_alert]', 'failure_route[voicemail_failed]')
+    expect(vmAlert).toContain('cache_add("local", "$var(told_key)", 1, 600, $var(told));')
+    expect(vmAlert).toContain('raise_event("E_TWAKEPHONE_VMCAP", $avp(ev_attr), $avp(ev_val));')
+    // Counted out of the hour when rtpengine fails, and in the undo (Asterisk silent, refused, t_relay failed), once,
+    // under the lock; a key gone meanwhile removed, never left at -1.
+    expect(vm).toContain('failed\\n");\n\t\t\troute(voicemail_unhour);\n\t\t\treturn(-1);')
+    expect(section('route[voicemail_undo]', 'failure_route[voicemail_failed]')).toContain('route[voicemail_undo] {\n\troute(voicemail_unhour);')
+    const unhour = section('route[voicemail_unhour]', 'failure_route[voicemail_failed]')
+    expect(unhour.indexOf('get_static_lock("vm_count");')).toBeLessThan(unhour.indexOf('cache_sub('))
+    expect(unhour.indexOf('cache_remove(')).toBeLessThan(unhour.indexOf('release_static_lock("vm_count");'))
+    // The caps and the bound in shared variables, for the calls to come (MI shv_set) and for the Gateway (shv_get).
+    expect(cfg).toContain('modparam("cfgutils", "shvset", "vm_per_caller=i:2")')
+    expect(cfg).toContain('modparam("cfgutils", "shvset", "vm_hidden=i:5")')
+    expect(cfg).toContain('modparam("cfgutils", "shvset", "vm_hidden_all=i:10")')
+    expect(cfg).toMatch(/modparam\("cfgutils", "shvset", "vm_key=s:[0-9a-f]{32}"\)/)
+    expect(cfg).toContain('modparam("cfgutils", "shvset", "vm_calls_all=i:30")')
+    expect(cfg).toContain('modparam("cfgutils", "shvset", "vm_per_hour=i:10")')
+    expect(cfg).toContain('modparam("cfgutils", "shvset", "vm_max_sec=i:300")')
+    const capped = render({ WAZO_SIP: '192.0.2.30:5100', VOICEMAIL_CALLS_PER_CALLER: '1', VOICEMAIL_CALLS_HIDDEN: '2', VOICEMAIL_CALLS_ALL: '5', VOICEMAIL_CALLS_PER_HOUR: '3' }).cfg
+    // The share of those with no number follows VOICEMAIL_CALLS_ALL when it is not given, or given empty as the Compose
+    // stack passes it: OpenSIPS starts with VOICEMAIL_CALLS_ALL alone lowered.
+    for (const hiddenAll of [{}, { VOICEMAIL_CALLS_HIDDEN_ALL: '' }] as Record<string, string>[]) {
+      const twelve = render({ WAZO_SIP: '192.0.2.30:5100', VOICEMAIL_CALLS_ALL: '12', ...hiddenAll })
+      expect([twelve.status, twelve.stderr]).toEqual([0, ''])
+      expect(twelve.cfg).toContain('modparam("cfgutils", "shvset", "vm_hidden_all=i:4")')
+    }
+    expect(readFileSync(join(dir, '..', 'docker-compose.sip.yml'), 'utf8')).toContain('VOICEMAIL_CALLS_HIDDEN_ALL: ${VOICEMAIL_CALLS_HIDDEN_ALL:-}\n')
+    // The key of the prints drawn at each start: two starts, two keys.
+    const keyOf = (rendered: string) => /"vm_key=s:([0-9a-f]{32})"/.exec(rendered)?.[1]
+    const keys = [keyOf(render({ WAZO_SIP: '192.0.2.30:5100' }).cfg), keyOf(render({ WAZO_SIP: '192.0.2.30:5100' }).cfg)]
+    expect(keys.every(k => k !== undefined)).toBe(true)
+    expect(keys[0]).not.toBe(keys[1])
+    // Their share at 0 closes the mailboxes to them without an alert at each call.
+    expect(vm).toContain('if ($var(vm_nobody) >= $shv(vm_hidden_all)) {\n\t\t\t\t\tif ($shv(vm_hidden_all) > 0)\n\t\t\t\t\t\troute(voicemail_alert, "hidden-all", ')
+    for (const shv of ['vm_per_caller=i:1', 'vm_hidden=i:2', 'vm_hidden_all=i:1', 'vm_calls_all=i:5', 'vm_per_hour=i:3']) expect(capped).toContain(`modparam("cfgutils", "shvset", "${shv}")`)
+    for (const [env, message] of [
+      [{ VOICEMAIL_CALLS_PER_CALLER: '0' }, /VOICEMAIL_CALLS_PER_CALLER must be 1 to 20/],
+      [{ VOICEMAIL_CALLS_PER_CALLER: '4', VOICEMAIL_CALLS_ALL: '3' }, /VOICEMAIL_CALLS_ALL must be VOICEMAIL_CALLS_PER_CALLER to 10000/],
+      [{ VOICEMAIL_CALLS_HIDDEN: '0' }, /VOICEMAIL_CALLS_HIDDEN must be 1 to VOICEMAIL_CALLS_ALL/],
+      [{ VOICEMAIL_CALLS_HIDDEN: '31' }, /VOICEMAIL_CALLS_HIDDEN must be 1 to VOICEMAIL_CALLS_ALL/],
+      [{ VOICEMAIL_CALLS_PER_HOUR: 'x' }, /VOICEMAIL_CALLS_PER_HOUR must be a number/],
+      [{ VOICEMAIL_CALLS_HIDDEN_ALL: '16' }, /VOICEMAIL_CALLS_HIDDEN_ALL must be 0 to half of VOICEMAIL_CALLS_ALL/],
+      [{ VOICEMAIL_CALLS_HIDDEN_ALL: 'x' }, /VOICEMAIL_CALLS_HIDDEN_ALL must be a number/],
+      // The variable that is wrong is the one named, not the share reckoned from it.
+      [{ VOICEMAIL_CALLS_ALL: 'x' }, /^VOICEMAIL_CALLS_ALL must be a number of calls\n$/]
+    ] as const)
+      expect(render({ WAZO_SIP: '192.0.2.30:5100', ...env }).stderr).toMatch(message)
+    // A caller from outside is said as such: the greeting never spells the extension to them.
+    expect(vm).toContain('if ($dlg_val(trunk) == "caller")\n\t\tappend_hf("X-Twake-Voicemail: $param(1);caller=external\\r\\n");')
+    // Bounded: VOICEMAIL_MAX_CALL_SEC (300 s by default); a mailbox that does not answer at once is left.
+    expect(vm).toContain('if ($DLG_timeout == NULL || $DLG_timeout > $shv(vm_max_sec))\n\t\t$DLG_timeout = $shv(vm_max_sec);')
+    expect(vm).toContain('$T_fr_timeout = 2;')
+    expect(render({ WAZO_SIP: '192.0.2.30:5100', VOICEMAIL_MAX_CALL_SEC: '120' }).cfg).toContain('modparam("cfgutils", "shvset", "vm_max_sec=i:120")')
+    expect(render({ WAZO_SIP: '192.0.2.30:5100', VOICEMAIL_MAX_CALL_SEC: '10' }).stderr).toMatch(/VOICEMAIL_MAX_CALL_SEC must be 30 to 3600/)
+    // Given back as it was when the mailbox does not answer: the way the call went, and its lifetime.
+    expect(vm.indexOf('$avp(vm_via) = $acc_extra(via);')).toBeLessThan(vm.indexOf('$acc_extra(via) = "voicemail";'))
+    const undo = section('route[voicemail_undo]', 'failure_route[voicemail_failed]')
+    expect(undo).toContain('if ($avp(vm_via) != NULL)\n\t\t$acc_extra(via) = $avp(vm_via);')
+    expect(undo).toContain('$DLG_timeout = $avp(vm_timeout);')
+    expect(vm).toContain('$acc_extra(callee) = $avp(dialled);')
+    expect(vm).toContain('$acc_extra(via) = "voicemail";')
+    expect(vm).toContain('t_on_failure("voicemail_failed");')
+    // No route[rtp_offer] (route[sides] is not for a failure route), no reply of its own.
+    expect(vm).not.toContain('route(rtp_offer)')
+    expect(vm).not.toMatch(/send_reply|t_reply/)
+    // Every place a call ends unanswered asks it first: "do not disturb", nobody to ring, no window reached, and the
+    // failure route after the forwards and the direct number's fallback, busy (486, 600, 603) with its own greeting.
+    expect(cfg.match(/route\(voicemail, "unavailable"\);/g)).toHaveLength(5)
+    expect(cfg.match(/route\(voicemail, "busy"\);/g)).toHaveLength(1)
+    const dnd = section('route[dnd_reply]', 'route[forwarded]')
+    expect(dnd.indexOf('route(voicemail, "unavailable");')).toBeGreaterThan(0)
+    expect(dnd.indexOf('route(voicemail, "unavailable");')).toBeLessThan(dnd.indexOf('raise_event('))
+    const failure = cfg.slice(cfg.indexOf('\nfailure_route[call_failed] {'))
+    expect(failure.indexOf('route(voicemail, "busy");')).toBeGreaterThan(failure.indexOf('route(did_fallback, "not answered", $var(code));'))
+    expect(failure).toContain('if (t_check_status("486|600|603") && $var(rang_out) == 0)\n\t\t\troute(voicemail, "busy");')
+    // Not answered: everything undone, the same refusal and missed call as without it ("do not disturb": its own).
+    const failed = cfg.slice(cfg.indexOf('\nfailure_route[voicemail_failed] {'), cfg.indexOf('\nlocal_route {'))
+    expect(failed.indexOf('route(voicemail_undo);')).toBeGreaterThan(0)
+    expect(failed.indexOf('route(dnd_reply);')).toBeGreaterThan(failed.indexOf('if ($avp(vm_then) == "dnd") {'))
+    expect(failed).toContain('route(account_missed);\n\tt_reply($avp(vm_code), "$avp(vm_reason)");')
+    // The caller's window is told the mailbox answered: a header no phone can send it, never sent to the operator.
+    const rtpReply = section('onreply_route[rtp]', 'route[event_attrs]')
+    expect(rtpReply.indexOf('remove_hf("Twake-Voicemail");')).toBeGreaterThan(0)
+    expect(rtpReply.indexOf('remove_hf("Twake-Voicemail");')).toBeLessThan(rtpReply.indexOf('append_hf("Twake-Voicemail: 1'))
+    expect(rtpReply).toContain('if ($rs >= 200 && $rs < 300 && $dlg_val(trunk) != "caller")\n\t\t\tappend_hf("Twake-Voicemail: 1\\r\\n");')
+    // Never anywhere else: the operator never hears it.
+    expect(cfg.match(/append_hf\("Twake-Voicemail/g)).toHaveLength(1)
+    expect(cfg.match(/append_to_reply\("Twake-Voicemail/g)).toBeNull()
+    // Nor what answered: the software of the mailbox, or that it is one.
+    const mailboxReply = rtpReply.slice(rtpReply.indexOf('if ($avp(voicemail) != NULL) {'))
+    expect(mailboxReply.indexOf('remove_hf("Server");')).toBeGreaterThan(0)
+    expect(mailboxReply.indexOf('remove_hf("User-Agent");')).toBeGreaterThan(0)
+    expect(mailboxReply.indexOf('remove_hf("Server");')).toBeLessThan(mailboxReply.indexOf('exit;'))
+    // Asterisk heard nothing from: the mailboxes left out 30 s, before the refusal is given back.
+    expect(cfg).toContain('modparam("cfgutils", "shvset", "wazo_mute_until=i:0")')
+    expect(failed).toContain('if (t_check_status("408") && t_local_replied("all")) {\n\t\t$shv(wazo_mute_until) = $Ts + 30;')
+    expect(failed.indexOf('$shv(wazo_mute_until) = $Ts + 30;')).toBeLessThan(failed.indexOf('route(voicemail_undo);'))
+    // A direct number whose fallback is a group nobody of which answered: the mailbox of the
+    // extension the number rings, the group set aside while it is tried; not answered, the group's refusal.
+    const group = failure.slice(failure.indexOf('route(did_fallback, "the group did not answer", "480");'), failure.indexOf('route(group_missed, "480 Temporarily Unavailable");'))
+    expect(group).toContain('if ($avp(fb_used) != NULL && $avp(vm_box) != NULL) {')
+    expect(group.indexOf('$(avp(group)[*]) = NULL;')).toBeLessThan(group.indexOf('route(voicemail, "unavailable");'))
+    expect(group.indexOf('$avp(group) = $avp(vm_group);')).toBeGreaterThan(group.indexOf('route(voicemail, "unavailable");'))
+    expect(failed).toContain('if ($avp(vm_then) == "group") {\n\t\t$avp(group) = $avp(vm_group);\n\t\trtpengine_delete();\n\t\troute(group_missed, "480 Temporarily Unavailable");\n\t\tt_reply(480, "Temporarily Unavailable");')
+    // Answered: told once, as the mailbox's, never as the callee's answer.
+    const onreply = cfg.slice(cfg.indexOf('\nonreply_route[rtp] {'), cfg.indexOf('\nroute[event_attrs] {'))
+    const told = onreply.indexOf('if ($avp(voicemail) != NULL) {')
+    expect(told).toBeGreaterThan(onreply.indexOf('route(rtp_answer);'))
+    expect(told).toBeLessThan(onreply.indexOf('if ($avp(callee) != NULL) {'))
+    expect(onreply).toContain('raise_event("E_TWAKEPHONE_VOICEMAIL", $avp(ev_attr), $avp(ev_val));')
+  })
+
   it('takes a room call only with the Gateway grant of that very call: used once, for its person and number (step 8, review n°1)', () => {
     const { cfg } = render({ SIP_DOMAIN: 'sip.example.test', MEET_SIP: '192.0.2.20:5080', MEET_SIP_PASSWORD: 'not-a-real-secret-0' })
     const section = (name: string, next: string) => cfg.slice(cfg.indexOf(`\n${name} {`), cfg.indexOf(`\n${next} {`))
@@ -262,7 +477,7 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(cfg).toContain('modparam("cfgutils", "shvset", "meet_max_sec=i:1800")')
     expect(call).toContain('if ($dlg_val(trunk) == NULL)\n\t\tcreate_dialog("B");\n\tif ($DLG_timeout > $shv(meet_max_sec))\n\t\t$DLG_timeout = $shv(meet_max_sec);')
     expect(cfg).toContain('if ($dlg_val(meet) == "caller" && $DLG_timeout > $shv(meet_max_sec))\n\t\t$DLG_timeout = $shv(meet_max_sec);')
-    expect(cfg).toContain('modparam("dialog", "profiles_with_value", "trunk_caller;meet_caller")')
+    expect(cfg).toContain('modparam("dialog", "profiles_with_value", "trunk_caller;meet_caller;vm_caller")')
     // The defaults.
     const defaults = render({ MEET_SIP: '192.0.2.20:5080', MEET_SIP_PASSWORD: 'not-a-real-secret-0' }).cfg
     expect(defaults).toContain('$var(pin_cap) = 10;\n\t$var(m_cap) = 2;')
@@ -309,7 +524,23 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     // its offer made first.
     const steps = unreachable.filter(l => l && !l.startsWith('#'))
     const at = steps.indexOf('route(account_missed);')
-    expect(steps.slice(at - 4, at + 3)).toEqual(['route(calling);', 'route(did_fallback_request, "unreachable", "480");', 'if ($avp(rtp_on) != NULL)', 'rtpengine_delete();', 'route(account_missed);', 'if ($avp(fwd_hops) == 0 && $avp(dialled_unread) != 1)', 't_reply(404, "Not Found");'])
+    // Then the mailbox of the extension dialled (step 11a, route[voicemail]), which ends the script when it takes the call.
+    expect(steps.slice(at - 12, at + 2)).toEqual([
+      'route(calling);',
+      'route(did_fallback_request, "unreachable", "480");',
+      '$avp(vm_code) = 480;',
+      '$avp(vm_reason) = "Temporarily Unavailable";',
+      'if ($avp(fwd_hops) == 0 && $avp(dialled_unread) != 1) {',
+      '$avp(vm_code) = 404;',
+      '$avp(vm_reason) = "Not Found";',
+      '}',
+      '$avp(vm_then) = "reply";',
+      'route(voicemail, "unavailable");',
+      'if ($avp(rtp_on) != NULL)',
+      'rtpengine_delete();',
+      'route(account_missed);',
+      't_reply($avp(vm_code), "$avp(vm_reason)");'
+    ])
     expect(missed).toBeGreaterThan(0)
     expect(cfg.match(/raise_event\("E_TWAKEPHONE_CALLING"/g)).toHaveLength(1)
     // The transaction of every call exists before its rules are read and before its relay: a relay that cannot send
@@ -327,7 +558,7 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
 
   it('takes the no-answer forward when no window of the callee can be reached, else answers 477, a missed call either way', () => {
     const { cfg } = render()
-    const relay = cfg.slice(cfg.indexOf('route[relay_call] {'), cfg.indexOf('onreply_route[rtp] {'))
+    const relay = cfg.slice(cfg.indexOf('route[relay_call] {'), cfg.indexOf('#### Voicemail (step 11a'))
     expect(relay).toContain('if (!t_relay())\n\t\t$var(relay_rc) = $rc;')
     const forward = relay.indexOf('if ($var(relay_rc) == -6 && $avp(r_noanswer) != NULL) {')
     expect(forward).toBeGreaterThan(0)
@@ -336,8 +567,12 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     // Nothing to forward to: the missed call, then the reply (477, or 500 for any other failure).
     const missed = relay.lastIndexOf('route(account_missed);')
     expect(missed).toBeGreaterThan(relay.indexOf('route(rules_local);'))
-    expect(relay.indexOf('t_reply(477, "Send failed");', missed)).toBeGreaterThan(missed)
-    expect(relay.indexOf('t_reply(500, "Internal Error");', missed)).toBeGreaterThan(missed)
+    // The mailbox of the extension dialled first (step 11a), the same refusal when it does not take the call.
+    expect(relay.indexOf('route(voicemail, "unavailable");')).toBeGreaterThan(relay.indexOf('route(rules_local);'))
+    expect(relay.indexOf('route(voicemail, "unavailable");')).toBeLessThan(missed)
+    expect(relay.indexOf('$avp(vm_code) = 477;\n\t\t$avp(vm_reason) = "Send failed";')).toBeGreaterThan(0)
+    expect(relay.indexOf('$avp(vm_code) = 500;\n\t$avp(vm_reason) = "Internal Error";')).toBeGreaterThan(0)
+    expect(relay.indexOf('t_reply($avp(vm_code), "$avp(vm_reason)");', missed)).toBeGreaterThan(missed)
     // Every initial INVITE goes through it, in the request route and in failure_route (a direct number's fallback
     // too, step 6b); in-dialog ones keep route[relay].
     expect(cfg.match(/route\(relay_call\);/g)).toHaveLength(4)
@@ -387,17 +622,19 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     // members of a group, the preload, whether the callee can be woken), none is run where async is not available.
     // The trunk of a call to the public network, the direct number of a call from it: step 6; the caller's rights and
     // caps, a query of its own after the trunk's: step 6b; whether the From of a room's call is one of our accounts:
-    // step 8). Two synchronous queries ask the catalog whether the tables
-    // of step 4c, or that of step 5, exist, only after a read failed, from the routes that resume a read; two more read
+    // step 8). Three synchronous queries ask the catalog whether the tables
+    // of step 4c, that of step 5 or that of step 11a exist, only after a read failed, from the routes that resume a read; two more read
     // the default trunk and the direct numbers on it every 15 s, in a timer of its own, never in a call (an emergency
     // call's fallback when the trunk of the call cannot be read, with its caller's own number). The last two make the
     // direct number's and the trunk's reads again, synchronously, when OpenSIPS dropped them (route[read_again]).
     // One more withdraws what twake_outbound() reserved for a call it refuses after all (review 8b, n°5).
-    expect(cfg.match(/sql_query/g)).toHaveLength(17)
+    expect(cfg.match(/sql_query/g)).toHaveLength(18)
     expect(cfg.match(/async\(sql_query/g)).toHaveLength(10)
     const timer = cfg.slice(cfg.indexOf('\ntimer_route[default_trunk, 15] {'), cfg.indexOf('\nroute[emergency_failed] {'))
     expect(timer.match(/sql_query(_one)?\(/g)).toHaveLength(2)
-    expect(section('route[tables_4c_missing]', 'route[table_5_missing]').match(/sql_query_one\(/g)).toHaveLength(1)
+    expect(section('route[tables_4c_missing]', 'route[table_11_missing]').match(/sql_query_one\(/g)).toHaveLength(1)
+    expect(section('route[table_11_missing]', 'route[table_5_missing]').match(/sql_query_one\(/g)).toHaveLength(1)
+    expect(cfg.match(/route\(table_11_missing\)/g)).toHaveLength(1)
     expect(section('route[table_5_missing]', 'route[wake_next]').match(/sql_query_one\(/g)).toHaveLength(1)
     expect(cfg.match(/route\(tables_4c_missing\)/g)).toHaveLength(1)
     expect(cfg.match(/route\(table_5_missing\)/g)).toHaveLength(1)
@@ -517,7 +754,7 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     // Nobody to ring at the end of a forward: the dialled extension's "do not disturb" first.
     const unreachable = section('route[unreachable]', 'route[forward_to]')
     expect(unreachable.indexOf('route(dnd_refuse_dialled);')).toBeGreaterThan(0)
-    expect(unreachable.indexOf('route(dnd_refuse_dialled);')).toBeLessThan(unreachable.indexOf('t_reply(404'))
+    expect(unreachable.indexOf('route(dnd_refuse_dialled);')).toBeLessThan(unreachable.indexOf('$avp(vm_code) = 404;'))
     // Nor when the one it was forwarded to failed (declined, busy, no answer): its missed call waits for that refusal.
     const failure = cfg.slice(cfg.indexOf('failure_route[call_failed]'))
     const dialled = failure.lastIndexOf('if ($avp(d_dnd) == 1)\n\t\troute(dnd_refuse_dialled);')
@@ -581,7 +818,7 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     const onreply = cfg.slice(cfg.indexOf('onreply_route[rtp] {'), cfg.indexOf('route[event_attrs]'))
     expect(onreply.indexOf('remove_hf("P-Asserted-Identity");')).toBeLessThan(onreply.indexOf('append_hf("P-Asserted-Identity: '))
     expect(onreply).toContain('append_hf("P-Asserted-Identity: \\"$var(pai_name)\\" <sip:$var(pai_ext)@$avp(domain)>\\r\\n");')
-    expect(onreply.indexOf('if ($var(pai_ext) =~ "^[A-Za-z0-9._+-]{1,64}$") {')).toBeLessThan(onreply.indexOf('append_hf('))
+    expect(onreply.indexOf('if ($var(pai_ext) =~ "^[A-Za-z0-9._+-]{1,64}$") {')).toBeLessThan(onreply.indexOf('append_hf("P-Asserted-Identity: '))
   })
 
   it('rings every member of a ring group at once, as dialled only, without anyone in "do not disturb" or anyone\'s rules', () => {
@@ -632,7 +869,9 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     const group = failure.slice(failure.indexOf('if ($avp(group) != NULL) {'), failure.indexOf('$var(dnd_code) = $T_reply_code;'))
     expect(group).toContain('if ($avp(g_declines) != NULL && $avp(g_declines) >= $avp(g_windows)) {')
     // A call from the operator: the fallback of its direct number, never after every window declined (review 6b, n°9).
-    expect(group).toContain('route(did_fallback, "the group did not answer", "480");\n\t\trtpengine_delete();\n\t\troute(group_missed, "480 Temporarily Unavailable");\n\t\tt_reply(480, "Temporarily Unavailable");')
+    // Then the mailbox of the number's extension when that fallback was this group (step 11a), then 480.
+    expect(group).toContain('route(did_fallback, "the group did not answer", "480");\n\t\t# That fallback was this group')
+    expect(group).toContain('\t\t\t$avp(group) = $avp(vm_group);\n\t\t}\n\t\trtpengine_delete();\n\t\troute(group_missed, "480 Temporarily Unavailable");\n\t\tt_reply(480, "Temporarily Unavailable");')
     expect(group.indexOf('route(did_fallback')).toBeGreaterThan(group.indexOf('route(group_missed, $var(group_reply));\n\t\t\texit;'))
     expect(onreply).toContain('$var(mark) = ",b" + $T_branch_idx + ",";')
     // A member woken by a push (step 5) declines once, whatever the number of windows they opened.
@@ -1230,7 +1469,7 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     for (const what of ['$rU', '$tU', '$fU']) expect(trunkIn).toContain(`route(inbound_number, ${what})`)
     // Every Privacy header (all their values, joined), any case: `id` or `user` hides the caller, nothing else does.
     expect(trunkIn).toContain('if (is_present_hf("Privacy")) {\n\t\t$var(privacy) = $(hdr(Privacy)[*]{s.tolower});')
-    const privacy = /\$var\(privacy\) =~ "([^"]+)"\)\n\t\t\t\$var\(from_number\) = "anonymous";/.exec(trunkIn)?.[1]
+    const privacy = /\$var\(privacy\) =~ "([^"]+)"\) \{\n(?:\t\t\t.*\n){2}\t\t\t\$var\(from_number\) = "anonymous";/.exec(trunkIn)?.[1]
     expect(privacy).toBeDefined()
     const hides = (value: string) => new RegExp(privacy ?? 'never').test(value.toLowerCase())
     for (const value of ['id', 'user', 'none, user', 'header;id', 'ID', 'header, critical, user']) expect(hides(value), value).toBe(true)
@@ -1269,8 +1508,10 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     const lines = (text: string) => text.split('\n').map(l => l.trim())
     expect(section('route[rules_loaded]', 'route[rules_step]')).toContain('if ($avp(d_loaded) == NULL && $avp(fwd_hops) == 0)\n\t\t\t$avp(dialled_unread) = 1;')
     const unreachable = lines(section('route[unreachable]', 'route[forward_to]'))
-    const reply = unreachable.indexOf('t_reply(404, "Not Found");')
-    expect(unreachable.slice(reply - 1, reply + 3)).toEqual(['if ($avp(fwd_hops) == 0 && $avp(dialled_unread) != 1)', 't_reply(404, "Not Found");', 'else', 't_reply(480, "Temporarily Unavailable");'])
+    // The refusal the caller gets, the mailbox of the extension dialled taking the call or not (step 11a).
+    const reply = unreachable.indexOf('$avp(vm_code) = 404;')
+    expect(unreachable.slice(reply - 3, reply + 3)).toEqual(['$avp(vm_code) = 480;', '$avp(vm_reason) = "Temporarily Unavailable";', 'if ($avp(fwd_hops) == 0 && $avp(dialled_unread) != 1) {', '$avp(vm_code) = 404;', '$avp(vm_reason) = "Not Found";', '}'])
+    expect(unreachable).toContain('t_reply($avp(vm_code), "$avp(vm_reason)");')
   })
   it('keeps what an emergency call presents however long the database is down, bounds the emergency calls a restart restores, and never rings a fallback group where the call has been (second review 6b, n°1, n°4, n°9, n°10)', () => {
     const { cfg } = render()
@@ -1285,7 +1526,7 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(section('route[default_trunk]', 'timer_route[default_trunk, 15]')).toContain('$(var(dn){s.select,1,|}{s.int}) >= $shv(dn_gen)')
     expect(cfg).toContain('modparam("cfgutils", "shvset", "dn_gen=i:0")')
     // n°10: the emergency calls known as such in the database (their profile), a day at most, 2 h once restored.
-    expect(cfg).toContain('modparam("dialog", "profiles_no_value", "trunk_out;trunk_emergency;meet_all")')
+    expect(cfg).toContain('modparam("dialog", "profiles_no_value", "trunk_out;trunk_emergency;meet_all;vm_all;vm_hidden")')
     const entry = readFileSync(join(dir, 'entrypoint.sh'), 'utf8')
     expect(entry).toContain(`-c "SELECT twake_outbound_restart(${EMERGENCY_RESTORED_SEC})"`)
     // n°4: before OpenSIPS starts, after the tables are there.

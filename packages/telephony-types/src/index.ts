@@ -244,9 +244,16 @@ export interface TelephonyAlert {
    * (`reconciliation`, `value` the percentage, `threshold` 99); a removal of the forwards of a line there (third
    * review 10b, n°2 and n°4, `number` the line): left as it was because someone changed it in the manager since
    * (`removal-changed`), let go because the operator no longer has the line (`removal-gone`), owed for over a day
-   * (`removal-late`).
+   * (`removal-late`). `voicemail` (step 11a): raised by the Gateway, the synchronisation of the mailboxes fails since
+   * `value` minutes (`sync-failing`), the SIP server's database refused its write under the lease it holds
+   * (`sync-fenced`), or it keeps leaving out `value` mailboxes the voicemail server refuses (`boxes-refused`), or it holds back `value`
+   * mailboxes of `threshold` reached, too many set aside at once (`held-back`), or `value` mailboxes past their grace
+   * period, too many removed at once (`held-back-remove`); raised by
+   * the SIP server, a call to the mailbox of `extension` refused for a cap, `value` of `threshold`: of the callers with
+   * no number there, at the same time (`hidden-calls`) or in the hour (`hidden-hour`), of those with no number to all
+   * the mailboxes (`hidden-all`), or of all callers (`calls-all`).
    */
-  kind: 'fraud-warning' | 'fraud-critical' | 'limit' | 'rights' | 'emergency' | 'meet' | 'webhook' | 'operator'
+  kind: 'fraud-warning' | 'fraud-critical' | 'limit' | 'rights' | 'emergency' | 'meet' | 'webhook' | 'operator' | 'voicemail'
   param: string
   scope?: 'user' | 'tenant'
   value?: number
@@ -256,6 +263,12 @@ export interface TelephonyAlert {
   number?: string
   /** Who holds the extension, as the Gateway knows them. */
   userId?: UserId
+  /**
+   * `held-back` only: the new holders left without a mailbox until the release (`waiting`), and whether no extension
+   * of the tenant reaches a mailbox meanwhile (`noneReached`: the voicemail off for everyone).
+   */
+  waiting?: number
+  noneReached?: boolean
 }
 
 /**
@@ -451,6 +464,39 @@ export interface Call {
    * them in it. `remoteNumber` is then whoever made the conference (themselves, for that person).
    */
   conference?: boolean
+  /**
+   * The call went to the mailbox of the extension dialled (step 11a, ADR 0022): nobody answered it, refused it or could
+   * be reached, and the voicemail server took it. For the caller it was answered (by the mailbox); for the callee it is
+   * a missed call, whose message, if one was left, is in their mailbox (`Voicemail`).
+   */
+  voicemail?: boolean
+}
+
+/**
+ * A message left in a person's mailbox (step 11a, ADR 0022), as their Messagerie shows it: who left it (`from`, an
+ * extension or an E.164 number, absent when the caller hid it; `fromName`, as the directory or the operator named
+ * them), when, how long, and whether it was listened to. Its audio is read apart (GET /v1/voicemails/{id}/audio).
+ */
+export interface Voicemail {
+  /** Opaque, stable for the life of the message. */
+  id: string
+  from?: string
+  fromName?: string
+  receivedAt: string
+  durationSec: number
+  /** Not yet marked as read (listened to). */
+  unread: boolean
+}
+
+/**
+ * The answer of DELETE /v1/me/history: how many entries of the person's history were erased and, with a voicemail
+ * server, what became of their messages: `asked` of the Gateway that writes the mailboxes, erased at its next round
+ * (the voicemail server down or not); `limited`, not asked this time, past the few erasures an hour each person may ask
+ * (their history erased all the same: asking again later asks it). Absent without a voicemail server.
+ */
+export interface HistoryErasure {
+  deleted: number
+  voicemailErasure?: 'asked' | 'limited'
 }
 
 export interface OriginateRequest {
@@ -496,6 +542,11 @@ export interface Capabilities {
    */
   outboundPolicy?: boolean
   conference: { dialIn: boolean; dialOut: boolean }
+  /**
+   * Each person has a mailbox (step 11a, ADR 0022): a call nobody answers, refused by their "do not disturb", busy or
+   * that reaches nobody goes there, and they read their messages (`Voicemail`, the `voicemail.*` events).
+   */
+  voicemail?: boolean
 }
 
 /** Media plane description handed to the client; opaque to the Gateway. */
@@ -565,6 +616,12 @@ export type TelephonyEvent =
   | { type: 'conference.participant.joined' | 'conference.participant.left'; timestamp: string; payload: { participant: ConferenceParticipant } }
   /** For the administrators, never the person: a volume threshold crossed or a cap reached (step 6b). */
   | { type: 'alert.raised'; timestamp: string; payload: { alert: TelephonyAlert } }
+  /**
+   * The person's mailbox (step 11a): a message left (`voicemail.created`), marked as read (`voicemail.updated`), or
+   * deleted (`voicemail.deleted`, its id only), from any of their screens.
+   */
+  | { type: 'voicemail.created' | 'voicemail.updated'; timestamp: string; payload: { voicemail: Voicemail } }
+  | { type: 'voicemail.deleted'; timestamp: string; payload: { id: string } }
 
 export type ProviderStatus = 'CONNECTED' | 'DEGRADED' | 'DISCONNECTED' | 'ERROR'
 
@@ -609,6 +666,11 @@ export interface WebhookCall {
   outcome?: WebhookCallOutcome
   /** A conference's call (step 8b): the room called this person. */
   conference?: true
+  /**
+   * The call went to a mailbox (step 11a): nobody took it, the voicemail server did. For the caller,
+   * `answered_at` and `outcome: answered` are the mailbox's answer, not the person's; for the callee it is missed.
+   */
+  voicemail?: true
   /**
    * Where TwakePhone knows the call from: `opensips`, the SIP server, as it happens. The operator's records come
    * later (step 10b: read every 10 minutes) and are reconciled in the history (`GET /calls/history`, its `sources`),

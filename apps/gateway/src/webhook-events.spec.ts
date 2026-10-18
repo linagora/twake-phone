@@ -73,6 +73,15 @@ describe('the public events of a call', () => {
   it('says a call of a conference as such', () => {
     expect(webhookEventsFor('acme', 'jdupont', '102', ev('call.ringing', call({ conference: true })))[0]).toMatchObject({ call: { conference: true } })
   })
+
+  it('says a call a mailbox took as such, whose answer is not the person’s (step 11a)', () => {
+    const ended = webhookEventsFor('acme', 'jdupont', '102', ev('call.ended', call({ voicemail: true, state: 'missed', endedAt: at })))
+    expect(ended.map(e => [e.type, (e as { call: { voicemail?: true; outcome?: string } }).call.voicemail, (e as { call: { outcome?: string } }).call.outcome])).toEqual([
+      ['call.ended', true, 'missed'],
+      ['call.missed', true, 'missed']
+    ])
+    expect(webhookEventsFor('acme', 'jdupont', '102', ev('call.ringing', call()))[0]).not.toHaveProperty('call.voicemail')
+  })
 })
 
 describe('the public event of a presence', () => {

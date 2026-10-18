@@ -21,6 +21,7 @@
     "@twake/conference-livekit": "*",
     "@twake/provider-opensips": "*",
     "@twake/provider-ovh": "*",
+    "@twake/provider-wazo": "*",
     "@twake/telephony-provider-sdk": "*",
     "@twake/telephony-types": "*",
     "fastify": "^5.0.0",

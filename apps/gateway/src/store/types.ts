@@ -35,6 +35,8 @@ export interface HistoryEntry {
   answered: boolean
   /** A conference's call (step 8b, ADR 0019): the room called the person in the place of a call of theirs. */
   conference?: boolean
+  /** A call a mailbox took (step 11a, ADR 0022): answered by it for the caller, missed for the person called. */
+  voicemail?: boolean
   /** The operator whose record of the call (`operatorCdr`, its id there) was reconciled with it (step 10b, ADR 0021). */
   operator?: string
   operatorCdr?: string
@@ -476,10 +478,17 @@ export interface WebhookSendQuota {
 
 /**
  * The lease of a role taken or renewed (takeWebhookLease): its holder writes from `writeFrom` (on the store's
- * clock), once what the previous holder was writing is done.
+ * clock), once what the previous holder was writing is done, and until `writeUntil` (a third of the lease before its
+ * end: the next holder writes a third later still), unless it renews it meanwhile.
  */
 export interface WebhookLease {
   writeFrom: string
+  writeUntil: string
+  /**
+   * One more for each lease of the role taken (from another holder, or by the same once it lapsed or was given back),
+   * the same while it is renewed: a fencing token that no clock moves.
+   */
+  generation: number
 }
 
 /**

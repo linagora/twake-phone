@@ -313,11 +313,11 @@ if (process.env.TEST_DATABASE_URL) {
           await store.migrate()
           const pool = (store as unknown as { pool: pg.Pool }).pool
           const fresh = await schemaOf(pool)
-          // The webhook tables as that 013 made them, 014 never played.
+          // The webhook tables as that 013 made them, 014 never played, nor 018 (the leases' generation).
           await pool.query(`
             DROP TABLE IF EXISTS webhook_leases, webhook_state, webhook_sends, webhook_deliveries, webhook_domains, webhook_subscriptions;
             ${sql};
-            DELETE FROM schema_migrations WHERE name = '014_webhooks_fairness.sql';
+            DELETE FROM schema_migrations WHERE name IN ('014_webhooks_fairness.sql', '018_history_voicemail.sql');
           `)
           await store.migrate()
           expect(await schemaOf(pool)).toEqual(fresh)
@@ -326,7 +326,7 @@ if (process.env.TEST_DATABASE_URL) {
           expect(await store.enqueueWebhookDelivery('acme', 'wh_00000000000000a1', 'evt_1', 'webhook.test', '{}', undefined, 1000, { perSubscription: 1, windowMs: 60_000 })).toMatchObject({ eventId: 'evt_1' })
           expect(await store.claimWebhookDeliveries(4, { perSubscription: 2, perTenant: 4, maxAttempts: 9 })).toHaveLength(1)
           // Played again on a database up to date: nothing changes.
-          await pool.query("DELETE FROM schema_migrations WHERE name = '014_webhooks_fairness.sql'")
+          await pool.query("DELETE FROM schema_migrations WHERE name IN ('014_webhooks_fairness.sql', '018_history_voicemail.sql')")
           await store.migrate()
           expect(await schemaOf(pool)).toEqual(fresh)
         } finally {

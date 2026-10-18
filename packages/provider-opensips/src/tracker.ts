@@ -39,6 +39,13 @@ interface TrackedCall {
    * neither told of it nor busy with it (their own is the call of the room to them).
    */
   conference?: boolean
+  /**
+   * The mailbox of the callee (the extension dialled) took the call (step 11a, ADR 0022; E_TWAKEPHONE_VOICEMAIL): for
+   * the caller it is answered, for the callee a missed call, told then, whatever rang; the callee is not busy with it.
+   */
+  voicemail?: boolean
+  /** The extensions told the call ended for them while it went on elsewhere (a forward, a group): told once. */
+  over?: Set<string>
 }
 
 /** What the SIP server knows of an extension: registered or not, in a call or not. */
@@ -61,6 +68,8 @@ export interface ContactRegistration {
 
 /** Longer than OpenSIPS's dialog timeout (4 h): a call whose end was never told (a lost datagram) is forgotten. */
 const MAX_CALL_MS = 5 * 3_600_000
+/** The caps of the calls to the mailboxes E_TWAKEPHONE_VMCAP says were reached (route[voicemail_alert]). */
+const VMCAP_PARAMS = new Set(['hidden-calls', 'hidden-hour', 'hidden-all', 'calls-all'])
 /** The ended calls remembered, so that a late event (a RINGING after the MISSED, a CDR resent) does not bring one back. */
 const MAX_TOMBSTONES = 10_000
 /** A contact past its expiry is dropped after this much more: its refresh may be on its way. */
@@ -364,6 +373,21 @@ export class CallTracker {
         this.emit(number, { type: 'alert.raised', timestamp: now, payload: { alert } })
         return
       }
+      case 'E_TWAKEPHONE_VMCAP': {
+        // A call to the mailbox of `extension` (step 11a) refused for a cap, for the administrators: of the callers with
+        // no number there, at the same time (hidden-calls) or in the hour (hidden-hour), of those with no number to all
+        // the mailboxes (hidden-all), or of all callers (calls-all); the next ones get what they would have had
+        // without it.
+        const extension = str(p.extension)
+        if (!/^[0-9]{1,40}$/.test(extension)) return
+        const param = str(p.param)
+        if (!VMCAP_PARAMS.has(param)) return
+        const value = num(p.value)
+        const threshold = num(p.threshold)
+        const alert: TelephonyAlert = { kind: 'voicemail', param, scope: 'tenant', extension, ...(value !== undefined ? { value } : {}), ...(threshold !== undefined ? { threshold } : {}) }
+        this.emit(extension, { type: 'alert.raised', timestamp: now, payload: { alert } })
+        return
+      }
       case 'E_TWAKEPHONE_EMERGENCY': {
         // Never refused, never counted by a cap: emergency calls in a row from one extension (EMERGENCY_BURST within
         // EMERGENCY_BURST_WINDOW_MS) are told to the administrators, each one from there on.
@@ -393,6 +417,29 @@ export class CallTracker {
         this.emit(who, { type: 'call.wake', timestamp: this.now(), payload: { call: this.toCall(call, who, 'ringing'), waitSec, ...(call.group ? { group: call.dialled } : {}) } })
         return
       }
+      case 'E_TWAKEPHONE_VOICEMAIL': {
+        // The mailbox of `callee`, the extension dialled, answered (step 11a): nobody of theirs answered, refused or
+        // could be reached (`code`: what the caller would have been told). Whoever a forward made ring before has the
+        // call missed (or declined); the callee too, at once (their phone is free: the mailbox has the call); the caller
+        // is in a call, with the mailbox.
+        const call = this.find(p, now)
+        if (!call || call.connectedAt || call.conference) return
+        // The fallback group of a direct number nobody of which answered, then the mailbox of the extension the number
+        // rings: each member whose phone rang has the call missed, never taken by a colleague;
+        // the call is no group's any more.
+        if (call.group) this.leaveGroup(call, now)
+        const code = Number(p.code) || 0
+        this.moveTo(call, userOf(str(p.callee)), code, now)
+        if (call.rang) this.count(call.callee, -1)
+        call.rang = false
+        call.woken?.delete(call.callee)
+        call.voicemail = true
+        call.connectedAt = now
+        // Told once: the extension dialled whose phone rang before a forward (or a group) has its missed call already.
+        if (call.callee !== call.caller && !call.over?.has(call.callee)) this.emit(call.callee, { type: 'call.ended', timestamp: now, payload: { call: { ...this.toCall(call, call.callee, DECLINED.has(code) ? 'rejected' : 'missed', now), connectedAt: undefined } } })
+        this.tell(call, call.caller, 'call.connected', 'connected')
+        break
+      }
       case 'E_TWAKEPHONE_RINGING': {
         const call = this.find(p, now)
         // A group call: `callee` is the member whose phone rings.
@@ -420,9 +467,10 @@ export class CallTracker {
         const created = epochMs(p.created)
         const call = this.find(p, created !== undefined ? iso(created) : now)
         if (!call) return
-        // Answered (by the member acc names, for a group whose answer was not told): both sides knew of it.
+        // Answered (by the member acc names, for a group whose answer was not told): both sides knew of it. By the
+        // callee's mailbox (step 11a): the callee was told already, and was never busy with it.
         if (call.group && !call.connectedAt) this.memberAnswers(call, userOf(str(p.callee)))
-        this.rings(call)
+        if (!call.voicemail) this.rings(call)
         const answeredMs = epochMs(p.time)
         const ms = num(p.ms_duration)
         const sec = num(p.duration)
@@ -576,7 +624,10 @@ export class CallTracker {
   private leaveGroup(call: TrackedCall, now: string) {
     for (const m of call.group?.ringing ?? []) {
       this.count(m, -1)
-      if (m !== call.caller) this.emit(m, { type: 'call.ended', timestamp: this.now(), payload: { call: this.toCall(call, m, 'missed', now) } })
+      if (m !== call.caller) {
+        this.emit(m, { type: 'call.ended', timestamp: this.now(), payload: { call: this.toCall(call, m, 'missed', now) } })
+        ;(call.over ??= new Set()).add(m)
+      }
     }
     delete call.group
     call.rang = false
@@ -588,7 +639,10 @@ export class CallTracker {
     // Woken for it (its browser was, nothing of its rang): missed all the same.
     const woken = call.woken?.delete(call.callee) ?? false
     if (call.rang) this.count(call.callee, -1)
-    if ((call.rang || woken) && call.callee !== call.caller) this.emit(call.callee, { type: 'call.ended', timestamp: this.now(), payload: { call: this.toCall(call, call.callee, DECLINED.has(code) ? 'rejected' : 'missed', now) } })
+    if ((call.rang || woken) && call.callee !== call.caller) {
+      this.emit(call.callee, { type: 'call.ended', timestamp: this.now(), payload: { call: this.toCall(call, call.callee, DECLINED.has(code) ? 'rejected' : 'missed', now) } })
+      ;(call.over ??= new Set()).add(call.callee)
+    }
     call.callee = to
     call.rang = false
   }
@@ -619,6 +673,7 @@ export class CallTracker {
     const outbound = viewer === c.caller
     return {
       ...(c.conference ? { conference: true } : {}),
+      ...(c.voicemail ? { voicemail: true } : {}),
       id: c.id,
       direction: outbound ? 'outbound' : 'inbound',
       state,
@@ -649,7 +704,7 @@ export class CallTracker {
     const rang = [...(c.group?.ringing ?? [])]
     for (const m of rang) this.count(m, -1)
     c.group?.ringing.clear()
-    const callee = (c.conference || c.callee !== c.caller) && (c.rang || !!c.woken?.has(c.callee))
+    const callee = !c.voicemail && (c.conference || c.callee !== c.caller) && (c.rang || !!c.woken?.has(c.callee))
     const members = [...new Set([...rang, ...[...(c.woken ?? [])].filter(m => m !== c.callee && m !== c.caller)])]
     if (tombstone) {
       this.ended.add(c.id)

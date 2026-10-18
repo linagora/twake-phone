@@ -817,7 +817,7 @@ try {
   await step('the app and the Gateway answer with their security headers', async () => {
     const app = await page.request.get(`${appOrigin}/recents`)
     const csp = app.headers()['content-security-policy'] ?? ''
-    for (const expected of ["script-src 'self'", `connect-src 'self' ${gatewayUrl} ${gatewayUrl.replace('http', 'ws')} ${oidc.issuer}`, "frame-ancestors 'none'"]) {
+    for (const expected of ["script-src 'self'", "media-src 'self' blob:", `connect-src 'self' ${gatewayUrl} ${gatewayUrl.replace('http', 'ws')} ${oidc.issuer}`, "frame-ancestors 'none'"]) {
       if (!csp.includes(expected)) throw new Error(`app CSP lacks ${JSON.stringify(expected)}: ${csp}`)
     }
     expectEqual(app.headers()['x-frame-options'], 'DENY', 'app X-Frame-Options')

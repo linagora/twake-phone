@@ -49,6 +49,12 @@ jobs:
         run: yarn test
         env:
           TEST_DATABASE_URL: postgres://twake:twake@localhost:5432/twake_test
+      # Les scripts Python de la stack Wazo : le remplaçant de wazo-sysconfd (refus des
+      # requêtes de navigateur, échecs de l'AMI, déplacement d'une boîte) et le contrôle d'écoute (un faux
+      # Asterisk qui écoute partout échoue). Bibliothèque standard seulement, sans Docker.
+      - name: Tests Python de la stack Wazo (sysconfd.py, check-loopback.py)
+        if: ${{ !cancelled() }}
+        run: python3 -I -m unittest discover -s docker/wazo/tests -v
       - name: Cache de Chromium (clé = version de playwright-core)
         id: chromium-cache
         uses: actions/cache@v4
@@ -101,9 +107,17 @@ jobs:
           node-version: 22
           cache: yarn
       # La stack SIP d'abord (`--wait` bloque jusqu'aux healthchecks) : OpenSIPS 3.6 (image officielle + modules
-      # WSS, TLS, PostgreSQL), rtpengine en espace utilisateur, PostgreSQL avec la table `subscriber`. Réseau hôte.
+      # WSS, TLS, PostgreSQL), rtpengine en espace utilisateur, PostgreSQL avec la table `subscriber`, et Wazo 26.10 pour
+      # les messageries (étape 11a, ADR 0022 : images officielles épinglées par empreinte). Réseau hôte.
       - name: Stack SIP (Docker Compose)
         run: docker compose -f docker/docker-compose.sip.yml up --build --wait --wait-timeout 300
+      # Chaque socket des services Wazo (bus et base compris), lu dans /proc : hors de 127.0.0.0/8 et ::1, le job échoue.
+      # Seule exception nommée, le client DNS de PJSIP dans Asterisk (UDP sur 0.0.0.0 et, le runner ayant IPv6, sur ::,
+      # un port éphémère chacun), reconnue par ce qu'une autre écoute ne peut pas imiter : le
+      # binaire d'Asterisk, et l'epoll de PJSIP qui surveille aussi son transport SIP (ADR 0022). Rejoué pendant un
+      # appel vers une boîte (l'e2e SIP) et après l'e2e.
+      - name: Wazo n'écoute que sur la boucle locale
+        run: sudo python3 -I docker/wazo/check-loopback.py docker/docker-compose.sip.yml
       - run: yarn install --frozen-lockfile
       - run: yarn build
       - name: Cache du navigateur Playwright (clé = navigateur et version de playwright-core)
@@ -142,17 +156,21 @@ jobs:
         env:
           OPENSIPS_DB_URL: postgres://twake:twake@127.0.0.1:54320/twake
           OPENSIPS_RESTART: docker compose -f docker/docker-compose.sip.yml kill -s KILL opensips && docker compose -f docker/docker-compose.sip.yml up -d --wait --wait-timeout 120 opensips
-      - name: e2e SIP (trois personnes dans ${{ matrix.browser }}, micro simulé, OpenSIPS et rtpengine en Docker)
+      - name: e2e SIP (trois personnes dans ${{ matrix.browser }}, micro simulé, OpenSIPS, rtpengine et Wazo en Docker)
         run: node apps/web/test/sip.e2e.mjs
         env:
           BROWSER: ${{ matrix.browser }}
           SIP_WSS_URL: wss://127.0.0.1:8089
           OPENSIPS_DB_URL: postgres://twake:twake@127.0.0.1:54320/twake
-      # Service par service (étape 8 : LiveKit et LiveKit SIP écrivent beaucoup), la fin de chacun.
+      # Ce que les appels de l'e2e ont ouvert depuis le premier contrôle.
+      - name: Wazo n'écoute toujours que sur la boucle locale, après l'e2e SIP
+        run: sudo python3 -I docker/wazo/check-loopback.py docker/docker-compose.sip.yml
+      # Service par service (étape 8 : LiveKit et LiveKit SIP écrivent beaucoup), la fin de chacun ; Wazo (étape 11a) :
+      # l'Asterisk des messageries et les services que la passerelle appelle.
       - name: Journaux de la stack SIP en cas d'échec
         if: failure()
         run: |
-          for service in opensips rtpengine livekit-sip livekit; do
+          for service in opensips rtpengine livekit-sip livekit wazo-asterisk wazo-calld wazo-confd wazo-websocketd wazo-auth wazo-bootstrap wazo-amid wazo-sysconfd wazo-confgend wazo-db rabbitmq; do
             echo "::group::$service"
             docker compose -f docker/docker-compose.sip.yml logs --no-color --timestamps --tail 300 "$service"
             echo "::endgroup::"

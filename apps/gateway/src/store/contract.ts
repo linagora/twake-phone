@@ -93,6 +93,18 @@ export const storeContract = (name: string, make: () => Promise<Store>) =>
       await s.close()
     })
 
+    it('keeps whether a mailbox took a call (step 11a), and only then says so', async () => {
+      const s = await make()
+      await s.addHistory(entry({ callId: 'vm', voicemail: true, answered: true, durationSec: 12 }))
+      await s.addHistory(entry({ callId: 'plain', startedAt: '2026-10-05T09:00:00.000Z' }))
+      const { items } = await s.listHistory('A', 'alice')
+      expect(items.map(e => [e.callId, e.voicemail, e.answered])).toEqual([
+        ['vm', true, true],
+        ['plain', undefined, expect.any(Boolean)]
+      ])
+      await s.close()
+    })
+
     it('is idempotent on the call id', async () => {
       const s = await make()
       await s.addHistory(entry({}))
@@ -1349,11 +1361,18 @@ export const storeContract = (name: string, make: () => Promise<Store>) =>
       await new Promise(r => setTimeout(r, wait + 20))
       expect(await write('gw_two')).not.toBeNull()
       // Its renewal keeps the time it writes from, and writes until a third of the lease before its end.
-      expect((await s.takeWebhookLease(WEBHOOK_STATE_ROLE, 'gw_two', 600, 2))!.writeFrom).toBe(taken!.writeFrom)
+      const renewed = await s.takeWebhookLease(WEBHOOK_STATE_ROLE, 'gw_two', 600, 2)
+      expect(renewed!.writeFrom).toBe(taken!.writeFrom)
+      // Its generation too: one more than the lease it took the role from, whatever the clocks.
+      expect(renewed!.generation).toBe(taken!.generation)
+      const left = Date.parse(renewed!.writeUntil) - Date.parse(await s.clock())
+      expect(left).toBeGreaterThan(300)
+      expect(left).toBeLessThanOrEqual(400)
       // Given back: another one takes it at once, and writes a third of its lease later (what was under way done).
       expect(await s.takeWebhookLease(WEBHOOK_STATE_ROLE, 'gw_two', 0)).toBeNull()
       const next = await s.takeWebhookLease(WEBHOOK_STATE_ROLE, 'gw_one', 600, 1)
       expect(next).toBeTruthy()
+      expect(next!.generation).toBe(taken!.generation + 1)
       expect(Date.parse(next!.writeFrom) - Date.parse(await s.clock())).toBeGreaterThan(100)
       expect(await write('gw_two')).toBeNull()
       // A lease that lapsed: another one takes it and writes at once (its holder could not write for a third of it).
@@ -1361,6 +1380,10 @@ export const storeContract = (name: string, make: () => Promise<Store>) =>
       const lapsed = await s.takeWebhookLease(WEBHOOK_STATE_ROLE, 'gw_none', 600)
       expect(Date.parse(lapsed!.writeFrom) - Date.parse(await s.clock())).toBeLessThanOrEqual(0)
       expect(await write('gw_none')).not.toBeNull()
+      expect(lapsed!.generation).toBe(next!.generation + 1)
+      // Given back and taken again by the same holder: a lease of its own, one more.
+      expect(await s.takeWebhookLease(WEBHOOK_STATE_ROLE, 'gw_none', 0)).toBeNull()
+      expect((await s.takeWebhookLease(WEBHOOK_STATE_ROLE, 'gw_none', 600))!.generation).toBe(lapsed!.generation + 1)
       await s.close()
     })
 

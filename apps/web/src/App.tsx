@@ -18,6 +18,7 @@ import { Webhooks } from './pages/admin/Webhooks.js'
 import { Dialer } from './pages/Dialer.js'
 import { ContactPage } from './pages/ContactPage.js'
 import { Directory } from './pages/Directory.js'
+import { VoicemailPage } from './pages/Voicemail.js'
 import { FavoritesProvider } from './favorites.js'
 import { PresenceProvider } from './presence.js'
 import { Recents } from './pages/Recents.js'
@@ -40,6 +41,7 @@ const Gate = ({ config }: { config: AppConfig }) => {
               <Route element={<Layout />}>
                 <Route index element={<Dialer />} />
                 <Route path="recents" element={<Recents />} />
+                <Route path="voicemail" element={<VoicemailPage />} />
                 <Route path="directory" element={<Directory />} />
                 <Route path="directory/:id" element={<ContactPage />} />
                 <Route path="settings" element={<Settings config={config} />} />

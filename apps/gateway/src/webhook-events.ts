@@ -39,6 +39,7 @@ const webhookCall = (userId: string, extension: string, call: Call, ended: boole
     ...(ended && call.endedAt ? { ended_at: call.endedAt } : {}),
     ...(ended ? { duration_sec: durationSec, outcome: outcomeOf(call) } : {}),
     ...(call.conference ? { conference: true as const } : {}),
+    ...(call.voicemail ? { voicemail: true as const } : {}),
     source: ['opensips']
   }
 }

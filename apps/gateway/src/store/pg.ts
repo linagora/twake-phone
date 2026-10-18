@@ -13,7 +13,7 @@ const MIGRATIONS = fileURLToPath(new URL('../../migrations/', import.meta.url))
 type Timestamp = Date | string
 type ProviderRow = { tenant_id: string; site: string; type: string; config: unknown }
 type MappingRow = { tenant_id: string; user_id: string; extension: string; display_name: string | null; department: string | null; source: MappingSource; synced_at: Timestamp | null }
-type HistoryRow = { tenant_id: string; user_id: string; call_id: string; direction: HistoryEntry['direction']; remote_number: string; started_at: Timestamp; ended_at: Timestamp | null; duration_sec: number; state: HistoryEntry['state']; answered: boolean; conference: boolean; operator: string | null; operator_cdr: string | null; operator_only: boolean; operator_forwarded: boolean }
+type HistoryRow = { tenant_id: string; user_id: string; call_id: string; direction: HistoryEntry['direction']; remote_number: string; started_at: Timestamp; ended_at: Timestamp | null; duration_sec: number; state: HistoryEntry['state']; answered: boolean; conference: boolean; operator: string | null; operator_cdr: string | null; operator_only: boolean; operator_forwarded: boolean; voicemail: boolean }
 type OperatorCdrRow = { tenant_id: string; operator: string; id: string; line: string; direction: HistoryEntry['direction']; forwarded: boolean; calling: string | null; called: string | null; started_at: Timestamp; duration_sec: number; outcome: OperatorCdrRecord['outcome'] | null; call_id: string | null; user_id: string | null; invalid: string | null }
 type PresenceRow = { tenant_id: string; user_id: string; status: UserPresenceRecord['status']; since: Timestamp; until: Timestamp | null; message: string | null }
 type ConferenceRow = { tenant_id: string; meeting_id: string; owner_user_id: string; pin: string | null; created_at: Timestamp }
@@ -134,7 +134,8 @@ const toEntry = (r: HistoryRow): HistoryEntry => ({
   ...(r.operator ? { operator: r.operator } : {}),
   ...(r.operator_cdr ? { operatorCdr: r.operator_cdr } : {}),
   ...(r.operator_only ? { operatorOnly: true } : {}),
-  ...(r.operator_forwarded ? { operatorForwarded: true } : {})
+  ...(r.operator_forwarded ? { operatorForwarded: true } : {}),
+  ...(r.voicemail ? { voicemail: true } : {})
 })
 
 const toOperatorCdr = (r: OperatorCdrRow): OperatorCdrRecord => ({
@@ -309,9 +310,9 @@ export class PgStore implements Store {
 
   async addHistory(e: HistoryEntry, client: pg.Pool | pg.PoolClient = this.pool) {
     await client.query(
-      `INSERT INTO call_history (tenant_id, user_id, call_id, direction, remote_number, started_at, ended_at, duration_sec, state, answered, conference, operator, operator_cdr, operator_only, operator_forwarded)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) ON CONFLICT DO NOTHING`,
-      [e.tenantId, e.userId, e.callId, e.direction, e.remoteNumber, e.startedAt, e.endedAt ?? null, e.durationSec, e.state, e.answered, e.conference === true, e.operator ?? null, e.operatorCdr ?? null, e.operatorOnly === true, e.operatorForwarded === true]
+      `INSERT INTO call_history (tenant_id, user_id, call_id, direction, remote_number, started_at, ended_at, duration_sec, state, answered, conference, operator, operator_cdr, operator_only, operator_forwarded, voicemail)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) ON CONFLICT DO NOTHING`,
+      [e.tenantId, e.userId, e.callId, e.direction, e.remoteNumber, e.startedAt, e.endedAt ?? null, e.durationSec, e.state, e.answered, e.conference === true, e.operator ?? null, e.operatorCdr ?? null, e.operatorOnly === true, e.operatorForwarded === true, e.voicemail === true]
     )
   }
 
@@ -1434,17 +1435,20 @@ export class PgStore implements Store {
     // Taken from another holder when it lapsed, or at once when this one hears more tenants than it does: it writes
     // from a third of the lease after what the other could still write (none once it lapsed).
     const margin = Math.floor(ms / 3)
-    const { rows } = await this.leasePool.query<{ write_from: Timestamp }>(
-      `INSERT INTO webhook_leases (role, holder, until, heard, write_from, write_until)
-       VALUES ($1, $2, now() + $3 * interval '1 millisecond', $4, now(), now() + ($3 - $5) * interval '1 millisecond')
+    // Its generation: one more for each lease taken (from another holder, or once it lapsed or was given back).
+    const { rows } = await this.leasePool.query<{ write_from: Timestamp; write_until: Timestamp; generation: string }>(
+      `INSERT INTO webhook_leases (role, holder, until, heard, write_from, write_until, generation)
+       VALUES ($1, $2, now() + $3 * interval '1 millisecond', $4, now(), now() + ($3 - $5) * interval '1 millisecond', 1)
        ON CONFLICT (role) DO UPDATE SET holder = EXCLUDED.holder, until = EXCLUDED.until, heard = EXCLUDED.heard, write_until = EXCLUDED.write_until,
          write_from = CASE WHEN webhook_leases.holder = EXCLUDED.holder THEN webhook_leases.write_from
-                           ELSE greatest(now(), least(webhook_leases.write_until, now()) + $5 * interval '1 millisecond') END
+                           ELSE greatest(now(), least(webhook_leases.write_until, now()) + $5 * interval '1 millisecond') END,
+         generation = CASE WHEN webhook_leases.holder = EXCLUDED.holder AND webhook_leases.until > now() THEN webhook_leases.generation
+                           ELSE webhook_leases.generation + 1 END
        WHERE webhook_leases.holder = EXCLUDED.holder OR webhook_leases.until <= now() OR EXCLUDED.heard > webhook_leases.heard
-       RETURNING write_from`,
+       RETURNING write_from, write_until, generation`,
       [role, holder, ms, heard, margin]
     )
-    return rows[0] ? { writeFrom: iso(rows[0].write_from) } : null
+    return rows[0] ? { writeFrom: iso(rows[0].write_from), writeUntil: iso(rows[0].write_until), generation: Number(rows[0].generation) } : null
   }
 
   async listWebhookStates(tenantId: string, prefix: string) {

@@ -12,6 +12,7 @@ import { WebPush, parsePushServices, parseVapidSubject } from './push.js'
 import { ProviderRegistry } from './registry.js'
 import { PgStore } from './store/pg.js'
 import { trunkFromEnv, trunkRecord } from './trunks.js'
+import { absenceMsOf, holderRecordKeepMsOf, retentionDaysOf, voicemailMismatch, wazoFromEnv } from './voicemail.js'
 import { networkInterfaces } from 'node:os'
 import { denyNetworks, parsePorts, parseTenantNetworks } from './webhook-delivery.js'
 
@@ -159,7 +160,7 @@ const groupNumbers = async (tenantId: string) => {
   const provider = registry.forTenant(tenantId)
   return provider.listGroups ? (await provider.listGroups()).map(g => g.number) : []
 }
-const directorySync = contacts && env.LDAP_ATTR_EXTENSION ? new DirectorySync({ store, directory: contacts, tenantId: env.LDAP_TENANT ?? tenant, reserved: async t => [...(await groupNumbers(t)), ...(conference && accessNumber ? [accessNumber] : [])] }) : undefined
+const directorySync = contacts && env.LDAP_ATTR_EXTENSION ? new DirectorySync({ store, directory: contacts, tenantId: env.LDAP_TENANT ?? tenant, absenceMs: absenceMsOf(env), recordKeepMs: holderRecordKeepMsOf(env), reserved: async t => [...(await groupNumbers(t)), ...(conference && accessNumber ? [accessNumber] : [])] }) : undefined
 // Webhooks (step 10a, ADR 0020), with SECRETS_KEY: deliveries in https only, on port 443 (80 in http; WEBHOOK_PORTS:
 // others), never to this host or the private networks, unless the operator opens some to one organisation
 // (WEBHOOK_PRIVATE_NETWORKS, `acme=10.20.0.0/16;beta=192.0.2.10`, a bare list for DEFAULT_TENANT: the CRM of that
@@ -185,6 +186,13 @@ if (!key) console.warn('WARNING: no webhooks without SECRETS_KEY (their secrets 
 // the database nor the log.
 const ovh = ovhOperatorFromEnv(env)
 if (ovh) console.info(`OVHcloud: the operator of the trunks of ${JSON.stringify(tenant)} (billing account ${env.OVH_BILLING_ACCOUNT})`)
+
+// The mailboxes (step 11a, ADR 0022): Wazo Platform for DEFAULT_TENANT, from WAZO_URL (or the URL of each of its
+// APIs), WAZO_USER and WAZO_PASSWORD, with SECRETS_KEY (voicemail.ts). Without it, a call nobody takes ends as before.
+// The messages are kept VOICEMAIL_RETENTION_DAYS (30 by default).
+const voicemail = wazoFromEnv(env, key)
+const voicemailRetentionDays = retentionDaysOf(env)
+if (!voicemail) console.warn('WARNING: no mailboxes (WAZO_URL or the URLs of its APIs, WAZO_USER, WAZO_PASSWORD): a call nobody takes is not taken by a mailbox')
 const hstsMaxAge = env.HSTS_MAX_AGE ? Number(env.HSTS_MAX_AGE) : undefined
 if (hstsMaxAge !== undefined && !(Number.isInteger(hstsMaxAge) && hstsMaxAge >= 0)) throw new Error('HSTS_MAX_AGE must be a number of seconds')
 const app = await buildApp(registry, {
@@ -198,9 +206,11 @@ const app = await buildApp(registry, {
   ...(key ? { secretsKey: key } : {}),
   webhooks: { policy: { allowHttp: webhookHttp, ...(webhookPorts ? { ports: webhookPorts } : {}) }, open: webhookOpen, deny: webhookDeny },
   ...(ovh ? { operators: new Map([[tenant, ovh]]) } : {}),
-  ...(conference ? { conference } : {})
+  ...(conference ? { conference } : {}),
+  ...(voicemail ? { voicemail: (t: string) => (t === tenant ? voicemail : undefined), voicemailRetentionDays } : {})
 })
 directorySync?.useLogger(app.log)
+app.addHook('onClose', async () => voicemail?.close())
 const syncEvery = parseInterval(env.LDAP_SYNC_INTERVAL, 3_600_000)
 if (directorySync && syncEvery > 0) directorySync.start(syncEvery)
 app.addHook('onClose', async () => directorySync?.stop())
@@ -220,5 +230,11 @@ setTimeout(() => {
       for (const what of meetAccessMismatch(accessNumber, sip)) console.warn(`WARNING: ${what}`)
     })
     .catch((err: unknown) => console.warn(`WARNING: the access number of the meeting rooms not compared with OpenSIPS's: ${err instanceof Error ? err.message : String(err)}`))
+  // The mailboxes likewise: OpenSIPS's own bound of a call to one, not this Gateway's.
+  void Promise.resolve(registry.forTenant(tenant).getVoicemailSettings?.())
+    .then(sip => {
+      for (const what of voicemailMismatch(voicemail, sip)) console.warn(`WARNING: ${what}`)
+    })
+    .catch((err: unknown) => console.warn(`WARNING: the mailboxes not compared with OpenSIPS's: ${err instanceof Error ? err.message : String(err)}`))
 }, 10_000).unref()
 await app.listen({ host: env.HOST ?? '0.0.0.0', port: Number(env.PORT ?? 8080) })

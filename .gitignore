@@ -21,3 +21,6 @@ coverage
 
 # Arbres de travail temporaires des agents
 .claude/worktrees/
+
+# Bytecode Python (tests de docker/wazo)
+__pycache__/

@@ -10,6 +10,8 @@ describe('contentSecurityPolicy', () => {
     expect(csp).toContain("object-src 'none'")
     // The service worker of the notifications, from the app's own origin only.
     expect(csp).toContain("worker-src 'self'")
+    // The recordings of the mailbox, played from what the page fetched (blob:), nothing from elsewhere.
+    expect(csp).toContain("media-src 'self' blob:")
     expect(csp).not.toContain('unsafe')
   })
   it('adds the extra connect origins and the allowed ancestors', () => {

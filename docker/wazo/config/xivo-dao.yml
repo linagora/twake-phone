@@ -1,0 +1,1 @@
+db_uri: postgresql://asterisk:twake-wazo-dev-only-db@127.0.0.1:54330/asterisk?application_name=wazo-confd

@@ -547,7 +547,9 @@ const Active = ({ call, tones, original, hasOther, onError }: { call: SoftCall; 
       ? t('call.dialing', { who: who(call, t) })
       : call.state === 'held'
         ? t('call.held', { who: who(call, t) })
-        : t('call.inProgress', { who: who(call, t) })
+        : call.voicemail
+          ? t('call.voicemailOf', { who: who(call, t) })
+          : t('call.inProgress', { who: who(call, t) })
   const originalReady = original && (original.state === 'connected' || original.state === 'held')
   // While the transfer of the original is on its way, the consultation must stay: its dialog is what the far end
   // takes over (Replaces); hanging it up first would make the transfer fail.

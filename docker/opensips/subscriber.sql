@@ -634,6 +634,24 @@ INSERT INTO dialplan (dpid, pr, match_op, match_exp, match_flags, subst_exp, rep
   (3, 10, 1, '^([1-9][0-9]{8})$', 0, '^([1-9][0-9]{8})$', '+33\1', 0, 'e164'),
   (4, 10, 1, '^\+1(24[26]|26[48]|284|345|441|473|649|658|664|721)', 0, '^(.*)$', '\1', 0, 'international'),
   (4, 10, 1, '^\+1(758|767|784|8[024]9|86[89]|876)', 0, '^(.*)$', '\1', 0, 'international');
+
+CREATE TABLE IF NOT EXISTS voicemail_boxes (
+    extension VARCHAR(64) PRIMARY KEY NOT NULL,
+    tenant_id TEXT DEFAULT '' NOT NULL,
+    mailbox VARCHAR(128) NOT NULL,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL
+);
+CREATE TABLE IF NOT EXISTS voicemail_writers (
+    tenant_id TEXT PRIMARY KEY NOT NULL,
+    fence BIGINT DEFAULT 0 NOT NULL,
+    withdrawals BIGINT DEFAULT 0 NOT NULL
+);
+CREATE TABLE IF NOT EXISTS voicemail_withdrawals (
+    tenant_id TEXT NOT NULL,
+    extension VARCHAR(64) NOT NULL,
+    seq BIGINT NOT NULL,
+    PRIMARY KEY (tenant_id, extension)
+);
 ALTER TABLE subscriber ADD COLUMN IF NOT EXISTS holder TEXT;
 ALTER TABLE acc ADD COLUMN IF NOT EXISTS caller VARCHAR(64) DEFAULT '' NOT NULL;
 ALTER TABLE acc ADD COLUMN IF NOT EXISTS callee VARCHAR(64) DEFAULT '' NOT NULL;
