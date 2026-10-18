@@ -154,7 +154,7 @@ jobs:
       - name: Journaux de la stack SIP en cas d'échec
         if: failure()
         run: |
-          for service in opensips rtpengine livekit-sip livekit wazo-asterisk wazo-calld wazo-confd wazo-websocketd wazo-auth wazo-bootstrap; do
+          for service in opensips rtpengine livekit-sip livekit wazo-asterisk wazo-calld wazo-confd wazo-websocketd wazo-auth wazo-bootstrap wazo-amid wazo-sysconfd wazo-confgend wazo-db rabbitmq; do
             echo "::group::$service"
             docker compose -f docker/docker-compose.sip.yml logs --no-color --timestamps --tail 300 "$service"
             echo "::endgroup::"

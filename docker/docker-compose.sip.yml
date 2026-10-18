@@ -159,13 +159,16 @@ services:
       timeout: 3s
       retries: 3
 
-  # Wazo's bus, the loopback only (AMQP, and Erlang's port mapper and distribution port).
+  # Wazo's bus, the loopback only (AMQP, Erlang's port mapper and distribution port, the metrics of its Prometheus
+  # plugin). Its node is named after localhost, not the machine: where the machine's name resolves off the loopback
+  # (a CI runner), the port mapper would be looked for there, and RabbitMQ would not start.
   rabbitmq:
     image: rabbitmq:3.13.7-alpine
     environment:
+      RABBITMQ_NODENAME: rabbit@localhost
       RABBITMQ_NODE_IP_ADDRESS: 127.0.0.1
       ERL_EPMD_ADDRESS: 127.0.0.1
-      RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS: "-kernel inet_dist_use_interface {127,0,0,1}"
+      RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS: "-kernel inet_dist_use_interface {127,0,0,1} -rabbitmq_prometheus tcp_config [{ip,{127,0,0,1}},{port,15692}]"
     network_mode: host
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "-q", "check_port_connectivity"]
