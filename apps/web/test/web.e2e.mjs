@@ -700,7 +700,7 @@ try {
     await forwarded.getByText('Renvoyé au numéro de repli').waitFor()
     await forwarded.getByText('Manqué', { exact: true }).waitFor()
   })
-  await step('the fallback removed while OVH does not answer: said not removed yet, kept, and removed once OVH answers again (second review 10b, n°1)', async () => {
+  await step('the fallback removed while OVH does not answer: said not removed yet, kept, and removed once OVH answers again, the voicemail of before put back (second review 10b, n°1; third review n°8)', async () => {
     await page.getByRole('link', { name: 'Administration' }).click()
     await subnav.getByRole('link', { name: 'Trunks', exact: true }).click()
     await trunkList.getByText(LINE_SET).waitFor()
@@ -708,6 +708,10 @@ try {
     ovh.state.down = true
     try {
       await trunkList.getByRole('button', { name: "Retirer le renvoi de repli du trunk operator chez l'opérateur" }).click()
+      // What it puts back is said before (third review 10b, n°8): what OVH had before the platform took the line.
+      await trunkList
+        .getByRole('group', { name: `Retirer le renvoi de repli des lignes du trunk operator chez l'opérateur ? La plateforme ne le tiendra plus. Ligne ${OVH_LINE} : ses renvois d'avant la plateforme seront remis (renvoi sur indisponibilité vers la messagerie).` })
+        .waitFor()
       await trunkList.getByRole('button', { name: 'Oui, retirer' }).click()
       await page.getByRole('alert').getByText(`Le trunk operator ne tient plus de renvoi de repli, mais l'opérateur ne l'a pas encore retiré de ${OVH_LINE} : la plateforme réessaie à chaque relevé.`).waitFor()
       expectEqual(ovh.options(OVH_ACCOUNT, OVH_LINE).forwardBackup, true, 'still at OVH')
@@ -721,15 +725,15 @@ try {
     } finally {
       ovh.state.down = false
     }
-    // OVH back: the next round removes it, reads the line without a forward, and lets the removal go.
-    await until(() => !ovh.options(OVH_ACCOUNT, OVH_LINE).forwardBackup && !ovh.options(OVH_ACCOUNT, OVH_LINE).forwardNoReply, 'the fallback removed at OVH')
+    // OVH back: the next round removes it, puts back the voicemail OVH had before, reads it back, and lets the removal go.
+    await until(() => ovh.options(OVH_ACCOUNT, OVH_LINE).forwardBackup && ovh.options(OVH_ACCOUNT, OVH_LINE).forwardBackupNature === 'voicemail' && !ovh.options(OVH_ACCOUNT, OVH_LINE).forwardNoReply, 'the fallback removed at OVH, the voicemail put back')
     await until(async () => !(await api('/admin/operator')).json().removals, 'the removal done')
     // Refused while OVH was down, then written once.
     expectEqual(JSON.stringify(ovh.requests.filter(r => r.method === 'PUT').slice(puts).map(r => r.status).filter(s => s === 200)), JSON.stringify([200]), 'written once OVH answers')
     await page.getByRole('button', { name: "Actualiser l'état" }).click()
-    await trunkList.getByText(`Ligne ${OVH_LINE} : aucun renvoi · renvoi réglé hors de la plateforme`).waitFor()
+    await trunkList.getByText(`Ligne ${OVH_LINE} : renvoi sur indisponibilité vers la messagerie · renvoi réglé hors de la plateforme`).waitFor()
     expectEqual(await page.getByRole('list', { name: "Renvois pas encore retirés chez l'opérateur" }).count(), 0, 'no removal shown')
-    expectEqual(await trunkList.getByRole('button', { name: "Retirer le renvoi de repli du trunk operator chez l'opérateur" }).count(), 0, 'nothing left to remove')
+    await page.getByRole('list', { name: 'Retraits des 7 derniers jours' }).getByText(new RegExp(`^Ligne ${OVH_LINE} : renvoi retiré le .*, ses renvois d'avant remis$`)).waitFor()
   })
   await step('in English, the refusals of the Gateway read in English too', async () => {
     await page.getByRole('link', { name: 'Réglages' }).click()

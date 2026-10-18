@@ -112,6 +112,11 @@ export interface OperatorLine {
   error?: OperatorProblem
   /** The operator did not keep what was asked: not written again until the trunk is saved. */
   rejected?: true
+  /**
+   * What was there before the platform first wrote its fallback (third review 10b, n°8): put back when the fallback is
+   * removed, if the platform can write it (to a number, the voicemail or a fax). Absent: not known (nothing put back).
+   */
+  original?: OperatorLineForwards
 }
 
 /** What is set at the operator on a line now (POST /admin/operator/lines), or why it could not be read. */
@@ -131,6 +136,21 @@ export interface OperatorRemoval {
   trunkId?: string
   triedAt?: string
   error?: OperatorProblem
+  /** What it puts back (third review 10b, n°8): what was there before the platform took the line. */
+  original?: OperatorLineForwards
+}
+
+/**
+ * What became of a removal of the last days (third review 10b, n°2 and n°4): done (`restored`: the forwards of before
+ * put back), left as it was because someone changed it in the manager since (`changed`), let go because the operator
+ * has no such line (`gone`), or by an administrator (`abandoned`).
+ */
+export interface OperatorClosedRemoval {
+  line: string
+  at: string
+  outcome: 'done' | 'changed' | 'gone' | 'abandoned'
+  trunkId?: string
+  restored?: true
 }
 
 /** The operator of the trunks, as the administration shows it (GET /admin/operator). */
@@ -140,6 +160,8 @@ export interface OperatorStatus {
   trunks?: { id: string; lines: OperatorLine[] }[]
   /** The removals at the operator still owed. */
   removals?: OperatorRemoval[]
+  /** What became of the removals of the last days, the latest first. */
+  closedRemovals?: OperatorClosedRemoval[]
   cdrs?: {
     readAt?: string
     read?: number
@@ -395,9 +417,12 @@ export class TelephonyClient {
     return this.request<{ available: boolean; items: TrunkStatus[] }>('/admin/trunks/status')
   }
 
-  /** Creates or replaces a trunk; `password` absent keeps the one kept, `null` removes it. Refusals carry a `code`. */
+  /**
+   * Creates or replaces a trunk; `password` absent keeps the one kept, `null` removes it. Refusals carry a `code`.
+   * `pending`: the removals at the operator of the lines it no longer names not done yet (202, third review 10b, n°11).
+   */
   setTrunk(id: string, trunk: TrunkInput) {
-    return this.request<Trunk>(`/admin/trunks/${encodeURIComponent(id)}`, { method: 'PUT', body: JSON.stringify(trunk) })
+    return this.request<Trunk & { pending?: OperatorRemoval[] }>(`/admin/trunks/${encodeURIComponent(id)}`, { method: 'PUT', body: JSON.stringify(trunk) })
   }
 
   /** The operator of the trunks (step 10b): its lines, their fallback, the records of calls reconciled. */
@@ -421,6 +446,11 @@ export class TelephonyClient {
    */
   removeOperatorFallback(trunkId: string) {
     return this.request<{ trunk: Trunk; pending: OperatorRemoval[] }>(`/admin/trunks/${encodeURIComponent(trunkId)}/operator/fallback`, { method: 'DELETE' })
+  }
+
+  /** Lets a removal at the operator go (third review 10b, n°4): nothing more is written on that line (404: none owed). */
+  async abandonOperatorRemoval(line: string): Promise<void> {
+    await this.request<void>(`/admin/operator/removals/${encodeURIComponent(line)}`, { method: 'DELETE' })
   }
 
   /**

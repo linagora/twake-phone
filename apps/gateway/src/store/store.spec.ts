@@ -318,6 +318,76 @@ if (process.env.TEST_DATABASE_URL) {
   })
 
   describe('PgStore, the history of a person and the records of the operator (second review 10b)', () => {
+    /** The tables of the operator and of the erasures as the catalog has them, and the function of E.164. */
+    const operatorSchemaOf = async (pool: pg.Pool) => {
+      const tables = ['call_history', 'history_erasures', 'history_erased_calls', 'number_changes', 'operator_cdrs', 'operator_state']
+      return {
+        columns: (
+          await pool.query(
+            'SELECT table_name, column_name, data_type, is_nullable, column_default, generation_expression FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = ANY($1) ORDER BY table_name, column_name',
+            [tables]
+          )
+        ).rows,
+        indexes: (await pool.query('SELECT tablename, indexname, indexdef FROM pg_indexes WHERE schemaname = current_schema() AND tablename = ANY($1) ORDER BY indexname', [tables])).rows,
+        constraints: (await pool.query('SELECT conrelid::regclass::text AS t, conname, pg_get_constraintdef(oid) AS def FROM pg_constraint WHERE conrelid::regclass::text = ANY($1) ORDER BY 1, 2', [tables])).rows,
+        e164: (await pool.query("SELECT pg_get_functiondef('e164_of(text)'::regprocedure) AS def")).rows
+      }
+    }
+
+    it('brings a database that played 016 as it stood at 6ef6cc6 or at fbebfe6 to the schema of one made afresh, its erasures working (third review, n°7)', async () => {
+      const base = new URL(process.env.TEST_DATABASE_URL!)
+      const name = `${decodeURIComponent(base.pathname.slice(1)) || 'postgres'}_migrate_017`
+      const own = new URL(base.toString())
+      own.pathname = `/${name}`
+      const server = new pg.Client({ connectionString: base.toString() })
+      await server.connect()
+      await server.query(`DROP DATABASE IF EXISTS "${name}" WITH (FORCE)`)
+      await server.query(`CREATE DATABASE "${name}"`)
+      const store = new PgStore(own.toString())
+      try {
+        await store.migrate()
+        const pool = (store as unknown as { pool: pg.Pool }).pool
+        const fresh = await operatorSchemaOf(pool)
+        // 6ef6cc6: its 016 played (the one in the repository, never rewritten again), 017 not; an entry written under
+        // the rules of E.164 of then, with no-break spaces.
+        await pool.query(`
+          DELETE FROM schema_migrations WHERE name = '017_operator_erasures.sql';
+          ALTER TABLE history_erasures DROP COLUMN numbers;
+          DROP TABLE history_erased_calls, number_changes;
+          DROP INDEX history_erasures_purge;
+          ALTER TABLE call_history DROP COLUMN operator_forwarded;
+          ${readFileSync(new URL('../../migrations/016_operator_review.sql', import.meta.url), 'utf8')}
+        `)
+        await pool.query("INSERT INTO call_history (tenant_id, user_id, call_id, direction, remote_number, started_at, duration_sec, state, answered) VALUES ('A', 'jean', 'nb', 'outbound', '06 39 98 00 01', now(), 0, 'ended', true)")
+        await store.migrate()
+        expect(await operatorSchemaOf(pool)).toEqual(fresh)
+        expect((await pool.query("SELECT remote_e164 FROM call_history WHERE call_id = 'nb'")).rows).toEqual([{ remote_e164: '+33639980001' }])
+        // The right to erasure works (it answered 500: no column `numbers`), its calls kept with their print.
+        expect(await store.deleteHistory('A', 'jean', ['+33199000101'], { since: new Date(Date.now() - 60_000).toISOString(), keyOf: n => `key:${n}` })).toBe(1)
+        expect(await store.numbersErasedAt('A', ['+33199000101'])).toHaveProperty('size', 1)
+        expect((await store.erasedCalls('A', new Date(Date.now() - 60_000).toISOString(), new Date(Date.now() + 60_000).toISOString())).map(c => c.remoteKey)).toEqual(['key:+33639980001'])
+        // fbebfe6: its 016 had the rest, but neither the prints nor the indexes of the purge.
+        await pool.query(`
+          DELETE FROM schema_migrations WHERE name = '017_operator_erasures.sql';
+          ALTER TABLE history_erased_calls DROP COLUMN remote_key;
+          DROP INDEX history_erased_calls_purge, number_changes_purge, history_erasures_purge;
+        `)
+        await store.migrate()
+        expect(await operatorSchemaOf(pool)).toEqual(fresh)
+        // Played again on a database up to date: nothing changes.
+        await pool.query("DELETE FROM schema_migrations WHERE name = '017_operator_erasures.sql'")
+        await store.migrate()
+        expect(await operatorSchemaOf(pool)).toEqual(fresh)
+      } finally {
+        await store.close()
+        for (let i = 0; i < 100; i++) {
+          if (await server.query(`DROP DATABASE IF EXISTS "${name}"`).then(() => true, () => false)) break
+          await new Promise(r => setTimeout(r, 20))
+        }
+        await server.end()
+      }
+    }, 30_000)
+
     it('erases a history under its lock: an orphan settled meanwhile waits for it, then sees it (n°10)', async () => {
       const store = new PgStore(process.env.TEST_DATABASE_URL!)
       await store.migrate()

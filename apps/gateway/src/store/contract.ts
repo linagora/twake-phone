@@ -274,20 +274,17 @@ export const storeContract = (name: string, make: () => Promise<Store>) =>
         cdr('bob', { direction: 'outbound', calling: '+33199000100', called: '+33698765555', startedAt: '2026-10-05T15:00:02.000Z' })
       ])
       const t0 = Date.now()
-      expect(await s.deleteHistory('A', 'alice', ['+33972000001'])).toBe(2)
+      // The calls a record read later may be of only (third review 10b, n°3), each with the print of its number (n°5).
+      expect(await s.deleteHistory('A', 'alice', ['+33972000001'], { since: '2026-10-05T10:30:00.000Z', keyOf: n => `key:${n}` })).toBe(2)
       const erased = await s.historyErasedAt('A', 'alice')
       expect(Math.abs(Date.parse(erased!) - t0)).toBeLessThan(60_000)
       expect(await s.historyErasedAt('A', 'bob')).toBeUndefined()
       expect(await s.historyErasedAt('B', 'alice')).toBeUndefined()
       expect(await s.numbersErasedAt('A', ['+33972000001', '+33972000002'])).toEqual(new Map([['+33972000001', erased]]))
       expect((await s.numbersErasedAt('B', ['+33972000001'])).size).toBe(0)
-      // When the erased entries were, without a number; another tenant has none.
-      const calls = await s.erasedCalls('A', '2026-10-05T09:00:00.000Z', '2026-10-05T12:00:00.000Z')
-      expect(calls.sort((a, b) => (a.startedAt < b.startedAt ? -1 : 1))).toEqual([
-        { direction: 'inbound', startedAt: '2026-10-05T10:00:00.000Z', endedAt: '2026-10-05T10:01:00.000Z' },
-        { direction: 'outbound', startedAt: '2026-10-05T11:00:00.000Z', endedAt: '2026-10-05T11:02:00.000Z' }
-      ])
-      expect(await s.erasedCalls('A', '2026-10-05T10:30:00.000Z', '2026-10-05T12:00:00.000Z')).toHaveLength(1)
+      // When the erased entries were, without a number but its print (of its E.164), from `since` on; another tenant has none.
+      expect(await s.erasedCalls('A', '2026-10-05T09:00:00.000Z', '2026-10-05T12:00:00.000Z')).toEqual([{ direction: 'outbound', startedAt: '2026-10-05T11:00:00.000Z', endedAt: '2026-10-05T11:02:00.000Z', remoteKey: 'key:+33698765555' }])
+      expect(await s.erasedCalls('A', '2026-10-05T11:30:00.000Z', '2026-10-05T12:00:00.000Z')).toEqual([])
       expect(await s.erasedCalls('B', '2026-10-05T09:00:00.000Z', '2026-10-05T12:00:00.000Z')).toEqual([])
       // An orphan of a call from before the erasure, whatever the caller says: in nobody's history, without its numbers.
       await s.settleOperatorCdrs('A', 'ovh', [{ id: 'before', outcome: 'orphan', entry: entry({ callId: 'ovh:before', direction: 'inbound', remoteNumber: '+33612345678' }) }])
@@ -312,9 +309,15 @@ export const storeContract = (name: string, make: () => Promise<Store>) =>
       await s.deleteHistory('A', 'alice')
       expect((await s.historyErasedAt('A', 'alice'))! > erased!).toBe(true)
       expect((await s.numbersErasedAt('A', ['+33972000001'])).size).toBe(0)
-      // Kept a few days only.
-      await s.purgeOperatorCdrs('2026-01-01T00:00:00.000Z', '2026-10-06T00:00:00.000Z')
+      // Not asked to keep when its calls were (an organisation without an operator): nothing kept of them.
+      await s.deleteHistory('A', 'bob')
+      expect(await s.erasedCalls('A', '2026-10-05T14:00:00.000Z', '2026-10-05T16:00:00.000Z')).toEqual([])
+      // Kept a few days only, whatever the operator (third review 10b, n°3): the times of the calls, then the erasures.
+      await s.purgeErasures('2026-10-06T00:00:00.000Z')
       expect(await s.erasedCalls('A', '2026-10-05T09:00:00.000Z', '2026-10-05T12:00:00.000Z')).toEqual([])
+      expect(await s.historyErasedAt('A', 'alice')).toBeDefined()
+      expect(await s.purgeErasures(soon)).toBeGreaterThanOrEqual(2)
+      expect([await s.historyErasedAt('A', 'alice'), await s.historyErasedAt('A', 'bob')]).toEqual([undefined, undefined])
       await s.close()
     })
 
@@ -338,8 +341,12 @@ export const storeContract = (name: string, make: () => Promise<Store>) =>
       expect((await s.numberChangedAt('A', '102', '+33199000102'))! > left!).toBe(true)
       expect(await s.numberChangedAt('A', '103', '+33199000203')).toBeUndefined()
       expect(await s.numberChangedAt('B', '102', '+33199000102')).toBeUndefined()
-      // Carol given another extension: the one she had changes hands; the new one had no holder lately.
+      // Carol given another extension: the one she had changes hands (third review 10b, n°6), the new one had no holder
+      // lately.
+      const held = await s.numberChangedAt('A', '102', '+33199000102')
+      await new Promise(r => setTimeout(r, 5))
       await s.upsertMapping({ tenantId: 'A', userId: 'carol', extension: '104' })
+      expect((await s.numberChangedAt('A', '102', '+33199000102'))! > held!).toBe(true)
       expect(await s.numberChangedAt('A', '104', '+33199000204')).toBeUndefined()
       // A range aimed elsewhere: its numbers changed hands, not the others.
       await s.upsertDid({ ...desk, suffixDigits: 0, target: '105' })
@@ -352,9 +359,24 @@ export const storeContract = (name: string, make: () => Promise<Store>) =>
       await s.upsertDid({ tenantId: 'A', id: 'third', trunkId: 'main', first: '+33199000401', last: '+33199000401', target: '107' })
       await s.deleteTrunk('A', 'main')
       expect(await s.numberChangedAt('A', '107', '+33199000401')).toBeDefined()
-      // Kept a few days only.
-      await s.purgeOperatorCdrs('2026-01-01T00:00:00.000Z', new Date(Date.now() + 60_000).toISOString())
+      // Kept a few days only, whatever the operator (third review 10b, n°3).
+      await s.purgeErasures(new Date(Date.now() - 60_000).toISOString())
+      expect(await s.numberChangedAt('A', '102', '+33199000102')).toBeDefined()
+      await s.purgeErasures(new Date(Date.now() + 60_000).toISOString())
       expect(await s.numberChangedAt('A', '102', '+33199000102')).toBeUndefined()
+      await s.close()
+    })
+
+    it('forgets the erasure of a person with them: neither who nor their numbers (third review 10b, n°3)', async () => {
+      const s = await make()
+      await s.upsertMapping({ tenantId: 'A', userId: 'jean', extension: '102' })
+      await s.upsertMapping({ tenantId: 'A', userId: 'paul', extension: '103' })
+      await s.deleteHistory('A', 'jean', ['+33199000102'])
+      await s.deleteHistory('A', 'paul', ['+33199000103'])
+      await s.deleteMapping('A', 'jean')
+      expect(await s.historyErasedAt('A', 'jean')).toBeUndefined()
+      expect([...(await s.numbersErasedAt('A', ['+33199000102', '+33199000103'])).keys()]).toEqual(['+33199000103'])
+      expect(await s.historyErasedAt('A', 'paul')).toBeDefined()
       await s.close()
     })
 
@@ -410,8 +432,15 @@ export const storeContract = (name: string, make: () => Promise<Store>) =>
         { key: 'line:0033972000001', value: { inSync: false, error: 'refused' } },
         { key: 'line:0033972000002', value: { readAt: '2026-10-05T10:00:00.000Z', forwards: {} } }
       ])
-      await s.deleteOperatorState('A', 'line:0033972000002')
+      expect(await s.deleteOperatorState('A', 'line:0033972000002')).toBe(true)
+      expect(await s.deleteOperatorState('A', 'line:0033972000002')).toBe(false)
       expect((await s.listOperatorState('A', 'line:')).map(x => x.key)).toEqual(['line:0033972000001'])
+      // Removed only as it was read, when asked so (third review 10b, n°1), whatever the order of its keys.
+      expect(await s.deleteOperatorState('A', 'line:0033972000001', { inSync: true })).toBe(false)
+      expect(await s.getOperatorState('A', 'line:0033972000001')).toEqual({ inSync: false, error: 'refused' })
+      expect(await s.deleteOperatorState('A', 'line:0033972000001', { error: 'refused', inSync: false })).toBe(true)
+      expect(await s.listOperatorState('A', 'line:')).toEqual([])
+      await s.putOperatorState('A', 'line:0033972000001', { inSync: false, error: 'refused' })
       expect(await s.getOperatorState('B', 'cdrs')).toBeUndefined()
       expect(await s.takeOperatorQuota('A', 'sync', 60_000, 2)).toBe(true)
       expect(await s.takeOperatorQuota('A', 'sync', 60_000, 2)).toBe(true)

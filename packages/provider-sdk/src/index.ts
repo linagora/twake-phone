@@ -200,6 +200,11 @@ export interface OperatorProvider {
   /** Sets them to one fallback: `number` E.164; both off removes the forwards. Nothing else of the line is touched. */
   setFallback(line: string, fallback: OperatorFallback): Promise<void>
   /**
+   * Sets them as given, each to a number, the voicemail or a fax (third review 10b, n°8: what was there before the
+   * platform took the line, put back); absent: off. A forward elsewhere (`other`) cannot be written: refused.
+   */
+  setForwards(line: string, forwards: OperatorLineForwards): Promise<void>
+  /**
    * The ids of the line's records of calls (CDR) dated from `from` to `to` (ISO 8601), all of them (however many
    * pages, whatever billing period they are in), each once.
    */

@@ -140,6 +140,30 @@ describe('the watch over the trunks', () => {
     expect([back.type, 'fallback' in back.trunk]).toEqual(['trunk.recovered', false])
   })
 
+  it('reads the fallback once per change of health, not at every read while nobody is subscribed to hear it (third review 10b, n°12)', async () => {
+    const { store, told, gateway, set, setFallback, subscribe } = await setup()
+    let asked = 0
+    setFallback(async () => {
+      asked++
+      return { on_unavailable: 'number', on_no_answer: 'none' }
+    })
+    await store.deleteWebhookSubscription('acme', 'wh_00000000000000c1')
+    const { hub, watch: w } = await gateway()
+    set([trunk(ALL_OUT)])
+    for (let i = 0; i < 6; i++) await w.tick()
+    expect([asked, await told()]).toEqual([1, []])
+    // Someone subscribes: told with what was read for this outage, not read again.
+    await subscribe()
+    hub.forget('acme')
+    await w.tick()
+    expect([asked, (await told()).map(e => e.trunk.fallback)]).toEqual([1, [{ on_unavailable: 'number', on_no_answer: 'none' }]])
+    // Another change: read again.
+    set([trunk(UP)])
+    await w.tick()
+    await w.tick()
+    expect([asked, (await told()).map(e => e.type)]).toEqual([2, ['trunk.degraded', 'trunk.recovered']])
+  })
+
   it('tells a partial recovery (down to degraded), and a trunk no longer watched as recovered, removed (review 10a, second, n°16)', async () => {
     const { told, gateway, set, setNames } = await setup()
     const { watch: w } = await gateway()

@@ -20,7 +20,7 @@ import { ENDED_TTL_SEC, MISSED_TTL_SEC, type PushMessage, type WebPush } from '.
 import type { ProviderRegistry } from './registry.js'
 import { securityHeadersFor, type SecurityOptions } from './security.js'
 import { TrunkWatch } from './trunk-health.js'
-import { OperatorRoundError, OperatorSync, askKey, erasedNumbersOf, type OperatorRemoval } from './operator.js'
+import { OPERATOR_KEPT_MS, OperatorRoundError, OperatorSync, askKey, erasedNumbersOf, type OperatorRemoval } from './operator.js'
 import { e164Of } from './e164.js'
 import { encrypt } from './crypto.js'
 import { newWebhookSecret, parseWebhookDomains } from './webhook-delivery.js'
@@ -50,6 +50,16 @@ const pseudonymizer = (secretsKey: Buffer | undefined) => {
   if (!secretsKey) return undefined
   const key = Buffer.from(hkdfSync('sha256', secretsKey, Buffer.alloc(0), 'twake-phone: extensions in the log', 32))
   return (tenantId: string, extension: string) => createHmac('sha256', key).update(`${tenantId}\u0000${extension}`).digest('hex').slice(0, 16)
+}
+/**
+ * The print of the number on the other side of an erased call (third review 10b, n°5): HMAC-SHA-256 with a key the
+ * Gateway derives from SECRETS_KEY, the same for one number of one tenant, that the base alone does not give back.
+ * Without SECRETS_KEY, none: an erased call is kept by its way and time alone.
+ */
+const erasedRemoteKey = (secretsKey: Buffer | undefined) => {
+  if (!secretsKey) return undefined
+  const key = Buffer.from(hkdfSync('sha256', secretsKey, Buffer.alloc(0), 'twake-phone: erased calls', 32))
+  return (tenantId: string, number: string) => createHmac('sha256', key).update(`${tenantId}\u0000${number}`).digest('hex')
 }
 /** The cursor of a page of alerts (`next`, `before`): the last repeat (ms) and id of the last alert of the page. */
 const ALERT_CURSOR = /^([0-9]{1,15})-([1-9][0-9]{0,17})$/
@@ -837,14 +847,23 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
       }
     })().catch(err => app.log.error({ err }, 'provider event stream failed'))
   }
-  // The alerts past their retention go every hour (and once at start), whoever they belong to (step 6b).
+  // The alerts past their retention go every hour (and once at start), whoever they belong to (step 6b). With them,
+  // what erasures and changes of hands keep past OPERATOR_KEPT_MS, with an operator or not (third review 10b, n°3).
   const purgeAlerts = () =>
-    store.purgeAlerts(new Date(Date.now() - ALERT_RETENTION_DAYS * 86_400_000).toISOString()).then(
-      n => {
-        if (n) app.log.info({ purged: n }, 'alerts past their retention removed')
-      },
-      err => app.log.error({ err }, 'alerts not purged')
-    )
+    Promise.all([
+      store.purgeAlerts(new Date(Date.now() - ALERT_RETENTION_DAYS * 86_400_000).toISOString()).then(
+        n => {
+          if (n) app.log.info({ purged: n }, 'alerts past their retention removed')
+        },
+        err => app.log.error({ err }, 'alerts not purged')
+      ),
+      store.purgeErasures(new Date(Date.now() - OPERATOR_KEPT_MS).toISOString()).then(
+        n => {
+          if (n) app.log.info({ purged: n }, 'erasures and changes of hands past their days removed')
+        },
+        err => app.log.error({ err }, 'erasures not purged')
+      )
+    ])
   const alertPurge = setInterval(() => void purgeAlerts(), options.alertPurgeIntervalMs ?? 3_600_000)
   alertPurge.unref()
   /**
@@ -872,6 +891,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
     return answer
   }
   // The operator of the trunks (step 10b, ADR 0021): what is kept in step with it, by the Gateway that leads.
+  const remoteKey = erasedRemoteKey(options.secretsKey)
   const operatorSync = options.operators?.size
     ? new OperatorSync({
         store,
@@ -879,6 +899,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         ...(hub ? { leading: () => hub.leading } : {}),
         ...(options.operatorSyncMs ? { everyMs: options.operatorSyncMs } : {}),
         ...(options.operatorSettleMs !== undefined ? { settleMs: options.operatorSettleMs } : {}),
+        ...(remoteKey ? { remoteKey } : {}),
         logger: app.log
       })
     : undefined
@@ -1362,9 +1383,16 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         // Its lines at the operator (step 10b), read, and its fallback set there, now: the screen says how it went
         // (GET /admin/operator). A failure leaves the trunk saved; the next round tries again. The lines it no longer
         // names lose the fallback it kept there (second review 10b, n°8), as owed until done (n°1).
+        // What is owed still of those (third review 10b, n°11): 202 with it, as the deletions say it.
         const dropped = before?.config.operator?.fallback ? before.config.operator.lines.filter(l => !record.config.operator?.lines.includes(l)) : []
-        if (operatorSync && (record.config.operator || before?.config.operator))
-          await within(operatorSync.applyTrunk(user.tenantId, id, dropped), OPERATOR_APPLY_MS, 'operator').catch((err: unknown) => req.log.warn({ err }, 'operator: the trunk not handed to the operator'))
+        const pending =
+          operatorSync && (record.config.operator || before?.config.operator)
+            ? await within(operatorSync.applyTrunk(user.tenantId, id, dropped), OPERATOR_APPLY_MS, 'operator').catch(async (err: unknown) => {
+                req.log.warn({ err }, 'operator: the trunk not handed to the operator')
+                return (await operatorSync.removals(user.tenantId)).filter(r => dropped.includes(r.line))
+              })
+            : []
+        if (pending.length) return reply.code(202).send({ ...publicTrunk(record), pending })
         return reply.code(created ? 201 : 200).send(publicTrunk(record))
       })
       /** Removes the forwards of `lines` at the operator, and says what is owed still (all of them, past OPERATOR_APPLY_MS). */
@@ -1456,6 +1484,14 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
             message: failed instanceof OperatorRoundError && failed.timeout ? 'The operator was not read in time' : 'The operator could not be read'
           })
         return { configured: true, ...(await operatorSync.status(user.tenantId)) }
+      })
+      // A removal at the operator let go (third review 10b, n°4: a line the operator no longer has, keys without the
+      // right to write it): nothing more is written there, what is there stays. 204, or 404 when none is owed.
+      v1.delete<{ Params: { line: string } }>('/admin/operator/removals/:line', async (req, reply) => {
+        const user = await administrator(req)
+        if (!operatorSync?.serves(user.tenantId)) throw Object.assign(new Error('No operator is configured for this organisation'), { statusCode: 409, code: 'OPERATOR_NONE' })
+        if (!(await operatorSync.abandonRemoval(user.tenantId, req.params.line))) throw notFound('removal')
+        return reply.code(204).send()
       })
       // What is set at the operator on lines now, read only (review 10b, n°13): the screen shows it before a first
       // fallback replaces it. The lines as a trunk names them, MAX_OPERATOR_LINES at most.
@@ -1774,8 +1810,10 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         forgetPresence(user.tenantId, user.id)
         await store.eraseWebhookSubject(user.tenantId, user.id)
         // The operator's records of their direct numbers lose their numbers, and those not reconciled yet never enter
-        // anybody's history (review 10b, n°1; a record read later neither, whoever holds the number then: n°3).
-        const deleted = await store.deleteHistory(user.tenantId, user.id, await erasedNumbersOf(store, user.tenantId, user.id))
+        // anybody's history (review 10b, n°1; a record read later neither, whoever holds the number then: n°3). When
+        // their calls were is kept only with an operator, for those a record read later may be of (third review n°3).
+        const kept = operatorSync?.keptOfErasure(user.tenantId)
+        const deleted = await store.deleteHistory(user.tenantId, user.id, await erasedNumbersOf(store, user.tenantId, user.id), kept)
         return reply.send({ deleted })
       })
 

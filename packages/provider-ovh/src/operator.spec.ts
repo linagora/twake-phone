@@ -40,6 +40,23 @@ describe('OVHcloud as the operator of the trunks', () => {
     await expect(ovh.setFallback(LINE, { onUnavailable: true })).rejects.toThrow(/number/)
   })
 
+  it('puts forwards back as they were: the voicemail on no answer, a number on unavailability; a forward elsewhere is not written (third review 10b, n°8)', async () => {
+    const { f, ovh } = await setup({ [LINE]: { options: { forwardBusy: true, displayNumber: '0033972000001' } } })
+    await ovh.setForwards(LINE, { onUnavailable: { nature: 'number', number: '+33612345678' }, onNoAnswer: { nature: 'voicemail', afterSec: 20 } })
+    expect(f.requests.at(-1)!.body).toEqual({ forwardBackup: true, forwardBackupNature: 'number', forwardBackupNumber: '0033612345678', forwardNoReply: true, forwardNoReplyDelay: 20, forwardNoReplyNature: 'voicemail' })
+    expect(f.options(ACCOUNT, LINE)).toMatchObject({ forwardBusy: true, displayNumber: '0033972000001' })
+    expect(await ovh.getForwards(LINE)).toEqual({ onUnavailable: { nature: 'number', number: '+33612345678' }, onNoAnswer: { nature: 'voicemail', afterSec: 20 } })
+    await ovh.setForwards(LINE, { onUnavailable: { nature: 'fax' } })
+    expect(await ovh.getForwards(LINE)).toEqual({ onUnavailable: { nature: 'fax' } })
+    await ovh.setForwards(LINE, {})
+    expect(f.requests.at(-1)!.body).toEqual({ forwardBackup: false, forwardNoReply: false })
+    expect(await ovh.getForwards(LINE)).toEqual({})
+    const puts = f.requests.filter(r => r.method === 'PUT').length
+    await expect(ovh.setForwards(LINE, { onNoAnswer: { nature: 'other', afterSec: 20 } })).rejects.toThrow(/other/)
+    await expect(ovh.setForwards(LINE, { onUnavailable: { nature: 'number' } })).rejects.toThrow(/no number/)
+    expect(f.requests.filter(r => r.method === 'PUT').length).toBe(puts)
+  })
+
   it('reads each forward set in the manager as it is: two numbers, the voicemail, a fax, something unknown (review 10b, n°4 and n°15)', async () => {
     const { ovh } = await setup({
       [LINE]: { options: { forwardBackup: true, forwardBackupNumber: '0033612345678', forwardNoReply: true, forwardNoReplyDelay: 30, forwardNoReplyNumber: '0033698765432' } },

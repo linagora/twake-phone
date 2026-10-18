@@ -104,11 +104,25 @@ export interface OperatorCdrStats {
   erased: number
 }
 
-/** When an erased entry of the history was, by way, without any number (second review 10b, n°2). */
+/**
+ * When an erased entry of the history was, by way, without any number (second review 10b, n°2), and a keyed print of
+ * the number on the other side (third review n°5: HMAC with a key of the Gateway, never the number), when kept.
+ */
 export interface ErasedCall {
   direction: CallDirection
   startedAt: string
   endedAt: string
+  remoteKey?: string
+}
+
+/**
+ * What an erasure keeps of the calls erased (third review 10b, n°3): given only for an organisation with an operator,
+ * the entries started from `since` on (those a record read later may be of), each with the print `keyOf` gives of its
+ * number on the other side (E.164), when the Gateway has a key. Nothing otherwise.
+ */
+export interface ErasedCallsKept {
+  since: string
+  keyOf?: (remote: string) => string
 }
 
 /** A missed call: inbound, never answered, and not declined by the user (state `missed`, not `rejected`). */
@@ -567,6 +581,7 @@ export interface Store {
   upsertMapping(mapping: UserMapping): Promise<void>
   /** Every mapping of a tenant, by user id. */
   listMappings(tenantId: string): Promise<UserMapping[]>
+  /** Their erasure (historyErasedAt, numbersErasedAt) goes with them (third review 10b, n°3): neither who nor their numbers. */
   deleteMapping(tenantId: string, userId: string): Promise<void>
 
   /** Idempotent on (tenant, user, callId). */
@@ -579,9 +594,10 @@ export interface Store {
    * calls lose their numbers (kept as read, never read again): those reconciled with their entries, those to or from
    * `numbers` that started before, and those not reconciled yet that one of their entries would take (same way, same
    * number, the same window as matchCdrs: second review n°2); those not reconciled yet are settled `erased`. When
-   * their entries were is kept a few days, without a number (erasedCalls). Returns the number of rows of history.
+   * their entries were is kept a few days, without a number (erasedCalls), only as `calls` says (third review n°3).
+   * Returns the number of rows of history.
    */
-  deleteHistory(tenantId: string, userId: string, numbers?: readonly string[]): Promise<number>
+  deleteHistory(tenantId: string, userId: string, numbers?: readonly string[], calls?: ErasedCallsKept): Promise<number>
   /** When the user last erased their history (deleteHistory), if they did. */
   historyErasedAt(tenantId: string, userId: string): Promise<string | undefined>
   /** When each of `numbers` was last erased with the history of whom it rang (second review 10b, n°3), those that were. */
@@ -616,11 +632,14 @@ export interface Store {
   settleOperatorCdrs(tenantId: string, operator: string, outcomes: readonly OperatorCdrOutcome[]): Promise<void>
   /** The records of the operator that started from `since` on, by outcome. */
   operatorCdrStats(tenantId: string, operator: string, since: string): Promise<OperatorCdrStats>
+  /** Removes the records of the operator that started before `before` (retention), every tenant. */
+  purgeOperatorCdrs(before: string): Promise<number>
   /**
-   * Removes the records that started before `before` (retention), every tenant; and the times of erased calls and of
-   * changes of hands (erasedCalls, numberChangedAt) from before `keptBefore`, when given.
+   * Removes, every tenant, what erasures and changes of hands keep from before `before` (third review 10b, n°3): the
+   * erased calls (erasedCalls), the changes of hands (numberChangedAt) and the erasures themselves (historyErasedAt,
+   * numbersErasedAt), operator or not. How many rows.
    */
-  purgeOperatorCdrs(before: string, keptBefore?: string): Promise<number>
+  purgeErasures(before: string): Promise<number>
   /**
    * What the platform knows of its operator for a tenant (review 10b, n°8: the same for every Gateway, kept across a
    * restart): the state of each line, of the last read of the records, a round asked. JSON values, by key.
@@ -628,7 +647,8 @@ export interface Store {
   getOperatorState(tenantId: string, key: string): Promise<unknown>
   listOperatorState(tenantId: string, prefix: string): Promise<{ key: string; value: unknown }[]>
   putOperatorState(tenantId: string, key: string, value: unknown): Promise<void>
-  deleteOperatorState(tenantId: string, key: string): Promise<void>
+  /** Removes a key; only while its value is still `ifValue` when given (third review 10b, n°1). Whether it was removed. */
+  deleteOperatorState(tenantId: string, key: string, ifValue?: unknown): Promise<boolean>
   /** Counts one more use of `key` for the tenant, unless `max` were counted in the last `windowMs` (false), whatever Gateway asks. */
   takeOperatorQuota(tenantId: string, key: string, windowMs: number, max: number): Promise<boolean>
 

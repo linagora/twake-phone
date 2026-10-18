@@ -3,7 +3,7 @@ import type { OperatorFallback, OperatorForward, OperatorLineForwards, WebhookFo
 import { OperatorError, type OperatorErrorCode, type OperatorProvider } from '@twake/telephony-provider-sdk'
 import { e164Of } from './e164.js'
 import { RECONCILE_EARLY_MS, RECONCILE_LATE_MS, directNumbersOf, extensionOfDid, localOf, matchCdrs, remoteOf } from './reconcile.js'
-import type { HistoryEntry, HistoryNearQuery, OperatorCdrOutcome, OperatorCdrRecord, OperatorCdrStats, Store, TrunkRecord, UserMapping } from './store/types.js'
+import type { ErasedCallsKept, HistoryEntry, HistoryNearQuery, OperatorCdrOutcome, OperatorCdrRecord, OperatorCdrStats, Store, TrunkRecord, UserMapping } from './store/types.js'
 
 /** How often the operator is read (fallbacks, records of calls): every 10 minutes. */
 export const OPERATOR_SYNC_MS = 600_000
@@ -24,8 +24,18 @@ export const OPERATOR_ALERT_ROUNDS = 2
  */
 export const OPERATOR_RECONCILED_PERCENT = 99
 export const OPERATOR_RECONCILED_FLOOR = 20
-/** What erasures and changes of hands are kept for (erasedCalls, numberChangedAt): a record is asked over 48 hours. */
+/**
+ * What erasures and changes of hands are kept for (erasedCalls, numberChangedAt, historyErasedAt): a record is asked
+ * over 48 hours. Purged by the Gateway every hour with the alerts, whether the organisation has an operator or not
+ * (third review 10b, n°3: Store.purgeErasures).
+ */
 export const OPERATOR_KEPT_MS = 4 * 86_400_000
+/** A removal the operator has no line for that many rounds in a row is let go, and said (third review 10b, n°4). */
+export const REMOVAL_GONE_ROUNDS = 3
+/** A removal owed longer than that raises an alert, once (third review 10b, n°4). */
+export const REMOVAL_LATE_MS = 86_400_000
+/** What became of a removal is shown that long (third review 10b, n°2 and n°4). */
+const REMOVAL_SHOWN_MS = 7 * 86_400_000
 /** A forward of the operator is of an inbound call it started that long after it at most (the delay of no answer, 600 s, and a minute). */
 const FORWARD_AFTER_MS = 660_000
 /** Records read per tenant and round at most (one request each), 4 at a time, the lines in turn (review 10b, n°2). */
@@ -36,6 +46,8 @@ const RECONCILE_BATCH = 500
 const RECONCILE_BATCHES = 4
 /** The calls of the history a record may be of: started at most that long before it (no call lasts longer). */
 const HISTORY_SPAN_MS = 4 * 3_600_000
+/** The erased calls a record read later may be of (third review 10b, n°3): those of its window, the longest call before. */
+export const ERASED_CALLS_MS = OPERATOR_CDR_WINDOW_MS + HISTORY_SPAN_MS
 /** The entries of one number or one person read by pages of that many, that many pages at most (review 10b, n°3). */
 const NEAR_PAGE = 1_000
 const NEAR_PAGES = 20
@@ -68,6 +80,12 @@ export interface OperatorSyncOptions {
   /** The entries of one number or one person read by pages of `nearPage`, `nearPages` pages at most (1 000 and 20 by default). */
   nearPage?: number
   nearPages?: number
+  /**
+   * The keyed print of a number on the other side of an erased call (third review 10b, n°5: HMAC with a key of the
+   * Gateway, never the number), the same for one number of one tenant. Without it, an erased call is told by its way
+   * and time alone.
+   */
+  remoteKey?: (tenantId: string, number: string) => string
   logger?: OperatorLogger
   now?: () => number
 }
@@ -92,6 +110,13 @@ interface LineState {
   error?: OperatorLineError
   /** What the operator did not keep (askKey, review 10b, n°7): not written again until a trunk is saved. */
   rejected?: string
+  /**
+   * The fallback the platform set there and read back (third review 10b, n°2): kept while the line is read with it.
+   * A removal takes away that, never what someone set in the manager since.
+   */
+  set?: OperatorFallback
+  /** What was there before the platform first wrote (third review 10b, n°8): put back when its fallback is removed. */
+  original?: OperatorLineForwards
 }
 
 /** One line of the trunks at the operator, as the administration is shown it. */
@@ -109,23 +134,51 @@ export interface OperatorLineStatus {
   error?: OperatorLineError
   /** The operator did not keep what was asked (read back otherwise, or refused): not written again until the trunk is saved. */
   rejected?: true
+  /** What was there before the platform first wrote (third review 10b, n°8): put back when its fallback is removed. */
+  original?: OperatorLineForwards
 }
 
 /**
  * A removal of the forwards of a line at the operator still owed (operator_state `remove:<line>`, second review 10b,
  * n°1): asked when, by which trunk, last tried when, and why it failed. Kept, whatever becomes of the trunk, until the
- * line is read without a forward; replayed at each round meanwhile.
+ * line is read as it should be; replayed at each round meanwhile. Third review: each write of it its own (`id`), let go
+ * only as it was read (n°1); what the platform set there (`expect`), the line read with anything else left as it is
+ * (n°2); what was there before (`original`), put back (n°8); the rounds the operator had no such line (`gone`), and
+ * whether it was said late (`late`, n°4).
  */
 interface RemovalState {
+  id: string
   since: string
   trunkId?: string
   triedAt?: string
   error?: OperatorErrorCode
+  expect?: OperatorLineForwards
+  original?: OperatorLineForwards
+  gone?: number
+  late?: true
 }
 
-/** A removal at the operator not done yet, as the administration is shown it. */
-export interface OperatorRemoval extends RemovalState {
+/** A removal at the operator not done yet, as the administration is shown it, and what it puts back (`original`). */
+export interface OperatorRemoval {
   line: string
+  since: string
+  trunkId?: string
+  triedAt?: string
+  error?: OperatorErrorCode
+  original?: OperatorLineForwards
+}
+
+/**
+ * What became of a removal (operator_state `removed:<line>`, third review 10b, n°2 and n°4), shown REMOVAL_SHOWN_MS:
+ * `done` (the forwards of before put back, `restored`), `changed` (changed in the manager since it was asked: left as
+ * it is), `gone` (the operator has no such line), `abandoned` (an administrator let it go).
+ */
+export interface OperatorClosedRemoval {
+  line: string
+  at: string
+  outcome: 'done' | 'changed' | 'gone' | 'abandoned'
+  trunkId?: string
+  restored?: true
 }
 
 /** A round that could not be run (second review 10b, n°6): `timeout`, not ended in time; the operator not read at all. */
@@ -159,6 +212,8 @@ export interface OperatorStatus {
   trunks: { id: string; lines: OperatorLineStatus[] }[]
   /** The removals at the operator not done yet (second review 10b, n°1), whatever became of their trunk. */
   removals?: OperatorRemoval[]
+  /** What became of the removals of the last days (third review 10b, n°2 and n°4), the latest first. */
+  closedRemovals?: OperatorClosedRemoval[]
   cdrs: { readAt?: string; read?: number; lines?: { line: string; error: OperatorErrorCode }[]; stats: OperatorCdrStats; since: string }
 }
 
@@ -182,7 +237,28 @@ export const matchesFallback = (asked: OperatorFallback, f: OperatorLineForwards
 const codeOf = (err: unknown): OperatorErrorCode => (err instanceof OperatorError ? err.code : 'unreachable')
 const lineKey = (line: string) => `line:${line}`
 const removeKey = (line: string) => `remove:${line}`
+const closedKey = (line: string) => `removed:${line}`
 const hasForward = (f: OperatorLineForwards) => !!(f.onUnavailable || f.onNoAnswer)
+
+const sameForward = (a: (OperatorForward & { afterSec?: number }) | undefined, b: (OperatorForward & { afterSec?: number }) | undefined) =>
+  !a || !b ? !a && !b : a.nature === b.nature && a.afterSec === b.afterSec && (a.nature !== 'number' || (a.number ? e164Of(a.number) : '') === (b.number ? e164Of(b.number) : ''))
+/** Whether two reads of a line's forwards are the same, forward by forward: nature, number, delay (third review 10b, n°2). */
+export const sameForwards = (a: OperatorLineForwards, b: OperatorLineForwards) => sameForward(a.onUnavailable, b.onUnavailable) && sameForward(a.onNoAnswer, b.onNoAnswer)
+/** Forwards the platform can write back (OperatorProvider.setForwards): to a number, the voicemail or a fax. */
+const writable = (f: OperatorLineForwards) => [f.onUnavailable, f.onNoAnswer].every(fw => !fw || (fw.nature === 'number' ? !!fw.number : fw.nature !== 'other'))
+/** The forwards a fallback sets, as they read back. */
+const forwardsOfFallback = (f: OperatorFallback): OperatorLineForwards => ({
+  ...(f.onUnavailable && f.number ? { onUnavailable: { nature: 'number' as const, number: f.number } } : {}),
+  ...(f.noAnswerAfterSec !== undefined && f.number ? { onNoAnswer: { nature: 'number' as const, number: f.number, afterSec: f.noAnswerAfterSec } } : {})
+})
+const shownRemoval = (line: string, r: RemovalState): OperatorRemoval => ({
+  line,
+  since: r.since,
+  ...(r.trunkId ? { trunkId: r.trunkId } : {}),
+  ...(r.triedAt ? { triedAt: r.triedAt } : {}),
+  ...(r.error ? { error: r.error } : {}),
+  ...(r.original ? { original: r.original } : {})
+})
 
 const within = <T>(p: Promise<T>, ms: number) =>
   new Promise<T>((resolve, reject) => {
@@ -331,8 +407,9 @@ export class OperatorSync {
         if (this.stopped) return
         await this.round(tenantId).catch((err: unknown) => this.options.logger?.warn({ err, tenantId }, 'operator: round not done'))
       }
+      // The erasures and changes of hands are purged with the alerts, operator or not (third review 10b, n°3).
       await this.options.store
-        .purgeOperatorCdrs(this.iso(this.now() - OPERATOR_CDR_RETENTION_MS), this.iso(this.now() - OPERATOR_KEPT_MS))
+        .purgeOperatorCdrs(this.iso(this.now() - OPERATOR_CDR_RETENTION_MS))
         .catch((err: unknown) => this.options.logger?.warn({ err }, 'operator: old records of calls not purged'))
     })().finally(() => (this.ticking = undefined))
     return this.ticking
@@ -346,14 +423,8 @@ export class OperatorSync {
       if (!asked?.id) continue
       const cdrs = (await this.options.store.getOperatorState(tenantId, 'cdrs').catch(() => undefined)) as CdrsState | undefined
       if (cdrs?.answered === asked.id) continue
-      await this.round(tenantId, asked.id).catch(async (err: unknown) => {
-        this.options.logger?.warn({ err, tenantId }, 'operator: round asked not done')
-        // Answered all the same, with why (second review 10b, n°11): neither asked again every 2 s, nor waited for.
-        const now = ((await this.options.store.getOperatorState(tenantId, 'cdrs').catch(() => undefined)) as CdrsState | undefined) ?? {}
-        await this.options.store
-          .putOperatorState(tenantId, 'cdrs', { ...now, answered: asked.id, answerError: err instanceof Error ? err.message : String(err) } satisfies CdrsState)
-          .catch(() => undefined)
-      })
+      // Answered by the round itself, done or not (run): neither asked again every 2 s, nor waited for.
+      await this.round(tenantId, asked.id).catch((err: unknown) => this.options.logger?.warn({ err, tenantId }, 'operator: round asked not done'))
     }
   }
 
@@ -364,14 +435,14 @@ export class OperatorSync {
   async roundNow(tenantId: string, timeoutMs: number) {
     if (this.leads) return within(this.round(tenantId), timeoutMs)
     const id = randomUUID()
-    const before = ((await this.options.store.getOperatorState(tenantId, 'cdrs')) as CdrsState | undefined)?.roundAt
     await this.options.store.putOperatorState(tenantId, 'sync', { id })
     const until = Date.now() + timeoutMs
     while (Date.now() < until) {
       await new Promise(r => setTimeout(r, ANSWER_POLL_MS))
       const cdrs = (await this.options.store.getOperatorState(tenantId, 'cdrs')) as CdrsState | undefined
+      // Answered once the round asked ended, with why it failed if it did (third review 10b, n°9): never before.
       if (cdrs?.answered === id && cdrs.answerError) throw new OperatorRoundError(cdrs.answerError)
-      if (cdrs?.answered === id || (cdrs?.roundAt && cdrs.roundAt !== before)) return
+      if (cdrs?.answered === id) return
     }
     throw new OperatorRoundError('operator: the Gateway that leads did not run the round in time', true)
   }
@@ -388,13 +459,42 @@ export class OperatorSync {
 
   private async run(tenantId: string, answering: string | undefined) {
     if (!this.serves(tenantId)) return
+    let failure: unknown
+    try {
+      await this.runRound(tenantId)
+    } catch (err) {
+      failure = err
+      throw err
+    } finally {
+      // A round asked is answered once, as it ended (third review 10b, n°9: done, or why not), whatever failed.
+      if (answering) await this.answer(tenantId, answering, failure)
+    }
+  }
+
+  private async answer(tenantId: string, answering: string, failure: unknown) {
+    const store = this.options.store
+    try {
+      const { answerError: _was, ...cdrs } = ((await store.getOperatorState(tenantId, 'cdrs')) as CdrsState | undefined) ?? {}
+      await store.putOperatorState(tenantId, 'cdrs', {
+        ...cdrs,
+        answered: answering,
+        ...(failure !== undefined ? { answerError: failure instanceof Error ? failure.message : typeof failure === 'string' ? failure : 'round failed' } : {})
+      } satisfies CdrsState)
+    } catch (err) {
+      this.options.logger?.warn({ err, tenantId }, 'operator: a round asked not answered')
+    }
+  }
+
+  private async runRound(tenantId: string) {
     const store = this.options.store
     const codes: OperatorLineError[] = []
     let read = 0
     const names = await this.exclusive(tenantId, async () => {
       const lines = linesOf(await store.listTrunks(tenantId))
-      // What was seen of lines no trunk names any more is forgotten.
+      // What was seen of lines no trunk names any more is forgotten, and what became of removals long ago.
       await this.forgetLines(tenantId, lines)
+      const shownSince = this.iso(this.now() - REMOVAL_SHOWN_MS)
+      for (const { key, value } of await store.listOperatorState(tenantId, 'removed:')) if ((value as OperatorClosedRemoval).at < shownSince) await store.deleteOperatorState(tenantId, key)
       // The removals still owed first (second review 10b, n°1), until the operator has them.
       for (const { key } of await store.listOperatorState(tenantId, 'remove:')) {
         const left = await this.removeLine(tenantId, key.slice(7))
@@ -409,7 +509,7 @@ export class OperatorSync {
     })
     const failed = await this.importCdrs(tenantId, names)
     await this.reconcile(tenantId)
-    await this.alerts(tenantId, [...codes, ...failed], answering)
+    await this.alerts(tenantId, [...codes, ...failed])
     // Nothing could be read at the operator (second review 10b, n°6): said to whom asked the round.
     if (names.length && !read && failed.length === names.length) throw new OperatorRoundError(`operator: not read (${failed[0]})`)
   }
@@ -432,19 +532,19 @@ export class OperatorSync {
 
   /**
    * Removes the forwards of these lines at the operator (review 10b, n°13: on an administrator's word, or the trunk
-   * deleted), those no trunk asks a fallback for still, and reads them back. Kept as owed first (second review n°1:
-   * operator_state `remove:<line>`), whatever comes next, and replayed at each round until the operator has it.
-   * Returns the removals not done yet.
+   * deleted), those no trunk asks a fallback for still, and reads them back: what the platform set there goes, and what
+   * was there before it is put back (third review n°8); what someone set in the manager since is left as it is (n°2).
+   * Kept as owed first (second review n°1: operator_state `remove:<line>`), whatever comes next, and replayed at each
+   * round until done. Written before the turn of the tenant (a route that times out behind a round still lists it):
+   * nothing lets it go but a read of the trunks made after it, and only as it was written (third review n°1). Returns
+   * the removals not done yet.
    */
   async removeForwards(tenantId: string, names: readonly string[], trunkId?: string): Promise<OperatorRemoval[]> {
     if (!this.serves(tenantId)) return []
     const store = this.options.store
     const lines = linesOf(await store.listTrunks(tenantId))
     const owed = [...new Set(names)].filter(line => !lines.get(line)?.asks.size)
-    for (const line of owed) {
-      const before = (await store.getOperatorState(tenantId, removeKey(line))) as RemovalState | undefined
-      await store.putOperatorState(tenantId, removeKey(line), { since: before?.since ?? this.iso(), ...(trunkId ? { trunkId } : {}) } satisfies RemovalState)
-    }
+    for (const line of owed) await this.owe(tenantId, line, trunkId)
     return this.exclusive(tenantId, async () => {
       const left: OperatorRemoval[] = []
       for (const line of owed) {
@@ -458,13 +558,85 @@ export class OperatorSync {
 
   /** The removals at the operator not done yet (second review 10b, n°1). */
   async removals(tenantId: string): Promise<OperatorRemoval[]> {
-    return (await this.options.store.listOperatorState(tenantId, 'remove:')).map(({ key, value }) => ({ line: key.slice(7), ...(value as RemovalState) }))
+    return (await this.options.store.listOperatorState(tenantId, 'remove:')).map(({ key, value }) => shownRemoval(key.slice(7), value as RemovalState))
+  }
+
+  /** What became of the removals of the last days (third review 10b, n°2 and n°4), the latest first. */
+  async closedRemovals(tenantId: string): Promise<OperatorClosedRemoval[]> {
+    const since = this.iso(this.now() - REMOVAL_SHOWN_MS)
+    return (await this.options.store.listOperatorState(tenantId, 'removed:'))
+      .map(({ key, value }) => ({ ...(value as Omit<OperatorClosedRemoval, 'line'>), line: key.slice(8) }))
+      .filter(r => r.at >= since)
+      .sort((a, b) => (a.at < b.at ? 1 : a.at > b.at ? -1 : a.line < b.line ? -1 : 1))
   }
 
   /**
-   * The removal owed on a line, tried (within `exclusive`): its forwards read, removed when there are some, read back.
-   * Done (undefined) once the line is read without a forward, or a trunk asks a fallback there again (that one is
-   * kept); kept with why otherwise.
+   * A removal let go by an administrator (third review 10b, n°4: a line the operator no longer has, keys without the
+   * right to write): nothing more is written there, what is there stays. False when none was owed.
+   */
+  async abandonRemoval(tenantId: string, line: string): Promise<boolean> {
+    if (!this.serves(tenantId)) return false
+    const store = this.options.store
+    const owed = (await store.getOperatorState(tenantId, removeKey(line))) as RemovalState | undefined
+    if (!owed || !(await store.deleteOperatorState(tenantId, removeKey(line)))) return false
+    this.options.logger?.info({ tenantId, line }, 'operator: a removal let go by an administrator, the forwards of the line left as they are')
+    await this.closeRemoval(tenantId, line, owed, 'abandoned')
+    return true
+  }
+
+  /**
+   * What an erasure of the tenant keeps of the calls erased (third review 10b, n°3 and n°5; Store.deleteHistory): with
+   * an operator only, those a record read later may be of, each with the keyed print of its number on the other side.
+   */
+  keptOfErasure(tenantId: string): ErasedCallsKept | undefined {
+    if (!this.serves(tenantId)) return undefined
+    const keyOf = this.options.remoteKey
+    return { since: this.iso(this.now() - ERASED_CALLS_MS), ...(keyOf ? { keyOf: (n: string) => keyOf(tenantId, n) } : {}) }
+  }
+
+  /**
+   * The removal owed on a line, written (a new `id` at each write: third review 10b, n°1), with what the platform set
+   * there to take away (n°2: its fallback, or the forwards last read there) and what was there before it (n°8), those
+   * of a removal owed already kept.
+   */
+  private async owe(tenantId: string, line: string, trunkId?: string) {
+    const store = this.options.store
+    const before = (await store.getOperatorState(tenantId, removeKey(line))) as RemovalState | undefined
+    const state = (await store.getOperatorState(tenantId, lineKey(line))) as LineState | undefined
+    const expect = before ? before.expect : state?.set ? forwardsOfFallback(state.set) : state?.readAt ? (state.forwards ?? {}) : undefined
+    const original = before ? before.original : state?.original
+    const by = trunkId ?? before?.trunkId
+    await store.putOperatorState(tenantId, removeKey(line), {
+      id: randomUUID(),
+      since: before?.since ?? this.iso(),
+      ...(by ? { trunkId: by } : {}),
+      ...(expect ? { expect } : {}),
+      ...(original ? { original } : {}),
+      ...(before?.late ? { late: true as const } : {})
+    } satisfies RemovalState)
+  }
+
+  private async closeRemoval(tenantId: string, line: string, owed: RemovalState, outcome: OperatorClosedRemoval['outcome'], restored = false) {
+    await this.options.store.putOperatorState(tenantId, closedKey(line), {
+      at: this.iso(),
+      outcome,
+      ...(owed.trunkId ? { trunkId: owed.trunkId } : {}),
+      ...(restored ? { restored: true as const } : {})
+    } satisfies Omit<OperatorClosedRemoval, 'line'>)
+  }
+
+  private async removalAlert(tenantId: string, line: string, param: 'removal-changed' | 'removal-gone' | 'removal-late') {
+    await this.options.store.addAlert({ tenantId, at: this.iso(), alert: { kind: 'operator', param, scope: 'tenant', number: e164Of(line) } })
+  }
+
+  /**
+   * The removal owed on a line, tried (within `exclusive`), with the trunks read now. A trunk asks a fallback there
+   * again: let go, that one kept. Otherwise its forwards read: done when they are what should be left (the forwards of
+   * before, when the platform can write them back, none otherwise); left as they are, and said, when they are no longer
+   * what the platform set (third review 10b, n°2: changed in the manager since); written otherwise, read back, and the
+   * trunks read again (n°10: a fallback asked again meanwhile is set again, never said changed at the operator). Let
+   * go once the operator has had no such line REMOVAL_GONE_ROUNDS times in a row, and said (n°4); said when owed past
+   * REMOVAL_LATE_MS. Each removal let go only as it was read (n°1). Undefined once done or let go; kept with why otherwise.
    */
   private async removeLine(tenantId: string, line: string): Promise<OperatorRemoval | undefined> {
     const operator = this.options.operators.get(tenantId)!
@@ -473,41 +645,87 @@ export class OperatorSync {
     if (!owed) return undefined
     const lines = linesOf(await store.listTrunks(tenantId))
     if (lines.get(line)?.asks.size) {
-      await store.deleteOperatorState(tenantId, removeKey(line))
+      await store.deleteOperatorState(tenantId, removeKey(line), owed)
       return undefined
     }
+    const target = owed.original && writable(owed.original) ? owed.original : {}
+    const restoring = hasForward(target)
     const at = this.iso()
     let forwards: OperatorLineForwards | undefined
     let error: OperatorErrorCode | undefined
+    let outcome: 'done' | 'changed' | undefined
+    let wrote = false
+    let askedAgain = false
     try {
       forwards = await operator.getForwards(line)
-      if (hasForward(forwards)) {
-        await operator.setFallback(line, { onUnavailable: false })
+      if (sameForwards(forwards, target)) outcome = 'done'
+      else if (owed.expect && !sameForwards(forwards, owed.expect)) outcome = 'changed'
+      else {
+        if (restoring) await operator.setForwards(line, target)
+        else await operator.setFallback(line, { onUnavailable: false })
+        wrote = true
         forwards = await operator.getForwards(line)
+        if (sameForwards(forwards, target)) outcome = 'done'
+        else error = 'refused'
+        askedAgain = (await this.askedNow(tenantId, line)) !== undefined
       }
-      if (hasForward(forwards)) error = 'refused'
     } catch (err) {
       this.options.logger?.warn({ err, tenantId, line }, 'operator: the forwards of a line not removed, tried again at the next round')
       error = codeOf(err)
     }
-    // A line a trunk names still: what was read of it.
+    // A line a trunk names still: what was read of it, what the platform set and found there forgotten once done.
     if (lines.has(line)) {
       const before = ((await store.getOperatorState(tenantId, lineKey(line))) as LineState | undefined) ?? {}
+      const carried: Partial<LineState> = outcome ? {} : { ...(before.set ? { set: before.set } : {}), ...(before.original ? { original: before.original } : {}) }
       await store.putOperatorState(
         tenantId,
         lineKey(line),
-        forwards ? ({ forwards, readAt: at, ...(error ? { error } : { appliedAt: at }) } satisfies LineState) : ({ ...(before.forwards ? { forwards: before.forwards } : {}), ...(before.readAt ? { readAt: before.readAt } : {}), ...(error ? { error } : {}) } satisfies LineState)
+        (forwards
+          ? { forwards, readAt: at, ...(error ? { error } : wrote ? { appliedAt: at } : {}), ...carried }
+          : { ...(before.forwards ? { forwards: before.forwards } : {}), ...(before.readAt ? { readAt: before.readAt } : {}), ...(error ? { error } : {}), ...carried }) satisfies LineState
       )
     }
-    if (!error) {
-      await store.deleteOperatorState(tenantId, removeKey(line))
-      this.options.logger?.info({ tenantId, line }, 'operator: the forwards of a line removed at the operator')
+    if (outcome) {
+      await store.deleteOperatorState(tenantId, removeKey(line), owed)
+      if (outcome === 'changed') {
+        this.options.logger?.warn({ tenantId, line }, 'operator: the forwards of a line were changed at the operator since their removal was asked, left as they are')
+        await this.removalAlert(tenantId, line, 'removal-changed')
+      } else if (restoring) this.options.logger?.info({ tenantId, line }, 'operator: the fallback of a line removed at the operator, the forwards of before put back')
+      else this.options.logger?.info({ tenantId, line }, 'operator: the forwards of a line removed at the operator')
+      await this.closeRemoval(tenantId, line, owed, outcome, outcome === 'done' && restoring)
+      if (askedAgain) {
+        // Asked again as it was removed (another Gateway): set again as a first write, not a change in the manager.
+        const asks = linesOf(await store.listTrunks(tenantId)).get(line)?.asks
+        if (asks?.size) {
+          this.options.logger?.info({ tenantId, line }, 'operator: a fallback asked again as it was removed, set again')
+          await this.line(tenantId, line, [...asks.values()], true)
+        }
+      }
       return undefined
     }
-    if (error === 'refused') this.options.logger?.warn({ tenantId, line }, 'operator: the operator kept the forwards of a line, tried again at the next round')
-    const kept: RemovalState = { ...owed, triedAt: at, error }
-    await store.putOperatorState(tenantId, removeKey(line), kept)
-    return { line, ...kept }
+    const gone = error === 'not-found' ? (owed.gone ?? 0) + 1 : 0
+    if (gone >= REMOVAL_GONE_ROUNDS) {
+      if (await store.deleteOperatorState(tenantId, removeKey(line), owed)) {
+        this.options.logger?.warn({ tenantId, line, rounds: gone }, 'operator: the operator has no such line, its removal let go')
+        await this.removalAlert(tenantId, line, 'removal-gone')
+        await this.closeRemoval(tenantId, line, owed, 'gone')
+      }
+      return undefined
+    }
+    const late = !owed.late && this.now() - Date.parse(owed.since) > REMOVAL_LATE_MS
+    if (late) {
+      this.options.logger?.warn({ tenantId, line, since: owed.since }, 'operator: the forwards of a line owed to be removed for over a day')
+      await this.removalAlert(tenantId, line, 'removal-late')
+    }
+    if (error === 'refused')
+      this.options.logger?.warn({ tenantId, line }, restoring ? 'operator: the operator did not keep the forwards of before, the fallback removed without them at the next round' : 'operator: the operator kept the forwards of a line, tried again at the next round')
+    const { gone: _gone, original, ...rest } = owed
+    // The forwards of before refused (or not kept): the next round removes the fallback without them.
+    const kept: RemovalState = { ...rest, ...(original && !(restoring && error === 'refused') ? { original } : {}), triedAt: at, error: error!, ...(gone ? { gone } : {}), ...(late ? { late: true as const } : {}) }
+    // Written again only as it was read: let go meanwhile (an administrator), or written again, it stays so.
+    const now = (await store.getOperatorState(tenantId, removeKey(line))) as RemovalState | undefined
+    if (now?.id === owed.id) await store.putOperatorState(tenantId, removeKey(line), kept)
+    return shownRemoval(line, kept)
   }
 
   private async forgetLines(tenantId: string, lines: ReadonlyMap<string, unknown>) {
@@ -519,28 +737,34 @@ export class OperatorSync {
    * (review 10b, n°7): what the operator did not keep is said (`refused`) and not written again until a trunk is saved
    * (`retry`). Two fallbacks asked (two trunks, review n°5): read only, said (`conflict`). The trunks are read again
    * just before writing, and just after (second review n°1): a fallback no longer asked is not written, and one
-   * written while its trunk stopped asking it (another Gateway) is removed again.
+   * written while its trunk stopped asking it (another Gateway) is removed again. What the platform set is kept while
+   * the line is read with it (third review n°2), and what was there before its first write (n°8).
    */
   private async line(tenantId: string, line: string, asks: OperatorFallback[], retry: boolean): Promise<LineState> {
     const operator = this.options.operators.get(tenantId)!
     const store = this.options.store
+    // A removal owed there while these trunks ask a fallback: tried, the trunks read again (third review 10b, n°1:
+    // those of a round may be from before the removal was asked), never let go on what this pass read.
+    if (asks.length && (await store.getOperatorState(tenantId, removeKey(line)))) await this.removeLine(tenantId, line)
     const before = ((await store.getOperatorState(tenantId, lineKey(line))) as LineState | undefined) ?? {}
     const asked = asks.length === 1 ? asks[0] : undefined
     const wanted = asked && askKey(asked)
-    // Asked again: a removal still owed there is not (the fallback asked is kept).
-    if (asks.length) await store.deleteOperatorState(tenantId, removeKey(line))
     let unasked = false
     const next: LineState = {
       ...(before.appliedAt ? { appliedAt: before.appliedAt } : {}),
       ...(before.restoredAt ? { restoredAt: before.restoredAt } : {}),
       ...(wanted ? { asked: wanted } : {}),
-      ...(wanted && !retry && before.rejected === wanted ? { rejected: wanted } : {})
+      ...(wanted && !retry && before.rejected === wanted ? { rejected: wanted } : {}),
+      ...(before.original ? { original: before.original } : {})
     }
     let forwards = before.forwards
     let readAt = before.readAt
+    let read = false
     try {
       forwards = await operator.getForwards(line)
       readAt = this.iso()
+      read = true
+      if (before.set && matchesFallback(before.set, forwards)) next.set = before.set
       if (asks.length > 1) Object.assign(next, { inSync: false, error: 'conflict' })
       else if (!asked || matchesFallback(asked, forwards)) {
         if (asked) next.inSync = true
@@ -552,12 +776,15 @@ export class OperatorSync {
       } else {
         // It was there as asked, and is no longer: someone changed it at the operator (its manager). Put back.
         const restored = before.inSync === true && before.asked === wanted
+        const prior = forwards
         try {
           await operator.setFallback(line, asked)
         } catch (err) {
           if (codeOf(err) === 'refused') next.rejected = wanted
           throw err
         }
+        // What was there before the platform first wrote (third review 10b, n°8), put back when its fallback goes.
+        if (!before.set && !before.original && !restored) next.original = prior
         forwards = await operator.getForwards(line)
         readAt = this.iso()
         next.appliedAt = readAt
@@ -568,19 +795,19 @@ export class OperatorSync {
         } else {
           if (restored) this.options.logger?.warn({ tenantId, line }, 'operator: the fallback was changed at the operator, put back as asked')
           else this.options.logger?.info({ tenantId, line }, 'operator: fallback set at the operator')
-          Object.assign(next, { inSync: true, ...(restored ? { restoredAt: readAt } : {}) })
+          Object.assign(next, { inSync: true, set: asked, ...(restored ? { restoredAt: readAt } : {}) })
         }
       }
     } catch (err) {
       this.options.logger?.warn({ err, tenantId, line }, 'operator: the forwards of a line not read or not set')
-      Object.assign(next, { ...(asked ? { inSync: false } : {}), error: codeOf(err) })
+      Object.assign(next, { ...(asked ? { inSync: false } : {}), error: codeOf(err), ...(!read && before.set ? { set: before.set } : {}) })
     }
     const state: LineState = { ...(forwards ? { forwards } : {}), ...(readAt ? { readAt } : {}), ...next }
     await store.putOperatorState(tenantId, lineKey(line), state)
     if (unasked) {
       // Written while its trunk stopped asking it: owed to be removed, now and at each round until it is.
       this.options.logger?.warn({ tenantId, line }, 'operator: a fallback written as its trunk stopped asking it, removed again')
-      await store.putOperatorState(tenantId, removeKey(line), { since: this.iso() } satisfies RemovalState)
+      await this.owe(tenantId, line)
       await this.removeLine(tenantId, line)
       return ((await store.getOperatorState(tenantId, lineKey(line))) as LineState | undefined) ?? state
     }
@@ -736,9 +963,16 @@ export class OperatorSync {
       const entries = [...history.values()]
       // When erased entries were (second review 10b, n°2): a record no entry takes, then, was of one of them.
       const erasedCalls = records.length ? await store.erasedCalls(tenantId, span(records).from, span(records).to) : []
+      // Of the same number on the other side, by its keyed print (third review 10b, n°5): never the call of another
+      // person then. One kept without a print (no key) is told by its way and time alone.
+      const keyOf = this.options.remoteKey
       const ofErased = (r: OperatorCdrRecord) => {
         const at = Date.parse(r.startedAt)
-        return erasedCalls.some(c => c.direction === r.direction && at >= Date.parse(c.startedAt) - RECONCILE_EARLY_MS && at <= Date.parse(c.endedAt) + RECONCILE_LATE_MS)
+        const remote = remoteOf(r)
+        const key = remote && keyOf ? keyOf(tenantId, e164Of(remote)) : undefined
+        return erasedCalls.some(
+          c => c.direction === r.direction && (c.remoteKey === undefined || c.remoteKey === key) && at >= Date.parse(c.startedAt) - RECONCILE_EARLY_MS && at <= Date.parse(c.endedAt) + RECONCILE_LATE_MS
+        )
       }
       const strict = matchCdrs(records, entries)
       // The records left, durations apart or a caller the platform did not see (review 10b, n°17).
@@ -794,7 +1028,7 @@ export class OperatorSync {
    * OPERATOR_RECONCILED_PERCENT % (FR-D4: of the records the platform should have had a call for, OPERATOR_RECONCILED_FLOOR
    * at least). Each once, as it happens (second review n°5): acknowledged, not raised again until it happens again.
    */
-  private async alerts(tenantId: string, codes: readonly OperatorLineError[], answering: string | undefined) {
+  private async alerts(tenantId: string, codes: readonly OperatorLineError[]) {
     const store = this.options.store
     const operator = this.options.operators.get(tenantId)!
     const cdrs = ((await store.getOperatorState(tenantId, 'cdrs')) as CdrsState | undefined) ?? {}
@@ -810,8 +1044,8 @@ export class OperatorSync {
       const percent = Math.floor((stats.matched * 1000) / owed) / 10
       await store.addAlert({ tenantId, at, alert: { kind: 'operator', param: 'reconciliation', scope: 'tenant', value: percent, threshold: OPERATOR_RECONCILED_PERCENT } })
     }
-    const { answerError: _was, ...kept } = cdrs
-    await store.putOperatorState(tenantId, 'cdrs', { ...kept, refusedRounds, low, roundAt: at, ...(answering ? { answered: answering } : {}) } satisfies CdrsState)
+    // The round asked is answered once it ends (run), never here (third review 10b, n°9).
+    await store.putOperatorState(tenantId, 'cdrs', { ...cdrs, refusedRounds, low, roundAt: at } satisfies CdrsState)
   }
 
   /**
@@ -868,15 +1102,18 @@ export class OperatorSync {
         ...(s.appliedAt ? { appliedAt: s.appliedAt } : {}),
         ...(s.restoredAt ? { restoredAt: s.restoredAt } : {}),
         ...(error ? { error } : {}),
-        ...(wanted && s.rejected === wanted ? { rejected: true as const } : {})
+        ...(wanted && s.rejected === wanted ? { rejected: true as const } : {}),
+        ...(s.original ? { original: s.original } : {})
       }
     }
     const cdrs = ((await store.getOperatorState(tenantId, 'cdrs')) as CdrsState | undefined) ?? {}
     const removals = await this.removals(tenantId)
+    const closedRemovals = await this.closedRemovals(tenantId)
     return {
       operator: operator.id,
       trunks: trunks.filter(t => t.config.operator?.lines.length).map(t => ({ id: t.id, lines: t.config.operator!.lines.map(lineStatus) })),
       ...(removals.length ? { removals } : {}),
+      ...(closedRemovals.length ? { closedRemovals } : {}),
       cdrs: {
         ...(cdrs.readAt ? { readAt: cdrs.readAt, read: cdrs.read ?? 0 } : {}),
         ...(cdrs.lines?.length ? { lines: cdrs.lines } : {}),

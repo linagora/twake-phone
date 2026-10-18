@@ -183,7 +183,8 @@ Sans ces variables, rien ne change : le renvoi se règle dans le manager d'OVH, 
    - L'écran dit pour chaque ligne chaque renvoi posé chez OVH, tel qu'il est (vers un numéro, la messagerie…), et quand il a été remis après un changement dans le manager.
    - La passerelle relit la ligne après l'avoir écrite. Si OVH n'a pas gardé le réglage (un délai refusé ou arrondi), l'écran le dit et rien n'est réécrit avant le prochain enregistrement du trunk.
    - Décoché, la passerelle n'écrit plus rien chez OVH : ce qui est posé reste, et l'écran le dit. « Retirer le renvoi chez l'opérateur » (avec confirmation) l'enlève des lignes, de même que la suppression du trunk, ou le retrait d'une ligne de la liste. Le bouton reste là tant qu'une ligne du trunk a été lue avec un renvoi.
-   - Un retrait qu'OVH n'a pas encore pris (OVH ne répond pas) est gardé en base et retenté à chaque relevé, même pour un trunk supprimé, jusqu'à relire la ligne sans renvoi. L'écran dit « pas encore retiré » et liste ces retraits dans « Relevés de l'opérateur ».
+   - Un retrait qu'OVH n'a pas encore pris (OVH ne répond pas) est gardé en base et retenté à chaque relevé, même pour un trunk supprimé, jusqu'à relire la ligne comme avant la plateforme. L'écran dit « pas encore retiré » et liste ces retraits dans « Relevés de l'opérateur », chacun avec un bouton « Abandonner ».
+   - Le retrait remet les renvois qu'OVH avait avant que la plateforme prenne la ligne (vers un numéro, la messagerie, un fax), quand elle les a lus ; sinon la confirmation dit qu'ils ne seront pas remis. Il ne touche pas à une ligne changée dans le manager depuis : elle reste telle quelle, avec une alerte. Une ligne qu'OVH ne connaît plus trois relevés de suite est abandonnée, avec une alerte ; une autre alerte dit un retrait dû depuis plus d'un jour. Les retraits des 7 derniers jours sont listés avec ce qu'ils sont devenus.
 
 Ensuite, toutes les 10 minutes, la passerelle qui tient le bail des états fait un relevé. Sans `SECRETS_KEY`, il n'y a pas de bail : chaque passerelle fait les siens. Ce qu'un administrateur enregistre, retire ou lit chez OVH part de la passerelle qui reçoit sa demande ; la configuration des trunks est relue juste avant et juste après chaque écriture chez OVH :
 - Elle relit les renvois de chaque ligne, et les remet s'ils ont été changés.
@@ -196,7 +197,7 @@ Ce que l'on voit ensuite :
 - Une alerte « Opérateur des trunks » est levée une fois, quand cela se produit : OVH refuse les clés ou leurs droits au deuxième relevé de suite, ou le taux passe sous 99 % (FR-D4, dès 20 appels comptés). Acquittée, elle ne revient qu'après un retour au-dessus.
 - `trunk.degraded` et `trunk.recovered` disent alors où vont les appelants pendant la panne (`fallback` : `on_unavailable` et `on_no_answer`, vers un numéro, la messagerie…, sans le numéro).
 
-La passerelle ne bascule rien à la panne : c'est le renvoi sur indisponibilité d'OVH qui le fait, même passerelle arrêtée. Les CDR sont gardés 90 jours.
+La passerelle ne bascule rien à la panne : c'est le renvoi sur indisponibilité d'OVH qui le fait, même passerelle arrêtée. Les CDR sont gardés 90 jours. Ce qui sert à ne pas remettre un appel effacé (heures des appels effacés des 52 dernières heures, avec une empreinte à clé du numéro distant tirée de `SECRETS_KEY`, effacements datés, changements de titulaire d'un numéro) est gardé 4 jours, puis purgé toutes les heures, même sans clés OVH ; la suppression d'un compte efface aussi le sien.
 
 ## Exploiter
 

@@ -86,6 +86,23 @@ export class OvhOperator implements OperatorProvider {
     await this.client.request('PUT', `${this.line(line)}/options`, { body })
   }
 
+  async setForwards(line: string, forwards: OperatorLineForwards): Promise<void> {
+    const target = (fw: OperatorForward) => {
+      if (fw.nature === 'number' && fw.number) return { nature: 'number', number: toOvhNumber(fw.number) }
+      if (fw.nature === 'voicemail' || fw.nature === 'fax') return { nature: fw.nature }
+      throw new Error(`a forward ${fw.nature === 'number' ? 'to no number' : `to ${fw.nature}`} cannot be written`)
+    }
+    const backup = forwards.onUnavailable && target(forwards.onUnavailable)
+    const noReply = forwards.onNoAnswer && target(forwards.onNoAnswer)
+    const body: OvhLineForwards = {
+      forwardBackup: !!backup,
+      ...(backup ? { forwardBackupNature: backup.nature, ...(backup.number ? { forwardBackupNumber: backup.number } : {}) } : {}),
+      forwardNoReply: !!noReply,
+      ...(noReply ? { forwardNoReplyDelay: forwards.onNoAnswer!.afterSec, forwardNoReplyNature: noReply.nature, ...(noReply.number ? { forwardNoReplyNumber: noReply.number } : {}) } : {})
+    }
+    await this.client.request('PUT', `${this.line(line)}/options`, { body })
+  }
+
   private consumption(line: string, previous: boolean) {
     return `/telephony/${this.account}/service/${segment(line)}/${previous ? 'previousVoiceConsumption' : 'voiceConsumption'}`
   }

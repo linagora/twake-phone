@@ -3,6 +3,7 @@ import {
   TRUNK_CODECS,
   TRUNK_OUTBOUND_CLASSES,
   formatNumber,
+  type OperatorClosedRemoval,
   type OperatorForward,
   type OperatorLine,
   type OperatorLineForwards,
@@ -67,6 +68,19 @@ const forwardsOf = (f: OperatorLineForwards | undefined, t: T) => {
   return out.length ? out.join(' ; ') : t('admin.operator.noForward')
 }
 
+/** Whether the platform can write these forwards back (to a number, the voicemail or a fax). */
+const writable = (f: OperatorLineForwards) => [f.onUnavailable, f.onNoAnswer].every(fw => !fw || (fw.nature === 'number' ? !!fw.number : fw.nature !== 'other'))
+/**
+ * What removing the fallback of a line puts back there, in words (third review 10b, n°8): the forwards of before the
+ * platform took it; that they are not known, or go elsewhere than the platform can write, and stay gone; nothing when
+ * there were none.
+ */
+const restoreOf = (line: string, original: OperatorLineForwards | undefined, t: T) => {
+  if (!original) return t('admin.operator.restoreUnknown', { line })
+  if (!original.onUnavailable && !original.onNoAnswer) return undefined
+  return writable(original) ? t('admin.operator.restoreLine', { line, forwards: forwardsOf(original, t) }) : t('admin.operator.restoreOther', { line, forwards: forwardsOf(original, t) })
+}
+
 /** A trunk's lines at the operator (step 10b): the forwards set there and whether they are the ones asked. */
 const OperatorLines = ({ lines }: { lines: OperatorLine[] }) => {
   const { t, lang } = useT()
@@ -97,9 +111,10 @@ const OperatorLines = ({ lines }: { lines: OperatorLine[] }) => {
 
 /**
  * The removals at the operator not done yet (second review 10b, n°1): kept by the Gateway, whatever became of their
- * trunk, and tried again at each round until it reads the line without a forward.
+ * trunk, and tried again at each round until done; each with what it puts back (third review n°8), and let go on the
+ * administrator's word (n°4: a line the operator no longer has, keys without the right to write).
  */
-const Removals = ({ removals }: { removals: OperatorRemoval[] }) => {
+const Removals = ({ removals, onAbandon, busy }: { removals: OperatorRemoval[]; onAbandon: (line: string) => void; busy: boolean }) => {
   const { t, lang } = useT()
   const at = new Intl.DateTimeFormat(lang, { dateStyle: 'short', timeStyle: 'short' })
   return (
@@ -110,6 +125,16 @@ const Removals = ({ removals }: { removals: OperatorRemoval[] }) => {
           <li key={r.line}>
             {t('admin.operator.removal', { line: r.line, since: at.format(new Date(r.since)) })}
             {r.error ? <span className="state state-error"> · {t(`admin.operator.err.${r.error}` as Key)}</span> : null}
+            {restoreOf(r.line, r.original, t) ? <> · {restoreOf(r.line, r.original, t)}</> : null}{' '}
+            <ConfirmDelete
+              label={t('admin.operator.abandonOf', { line: r.line })}
+              question={t('admin.operator.abandonConfirm', { line: r.line })}
+              action="admin.operator.abandon"
+              yes="admin.operator.abandonYes"
+              tone="plain"
+              onConfirm={() => onAbandon(r.line)}
+              disabled={busy}
+            />
           </li>
         ))}
       </ul>
@@ -118,8 +143,26 @@ const Removals = ({ removals }: { removals: OperatorRemoval[] }) => {
   )
 }
 
+/** What became of the removals of the last days (third review 10b, n°2 and n°4): done, left as changed, let go. */
+const ClosedRemovals = ({ removals }: { removals: OperatorClosedRemoval[] }) => {
+  const { t, lang } = useT()
+  const at = new Intl.DateTimeFormat(lang, { dateStyle: 'short', timeStyle: 'short' })
+  return (
+    <div className="field">
+      <p>{t('admin.operator.closedRemovals')}</p>
+      <ul className="plain" aria-label={t('admin.operator.closedRemovals')}>
+        {removals.map(r => (
+          <li key={r.line} className={r.outcome === 'changed' || r.outcome === 'gone' ? 'state state-error' : undefined}>
+            {t(`admin.operator.closed.${r.outcome === 'done' && r.restored ? 'restored' : r.outcome}` as Key, { line: r.line, at: at.format(new Date(r.at)) })}
+          </li>
+        ))}
+      </ul>
+    </div>
+  )
+}
+
 /** The records of calls the operator keeps (step 10b): when last read, and what became of those of the last days. */
-const OperatorRecords = ({ status, onSync, busy }: { status: OperatorStatus; onSync: () => void; busy: boolean }) => {
+const OperatorRecords = ({ status, onSync, onAbandon, busy }: { status: OperatorStatus; onSync: () => void; onAbandon: (line: string) => void; busy: boolean }) => {
   const { t, lang } = useT()
   const at = new Intl.DateTimeFormat(lang, { dateStyle: 'short', timeStyle: 'short' })
   const cdrs = status.cdrs
@@ -145,7 +188,8 @@ const OperatorRecords = ({ status, onSync, busy }: { status: OperatorStatus; onS
   return (
     <>
       <p>{t('admin.operator.help')}</p>
-      {status.removals?.length ? <Removals removals={status.removals} /> : null}
+      {status.removals?.length ? <Removals removals={status.removals} onAbandon={onAbandon} busy={busy} /> : null}
+      {status.closedRemovals?.length ? <ClosedRemovals removals={status.closedRemovals} /> : null}
       <p>
         {cdrs?.readAt ? t('admin.operator.readAt', { at: at.format(new Date(cdrs.readAt)), count: cdrs.read ?? 0 }) : t('admin.operator.notYet')}
       </p>
@@ -292,7 +336,12 @@ export const Trunks = () => {
     setBusy(true)
     try {
       const saved = await client.setTrunk(form.id.trim(), checked.input)
-      setNote({ kind: 'ok', text: t('admin.trunk.saved', { id: saved.id }) })
+      // A line it no longer names whose fallback the operator did not remove yet is said so (third review 10b, n°11).
+      setNote(
+        saved.pending?.length
+          ? { kind: 'error', text: t('admin.trunk.savedPending', { id: saved.id, lines: saved.pending.map(r => r.line).join(', ') }) }
+          : { kind: 'ok', text: t('admin.trunk.saved', { id: saved.id }) }
+      )
       reset()
       load()
       void readStatus()
@@ -380,6 +429,21 @@ export const Trunks = () => {
     }
   }
 
+  // A removal at the operator let go on the administrator's word (third review 10b, n°4).
+  const abandon = async (line: string) => {
+    setOperatorNote(null)
+    setSyncing(true)
+    try {
+      await client.abandonOperatorRemoval(line)
+      setOperatorNote({ kind: 'ok', text: t('admin.operator.abandoned', { line }), focus: true })
+    } catch (err) {
+      setOperatorNote({ kind: 'error', text: say(trunkRefusal(err).problem)!, focus: true })
+    } finally {
+      setSyncing(false)
+      void readStatus()
+    }
+  }
+
   if (unavailable)
     return (
       <Section id="trunks" title={t('admin.nav.trunks')}>
@@ -402,6 +466,13 @@ export const Trunks = () => {
     const lines = operator.trunks?.find(o => o.id === trunk.id)?.lines ?? []
     return lines.some(l => !!l.forwards?.onUnavailable || !!l.forwards?.onNoAnswer) || !!operator.removals?.some(r => trunk.operator!.lines.includes(r.line))
   }
+  /** What removing the fallback of the trunk puts back on its lines, or that it cannot (third review 10b, n°8). */
+  const restoring = (trunk: Trunk) =>
+    (operator?.trunks?.find(o => o.id === trunk.id)?.lines ?? [])
+      .filter(l => l.managed)
+      .map(l => restoreOf(l.line, l.original, t))
+      .filter(s => !!s)
+      .join(' ')
   return (
     <>
       <Section id="trunks" title={t('admin.nav.trunks')}>
@@ -468,7 +539,7 @@ export const Trunks = () => {
                   {removable(trunk) ? (
                     <ConfirmDelete
                       label={t('admin.operator.removeOf', { id: trunk.id })}
-                      question={t(trunk.operator?.fallback ? 'admin.operator.removeConfirm' : 'admin.operator.removeConfirmSet', { id: trunk.id })}
+                      question={[t(trunk.operator?.fallback ? 'admin.operator.removeConfirm' : 'admin.operator.removeConfirmSet', { id: trunk.id }), trunk.operator?.fallback ? restoring(trunk) : ''].filter(s => !!s).join(' ')}
                       action="admin.operator.remove"
                       yes="admin.operator.removeYes"
                       tone="plain"
@@ -478,7 +549,7 @@ export const Trunks = () => {
                   ) : null}
                   <ConfirmDelete
                     label={t('admin.trunk.delete', { id: trunk.id })}
-                    question={t(operator?.configured && trunk.operator?.fallback ? 'admin.trunk.deleteConfirmOperator' : 'admin.trunk.deleteConfirm', { id: trunk.id })}
+                    question={[t(operator?.configured && trunk.operator?.fallback ? 'admin.trunk.deleteConfirmOperator' : 'admin.trunk.deleteConfirm', { id: trunk.id }), operator?.configured && trunk.operator?.fallback ? restoring(trunk) : ''].filter(s => !!s).join(' ')}
                     onConfirm={() => void remove(trunk)}
                     disabled={busy}
                   />
@@ -603,7 +674,7 @@ export const Trunks = () => {
       </Section>
       {operator?.configured ? (
         <Section id="operator" title={t('admin.operator.title')}>
-          <OperatorRecords status={operator} onSync={() => void syncOperator()} busy={syncing} />
+          <OperatorRecords status={operator} onSync={() => void syncOperator()} onAbandon={line => void abandon(line)} busy={syncing} />
           <NoteLine note={operatorNote} />
         </Section>
       ) : null}

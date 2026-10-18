@@ -241,7 +241,10 @@ export interface TelephonyAlert {
    * the Gateway's webhook hub (step 10a), a subscription disabled after failing for a day in a row (`param` 'disabled').
    * `operator`: raised by the Gateway (step 10b, review n°12): the operator refuses its keys (`unauthorized`) or their
    * rights (`forbidden`) round after round, or the records of calls reconciled fall under FR-D4's 99 %
-   * (`reconciliation`, `value` the percentage, `threshold` 99).
+   * (`reconciliation`, `value` the percentage, `threshold` 99); a removal of the forwards of a line there (third
+   * review 10b, n°2 and n°4, `number` the line): left as it was because someone changed it in the manager since
+   * (`removal-changed`), let go because the operator no longer has the line (`removal-gone`), owed for over a day
+   * (`removal-late`).
    */
   kind: 'fraud-warning' | 'fraud-critical' | 'limit' | 'rights' | 'emergency' | 'meet' | 'webhook' | 'operator'
   param: string

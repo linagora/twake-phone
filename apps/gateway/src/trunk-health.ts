@@ -68,6 +68,11 @@ export class TrunkWatch {
   private readonly seen = new Map<string, { health: TrunkHealth | typeof REMOVED; reads: number }>()
   /** What was last written for each trunk of each tenant (by this Gateway, or read from the store): the same costs no write. */
   private readonly written = new Map<string, Map<string, string>>()
+  /**
+   * The fallback read for each trunk, for the health it was read in (third review 10b, n°12): read once per change,
+   * not at every read while the change waits to be told (nobody subscribed yet), which would read the operator's lines.
+   */
+  private readonly fallbacks = new Map<string, { health: string; fallback: Promise<WebhookTrunkFallback | undefined> }>()
   private timer: ReturnType<typeof setInterval> | undefined
   private busy = false
   private skipped = 0
@@ -96,6 +101,7 @@ export class TrunkWatch {
     if (!this.options.leading()) {
       this.seen.clear()
       this.written.clear()
+      this.fallbacks.clear()
       return
     }
     this.busy = true
@@ -133,10 +139,16 @@ export class TrunkWatch {
     const confirm = this.options.confirm ?? 2
     let names: Map<string, string | undefined> | undefined
     const watched = new Set<string>()
-    const describe = async (status: TrunkStatus | undefined, id: string) => {
+    const describe = async (status: TrunkStatus | undefined, id: string, health: string) => {
       names ??= await this.options.names(tenantId)
       const name = names.get(id)
-      const fallback = await this.options.fallback?.(tenantId, id).catch(() => undefined)
+      const k = `${tenantId}\u0000${id}`
+      let kept = this.fallbacks.get(k)
+      if (this.options.fallback && kept?.health !== health) {
+        kept = { health, fallback: this.options.fallback(tenantId, id).catch(() => undefined) }
+        this.fallbacks.set(k, kept)
+      }
+      const fallback = await kept?.fallback
       return {
         id,
         ...(name ? { name } : {}),
@@ -154,7 +166,7 @@ export class TrunkWatch {
       const reads = before?.health === health ? before.reads + 1 : 1
       this.seen.set(k, { health, reads })
       if (reads < confirm || written.get(status.id) === health) continue
-      const trunk = await describe(status, status.id)
+      const trunk = await describe(status, status.id, health)
       const queued = await this.options.publishChange(tenantId, `trunk:${status.id}`, health, TYPES, (was, at): PublishedWebhookEvent | null => {
         const previous = was === REMOVED ? undefined : (was as TrunkHealth | undefined)
         const base = { id: randomEventId(), occurred_at: at, tenant: tenantId }
@@ -163,7 +175,10 @@ export class TrunkWatch {
         return null
       })
       // Not asked of the store (nobody subscribed yet, this Gateway no longer leads): asked again at the next read.
-      if (queued !== null) written.set(status.id, health)
+      if (queued !== null) {
+        written.set(status.id, health)
+        this.fallbacks.delete(k)
+      }
     }
     // A trunk no longer watched (disabled whole, or deleted): told recovered if it was told degraded or down, then
     // kept `removed` (purged after the retention). Only once the store says so as well (deleted from it, or the SIP
@@ -183,12 +198,15 @@ export class TrunkWatch {
       this.seen.set(k, { health: REMOVED, reads })
       if (reads < confirm) continue
       this.seen.delete(k)
-      const trunk = await describe(status, id)
+      const trunk = await describe(status, id, REMOVED)
       const queued = await this.options.publishChange(tenantId, `trunk:${id}`, REMOVED, TYPES, (was, at): PublishedWebhookEvent | null => {
         if (was !== 'degraded' && was !== 'down') return null
         return { id: randomEventId(), occurred_at: at, tenant: tenantId, type: 'trunk.recovered', trunk: { ...trunk, state: 'up', previous: was, removed: true } }
       })
-      if (queued !== null) written.set(id, REMOVED)
+      if (queued !== null) {
+        written.set(id, REMOVED)
+        this.fallbacks.delete(k)
+      }
     }
   }
 }
