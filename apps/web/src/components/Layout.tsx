@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom'
 import { adminSectionOf } from '../admin/sections.js'
 import { useAuth } from '../auth/AuthProvider.js'
@@ -13,6 +13,7 @@ import { CallPanel } from './CallPanel.js'
 const LINKS: [string, Key][] = [
   ['/', 'nav.dialer'],
   ['/recents', 'nav.recents'],
+  ['/voicemail', 'nav.voicemail'],
   ['/directory', 'nav.directory'],
   ['/settings', 'nav.settings'],
   ['/admin', 'nav.admin']
@@ -26,8 +27,21 @@ export const Layout = () => {
   const push = useMemo(() => browserPush(), [])
   const navigate = useNavigate()
   const name = displayNameFor(me, state.status === 'signed-in' ? state.user : null)
+  // The mailbox (step 11a) shows only where the platform has one for this person (capability `voicemail`).
+  const [voicemail, setVoicemail] = useState(false)
+  useEffect(() => {
+    let cancelled = false
+    if (!me?.extension) return
+    client
+      .getCapabilities()
+      .then(caps => !cancelled && setVoicemail(!!caps.voicemail))
+      .catch(() => undefined)
+    return () => {
+      cancelled = true
+    }
+  }, [client, me?.id, me?.extension])
   // The administration link shows only to administrators; the Gateway refuses the others anyway.
-  const links = LINKS.filter(([to]) => to !== '/admin' || me?.features?.admin)
+  const links = LINKS.filter(([to]) => (to !== '/admin' || me?.features?.admin) && (to !== '/voicemail' || (voicemail && me?.extension)))
   const { pathname, search } = useLocation()
   // Opened by the notification of a call: signed in, the softphone registers and the call rings here. The address
   // keeps no trace of it (a reload is no reason to do anything about that call).

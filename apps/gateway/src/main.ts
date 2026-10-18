@@ -11,6 +11,7 @@ import { WebPush, parsePushServices, parseVapidSubject } from './push.js'
 import { ProviderRegistry } from './registry.js'
 import { PgStore } from './store/pg.js'
 import { trunkFromEnv, trunkRecord } from './trunks.js'
+import { wazoFromEnv } from './voicemail.js'
 import { networkInterfaces } from 'node:os'
 import { denyNetworks, parsePorts, parseTenantNetworks } from './webhook-delivery.js'
 
@@ -178,6 +179,10 @@ const webhookDeny = denyNetworks(env.WEBHOOK_DENY_NETWORKS, networkInterfaces())
 const webhookHttp = env.WEBHOOK_ALLOW_HTTP === '1'
 if (webhookHttp) console.warn('WARNING: WEBHOOK_ALLOW_HTTP=1: webhooks may be delivered in clear (http), for development only')
 if (!key) console.warn('WARNING: no webhooks without SECRETS_KEY (their secrets are kept encrypted with it)')
+// The mailboxes (step 11a, ADR 0021): Wazo Platform for DEFAULT_TENANT, from WAZO_URL (or the URL of each of its
+// APIs), WAZO_USER and WAZO_PASSWORD (voicemail.ts). Without it, a call nobody takes ends as before.
+const voicemail = wazoFromEnv(env)
+if (!voicemail) console.warn('WARNING: no mailboxes (WAZO_URL or the URLs of its APIs, WAZO_USER, WAZO_PASSWORD): a call nobody takes is not taken by a mailbox')
 const hstsMaxAge = env.HSTS_MAX_AGE ? Number(env.HSTS_MAX_AGE) : undefined
 if (hstsMaxAge !== undefined && !(Number.isInteger(hstsMaxAge) && hstsMaxAge >= 0)) throw new Error('HSTS_MAX_AGE must be a number of seconds')
 const app = await buildApp(registry, {
@@ -190,9 +195,11 @@ const app = await buildApp(registry, {
   ...(push ? { push } : {}),
   ...(key ? { secretsKey: key } : {}),
   webhooks: { policy: { allowHttp: webhookHttp, ...(webhookPorts ? { ports: webhookPorts } : {}) }, open: webhookOpen, deny: webhookDeny },
-  ...(conference ? { conference } : {})
+  ...(conference ? { conference } : {}),
+  ...(voicemail ? { voicemail: (t: string) => (t === tenant ? voicemail : undefined) } : {})
 })
 directorySync?.useLogger(app.log)
+app.addHook('onClose', async () => voicemail?.close())
 const syncEvery = parseInterval(env.LDAP_SYNC_INTERVAL, 3_600_000)
 if (directorySync && syncEvery > 0) directorySync.start(syncEvery)
 app.addHook('onClose', async () => directorySync?.stop())

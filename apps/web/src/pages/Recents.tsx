@@ -8,10 +8,15 @@ import { Reloader } from '../reload.js'
 /** How long the history waits for the event stream before it is read without it. */
 const WITHOUT_STREAM_MS = 3_000
 
-/** Missed (the phone rang, nobody took it), declined (the user refused it), a conference (step 8b), or simply in or out. */
+/**
+ * Missed (the phone rang, nobody took it), declined (the user refused it), a conference (step 8b), a call a mailbox
+ * took for the caller (step 11a), or simply in or out.
+ */
 const recentLabel = (it: HistoryItem, t: (key: Key) => string) =>
   it.missed
     ? t('recents.missed')
+    : it.voicemail && it.direction === 'outbound'
+      ? t('recents.voicemail')
     : it.direction === 'inbound' && it.state === 'rejected'
       ? t('recents.declined')
       : it.conference

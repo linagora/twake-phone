@@ -1,4 +1,4 @@
-import type { Call, Capabilities, ConferenceParticipant, Contact, DialInConfiguration, DidRange, ForwardingRules, FraudRule, MediaSession, OutboundAssignment, OutboundCaps, OutboundPolicy, OutboundProfile, Presence, PresenceStatus, RingGroup, TelephonyAlert, TelephonyEvent, Trunk, TrunkInput, TrunkStatus, WebhookEventType } from '@twake/telephony-types'
+import type { Call, Capabilities, ConferenceParticipant, Contact, DialInConfiguration, DidRange, ForwardingRules, FraudRule, MediaSession, OutboundAssignment, OutboundCaps, OutboundPolicy, OutboundProfile, Presence, PresenceStatus, RingGroup, TelephonyAlert, TelephonyEvent, Trunk, TrunkInput, TrunkStatus, Voicemail, WebhookEventType } from '@twake/telephony-types'
 
 export type {
   Contact,
@@ -22,6 +22,7 @@ export type {
   TrunkRegistrationState,
   TrunkServerState,
   TrunkStatus,
+  Voicemail,
   WebhookEvent,
   WebhookEventType
 } from '@twake/telephony-types'
@@ -70,6 +71,8 @@ export interface HistoryItem {
   missed: boolean
   /** A conference's call (step 8b): the room called the person in the place of a call of theirs. */
   conference?: boolean
+  /** Taken by a mailbox (step 11a): the caller left a message (or could have), the person called has it. */
+  voicemail?: boolean
 }
 
 export interface HistoryFilter {
@@ -468,6 +471,34 @@ export class TelephonyClient {
 
   getCapabilities() {
     return this.request<Capabilities>('/capabilities')
+  }
+
+  /** The messages of the person's mailbox, newest first (step 11a; 501: the platform has no mailboxes). */
+  listVoicemails() {
+    return this.request<{ items: Voicemail[] }>('/voicemails')
+  }
+
+  /** The recording of a message, to play (a WAV); 404 when it is not in the person's mailbox. */
+  async getVoicemailAudio(id: string): Promise<Blob> {
+    const path = `/voicemails/${encodeURIComponent(id)}/audio`
+    const res = await fetch(`${this.options.baseUrl}/api/v1${path}`, {
+      headers: { authorization: `Bearer ${await this.options.getToken()}`, ...(this.options.getInstance ? { 'x-cozy-instance': this.options.getInstance() } : {}) }
+    })
+    if (!res.ok) {
+      await res.text().catch(() => undefined)
+      throw Object.assign(new Error(`Gateway ${res.status} on ${path}`), { status: res.status })
+    }
+    return res.blob()
+  }
+
+  /** Marks a message as listened to, on every screen of the person (a `voicemail.updated` event follows). */
+  markVoicemailRead(id: string) {
+    return this.request<void>(`/voicemails/${encodeURIComponent(id)}/read`, { method: 'POST', body: '{}' })
+  }
+
+  /** Deletes a message, for good (a `voicemail.deleted` event follows). */
+  deleteVoicemail(id: string) {
+    return this.request<void>(`/voicemails/${encodeURIComponent(id)}`, { method: 'DELETE' })
   }
 
   /** People matching the words of `q` in the organisation's directory (`truncated`: refine the search). 501: no directory. */

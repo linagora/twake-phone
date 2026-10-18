@@ -2,5 +2,5 @@
   "extends": "../../tsconfig.base.json",
   "compilerOptions": { "outDir": "dist", "rootDir": "src" },
   "include": ["src"], "exclude": ["src/**/*.spec.ts", "src/store/contract.ts"],
-  "references": [{"path":"../../packages/telephony-types"},{"path":"../../packages/provider-sdk"},{"path":"../../packages/provider-opensips"},{"path":"../../packages/conference-livekit"}]
+  "references": [{"path":"../../packages/telephony-types"},{"path":"../../packages/provider-sdk"},{"path":"../../packages/provider-opensips"},{"path":"../../packages/provider-wazo"},{"path":"../../packages/conference-livekit"}]
 }

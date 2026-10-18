@@ -6,7 +6,7 @@ import swagger from '@fastify/swagger'
 import swaggerUi from '@fastify/swagger-ui'
 import { LiveKitError, PIN_DIGITS, maskNumber, splitParticipantId, verifyWebhook, type LiveKitConferenceBridge, type MeetApi, type MeetRoom, type ParticipantCall } from '@twake/conference-livekit'
 import { REPLACES } from '@twake/provider-opensips'
-import type { DialedParticipant, MediaProvider, RoomCallGrantToken, TelephonyProvider } from '@twake/telephony-provider-sdk'
+import type { DialedParticipant, MediaProvider, RoomCallGrantToken, TelephonyProvider, VoicemailProvider } from '@twake/telephony-provider-sdk'
 import { EXTENSION_FORMAT, FRAUD_DEFAULTS, OUTBOUND_CAP_DEFAULTS, isReservedNumber, type CallDirection, type DidRange, type Endpoint, type ForwardingRules, type Presence, type PresenceStatus, type RingGroup, type TelephonyEvent, type TrunkStatus, type User } from '@twake/telephony-types'
 import { adminPolicyFromEnv, isAdmin, type AdminPolicy } from './admin.js'
 import { authenticatorFromEnv, TicketStore, type Authenticator, type Identity } from './auth.js'
@@ -23,6 +23,7 @@ import { TrunkWatch } from './trunk-health.js'
 import { encrypt } from './crypto.js'
 import { newWebhookSecret, parseWebhookDomains } from './webhook-delivery.js'
 import { presenceEvent, webhookEventsFor } from './webhook-events.js'
+import { VOICEMAIL_ID } from './voicemail.js'
 import { DELIVERY_CURSOR, DELIVERY_ID, MAX_WEBHOOKS, WEBHOOK_ID, WEBHOOK_SECRET_GRACE_MS, WEBHOOK_SENDS_PER_MINUTE, WEBHOOK_TENANT_SENDS_PER_MINUTE, WebhookHub, parseSubscription, publicDelivery, publicSubscription, secretContext, type WebhookHubOptions } from './webhooks.js'
 import { MAX_DIDS, MAX_TRUNKS, TRUNK_ID, defaultTrunk, parseDid, parseTrunk, providerTrunks, publicDid, publicTrunk, trunkRecord } from './trunks.js'
 import { EMPTY_OUTBOUND, PROFILE_ID, outboundVersion, parseOutbound, staleOutbound, type Outbound } from './outbound.js'
@@ -183,6 +184,11 @@ export interface BuildOptions {
    */
   trunkWatchMs?: number
   trunkWatchConfirm?: number
+  /**
+   * The voicemail server of a tenant (step 11a, ADR 0021): a mailbox for each holder of an extension, where the SIP
+   * server sends the calls nobody takes. Absent (or undefined for the tenant): no mailboxes, the endpoints answer 501.
+   */
+  voicemail?: (tenantId: string) => VoicemailProvider | undefined
   /** Phone access to Meet rooms. Absent when no LiveKit is configured: the endpoints answer 501. */
   conference?: {
     bridge: (tenantId: string) => LiveKitConferenceBridge | undefined
@@ -537,6 +543,13 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
     }
     const userId = await dir.userIdForExtension(tenantId, extension)
     if (!userId) return
+    // A mailbox's news (step 11a): for its holder only, never for someone the extension was just given to (the
+    // mailbox goes at the next synchronisation, with its messages).
+    if (event.type === 'voicemail.created' || event.type === 'voicemail.updated' || event.type === 'voicemail.deleted') {
+      const vm = options.voicemail?.(tenantId)
+      if (vm && (await vm.owns({ extension, userId }))) bus.publish(tenantId, userId, event)
+      return
+    }
     // A call held for someone without a window: their browsers are woken (not awaited: the stream goes on).
     if (event.type === 'call.wake') {
       wake(tenantId, userId, event.payload)
@@ -636,6 +649,59 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
     } finally {
       restoring.delete(tenantId)
     }
+  }
+  // The mailboxes (step 11a, ADR 0021): one for each holder of an extension, made or removed as the extensions pass
+  // from one person to another, then handed to the SIP server, which sends there the calls nobody takes. In the
+  // tenant's turn, retried until it holds (Wazo may start after the Gateway); a change heard meanwhile asks one more
+  // round. Kept apart from the presences: a voicemail server down holds nothing else back.
+  const syncingVoicemail = new Map<string, { again: boolean }>()
+  const syncVoicemail = async (tenantId: string, provider: TelephonyProvider): Promise<void> => {
+    const vm = options.voicemail?.(tenantId)
+    if (!vm) return
+    const running = syncingVoicemail.get(tenantId)
+    if (running) {
+      running.again = true
+      return
+    }
+    const state = { again: true }
+    syncingVoicemail.set(tenantId, state)
+    let attempt = 0
+    try {
+      while (state.again && !closing) {
+        state.again = false
+        try {
+          await inTurn(tenantId, async () => {
+            const boxes = await vm.syncMailboxes((await store.listMappings(tenantId)).map(m => ({ extension: m.extension, userId: m.userId, ...(m.displayName ? { displayName: m.displayName } : {}) })))
+            await provider.setVoicemailBoxes?.(boxes)
+          })
+          attempt = 0
+        } catch (err) {
+          if (closing) return
+          state.again = true
+          const delay = RESTORE_RETRY_MS[Math.min(attempt++, RESTORE_RETRY_MS.length - 1)]!
+          app.log.error({ err, tenantId }, `mailboxes not synchronised with the voicemail server, retrying in ${delay / 1000} s`)
+          await new Promise(resolve => setTimeout(resolve, delay).unref())
+        }
+      }
+    } finally {
+      syncingVoicemail.delete(tenantId)
+    }
+  }
+  /** The events of each voicemail server, heard once whatever the providers of its tenant (re)made. */
+  const heardVoicemail = new Set<VoicemailProvider>()
+  const hearVoicemail = (tenantId: string) => {
+    const vm = options.voicemail?.(tenantId)
+    if (!vm || heardVoicemail.has(vm)) return
+    heardVoicemail.add(vm)
+    void (async () => {
+      for await (const { extension, event } of vm.subscribe()) {
+        try {
+          await deliver(tenantId, extension, event)
+        } catch (err) {
+          app.log.error({ err, tenantId, type: event.type }, 'voicemail event not delivered')
+        }
+      }
+    })().catch(err => app.log.error({ err }, 'voicemail event stream failed'))
   }
   const started = new Map<string, TelephonyProvider>()
   // The trunks and direct numbers the store keeps (step 6, ADR 0016): handed to the provider when it starts, in the
@@ -796,12 +862,15 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
   options.directorySync?.onChange(tenantId => {
     const provider = started.get(tenantId)
     if (provider) void restorePresences(tenantId, provider)
+    if (provider) void syncVoicemail(tenantId, provider)
     // Extensions given to someone else, or to nobody: what was heard of them before is forgotten.
     void checkedPresences(tenantId).catch((err: unknown) => app.log.error({ err, tenantId }, 'presences not checked against the directory'))
   })
   registry.onCreate = (tenantId, provider) => {
     started.set(tenantId, provider)
     void restorePresences(tenantId, provider)
+    void syncVoicemail(tenantId, provider)
+    hearVoicemail(tenantId)
     void restoreTrunks(tenantId, provider)
     void restoreOutbound(tenantId, provider)
     void (async () => {
@@ -906,9 +975,11 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
     const providers = registry.all()
     const statuses = providers.map(p => p.getStatus())
     const ready = statuses.every(s => s === 'CONNECTED' || s === 'DEGRADED')
-    const degraded = statuses.filter(s => s === 'DEGRADED').length
+    // The voicemail servers (step 11a): calls go through without them, a mailbox left out; degraded, never not ready.
+    const mailboxes = [...heardVoicemail]
+    const degraded = statuses.filter(s => s === 'DEGRADED').length + mailboxes.filter(v => v.getStatus() !== 'CONNECTED').length
     // Why, in the providers' few words (no addresses): the details are in the log.
-    const reasons = [...new Set(providers.flatMap(p => (p.getStatus() === 'CONNECTED' ? [] : [p.getStatusReason?.()])).filter((r): r is string => !!r))]
+    const reasons = [...new Set([...providers, ...mailboxes].flatMap(p => (p.getStatus() === 'CONNECTED' ? [] : [p.getStatusReason?.()])).filter((r): r is string => !!r))]
     return reply.code(ready ? 200 : 503).send({ ready, ...(degraded ? { degraded } : {}), ...(reasons.length ? { reasons } : {}) })
   })
   app.get('/openapi.json', async () => app.swagger())
@@ -949,7 +1020,9 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         const { user, provider } = await who(req)
         const caps = await provider.getCapabilities()
         const enabled = !!options.conference?.bridge(user.tenantId)
-        return { ...caps, conference: { dialIn: enabled, dialOut: enabled } }
+        // A mailbox (step 11a): with a voicemail server for the tenant, and a SIP server that sends calls to it.
+        const voicemail = !!options.voicemail?.(user.tenantId) && !!provider.setVoicemailBoxes && !!user.extension
+        return { ...caps, conference: { dialIn: enabled, dialOut: enabled }, ...(voicemail ? { voicemail: true } : {}) }
       })
 
       // What the others see, and what the person chose (`choice`: kept in the store, with its end and message).
@@ -1619,6 +1692,44 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         await store.eraseWebhookSubject(user.tenantId, user.id)
         const deleted = await store.deleteHistory(user.tenantId, user.id)
         return reply.send({ deleted })
+      })
+
+      // The person's mailbox (step 11a, ADR 0021): their messages, newest first, each one's audio, marked as read
+      // (listened to) or deleted. Their own only: the mailbox of their extension, made for them (an extension just
+      // given to someone else keeps the old holder's until the next synchronisation: nobody's for the new one). A
+      // message that is not theirs looks exactly like one that does not exist. The news of the mailbox (another screen,
+      // a phone) comes as `voicemail.*` events.
+      const mailboxOf = async (req: FastifyRequest) => {
+        const { user, provider } = await who(req)
+        const vm = options.voicemail?.(user.tenantId)
+        if (!vm || !provider.setVoicemailBoxes) throw Object.assign(new Error('Voicemail is not available on this platform'), { statusCode: 501 })
+        return { vm, owner: user.extension ? { extension: user.extension, userId: user.id } : undefined }
+      }
+      const unreachable = (err: unknown): never => {
+        app.log.warn({ err }, 'voicemail server failed')
+        throw Object.assign(new Error('The voicemail server is not available, try again later'), { statusCode: 502, code: 'VOICEMAIL_UNAVAILABLE' })
+      }
+      const noMessage = () => Object.assign(new Error('Message not found'), { statusCode: 404 })
+      v1.get('/voicemails', async req => {
+        const { vm, owner } = await mailboxOf(req)
+        return { items: owner ? await vm.listMessages(owner).catch(unreachable) : [] }
+      })
+      v1.get<{ Params: { id: string } }>('/voicemails/:id/audio', async (req, reply) => {
+        const { vm, owner } = await mailboxOf(req)
+        if (!owner || !VOICEMAIL_ID.test(req.params.id)) throw noMessage()
+        const audio = await vm.getRecording(owner, req.params.id).catch(unreachable)
+        if (!audio) throw noMessage()
+        return reply.header('content-type', audio.contentType).header('cache-control', 'private, no-store').send(Buffer.from(audio.body))
+      })
+      v1.post<{ Params: { id: string } }>('/voicemails/:id/read', async (req, reply) => {
+        const { vm, owner } = await mailboxOf(req)
+        if (!owner || !VOICEMAIL_ID.test(req.params.id) || !(await vm.markRead(owner, req.params.id).catch(unreachable))) throw noMessage()
+        return reply.code(204).send()
+      })
+      v1.delete<{ Params: { id: string } }>('/voicemails/:id', async (req, reply) => {
+        const { vm, owner } = await mailboxOf(req)
+        if (!owner || !VOICEMAIL_ID.test(req.params.id) || !(await vm.deleteMessage(owner, req.params.id).catch(unreachable))) throw noMessage()
+        return reply.code(204).send()
       })
 
       const action = (name: string, run: (p: TelephonyProvider, id: string, body: { digits?: string; destination?: string }) => Promise<void>) =>
