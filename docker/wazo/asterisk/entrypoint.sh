@@ -17,9 +17,9 @@
 #
 # Everything it listens on is on the loopback (review 11a, n°4: docker/wazo/check-loopback.py says so in CI): SIP and
 # its media where they are told, the AMI and the HTTP server of ARI (127.0.0.1:5039), and no channel or service this
-# stack does not use (IAX2, SCCP, DUNDi). One socket only is on every address, which this Asterisk always makes: the
-# DNS client of PJSIP (an ephemeral port that takes the answers to its own queries; it makes none here, every address
-# being an IP). It keeps no call log of its own (CEL, queue_log: review 11a, n°10): the history of the calls is the
+# stack does not use (IAX2, SCCP, DUNDi). One socket only is on every address (one per family: 0.0.0.0, and :: where
+# the host has IPv6), which this Asterisk always makes: the DNS client of PJSIP (an ephemeral port that takes the
+# answers to its own queries; it makes none here, every address being an IP). It keeps no call log of its own (CEL, queue_log: review 11a, n°10): the history of the calls is the
 # Gateway's.
 set -euo pipefail
 : "${WAZO_SIP_LISTEN:=127.0.0.1:5100}"

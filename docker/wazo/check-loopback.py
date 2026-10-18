@@ -8,9 +8,10 @@ namespace): one bound to an address other than 127.0.0.0/8 or ::1, any address i
 and the check fails. Root reads the sockets of the other processes. Exits 0 when all of them are on the loopback.
 
 One exception, named: the DNS client of Asterisk's PJSIP (res_pjsip makes it whatever its configuration, bound to
-0.0.0.0 on an ephemeral port, for the answers to its own queries; it makes none here, every address being an IP). One
-UDP socket of the asterisk process on 0.0.0.0 at a port of the ephemeral range (ip_local_port_range), no more: any
-other one, a second one, or one at a fixed port fails.
+0.0.0.0 on an ephemeral port, for the answers to its own queries, and on :: as well where the host has IPv6, as a CI
+runner does; it makes none here, every address being an IP). One UDP socket of the asterisk process on 0.0.0.0 and one
+on ::, each at a port of the ephemeral range (ip_local_port_range), no more: any other one, a second one of a family,
+or one at a fixed port fails.
 """
 import ipaddress
 import os
@@ -83,7 +84,7 @@ def main():
     bad = []
     seen = 0
     low, high = ephemeral()
-    dns_client = []
+    dns_client = {}
     for service in SERVICES:
         cid = compose(['ps', '-q', service]).strip()
         if not cid:
@@ -101,13 +102,14 @@ def main():
                 if ip.is_loopback:
                     continue
                 what = f'{service} ({comm.strip()}, pid {pid}): {proto} {ip}:{port}'
-                if service == 'wazo-asterisk' and comm.strip() == 'asterisk' and proto == 'udp' and str(ip) == '0.0.0.0' and low <= port <= high and not dns_client:
-                    dns_client.append(what)
+                any_address = (proto == 'udp' and str(ip) == '0.0.0.0') or (proto == 'udp6' and str(ip) == '::')
+                if service == 'wazo-asterisk' and comm.strip() == 'asterisk' and any_address and low <= port <= high and proto not in dns_client:
+                    dns_client[proto] = what
                     continue
                 bad.append(what)
     if not seen:
         bad.append('no listening socket read (not root?)')
-    for line in dns_client:
+    for line in dns_client.values():
         print(f'allowed, the DNS client of PJSIP: {line}')
     for line in sorted(set(bad)):
         print(f'NOT ON THE LOOPBACK: {line}')

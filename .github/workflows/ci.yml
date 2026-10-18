@@ -106,7 +106,8 @@ jobs:
       - name: Stack SIP (Docker Compose)
         run: docker compose -f docker/docker-compose.sip.yml up --build --wait --wait-timeout 300
       # Chaque socket des services Wazo (bus et base compris), lu dans /proc : hors de 127.0.0.0/8 et ::1, le job échoue.
-      # Seule exception nommée, le client DNS de PJSIP dans Asterisk (UDP, 0.0.0.0, port éphémère) : ADR 0022.
+      # Seule exception nommée, le client DNS de PJSIP dans Asterisk (UDP sur 0.0.0.0 et, le runner ayant IPv6, sur ::,
+      # un port éphémère chacun) : ADR 0022.
       - name: Wazo n'écoute que sur la boucle locale (revue 11a, n°4)
         run: sudo python3 -I docker/wazo/check-loopback.py docker/docker-compose.sip.yml
       - run: yarn install --frozen-lockfile
