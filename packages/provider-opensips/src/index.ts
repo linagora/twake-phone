@@ -386,6 +386,18 @@ export class OpensipsProvider implements TelephonyProvider, MediaProvider {
   }
 
   /**
+   * Whether OpenSIPS sends calls to the mailboxes (its shared variable wazo_on, MI shv_get): undefined when it cannot
+   * be asked (no MI) or did not say.
+   */
+  async getVoicemailAccess(): Promise<boolean | undefined> {
+    if (!this.events) return undefined
+    const vars = (await this.events.call<{ VARs?: { name?: string; value?: unknown }[] } | undefined>('shv_get'))?.VARs
+    if (!Array.isArray(vars)) return undefined
+    const on = vars.find(v => v.name === 'wazo_on')?.value
+    return on === undefined ? undefined : Number(on) === 1
+  }
+
+  /**
    * A room of Meet may call `number` at the name of `extension`, once, within `ttlSec` seconds (route[meet_source]);
    * in the place of a call of `number` (`replaces`), or to the window of `extension` that waits for `join` (step 8b),
    * a call of the conference `room`. `taken`: the call that took it, as OpenSIPS wrote it (review 8b, n°3).

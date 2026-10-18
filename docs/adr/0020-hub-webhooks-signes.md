@@ -10,7 +10,7 @@ Le plan veut que les outils d'une organisation (CRM, supervision, ticketing) re�
 
 **Le modèle.** `WebhookEvent` (`telephony-types`) est distinct de `TelephonyEvent`, ce que les providers disent à la passerelle (par poste, interne). Un événement porte `id` (`evt_` et 32 caractères hexadécimaux), `type`, `occurred_at`, `tenant`, et selon son type :
 
-- `call` : l'appel tel qu'une personne l'a vécu. On y trouve l'identifiant SIP de l'appel, le sens, `from` et `to` (un poste ou un numéro E.164 : le seul numéro de téléphone du modèle), `user` et `extension`, les heures connues et, à la fin, `duration_sec` et `outcome` (`answered`, `missed`, `declined`, `failed`, `unanswered`, `answered_elsewhere`). `conference: true` marque un appel d'une conférence, et `source` vaut `["opensips"]` (puis OVH à l'étape 10b).
+- `call` : l'appel tel qu'une personne l'a vécu. On y trouve l'identifiant SIP de l'appel, le sens, `from` et `to` (un poste ou un numéro E.164 : le seul numéro de téléphone du modèle), `user` et `extension`, les heures connues et, à la fin, `duration_sec` et `outcome` (`answered`, `missed`, `declined`, `failed`, `unanswered`, `answered_elsewhere`). `conference: true` marque un appel d'une conférence, `voicemail: true` un appel qu'a pris une messagerie (étape 11a, ADR 0022 : pour l'appelant, `answered` est la réponse de la boîte, pas de la personne), et `source` vaut `["opensips"]` (puis OVH à l'étape 10b).
 - `presence` : `user`, `extension` et `status` seulement, ni message ni échéance.
 - `trunk` : `id`, `name`, `state` (`degraded` ou `down` ; `up` pour `trunk.recovered`), `previous`, l'état de l'enregistrement, et les serveurs avec leur état.
 

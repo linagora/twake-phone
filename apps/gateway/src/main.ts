@@ -12,7 +12,7 @@ import { WebPush, parsePushServices, parseVapidSubject } from './push.js'
 import { ProviderRegistry } from './registry.js'
 import { PgStore } from './store/pg.js'
 import { trunkFromEnv, trunkRecord } from './trunks.js'
-import { wazoFromEnv } from './voicemail.js'
+import { retentionDaysOf, wazoFromEnv } from './voicemail.js'
 import { networkInterfaces } from 'node:os'
 import { denyNetworks, parsePorts, parseTenantNetworks } from './webhook-delivery.js'
 
@@ -188,8 +188,10 @@ const ovh = ovhOperatorFromEnv(env)
 if (ovh) console.info(`OVHcloud: the operator of the trunks of ${JSON.stringify(tenant)} (billing account ${env.OVH_BILLING_ACCOUNT})`)
 
 // The mailboxes (step 11a, ADR 0022): Wazo Platform for DEFAULT_TENANT, from WAZO_URL (or the URL of each of its
-// APIs), WAZO_USER and WAZO_PASSWORD (voicemail.ts). Without it, a call nobody takes ends as before.
-const voicemail = wazoFromEnv(env)
+// APIs), WAZO_USER and WAZO_PASSWORD, with SECRETS_KEY (voicemail.ts). Without it, a call nobody takes ends as before.
+// The messages are kept VOICEMAIL_RETENTION_DAYS (30 by default).
+const voicemail = wazoFromEnv(env, key)
+const voicemailRetentionDays = retentionDaysOf(env)
 if (!voicemail) console.warn('WARNING: no mailboxes (WAZO_URL or the URLs of its APIs, WAZO_USER, WAZO_PASSWORD): a call nobody takes is not taken by a mailbox')
 const hstsMaxAge = env.HSTS_MAX_AGE ? Number(env.HSTS_MAX_AGE) : undefined
 if (hstsMaxAge !== undefined && !(Number.isInteger(hstsMaxAge) && hstsMaxAge >= 0)) throw new Error('HSTS_MAX_AGE must be a number of seconds')
@@ -205,7 +207,7 @@ const app = await buildApp(registry, {
   webhooks: { policy: { allowHttp: webhookHttp, ...(webhookPorts ? { ports: webhookPorts } : {}) }, open: webhookOpen, deny: webhookDeny },
   ...(ovh ? { operators: new Map([[tenant, ovh]]) } : {}),
   ...(conference ? { conference } : {}),
-  ...(voicemail ? { voicemail: (t: string) => (t === tenant ? voicemail : undefined) } : {})
+  ...(voicemail ? { voicemail: (t: string) => (t === tenant ? voicemail : undefined), voicemailRetentionDays } : {})
 })
 directorySync?.useLogger(app.log)
 app.addHook('onClose', async () => voicemail?.close())

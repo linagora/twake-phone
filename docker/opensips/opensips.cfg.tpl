@@ -219,6 +219,9 @@ modparam("cfgutils", "shvset", "meet_max_sec=i:${MEET_MAX_CALL_SEC}")
 # as the tables of step 4c.
 modparam("cfgutils", "shvset", "wazo_on=i:${WAZO_ON}")
 modparam("cfgutils", "shvset", "no11_until=i:0")
+# Wazo's Asterisk heard nothing from (a mailbox called, no answer at all within 2 s): the mailboxes are left out 30 s
+# ($shv(wazo_mute_until), failure_route[voicemail_failed]), the calls get their refusal at once (review 11a, n°14).
+modparam("cfgutils", "shvset", "wazo_mute_until=i:0")
 
 #### Calls to someone without a window (step 5, ADR 0015): when the extension a call reaches has no registered window
 #### and its holder has a browser to wake (`push_targets`, written by the Gateway for a person with a push
@@ -3473,10 +3476,15 @@ route[relay_failed] {
 # takes it as a browser would: ICE, DTLS-SRTP). For the caller the mailbox answered (E_TWAKEPHONE_VOICEMAIL, then the
 # CDR, `via` voicemail); for the extension dialled it is a missed call. A mailbox that does not answer gives the caller
 # what it would have had without it (failure_route[voicemail_failed]): the same refusal, the same missed call.
+# A call to a mailbox lasts VOICEMAIL_MAX_CALL_SEC at most ($DLG_timeout; a call from the operator then ends with a BYE
+# both ways, B; Asterisk hangs up its side at that bound too, and records VOICEMAIL_MAX_SEC at most: review 11a, n°3).
+# A mailbox that does not answer within 2 s (Wazo down, a row of voicemail_boxes out of date) is left for the refusal,
+# and when nothing at all came back from Asterisk, every mailbox is left out the next 30 s (n°14). The greeting says whether the caller is outside (`;caller=external`): the extension is never spelled out to
+# them (n°12).
 # $param(1): the greeting; $avp(vm_then), $avp(vm_code), $avp(vm_reason): that refusal. Ends the script when the
 # mailbox is called; -1 otherwise.
 route[voicemail] {
-	if ($shv(wazo_on) != 1 || $avp(vm_box) == NULL || $avp(vm_used) != NULL || $avp(group) != NULL || $dlg_val(meet) != NULL || $avp(conference) != NULL)
+	if ($shv(wazo_on) != 1 || $shv(wazo_mute_until) > $Ts || $avp(vm_box) == NULL || $avp(vm_used) != NULL || $avp(group) != NULL || $dlg_val(meet) != NULL || $avp(conference) != NULL)
 		return(-1);
 	if (is_present_hf("Replaces") || t_was_cancelled() || $avp(dialled) == $avp(caller) || !($avp(dialled) =~ "^[0-9]{1,40}$"))
 		return(-1);
@@ -3502,6 +3510,12 @@ route[voicemail] {
 	}
 	$(avp(vm_from)[*]) = NULL;
 	$avp(vm_from) = $avp(callee);
+	# How the call went until now, given back if the mailbox does not answer (route[voicemail_undo]).
+	$(avp(vm_via)[*]) = NULL;
+	if ($acc_extra(via) != NULL)
+		$avp(vm_via) = $acc_extra(via);
+	$(avp(vm_timeout)[*]) = NULL;
+	$avp(vm_timeout) = $DLG_timeout;
 	$(avp(callee)[*]) = NULL;
 	$avp(callee) = $avp(dialled);
 	$acc_extra(callee) = $avp(dialled);
@@ -3516,8 +3530,14 @@ route[voicemail] {
 	remove_hf("X-Twake-Mailbox");
 	remove_hf("X-Twake-Voicemail");
 	append_hf("X-Twake-Mailbox: $avp(vm_box)\r\n");
-	append_hf("X-Twake-Voicemail: $param(1)\r\n");
-	# Asterisk answers at once; the ringing delay of a forward does not apply.
+	if ($dlg_val(trunk) == "caller")
+		append_hf("X-Twake-Voicemail: $param(1);caller=external\r\n");
+	else
+		append_hf("X-Twake-Voicemail: $param(1)\r\n");
+	if ($DLG_timeout == NULL || $DLG_timeout > ${VOICEMAIL_MAX_CALL_SEC})
+		$DLG_timeout = ${VOICEMAIL_MAX_CALL_SEC};
+	# Asterisk answers at once (100 Trying within 2 s, then its 200); the ringing delay of a forward does not apply.
+	$T_fr_timeout = 2;
 	$T_fr_inv_timeout = 15;
 	route(calling);
 	t_on_reply("rtp");
@@ -3530,7 +3550,7 @@ route[voicemail] {
 	return(-1);
 }
 
-# The mailbox did not take the call: it is back where it was, for its refusal.
+# The mailbox did not take the call: it is back where it was, for its refusal (its `via` and its lifetime too).
 route[voicemail_undo] {
 	$(avp(voicemail)[*]) = NULL;
 	$dlg_val(voicemail) = "0";
@@ -3538,6 +3558,10 @@ route[voicemail_undo] {
 	$avp(callee) = $avp(vm_from);
 	$acc_extra(callee) = $avp(vm_from);
 	$acc_extra(via) = "";
+	if ($avp(vm_via) != NULL)
+		$acc_extra(via) = $avp(vm_via);
+	if ($avp(vm_timeout) != NULL && $avp(vm_timeout) > 0)
+		$DLG_timeout = $avp(vm_timeout);
 	$dlg_val(callee) = $avp(vm_from);
 	remove_hf("X-Twake-Mailbox");
 	remove_hf("X-Twake-Voicemail");
@@ -3551,7 +3575,20 @@ failure_route[voicemail_failed] {
 		exit;
 	}
 	xlog("L_NOTICE", "call $ci: the mailbox of $avp(dialled) did not answer ($T_reply_code), the caller gets $avp(vm_code)\n");
+	if (t_check_status("408") && t_local_replied("all")) {
+		$shv(wazo_mute_until) = $Ts + 30;
+		xlog("L_WARN", "Wazo's Asterisk does not answer: the mailboxes are left out 30 s\n");
+	}
 	route(voicemail_undo);
+	# The fallback group of a direct number nobody of which answered (the failure route of a call): its refusal, the
+	# group's missed call.
+	if ($avp(vm_then) == "group") {
+		$avp(group) = $avp(vm_group);
+		rtpengine_delete();
+		route(group_missed, "480 Temporarily Unavailable");
+		t_reply(480, "Temporarily Unavailable");
+		exit;
+	}
 	# A "do not disturb": its refusal as it was, with its message (route[dnd_reply], which ends the script).
 	if ($avp(vm_then) == "dnd") {
 		$var(dnd_who) = $avp(vm_who);
@@ -3595,6 +3632,7 @@ onreply_route[rtp] {
 	# P-Asserted-Identity headers do not pass, or the caller would show them as the dialled extension's.
 	remove_hf_glob("Twake-Dnd*");
 	remove_hf("Twake-Call-Refused");
+	remove_hf("Twake-Voicemail");
 	remove_hf("P-Asserted-Identity");
 	# The callee's Contact: same ".invalid" host, same fix (see above).
 	fix_nated_contact();
@@ -3621,6 +3659,9 @@ onreply_route[rtp] {
 	# The mailbox answered (step 11a, route[voicemail]): told once, as itself, never as a ringing or an answer of the
 	# callee; nobody's identity is asserted to the caller.
 	if ($avp(voicemail) != NULL) {
+		# The caller's window says whose mailbox it hears (review 11a, n°26): Twake-Voicemail, never to the operator.
+		if ($rs >= 200 && $rs < 300 && $dlg_val(trunk) != "caller")
+			append_hf("Twake-Voicemail: 1\r\n");
 		if ($rs >= 200 && $rs < 300 && $avp(vm_answered) == NULL) {
 			$avp(vm_answered) = 1;
 			route(event_attrs);
@@ -3812,6 +3853,19 @@ failure_route[call_failed] {
 		}
 		# A call from the operator: the fallback of its direct number (never after the group declined, above).
 		route(did_fallback, "the group did not answer", "480");
+		# That fallback was this group, nobody of which answered (review 11a, n°6): the mailbox of the extension the
+		# number rings, as after a fallback to an extension (route[voicemail] takes no group's call: the group is set
+		# aside while it is tried, given back if the mailbox is not called).
+		if ($avp(fb_used) != NULL && $avp(vm_box) != NULL) {
+			$(avp(vm_group)[*]) = NULL;
+			$avp(vm_group) = $avp(group);
+			$(avp(group)[*]) = NULL;
+			$avp(vm_then) = "group";
+			$avp(vm_code) = 480;
+			$avp(vm_reason) = "Temporarily Unavailable";
+			route(voicemail, "unavailable");
+			$avp(group) = $avp(vm_group);
+		}
 		rtpengine_delete();
 		route(group_missed, "480 Temporarily Unavailable");
 		t_reply(480, "Temporarily Unavailable");

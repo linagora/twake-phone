@@ -60,6 +60,8 @@ export const callRefusal = (status: number | undefined, header: string | undefin
  */
 export const DND_HEADER = 'Twake-Dnd'
 export const DND_MESSAGE_HEADER = 'Twake-Dnd-Message'
+/** The SIP server's word, in the answer to a call we placed, that the mailbox of the extension called took it (step 11a). */
+export const VOICEMAIL_HEADER = 'Twake-Voicemail'
 
 export type DtmfTransport = 'RFC2833' | 'INFO'
 
@@ -148,6 +150,8 @@ export interface SoftCall {
   readonly endMessage?: string
   /** Why the SIP server refused the number (endReason `refused`). */
   readonly endRefusal?: CallRefusal
+  /** A call we placed that the mailbox of the extension called answered (VOICEMAIL_HEADER, step 11a): not the person. */
+  readonly voicemail?: boolean
   /** The far end put us on hold (re-INVITE with sendonly or inactive). */
   readonly remoteHold: boolean
   readonly muted: boolean
@@ -301,6 +305,7 @@ class WebCall implements SoftCall {
   state: SoftCallState = 'new'
   readonly startedAt = new Date()
   connectedAt?: Date
+  voicemail?: boolean
   endedAt?: Date
   endReason?: EndReason
   endStatus?: number
@@ -364,6 +369,7 @@ class WebCall implements SoftCall {
         this.remoteNumber = asserted.number
         this.remoteName = asserted.name
       }
+      if (direction === 'outbound' && e?.response?.getHeader?.(VOICEMAIL_HEADER)?.trim() === '1') this.voicemail = true
       this.connectedAt ??= new Date()
       this.watchMicrophone()
       this.set('connected')

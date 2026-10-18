@@ -1,4 +1,5 @@
 import { createHmac, hkdfSync, randomBytes } from 'node:crypto'
+import { Readable } from 'node:stream'
 import Fastify, { type FastifyReply, type FastifyRequest } from 'fastify'
 import cors from '@fastify/cors'
 import websocket from '@fastify/websocket'
@@ -228,6 +229,14 @@ export interface BuildOptions {
    * server sends the calls nobody takes. Absent (or undefined for the tenant): no mailboxes, the endpoints answer 501.
    */
   voicemail?: (tenantId: string) => VoicemailProvider | undefined
+  /** The waits between two tries of a synchronisation of the mailboxes that failed, the last repeated (tests). */
+  voicemailRetryMs?: number[]
+  /**
+   * How long a message is kept (VOICEMAIL_RETENTION_DAYS, 30 by default; 0: for good), and how often those older are
+   * deleted (every 6 hours by default, and once at the start).
+   */
+  voicemailRetentionDays?: number
+  voicemailPurgeMs?: number
   /**
    * The operator of the trunks of each tenant that has one (step 10b, ADR 0021: OVHcloud for the organisation of the
    * pilot), read every `operatorSyncMs` (10 minutes by default; 0: never on a schedule) by the Gateway that leads:
@@ -705,11 +714,15 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
       restoring.delete(tenantId)
     }
   }
-  // The mailboxes (step 11a, ADR 0022): one for each holder of an extension, made or removed as the extensions pass
-  // from one person to another, then handed to the SIP server, which sends there the calls nobody takes. In the
-  // tenant's turn, retried until it holds (Wazo may start after the Gateway); a change heard meanwhile asks one more
-  // round. Kept apart from the presences: a voicemail server down holds nothing else back.
+  // The mailboxes (step 11a, ADR 0022): one for each holder of an extension, made, moved or set aside as the
+  // extensions pass from one person to another, then handed to the SIP server, which sends there the calls nobody
+  // takes. One synchronisation at a time per tenant, retried until it holds (Wazo may start after the Gateway); a
+  // change heard meanwhile asks one more round. Out of the tenant's turn (review 11a, n°1): the voicemail server's
+  // many requests hold back no one's presence or forward; only the list handed to the SIP server takes the turn. One
+  // that fails leaves the SIP server without mailboxes until the next holds (n°14): an extension given to someone else
+  // meanwhile never sends its calls to the previous holder's mailbox.
   const syncingVoicemail = new Map<string, { again: boolean }>()
+  const voicemailRetryMs = options.voicemailRetryMs ?? RESTORE_RETRY_MS
   const syncVoicemail = async (tenantId: string, provider: TelephonyProvider): Promise<void> => {
     const vm = options.voicemail?.(tenantId)
     if (!vm) return
@@ -725,16 +738,15 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
       while (state.again && !closing) {
         state.again = false
         try {
-          await inTurn(tenantId, async () => {
-            const boxes = await vm.syncMailboxes((await store.listMappings(tenantId)).map(m => ({ extension: m.extension, userId: m.userId, ...(m.displayName ? { displayName: m.displayName } : {}) })))
-            await provider.setVoicemailBoxes?.(boxes)
-          })
+          const boxes = await vm.syncMailboxes((await store.listMappings(tenantId)).map(m => ({ extension: m.extension, userId: m.userId, ...(m.displayName ? { displayName: m.displayName } : {}) })))
+          await inTurn(tenantId, async () => provider.setVoicemailBoxes?.(boxes))
           attempt = 0
         } catch (err) {
           if (closing) return
           state.again = true
-          const delay = RESTORE_RETRY_MS[Math.min(attempt++, RESTORE_RETRY_MS.length - 1)]!
-          app.log.error({ err, tenantId }, `mailboxes not synchronised with the voicemail server, retrying in ${delay / 1000} s`)
+          if (attempt === 0) await inTurn(tenantId, async () => provider.setVoicemailBoxes?.([])).catch((e: unknown) => app.log.error({ err: e, tenantId }, 'mailboxes not taken from the SIP server'))
+          const delay = voicemailRetryMs[Math.min(attempt++, voicemailRetryMs.length - 1)]!
+          app.log.error({ err, tenantId }, `mailboxes not synchronised with the voicemail server, none for the SIP server until they are, retrying in ${delay / 1000} s`)
           await new Promise(resolve => setTimeout(resolve, delay).unref())
         }
       }
@@ -742,6 +754,21 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
       syncingVoicemail.delete(tenantId)
     }
   }
+  // The retention period of the messages (review 11a, n°10): those older are deleted, every voicemailPurgeMs.
+  const retentionMs = (options.voicemailRetentionDays ?? 30) * 86_400_000
+  const purgeVoicemail = async () => {
+    for (const vm of heardVoicemail) {
+      try {
+        await vm.purgeMessages(new Date(Date.now() - retentionMs))
+      } catch (err) {
+        app.log.error({ err }, 'messages past the retention period not deleted, again at the next round')
+      }
+    }
+  }
+  const purgeEvery = options.voicemailPurgeMs ?? 6 * 3_600_000
+  let purgedOnce = false
+  const purgeTimer = options.voicemail && retentionMs > 0 && purgeEvery > 0 ? setInterval(() => void purgeVoicemail(), purgeEvery) : undefined
+  purgeTimer?.unref()
   /** The events of each voicemail server, heard once whatever the providers of its tenant (re)made. */
   const heardVoicemail = new Set<VoicemailProvider>()
   const hearVoicemail = (tenantId: string) => {
@@ -925,7 +952,14 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
     started.set(tenantId, provider)
     void restorePresences(tenantId, provider)
     void syncVoicemail(tenantId, provider)
+    // No voicemail server for the tenant: what the SIP server kept of one before is emptied (review 11a, n°14).
+    if (!options.voicemail?.(tenantId) && provider.setVoicemailBoxes)
+      void inTurn(tenantId, async () => provider.setVoicemailBoxes?.([])).catch((err: unknown) => app.log.error({ err, tenantId }, 'mailboxes of before not taken from the SIP server'))
     hearVoicemail(tenantId)
+    if (heardVoicemail.size && purgeTimer && !purgedOnce) {
+      purgedOnce = true
+      void purgeVoicemail()
+    }
     void restoreTrunks(tenantId, provider)
     void restoreOutbound(tenantId, provider)
     void (async () => {
@@ -1043,6 +1077,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
     for (const { timer } of settling.values()) clearTimeout(timer)
     settling.clear()
     clearInterval(alertPurge)
+    clearInterval(purgeTimer)
     trunkWatch?.stop()
     // Its round under way ends first: the store is closed after (review 10b, n°25).
     await operatorSync?.stop()
@@ -1104,7 +1139,8 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         const caps = await provider.getCapabilities()
         const enabled = !!options.conference?.bridge(user.tenantId)
         // A mailbox (step 11a): with a voicemail server for the tenant, and a SIP server that sends calls to it.
-        const voicemail = !!options.voicemail?.(user.tenantId) && !!provider.setVoicemailBoxes && !!user.extension
+        // Its shared variable says so when it can (review 11a, n°13): a SIP server started without Wazo has none.
+        const voicemail = !!options.voicemail?.(user.tenantId) && !!provider.setVoicemailBoxes && !!user.extension && (await provider.getVoicemailAccess?.().catch(() => undefined)) !== false
         return { ...caps, conference: { dialIn: enabled, dialOut: enabled }, ...(voicemail ? { voicemail: true } : {}) }
       })
 
@@ -1910,7 +1946,11 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         // their calls were is kept only with an operator, for those a record read later may be of (third review n°3).
         const kept = operatorSync?.keptOfErasure(user.tenantId)
         const deleted = await store.deleteHistory(user.tenantId, user.id, await erasedNumbersOf(store, user.tenantId, user.id), kept)
-        return reply.send({ deleted })
+        // Their messages too, in every mailbox held for them (review 11a, n°10). Last: a voicemail server down leaves
+        // the messages only, and the erasure asked again (502) finishes it.
+        const vm = options.voicemail?.(user.tenantId)
+        const voicemails = vm ? await vm.eraseMessages({ userId: user.id }).catch(unreachable) : undefined
+        return reply.send({ deleted, ...(voicemails !== undefined ? { voicemails } : {}) })
       })
 
       // The person's mailbox (step 11a, ADR 0022): their messages, newest first, each one's audio, marked as read
@@ -1938,7 +1978,12 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         if (!owner || !VOICEMAIL_ID.test(req.params.id)) throw noMessage()
         const audio = await vm.getRecording(owner, req.params.id).catch(unreachable)
         if (!audio) throw noMessage()
-        return reply.header('content-type', audio.contentType).header('cache-control', 'private, no-store').send(Buffer.from(audio.body))
+        // Sent on as it comes (review 11a, n°3): never whole in memory; cut past the provider's bound.
+        const body = Readable.from(audio.body, { objectMode: false })
+        body.on('error', err => req.log.warn({ err }, 'recording not sent whole'))
+        reply.header('content-type', audio.contentType).header('cache-control', 'private, no-store')
+        if (audio.size !== undefined) reply.header('content-length', String(audio.size))
+        return reply.send(body)
       })
       v1.post<{ Params: { id: string } }>('/voicemails/:id/read', async (req, reply) => {
         const { vm, owner } = await mailboxOf(req)

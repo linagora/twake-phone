@@ -437,6 +437,23 @@ describe('OpensipsProvider call rules', () => {
     expect(await make().getMeetAccess()).toBeUndefined()
   })
 
+  it('reads whether OpenSIPS sends calls to the mailboxes, or says it cannot (step 11a, review n°13)', async () => {
+    const sips = await fakeOpensips()
+    cleanups.push(sips.close)
+    const p = new OpensipsProvider({ websocketUrl: 'wss://sip.example.test', domain: 'sip.example.test', sipSecretFor: async () => 's', events: { miUrl: sips.url, timeoutMs: 300 }, logger: { info: () => undefined, warn: () => undefined } })
+    cleanups.push(() => p.close())
+    await p.getCapabilities()
+    await until('the subscription', () => p.getStatus() === 'CONNECTED')
+    sips.state.shv = [{ name: 'wazo_on', type: 1, value: 1 }, { name: 'meet_on', type: 1, value: 0 }]
+    expect(await p.getVoicemailAccess()).toBe(true)
+    sips.state.shv = [{ name: 'wazo_on', type: 1, value: 0 }]
+    expect(await p.getVoicemailAccess()).toBe(false)
+    // An OpenSIPS of before step 11a: it cannot say.
+    sips.state.shv = [{ name: 'meet_on', type: 1, value: 1 }]
+    expect(await p.getVoicemailAccess()).toBeUndefined()
+    expect(await make().getVoicemailAccess()).toBeUndefined()
+  })
+
   it('asks OpenSIPS how the trunks are doing (step 7): its servers and registrations, nothing else of its answers', async () => {
     let sets = [
       { id: 'operator', setid: 1, aor: 'sip:0033199000100@operator.example' },

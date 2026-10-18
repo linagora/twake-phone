@@ -12,3 +12,6 @@ auth:
 bus:
   host: 127.0.0.1
   port: 5672
+  # The bus account of this stack (RABBITMQ_DEFAULT_USER and _PASS of docker-compose.sip.yml), not RabbitMQ's guest.
+  username: wazo
+  password: twake-wazo-dev-only-bus

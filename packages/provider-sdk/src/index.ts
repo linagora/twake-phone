@@ -90,6 +90,11 @@ export interface TelephonyProvider {
    */
   getMeetAccess?(): Promise<{ number?: string } | undefined>
   /**
+   * Whether the SIP server sends calls to the mailboxes (step 11a): undefined when it cannot say. The Gateway gives
+   * the capability `voicemail` only when it does.
+   */
+  getVoicemailAccess?(): Promise<boolean | undefined>
+  /**
    * The mailboxes of the tenant (step 11a, ADR 0022), as the voicemail server named them (VoicemailProvider's
    * syncMailboxes): replaces the list. A call to one of these extensions that nobody answers, that its "do not disturb"
    * refuses, busy or that reaches nobody goes to `mailbox`; an extension not in it has none.
@@ -164,20 +169,29 @@ export interface VoicemailProvider {
   /** Why the status is not CONNECTED, in a few words without addresses or secrets. */
   getStatusReason?(): string | undefined
   /**
-   * Who holds each extension of the tenant now: each gets a mailbox (made, or kept with its messages), the others go
-   * (with theirs). Returns the mailboxes, for the SIP server (TelephonyProvider's setVoicemailBoxes).
+   * Who holds each extension of the tenant now: each gets a mailbox (kept, moved with its messages from the extension
+   * its holder had, or made). The others are set aside with their messages, out of reach of any call, and removed only
+   * after a grace period if their holder has not come back. Returns the mailboxes, for the SIP server
+   * (TelephonyProvider's setVoicemailBoxes).
    */
   syncMailboxes(holders: { extension: string; userId: string; displayName?: string }[]): Promise<VoicemailBox[]>
   /** Whether the mailbox of `owner.extension` is `owner.userId`'s (the events of a mailbox go to its holder only). */
   owns(owner: VoicemailOwner): Promise<boolean>
   /** The messages of the owner's mailbox, newest first; none when they have no mailbox. */
   listMessages(owner: VoicemailOwner): Promise<Voicemail[]>
-  /** The recording of a message (WAV), undefined when the owner's mailbox has no such message. */
-  getRecording(owner: VoicemailOwner, id: string): Promise<{ contentType: string; body: Uint8Array } | undefined>
+  /**
+   * The recording of a message (WAV), as a stream read once (`size`: its length in bytes when known), undefined when
+   * the owner's mailbox has no such message. The stream fails past the provider's bound of a recording.
+   */
+  getRecording(owner: VoicemailOwner, id: string): Promise<{ contentType: string; size?: number; body: AsyncIterable<Uint8Array> } | undefined>
   /** Marks a message as read (listened to); false when the owner's mailbox has no such message. */
   markRead(owner: VoicemailOwner, id: string): Promise<boolean>
   /** Deletes a message; false when the owner's mailbox has no such message. */
   deleteMessage(owner: VoicemailOwner, id: string): Promise<boolean>
+  /** Deletes every message of the person, in any mailbox held for them (step 10's erasure); how many. */
+  eraseMessages(owner: Pick<VoicemailOwner, 'userId'>): Promise<number>
+  /** Deletes the messages left before `before`, in every mailbox (the retention period); how many. */
+  purgeMessages(before: Date): Promise<number>
   /**
    * The `voicemail.*` events, by the extension of the mailbox (a message left, read, deleted), whichever screen or
    * phone did it. The Gateway tells them to the extension's holder if it is the mailbox's (owns).

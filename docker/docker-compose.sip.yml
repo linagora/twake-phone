@@ -143,16 +143,22 @@ services:
   # tag), on the loopback, each on its port: Wazo's database (54330), its bus (RabbitMQ, 5672), wazo-auth (9497),
   # wazo-confd (9486), wazo-confgend (8669), Asterisk (5100/udp SIP, 5038 AMI, 5039 ARI, 32000-32100/udp RTP),
   # wazo-amid (9491), wazo-calld (9500), wazo-websocketd (9502), and two stand-ins of this stack: the accounts
-  # wazo-auth-keys makes on a Wazo (wazo-bootstrap) and the part of wazo-sysconfd wazo-confd uses (8668). Passwords
-  # and keys are this stack's own, or Wazo's defaults, for development and CI only (as twake:twake for PostgreSQL).
-  # Their healthchecks run every 2 s while they start (start_interval), then every minute: run every 2 s, they kept a CPU
-  # of the CI's runner busy, which the browsers and LiveKit SIP (it refuses calls on a loaded machine) need.
+  # wazo-auth-keys makes on a Wazo (wazo-bootstrap) and the part of wazo-sysconfd wazo-confd uses (8668). Nothing
+  # listens off the loopback (docker/wazo/check-loopback.py, a step of the CI: review 11a, n°4). Passwords and keys are
+  # this stack's own, never Wazo's nor RabbitMQ's public defaults (the database's, ARI's, the bus's guest), for
+  # development and CI only (as twake:twake for PostgreSQL).
+  # Their healthchecks run every 2 s while they start (start_interval, Docker Engine 25 or later: an older one ignores
+  # it and checks every minute only, the stack then taking minutes to start), then every minute: run every 2 s, they
+  # kept a CPU of the CI's runner busy, which the browsers and LiveKit SIP (it refuses calls on a loaded machine) need.
+  # Its image has no other tag than latest, which moves: the digest is what is used (review 11a, n°16), the tag only
+  # says which repository. Its account's password is Wazo's public default (proformatique): the healthcheck sets this
+  # stack's own before it says healthy, so before any service of Wazo connects (a database kept by a restart has it).
   wazo-db:
     image: wazoplatform/wazo-confd-db:latest@sha256:76b5e45d790496c338ae4ec4a69cfbb7a0e1fe6cf4bf9e522c73409f517a1243
     command: ["-p", "54330", "-c", "listen_addresses=127.0.0.1"]
     network_mode: host
     healthcheck:
-      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-p", "54330", "-U", "asterisk"]
+      test: ["CMD-SHELL", "pg_isready -q -h 127.0.0.1 -p 54330 -U asterisk && { PGPASSWORD=twake-wazo-dev-only-db psql -h 127.0.0.1 -p 54330 -U asterisk -d asterisk -qAtc 'SELECT 1' >/dev/null 2>&1 || PGPASSWORD=proformatique psql -h 127.0.0.1 -p 54330 -U asterisk -d asterisk -qAtc \"ALTER ROLE asterisk PASSWORD 'twake-wazo-dev-only-db'\" >/dev/null; }"]
       interval: 60s
       start_period: 5m
       start_interval: 2s
@@ -162,9 +168,12 @@ services:
   # Wazo's bus, the loopback only (AMQP, Erlang's port mapper and distribution port, the metrics of its Prometheus
   # plugin). Its node is named after localhost, not the machine: where the machine's name resolves off the loopback
   # (a CI runner), the port mapper would be looked for there, and RabbitMQ would not start.
+  # RabbitMQ 4.3 (maintained), pinned by digest; its account is this stack's, not guest.
   rabbitmq:
-    image: rabbitmq:3.13.7-alpine
+    image: rabbitmq:4.3.6-alpine@sha256:6931816af1a943f471c038b278835d36692d55dec769232739296bb91b7de0f5
     environment:
+      RABBITMQ_DEFAULT_USER: wazo
+      RABBITMQ_DEFAULT_PASS: twake-wazo-dev-only-bus
       RABBITMQ_NODENAME: rabbit@localhost
       RABBITMQ_NODE_IP_ADDRESS: 127.0.0.1
       ERL_EPMD_ADDRESS: 127.0.0.1
@@ -279,6 +288,11 @@ services:
       WAZO_RTP_ADDRESS: 127.0.0.1
       WAZO_RTP_MIN: "32000"
       WAZO_RTP_MAX: "32100"
+      # This stack's own passwords: the ARI account of wazo-calld and wazo-confd, the database's (set by wazo-db's healthcheck).
+      WAZO_ARI_PASSWORD: twake-wazo-dev-only-ari
+      WAZO_DB_PASSWORD: twake-wazo-dev-only-db
+      # The longest a call to a mailbox lasts (review 11a, n°3), as OpenSIPS bounds it.
+      VOICEMAIL_MAX_CALL_SEC: ${VOICEMAIL_MAX_CALL_SEC:-300}
     volumes:
       - ./wazo/asterisk/entrypoint.sh:/twake/entrypoint.sh:ro
       - ./wazo/asterisk/extensions.conf:/etc/asterisk/extensions.d/01-wazo.conf:ro
@@ -442,6 +456,8 @@ services:
       WAZO_SIP: ${WAZO_SIP-127.0.0.1:5100}
       WAZO_LISTEN_IP: ${WAZO_LISTEN_IP:-127.0.0.1}
       WAZO_PORT: ${WAZO_PORT:-5095}
+      # The longest a call to a mailbox lasts (review 11a, n°3); Asterisk bounds it too.
+      VOICEMAIL_MAX_CALL_SEC: ${VOICEMAIL_MAX_CALL_SEC:-300}
     network_mode: host
     healthcheck:
       test: ["CMD-SHELL", "test -p /tmp/opensips_fifo"]

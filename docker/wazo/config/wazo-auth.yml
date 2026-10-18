@@ -1,14 +1,15 @@
 # wazo-auth for the development and CI stack (docker-compose.sip.yml, ADR 0022): on the loopback, Wazo's database and
 # bus of this stack. Its first user (`bootstrap_user_*`, every right) is what wazo-bootstrap makes the service accounts
-# with; development values only, as the database's.
+# with; development values only, as the database's and the bus's (this stack's own, never Wazo's or RabbitMQ's public
+# defaults: review 11a, n°4).
 debug: false
 log_level: info
 rest_api:
   listen: 127.0.0.1
   port: 9497
-db_uri: postgresql://asterisk:proformatique@127.0.0.1:54330/asterisk?application_name=wazo-auth
+db_uri: postgresql://asterisk:twake-wazo-dev-only-db@127.0.0.1:54330/asterisk?application_name=wazo-auth
 amqp:
-  uri: amqp://guest:guest@127.0.0.1:5672/
+  uri: amqp://wazo:twake-wazo-dev-only-bus@127.0.0.1:5672/
 service_discovery:
   enabled: false
 bootstrap_user_on_startup: true

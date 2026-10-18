@@ -19,9 +19,15 @@ confd:
 bus:
   host: 127.0.0.1
   port: 5672
+  # The bus account of this stack (RABBITMQ_DEFAULT_USER and _PASS of docker-compose.sip.yml), not RabbitMQ's guest.
+  username: wazo
+  password: twake-wazo-dev-only-bus
 ari:
   connection:
     base_url: http://127.0.0.1:5039
+    # The ARI account docker/wazo/asterisk/entrypoint.sh writes (WAZO_ARI_PASSWORD), not Wazo's public default.
+    username: xivo
+    password: twake-wazo-dev-only-ari
 amid:
   host: 127.0.0.1
   port: 9491

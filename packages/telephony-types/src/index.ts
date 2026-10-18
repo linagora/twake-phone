@@ -643,6 +643,11 @@ export interface WebhookCall {
   /** A conference's call (step 8b): the room called this person. */
   conference?: true
   /**
+   * The call went to a mailbox (step 11a, review n°11): nobody took it, the voicemail server did. For the caller,
+   * `answered_at` and `outcome: answered` are the mailbox's answer, not the person's; for the callee it is missed.
+   */
+  voicemail?: true
+  /**
    * Where TwakePhone knows the call from: `opensips`, the SIP server, as it happens. The operator's records come
    * later (step 10b: read every 10 minutes) and are reconciled in the history (`GET /calls/history`, its `sources`),
    * not told again.

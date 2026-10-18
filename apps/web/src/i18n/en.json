@@ -791,8 +791,8 @@
   "voicemail.unreadCount": "Unread messages: {count}",
   "voicemail.allRead": "All messages have been read.",
   "voicemail.new": "New",
-  "voicemail.arrived": "New message from {who}",
-  "voicemail.durationLabel": "Length {duration}",
+  "voicemail.arrived": "New message from {who}, received at {time} ({count} unread)",
+  "voicemail.durationLabel": "duration {duration}",
   "voicemail.listen": "Listen",
   "voicemail.listenTo": "Listen to the message from {who}",
   "voicemail.player": "Message from {who}",
@@ -864,5 +864,8 @@
   "admin.operator.restoreRefused.outbound": "Line {line}: its forwards from before the platform ({forwards}) will not be put back: they go to a number its trunk does not call.",
   "admin.operator.closed.unrestored.loop": "Line {line}: forward removed on {at}, its forwards from before not put back (they would bring the calls back to the platform)",
   "admin.operator.closed.unrestored.outbound": "Line {line}: forward removed on {at}, its forwards from before not put back (a number its trunk does not call)",
-  "admin.operator.closed.unrestored.refused": "Line {line}: forward removed on {at}, its forwards from before not put back (the operator did not keep them as they were)"
+  "admin.operator.closed.unrestored.refused": "Line {line}: forward removed on {at}, its forwards from before not put back (the operator did not keep them as they were)",
+  "voicemail.deleted": "Message from {who} deleted.",
+  "voicemail.markedRead": "Message from {who} marked as read.",
+  "call.voicemailOf": "Voicemail of {who}"
 }

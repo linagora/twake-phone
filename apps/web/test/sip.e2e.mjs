@@ -37,6 +37,7 @@
 //   WAZO_USER, WAZO_PASSWORD             the Gateway's account in Wazo (default the stack's development one)
 import { randomBytes } from 'node:crypto'
 import { createSocket } from 'node:dgram'
+import { readFileSync } from 'node:fs'
 import { createServer, connect } from 'node:net'
 import { fileURLToPath } from 'node:url'
 import pg from 'pg'
@@ -49,6 +50,7 @@ import { DirectorySync } from '../../gateway/dist/directory-sync.js'
 import { DEFAULT_ATTRIBUTES, LdapDirectory } from '../../gateway/dist/ldap-directory.js'
 import { storedOpensipsFactory } from '../../gateway/dist/providers.js'
 import { WazoVoicemail } from '../../../packages/provider-wazo/dist/index.js'
+import { holderSecretOf } from '../../gateway/dist/voicemail.js'
 import { ProviderRegistry } from '../../gateway/dist/registry.js'
 import { SubscriberProvisioner } from '../../../packages/provider-opensips/dist/subscriber.js'
 import { MemoryStore } from '../../gateway/dist/store/memory.js'
@@ -58,6 +60,7 @@ import { startPushService } from '../../gateway/test/push-service.mjs'
 import { startWebhookReceiver } from '../../gateway/test/webhook-receiver.mjs'
 import { startOidcMock } from './oidc-mock.mjs'
 import { serveApp } from '../server/serve.mjs'
+import { sipPhone } from './sip-phone.mjs'
 import { sipUa } from './sip-ua.mjs'
 import { plainRtp, startOperator } from './sip-trunk.mjs'
 
@@ -132,11 +135,17 @@ const until = async (what, fn, { timeout = 15_000, every = 250 } = {}) => {
  * A TCP relay in front of the SIP WebSocket: the browsers register through it, and the test cuts every connection
  * at once to prove the softphone comes back on its own. The TLS bytes pass untouched (the certificate is OpenSIPS's).
  */
-const startRelay = (targetHost, targetPort, port) =>
+const startRelay = (targetHost, targetPort, port, { refusing = false } = {}) =>
   new Promise((resolve, reject) => {
     const sockets = new Set()
     const pairs = []
+    // Refusing: listening already (its port is its own from the start), every connection closed at once until open().
+    let open = !refusing
     const server = createServer(client => {
+      if (!open) {
+        client.destroy()
+        return
+      }
       const upstream = connect(targetPort, targetHost)
       sockets.add(client).add(upstream)
       pairs.push({ client, upstream })
@@ -153,6 +162,9 @@ const startRelay = (targetHost, targetPort, port) =>
     server.on('error', reject)
     server.listen(port, '127.0.0.1', () =>
       resolve({
+        port: server.address().port,
+        /** A relay started refusing relays from now on. */
+        open: () => void (open = true),
         /** Drops the SIP server's side of the n-th connection only: the browser keeps its socket and suspects nothing. */
         cutUpstream: n => {
           const pair = pairs[n]
@@ -286,24 +298,32 @@ const receiver = await startWebhookReceiver()
 // Step 11a: Wazo out of reach until the voicemail steps (nothing listens where the Gateway reaches it), as a Wazo that
 // starts after the Gateway or is down a while: every call before them ends as without mailboxes. Those steps open the
 // way, a TCP relay to each of its APIs, and the Gateway makes the mailboxes without a restart.
+// Each relay listens from the start on a port of its own (review 11a, n°27: none picked then freed, which another
+// process could take meanwhile), closing every connection until openWazo().
 const WAZO_APIS = ['authUrl', 'confdUrl', 'calldUrl', 'websocketdUrl']
 const wazoVia = {}
+const wazoRelays = []
 for (const api of WAZO_APIS) {
   const target = new URL(WAZO[api])
+  const relay = await startRelay(target.hostname, Number(target.port || (/^(https|wss):$/.test(target.protocol) ? 443 : 80)), 0, { refusing: true })
+  wazoRelays.push(relay)
   const relayed = new URL(WAZO[api])
-  relayed.host = `127.0.0.1:${await freePort()}`
-  wazoVia[api] = { target, relayed }
+  relayed.host = `127.0.0.1:${relay.port}`
+  wazoVia[api] = { target, relayed, relay }
 }
-const wazoRelays = []
+let wazoOpen = false
 const openWazo = async () => {
-  for (const { target, relayed } of Object.values(wazoVia)) wazoRelays.push(await startRelay(target.hostname, Number(target.port || (/^(https|wss):$/.test(target.protocol) ? 443 : 80)), Number(relayed.port)))
+  for (const { relay } of Object.values(wazoVia)) relay.open()
+  wazoOpen = true
 }
 const wazo = new WazoVoicemail({
   ...WAZO,
   ...Object.fromEntries(WAZO_APIS.map(api => [api, wazoVia[api].relayed.toString()])),
+  // The key of the holders' prints, as the Gateway derives it from SECRETS_KEY (voicemail.ts).
+  holderSecret: holderSecretOf(key),
   reconnectMs: [1_000, 2_000, 5_000],
   // What it says while out of reach is what the steps expect; once reachable, everything.
-  logger: { info: () => {}, warn: m => wazoRelays.length && console.log(`[wazo] ${m}`), error: m => console.log(`[wazo] ${m}`) }
+  logger: { info: () => {}, warn: m => wazoOpen && console.log(`[wazo] ${m}`), error: m => console.log(`[wazo] ${m}`) }
 })
 const gateway = await buildApp(registry, {
   auth,
@@ -316,7 +336,10 @@ const gateway = await buildApp(registry, {
   conference,
   webhooks: { policy: { allowHttp: true, ports: [Number(new URL(receiver.url).port)] }, open: parseNetworks('127.0.0.1/32'), retryBaseMs: 1_000 },
   trunkWatchMs: 2_000,
-  voicemail: tenantId => (tenantId === TENANT ? wazo : undefined)
+  voicemail: tenantId => (tenantId === TENANT ? wazo : undefined),
+  // A synchronisation of the mailboxes that failed (Wazo out of reach) is tried again every 2 s here (review 11a,
+  // n°17: the steps wait for it, not for the 30 s of the Gateway's default).
+  voicemailRetryMs: [1_000, 2_000]
 })
 // LiveKit's webhooks as the Gateway answered them: signed with its key, each one 204.
 const livekitWebhooks = []
@@ -2908,9 +2931,24 @@ try {
       const { rows } = await db.query('SELECT caller, callee, sip_code, via FROM acc WHERE id > $1 ORDER BY id', [after])
       return rows.length ? rows.map(r => `${r.caller}>${r.callee} ${r.sip_code} ${r.via || '-'}`) : null
     })
-  // The greeting of a mailbox with none recorded (Asterisk's: "the person at extension 1 0 2 is unavailable", the
-  // instructions, the beep) lasts about 7 s on this stack's prompts: a message is what the caller says after it.
-  const GREETING_MS = 7_500
+  // The greeting of a mailbox with none recorded (docker/wazo/asterisk/extensions.conf): "Votre correspondant", the
+  // extension (to a caller of the platform only), "n'est pas disponible" or "est déjà en ligne", the instructions and
+  // the beep, as long as this stack's prompts last (read from their files, not guessed: review 11a, n°17), and 1.5 s
+  // more. A message is what the caller says after it.
+  const SOUNDS = new URL('../../../docker/wazo/asterisk/sounds/', import.meta.url)
+  /** How long a prompt plays: the bytes of its WAV's data chunk over its byte rate. */
+  const promptMs = name => {
+    const wav = readFileSync(new URL(`${name}.wav`, SOUNDS))
+    let byteRate = 0
+    for (let at = 12; at + 8 <= wav.length; at += 8 + wav.readUInt32LE(at + 4) + (wav.readUInt32LE(at + 4) % 2)) {
+      const id = wav.toString('ascii', at, at + 4)
+      if (id === 'fmt ') byteRate = wav.readUInt32LE(at + 16)
+      if (id === 'data' && byteRate) return (wav.readUInt32LE(at + 4) / byteRate) * 1_000
+    }
+    throw new Error(`${name}.wav: no data chunk`)
+  }
+  const greetingMs = ({ extension = '', busy = false } = {}) =>
+    ['vm-theperson', ...[...extension].map(d => `digits/${d}`), busy ? 'vm-isonphone' : 'vm-isunavail', 'vm-intro', 'beep'].reduce((ms, name) => ms + promptMs(name), 1_500)
   let jeanMailbox
   await step('step 11a: Wazo, out of reach since the Gateway started (nothing listened at its addresses): the Gateway was ready all along, saying its mailboxes degraded, and OpenSIPS had none; Wazo answers: without a restart, each holder of an extension has a mailbox in a TwakePhone context, handed to OpenSIPS', async () => {
     const before = await gateway.inject({ method: 'GET', url: '/ready' })
@@ -2919,11 +2957,11 @@ try {
     expectEqual(await mailboxRows(), [], 'voicemail_boxes while Wazo is out of reach')
     await openWazo()
     const holders = (await store.listMappings(TENANT)).map(m => m.extension).sort()
-    // The Gateway tries again on its own (1, 5, 15 then every 30 s): within 30 s of Wazo answering.
+    // The Gateway tries again on its own, every 2 s here (voicemailRetryMs; 1, 5, 15 then every 30 s by default).
     const boxes = await until('a mailbox for each holder in voicemail_boxes', async () => {
       const rows = await mailboxRows()
       return rows.length === holders.length ? rows : null
-    }, { timeout: 45_000 })
+    }, { timeout: 20_000 })
     expectEqual(boxes.map(b => b.extension), holders, 'the extensions with a mailbox')
     for (const b of boxes) if (!new RegExp(`^${b.extension}@[A-Za-z0-9_-]+$`).test(b.mailbox)) throw new Error(`mailbox of ${b.extension}: ${b.mailbox}`)
     expectEqual(new Set(boxes.map(b => b.mailbox.split('@')[1])).size, 1, 'contexts of the mailboxes')
@@ -2937,20 +2975,24 @@ try {
     expectEqual(caps.voicemail, true, 'voicemail capability for Jean')
     for (const m of (await jeanMailbox('GET', '/voicemails')).json().items) expectEqual((await jeanMailbox('DELETE', `/voicemails/${m.id}`)).statusCode, 204, 'DELETE of a message left by an earlier run')
   })
-  await step('step 11a, the demo: Jean does not want to be disturbed and looks at his Messagerie; Bob calls 102: Jean\'s mailbox answers, Bob speaks and hangs up; the message arrives in Jean\'s Messagerie as he looks at it, new, from Bob; Bob\'s Récents say « Messagerie », Jean\'s a missed call', async () => {
+  await step('step 11a, the demo: Jean does not want to be disturbed and looks at his Messagerie vocale; Bob calls 102: Jean\'s mailbox answers, Bob\'s panel says so, Bob speaks and hangs up; the message arrives in Jean\'s Messagerie vocale as he looks at it, new, from Bob, told with its time and the unread count; Bob\'s Récents say « Messagerie vocale », Jean\'s a missed call', async () => {
     await setStatus(jean, 'Ne pas déranger')
-    await jean.page.getByRole('link', { name: 'Messagerie' }).click()
-    await jean.page.getByRole('heading', { level: 1, name: 'Messagerie' }).waitFor()
+    await jean.page.getByRole('link', { name: 'Messagerie vocale' }).click()
+    await jean.page.getByRole('heading', { level: 1, name: 'Messagerie vocale' }).waitFor()
     await jean.page.getByText('Aucun message.').waitFor()
     const started = new Date().toISOString()
     const accFrom = await lastId('acc')
     const missedFrom = await lastId('missed_calls')
     await dial(bob.page, '102')
     await connected(bob.page, 'the call of Bob answered by the mailbox')
+    const answeredAt = Date.now()
     expectEqual(await jean.page.getByTestId('incoming-call').count(), 0, 'incoming calls on Jean side')
+    // His panel says whose mailbox he hears (review 11a, n°26: Twake-Voicemail in the answer OpenSIPS relayed).
+    const panel = await bob.page.getByText(/^Messagerie de /).first().textContent({ timeout: 10_000 })
+    if (!panel.includes('102')) throw new Error(`Bob's call panel says ${panel}`)
     // Bob hears the greeting and the mailbox hears him: the media of a browser to Asterisk, through rtpengine.
     await rtpBothWays(bob)
-    await sleep(GREETING_MS + 4_000)
+    await sleep(Math.max(0, answeredAt + greetingMs({ extension: '102' }) + 4_000 - Date.now()))
     await bob.page.getByRole('button', { name: 'Raccrocher' }).click()
     // Live: Jean's page is not reloaded, the message comes as an event (wazo-websocketd, then the Gateway's stream).
     const message = jean.page.getByTestId('voicemail')
@@ -2960,22 +3002,32 @@ try {
     const who = await message.locator('strong').textContent()
     if (!who.includes('103')) throw new Error(`the message is from ${who}, 103 expected`)
     await jean.page.getByText('Messages non lus : 1').waitFor()
-    expectEqual((await jean.page.locator('[aria-live=polite]').textContent()).startsWith('Nouveau message de'), true, 'what assistive tech is told')
+    const told = await jean.page.locator('[aria-live=polite]').textContent()
+    if (!/^Nouveau message de .+, reçu à \d{2}:\d{2} \(1 non lus\)/.test(told)) throw new Error(`what assistive tech is told: ${told}`)
     const [item, ...more] = (await jeanMailbox('GET', '/voicemails')).json().items
     expectEqual(more.length, 0, 'other messages for Jean')
     expectEqual(`${item.from} ${item.unread}`, '103 true', 'the message as the Gateway serves it')
     if (!(item.durationSec >= 2)) throw new Error(`the message lasts ${item.durationSec} s, Bob spoke 4 s`)
     // For Bob the mailbox answered; for Jean it is a missed call.
-    expectEqual((await recents(bob.page, 1))[0], '102: Messagerie', "Bob's newest recent call")
+    expectEqual((await recents(bob.page, 1))[0], '102: Messagerie vocale', "Bob's newest recent call")
     const jeanCall = await newestCall('jdupont', started)
     expectEqual(`${jeanCall.direction} ${jeanCall.remoteNumber} ${jeanCall.state}`, 'inbound 103 missed', "Jean's newest call")
     // Answered, by the mailbox: a CDR that says so, no row in OpenSIPS's missed_calls (Jean's history says it).
     expectEqual(await cdrsViaSince(accFrom), ['103>102 200 voicemail'], 'CDRs of the call')
     expectEqual(await missedSince(missedFrom), [], 'missed_calls rows of the call')
   })
+  await step('step 11a (review 11a, n°18): Bob asks, with his own account, for the recording of Jean\'s message, to mark it read and to delete it: 404 each time, against the real Wazo; the message is still Jean\'s, unread, and not in Bob\'s list', async () => {
+    const [item] = (await jeanMailbox('GET', '/voicemails')).json().items
+    const bobApi = await asPerson(bob)
+    expectEqual((await bobApi('GET', `/voicemails/${item.id}/audio`)).statusCode, 404, "Bob's GET of the recording of Jean's message")
+    expectEqual((await bobApi('POST', `/voicemails/${item.id}/read`, {})).statusCode, 404, "Bob's POST /read of Jean's message")
+    expectEqual((await bobApi('DELETE', `/voicemails/${item.id}`)).statusCode, 404, "Bob's DELETE of Jean's message")
+    expectEqual((await bobApi('GET', '/voicemails')).json().items.some(i => i.id === item.id), false, "Jean's message in Bob's list")
+    expectEqual((await jeanMailbox('GET', '/voicemails')).json().items.map(i => `${i.id} ${i.unread}`), [`${item.id} true`], "Jean's message after Bob's requests")
+  })
   await step('step 11a: Jean listens to it in the page (the recording, from Wazo), marks it read, then calls Bob back from it: Bob\'s browser rings, they talk', async () => {
     await setStatus(jean, 'Disponible')
-    await jean.page.getByRole('link', { name: 'Messagerie' }).click()
+    await jean.page.getByRole('link', { name: 'Messagerie vocale' }).click()
     const message = jean.page.getByTestId('voicemail')
     await message.getByRole('button', { name: /^Écouter le message de / }).click()
     // It plays: its length known (a WAV of a few seconds), its time going.
@@ -2996,10 +3048,12 @@ try {
     await bob.page.getByRole('button', { name: 'Raccrocher' }).click()
     await jean.page.getByText('Appel avec Bob Durand (103) terminé.').waitFor()
   })
-  await step('step 11a: Jean deletes it: gone from his Messagerie, and from Wazo', async () => {
-    await jean.page.getByRole('link', { name: 'Messagerie' }).click()
+  await step('step 11a: Jean deletes it: gone from his Messagerie vocale, and from Wazo; the focus on the title, the deletion told', async () => {
+    await jean.page.getByRole('link', { name: 'Messagerie vocale' }).click()
     await jean.page.getByTestId('voicemail').getByRole('button', { name: /^Supprimer le message de / }).click()
     await jean.page.getByText('Aucun message.').waitFor()
+    expectEqual(await jean.page.evaluate(() => document.activeElement?.tagName), 'H1', 'the focus once the last message is deleted')
+    if (!/^Message de .+ supprimé\./.test(await jean.page.locator('[aria-live=polite]').textContent())) throw new Error('the deletion was not told')
     expectEqual((await jeanMailbox('GET', '/voicemails')).json().items, [], "Jean's messages after he deleted it")
   })
   await step('step 11a: Jean declines Bob\'s call: Bob reaches Jean\'s mailbox (its "busy" greeting) and hangs up before the beep: no message', async () => {
@@ -3018,7 +3072,9 @@ try {
     expectEqual(await missedSince(missedFrom), ['103>102 603'], 'missed_calls rows of the call')
     const jeanCall = await newestCall('jdupont', started)
     expectEqual(`${jeanCall.direction} ${jeanCall.remoteNumber} ${jeanCall.state}`, 'inbound 103 rejected', "Jean's newest call")
-    await sleep(3_000)
+    // The call over at OpenSIPS (no dialog to 102 left, review 11a, n°17) and at Bob's (Asterisk answered his BYE).
+    await until('the end of the call to the mailbox at OpenSIPS', async () => (((await mi('dlg_list')).result?.Dialogs ?? []).some(d => JSON.stringify(d).includes('sip:102@')) ? null : true))
+    await until('the end of the call on Bob side', async () => ((await calls(bob.page)).length === 0 ? true : null))
     expectEqual((await jeanMailbox('GET', '/voicemails')).json().items, [], "Jean's messages after Bob hung up during the greeting")
   })
   await step('step 11a: Jean does not answer: after his no-answer forward to 104 (5 s), where nobody answers either, the mailbox of 102 takes the call, not that of 104; Bob\'s message is Jean\'s', async () => {
@@ -3029,8 +3085,9 @@ try {
       await dial(bob.page, '102')
       await jean.page.getByTestId('incoming-call').getByText('Appel entrant de Bob Durand (103)').waitFor({ timeout: 20_000 })
       await connected(bob.page, 'the call of Bob answered by the mailbox')
+      const answeredAt = Date.now()
       await rtpBothWays(bob)
-      await sleep(GREETING_MS + 3_000)
+      await sleep(Math.max(0, answeredAt + greetingMs({ extension: '102' }) + 3_000 - Date.now()))
       await bob.page.getByRole('button', { name: 'Raccrocher' }).click()
       expectEqual(await cdrsViaSince(accFrom), ['103>102 200 voicemail'], 'CDRs of the call')
       const items = await until("Bob's message in Jean's mailbox", async () => {
@@ -3062,6 +3119,76 @@ try {
     } finally {
       await db.query("UPDATE voicemail_boxes SET mailbox = $1 WHERE extension = '104'", [row.mailbox])
     }
+  })
+  await step('step 11a (review 11a, n°5 and n°7): Jean does not want to be disturbed; the operator calls his direct number +33 1 99 00 01 02 from +33 6 39 98 00 08 with an X-Twake-Mailbox and an X-Twake-Voicemail of its own (Bob\'s mailbox): Jean\'s mailbox answers the operator (200, plain RTP, sound both ways, VOICEMAIL_MAX_CALL_SEC at most); meanwhile, under a cap of one external call at a time, Alice\'s call to the operator still goes; the caller speaks and hangs up; the CDR says voicemail; the message is Jean\'s, none Bob\'s; the caps count nothing, no alert', async () => {
+    alice = await open('amartin', 'Alice Martin')
+    await phoneState(alice.page).getByText('En ligne').waitFor({ timeout: 20_000 })
+    const api = await asPerson(alice)
+    const jeanApi = await asPerson(jean)
+    const bobApi = await asPerson(bob)
+    const bobsBox = (await mailboxRows()).find(r => r.extension === '103').mailbox
+    const bobsBefore = (await bobApi('GET', '/voicemails')).json().items.length
+    await setStatus(jean, 'Ne pas déranger')
+    const started = new Date().toISOString()
+    const accFrom = await lastId('acc')
+    const usage = async () => (await db.query('SELECT coalesce(sum(calls), 0)::int AS calls, coalesce(sum(seconds), 0)::int AS seconds FROM outbound_usage')).rows[0]
+    const used = await usage()
+    expectEqual((await api('PUT', '/admin/outbound', { policy: { caps: { concurrent: 1 }, fraud: FRAUD } })).statusCode, 200, 'PUT /admin/outbound (one external call at a time)')
+    try {
+      const placed = await operator.call('+33199000102', { from: '+33639980008', ruri: TRUNK_LOGIN, headers: [`X-Twake-Mailbox: ${bobsBox}`, 'X-Twake-Voicemail: busy'] })
+      const answer = await placed.final
+      const answeredAt = Date.now()
+      // Bob's mailbox would have been refused by the dialplan (not the extension called), the caller given Jean's 480.
+      expectEqual(answer.status, 200, "the mailbox's answer to the operator")
+      if (!plainRtp(answer.body)) throw new Error(`the answer of the mailbox to the operator: ${answer.body}`)
+      if (/^Twake-/im.test(answer.raw.split('\r\n\r\n')[0])) throw new Error(`a header of the platform sent to the operator: ${answer.raw.split('\r\n\r\n')[0]}`)
+      expectEqual(await jean.page.getByTestId('incoming-call').count(), 0, 'incoming calls on Jean side')
+      const dialog = await until('the dialog of the call to the mailbox', async () => ((await mi('dlg_list')).result?.Dialogs ?? []).find(d => d.callid === placed.callId) ?? null)
+      const left = Number(dialog.timeout) - Math.floor(Date.now() / 1000)
+      if (!(left > 0 && left <= 300)) throw new Error(`the call to the mailbox ends in ${left} s, VOICEMAIL_MAX_CALL_SEC (300) at most expected`)
+      // Not an external call of the platform: Alice's still goes under the cap of one (the operator busy, 486).
+      operator.state.next.push({ reply: '486 Busy Here' })
+      const out = await dialUntilEnded(alice.page, '06 39 98 00 09')
+      await operator.invited(invite => invite.uri === 'sip:+33639980009@operator.example')
+      expectEqual(`${out.endStatus}`, '486', "how Alice's call to the operator ended during the call to the mailbox")
+      await until('the greeting at the operator', () => (placed.media.stats.voiced > 20 ? true : null))
+      await sleep(Math.max(0, answeredAt + greetingMs() + 4_000 - Date.now()))
+      expectEqual((await placed.hangup()).status, 200, 'answer to the operator BYE')
+    } finally {
+      expectEqual((await api('PUT', '/admin/outbound', { policy: { fraud: FRAUD } })).statusCode, 200, 'PUT /admin/outbound (no cap)')
+      await setStatus(jean, 'Disponible')
+    }
+    expectEqual(await cdrsViaSince(accFrom), ['+33639980008>102 200 voicemail'], 'CDRs of the call')
+    const items = await until("the operator's message in Jean's mailbox", async () => {
+      const { items } = (await jeanApi('GET', '/voicemails')).json()
+      return items.some(i => i.from === '+33639980008') ? items : null
+    })
+    const [message, ...others] = items
+    expectEqual(`${message.from} ${message.unread} ${others.length}`, '+33639980008 true 0', "Jean's messages")
+    if (!(message.durationSec >= 2)) throw new Error(`the message lasts ${message.durationSec} s, the operator spoke 4 s`)
+    expectEqual((await bobApi('GET', '/voicemails')).json().items.length, bobsBefore, "Bob's messages")
+    expectEqual(await usage(), used, 'outbound_usage (the caps)')
+    expectEqual((await store.listAlerts(TENANT, { limit: 100 })).filter(a => a.lastAt > started).map(a => `${a.kind} ${a.param}`), [], 'alerts since the call')
+    expectEqual((await jeanApi('DELETE', `/voicemails/${message.id}`)).statusCode, 204, 'DELETE of the message')
+    await signOut(alice)
+  })
+  await step('step 11a (review 11a, n°7): a phone of the platform (an agent of this process, 135) calls Jean, who does not want to be disturbed, with an X-Twake-Mailbox of its own (Bob\'s mailbox) and an X-Twake-Voicemail: Jean\'s mailbox answers all the same (Asterisk refuses a mailbox that is not the extension called): those headers never reached it', async () => {
+    await store.upsertMapping({ tenantId: TENANT, userId: 'ua-135', extension: '135', displayName: 'Fenêtre 135' })
+    const { credential } = await registry.forTenant(TENANT).getSession({ id: 'ua-135', tenantId: TENANT, displayName: 'Fenêtre 135', extension: '135' }, { id: 'ua', type: 'browser', label: 'UA' })
+    const bobsBox = (await mailboxRows()).find(r => r.extension === '103').mailbox
+    await setStatus(jean, 'Ne pas déranger')
+    const accFrom = await lastId('acc')
+    const phone = await sipPhone({ proxy: SIP_UDP, domain: SIP_DOMAIN, user: '135', password: credential })
+    try {
+      expectEqual(await phone.register(), 200, 'registration of 135')
+      const call = await phone.dial('102', { extra: [`X-Twake-Mailbox: ${bobsBox}`, 'X-Twake-Voicemail: busy'] })
+      expectEqual(call.final?.status, 200, "the answer to the call of 135 to 102 (Jean's mailbox)")
+      expectEqual((await phone.hangup(call)).status, 200, 'answer to the BYE of 135')
+    } finally {
+      await phone.close()
+      await setStatus(jean, 'Disponible')
+    }
+    expectEqual(await cdrsViaSince(accFrom), ['135>102 200 voicemail'], 'CDRs of the call')
   })
   await step('the directory now shows Alice offline, and Bob available', async () => {
     await presenceIs(jean.page, 'Martin', '101', 'Hors ligne')
