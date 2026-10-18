@@ -245,10 +245,11 @@ export interface TelephonyAlert {
    * review 10b, n°2 and n°4, `number` the line): left as it was because someone changed it in the manager since
    * (`removal-changed`), let go because the operator no longer has the line (`removal-gone`), owed for over a day
    * (`removal-late`). `voicemail` (step 11a): raised by the Gateway, the synchronisation of the mailboxes fails since
-   * `value` minutes (`sync-failing`, third review n°11), or keeps leaving out `value` mailboxes the voicemail server
-   * refuses (`boxes-refused`, fourth review n°12); raised by the SIP server, the callers with no number reached their
-   * cap at the mailbox of `extension`, at the same time (`hidden-calls`) or in the hour (`hidden-hour`, fourth review
-   * n°8).
+   * `value` minutes (`sync-failing`), the SIP server's database refused its write under the lease it holds
+   * (`sync-fenced`), or it keeps leaving out `value` mailboxes the voicemail server refuses (`boxes-refused`); raised by
+   * the SIP server, a call to the mailbox of `extension` refused for a cap, `value` of `threshold`: of the callers with
+   * no number there, at the same time (`hidden-calls`) or in the hour (`hidden-hour`), of those with no number to all
+   * the mailboxes (`hidden-all`), or of all callers (`calls-all`).
    */
   kind: 'fraud-warning' | 'fraud-critical' | 'limit' | 'rights' | 'emergency' | 'meet' | 'webhook' | 'operator' | 'voicemail'
   param: string

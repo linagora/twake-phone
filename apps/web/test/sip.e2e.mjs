@@ -39,7 +39,7 @@
 // (docker compose -f docker/docker-compose.sip.yml exec wazo-asterisk; COMPOSE_PROJECT_NAME as Docker Compose reads
 // it), and docker/wazo/check-loopback.py runs during a call to a mailbox (as root: sudo -n when this is not root).
 import { execFileSync } from 'node:child_process'
-import { randomBytes } from 'node:crypto'
+import { createHmac, randomBytes } from 'node:crypto'
 import { createSocket } from 'node:dgram'
 import { readFileSync } from 'node:fs'
 import { createServer, connect } from 'node:net'
@@ -2928,6 +2928,24 @@ try {
     const got = await mi('cache_fetch', { system: 'local', attr: key })
     return got.result?.value === undefined ? 0 : Number(got.result.value)
   }
+  /** OpenSIPS's shared variable `name` (MI shv_get), as a string. */
+  const shvOf = async name => {
+    const result = (await mi('shv_get', { name })).result
+    // OpenSIPS 3.6 answers a variable asked by its name as { VAR: { type, value } }; the list forms are read as well.
+    const value = result?.VAR?.value ?? [result?.VARs ?? result].flat(3).find(v => v && typeof v === 'object' && v.name === name)?.value
+    if (value === undefined) throw new Error(`shv_get ${name}: ${JSON.stringify(result)}`)
+    return String(value)
+  }
+  /** The print OpenSIPS counts a caller by (route[voicemail]): HMAC-SHA256 of the number with its key of the start. */
+  const whoOf = async number => createHmac('sha256', await shvOf('vm_key')).update(number).digest('hex').slice(0, 24)
+  /** The key of the calls of `number` to the mailbox of `extension` in the hour: by its print, by the mailbox. */
+  const hourKey = async (number, extension) => `vm:h:${await whoOf(number)}:${(await mailboxRows()).find(r => r.extension === extension).mailbox}`
+  /** The commands wazo-sysconfd ran for wazo-confd since `since` (module reloads of Asterisk), from its log. */
+  const reloadsSince = since =>
+    execFileSync('docker', ['compose', '-f', COMPOSE_FILE, 'logs', '--no-log-prefix', '--since', since, 'wazo-sysconfd'], { encoding: 'utf8', timeout: 30_000 })
+      .split('\n')
+      .map(l => /sysconfd: ran '([^']+)'/.exec(l)?.[1])
+      .filter(Boolean)
   // Asterisk of the stack, in its container (second review 11a, n°6, n°7 and n°13): its CLI, a command of its own.
   const COMPOSE_FILE = fileURLToPath(new URL('../../../docker/docker-compose.sip.yml', import.meta.url))
   const inAsterisk = (...args) => execFileSync('docker', ['compose', '-f', COMPOSE_FILE, 'exec', '-T', 'wazo-asterisk', ...args], { encoding: 'utf8', timeout: 30_000 })
@@ -3231,14 +3249,14 @@ try {
     await bob.page.getByRole('button', { name: 'Raccrocher' }).click()
     expectEqual(await cdrsViaSince(accFrom), ['103>101 200 voicemail'], 'CDRs of the call')
     const [row] = (await db.query("SELECT mailbox FROM voicemail_boxes WHERE extension = '104'")).rows
-    const hour = await hourOf('vm:h:103:104')
+    const gone = `vm:h:${await whoOf('103')}:104@twake-gone`
     try {
       await db.query("UPDATE voicemail_boxes SET mailbox = '104@twake-gone' WHERE extension = '104'")
       const ended = await dialUntilEnded(bob.page, '104')
       expectEqual(`${ended.endStatus} ${ended.endReason}`, '404 unavailable', 'how the call to a mailbox Wazo does not have ended')
       await bob.page.getByText('104 est injoignable.').waitFor()
-      // Counted when it went to the mailbox, counted out when Asterisk refused it: back to what it was.
-      expectEqual(await hourOf('vm:h:103:104'), hour, "Bob's calls to the mailbox of 104 in the hour, after its refusal")
+      // Counted when it went to the mailbox, counted out when Asterisk refused it: nothing left (never -1).
+      expectEqual(await hourOf(gone), 0, "Bob's calls to the mailbox Wazo does not have in the hour, after its refusal")
     } finally {
       await db.query("UPDATE voicemail_boxes SET mailbox = $1 WHERE extension = '104'", [row.mailbox])
     }
@@ -3383,17 +3401,19 @@ try {
     if (!external.some(c => c.execIf?.includes('"0?SayDigits(')) || external.some(c => c.said || (c.execIf && !c.execIf.includes('"0?SayDigits(')))) throw new Error(`the calls from outside: ${JSON.stringify(external)}`)
     if (!internal.some(c => c.said && c.execIf?.includes('"1?SayDigits(102)"'))) throw new Error(`the calls of the platform: ${JSON.stringify(internal)}`)
   })
-  await step('step 11a (third review 11a, n°7; fourth review n°8): the caps of the calls to the mailboxes, lowered a moment (MI shv_set: one call of a caller at a time, one of all who have no number to a mailbox, two of a caller to a mailbox in an hour): the operator calls Alice (101, signed out: her mailbox at once) from +33 6 39 98 00 51; a second call of that number meanwhile gets what it would have had without the mailbox and counts for nothing in the hour; a third once the first ended is the mailbox\'s, a fourth is past the hour\'s; a number hidden at the caller\'s request (Privacy: id) counts as that caller\'s, apart from the others: a second call of it waits, another hidden number goes; those with no number at all are one caller at that mailbox: the second at once gets its refusal, and the administrators are told', async () => {
+  await step('step 11a (third review 11a, n°7; fourth review n°8): the caps of the calls to the mailboxes, lowered a moment (MI shv_set: one call of a caller at a time, one of all who have no number to a mailbox, two of a caller to a mailbox in an hour): the operator calls Alice (101, signed out: her mailbox at once) from +33 6 39 98 00 51; a second call of that number meanwhile gets what it would have had without the mailbox and counts for nothing in the hour; a third once the first ended is the mailbox\'s, a fourth is past the hour\'s; a number hidden at the caller\'s request (Privacy: id) counts as that caller\'s, by a keyed print of it (never the number in a key, a profile or a value of the dialog), apart from the others: a second call of it waits, another hidden number goes; those with no number at all are one caller at that mailbox: the second at once gets its refusal, and the administrators are told; all of them together have a bounded share of the places (lowered to one): one at Alice\'s mailbox, another is refused at Jean\'s while a caller with a number gets it, and the administrators are told', async () => {
     const shv = (name, value) => mi('shv_set', { name, type: 'int', value })
-    const keys = ['vm:h:+33639980051:101', 'vm:h:+33639980052:101', 'vm:h:+33639980053:101', 'vm:h:*hidden:101:101', 'vm:told:hidden-calls:101']
+    const alicesBox = (await mailboxRows()).find(r => r.extension === '101').mailbox
+    const jeansBox = (await mailboxRows()).find(r => r.extension === '102').mailbox
+    const keys = [await hourKey('+33639980051', '101'), await hourKey('+33639980052', '101'), await hourKey('+33639980053', '101'), `vm:h:*hidden:${alicesBox}:${alicesBox}`, `vm:told:hidden-calls:${alicesBox}`, 'vm:told:hidden-all', `vm:h:*hidden:${jeansBox}:${jeansBox}`, await hourKey('+33639980054', '102')]
     for (const key of keys) await mi('cache_remove', { system: 'local', attr: key })
     await shv('vm_per_caller', 1)
     await shv('vm_hidden', 1)
     await shv('vm_per_hour', 2)
     const open = []
-    /** A call of the operator to Alice's direct number: its final answer, the call kept open when answered. */
-    const ring = async (from, headers = []) => {
-      const placed = await operator.call('+33199000101', { from, ruri: TRUNK_LOGIN, headers })
+    /** A call of the operator to a direct number (Alice's by default): its final answer, the call kept open when answered. */
+    const ring = async (from, headers = [], to = '+33199000101') => {
+      const placed = await operator.call(to, { from, ruri: TRUNK_LOGIN, headers })
       const answer = await placed.final
       if (answer.status === 200) open.push(placed)
       return { placed, status: answer.status }
@@ -3428,6 +3448,22 @@ try {
       const other = await ring('+33639980053', ['Privacy: id'])
       expectEqual(other.status, 200, 'another hidden number at the same time: not shut out by the first')
       expectEqual([await hourOf(keys[1]), await hourOf(keys[2])], [1, 1], 'the calls of the hidden numbers to 101 in the hour, each its own')
+      // A hidden number is counted by its print only: never the number in a key of the count, a profile of the
+      // dialog (the MI, the `dialog` table), nor any value of the dialog.
+      expectEqual(await hourOf(`vm:h:+33639980052:${alicesBox}`), 0, 'a key of the count with the hidden number itself')
+      const prints = { [hidden.placed.callId]: await whoOf('+33639980052'), [other.placed.callId]: await whoOf('+33639980053') }
+      // Left out: `vsf`, where uac (restore_mode auto) keeps the From the operator sent, to give it back in that
+      // dialog's requests and replies, as the dialog's own From keeps it (ADR 0022, what remains).
+      const listed = ((await mi('dlg_list_ctx')).result?.Dialogs ?? []).filter(d => d.callid in prints)
+      expectEqual(listed.map(d => (d.context?.values ?? []).some(v => /39980052|39980053/.test(v.vsf ?? ''))), [true, true], 'the From the operator sent, kept by uac for that dialog')
+      const contexts = listed.map(d => JSON.stringify({ ...d.context, values: (d.context?.values ?? []).filter(v => !('vsf' in v)) }))
+      expectEqual(contexts.length, 2, 'the dialogs of the hidden numbers (MI dlg_list_ctx)')
+      if (contexts.some(c => /39980052|39980053/.test(c))) throw new Error(`the context of the dialog of a hidden number (MI): ${contexts.join(' ')}`)
+      const flushed = await until('the profiles of the calls of the hidden numbers in the dialog table', async () => {
+        const { rows } = await db.query('SELECT callid, profiles FROM dialog WHERE callid = ANY($1)', [Object.keys(prints)])
+        return rows.length === 2 && rows.every(r => String(r.profiles ?? '').includes(prints[r.callid])) ? rows : null
+      }, { timeout: 15_000 })
+      if (/39980052|39980053/.test(JSON.stringify(flushed))) throw new Error(`the dialog table keeps a hidden number in a profile: ${JSON.stringify(flushed)}`)
       // No number at all: one caller at this mailbox; the second at the same time refused, and said.
       const nobody = await ring('anonymous')
       expectEqual(nobody.status, 200, 'the answer of the mailbox to a caller with no number')
@@ -3438,6 +3474,24 @@ try {
         const alerts = (await store.listAlerts(TENANT, { limit: 100 })).filter(a => a.lastAt > started && a.alert.kind === 'voicemail')
         return alerts.some(a => a.alert.param === 'hidden-calls' && a.alert.extension === '101' && a.alert.value === 1 && a.alert.threshold === 1) ? alerts : null
       })
+      // Those with no number, all mailboxes together, have a bounded share of the places (VOICEMAIL_CALLS_HIDDEN_ALL,
+      // lowered to one): with one of them at Alice's mailbox, another is refused at Jean's (who does not want to be
+      // disturbed: his refusal, 480), and the administrators are told; a caller with a number still gets Jean's.
+      await setStatus(jean, 'Ne pas déranger')
+      try {
+        await shv('vm_hidden_all', 1)
+        const elsewhere = await ring('anonymous', [], '+33199000102')
+        expectEqual(elsewhere.status, 480, 'a caller with no number at the mailbox of 102, one already at that of 101')
+        const numbered = await ring('+33639980054', [], '+33199000102')
+        expectEqual(numbered.status, 200, 'a caller with a number at the mailbox of 102 meanwhile')
+        await until('the alert of the callers with no number at their share of all places', async () => {
+          const alerts = (await store.listAlerts(TENANT, { limit: 100 })).filter(a => a.lastAt > started && a.alert.kind === 'voicemail')
+          return alerts.some(a => a.alert.param === 'hidden-all' && a.alert.extension === '102' && a.alert.value === 1 && a.alert.threshold === 1) ? alerts : null
+        })
+      } finally {
+        await shv('vm_hidden_all', 10)
+        await setStatus(jean, 'Disponible')
+      }
       for (const placed of [...open]) await hangUp(placed)
     } finally {
       for (const placed of [...open]) await placed.hangup().catch(() => undefined)
@@ -3447,10 +3501,15 @@ try {
       for (const key of keys) await mi('cache_remove', { system: 'local', attr: key }).catch(() => undefined)
     }
     // The callee and the CDRs never see a hidden number.
-    expectEqual(await cdrsViaSince(accFrom), ['+33639980051>101 200 voicemail', '+33639980051>101 200 voicemail', 'anonymous>101 200 voicemail', 'anonymous>101 200 voicemail', 'anonymous>101 200 voicemail'], 'CDRs of the calls answered by the mailbox')
+    expectEqual(
+      await cdrsViaSince(accFrom),
+      ['+33639980051>101 200 voicemail', '+33639980051>101 200 voicemail', 'anonymous>101 200 voicemail', 'anonymous>101 200 voicemail', 'anonymous>101 200 voicemail', '+33639980054>102 200 voicemail'],
+      'CDRs of the calls answered by the mailbox'
+    )
     await wazo.eraseMessages({ userId: 'amartin' }).catch(() => 0)
+    await wazo.eraseMessages({ userId: 'jdupont' }).catch(() => 0)
   })
-  await step('step 11a (fourth review 11a, n°1): against the real Wazo, a person\'s mailbox is theirs whatever extension they hold, at a number of their own that never changes (wazo-sysconfd never moves it): Alice (101, signed out) and Claire Petit (108, new in the directory) each have a message from the operator; Alice moves to 109, then she and Claire swap 109 and 108: each time each one\'s message is theirs, its recording read, their folder in the spool where it was; messages left in the spool under 108 and 109 (numbers of extensions, as a mailbox of before would have left them) are nobody\'s: no mailbox shows them; Claire leaves the directory: her mailbox set aside with her message, which her erasure takes', async () => {
+  await step('step 11a (fourth review 11a, n°1): against the real Wazo, a person\'s mailbox is theirs whatever extension they hold, at a number of their own that never changes (wazo-sysconfd never moves it): Alice (101, signed out) and Claire Petit (108, new in the directory) each have a message from the operator; Alice moves to 109, then she and Claire swap 109 and 108: each time each one\'s message is theirs, its recording read, their folder in the spool where it was; messages left in the spool under 108 and 109 (numbers of extensions, as a mailbox of before would have left them) are nobody\'s: no mailbox shows them; nothing of it is written in Wazo (no reload of Asterisk), whose mailboxes and users carry nothing of the person; Claire leaves the directory: her mailbox set aside with her message (its name says since when), which an administrator has erased through the Gateway', async () => {
     const claire = { uid: 'cpetit', cn: 'Claire Petit', sn: 'Petit', givenName: 'Claire', mail: 'claire.petit@example.test', ipPhone: '108', ou: 'Support' }
     const aliceEntry = people.find(p => p.uid === 'amartin')
     const context = (await mailboxRows())[0].mailbox.split('@')[1]
@@ -3478,19 +3537,20 @@ try {
     const spoolIs = (want, what) => until(what, async () => (Object.entries(want).every(([n, count]) => spooled(n) === String(count)) ? true : null), { timeout: 30_000 })
     const rowsAre = (want, what) => until(what, async () => ((await Promise.all(Object.entries(want).map(async ([ext, box]) => (await boxAt(ext)) === box))).every(Boolean) ? true : null), { timeout: 30_000 })
     /**
-     * Where the Wazo user of a person's mailbox says it is (`twakephone:at=<extension>`, what its events say, or
-     * `twakephone:aside=<date>`), read in wazo-confd with the Gateway's own account: what its rights let it write.
+     * A person's mailbox and its user as wazo-confd has them, read with the Gateway's own account: the mailbox's name
+     * (TwakePhone, or `TwakePhone aside <date>`), and its user's name and description (nothing of the person).
      */
-    const placeOf = async userId => {
+    const wazoOf = async userId => {
       const basic = Buffer.from(`${WAZO.username}:${WAZO.password}`).toString('base64')
       const auth = await fetch(`${WAZO.authUrl}/token`, { method: 'POST', headers: { authorization: `Basic ${basic}`, 'content-type': 'application/json' }, body: JSON.stringify({ expiration: 60 }) })
       const token = (await auth.json()).data.token
       const get = async path => (await fetch(`${WAZO.confdUrl}${path}`, { headers: { 'x-auth-token': token, accept: 'application/json' } })).json()
       const vm = (await get(`/voicemails?search=${numberOf(userId)}`)).items.find(v => v.number === numberOf(userId))
       const uuid = vm?.users?.[0]?.uuid
-      return uuid ? String((await get(`/users/${uuid}`)).description) : undefined
+      const user = uuid ? await get(`/users/${uuid}`) : undefined
+      return vm ? { name: vm.name, user: user ? `${user.firstname} ${user.lastname ?? ''} ${user.description ?? ''}`.trim() : undefined } : undefined
     }
-    const placeIs = (userId, want, what) => until(what, async () => ((await placeOf(userId))?.startsWith(want) ? true : null), { timeout: 30_000 })
+    const nameIs = (userId, want, what) => until(what, async () => ((await wazoOf(userId))?.name?.startsWith(want) ? true : null), { timeout: 30_000 })
     const leave = async (number, from) => {
       const placed = await operator.call(number, { from, ruri: TRUNK_LOGIN })
       const answer = await placed.final
@@ -3511,6 +3571,7 @@ try {
       people.push(claire)
       await directorySync.run()
       await rowsAre({ 108: `${claires}@${context}` }, 'a mailbox for Claire at 108, at her number')
+      expectEqual(await wazoOf('cpetit'), { name: 'TwakePhone', user: 'TwakePhone' }, "Claire's mailbox and its user in Wazo: nothing of her")
       // Hers shows nothing of what was under 108: never at an extension's number.
       expectEqual(await wazo.listMessages({ userId: 'cpetit', extension: '108' }), [], "Claire's messages in her new mailbox")
       // Her account, as when she signs in: her direct number reaches her (she has no window: her mailbox at once).
@@ -3518,11 +3579,12 @@ try {
       await leave('+33199000108', '+33639980042')
       await theirs('cpetit', '108', '+33639980042')
       await spoolIs({ [alices]: 1, [claires]: 1, 108: 1, 109: 1 }, 'the messages in the spool')
-      // Alice moves to 109: the same mailbox, at the same number, now reached at 109; 101 has none.
+      // Alice moves to 109: the same mailbox, at the same number, now reached at 109; 101 has none. Nothing of it is
+      // written in Wazo: wazo-sysconfd reloads nothing of Asterisk for it.
+      const moving = new Date().toISOString()
       aliceEntry.ipPhone = '109'
       await directorySync.run()
       await rowsAre({ 109: `${alices}@${context}`, 101: undefined }, "Alice's mailbox at 109, none at 101")
-      await placeIs('amartin', 'twakephone:at=109', "where Alice's mailbox says it is, in Wazo")
       await theirs('amartin', '109', '+33639980041')
       // Alice and Claire swap 109 and 108: each keeps hers.
       aliceEntry.ipPhone = '108'
@@ -3531,19 +3593,35 @@ try {
       await rowsAre({ 108: `${alices}@${context}`, 109: `${claires}@${context}` }, 'the mailboxes once they swapped')
       await theirs('amartin', '108', '+33639980041')
       await theirs('cpetit', '109', '+33639980042')
-      await placeIs('amartin', 'twakephone:at=108', "where Alice's mailbox says it is once they swapped")
-      await placeIs('cpetit', 'twakephone:at=109', "where Claire's mailbox says it is once they swapped")
+      await sleep(2_000)
+      expectEqual(reloadsSince(moving), [], 'what wazo-sysconfd reloaded of Asterisk for the moves and the swap')
+      expectEqual([(await wazoOf('amartin')).name, (await wazoOf('cpetit')).name], ['TwakePhone', 'TwakePhone'], 'the names of the mailboxes once they swapped')
       // Nothing moved in the spool: each one's folder where it was, those under 108 and 109 untouched.
       await spoolIs({ [alices]: 1, [claires]: 1, 108: 1, 109: 1 }, 'the messages in the spool once they swapped')
       // Claire leaves: no extension sends a call to her mailbox, set aside with her message (the retention period
       // applies to it as to any); her erasure takes it.
+      const leaving = new Date().toISOString()
       people.splice(people.indexOf(claire), 1)
       await directorySync.run()
       await rowsAre({ 109: undefined }, 'no mailbox at 109 once Claire left')
-      await placeIs('cpetit', 'twakephone:aside=', "Claire's mailbox, set aside in Wazo")
+      await nameIs('cpetit', 'TwakePhone aside ', "Claire's mailbox, set aside in Wazo")
       await theirs('cpetit', '109', '+33639980042')
-      expectEqual(await wazo.eraseMessages({ userId: 'cpetit' }), 1, "the messages of Claire's erasure")
-      await spoolIs({ [claires]: 0 }, "Claire's messages in the spool after her erasure")
+      await sleep(2_000)
+      // A change of the mailbox only: its module reloaded (what else wazo-confd asks for with it is said here).
+      const aside = reloadsSince(leaving)
+      console.log(`     wazo-sysconfd, for a mailbox set aside: ${aside.join(', ') || 'nothing'}`)
+      if (!aside.includes('voicemail reload')) throw new Error(`what wazo-sysconfd reloaded for a mailbox set aside: ${JSON.stringify(aside)}`)
+      // She left: an administrator has her messages erased, by the Gateway that writes the mailboxes, at its round.
+      alice = await open('amartin', 'Alice Martin')
+      try {
+        const admin = await asPerson(alice)
+        expectEqual((await admin('POST', '/admin/voicemail/erase', { userId: 'jdupont' })).json().code, 'VOICEMAIL_ERASE_HOLDER', 'the erasure of the messages of someone who holds an extension, asked by an administrator')
+        expectEqual((await admin('POST', '/admin/voicemail/erase', { userId: 'cpetit' })).statusCode, 202, 'the erasure of the messages of Claire, who left, asked by an administrator')
+        await spoolIs({ [claires]: 0 }, "Claire's messages in the spool after her erasure")
+        expectEqual(await wazo.listMessages({ userId: 'cpetit', extension: '109' }), [], "Claire's messages after her erasure")
+      } finally {
+        await signOut(alice)
+      }
     } finally {
       await wazo.eraseMessages({ userId: 'amartin' }).catch(() => 0)
       await wazo.eraseMessages({ userId: 'cpetit' }).catch(() => 0)

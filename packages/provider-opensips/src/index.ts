@@ -384,6 +384,11 @@ export class OpensipsProvider implements TelephonyProvider, MediaProvider {
     return (await this.config.voicemailBoxes?.mark()) ?? 0
   }
 
+  /** The mailboxes OpenSIPS sends calls to now (`voicemail_boxes`), by extension: none without the table. */
+  async listVoicemailBoxes() {
+    return (await this.config.voicemailBoxes?.list()) ?? []
+  }
+
   /**
    * The access number of Meet's rooms as OpenSIPS has it (its shared variables meet_on and meet_number, MI shv_get):
    * `number` undefined when Meet is off there. Undefined when it cannot be asked (no MI) or did not say.

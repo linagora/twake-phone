@@ -753,13 +753,18 @@ describe('CallTracker', () => {
     clear()
     tracker.handle('E_TWAKEPHONE_VMCAP', { param: 'hidden-calls', extension: '101', value: '5', threshold: '5' })
     tracker.handle('E_TWAKEPHONE_VMCAP', { param: 'hidden-hour', extension: '102', value: 11, threshold: 10 })
+    tracker.handle('E_TWAKEPHONE_VMCAP', { param: 'hidden-all', extension: '103', value: 10, threshold: 10 })
+    tracker.handle('E_TWAKEPHONE_VMCAP', { param: 'calls-all', extension: '104', value: 30, threshold: 30 })
+    tracker.handle('E_TWAKEPHONE_VMCAP', { param: 'calls-every', extension: '104', value: 30, threshold: 30 })
     // Nothing that is no extension, nor another cap.
     tracker.handle('E_TWAKEPHONE_VMCAP', { param: 'hidden-calls', extension: '*hidden:101', value: 5 })
     tracker.handle('E_TWAKEPHONE_VMCAP', { param: 'calls', extension: '101', value: 5 })
     tracker.handle('E_TWAKEPHONE_VMCAP', { param: 'hidden-calls' })
     expect(events.map(e => [e.extension, e.event.type === 'alert.raised' && e.event.payload.alert])).toEqual([
       ['101', { kind: 'voicemail', param: 'hidden-calls', scope: 'tenant', extension: '101', value: 5, threshold: 5 }],
-      ['102', { kind: 'voicemail', param: 'hidden-hour', scope: 'tenant', extension: '102', value: 11, threshold: 10 }]
+      ['102', { kind: 'voicemail', param: 'hidden-hour', scope: 'tenant', extension: '102', value: 11, threshold: 10 }],
+      ['103', { kind: 'voicemail', param: 'hidden-all', scope: 'tenant', extension: '103', value: 10, threshold: 10 }],
+      ['104', { kind: 'voicemail', param: 'calls-all', scope: 'tenant', extension: '104', value: 30, threshold: 30 }]
     ])
   })
 

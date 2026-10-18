@@ -180,51 +180,58 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     }
     // The headers appended are not undone by remove_hf (n°17): the undo does not pretend to.
     expect(section('route[voicemail_undo]', 'failure_route[voicemail_failed]')).not.toContain('remove_hf(')
-    // Bounded as Meet is (n°10; third review n°7): the calls of a caller, of those who hide their number together, and
-    // of all at the same time, and those of a caller to one mailbox in an hour, under a lock; counted in the hour only
-    // once the call has its place, counted out when the mailbox does not take it.
+    // Bounded as Meet is: pins on the invariants only (the behaviour of the caps is proven by the SIP e2e, against
+    // OpenSIPS itself): the calls of a caller, of those with no number at a mailbox and at all of them, and of all at
+    // the same time, and those of a caller to one mailbox in an hour, all read and counted under one lock; counted in
+    // the hour only once the call has its place, counted out when the mailbox does not take it.
     expect(cfg).toContain('modparam("dialog", "profiles_with_value", "trunk_caller;meet_caller;vm_caller")')
-    expect(cfg).toContain('modparam("dialog", "profiles_no_value", "trunk_out;trunk_emergency;meet_all;vm_all")')
-    // Each caller on their number, the one Privacy hides included (kept apart, never shown); those with none, together
-    // per mailbox (fourth review 11a, n°8).
-    expect(vm).toContain('$var(vm_who) = "*hidden:" + $avp(dialled);\n\t$var(vm_cap) = $shv(vm_hidden);\n\t$var(vm_anon) = 1;\n\tif ($avp(caller) =~ "^[A-Za-z0-9._+-]{1,64}$" && $avp(caller) != "anonymous") {\n\t\t$var(vm_who) = $avp(caller);\n\t\t$var(vm_cap) = $shv(vm_per_caller);\n\t\t$var(vm_anon) = 0;\n\t} else {\n\t\tif ($avp(vm_real) != NULL) {\n\t\t\t$var(vm_who) = $avp(vm_real);\n\t\t\t$var(vm_cap) = $shv(vm_per_caller);')
-    const trunkIn = section('route[trunk_in]', 'route[inbound_number]')
-    expect(trunkIn).toContain('$(avp(vm_real)[*]) = NULL;\n\tif (is_present_hf("Privacy")) {')
-    expect(trunkIn).toContain('if ($var(from_number) != "anonymous")\n\t\t\t\t$avp(vm_real) = $var(from_number);\n\t\t\t$var(from_number) = "anonymous";')
-    expect(cfg.split('$avp(vm_real)').length).toBe(6)
-    // The administrators told when those with no number reach a cap at a mailbox, once per 10 minutes.
-    expect(vm).toContain('if ($var(vm_anon) == 1)\n\t\t\troute(voicemail_alert, "hidden-hour", $var(vm_n), $shv(vm_per_hour));')
-    expect(vm).toContain('if ($var(vm_anon) == 1 && $var(vm_mine) >= $var(vm_cap))\n\t\t\troute(voicemail_alert, "hidden-calls", $var(vm_mine), $var(vm_cap));')
-    const vmAlert = section('route[voicemail_alert]', 'failure_route[voicemail_failed]')
-    expect(vmAlert).toContain('cache_add("local", "vm:told:$param(1):$avp(dialled)", 1, 600, $var(told));\n\tif ($var(told) != 1)\n\t\treturn(1);')
-    expect(vmAlert).toContain('raise_event("E_TWAKEPHONE_VMCAP", $avp(ev_attr), $avp(ev_val));')
+    expect(cfg).toContain('modparam("dialog", "profiles_no_value", "trunk_out;trunk_emergency;meet_all;vm_all;vm_hidden")')
     const room = vm.slice(vm.indexOf('get_static_lock("vm_count");'), vm.indexOf('release_static_lock("vm_count");'))
-    expect(room).toContain('if ($var(vm_mine) < $var(vm_cap) && $var(vm_all) < $shv(vm_calls_all)) {\n\t\tcache_add("local", "vm:h:$var(vm_who):$avp(dialled)", 1, 3600, $var(vm_n));\n\t\tif ($var(vm_n) > $shv(vm_per_hour)) {\n\t\t\tcache_sub("local", "vm:h:$var(vm_who):$avp(dialled)", 1, 3600, $var(vm_left));')
-    expect(room.indexOf('get_profile_size("vm_caller"')).toBeLessThan(room.indexOf('cache_add('))
-    expect(room.indexOf('cache_add(')).toBeLessThan(room.indexOf('set_dlg_profile("vm_all");'))
-    expect(room).toContain('$avp(vm_hour) = "vm:h:" + $var(vm_who) + ":" + $avp(dialled);')
+    const order = ['get_profile_size("vm_caller"', 'get_profile_size("vm_all"', 'get_profile_size("vm_hidden"', 'cache_add("local", "vm:h:', 'set_dlg_profile("vm_caller"', 'set_dlg_profile("vm_all")', 'set_dlg_profile("vm_hidden")']
+    for (const [i, step] of order.entries()) {
+      expect(room.indexOf(step), step).toBeGreaterThan(0)
+      if (i) expect(room.indexOf(order[i - 1]!), step).toBeLessThan(room.indexOf(step))
+    }
+    expect(room).toContain('$var(vm_nobody) < $shv(vm_hidden_all)')
     expect(vm.split('cache_add(').length).toBe(2)
-    expect(vm.indexOf('if ($var(vm_room) == -1) {')).toBeLessThan(vm.indexOf('t_relay()'))
-    expect(vm.indexOf('if ($var(vm_room) == 0) {')).toBeLessThan(vm.indexOf('t_relay()'))
-    // Counted out of the hour when rtpengine fails, and in the undo (Asterisk silent, refused, t_relay failed), once.
+    expect(vm.indexOf('release_static_lock("vm_count");')).toBeLessThan(vm.indexOf('t_relay()'))
+    // Counted by a keyed print of the number, never the number (a profile is written in `dialog`, shown by the MI); by
+    // the person's mailbox, whatever extension reaches it.
+    expect(vm).toContain('{s.sha256_hmac,$shv(vm_key)}')
+    expect(vm).not.toMatch(/\$var\(vm_who\) = \$avp\((caller|vm_real)\)/)
+    expect(room).toContain('"vm:h:$var(vm_who):$avp(vm_box)"')
+    expect(vm).not.toContain(':$avp(dialled)", 1, 3600')
+    expect(cfg.split('$avp(vm_real)').length).toBe(6)
+    // The administrators told of each cap reached, once per 10 minutes.
+    for (const param of ['hidden-hour', 'hidden-calls', 'hidden-all', 'calls-all']) expect(vm, param).toContain(`route(voicemail_alert, "${param}", `)
+    const vmAlert = section('route[voicemail_alert]', 'failure_route[voicemail_failed]')
+    expect(vmAlert).toContain('cache_add("local", "$var(told_key)", 1, 600, $var(told));')
+    expect(vmAlert).toContain('raise_event("E_TWAKEPHONE_VMCAP", $avp(ev_attr), $avp(ev_val));')
+    // Counted out of the hour when rtpengine fails, and in the undo (Asterisk silent, refused, t_relay failed), once,
+    // under the lock; a key gone meanwhile removed, never left at -1.
     expect(vm).toContain('failed\\n");\n\t\t\troute(voicemail_unhour);\n\t\t\treturn(-1);')
     expect(section('route[voicemail_undo]', 'failure_route[voicemail_failed]')).toContain('route[voicemail_undo] {\n\troute(voicemail_unhour);')
-    // A key gone meanwhile is removed, never left at -1 (fourth review 11a, n°7).
-    expect(section('route[voicemail_unhour]', 'failure_route[voicemail_failed]')).toContain('if ($avp(vm_hour) == NULL)\n\t\treturn;\n\t$var(vm_left) = 0;\n\tget_static_lock("vm_count");\n\tcache_sub("local", "$avp(vm_hour)", 1, 3600, $var(vm_left));\n\tif ($var(vm_left) < 0)\n\t\tcache_remove("local", "$avp(vm_hour)");\n\trelease_static_lock("vm_count");\n\t$(avp(vm_hour)[*]) = NULL;')
+    const unhour = section('route[voicemail_unhour]', 'failure_route[voicemail_failed]')
+    expect(unhour.indexOf('get_static_lock("vm_count");')).toBeLessThan(unhour.indexOf('cache_sub('))
+    expect(unhour.indexOf('cache_remove(')).toBeLessThan(unhour.indexOf('release_static_lock("vm_count");'))
     // The caps and the bound in shared variables, for the calls to come (MI shv_set) and for the Gateway (shv_get).
     expect(cfg).toContain('modparam("cfgutils", "shvset", "vm_per_caller=i:2")')
     expect(cfg).toContain('modparam("cfgutils", "shvset", "vm_hidden=i:5")')
+    expect(cfg).toContain('modparam("cfgutils", "shvset", "vm_hidden_all=i:10")')
+    expect(cfg).toMatch(/modparam\("cfgutils", "shvset", "vm_key=s:[0-9a-f]{32}"\)/)
     expect(cfg).toContain('modparam("cfgutils", "shvset", "vm_calls_all=i:30")')
     expect(cfg).toContain('modparam("cfgutils", "shvset", "vm_per_hour=i:10")')
     expect(cfg).toContain('modparam("cfgutils", "shvset", "vm_max_sec=i:300")')
     const capped = render({ WAZO_SIP: '192.0.2.30:5100', VOICEMAIL_CALLS_PER_CALLER: '1', VOICEMAIL_CALLS_HIDDEN: '2', VOICEMAIL_CALLS_ALL: '5', VOICEMAIL_CALLS_PER_HOUR: '3' }).cfg
-    for (const shv of ['vm_per_caller=i:1', 'vm_hidden=i:2', 'vm_calls_all=i:5', 'vm_per_hour=i:3']) expect(capped).toContain(`modparam("cfgutils", "shvset", "${shv}")`)
+    for (const shv of ['vm_per_caller=i:1', 'vm_hidden=i:2', 'vm_hidden_all=i:1', 'vm_calls_all=i:5', 'vm_per_hour=i:3']) expect(capped).toContain(`modparam("cfgutils", "shvset", "${shv}")`)
     for (const [env, message] of [
       [{ VOICEMAIL_CALLS_PER_CALLER: '0' }, /VOICEMAIL_CALLS_PER_CALLER must be 1 to 20/],
       [{ VOICEMAIL_CALLS_PER_CALLER: '4', VOICEMAIL_CALLS_ALL: '3' }, /VOICEMAIL_CALLS_ALL must be VOICEMAIL_CALLS_PER_CALLER to 10000/],
       [{ VOICEMAIL_CALLS_HIDDEN: '0' }, /VOICEMAIL_CALLS_HIDDEN must be 1 to VOICEMAIL_CALLS_ALL/],
       [{ VOICEMAIL_CALLS_HIDDEN: '31' }, /VOICEMAIL_CALLS_HIDDEN must be 1 to VOICEMAIL_CALLS_ALL/],
-      [{ VOICEMAIL_CALLS_PER_HOUR: 'x' }, /VOICEMAIL_CALLS_PER_HOUR must be a number/]
+      [{ VOICEMAIL_CALLS_PER_HOUR: 'x' }, /VOICEMAIL_CALLS_PER_HOUR must be a number/],
+      [{ VOICEMAIL_CALLS_HIDDEN_ALL: '16' }, /VOICEMAIL_CALLS_HIDDEN_ALL must be 0 to half of VOICEMAIL_CALLS_ALL/],
+      [{ VOICEMAIL_CALLS_HIDDEN_ALL: 'x' }, /VOICEMAIL_CALLS_HIDDEN_ALL must be a number/]
     ] as const)
       expect(render({ WAZO_SIP: '192.0.2.30:5100', ...env }).stderr).toMatch(message)
     // A caller from outside is said as such: the greeting never spells the extension to them (review 11a, n°12).
@@ -1502,7 +1509,7 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(section('route[default_trunk]', 'timer_route[default_trunk, 15]')).toContain('$(var(dn){s.select,1,|}{s.int}) >= $shv(dn_gen)')
     expect(cfg).toContain('modparam("cfgutils", "shvset", "dn_gen=i:0")')
     // n°10: the emergency calls known as such in the database (their profile), a day at most, 2 h once restored.
-    expect(cfg).toContain('modparam("dialog", "profiles_no_value", "trunk_out;trunk_emergency;meet_all;vm_all")')
+    expect(cfg).toContain('modparam("dialog", "profiles_no_value", "trunk_out;trunk_emergency;meet_all;vm_all;vm_hidden")')
     const entry = readFileSync(join(dir, 'entrypoint.sh'), 'utf8')
     expect(entry).toContain(`-c "SELECT twake_outbound_restart(${EMERGENCY_RESTORED_SEC})"`)
     // n°4: before OpenSIPS starts, after the tables are there.

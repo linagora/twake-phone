@@ -177,7 +177,7 @@ modparam("dialog", "options_ping_interval", ${CALL_PING_SEC})
 # (one organisation per OpenSIPS). An emergency call is in neither, but in trunk_emergency: how a restart knows it.
 # The calls to the access number of Meet's rooms in progress (step 8, route[meet_call]): per caller, and all of them.
 modparam("dialog", "profiles_with_value", "trunk_caller;meet_caller;vm_caller")
-modparam("dialog", "profiles_no_value", "trunk_out;trunk_emergency;meet_all;vm_all")
+modparam("dialog", "profiles_no_value", "trunk_out;trunk_emergency;meet_all;vm_all;vm_hidden")
 loadmodule "rtpengine.so"
 modparam("rtpengine", "rtpengine_sock", "${RTPENGINE_SOCK}")
 
@@ -225,10 +225,13 @@ modparam("cfgutils", "shvset", "wazo_mute_until=i:0")
 # The bounds of the calls to the mailboxes (route[voicemail]), for the calls to come once changed (MI shv_set; the e2e
 # lowers the caps a moment): VOICEMAIL_MAX_CALL_SEC, which the Gateway reads (shv_get) and compares with the longest
 # message of its voicemail server at its start (third review 11a, n°10); VOICEMAIL_CALLS_PER_CALLER,
-# VOICEMAIL_CALLS_HIDDEN, VOICEMAIL_CALLS_ALL and VOICEMAIL_CALLS_PER_HOUR (n°7).
+# VOICEMAIL_CALLS_HIDDEN, VOICEMAIL_CALLS_HIDDEN_ALL, VOICEMAIL_CALLS_ALL and VOICEMAIL_CALLS_PER_HOUR (n°7); the key
+# of the prints the caps count the callers by (VOICEMAIL_CALLER_KEY, drawn by entrypoint.sh at each start).
 modparam("cfgutils", "shvset", "vm_max_sec=i:${VOICEMAIL_MAX_CALL_SEC}")
 modparam("cfgutils", "shvset", "vm_per_caller=i:${VOICEMAIL_CALLS_PER_CALLER}")
 modparam("cfgutils", "shvset", "vm_hidden=i:${VOICEMAIL_CALLS_HIDDEN}")
+modparam("cfgutils", "shvset", "vm_hidden_all=i:${VOICEMAIL_CALLS_HIDDEN_ALL}")
+modparam("cfgutils", "shvset", "vm_key=s:${VOICEMAIL_CALLER_KEY}")
 modparam("cfgutils", "shvset", "vm_calls_all=i:${VOICEMAIL_CALLS_ALL}")
 modparam("cfgutils", "shvset", "vm_per_hour=i:${VOICEMAIL_CALLS_PER_HOUR}")
 
@@ -1852,8 +1855,10 @@ route[trunk_in] {
 	if (route(inbound_number, $fU))
 		$var(from_number) = $var(inbound_number);
 	# Every Privacy header, every value: `id` (the asserted identity) or `user` (the From) hides the caller. The number
-	# the From still has then is kept for the caps of the mailboxes only ($avp(vm_real), route[voicemail]: fourth review
-	# 11a, n°8): never shown to the callee, never in a CDR or an event.
+	# the From still has then is kept, in this transaction only, for the caps of the mailboxes ($avp(vm_real),
+	# route[voicemail], which counts its print): never shown to the callee, never in a CDR, an event, a profile or a key
+	# of the count. The From of the dialog keeps it, as for any call of the operator (`dialog` and the MI, while the call
+	# lasts).
 	$(avp(vm_real)[*]) = NULL;
 	if (is_present_hf("Privacy")) {
 		$var(privacy) = $(hdr(Privacy)[*]{s.tolower});
@@ -3496,19 +3501,22 @@ route[relay_failed] {
 # A mailbox that does not answer within 2 s (Wazo down, a row of voicemail_boxes out of date) is left for the refusal,
 # and when nothing at all came back from Asterisk, every mailbox is left out the next 30 s (n°14). The greeting says
 # whether the caller is outside (`;caller=external`): the extension is never spelled out to them (n°12). Bounded as
-# Meet's access number is (second review 11a, n°10; third review n°7), $shv(vm_*): VOICEMAIL_CALLS_PER_CALLER calls of
-# one caller to the mailboxes at the same time, VOICEMAIL_CALLS_ALL of all callers, and VOICEMAIL_CALLS_PER_HOUR calls
-# of one caller to the same mailbox in an hour (one caller filling a mailbox fills it for everyone; the hour from the
-# first of them: cache_add keeps the lifetime it began with); past one, the refusal the call would have had without the
-# mailbox. A caller the operator hides at their request (Privacy) is counted on the number it still sent
-# ($avp(vm_real), route[trunk_in]: fourth review 11a, n°8); those with no number at all (anonymous, or a caller that is
-# no number) are one caller per mailbox, `*hidden:<extension>`, VOICEMAIL_CALLS_HIDDEN of them to it at the same time
-# and VOICEMAIL_CALLS_PER_HOUR in the hour: one of them closes that mailbox to the others with no number only, never
-# another mailbox, never to a caller with a number; the administrators are told when they reach a cap there
-# (E_TWAKEPHONE_VMCAP, route[voicemail_alert]). A call is counted in the hour only once it has its place, and counted
-# out again when the mailbox does not take it (route[voicemail_undo]): a call refused for want of a place, or that
-# rtpengine or Asterisk failed, counts for nothing. One the caller cancels before the mailbox answers stays counted
-# (failure_route[voicemail_failed]): ringing a mailbox and hanging up, again and again, uses it as a call would.
+# Meet's access number is, $shv(vm_*): VOICEMAIL_CALLS_PER_CALLER calls of one caller to the mailboxes at the same
+# time, VOICEMAIL_CALLS_ALL of all callers, and VOICEMAIL_CALLS_PER_HOUR calls of one caller to the same mailbox in an
+# hour (one caller filling a mailbox fills it for everyone; the hour from the first of them: cache_add keeps the
+# lifetime it began with); past one, the refusal the call would have had without the mailbox. The mailbox is the
+# person's ($avp(vm_box)), whatever extension reaches it. A caller is counted by a print of their number (HMAC-SHA-256
+# with $shv(vm_key)), never by the number itself: the profiles of a dialog are written in the `dialog` table and shown
+# by the MI. The number a caller hidden at their request (Privacy) still sent is theirs ($avp(vm_real),
+# route[trunk_in]). Those with no number at all (anonymous, or a caller that is no number) are one caller per mailbox,
+# `*hidden:<mailbox>`, VOICEMAIL_CALLS_HIDDEN of them to it at the same time and VOICEMAIL_CALLS_PER_HOUR in the hour,
+# and VOICEMAIL_CALLS_HIDDEN_ALL of them to all the mailboxes at the same time (profile vm_hidden), at most half of
+# VOICEMAIL_CALLS_ALL: the callers with a number always keep places. The administrators are told when a cap of those
+# with no number, or VOICEMAIL_CALLS_ALL, is reached (E_TWAKEPHONE_VMCAP, route[voicemail_alert]). A call is counted
+# in the hour only once it has its place, and counted out again when the mailbox does not take it
+# (route[voicemail_undo]): a call refused for want of a place, or that rtpengine or Asterisk failed, counts for
+# nothing. One the caller cancels before the mailbox answers stays counted (failure_route[voicemail_failed]): ringing
+# a mailbox and hanging up, again and again, uses it as a call would.
 # $param(1): the greeting; $avp(vm_then), $avp(vm_code), $avp(vm_reason): that refusal. Ends the script when the
 # mailbox is called; -1 otherwise.
 route[voicemail] {
@@ -3519,40 +3527,47 @@ route[voicemail] {
 	if ($avp(rtp_on) == NULL && !has_body_part("application/sdp"))
 		return(-1);
 	$avp(vm_used) = 1;
-	# Who the caps count (fourth review 11a, n°8): the caller's number, the one Privacy hides included; those with none
-	# at all, one caller per mailbox: `*hidden:<extension>`, which no caller's own number is.
-	$var(vm_who) = "*hidden:" + $avp(dialled);
-	$var(vm_cap) = $shv(vm_hidden);
-	$var(vm_anon) = 1;
+	# Who the caps count: the print of the caller's number, the one Privacy hides included; those with none at all, one
+	# caller per mailbox: `*hidden:<mailbox>`, which no print is.
+	$var(vm_num) = "";
 	if ($avp(caller) =~ "^[A-Za-z0-9._+-]{1,64}$" && $avp(caller) != "anonymous") {
-		$var(vm_who) = $avp(caller);
+		$var(vm_num) = $avp(caller);
+	} else {
+		if ($avp(vm_real) != NULL)
+			$var(vm_num) = $avp(vm_real);
+	}
+	if ($var(vm_num) != "") {
+		$var(vm_who) = $(var(vm_num){s.sha256_hmac,$shv(vm_key)}{s.substr,0,24});
 		$var(vm_cap) = $shv(vm_per_caller);
 		$var(vm_anon) = 0;
 	} else {
-		if ($avp(vm_real) != NULL) {
-			$var(vm_who) = $avp(vm_real);
-			$var(vm_cap) = $shv(vm_per_caller);
-			$var(vm_anon) = 0;
-		}
+		$var(vm_who) = "*hidden:" + $avp(vm_box);
+		$var(vm_cap) = $shv(vm_hidden);
+		$var(vm_anon) = 1;
 	}
 	# The calls to the mailboxes at the same time, and of this caller to this mailbox in the hour, under a lock: of two
 	# calls at once, one counts the other. This one counted in only if there is room for it in both; its dialog leaves
 	# the profiles when it ends, the hour keeps it unless the mailbox does not take it.
 	$var(vm_room) = 0;
 	$var(vm_n) = 0;
+	$var(vm_nobody) = 0;
 	get_static_lock("vm_count");
 	get_profile_size("vm_caller", "$var(vm_who)", $var(vm_mine));
 	get_profile_size("vm_all", , $var(vm_all));
-	if ($var(vm_mine) < $var(vm_cap) && $var(vm_all) < $shv(vm_calls_all)) {
-		cache_add("local", "vm:h:$var(vm_who):$avp(dialled)", 1, 3600, $var(vm_n));
+	if ($var(vm_anon) == 1)
+		get_profile_size("vm_hidden", , $var(vm_nobody));
+	if ($var(vm_mine) < $var(vm_cap) && $var(vm_all) < $shv(vm_calls_all) && ($var(vm_anon) == 0 || $var(vm_nobody) < $shv(vm_hidden_all))) {
+		cache_add("local", "vm:h:$var(vm_who):$avp(vm_box)", 1, 3600, $var(vm_n));
 		if ($var(vm_n) > $shv(vm_per_hour)) {
-			cache_sub("local", "vm:h:$var(vm_who):$avp(dialled)", 1, 3600, $var(vm_left));
+			cache_sub("local", "vm:h:$var(vm_who):$avp(vm_box)", 1, 3600, $var(vm_left));
 			$var(vm_room) = -1;
 		} else {
 			set_dlg_profile("vm_caller", "$var(vm_who)");
 			set_dlg_profile("vm_all");
+			if ($var(vm_anon) == 1)
+				set_dlg_profile("vm_hidden");
 			$(avp(vm_hour)[*]) = NULL;
-			$avp(vm_hour) = "vm:h:" + $var(vm_who) + ":" + $avp(dialled);
+			$avp(vm_hour) = "vm:h:" + $var(vm_who) + ":" + $avp(vm_box);
 			$var(vm_room) = 1;
 		}
 	}
@@ -3564,9 +3579,17 @@ route[voicemail] {
 		return(-1);
 	}
 	if ($var(vm_room) == 0) {
-		xlog("L_WARN", "call $ci: the mailbox of $avp(dialled) left out, $var(vm_mine) calls of this caller and $var(vm_all) of all callers to the mailboxes at the same time\n");
-		if ($var(vm_anon) == 1 && $var(vm_mine) >= $var(vm_cap))
-			route(voicemail_alert, "hidden-calls", $var(vm_mine), $var(vm_cap));
+		xlog("L_WARN", "call $ci: the mailbox of $avp(dialled) left out, $var(vm_mine) calls of this caller, $var(vm_nobody) of those with no number and $var(vm_all) of all callers to the mailboxes at the same time\n");
+		if ($var(vm_all) >= $shv(vm_calls_all)) {
+			route(voicemail_alert, "calls-all", $var(vm_all), $shv(vm_calls_all));
+		} else {
+			if ($var(vm_anon) == 1) {
+				if ($var(vm_nobody) >= $shv(vm_hidden_all))
+					route(voicemail_alert, "hidden-all", $var(vm_nobody), $shv(vm_hidden_all));
+				else
+					route(voicemail_alert, "hidden-calls", $var(vm_mine), $var(vm_cap));
+			}
+		}
 		return(-1);
 	}
 	# The offer the windows would have had (a refusal before any of them rang has none yet: only in the request route,
@@ -3664,12 +3687,16 @@ route[voicemail_unhour] {
 	$(avp(vm_hour)[*]) = NULL;
 }
 
-# Tells the administrators (E_TWAKEPHONE_VMCAP) that the callers with no number reached their cap at the mailbox of
-# $avp(dialled) (fourth review 11a, n°8): $param(1) "hidden-calls" (at the same time) or "hidden-hour" (in the hour),
-# its value $param(2) and cap $param(3); once per 10 minutes for each mailbox and each.
+# Tells the administrators (E_TWAKEPHONE_VMCAP) that a cap of the calls to the mailboxes was reached, the call to
+# $avp(dialled) refused for it: $param(1) "hidden-calls" or "hidden-hour" (those with no number, at this mailbox, at
+# the same time or in the hour: once per 10 minutes for each mailbox and each), "hidden-all" (those with no number, to
+# all the mailboxes) or "calls-all" (all callers): once per 10 minutes each; its value $param(2) and cap $param(3).
 route[voicemail_alert] {
 	$var(told) = 0;
-	cache_add("local", "vm:told:$param(1):$avp(dialled)", 1, 600, $var(told));
+	$var(told_key) = "vm:told:" + $param(1);
+	if ($param(1) == "hidden-calls" || $param(1) == "hidden-hour")
+		$var(told_key) = $var(told_key) + ":" + $avp(vm_box);
+	cache_add("local", "$var(told_key)", 1, 600, $var(told));
 	if ($var(told) != 1)
 		return(1);
 	$(avp(ev_attr)[*]) = NULL;

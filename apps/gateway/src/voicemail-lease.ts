@@ -5,9 +5,10 @@ import type { Store } from './store/types.js'
 // window only. Only a Gateway with a voicemail server for the tenant takes it: one without never writes
 // `voicemail_boxes`. One whose voicemail server answers and whose events are heard takes it at once from one that has
 // one it does not reach: the mailboxes never wait behind a Gateway that cannot do them. What each can do is asked anew
-// at each renewal (fourth review 11a, n°3: a request to the voicemail server, not what its last request left). The
-// lease's fencing token (`fence`, when its holder may write from: a later lease has a greater one) goes with each write
-// of `voicemail_boxes`, where the database refuses one older than the last written (fourth review n°2).
+// at each renewal (a request to the voicemail server, not what its last request left). The lease's fencing token
+// (`fence`, its generation: one more for each lease taken, whatever the clocks) goes with each write of
+// `voicemail_boxes`, where the database refuses one older than the last written; a Gateway refused so while it holds
+// the lease gives it back (`drop`): the one that takes it next, this one included, has a greater token.
 
 /** The role of the lease of the mailboxes of `tenantId`. */
 export const voicemailRole = (tenantId: string) => `voicemail:${tenantId}`
@@ -40,7 +41,7 @@ export class VoicemailLeases {
   private readonly ms: number
   private readonly now: () => number
   /** The write window of each lease held: this clock reckoned on the store's (skew). */
-  private readonly held = new Map<string, { writeFrom: number; writeUntil: number }>()
+  private readonly held = new Map<string, { writeFrom: number; writeUntil: number; generation: number }>()
   private readonly timers = new Map<string, ReturnType<typeof setTimeout>>()
   private skew = 0
   private skewError = 0
@@ -77,11 +78,22 @@ export class VoicemailLeases {
   }
 
   /**
-   * The fencing token of the lease of `tenantId` held now (when its write window opened, on the store's clock):
-   * unchanged while this Gateway keeps it, greater for each lease taken after it, by any Gateway.
+   * The fencing token of the lease of `tenantId` held now (its generation): unchanged while this Gateway keeps it,
+   * greater for each lease taken after it, by any Gateway, this one included once it gave it back.
    */
   fence(tenantId: string) {
-    return this.held.get(tenantId)?.writeFrom
+    return this.held.get(tenantId)?.generation
+  }
+
+  /**
+   * Gives back the lease of `tenantId` at once: the SIP server's database refused a write under it (a later token
+   * written there). The next renewal takes a new one, if this Gateway is still the one to write.
+   */
+  async drop(tenantId: string) {
+    clearTimeout(this.timers.get(tenantId))
+    this.timers.delete(tenantId)
+    if (!this.held.delete(tenantId)) return
+    await this.options.store.takeWebhookLease(voicemailRole(tenantId), this.options.holder, 0).catch(() => undefined)
   }
 
   /** Takes or renews the leases (one renewal at a time), reading the store's clock again. */
@@ -114,7 +126,7 @@ export class VoicemailLeases {
         const had = this.held.has(tenantId)
         // Stopped meanwhile: a lease taken is kept for stop() to give back, nothing more.
         if (this.closed) {
-          if (lease) this.held.set(tenantId, { writeFrom: Date.parse(lease.writeFrom), writeUntil: Date.parse(lease.writeUntil) })
+          if (lease) this.held.set(tenantId, { writeFrom: Date.parse(lease.writeFrom), writeUntil: Date.parse(lease.writeUntil), generation: lease.generation })
           return
         }
         if (!lease) {
@@ -122,7 +134,7 @@ export class VoicemailLeases {
           this.held.delete(tenantId)
           continue
         }
-        this.held.set(tenantId, { writeFrom: Date.parse(lease.writeFrom), writeUntil: Date.parse(lease.writeUntil) })
+        this.held.set(tenantId, { writeFrom: Date.parse(lease.writeFrom), writeUntil: Date.parse(lease.writeUntil), generation: lease.generation })
         if (!had) {
           this.options.logger.info({ tenantId, from: lease.writeFrom, weight }, 'mailboxes: written by this Gateway')
           this.whenWritable(tenantId)

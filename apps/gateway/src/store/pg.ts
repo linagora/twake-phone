@@ -1435,17 +1435,20 @@ export class PgStore implements Store {
     // Taken from another holder when it lapsed, or at once when this one hears more tenants than it does: it writes
     // from a third of the lease after what the other could still write (none once it lapsed).
     const margin = Math.floor(ms / 3)
-    const { rows } = await this.leasePool.query<{ write_from: Timestamp; write_until: Timestamp }>(
-      `INSERT INTO webhook_leases (role, holder, until, heard, write_from, write_until)
-       VALUES ($1, $2, now() + $3 * interval '1 millisecond', $4, now(), now() + ($3 - $5) * interval '1 millisecond')
+    // Its generation: one more for each lease taken (from another holder, or once it lapsed or was given back).
+    const { rows } = await this.leasePool.query<{ write_from: Timestamp; write_until: Timestamp; generation: string }>(
+      `INSERT INTO webhook_leases (role, holder, until, heard, write_from, write_until, generation)
+       VALUES ($1, $2, now() + $3 * interval '1 millisecond', $4, now(), now() + ($3 - $5) * interval '1 millisecond', 1)
        ON CONFLICT (role) DO UPDATE SET holder = EXCLUDED.holder, until = EXCLUDED.until, heard = EXCLUDED.heard, write_until = EXCLUDED.write_until,
          write_from = CASE WHEN webhook_leases.holder = EXCLUDED.holder THEN webhook_leases.write_from
-                           ELSE greatest(now(), least(webhook_leases.write_until, now()) + $5 * interval '1 millisecond') END
+                           ELSE greatest(now(), least(webhook_leases.write_until, now()) + $5 * interval '1 millisecond') END,
+         generation = CASE WHEN webhook_leases.holder = EXCLUDED.holder AND webhook_leases.until > now() THEN webhook_leases.generation
+                           ELSE webhook_leases.generation + 1 END
        WHERE webhook_leases.holder = EXCLUDED.holder OR webhook_leases.until <= now() OR EXCLUDED.heard > webhook_leases.heard
-       RETURNING write_from, write_until`,
+       RETURNING write_from, write_until, generation`,
       [role, holder, ms, heard, margin]
     )
-    return rows[0] ? { writeFrom: iso(rows[0].write_from), writeUntil: iso(rows[0].write_until) } : null
+    return rows[0] ? { writeFrom: iso(rows[0].write_from), writeUntil: iso(rows[0].write_until), generation: Number(rows[0].generation) } : null
   }
 
   async listWebhookStates(tenantId: string, prefix: string) {

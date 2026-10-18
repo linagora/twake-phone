@@ -117,8 +117,13 @@ export interface TelephonyProvider {
    * as soon as it gave an extension to someone else. Each withdrawal is numbered (voicemailMark).
    */
   withdrawVoicemailBoxes?(extensions: string[]): Promise<void>
-  /** The number of the last withdrawal of mailboxes (fourth review 11a, n°2): read before the holders, for `write.since`. */
+  /** The number of the last withdrawal of mailboxes: read before the holders, for `write.since`. */
   voicemailMark?(): Promise<number>
+  /**
+   * The mailboxes the SIP server sends calls to now, by extension (what the last writes left): where each mailbox is
+   * reached, for the voicemail server (VoicemailSyncOptions' `reached`), which then never has to keep it itself.
+   */
+  listVoicemailBoxes?(): Promise<VoicemailBox[]>
   /** Where the calls of the user's extension go (capability `forwarding`). */
   getForwarding?(user: User): Promise<ForwardingRules>
   /** Replaces those rules; targets are extensions the Gateway checked. */
@@ -228,10 +233,30 @@ export interface VoicemailSyncOptions {
    */
   release?: VoicemailHeldBack
   /**
-   * Asked before each change of the voicemail server (third review 11a, n°2): false, the synchronisation stops there
-   * and rejects (the Gateway lost the right to write the mailboxes).
+   * Asked before each change of the voicemail server: false, the synchronisation stops there and rejects (the Gateway
+   * lost the right to write the mailboxes).
    */
   mayWrite?(): boolean
+  /**
+   * Where each mailbox is reached now, as the SIP server has it (TelephonyProvider's listVoicemailBoxes): the mailboxes
+   * of people gone that are still reached at the extension they had. Without it, what the last synchronisation
+   * returned.
+   */
+  reached?: VoicemailBox[]
+  /**
+   * A mailbox set aside past its grace period goes with its messages (no retention period deletes them: the Gateway's
+   * VOICEMAIL_RETENTION_DAYS is 0), not only once they are gone.
+   */
+  removeAsideWithMessages?: boolean
+}
+
+/** How the events of the mailboxes are told (VoicemailProvider's subscribe). */
+export interface VoicemailSubscribeOptions {
+  /**
+   * Who holds which extension now (the Gateway's directory): an event of a mailbox is told at an extension its holder
+   * holds now, read at each event. Without it, the extensions of the last synchronisation.
+   */
+  holders?(): Promise<{ extension: string; userId: string }[]>
 }
 
 /**
@@ -276,19 +301,23 @@ export interface VoicemailProvider {
   markRead(owner: VoicemailOwner, id: string): Promise<boolean>
   /** Deletes a message; false when the owner's mailbox has no such message. */
   deleteMessage(owner: VoicemailOwner, id: string): Promise<boolean>
-  /** Deletes every message of the person, in their mailbox, set aside or not (step 10's erasure); how many. */
-  eraseMessages(owner: Pick<VoicemailOwner, 'userId'>): Promise<number>
+  /**
+   * Deletes every message of the person, in their mailbox, set aside or not (step 10's erasure); how many. Never makes
+   * nor changes a mailbox: only the messages go. By the Gateway that writes the mailboxes: `mayWrite` is asked before
+   * each deletion (false, it stops there and rejects).
+   */
+  eraseMessages(owner: Pick<VoicemailOwner, 'userId'>, options?: { mayWrite?(): boolean }): Promise<number>
   /**
    * Deletes the messages left before `before`, in every mailbox (the retention period); how many. `mayWrite` is asked
    * before each deletion: false, it stops there.
    */
   purgeMessages(before: Date, options?: { mayWrite?(): boolean }): Promise<number>
   /**
-   * The `voicemail.*` events, by an extension the mailbox's holder held at the last synchronisation (a message left,
-   * read, deleted), whichever screen or phone did it. The Gateway tells them to the extension's holder if the mailbox
-   * is theirs (owns).
+   * The `voicemail.*` events (a message left, read, deleted, whichever screen or phone did it), by an extension the
+   * mailbox's holder holds (`options.holders`). The Gateway tells them to the extension's holder if the mailbox is
+   * theirs (owns).
    */
-  subscribe(): AsyncIterable<RoutedEvent>
+  subscribe(options?: VoicemailSubscribeOptions): AsyncIterable<RoutedEvent>
   close(): Promise<void>
 }
 

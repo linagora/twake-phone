@@ -144,6 +144,10 @@ if (process.env.TEST_DATABASE_URL) {
         const stale = await a.set([{ extension: '9201', mailbox: '9201@c' }, { extension: '9202', mailbox: '000100000000000000000001@c' }], { fence: 10, since })
         expect(stale.withdrawn).toEqual(['9202'])
         expect(await a.list()).toEqual([{ extension: '9201', mailbox: '9201@c' }])
+        // The same round's second write (after the voicemail server's changes), under the same mark: still left out.
+        const again = await a.set([{ extension: '9201', mailbox: '9201@c' }, { extension: '9202', mailbox: '000100000000000000000001@c' }], { fence: 10, since })
+        expect(again.withdrawn).toEqual(['9202'])
+        expect(await a.list()).toEqual([{ extension: '9201', mailbox: '9201@c' }])
         // The next round reads a mark after the withdrawal, and the holders after it: Marie's mailbox at 9202.
         await a.set([{ extension: '9201', mailbox: '9201@c' }, { extension: '9202', mailbox: '000100000000000000000002@c' }], { fence: 10, since: await a.mark() })
         expect(await a.list()).toEqual([{ extension: '9201', mailbox: '9201@c' }, { extension: '9202', mailbox: '000100000000000000000002@c' }])

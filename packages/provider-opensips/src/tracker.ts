@@ -68,6 +68,8 @@ export interface ContactRegistration {
 
 /** Longer than OpenSIPS's dialog timeout (4 h): a call whose end was never told (a lost datagram) is forgotten. */
 const MAX_CALL_MS = 5 * 3_600_000
+/** The caps of the calls to the mailboxes E_TWAKEPHONE_VMCAP says were reached (route[voicemail_alert]). */
+const VMCAP_PARAMS = new Set(['hidden-calls', 'hidden-hour', 'hidden-all', 'calls-all'])
 /** The ended calls remembered, so that a late event (a RINGING after the MISSED, a CDR resent) does not bring one back. */
 const MAX_TOMBSTONES = 10_000
 /** A contact past its expiry is dropped after this much more: its refresh may be on its way. */
@@ -372,13 +374,14 @@ export class CallTracker {
         return
       }
       case 'E_TWAKEPHONE_VMCAP': {
-        // The mailbox of `extension` (step 11a, fourth review n°8), for the administrators: the callers with no number
-        // at all reached their cap there, at the same time (hidden-calls) or in the hour (hidden-hour); the next ones
-        // get what they would have had without it.
+        // A call to the mailbox of `extension` (step 11a) refused for a cap, for the administrators: of the callers with
+        // no number there, at the same time (hidden-calls) or in the hour (hidden-hour), of those with no number to all
+        // the mailboxes (hidden-all), or of all callers (calls-all); the next ones get what they would have had
+        // without it.
         const extension = str(p.extension)
         if (!/^[0-9]{1,40}$/.test(extension)) return
         const param = str(p.param)
-        if (param !== 'hidden-calls' && param !== 'hidden-hour') return
+        if (!VMCAP_PARAMS.has(param)) return
         const value = num(p.value)
         const threshold = num(p.threshold)
         const alert: TelephonyAlert = { kind: 'voicemail', param, scope: 'tenant', extension, ...(value !== undefined ? { value } : {}), ...(threshold !== undefined ? { threshold } : {}) }

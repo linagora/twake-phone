@@ -60,15 +60,17 @@ SERVICES = {
 }
 
 # provider-wazo (step 11a): the Wazo users and their mailboxes it keeps for the people of the platform, the context of
-# those mailboxes, their messages, and the events of a new message, in its tenant only.
+# those mailboxes, their messages, and the events of a new message, in its tenant only (a tenant of its own: the
+# wildcards below reach every user and mailbox of that tenant, wazo-auth has no narrower right). It never changes a
+# user: no `confd.users.*.update`. The fake Wazo of provider-wazo's tests refuses anything this list does not cover.
 TWAKE_ACL = [
     'confd.contexts.create',
     'confd.contexts.read',
+    # A second context made by two Gateways at their first start, removed.
+    'confd.contexts.*.delete',
     'confd.users.create',
     'confd.users.read',
     'confd.users.*.read',
-    # The description of a holder's user: where their mailbox is reached, or since when it is set aside.
-    'confd.users.*.update',
     'confd.users.*.delete',
     'confd.users.*.voicemails.*.update',
     'confd.users.*.voicemails.delete',

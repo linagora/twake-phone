@@ -484,6 +484,11 @@ export interface WebhookSendQuota {
 export interface WebhookLease {
   writeFrom: string
   writeUntil: string
+  /**
+   * One more for each lease of the role taken (from another holder, or by the same once it lapsed or was given back),
+   * the same while it is renewed: a fencing token that no clock moves.
+   */
+  generation: number
 }
 
 /**
