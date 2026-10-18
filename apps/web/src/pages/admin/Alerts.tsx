@@ -223,7 +223,9 @@ export const Alerts = () => {
     const scope = a.kind === 'limit' && a.scope ? ` (${t(a.scope === 'tenant' ? 'admin.alert.scopeTenant' : 'admin.alert.scopeUser')})` : ''
     // A value with no threshold said as it is (the minutes a synchronisation fails, the mailboxes refused).
     const value = a.value === undefined ? '' : a.threshold !== undefined ? ` : ${t('admin.alert.valueOf', { value: a.value, threshold: a.threshold })}` : ` : ${a.value}`
-    return `${name}${scope}${value}`
+    // A set-aside held back: the new holders left without a mailbox meanwhile, and the voicemail off for everyone.
+    const held = `${a.waiting ? ` ; ${t('admin.alert.voicemailWaiting', { waiting: a.waiting })}` : ''}${a.noneReached ? ` ; ${t('admin.alert.voicemailOff')}` : ''}`
+    return `${name}${scope}${value}${held}`
   }
   const opt = (value: string, label: string) => ({ value, label })
   return (

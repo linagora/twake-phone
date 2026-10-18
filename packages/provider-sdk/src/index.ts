@@ -213,11 +213,18 @@ export interface VoicemailSync {
   released?: boolean
 }
 
-/** What a synchronisation held back (VoicemailSync's `heldBack`), as it counted it. */
+/**
+ * What a synchronisation held back (VoicemailSync's `heldBack`), as it counted it. With a set-aside held back, the new
+ * holders left without a mailbox meanwhile (`waiting`, when there are some), and whether no extension of the tenant
+ * reaches a mailbox any more (`noneReached`: the voicemail off for everyone until the release, an id attribute
+ * switched say). A release names `park`, `remove` and `of` only.
+ */
 export interface VoicemailHeldBack {
   park?: number
   remove?: number
   of: number
+  waiting?: number
+  noneReached?: boolean
 }
 
 export interface VoicemailSyncOptions {

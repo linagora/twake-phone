@@ -14,7 +14,7 @@ import { authenticatorFromEnv, TicketStore, type Authenticator, type Identity } 
 import { MAX_CONTACT_ID, MAX_FAVORITES, MAX_QUERY, MAX_SEARCH, RateLimiter, type ContactDirectory } from './contacts.js'
 import { CALL_ROOM, GATEWAY_ROOM } from './conference-sweep.js'
 import { StoreDirectory, seedUserMap, type UserDirectory } from './directory.js'
-import { HOLDER_RECORD, holderIdOf, type DirectorySync, type HolderRecord } from './directory-sync.js'
+import { HOLDER_RECORD, VOICEMAIL_HELD, holderIdOf, type DirectorySync, type HolderRecord } from './directory-sync.js'
 import { EventBus } from './events.js'
 import { historyEntryFor } from './history.js'
 import { ENDED_TTL_SEC, MISSED_TTL_SEC, type PushMessage, type WebPush } from './push.js'
@@ -121,7 +121,6 @@ const RESTORE_RETRY_MS = [1_000, 5_000, 15_000, 30_000]
  * What the synchronisation of the mailboxes held back, and an administrator's word that it is
  * meant, in the store (every Gateway reads them; the one that leads honours the word).
  */
-const VOICEMAIL_HELD = 'voicemail:held'
 const VOICEMAIL_RELEASE = 'voicemail:release'
 /** The releases of the guard asked, newest first, VOICEMAIL_RELEASES_KEPT of them. */
 const VOICEMAIL_RELEASES = 'voicemail:releases'
@@ -146,7 +145,7 @@ const VOICEMAIL_FAILING = ['sync-failing', 'boxes-refused'] as const
  * `voicemail:erase:<userId>`, done by the Gateway that writes the mailboxes, at its next round.
  */
 const VOICEMAIL_ERASE = 'voicemail:erase:'
-type HeldBack = { park?: number; remove?: number; of?: number; since?: string }
+type HeldBack = { park?: number; remove?: number; of?: number; waiting?: number; noneReached?: boolean; since?: string }
 /** How long someone found without an extension keeps their browsers' subscriptions (BuildOptions.pushPurgeGraceMs). */
 const PUSH_PURGE_GRACE_MS = 3_600_000
 /** Longest wait of a change for the one before it (a provider whose database hangs): the next one then goes. */
@@ -1050,7 +1049,10 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
   const eraseAsked = async (tenantId: string, vm: VoicemailProvider) => {
     for (const { key, value } of await store.listOperatorState(tenantId, VOICEMAIL_ERASE)) {
       const userId = key.slice(VOICEMAIL_ERASE.length)
-      const erased = await vm.eraseMessages({ userId: await holderIdFor(tenantId, userId) }, { mayWrite: () => mayWriteVoicemail(tenantId) })
+      // The holder they were when it was asked: an id given to someone after them since never takes the newcomer's.
+      const epoch = (value as { epoch?: unknown } | undefined)?.epoch
+      const holder = typeof epoch === 'number' ? holderIdOf(userId, { epoch }) : await holderIdFor(tenantId, userId)
+      const erased = await vm.eraseMessages({ userId: holder }, { mayWrite: () => mayWriteVoicemail(tenantId) })
       await store.deleteOperatorState(tenantId, key, value)
       app.log.info({ tenantId, erased }, 'mailboxes: the messages of a person erased, as asked')
     }
@@ -1059,7 +1061,8 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
   const askErasure = async (tenantId: string, userId: string) => {
     const at = new Date().toISOString()
     // Its own mark too: one asked again in the same millisecond is still another, kept for the next round.
-    await store.putOperatorState(tenantId, `${VOICEMAIL_ERASE}${userId}`, { at, ask: randomBytes(8).toString('hex') })
+    const record = (await store.getOperatorState(tenantId, `${HOLDER_RECORD}${userId}`)) as HolderRecord | undefined
+    await store.putOperatorState(tenantId, `${VOICEMAIL_ERASE}${userId}`, { at, ask: randomBytes(8).toString('hex'), epoch: record?.epoch ?? 0 })
     await store.putOperatorState(tenantId, VOICEMAIL_CHANGED, { at, erase: true })
     const provider = started.get(tenantId)
     if (provider) void syncVoicemail(tenantId, provider)
@@ -1082,12 +1085,16 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
     const heldBack = done.heldBack
     const before = (await store.getOperatorState(tenantId, VOICEMAIL_HELD)) as HeldBack | undefined
     if (heldBack) {
-      if (before?.park !== heldBack.park || before?.remove !== heldBack.remove || before?.of !== heldBack.of) {
+      const mass = before?.park !== heldBack.park || before?.remove !== heldBack.remove || before?.of !== heldBack.of
+      // The same mass, with more or fewer new holders waiting, or reached otherwise now: what GET says follows, no new alert.
+      if (!mass && (before?.waiting !== heldBack.waiting || before?.noneReached !== heldBack.noneReached))
+        await store.putOperatorState(tenantId, VOICEMAIL_HELD, { ...heldBack, since: before?.since ?? new Date().toISOString() })
+      if (mass) {
         await store.putOperatorState(tenantId, VOICEMAIL_HELD, { ...heldBack, since: before?.since ?? new Date().toISOString() })
         // Told at each new mass held back, each guard on its own: the mailboxes set aside, how many of how many reached;
         // those removed past their grace period, how many (their guard counts all the mailboxes, not those reached).
         const told = (alert: AlertRecord['alert']) => store.addAlert({ tenantId, at: new Date().toISOString(), alert }).catch((err: unknown) => app.log.error({ err, tenantId }, 'could not record the alert'))
-        if (heldBack.park !== undefined) await told({ kind: 'voicemail', param: 'held-back', scope: 'tenant', value: heldBack.park, threshold: heldBack.of })
+        if (heldBack.park !== undefined) await told({ kind: 'voicemail', param: 'held-back', scope: 'tenant', value: heldBack.park, threshold: heldBack.of, ...(heldBack.waiting ? { waiting: heldBack.waiting } : {}), ...(heldBack.noneReached ? { noneReached: true } : {}) })
         if (heldBack.remove !== undefined) await told({ kind: 'voicemail', param: 'held-back-remove', scope: 'tenant', value: heldBack.remove })
       }
     } else if (before) await store.deleteOperatorState(tenantId, VOICEMAIL_HELD)
@@ -2056,8 +2063,14 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
       // What a release does, said with what is held back and in the answer of the release: a
       // mailbox set aside is given back, messages and all, to whoever of them the directory lists again; a removal is
       // for good.
-      const releaseEffect = (held: { park?: number; remove?: number }) => ({
-        ...(held.park !== undefined ? { park: 'set aside with their messages, reversible: each mailbox given back, messages and all, to its holder once they hold an extension again' } : {}),
+      const releaseEffect = (held: { park?: number; remove?: number; waiting?: number; noneReached?: boolean }) => ({
+        ...(held.park !== undefined
+          ? {
+              park: 'set aside with their messages, reversible: each mailbox given back, messages and all, to its holder once they hold an extension again within VOICEMAIL_GRACE_DAYS of their absence (the time held back does not count; past it, the id listed again is taken for someone new, given a mailbox of their own)',
+              ...(held.waiting ? { waiting: `${held.waiting} new holder(s) without a mailbox until then, given one by the release` } : {}),
+              ...(held.noneReached ? { voicemail: 'off for the tenant until then: no extension reaches a mailbox' } : {})
+            }
+          : {}),
         ...(held.remove !== undefined ? { remove: retentionMs === 0 ? 'removed for good with their messages (no retention period): cannot be undone' : 'removed for good, each without a message left: cannot be undone' } : {})
       })
       v1.get('/admin/voicemail', async req => {

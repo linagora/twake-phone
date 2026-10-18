@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import type { Contact } from '@twake/telephony-types'
 import { MemoryContactDirectory } from './contacts.js'
-import { DirectorySync, HOLDER_RECORD, MAX_INTERVAL_MS, extensionOf, holderIdOf, parseInterval, type HolderRecord } from './directory-sync.js'
+import { DirectorySync, HOLDER_RECORD, MAX_INTERVAL_MS, VOICEMAIL_HELD, extensionOf, holderIdOf, parseInterval, type HolderRecord } from './directory-sync.js'
 import { accessNumberInUse, meetAccessMismatch, reservedInUse, seedUserMap } from './directory.js'
 import { MemoryStore } from './store/memory.js'
 
@@ -101,6 +101,47 @@ describe('DirectorySync', () => {
     for (let i = 0; i < 3; i++) await run([people[0]!], DAY / 2)
     await run([people[0]!, person('carol', 'Carol', '103')], DAY / 4)
     expect(await idOf('carol')).toBe('carol\u00001')
+  })
+
+  it('stands the absences still while a set-aside is held back, and forgets a decided one once no mailbox of theirs is left, unless something is held back (ninth review 11a, n°1 and n°3)', async () => {
+    const DAY = 86_400_000
+    let at = Date.parse('2026-10-14T10:00:00.000Z')
+    const store = new MemoryStore()
+    let people = [person('alice', 'Alice', '101'), person('bob', 'Bob', '102'), person('carol', 'Carol', '103')]
+    const directory = new MemoryContactDirectory(people)
+    directory.listAll = async () => people
+    const sync = new DirectorySync({ store, directory, tenantId: 'acme', now: () => new Date(at), absenceMs: DAY, recordKeepMs: 10 * DAY })
+    const record = async (userId: string) => (await store.getOperatorState('acme', `${HOLDER_RECORD}${userId}`)) as HolderRecord | undefined
+    const span = (r: HolderRecord | undefined) => Date.parse(r!.absentConfirmed!) - Date.parse(r!.absentSince!)
+    const run = async (after: number) => {
+      at += after
+      await sync.run()
+    }
+    await sync.run()
+    people = [people[0]!, people[2]!]
+    await run(0)
+    await run(DAY / 2)
+    expect(span(await record('bob'))).toBe(DAY / 2)
+    // Held back: however many runs and days, the absence keeps its length.
+    await store.putOperatorState('acme', VOICEMAIL_HELD, { park: 3, of: 4 })
+    for (let i = 0; i < 4; i++) await run(DAY)
+    expect(span(await record('bob'))).toBe(DAY / 2)
+    // A removal held back only: the absences run.
+    await store.putOperatorState('acme', VOICEMAIL_HELD, { remove: 3, of: 4 })
+    await run(DAY / 4)
+    expect(span(await record('bob'))).toBe((3 * DAY) / 4)
+    await store.deleteOperatorState('acme', VOICEMAIL_HELD)
+    await run(DAY / 4)
+    expect(span(await record('bob'))).toBe(DAY)
+    // Decided; kept while something is held back, gone once no mailbox of his can be left.
+    const since = Date.parse((await record('bob'))!.absentSince!)
+    await store.putOperatorState('acme', VOICEMAIL_HELD, { remove: 3, of: 4 })
+    at = since + 11 * DAY
+    await sync.run()
+    expect(await record('bob')).toBeDefined()
+    await store.deleteOperatorState('acme', VOICEMAIL_HELD)
+    await sync.run()
+    expect(await record('bob')).toBeUndefined()
   })
 
   it('changes nothing while who left cannot be recorded, and does it all at the next run that can (eighth review 11a, n°5)', async () => {

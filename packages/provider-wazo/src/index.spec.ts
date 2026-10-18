@@ -279,7 +279,7 @@ describe('WazoVoicemail, the mailboxes', () => {
     // Reached nowhere any more (the SIP server's rows gone, withdrawn while the round failed): held back all the same,
     // counted on the mailboxes in use (eighth review 11a, n°7).
     const unreached = await other.syncMailboxes([], { reached: [] })
-    expect([unreached.heldBack, unreached.boxes]).toEqual([{ park: 4, of: 4 }, []])
+    expect([unreached.heldBack, unreached.boxes]).toEqual([{ park: 4, of: 4, noneReached: true }, []])
     expect(four.map(h => wazo.nameOf(h.userId))).toEqual(four.map(() => 'TwakePhone'))
   })
 
@@ -292,7 +292,8 @@ describe('WazoVoicemail, the mailboxes', () => {
     const renamed = four.map(h => ({ ...h, userId: `uuid-${h.userId}` }))
     for (let round = 0; round < 3; round++) {
       const held = await vm.syncMailboxes(renamed, { reached: [] })
-      expect([held.heldBack, held.boxes]).toEqual([{ park: 4, of: 4 }, []])
+      // The four new ids waiting for a mailbox, and no extension reaching one: said.
+      expect([held.heldBack, held.boxes]).toEqual([{ park: 4, of: 4, waiting: 4, noneReached: true }, []])
     }
     expect(wazo.state.voicemails.map(v => v.name)).toEqual(four.map(() => 'TwakePhone'))
     // Switched back: each one's own again, messages and all.
@@ -333,7 +334,7 @@ describe('WazoVoicemail, the mailboxes', () => {
     expect(five.map(h => wazo.nameOf(h.userId)!.startsWith('TwakePhone aside '))).toEqual([true, true, false, false, false])
     // Three of the five others at once, not reached any more: counted on the mailboxes, held back (eighth review 11a, n°2).
     const mass = await vm.syncMailboxes(next.map((h, i) => (i >= 2 ? { extension: h.extension, userId: `n${i}` } : h)), { reached: [] })
-    expect(mass.heldBack).toEqual({ park: 3, of: 5 })
+    expect(mass.heldBack).toEqual({ park: 3, of: 5, waiting: 3 })
     expect(five.slice(2).map(h => wazo.nameOf(h.userId))).toEqual(['TwakePhone', 'TwakePhone', 'TwakePhone'])
   })
 

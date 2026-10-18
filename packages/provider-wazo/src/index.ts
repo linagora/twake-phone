@@ -767,7 +767,10 @@ export class WazoVoicemail implements VoicemailProvider {
       if (!u.userfield?.startsWith(HOLDER) || u.voicemail || people.has(u.userfield)) continue
       await attempt(`removing a user without a mailbox`, () => write(`/users/${u.uuid}`, 'DELETE'))
     }
-    const heldBack = holdPark || holdRemove ? { ...(holdPark ? { park: leaving.length } : {}), ...(holdRemove ? { remove: expired.length } : {}), of: active.length } : undefined
+    const heldBack =
+      holdPark || holdRemove
+        ? { ...(holdPark ? { park: leaving.length } : {}), ...(holdRemove ? { remove: expired.length } : {}), of: active.length, ...(holdPark && waiting ? { waiting } : {}), ...(holdPark && !boxes.length ? { noneReached: true } : {}) }
+        : undefined
     const note = heldBack ? JSON.stringify(heldBack) : undefined
     if (note && note !== this.heldNote)
       this.log.warn(

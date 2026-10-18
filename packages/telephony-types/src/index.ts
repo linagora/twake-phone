@@ -263,6 +263,12 @@ export interface TelephonyAlert {
   number?: string
   /** Who holds the extension, as the Gateway knows them. */
   userId?: UserId
+  /**
+   * `held-back` only: the new holders left without a mailbox until the release (`waiting`), and whether no extension
+   * of the tenant reaches a mailbox meanwhile (`noneReached`: the voicemail off for everyone).
+   */
+  waiting?: number
+  noneReached?: boolean
 }
 
 /**

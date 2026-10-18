@@ -49,6 +49,12 @@ export interface DirectorySyncOptions {
   exclusiveWaitMs?: number
   /** How long an absence must be confirmed before the id is someone else's (HolderRecord; ABSENCE_MS by default). */
   absenceMs?: number
+  /**
+   * How long after a person left their record is kept once their absence is decided (HolderRecord): past it, no
+   * mailbox of theirs is left (aside past the grace period, its messages past the retention period). By default
+   * `absenceMs` and 31 days.
+   */
+  recordKeepMs?: number
 }
 
 /**
@@ -71,6 +77,12 @@ export interface HolderRecord {
 export const holderIdOf = (userId: string, record?: HolderRecord) => (record?.epoch ? `${userId}\u0000${record.epoch}` : userId)
 /** How long a person must be confirmed absent before their id, listed again, is someone else's: 7 days by default. */
 export const ABSENCE_MS = 7 * 86_400_000
+/**
+ * What the synchronisation of the mailboxes holds back, too many at once (written by the Gateway that writes them):
+ * while a set-aside is held back, the absences do not run (HolderRecord), so that nobody it holds back comes back as
+ * someone else however long the administrators take.
+ */
+export const VOICEMAIL_HELD = 'voicemail:held'
 
 /** How long a change of the groups waits for a synchronisation that runs (DirectorySync.exclusive). */
 export const EXCLUSIVE_WAIT_MS = 10_000
@@ -109,11 +121,17 @@ export class DirectorySync {
    * to their epoch, or given the next one when their absence was confirmed long enough. An absence already confirmed
    * that long is decided: not written again. Each person whose mapping goes now is recorded: absent from now when not
    * listed; when listed (no extension any more), known, so that their absence later is one even without a mapping.
-   * Records stay: a person who left and comes back after months is someone new, whatever happened between.
+   * While a set-aside is held back (VOICEMAIL_HELD), the absences stand still: each one confirmed keeps the length it
+   * had, so that the time held back never counts. A decided absence's record goes once no mailbox of theirs can be left
+   * (`recordKeepMs` after they left), unless something is held back.
    */
   private async recordAbsences(present: Set<string>, released: Set<string>, at: string) {
     const { store, tenantId } = this.opts
     const absenceMs = this.opts.absenceMs ?? ABSENCE_MS
+    const keepMs = this.opts.recordKeepMs ?? absenceMs + 31 * 86_400_000
+    const held = (await store.getOperatorState(tenantId, VOICEMAIL_HELD)) as { park?: number } | undefined
+    const still = held?.park !== undefined
+    const now = Date.parse(at)
     const records = new Map((await store.listOperatorState(tenantId, HOLDER_RECORD)).map(r => [r.key.slice(HOLDER_RECORD.length), r.value as HolderRecord]))
     const long = (r: HolderRecord) => !!r.absentSince && Date.parse(r.absentConfirmed ?? r.absentSince) - Date.parse(r.absentSince) >= absenceMs
     for (const [userId, r] of records) {
@@ -123,7 +141,13 @@ export class DirectorySync {
         const epoch = (r.epoch ?? 0) + (long(r) ? 1 : 0)
         if (long(r)) this.opts.log?.info({ userId }, 'directory synchronisation: an id listed again after a long absence, someone new: a mailbox of their own')
         await store.putOperatorState(tenantId, key, epoch ? { epoch } : {})
-      } else if (!long(r)) await store.putOperatorState(tenantId, key, { ...r, absentSince: r.absentSince ?? at, absentConfirmed: at })
+      } else if (long(r)) {
+        if (!held && now - Date.parse(r.absentSince!) >= keepMs) await store.deleteOperatorState(tenantId, key, r)
+      } else {
+        // Held back: the absence moved along, its length as it was.
+        const since = !r.absentSince ? at : still ? new Date(now - (Date.parse(r.absentConfirmed ?? r.absentSince) - Date.parse(r.absentSince))).toISOString() : r.absentSince
+        await store.putOperatorState(tenantId, key, { ...r, absentSince: since, absentConfirmed: at })
+      }
     }
     for (const userId of released) if (!records.has(userId)) await store.putOperatorState(tenantId, `${HOLDER_RECORD}${userId}`, present.has(userId) ? {} : { absentSince: at, absentConfirmed: at })
   }
