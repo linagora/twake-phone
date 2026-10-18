@@ -273,8 +273,11 @@ export class DirectorySync {
     }
 
     // Rows that go, first: that frees the extensions before they are given to someone else (two people swapping).
+    const listed = new Set(people.map(p => p.id))
     for (const userId of released) {
-      await store.deleteMapping(tenantId, userId)
+      // Their erasure goes only when they left the directory (fourth review 10b, n°2): given another extension, or
+      // none, it stays (until purged).
+      await store.deleteMapping(tenantId, userId, { left: !listed.has(userId) })
       if (!wanted.has(userId)) report.removed++
     }
     for (const next of wanted.values()) {

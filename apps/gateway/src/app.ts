@@ -5,8 +5,8 @@ import websocket from '@fastify/websocket'
 import swagger from '@fastify/swagger'
 import swaggerUi from '@fastify/swagger-ui'
 import { LiveKitError, PIN_DIGITS, maskNumber, splitParticipantId, verifyWebhook, type LiveKitConferenceBridge, type MeetApi, type MeetRoom, type ParticipantCall } from '@twake/conference-livekit'
-import { REPLACES } from '@twake/provider-opensips'
-import type { DialedParticipant, MediaProvider, RoomCallGrantToken, TelephonyProvider } from '@twake/telephony-provider-sdk'
+import { OUTBOUND_ALLOWED, REPLACES, classify, countryAllowed } from '@twake/provider-opensips'
+import type { DialedParticipant, MediaProvider, OperatorProvider, RoomCallGrantToken, TelephonyProvider } from '@twake/telephony-provider-sdk'
 import { EXTENSION_FORMAT, FRAUD_DEFAULTS, OUTBOUND_CAP_DEFAULTS, isReservedNumber, type CallDirection, type DidRange, type Endpoint, type ForwardingRules, type Presence, type PresenceStatus, type RingGroup, type TelephonyEvent, type TrunkStatus, type User } from '@twake/telephony-types'
 import { adminPolicyFromEnv, isAdmin, type AdminPolicy } from './admin.js'
 import { authenticatorFromEnv, TicketStore, type Authenticator, type Identity } from './auth.js'
@@ -20,17 +20,26 @@ import { ENDED_TTL_SEC, MISSED_TTL_SEC, type PushMessage, type WebPush } from '.
 import type { ProviderRegistry } from './registry.js'
 import { securityHeadersFor, type SecurityOptions } from './security.js'
 import { TrunkWatch } from './trunk-health.js'
+import { OPERATOR_KEPT_MS, OperatorRoundError, OperatorSync, askKey, erasedNumbersOf, type OperatorRemoval, type OperatorRestoreRefusal } from './operator.js'
+import { e164Of } from './e164.js'
 import { encrypt } from './crypto.js'
 import { newWebhookSecret, parseWebhookDomains } from './webhook-delivery.js'
 import { presenceEvent, webhookEventsFor } from './webhook-events.js'
 import { DELIVERY_CURSOR, DELIVERY_ID, MAX_WEBHOOKS, WEBHOOK_ID, WEBHOOK_SECRET_GRACE_MS, WEBHOOK_SENDS_PER_MINUTE, WEBHOOK_TENANT_SENDS_PER_MINUTE, WebhookHub, parseSubscription, publicDelivery, publicSubscription, secretContext, type WebhookHubOptions } from './webhooks.js'
-import { MAX_DIDS, MAX_TRUNKS, TRUNK_ID, defaultTrunk, parseDid, parseTrunk, providerTrunks, publicDid, publicTrunk, trunkRecord } from './trunks.js'
+import { MAX_DIDS, MAX_TRUNKS, TRUNK_ID, defaultTrunk, inDids, parseDid, parseOperatorLines, parseTrunk, providerTrunks, publicDid, publicTrunk, trunkRecord } from './trunks.js'
 import { EMPTY_OUTBOUND, PROFILE_ID, outboundVersion, parseOutbound, staleOutbound, type Outbound } from './outbound.js'
 import { MemoryStore } from './store/memory.js'
 import { ALERT_RETENTION_DAYS, clampLimit, isMissed, type HistoryEntry, type HistoryQuery, type Store, type StoredAlert, type TrunkRecord, type UserPresenceRecord, type WebhookDeliveryStatus, type WebhookSubscriptionRecord } from './store/types.js'
 
+/** How long a trunk's save waits for its operator (step 10b), and a round asked from the administration. */
+const OPERATOR_APPLY_MS = 8_000
+const OPERATOR_ROUND_MS = 30_000
+/** Rounds asked a minute per tenant, whatever Gateway is asked (review 10b, n°8); reads of lines asked a minute. */
+const OPERATOR_SYNCS_PER_MINUTE = 2
+const OPERATOR_READS_PER_MINUTE = 10
+
 /** What the SIP server raises for the administrators (TelephonyAlert). */
-const ALERT_KINDS = ['fraud-warning', 'fraud-critical', 'limit', 'rights', 'emergency', 'meet', 'webhook'] as const
+const ALERT_KINDS = ['fraud-warning', 'fraud-critical', 'limit', 'rights', 'emergency', 'meet', 'webhook', 'operator'] as const
 /** An extension as the log names it: the same short hash for the same tenant and extension, never the extension. */
 /**
  * The extension of an alert in the log (second review 6b, n°7): a keyed hash (HMAC-SHA-256, with a key the Gateway
@@ -42,6 +51,36 @@ const pseudonymizer = (secretsKey: Buffer | undefined) => {
   const key = Buffer.from(hkdfSync('sha256', secretsKey, Buffer.alloc(0), 'twake-phone: extensions in the log', 32))
   return (tenantId: string, extension: string) => createHmac('sha256', key).update(`${tenantId}\u0000${extension}`).digest('hex').slice(0, 16)
 }
+/**
+ * The print of the number on the other side of an erased call (third review 10b, n°5): HMAC-SHA-256 with a key the
+ * Gateway derives from SECRETS_KEY, the same for one number of one tenant, that the base alone does not give back.
+ * Without SECRETS_KEY, none: an erased call is kept by its way and time alone.
+ */
+const erasedRemoteKey = (secretsKey: Buffer | undefined) => {
+  if (!secretsKey) return undefined
+  const key = Buffer.from(hkdfSync('sha256', secretsKey, Buffer.alloc(0), 'twake-phone: erased calls', 32))
+  return (tenantId: string, number: string) => createHmac('sha256', key).update(`${tenantId}\u0000${number}`).digest('hex')
+}
+/**
+ * Why a forward of before to `number` may not be put back on a line of trunk `trunkId` (fourth review 10b, n°3): the
+ * rules a fallback at the operator is held to (OPERATOR_FALLBACK_LOOP: a direct number, a line or the number of a
+ * trunk), and what the trunk may call (step 6: premium numbers never, overseas and international ones as it allows; its
+ * defaults when it is gone).
+ */
+export const restoreRefusalOf =
+  (store: Store) =>
+  async (tenantId: string, number: string, trunkId?: string): Promise<OperatorRestoreRefusal | undefined> => {
+    const n = e164Of(number)
+    if (inDids((await store.listDids(tenantId)).map(publicDid), n)) return 'loop'
+    const trunks = await store.listTrunks(tenantId)
+    if (trunks.some(t => [...(t.config.operator?.lines ?? []), ...(t.config.defaultNumber ? [t.config.defaultNumber] : [])].some(l => e164Of(l) === n))) return 'loop'
+    const trunk = trunks.find(t => t.id === trunkId)
+    const kind = classify(n)
+    const allowed: readonly string[] = trunk?.config.allowed ?? OUTBOUND_ALLOWED
+    if (!kind || !allowed.includes(kind.class)) return 'outbound'
+    if (kind.class === 'international' && !countryAllowed(kind.number, trunk?.config.countries ?? [])) return 'outbound'
+    return undefined
+  }
 /** The cursor of a page of alerts (`next`, `before`): the last repeat (ms) and id of the last alert of the page. */
 const ALERT_CURSOR = /^([0-9]{1,15})-([1-9][0-9]{0,17})$/
 /**
@@ -183,6 +222,17 @@ export interface BuildOptions {
    */
   trunkWatchMs?: number
   trunkWatchConfirm?: number
+  /**
+   * The operator of the trunks of each tenant that has one (step 10b, ADR 0021: OVHcloud for the organisation of the
+   * pilot), read every `operatorSyncMs` (10 minutes by default; 0: never on a schedule) by the Gateway that leads:
+   * the fallback forwards of the trunks' lines, the records of calls reconciled with the history once read
+   * `operatorSettleMs` ago (5 minutes by default).
+   */
+  operators?: ReadonlyMap<string, OperatorProvider>
+  /** Where the log goes (standard output by default): a test reads it (review 10b, n°22: no key in it). */
+  logStream?: { write(line: string): void }
+  operatorSyncMs?: number
+  operatorSettleMs?: number
   /** Phone access to Meet rooms. Absent when no LiveKit is configured: the endpoints answer 501. */
   conference?: {
     bridge: (tenantId: string) => LiveKitConferenceBridge | undefined
@@ -350,7 +400,11 @@ const publicEntry = (e: HistoryEntry) => ({
   answered: e.answered,
   // Missed: the phone rang and nobody took the call. One the user declined (state `rejected`) is not.
   missed: isMissed(e),
-  ...(e.conference ? { conference: true } : {})
+  ...(e.conference ? { conference: true } : {}),
+  // Where it is known from (step 10b): the SIP server, its operator's record reconciled with it, or that record alone.
+  sources: e.operatorOnly && e.operator ? [e.operator] : e.operator ? ['opensips', e.operator] : ['opensips'],
+  // Forwarded at the operator to the fallback, the platform out of reach (second review 10b, n°4): missed here.
+  ...(e.operatorForwarded ? { forwardedToFallback: true } : {})
 })
 
 export const buildApp = async (registry: ProviderRegistry, options: BuildOptions = {}) => {
@@ -394,6 +448,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
     logger: {
       level: process.env.LOG_LEVEL ?? 'info',
       redact: ['req.headers.authorization', 'req.headers.cookie'],
+      ...(options.logStream ? { stream: options.logStream } : {}),
       serializers: {
         // Tickets and dev tokens travel in the query string of the WebSocket: never log them.
         req: req => ({ method: req.method, url: req.url?.split('?')[0] })
@@ -812,14 +867,23 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
       }
     })().catch(err => app.log.error({ err }, 'provider event stream failed'))
   }
-  // The alerts past their retention go every hour (and once at start), whoever they belong to (step 6b).
+  // The alerts past their retention go every hour (and once at start), whoever they belong to (step 6b). With them,
+  // what erasures and changes of hands keep past OPERATOR_KEPT_MS, with an operator or not (third review 10b, n°3).
   const purgeAlerts = () =>
-    store.purgeAlerts(new Date(Date.now() - ALERT_RETENTION_DAYS * 86_400_000).toISOString()).then(
-      n => {
-        if (n) app.log.info({ purged: n }, 'alerts past their retention removed')
-      },
-      err => app.log.error({ err }, 'alerts not purged')
-    )
+    Promise.all([
+      store.purgeAlerts(new Date(Date.now() - ALERT_RETENTION_DAYS * 86_400_000).toISOString()).then(
+        n => {
+          if (n) app.log.info({ purged: n }, 'alerts past their retention removed')
+        },
+        err => app.log.error({ err }, 'alerts not purged')
+      ),
+      store.purgeErasures(new Date(Date.now() - OPERATOR_KEPT_MS).toISOString()).then(
+        n => {
+          if (n) app.log.info({ purged: n }, 'erasures and changes of hands past their days removed')
+        },
+        err => app.log.error({ err }, 'erasures not purged')
+      )
+    ])
   const alertPurge = setInterval(() => void purgeAlerts(), options.alertPurgeIntervalMs ?? 3_600_000)
   alertPurge.unref()
   /**
@@ -846,6 +910,20 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
     trunkStatus.set(tenantId, { at: Date.now(), answer })
     return answer
   }
+  // The operator of the trunks (step 10b, ADR 0021): what is kept in step with it, by the Gateway that leads.
+  const remoteKey = erasedRemoteKey(options.secretsKey)
+  const operatorSync = options.operators?.size
+    ? new OperatorSync({
+        store,
+        operators: options.operators,
+        ...(hub ? { leading: () => hub.leading } : {}),
+        ...(options.operatorSyncMs ? { everyMs: options.operatorSyncMs } : {}),
+        ...(options.operatorSettleMs !== undefined ? { settleMs: options.operatorSettleMs } : {}),
+        ...(remoteKey ? { remoteKey } : {}),
+        restorable: restoreRefusalOf(store),
+        logger: app.log
+      })
+    : undefined
   // trunk.degraded (step 10a, ADR 0020): the trunks of the tenants served, read on a schedule, from what the SIP server
   // already says of them (registration, servers probed).
   const trunkWatch =
@@ -862,6 +940,8 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
           },
           names: async tenantId => new Map((await store.listTrunks(tenantId)).map(t => [t.id, t.config.name])),
           told: tenantId => store.listWebhookStates(tenantId, 'trunk:'),
+          // Step 10b: whether its fallback is set at the operator (the callers reach it while the trunk is out).
+          ...(operatorSync ? { fallback: (tenantId: string, trunkId: string) => operatorSync.fallbackOf(tenantId, trunkId) } : {}),
           ...(options.trunkWatchMs ? { everyMs: options.trunkWatchMs } : {}),
           ...(options.trunkWatchConfirm ? { confirm: options.trunkWatchConfirm } : {}),
           logger: app.log
@@ -885,6 +965,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
     void purgeAlerts()
     hub?.start()
     trunkWatch?.start()
+    if (options.operatorSyncMs !== 0) operatorSync?.start()
   })
   app.addHook('onClose', async () => {
     closing = true
@@ -892,6 +973,8 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
     settling.clear()
     clearInterval(alertPurge)
     trunkWatch?.stop()
+    // Its round under way ends first: the store is closed after (review 10b, n°25).
+    await operatorSync?.stop()
     await hub?.stop()
     await registry.closeAll()
     await store.close()
@@ -1265,7 +1348,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         const apply = trunksOf(registry.forTenant(user.tenantId))
         const id = req.params.id
         if (!TRUNK_ID.test(id)) throw Object.assign(new Error('id: lower case letters, digits and dashes, 32 at most'), { statusCode: 400, code: 'TRUNK_INVALID' })
-        const { record, created } = await inTurn(user.tenantId, async () => {
+        const { record, created, before } = await inTurn(user.tenantId, async () => {
           const records = await store.listTrunks(user.tenantId)
           const current = records.find(t => t.id === id)
           if (!current && records.length >= MAX_TRUNKS) throw Object.assign(new Error(`At most ${MAX_TRUNKS} trunks`), { statusCode: 409, code: 'TRUNK_LIMIT' })
@@ -1279,6 +1362,30 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
             throw Object.assign(new Error('This is the default trunk: make another one the default instead'), { statusCode: 409, code: 'TRUNK_DEFAULT' })
           const dids = (await store.listDids(user.tenantId)).map(publicDid)
           await checkTarget(user.tenantId, registry.forTenant(user.tenantId), 'fallbackTarget', parsed.config.fallbackTarget, 'FALLBACK_TARGET')
+          // Its fallback at the operator (step 10b): only with an operator, and never one of the organisation's own
+          // direct numbers (the operator would forward a call to the number that could not be reached).
+          const atOperator = parsed.config.operator?.fallback
+          if (atOperator && !operatorSync?.serves(user.tenantId))
+            throw Object.assign(new Error('operator.fallback: no operator is configured for this organisation: its fallback cannot be set there'), { statusCode: 409, code: 'OPERATOR_NONE' })
+          if (atOperator?.number && inDids(dids, atOperator.number))
+            throw Object.assign(new Error(`operator.fallback.number: ${atOperator.number} is one of the direct numbers of this platform`), { statusCode: 409, code: 'OPERATOR_FALLBACK_LOOP' })
+          // Nor a line of a trunk at the operator, nor the number a trunk presents (review 10b, n°26): the same loop.
+          const others = records.filter(t => t.id !== id)
+          const own = [...others, { config: parsed.config }].flatMap(t => [...(t.config.operator?.lines ?? []).map(e164Of), ...(t.config.defaultNumber ? [e164Of(t.config.defaultNumber)] : [])])
+          if (atOperator?.number && own.includes(e164Of(atOperator.number)))
+            throw Object.assign(new Error(`operator.fallback.number: ${atOperator.number} is a line or the number of a trunk of this platform`), { statusCode: 409, code: 'OPERATOR_FALLBACK_LOOP' })
+          // The other way round (second review 10b, n°7): its lines and its number are never the fallback another trunk keeps.
+          const mine = [...(parsed.config.operator?.lines ?? []).map(e164Of), ...(parsed.config.defaultNumber ? [e164Of(parsed.config.defaultNumber)] : [])]
+          const looping = others.find(t => t.config.operator?.fallback?.number && mine.includes(e164Of(t.config.operator.fallback.number)))
+          if (looping)
+            throw Object.assign(new Error(`${looping.config.operator!.fallback!.number} is the fallback trunk ${looping.id} keeps at the operator: it cannot be a line or the number of a trunk`), {
+              statusCode: 409,
+              code: 'OPERATOR_FALLBACK_LOOP'
+            })
+          // One fallback a line (review 10b, n°5): another trunk that keeps another one on a line of this one is refused.
+          const shared = atOperator && others.find(t => t.config.operator?.fallback && askKey(t.config.operator.fallback) !== askKey(atOperator) && t.config.operator.lines.some(l => parsed.config.operator!.lines.includes(l)))
+          if (shared)
+            throw Object.assign(new Error(`operator.lines: trunk ${shared.id} keeps another fallback on ${shared.config.operator!.lines.filter(l => parsed.config.operator!.lines.includes(l)).join(', ')}: one fallback a line`), { statusCode: 409, code: 'OPERATOR_LINE_SHARED' })
           const record = trunkRecord(user.tenantId, id, parsed, current, options.secretsKey)
           // One default trunk: the one marked now, the others no longer.
           const unmark = (t: TrunkRecord): TrunkRecord => {
@@ -1290,27 +1397,131 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
           const next = current ? records.map(updated) : [...records.map(updated), record]
           // The marks moved together, or not at all.
           await changeTrunks(user.tenantId, apply, next, dids, () => store.upsertTrunks([...unmarked, record]))
-          return { record, created: !current }
+          return { record, created: !current, before: current }
         })
         // The state read before the change is no longer theirs: the screen reads it again at once.
         trunkStatus.delete(user.tenantId)
+        // Its lines at the operator (step 10b), read, and its fallback set there, now: the screen says how it went
+        // (GET /admin/operator). A failure leaves the trunk saved; the next round tries again. The lines it no longer
+        // names lose the fallback it kept there (second review 10b, n°8), as owed until done (n°1).
+        // What is owed still of those (third review 10b, n°11): 202 with it, as the deletions say it.
+        const dropped = before?.config.operator?.fallback ? before.config.operator.lines.filter(l => !record.config.operator?.lines.includes(l)) : []
+        const pending =
+          operatorSync && (record.config.operator || before?.config.operator)
+            ? await within(operatorSync.applyTrunk(user.tenantId, id, dropped), OPERATOR_APPLY_MS, 'operator').catch(async (err: unknown) => {
+                req.log.warn({ err }, 'operator: the trunk not handed to the operator')
+                return (await operatorSync.removals(user.tenantId)).filter(r => dropped.includes(r.line))
+              })
+            : []
+        if (pending.length) return reply.code(202).send({ ...publicTrunk(record), pending })
         return reply.code(created ? 201 : 200).send(publicTrunk(record))
       })
+      /** Removes the forwards of `lines` at the operator, and says what is owed still (all of them, past OPERATOR_APPLY_MS). */
+      const removing = async (tenantId: string, lines: readonly string[], trunkId: string, log: FastifyRequest['log']): Promise<OperatorRemoval[]> =>
+        within(operatorSync!.removeForwards(tenantId, lines, trunkId), OPERATOR_APPLY_MS, 'operator').catch(async (err: unknown) => {
+          log.warn({ err }, 'operator: the forwards of the trunk not removed at the operator yet')
+          return (await operatorSync!.removals(tenantId)).filter(r => lines.includes(r.line))
+        })
       v1.delete<{ Params: { id: string } }>('/admin/trunks/:id', async (req, reply) => {
         const user = await administrator(req)
         const apply = trunksOf(registry.forTenant(user.tenantId))
-        await inTurn(user.tenantId, async () => {
+        const gone = await inTurn(user.tenantId, async () => {
           const records = await store.listTrunks(user.tenantId)
-          if (!records.some(t => t.id === req.params.id)) throw notFound('trunk')
+          const current = records.find(t => t.id === req.params.id)
+          if (!current) throw notFound('trunk')
           // The default trunk gives its number to everyone without a direct number: never changed without a word.
           if (records.length > 1 && defaultTrunk(records)?.id === req.params.id)
             throw Object.assign(new Error('This is the default trunk: make another one the default first'), { statusCode: 409, code: 'TRUNK_DEFAULT' })
           // Its direct numbers go with it.
           const dids = (await store.listDids(user.tenantId)).filter(d => d.trunkId !== req.params.id).map(publicDid)
           await changeTrunks(user.tenantId, apply, records.filter(t => t.id !== req.params.id), dids, () => store.deleteTrunk(user.tenantId, req.params.id))
+          return current
         })
         trunkStatus.delete(user.tenantId)
+        // The forwards it kept at the operator go with it (review 10b, n°13), where no other trunk keeps one: owed
+        // until done, whatever became of it (second review n°1). Not done yet: 202, and what is owed.
+        if (operatorSync && gone.config.operator) {
+          const pending = gone.config.operator.fallback
+            ? await removing(user.tenantId, gone.config.operator.lines, gone.id, req.log)
+            : await within(operatorSync.applyTrunk(user.tenantId, gone.id), OPERATOR_APPLY_MS, 'operator').then(
+                () => [],
+                (err: unknown) => (req.log.warn({ err }, 'operator: the lines of the trunk not read at the operator'), [])
+              )
+          if (pending.length) return reply.code(202).send({ pending })
+        }
         return reply.code(204).send()
+      })
+      // The fallback a trunk keeps at the operator removed there, on an administrator's word (review 10b, n°13): the
+      // trunk no longer asks one, and the forwards of its lines go (those no other trunk keeps one on), read back,
+      // whether the trunk asked one still or not (second review n°8: one left there). 200 once the operator has it;
+      // 202 with what is owed still, done at the next rounds (n°1).
+      v1.delete<{ Params: { id: string } }>('/admin/trunks/:id/operator/fallback', async (req, reply) => {
+        const user = await administrator(req)
+        const apply = trunksOf(registry.forTenant(user.tenantId))
+        if (!operatorSync?.serves(user.tenantId)) throw Object.assign(new Error('No operator is configured for this organisation'), { statusCode: 409, code: 'OPERATOR_NONE' })
+        const record = await inTurn(user.tenantId, async () => {
+          const records = await store.listTrunks(user.tenantId)
+          const current = records.find(t => t.id === req.params.id)
+          if (!current) throw notFound('trunk')
+          if (!current.config.operator) throw Object.assign(new Error('This trunk has no line at the operator'), { statusCode: 409, code: 'OPERATOR_NO_LINES' })
+          if (!current.config.operator.fallback) return current
+          const { fallback: _gone, ...operator } = current.config.operator
+          const record: TrunkRecord = { ...current, config: { ...current.config, operator } }
+          const dids = (await store.listDids(user.tenantId)).map(publicDid)
+          await changeTrunks(user.tenantId, apply, records.map(t => (t.id === record.id ? record : t)), dids, () => store.upsertTrunks([record]))
+          return record
+        })
+        const pending = await removing(user.tenantId, record.config.operator!.lines, record.id, req.log)
+        return reply.code(pending.length ? 202 : 200).send({ trunk: publicTrunk(record), pending })
+      })
+      // The operator of the trunks (step 10b, ADR 0021), administrators only: whether there is one, each trunk's lines
+      // there (their fallback as last read, whether it is as asked, when it was set or put back, how it failed), and
+      // the records of calls of the last 7 days by what became of them (FR-D4: reconciled). `sync`: a round now (one
+      // at a time, OPERATOR_SYNCS_PER_MINUTE a minute per tenant: each is requests to the operator).
+      const operatorRate = (reply: FastifyReply) => reply.code(429).send({ statusCode: 429, code: 'OPERATOR_RATE', error: 'Too Many Requests', message: 'The operator was read a moment ago: wait a minute' })
+      v1.get('/admin/operator', async req => {
+        const user = await administrator(req)
+        const status = operatorSync?.serves(user.tenantId) ? await operatorSync.status(user.tenantId) : undefined
+        return status ? { configured: true, ...status } : { configured: false }
+      })
+      v1.post('/admin/operator/sync', async (req, reply) => {
+        const user = await administrator(req)
+        if (!operatorSync?.serves(user.tenantId)) throw Object.assign(new Error('No operator is configured for this organisation'), { statusCode: 409, code: 'OPERATOR_NONE' })
+        // Counted in the store (every Gateway), and run by the Gateway that leads (review 10b, n°8).
+        if (!(await store.takeOperatorQuota(user.tenantId, 'sync', 60_000, OPERATOR_SYNCS_PER_MINUTE))) return operatorRate(reply)
+        // A round that failed, or did not end in time, is said (second review 10b, n°6): 502 or 504 OPERATOR_ROUND.
+        const failed = await operatorSync.roundNow(user.tenantId, OPERATOR_ROUND_MS).then(
+          () => undefined,
+          (err: unknown) => {
+            req.log.warn({ err }, 'operator: round not done')
+            return err
+          }
+        )
+        if (failed)
+          return reply.code(failed instanceof OperatorRoundError && failed.timeout ? 504 : 502).send({
+            statusCode: failed instanceof OperatorRoundError && failed.timeout ? 504 : 502,
+            code: 'OPERATOR_ROUND',
+            error: failed instanceof OperatorRoundError && failed.timeout ? 'Gateway Timeout' : 'Bad Gateway',
+            message: failed instanceof OperatorRoundError && failed.timeout ? 'The operator was not read in time' : 'The operator could not be read'
+          })
+        return { configured: true, ...(await operatorSync.status(user.tenantId)) }
+      })
+      // A removal at the operator let go (third review 10b, n°4: a line the operator no longer has, keys without the
+      // right to write it): nothing more is written there, what is there stays. 204, or 404 when none is owed.
+      v1.delete<{ Params: { line: string } }>('/admin/operator/removals/:line', async (req, reply) => {
+        const user = await administrator(req)
+        if (!operatorSync?.serves(user.tenantId)) throw Object.assign(new Error('No operator is configured for this organisation'), { statusCode: 409, code: 'OPERATOR_NONE' })
+        if (!(await operatorSync.abandonRemoval(user.tenantId, req.params.line))) throw notFound('removal')
+        return reply.code(204).send()
+      })
+      // What is set at the operator on lines now, read only (review 10b, n°13): the screen shows it before a first
+      // fallback replaces it. The lines as a trunk names them, MAX_OPERATOR_LINES at most.
+      v1.post<{ Body: { lines?: unknown } }>('/admin/operator/lines', async (req, reply) => {
+        const user = await administrator(req)
+        if (!operatorSync?.serves(user.tenantId)) throw Object.assign(new Error('No operator is configured for this organisation'), { statusCode: 409, code: 'OPERATOR_NONE' })
+        const lines = parseOperatorLines((req.body as { lines?: unknown } | undefined)?.lines)
+        if (!(await store.takeOperatorQuota(user.tenantId, 'read', 60_000, OPERATOR_READS_PER_MINUTE))) return operatorRate(reply)
+        return { items: await within(operatorSync.readLines(user.tenantId, lines), OPERATOR_APPLY_MS, 'operator') }
       })
       v1.get('/admin/dids', async req => {
         const user = await administrator(req)
@@ -1327,6 +1538,10 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
           const current = dids.find(d => d.id === req.params.id)
           if (!current && dids.length >= MAX_DIDS) throw Object.assign(new Error(`At most ${MAX_DIDS} ranges of direct numbers`), { statusCode: 409, code: 'DID_LIMIT' })
           const did = parseDid(req.params.id, req.body, records, dids)
+          // The fallback a trunk keeps at the operator (step 10b) is never a direct number of the platform.
+          const looping = records.find(t => t.config.operator?.fallback?.number && inDids([did], t.config.operator.fallback.number))
+          if (looping)
+            throw Object.assign(new Error(`${looping.config.operator!.fallback!.number} is the fallback trunk ${looping.id} keeps at the operator: it cannot be a direct number of the platform`), { statusCode: 409, code: 'OPERATOR_FALLBACK_LOOP' })
           await checkTarget(user.tenantId, provider, 'target', did.target, 'DID_TARGET')
           await checkTarget(user.tenantId, provider, 'fallbackTarget', did.fallbackTarget, 'FALLBACK_TARGET')
           await changeTrunks(user.tenantId, apply, records, current ? dids.map(d => (d.id === did.id ? did : d)) : [...dids, did], () => store.upsertDid({ tenantId: user.tenantId, ...did }))
@@ -1615,7 +1830,11 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         const user = await whoIs(req)
         forgetPresence(user.tenantId, user.id)
         await store.eraseWebhookSubject(user.tenantId, user.id)
-        const deleted = await store.deleteHistory(user.tenantId, user.id)
+        // The operator's records of their direct numbers lose their numbers, and those not reconciled yet never enter
+        // anybody's history (review 10b, n°1; a record read later neither, whoever holds the number then: n°3). When
+        // their calls were is kept only with an operator, for those a record read later may be of (third review n°3).
+        const kept = operatorSync?.keptOfErasure(user.tenantId)
+        const deleted = await store.deleteHistory(user.tenantId, user.id, await erasedNumbersOf(store, user.tenantId, user.id), kept)
         return reply.send({ deleted })
       })
 

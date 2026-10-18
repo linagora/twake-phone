@@ -1,4 +1,5 @@
 import { LiveKitConferenceBridge, MeetApi } from '@twake/conference-livekit'
+import { ovhOperatorFromEnv } from '@twake/provider-ovh'
 import { buildApp } from './app.js'
 import { authenticatorFromEnv } from './auth.js'
 import { sweepDialIns, webhookKeyFromEnv } from './conference-sweep.js'
@@ -178,6 +179,12 @@ const webhookDeny = denyNetworks(env.WEBHOOK_DENY_NETWORKS, networkInterfaces())
 const webhookHttp = env.WEBHOOK_ALLOW_HTTP === '1'
 if (webhookHttp) console.warn('WARNING: WEBHOOK_ALLOW_HTTP=1: webhooks may be delivered in clear (http), for development only')
 if (!key) console.warn('WARNING: no webhooks without SECRETS_KEY (their secrets are kept encrypted with it)')
+// The operator of the trunks (step 10b, ADR 0021): OVHcloud for the organisation of the pilot (DEFAULT_TENANT), from
+// OVH_APPLICATION_KEY, OVH_APPLICATION_SECRET, OVH_CONSUMER_KEY and OVH_BILLING_ACCOUNT (all four, or none: no
+// operator), OVH_ENDPOINT (ovh-eu by default, ovh-ca or ovh-us, never a URL). The keys stay in the environment: never in
+// the database nor the log.
+const ovh = ovhOperatorFromEnv(env)
+if (ovh) console.info(`OVHcloud: the operator of the trunks of ${JSON.stringify(tenant)} (billing account ${env.OVH_BILLING_ACCOUNT})`)
 const hstsMaxAge = env.HSTS_MAX_AGE ? Number(env.HSTS_MAX_AGE) : undefined
 if (hstsMaxAge !== undefined && !(Number.isInteger(hstsMaxAge) && hstsMaxAge >= 0)) throw new Error('HSTS_MAX_AGE must be a number of seconds')
 const app = await buildApp(registry, {
@@ -190,6 +197,7 @@ const app = await buildApp(registry, {
   ...(push ? { push } : {}),
   ...(key ? { secretsKey: key } : {}),
   webhooks: { policy: { allowHttp: webhookHttp, ...(webhookPorts ? { ports: webhookPorts } : {}) }, open: webhookOpen, deny: webhookDeny },
+  ...(ovh ? { operators: new Map([[tenant, ovh]]) } : {}),
   ...(conference ? { conference } : {})
 })
 directorySync?.useLogger(app.log)

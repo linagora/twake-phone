@@ -7,6 +7,9 @@ import type {
   ForwardingRules,
   MediaSession,
   Meeting,
+  OperatorCdr,
+  OperatorFallback,
+  OperatorLineForwards,
   OriginateRequest,
   OutboundAssignment,
   OutboundPolicy,
@@ -182,6 +185,50 @@ export interface CallParties {
   /** The extension it reached (who answered), and the To tag. */
   callee: string
   calleeTag: string
+}
+
+/**
+ * The operator of the trunks (step 10b, ADR 0021), next to the PBX: what its own API says of the lines that carry the
+ * trunks' calls, and the fallback forward it applies to them. OVHcloud's (`provider-ovh`) first. Its errors carry an
+ * HTTP-like `statusCode` and a `code` (OperatorError), never a key.
+ */
+export interface OperatorProvider {
+  /** `ovh`, the source named in the history. */
+  readonly id: string
+  /** The forwards set on a line now, each as it is (to a number, the voicemail...). */
+  getForwards(line: string): Promise<OperatorLineForwards>
+  /** Sets them to one fallback: `number` E.164; both off removes the forwards. Nothing else of the line is touched. */
+  setFallback(line: string, fallback: OperatorFallback): Promise<void>
+  /**
+   * Sets them as given, each to a number, the voicemail or a fax (third review 10b, n°8: what was there before the
+   * platform took the line, put back); absent: off. A forward elsewhere (`other`) cannot be written: refused.
+   */
+  setForwards(line: string, forwards: OperatorLineForwards): Promise<void>
+  /**
+   * The ids of the line's records of calls (CDR) dated from `from` to `to` (ISO 8601), all of them (however many
+   * pages, whatever billing period they are in), each once.
+   */
+  listCdrIds(line: string, from: string, to: string): Promise<string[]>
+  /** One of them; undefined when the operator no longer has it; `invalid` when it cannot be read as a call. */
+  getCdr(line: string, id: string): Promise<OperatorCdr | undefined>
+}
+
+/**
+ * How an operator's API failed, in words without keys nor addresses: `unauthorized` (the keys are refused),
+ * `forbidden` (the consumer key has no right to that call), `not-found` (no such line or record), `refused` (it
+ * refused the values, its words in the log), `rate` (too many requests), `unreachable` (no answer, a time out, a 5xx).
+ */
+export type OperatorErrorCode = 'unauthorized' | 'forbidden' | 'not-found' | 'refused' | 'rate' | 'unreachable'
+
+export class OperatorError extends Error {
+  constructor(
+    readonly code: OperatorErrorCode,
+    message: string,
+    readonly statusCode = code === 'not-found' ? 404 : 502
+  ) {
+    super(message)
+    this.name = 'OperatorError'
+  }
 }
 
 /** Pushes a user's SIP secret where the SIP server checks it. The Gateway generates and keeps the secret. */
