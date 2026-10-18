@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import type { Contact } from '@twake/telephony-types'
 import { MemoryContactDirectory } from './contacts.js'
-import { DirectorySync, MAX_INTERVAL_MS, extensionOf, parseInterval } from './directory-sync.js'
+import { DirectorySync, HOLDER_RECORD, MAX_INTERVAL_MS, extensionOf, holderIdOf, parseInterval, type HolderRecord } from './directory-sync.js'
 import { accessNumberInUse, meetAccessMismatch, reservedInUse, seedUserMap } from './directory.js'
 import { MemoryStore } from './store/memory.js'
 
@@ -40,6 +40,93 @@ describe('DirectorySync', () => {
     expect(await store.getMappingByUser('acme', 'alice')).toMatchObject({ department: 'Direction' })
     expect(await store.getMappingByUser('acme', 'bob')).toBeNull()
     expect(await store.getMappingByUser('acme', 'dave')).toBeNull()
+  })
+
+  it('records who it no longer lists, forgets it once they are listed again in any form, and takes an id for someone new only after an absence confirmed at each run long enough (eighth review 11a, n°1 and n°3)', async () => {
+    const DAY = 86_400_000
+    let at = Date.parse('2026-10-14T10:00:00.000Z')
+    const store = new MemoryStore()
+    await store.upsertMapping({ tenantId: 'acme', userId: 'admin', extension: '100' })
+    let people = [person('alice', 'Alice', '101'), person('bob', 'Bob', '102')]
+    const directory = new MemoryContactDirectory(people)
+    directory.listAll = async () => people
+    const sync = new DirectorySync({ store, directory, tenantId: 'acme', now: () => new Date(at), absenceMs: DAY })
+    const record = async (userId: string) => (await store.getOperatorState('acme', `${HOLDER_RECORD}${userId}`)) as HolderRecord | undefined
+    const idOf = async (userId: string) => holderIdOf(userId, await record(userId))
+    await sync.run()
+    expect(await store.listOperatorState('acme', HOLDER_RECORD)).toEqual([])
+    const run = async (now: typeof people, after: number) => {
+      at += after
+      people = now
+      await sync.run()
+    }
+    // Bob missed by one listing: recorded; listed again two days later, without a run between that confirmed it: the
+    // same Bob, his record back to his epoch (0). The administrator's manual mapping, never listed, is no absence.
+    await run([people[0]!], 0)
+    expect(await record('bob')).toEqual({ absentSince: new Date(at).toISOString(), absentConfirmed: new Date(at).toISOString() })
+    expect(await record('admin')).toBeUndefined()
+    await run([person('alice', 'Alice', '101'), person('bob', 'Bob', '102')], 2 * DAY)
+    expect([await record('bob'), await idOf('bob')]).toEqual([{}, 'bob'])
+    // Missed at each run for less than the absence: the same Bob, listed again even without an extension.
+    await run([people[0]!], DAY / 4)
+    await run([people[0]!], DAY / 2)
+    await run([people[0]!, person('bob', 'Bob')], DAY / 4)
+    expect([await record('bob'), await idOf('bob')]).toEqual([{}, 'bob'])
+    expect(await store.getMappingByUser('acme', 'bob')).toBeNull()
+    // Missed at each run for a day (without a mapping since he had no extension): confirmed, not written again; listed
+    // again, someone new under that id.
+    await run([people[0]!], DAY / 4)
+    await run([people[0]!], DAY / 2)
+    await run([people[0]!], DAY / 2)
+    const confirmed = await record('bob')
+    await run([people[0]!], DAY)
+    expect(await record('bob')).toEqual(confirmed)
+    await run([people[0]!, person('bob', 'Bob', '102')], DAY / 4)
+    expect([await record('bob'), await idOf('bob')]).toEqual([{ epoch: 1 }, 'bob\u00001'])
+    expect(await store.getMappingByUser('acme', 'bob')).toMatchObject({ extension: '102' })
+    // That one missed once, then back: still the second holder of the id.
+    await run([people[0]!], DAY / 4)
+    expect(await record('bob')).toMatchObject({ epoch: 1, absentSince: new Date(at).toISOString() })
+    await run([people[0]!, person('bob', 'Bob', '102')], DAY / 4)
+    expect(await record('bob')).toEqual({ epoch: 1 })
+    // Not listed, but given a mapping by an administrator: present all the same, however long the directory omits him.
+    await run([people[0]!], DAY / 4)
+    await store.upsertMapping({ tenantId: 'acme', userId: 'bob', extension: '109' })
+    for (let i = 0; i < 4; i++) await run([people[0]!], DAY / 2)
+    expect([await record('bob'), await idOf('bob')]).toEqual([{ epoch: 1 }, 'bob\u00001'])
+    // Carol loses her extension, still listed (known from then on), then leaves for good: back, someone new.
+    await run([people[0]!, person('carol', 'Carol', '103')], DAY / 4)
+    await run([people[0]!, person('carol', 'Carol')], DAY / 4)
+    expect(await record('carol')).toEqual({})
+    for (let i = 0; i < 3; i++) await run([people[0]!], DAY / 2)
+    await run([people[0]!, person('carol', 'Carol', '103')], DAY / 4)
+    expect(await idOf('carol')).toBe('carol\u00001')
+  })
+
+  it('changes nothing while who left cannot be recorded, and does it all at the next run that can (eighth review 11a, n°5)', async () => {
+    const people = [person('alice', 'Alice', '101'), person('bob', 'Bob', '102'), person('carol', 'Carol', '103')]
+    const { store, directory, sync } = setup(people)
+    await sync.run()
+    const put = store.putOperatorState.bind(store)
+    let failing = 1
+    store.putOperatorState = async (tenantId, key, value) => {
+      if (key.startsWith(HOLDER_RECORD) && failing-- > 0) throw new Error('database down a moment')
+      return put(tenantId, key, value)
+    }
+    // Bob leaves, Carol changes extension: nothing done, said.
+    directory.listAll = async () => [person('alice', 'Alice', '101'), person('carol', 'Carol', '104')]
+    expect(await sync.run()).toMatchObject({ removed: 0, updated: 0, error: expect.stringMatching(/could not be recorded: nothing was changed/) })
+    expect(await store.getMappingByUser('acme', 'bob')).toMatchObject({ extension: '102' })
+    expect(await store.getMappingByUser('acme', 'carol')).toMatchObject({ extension: '103' })
+    expect(await store.listOperatorState('acme', HOLDER_RECORD)).toEqual([])
+    expect(await sync.run()).toMatchObject({ removed: 1, updated: 1 })
+    expect(await store.getMappingByUser('acme', 'carol')).toMatchObject({ extension: '104' })
+    expect(await store.getMappingByUser('acme', 'bob')).toBeNull()
+    // Bob absent from now; Carol, whose mapping changed, known.
+    expect((await store.listOperatorState('acme', HOLDER_RECORD)).map(r => [r.key, r.value])).toEqual([
+      [`${HOLDER_RECORD}bob`, { absentSince: '2026-10-14T10:00:00.000Z', absentConfirmed: '2026-10-14T10:00:00.000Z' }],
+      [`${HOLDER_RECORD}carol`, {}]
+    ])
   })
 
   it('keeps the erasure of a history of whom it gives another extension, or none, and forgets it of whom left (fourth review 10b, n°2)', async () => {

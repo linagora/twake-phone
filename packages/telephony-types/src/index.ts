@@ -482,6 +482,17 @@ export interface Voicemail {
   unread: boolean
 }
 
+/**
+ * The answer of DELETE /v1/me/history: how many entries of the person's history were erased and, with a voicemail
+ * server, what became of their messages: `asked` of the Gateway that writes the mailboxes, erased at its next round
+ * (the voicemail server down or not); `limited`, not asked this time, past the few erasures an hour each person may ask
+ * (their history erased all the same: asking again later asks it). Absent without a voicemail server.
+ */
+export interface HistoryErasure {
+  deleted: number
+  voicemailErasure?: 'asked' | 'limited'
+}
+
 export interface OriginateRequest {
   user: User
   target: string

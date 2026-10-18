@@ -12,7 +12,7 @@ import { WebPush, parsePushServices, parseVapidSubject } from './push.js'
 import { ProviderRegistry } from './registry.js'
 import { PgStore } from './store/pg.js'
 import { trunkFromEnv, trunkRecord } from './trunks.js'
-import { retentionDaysOf, voicemailMismatch, wazoFromEnv } from './voicemail.js'
+import { absenceMsOf, retentionDaysOf, voicemailMismatch, wazoFromEnv } from './voicemail.js'
 import { networkInterfaces } from 'node:os'
 import { denyNetworks, parsePorts, parseTenantNetworks } from './webhook-delivery.js'
 
@@ -160,7 +160,7 @@ const groupNumbers = async (tenantId: string) => {
   const provider = registry.forTenant(tenantId)
   return provider.listGroups ? (await provider.listGroups()).map(g => g.number) : []
 }
-const directorySync = contacts && env.LDAP_ATTR_EXTENSION ? new DirectorySync({ store, directory: contacts, tenantId: env.LDAP_TENANT ?? tenant, reserved: async t => [...(await groupNumbers(t)), ...(conference && accessNumber ? [accessNumber] : [])] }) : undefined
+const directorySync = contacts && env.LDAP_ATTR_EXTENSION ? new DirectorySync({ store, directory: contacts, tenantId: env.LDAP_TENANT ?? tenant, absenceMs: absenceMsOf(env), reserved: async t => [...(await groupNumbers(t)), ...(conference && accessNumber ? [accessNumber] : [])] }) : undefined
 // Webhooks (step 10a, ADR 0020), with SECRETS_KEY: deliveries in https only, on port 443 (80 in http; WEBHOOK_PORTS:
 // others), never to this host or the private networks, unless the operator opens some to one organisation
 // (WEBHOOK_PRIVATE_NETWORKS, `acme=10.20.0.0/16;beta=192.0.2.10`, a bare list for DEFAULT_TENANT: the CRM of that

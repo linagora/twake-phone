@@ -47,7 +47,30 @@ export interface DirectorySyncOptions {
   reserved?: (tenantId: string) => Promise<Iterable<string>>
   /** How long `exclusive` waits for a run in progress (EXCLUSIVE_WAIT_MS by default). */
   exclusiveWaitMs?: number
+  /** How long an absence must be confirmed before the id is someone else's (HolderRecord; ABSENCE_MS by default). */
+  absenceMs?: number
 }
+
+/**
+ * The record of a person whose mapping this synchronisation removed (operator state `voicemail:holder:<id>`): since
+ * when the directory no longer lists them (`absentSince`), until when the synchronisations since confirmed it, each one
+ * that listed them not (`absentConfirmed`), and which holder of that id they are (`epoch`, 0 for the first). A person the directory lists
+ * again, in any form (with or without an extension, in conflict), or who holds a mapping an administrator gave, is
+ * the same person, their record gone back to their epoch alone; one listed again only after an absence confirmed over
+ * `absenceMs` is someone else given that id: one more epoch. The mailboxes know each holder by `holderIdOf`, so that
+ * someone given an id that was another person's gets a mailbox of their own, the other's set aside, and that no single
+ * listing (a group emptied by mistake, a replica late, an entry without a name) ever changes anyone's mailbox.
+ */
+export const HOLDER_RECORD = 'voicemail:holder:'
+export interface HolderRecord {
+  epoch?: number
+  absentSince?: string
+  absentConfirmed?: string
+}
+/** The id the mailboxes know a person by: their id, and once it was given to someone after them, which holder of it. */
+export const holderIdOf = (userId: string, record?: HolderRecord) => (record?.epoch ? `${userId}\u0000${record.epoch}` : userId)
+/** How long a person must be confirmed absent before their id, listed again, is someone else's: 7 days by default. */
+export const ABSENCE_MS = 7 * 86_400_000
 
 /** How long a change of the groups waits for a synchronisation that runs (DirectorySync.exclusive). */
 export const EXCLUSIVE_WAIT_MS = 10_000
@@ -72,7 +95,7 @@ export class DirectorySync {
   private last: SyncReport | undefined
   private timer: NodeJS.Timeout | undefined
   private intervalMs: number | undefined
-  private readonly listeners: ((tenantId: string, extensions: string[], left: string[]) => void)[] = []
+  private readonly listeners: ((tenantId: string, extensions: string[]) => void)[] = []
 
   constructor(private readonly opts: DirectorySyncOptions) {}
 
@@ -82,11 +105,34 @@ export class DirectorySync {
   }
 
   /**
-   * Called after a run that created, changed or removed a mapping (who holds which extension changed), with the
-   * extensions that passed to someone else or to nobody (those given to someone else lose their mailbox at once), and
-   * the people who left the directory.
+   * HolderRecord for this run: each person the directory no longer lists confirmed absent, each one present again back
+   * to their epoch, or given the next one when their absence was confirmed long enough. An absence already confirmed
+   * that long is decided: not written again. Each person whose mapping goes now is recorded: absent from now when not
+   * listed; when listed (no extension any more), known, so that their absence later is one even without a mapping.
+   * Records stay: a person who left and comes back after months is someone new, whatever happened between.
    */
-  onChange(listener: (tenantId: string, extensions: string[], left: string[]) => void) {
+  private async recordAbsences(present: Set<string>, released: Set<string>, at: string) {
+    const { store, tenantId } = this.opts
+    const absenceMs = this.opts.absenceMs ?? ABSENCE_MS
+    const records = new Map((await store.listOperatorState(tenantId, HOLDER_RECORD)).map(r => [r.key.slice(HOLDER_RECORD.length), r.value as HolderRecord]))
+    const long = (r: HolderRecord) => !!r.absentSince && Date.parse(r.absentConfirmed ?? r.absentSince) - Date.parse(r.absentSince) >= absenceMs
+    for (const [userId, r] of records) {
+      const key = `${HOLDER_RECORD}${userId}`
+      if (present.has(userId)) {
+        if (!r.absentSince) continue
+        const epoch = (r.epoch ?? 0) + (long(r) ? 1 : 0)
+        if (long(r)) this.opts.log?.info({ userId }, 'directory synchronisation: an id listed again after a long absence, someone new: a mailbox of their own')
+        await store.putOperatorState(tenantId, key, epoch ? { epoch } : {})
+      } else if (!long(r)) await store.putOperatorState(tenantId, key, { ...r, absentSince: r.absentSince ?? at, absentConfirmed: at })
+    }
+    for (const userId of released) if (!records.has(userId)) await store.putOperatorState(tenantId, `${HOLDER_RECORD}${userId}`, present.has(userId) ? {} : { absentSince: at, absentConfirmed: at })
+  }
+
+  /**
+   * Called after a run that created, changed or removed a mapping (who holds which extension changed), with the
+   * extensions that passed to someone else or to nobody (those given to someone else lose their mailbox at once).
+   */
+  onChange(listener: (tenantId: string, extensions: string[]) => void) {
     this.listeners.push(listener)
   }
 
@@ -287,9 +333,19 @@ export class DirectorySync {
       }
     }
 
-    // Rows that go, first: that frees the extensions before they are given to someone else (two people swapping).
+    // Who is absent, who is back (HolderRecord), written before any mapping changes: a run that cannot write them
+    // changes nothing (no mapping of someone it no longer lists goes, nobody back after a long absence is given the
+    // previous holder's mailbox), and the next run tries again.
     const listed = new Set(people.map(p => p.id))
-    const left = [...released].filter(userId => !listed.has(userId)).sort()
+    const present = new Set([...listed, ...[...previous.values()].filter(m => m.source !== 'ldap').map(m => m.userId)])
+    try {
+      await this.recordAbsences(present, released, syncedAt)
+    } catch (err) {
+      this.opts.log?.error({ err }, 'directory synchronisation: who left or came back not recorded, nothing changed')
+      report.error = 'who left the directory could not be recorded: nothing was changed (see the Gateway log)'
+      return finish()
+    }
+    // Rows that go, first: that frees the extensions before they are given to someone else (two people swapping).
     for (const userId of released) {
       // Their erasure goes only when they left the directory (fourth review 10b, n°2): given another extension, or
       // none, it stays (until purged).
@@ -319,7 +375,7 @@ export class DirectorySync {
     if (report.created || report.updated || report.removed || released.size) {
       for (const listener of this.listeners) {
         try {
-          listener(tenantId, [...changed].sort(), left)
+          listener(tenantId, [...changed].sort())
         } catch (err) {
           this.opts.log?.error({ err }, 'directory synchronisation: a listener failed')
         }

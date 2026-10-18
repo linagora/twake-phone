@@ -594,11 +594,13 @@ export class WazoVoicemail implements VoicemailProvider {
    *
    * Before any change, `beforeChanges` hears the mailboxes already their holder's (the SIP server keeps only those
    * meanwhile). One mailbox Wazo refuses to change (a 4xx) is said and left out, the others done; one it refused to
-   * make is tried again after a wait that grows at each refusal, from a minute to an hour. Too many at once (more than
-   * two, and more than half of the mailboxes reached: a directory that came back short, a wrong tenant) is held back
-   * until `release` names exactly that: the mailboxes of the people gone stay reached at the extensions they had (as
-   * `reached` says); those past their grace period stay aside. Said once, not at each synchronisation. `mayWrite` is
-   * asked before each change, and again before each request once Wazo's token is in hand.
+   * make is tried again after a wait that grows at each refusal, from a minute to an hour. Too many gone at once (more
+   * than two, and more than half of the mailboxes in use, counted on the mailboxes and never on where they are reached:
+   * a directory that came back short, a wrong tenant, an id attribute switched) is held back until `release` names
+   * exactly that: the mailboxes of the people gone stay as they are, reached at the extensions nobody holds (as
+   * `reached` says), and nobody new is given one meanwhile; those past their grace period stay aside. Said once, not at
+   * each synchronisation. A release only sets aside: the mailbox is its holder's again, messages and all, if they come
+   * back. `mayWrite` is asked before each change, and again before each request once Wazo's token is in hand.
    */
   async syncMailboxes(holders: { extension: string; userId: string; displayName?: string }[], options: VoicemailSyncOptions = {}): Promise<VoicemailSync> {
     const guard = () => {
@@ -653,24 +655,36 @@ export class WazoVoicemail implements VoicemailProvider {
       const vm = byNumber.get(mailboxNumber(key))
       if (vm && holderOf(vm) === key) ready.set(key, vm)
     }
-    // Those of people who hold no extension now; the ones still reached at an extension nobody holds now go aside,
-    // unless too many go at once, unless an administrator said that very mass is meant.
+    // Those of people who hold no extension now go aside, unless too many go at once, unless an administrator said
+    // that very mass is meant. Counted on the mailboxes in use (a holder, not aside), never on where they are reached:
+    // a mass whose rows went (their extensions given to new ids: an id attribute switched, ids renamed) is a mass all
+    // the same. Held back, those still reached at an extension nobody holds stay reached there.
     const gone = ours.filter(vm => holderOf(vm) !== '' && !people.has(holderOf(vm)))
-    const stillAt = new Map(gone.map(vm => [vm, reachedOf(vm).filter(e => !held.has(e))] as const).filter(([, at]) => at.length > 0))
-    const active = ours.filter(vm => holderOf(vm) !== '' && reachedOf(vm).length > 0)
+    const inUse = (vm: WazoMailbox) => holderOf(vm) !== '' && !ASIDE.test(vm.name ?? '')
+    const leaving = gone.filter(inUse)
+    const active = ours.filter(inUse)
+    const stillAt = new Map(leaving.map(vm => [vm, reachedOf(vm).filter(e => !held.has(e))] as const))
     const release = options.release
     const sameOf = release !== undefined && release.of === active.length
-    const tooManyGone = stillAt.size > 2 && stillAt.size * 2 > active.length
-    const parkReleased = tooManyGone && sameOf && release?.park === stillAt.size
+    const tooManyGone = leaving.length > 2 && leaving.length * 2 > active.length
+    const parkReleased = tooManyGone && sameOf && release?.park === leaving.length
     const holdPark = tooManyGone && !parkReleased
     const stay = holdPark ? stillAt : new Map<WazoMailbox, string[]>()
     const stayBoxes = [...stay].flatMap(([vm, at]) => at.map(extension => ({ extension, mailbox: address(vm) })))
     const reachable = [...ready].flatMap(([key, vm]) => people.get(key)!.map(extension => ({ extension, mailbox: address(vm) }))).concat(stayBoxes)
     for (const [key, vm] of ready) this.remember(key, vm.id)
     await options.beforeChanges?.(reachable)
+    let waiting = 0
     for (const [key, extensions] of people) {
       const number = mailboxNumber(key)
       let vm = ready.get(key)
+      // A mass held back: nobody new given a mailbox meanwhile. The same people under new ids (an id attribute
+      // switched) would otherwise have theirs by the next round, the mass then less than half of the mailboxes in use,
+      // and set aside without anyone saying it is meant.
+      if (!vm && holdPark) {
+        waiting++
+        continue
+      }
       if (!vm) {
         const there = byNumber.get(number)
         if (there && holderOf(there) !== '') {
@@ -753,11 +767,11 @@ export class WazoVoicemail implements VoicemailProvider {
       if (!u.userfield?.startsWith(HOLDER) || u.voicemail || people.has(u.userfield)) continue
       await attempt(`removing a user without a mailbox`, () => write(`/users/${u.uuid}`, 'DELETE'))
     }
-    const heldBack = holdPark || holdRemove ? { ...(holdPark ? { park: stillAt.size } : {}), ...(holdRemove ? { remove: expired.length } : {}), of: active.length } : undefined
+    const heldBack = holdPark || holdRemove ? { ...(holdPark ? { park: leaving.length } : {}), ...(holdRemove ? { remove: expired.length } : {}), of: active.length } : undefined
     const note = heldBack ? JSON.stringify(heldBack) : undefined
     if (note && note !== this.heldNote)
       this.log.warn(
-        `Wazo: too many mailboxes at once, held back until an administrator says it is meant:${holdPark ? ` ${stillAt.size} of ${active.length} of people who hold no extension still reached at the one they had` : ''}${holdRemove ? ` ${expired.length} set aside past their grace period kept` : ''}`
+        `Wazo: too many mailboxes at once, held back until an administrator says it is meant:${holdPark ? ` ${leaving.length} of ${active.length} of people who hold no extension now (${waiting} new holder(s) without a mailbox meanwhile)` : ''}${holdRemove ? ` ${expired.length} set aside past their grace period kept` : ''}`
       )
     this.heldNote = note
     if (release && !parkReleased && !removeReleased) this.log.warn(`Wazo: the release of ${JSON.stringify(release)} not applied: this synchronisation did not find that (${note ?? 'nothing held back'})`)

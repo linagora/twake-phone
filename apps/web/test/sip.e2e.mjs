@@ -3519,7 +3519,7 @@ try {
     await wazo.eraseMessages({ userId: 'amartin' }).catch(() => 0)
     await wazo.eraseMessages({ userId: 'jdupont' }).catch(() => 0)
   })
-  await step('step 11a: against the real Wazo, a person\'s mailbox is theirs whatever extension they hold, at a number of their own that never changes (wazo-sysconfd never moves it): Alice (101, signed out) and Claire Petit (108, new in the directory) each have a message from the operator; Alice moves to 109, then she and Claire swap 109 and 108: each time each one\'s message is theirs, its recording read, their folder in the spool where it was; messages left in the spool under 108 and 109 (numbers of extensions, as a mailbox of before would have left them) are nobody\'s: no mailbox shows them; nothing of it is written in Wazo (no reload of Asterisk), whose mailboxes and users carry nothing of the person; Claire leaves the directory: her mailbox set aside (its name says since when) and her message erased with it, as an administrator may ask it through the Gateway', async () => {
+  await step('step 11a: against the real Wazo, a person\'s mailbox is theirs whatever extension they hold, at a number of their own that never changes (wazo-sysconfd never moves it): Alice (101, signed out) and Claire Petit (108, new in the directory) each have a message from the operator; Alice moves to 109, then she and Claire swap 109 and 108: each time each one\'s message is theirs, its recording read, their folder in the spool where it was; messages left in the spool under 108 and 109 (numbers of extensions, as a mailbox of before would have left them) are nobody\'s: no mailbox shows them; nothing of it is written in Wazo (no reload of Asterisk), whose mailboxes and users carry nothing of the person; Claire leaves the directory: her mailbox set aside with her message (its name says since when), which an administrator has erased through the Gateway', async () => {
     const claire = { uid: 'cpetit', cn: 'Claire Petit', sn: 'Petit', givenName: 'Claire', mail: 'claire.petit@example.test', ipPhone: '108', ou: 'Support' }
     const aliceEntry = people.find(p => p.uid === 'amartin')
     const context = (await mailboxRows())[0].mailbox.split('@')[1]
@@ -3608,22 +3608,20 @@ try {
       expectEqual([(await wazoOf('amartin')).name, (await wazoOf('cpetit')).name], ['TwakePhone', 'TwakePhone'], 'the names of the mailboxes once they swapped')
       // Nothing moved in the spool: each one's folder where it was, those under 108 and 109 untouched.
       await spoolIs({ [alices]: 1, [claires]: 1, 108: 1, 109: 1 }, 'the messages in the spool once they swapped')
-      // Claire leaves the directory: no extension sends a call to her mailbox, set aside, and her messages erased with
-      // it (her id may be given to someone else later: they never hear hers).
+      // Claire leaves: no extension sends a call to her mailbox, set aside with her message (the retention period
+      // applies to it as to any); her erasure takes it.
       const leaving = new Date().toISOString()
       people.splice(people.indexOf(claire), 1)
       await directorySync.run()
       await rowsAre({ 109: undefined }, 'no mailbox at 109 once Claire left')
       await nameIs('cpetit', 'TwakePhone aside ', "Claire's mailbox, set aside in Wazo")
-      await spoolIs({ [claires]: 0 }, "Claire's messages in the spool once she left the directory")
-      expectEqual(await wazo.listMessages({ userId: 'cpetit', extension: '109' }), [], "Claire's messages once she left the directory")
+      await theirs('cpetit', '109', '+33639980042')
       await sleep(2_000)
       // A change of the mailbox only: its module reloaded (what else wazo-confd asks for with it is said here).
       const aside = reloadsSince(leaving)
       console.log(`     wazo-sysconfd, for a mailbox set aside: ${aside.join(', ') || 'nothing'}`)
       if (!aside.includes('voicemail reload')) throw new Error(`what wazo-sysconfd reloaded for a mailbox set aside: ${JSON.stringify(aside)}`)
-      // She left: an administrator may ask it too (one held back with a mass, say), done by the Gateway that writes the
-      // mailboxes, at its round.
+      // She left: an administrator has her messages erased, by the Gateway that writes the mailboxes, at its round.
       alice = await open('amartin', 'Alice Martin')
       try {
         const admin = await asPerson(alice)

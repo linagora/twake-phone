@@ -386,37 +386,62 @@ const person = (id: string, extension: string): Person => ({ id, displayName: `P
  * The Gateway's own path against provider-wazo and a Wazo in memory: the directory lists `people` (`list` changes it,
  * then synchronises it), each of them given a mailbox. `db`: `voicemail_boxes` on PostgreSQL.
  */
-const throughTheGateway = async (people: Person[], db?: VoicemailBoxes) => {
+const throughTheGateway = async (people: Person[], db?: VoicemailBoxes, absenceMs?: number) => {
   const secret = Buffer.alloc(32, 9)
   const wazo = fakeWazo(userId => mailboxNumber(holderKey(secret, userId)))
-  // A wazo-websocketd that never answers: the events are no part of this.
-  const quiet = (): WebSocketLike => ({ onopen: null, onmessage: null, onclose: null, onerror: null, send() {}, close() {} })
-  const vm = new WazoVoicemail({ authUrl: 'http://wazo.test:9497/0.1', confdUrl: 'http://wazo.test:9486/1.1', calldUrl: 'http://wazo.test:9500/1.0', websocketdUrl: 'ws://wazo.test:9502/', username: 'twakephone', password: 'not-a-real-password', holderSecret: secret, fetch: wazo.fetch, webSocket: quiet, logger: { info() {}, warn() {}, error() {} } })
+  // wazo-websocketd as it spoke on the Docker stack: init, then start; `created` sends the news of a message.
+  const sockets: WebSocketLike[] = []
+  const socket = (): WebSocketLike => {
+    const ws: WebSocketLike = {
+      onopen: null,
+      onmessage: null,
+      onclose: null,
+      onerror: null,
+      send(data: string) {
+        if ((JSON.parse(data) as { op?: string }).op === 'start') queueMicrotask(() => ws.onmessage?.({ data: JSON.stringify({ op: 'start', code: 0, data: { message: 'success' } }) }))
+      },
+      close() {}
+    }
+    sockets.push(ws)
+    queueMicrotask(() => ws.onmessage?.({ data: JSON.stringify({ op: 'init', code: 0, data: { version: 2 } }) }))
+    return ws
+  }
+  const vm = new WazoVoicemail({ authUrl: 'http://wazo.test:9497/0.1', confdUrl: 'http://wazo.test:9486/1.1', calldUrl: 'http://wazo.test:9500/1.0', websocketdUrl: 'ws://wazo.test:9502/', username: 'twakephone', password: 'not-a-real-password', holderSecret: secret, fetch: wazo.fetch, webSocket: socket, logger: { info() {}, warn() {}, error() {} } })
   const store = new MemoryStore()
   let listed = people
   const directory = { listAll: async () => listed } as unknown as ContactDirectory
-  const directorySync = new DirectorySync({ store, directory, tenantId: 'A' })
+  const directorySync = new DirectorySync({ store, directory, tenantId: 'A', ...(absenceMs !== undefined ? { absenceMs } : {}) })
   await directorySync.run()
-  const { app, sip, as } = await setup({ store, directorySync, mapped: false, voicemailProvider: vm, changeMs: 30, ...(db ? { db } : {}) })
+  const { app, sip, as, heard } = await setup({ store, directorySync, mapped: false, voicemailProvider: vm, changeMs: 30, ...(db ? { db } : {}) })
+  /** A message left in the mailbox at the number of `userId`, as wazo-websocketd tells it. */
+  const created = (userId: string, id: string) => {
+    const message = { caller_id_name: 'Alice Martin', caller_id_num: '101', timestamp: 1792289524, folder: { type: 'new', name: 'inbox', id: 1 }, duration: 7, id }
+    const data = { name: 'user_voicemail_message_created', tenant_uuid: 'ignored', required_acl: 'events.users.x.voicemails', data: { voicemail_id: wazo.boxOf(userId)!.id, message_id: id, message } }
+    for (const ws of sockets) ws.onmessage?.({ data: JSON.stringify({ op: 'event', code: 0, data }) })
+  }
   const reached = () => (sip.given.at(-1) ?? []).map(b => b.extension).sort()
   await until('the mailboxes reached', () => reached().length === people.length && wazo.state.voicemails.length === people.length, 5_000)
   const list = async (now: Person[]) => {
     listed = now
     await directorySync.run()
   }
-  /** The messages in the mailbox at the number of `userId`. */
+  /** The messages in the mailbox at the number of `userId` (a holder id: `p2\u00001` the second holder of p2). */
   const messagesOf = (userId: string) => wazo.state.messages.get(wazo.boxOf(userId)!.id) ?? []
-  return { wazo, store, app, sip, as, reached, list, messagesOf }
+  /** Every message of every mailbox, by id: none ever erased unless said. */
+  const allMessages = () => [...wazo.state.messages.values()].flat().map(m => m.id).sort()
+  /** Each mailbox's name (TwakePhone, or aside since when), by the holder id at its number. */
+  const nameOf = (userId: string) => wazo.nameOf(userId)
+  return { wazo, store, app, sip, as, heard, created, reached, list, messagesOf, allMessages, nameOf }
 }
 
 /**
  * The guard of a mass set aside, through the Gateway's own path: six people of the directory have their mailbox; the
  * directory comes back with two of them (a filter changed, an OU moved). The synchronisation of the directory removes
  * the four mappings; their extensions, left to nobody, keep their row (no withdrawal); the round finds four of six
- * still reached there: held back, the administrators told, nothing set aside, each still reached, no message erased.
- * Then `release`: let go once an administrator says that very mass is meant (set aside, and the messages of those who
- * left the directory erased); or `return`: the directory comes back whole, nothing withdrawn on the way (each row
- * already at its holder's own mailbox), nothing erased. `db`: `voicemail_boxes` on PostgreSQL.
+ * gone: held back, the administrators told, nothing set aside, each still reached, no message erased.
+ * Then `release`: let go once an administrator says that very mass is meant (set aside, their messages kept: one of
+ * them listed again has theirs back); or `return`: the directory comes back whole, nothing withdrawn on the way (each
+ * row already at its holder's own mailbox), nothing erased. `db`: `voicemail_boxes` on PostgreSQL.
  */
 const massGoneThroughTheGateway = async (db?: VoicemailBoxes, then: 'release' | 'return' = 'release') => {
   const six = Array.from({ length: 6 }, (_, i) => person(`p${i}`, String(201 + i)))
@@ -437,17 +462,24 @@ const massGoneThroughTheGateway = async (db?: VoicemailBoxes, then: 'release' | 
     // The directory whole again: each of the four back at the extension whose row is already at their mailbox.
     await list(six)
     await until('no longer held back', async () => !(await store.getOperatorState('A', 'voicemail:held')), 5_000)
-    await until('nothing asked any more', async () => (await store.listOperatorState('A', 'voicemail:erase:')).length === 0, 5_000)
     expect(sip.withdrawn.flat()).toEqual([])
     expect(reached()).toEqual(six.map(p => p.numbers[0]!.number))
     expect(messagesOf('p3')).toHaveLength(1)
   } else {
-    // An administrator says those four left: set aside, no longer reached, and their messages erased (they left the
-    // directory: their id may be someone else's later).
+    // An administrator says those four left: set aside, no longer reached, their messages kept (eighth review 11a: a
+    // release erases nothing, it can be wrong).
     expect((await app.inject({ method: 'POST', url: '/api/v1/admin/voicemail/release', headers: as('root'), payload: { park: 4, of: 6 } })).statusCode).toBe(202)
     await until('set aside', () => wazo.state.voicemails.filter(v => v.name.startsWith('TwakePhone aside ')).length === 4, 5_000)
     await until('no longer reached', () => reached().join() === '201,202', 5_000)
-    await until('their messages erased', () => messagesOf('p3').length === 0, 5_000)
+    expect(messagesOf('p3')).toHaveLength(1)
+    expect(await store.listOperatorState('A', 'voicemail:erase:')).toEqual([])
+    // It was wrong for one of them: listed again, theirs again, messages and all.
+    await list([...six.slice(0, 2), six[3]!])
+    await until('theirs again', () => wazo.boxOf('p3')?.name === 'TwakePhone' && reached().join() === '201,202,204', 5_000)
+    // Settled: a withdrawal the directory's change asked, done once the round wrote, is undone by the round after it.
+    await sleep(300)
+    await until('still theirs', () => reached().join() === '201,202,204' && !!sip.given.length, 5_000)
+    expect(messagesOf('p3')).toHaveLength(1)
   }
   await app.close()
   for (const state of made.splice(0)) expect(state.denied).toEqual([])
@@ -862,20 +894,139 @@ describe('the mailboxes (step 11a)', () => {
     await massGoneThroughTheGateway(undefined, 'return')
   }, 15_000)
 
-  it("erases the messages of someone who left the directory once their mailbox is set aside: a newcomer given their id never hears them", async () => {
-    const { wazo, store, app, reached, list, messagesOf } = await throughTheGateway([person('p0', '201'), person('p1', '202'), person('p2', '203')])
-    messagesOf('p1').push(wazo.msg('m-p1'))
-    messagesOf('p2').push(wazo.msg('m-p2'))
-    // p2 leaves the directory; p1, still in it, has no extension for a while: theirs kept, set aside.
-    await list([person('p0', '201'), { ...person('p1', '202'), numbers: [] }])
-    await until('set aside', () => !!wazo.nameOf('p2')?.startsWith('TwakePhone aside ') && !!wazo.nameOf('p1')?.startsWith('TwakePhone aside '), 5_000)
-    await until('their messages erased', () => messagesOf('p2').length === 0, 5_000)
-    expect(messagesOf('p1')).toHaveLength(1)
+  it('keeps the messages of two of six people a listing missed once: set aside, theirs again when listed again (eighth review 11a, n°1)', async () => {
+    const six = Array.from({ length: 6 }, (_, i) => person(`p${i}`, String(201 + i)))
+    const { wazo, store, app, reached, list, messagesOf, allMessages, nameOf } = await throughTheGateway(six)
+    messagesOf('p4').push(wazo.msg('m-p4'))
+    messagesOf('p5').push(wazo.msg('m-p5'))
+    // A group emptied by mistake, a replica late: p4 and p5 not listed once. Not a mass: set aside, nothing erased.
+    await list(six.slice(0, 4))
+    await until('set aside', () => !!nameOf('p4')?.startsWith('TwakePhone aside ') && !!nameOf('p5')?.startsWith('TwakePhone aside '), 5_000)
+    await until('no longer reached', () => reached().join() === '201,202,203,204', 5_000)
+    expect(allMessages()).toEqual(['m-p4', 'm-p5'])
     expect(await store.listOperatorState('A', 'voicemail:erase:')).toEqual([])
-    // Someone new, given the same id: the mailbox at that id's number comes back to them, empty.
-    await list([person('p0', '201'), { ...person('p1', '202'), numbers: [] }, person('p2', '204')])
-    await until('theirs', () => wazo.nameOf('p2') === 'TwakePhone' && reached().includes('204'), 5_000)
-    expect(messagesOf('p2')).toEqual([])
+    // Listed again: the same people, their own mailboxes, messages and all.
+    await list(six)
+    await until('theirs again', () => nameOf('p4') === 'TwakePhone' && nameOf('p5') === 'TwakePhone' && reached().length === 6, 5_000)
+    expect([messagesOf('p4').map(m => m.id), messagesOf('p5').map(m => m.id)]).toEqual([['m-p4'], ['m-p5']])
+    expect(wazo.state.voicemails).toHaveLength(6)
+    await app.close()
+    for (const state of made.splice(0)) expect(state.denied).toEqual([])
+  }, 15_000)
+
+  it('never erases the messages of four of ten people missing: set aside, theirs again when listed again (eighth review 11a, n°1)', async () => {
+    const ten = Array.from({ length: 10 }, (_, i) => person(`p${i}`, String(201 + i)))
+    const { wazo, app, reached, list, messagesOf, allMessages, nameOf } = await throughTheGateway(ten)
+    for (const i of [6, 7, 8, 9]) messagesOf(`p${i}`).push(wazo.msg(`m-p${i}`))
+    await list(ten.slice(0, 6))
+    await until('set aside', () => [6, 7, 8, 9].every(i => nameOf(`p${i}`)?.startsWith('TwakePhone aside ')), 5_000)
+    await until('no longer reached', () => reached().length === 6, 5_000)
+    expect(allMessages()).toEqual(['m-p6', 'm-p7', 'm-p8', 'm-p9'])
+    await list(ten)
+    await until('theirs again', () => [6, 7, 8, 9].every(i => nameOf(`p${i}`) === 'TwakePhone') && reached().length === 10, 5_000)
+    expect([6, 7, 8, 9].map(i => messagesOf(`p${i}`).length)).toEqual([1, 1, 1, 1])
+    await app.close()
+    for (const state of made.splice(0)) expect(state.denied).toEqual([])
+  }, 15_000)
+
+  it('holds back an id attribute switched (the same six people under new ids), erases nothing, and gives each their own back when switched back (eighth review 11a, n°2)', async () => {
+    const six = Array.from({ length: 6 }, (_, i) => person(`p${i}`, String(201 + i)))
+    const { wazo, store, app, reached, list, messagesOf, allMessages, nameOf } = await throughTheGateway(six)
+    messagesOf('p3').push(wazo.msg('m-p3'))
+    // uid to entryUUID: each extension given to a new id, the rows of the old mailboxes withdrawn at once.
+    const renamed = six.map(p => ({ ...p, id: `uuid-${p.id}` }))
+    await list(renamed)
+    await until('held back', async () => !!(await store.getOperatorState('A', 'voicemail:held')), 5_000)
+    expect(await store.getOperatorState('A', 'voicemail:held')).toMatchObject({ park: 6, of: 6 })
+    const alerts = (await store.listAlerts('A', {})).filter(a => a.alert.param === 'held-back')
+    expect(alerts.map(a => [a.alert.value, a.alert.threshold])).toEqual([[6, 6]])
+    // Rounds after: still held, nobody new given a mailbox, nothing set aside, nothing erased.
+    await sleep(300)
+    expect(await store.getOperatorState('A', 'voicemail:held')).toMatchObject({ park: 6, of: 6 })
+    expect(wazo.state.voicemails.map(v => v.name)).toEqual(six.map(() => 'TwakePhone'))
+    expect(renamed.map(p => nameOf(p.id))).toEqual(six.map(() => undefined))
+    expect(allMessages()).toEqual(['m-p3'])
+    // Switched back: the same people, their own mailboxes, messages and all.
+    await list(six)
+    await until('no longer held back', async () => !(await store.getOperatorState('A', 'voicemail:held')), 5_000)
+    await until('reached again', () => reached().length === 6, 5_000)
+    expect(messagesOf('p3').map(m => m.id)).toEqual(['m-p3'])
+    expect(wazo.state.voicemails).toHaveLength(6)
+    await app.close()
+    for (const state of made.splice(0)) expect(state.denied).toEqual([])
+  }, 15_000)
+
+  it('keeps the messages of someone missed once and then listed without an extension, theirs again with one (eighth review 11a, n°3)', async () => {
+    const { wazo, app, reached, list, messagesOf, nameOf } = await throughTheGateway([person('p0', '201'), person('p1', '202'), person('p2', '203')], undefined, 60_000)
+    messagesOf('p2').push(wazo.msg('m-p2'))
+    await list([person('p0', '201'), person('p1', '202')])
+    await until('set aside', () => !!nameOf('p2')?.startsWith('TwakePhone aside '), 5_000)
+    await list([person('p0', '201'), person('p1', '202'), { ...person('p2', '203'), numbers: [] }])
+    await sleep(200)
+    expect(messagesOf('p2')).toHaveLength(1)
+    await list([person('p0', '201'), person('p1', '202'), person('p2', '205')])
+    await until('theirs again', () => nameOf('p2') === 'TwakePhone' && reached().includes('205'), 5_000)
+    expect(messagesOf('p2').map(m => m.id)).toEqual(['m-p2'])
+    await app.close()
+    for (const state of made.splice(0)) expect(state.denied).toEqual([])
+  }, 15_000)
+
+  it('gives someone new under the id of a person gone for good a mailbox of their own, empty, never the other\'s messages; a single listing missed is no absence (eighth review 11a)', async () => {
+    const { wazo, app, as, heard, created, reached, list, messagesOf, allMessages, nameOf } = await throughTheGateway([person('p0', '201'), person('p1', '202'), person('p2', '203')], undefined, 150)
+    messagesOf('p2').push(wazo.msg('m-p2'))
+    // Missed once, listed again long after without a run between: the same p2, theirs again.
+    await list([person('p0', '201'), person('p1', '202')])
+    await until('set aside', () => !!nameOf('p2')?.startsWith('TwakePhone aside '), 5_000)
+    await sleep(200)
+    await list([person('p0', '201'), person('p1', '202'), person('p2', '203')])
+    await until('theirs again', () => nameOf('p2') === 'TwakePhone' && reached().includes('203'), 5_000)
+    expect(messagesOf('p2').map(m => m.id)).toEqual(['m-p2'])
+    // Gone, confirmed at each run past the absence: someone new given that id later has a mailbox of their own.
+    await list([person('p0', '201'), person('p1', '202')])
+    await until('set aside again', () => !!nameOf('p2')?.startsWith('TwakePhone aside '), 5_000)
+    await sleep(200)
+    await list([person('p0', '201'), person('p1', '202')])
+    await list([person('p0', '201'), person('p1', '202'), person('p2', '204')])
+    await until('a mailbox of their own', () => nameOf('p2\u00001') === 'TwakePhone' && reached().includes('204'), 5_000)
+    expect(messagesOf('p2\u00001')).toEqual([])
+    expect(nameOf('p2')).toMatch(/^TwakePhone aside /)
+    // The other's messages kept aside, for the retention period, and never shown to the newcomer.
+    expect(allMessages()).toEqual(['m-p2'])
+    const theirs = await app.inject({ method: 'GET', url: '/api/v1/voicemails', headers: as('p2') })
+    expect([theirs.statusCode, theirs.json().items]).toEqual([200, []])
+    // The news of their own mailbox theirs; none of the other's.
+    const news = heard('p2')
+    created('p2', '1792289524-00000009')
+    created('p2\u00001', '1792289524-00000010')
+    await until('their news', () => news.length >= 1, 3_000)
+    await sleep(100)
+    expect(news.map(e => (e.payload as { voicemail?: { id?: string } }).voicemail?.id)).toEqual(['1792289524-00000010'])
+    // Their erasure erases their messages, never the other's.
+    messagesOf('p2\u00001').push(wazo.msg('m-new'))
+    expect((await app.inject({ method: 'DELETE', url: '/api/v1/me/history', headers: as('p2') })).json().voicemailErasure).toBe('asked')
+    await until('their messages erased', () => messagesOf('p2\u00001').length === 0, 5_000)
+    expect(allMessages()).toEqual(['m-p2'])
+    await app.close()
+    for (const state of made.splice(0)) expect(state.denied).toEqual([])
+  }, 15_000)
+
+  it('records an absence and gives someone new under that id no call to the other\'s mailbox while Wazo is down: its row withdrawn at once, a mailbox of their own once Wazo answers (eighth review 11a, n°5)', async () => {
+    const { wazo, sip, app, reached, list, messagesOf, allMessages, nameOf } = await throughTheGateway([person('p0', '201'), person('p1', '202'), person('p2', '203')], undefined, 150)
+    messagesOf('p2').push(wazo.msg('m-p2'))
+    // Wazo down: no round sets anything aside; the directory's synchronisation records the absence all the same.
+    wazo.state.down = true
+    await list([person('p0', '201'), person('p1', '202')])
+    await sleep(200)
+    await list([person('p0', '201'), person('p1', '202')])
+    expect(reached()).toContain('203')
+    // Someone new given p2 and 203: the row at the other's mailbox withdrawn at once, Wazo down or not.
+    await list([person('p0', '201'), person('p1', '202'), person('p2', '203')])
+    await until('withdrawn', () => sip.withdrawn.flat().includes('203'), 3_000)
+    wazo.state.down = false
+    await until('a mailbox of their own', () => nameOf('p2\u00001') === 'TwakePhone' && reached().includes('203'), 5_000)
+    expect(sip.given.at(-1)!.find(b => b.extension === '203')!.mailbox.split('@')[0]).toBe(wazo.boxOf('p2\u00001')!.number)
+    expect(nameOf('p2')).toMatch(/^TwakePhone aside /)
+    expect([messagesOf('p2\u00001'), allMessages()]).toEqual([[], ['m-p2']])
     await app.close()
     for (const state of made.splice(0)) expect(state.denied).toEqual([])
   }, 15_000)
@@ -1138,6 +1289,9 @@ describe('the mailboxes, with several Gateways', () => {
     let seen: { heldBack?: { park?: number; of?: number; since?: string }; release?: unknown; releases?: { applied: boolean; by: string; park?: number; of: number }[] } = {}
     await until('held back', () => (void held().then(h => (seen = h)), !!seen.heldBack))
     expect(seen.heldBack).toMatchObject({ park: 3, of: 4, since: expect.any(String) })
+    // What a release would do, said: a set aside can be undone (eighth review 11a, n°4).
+    expect(Object.keys((seen as { effect?: object }).effect ?? {})).toEqual(['park'])
+    expect((seen as { effect?: { park?: string } }).effect?.park).toMatch(/reversible/)
     expect(wazo.releases.every(r => !r)).toBe(true)
     expect((await app.inject({ method: 'POST', url: '/api/v1/admin/voicemail/release', headers: as('jean'), payload: { park: 3, of: 4 } })).statusCode).toBe(403)
     // The counts seen are said, and must be what is held now.
@@ -1148,7 +1302,7 @@ describe('the mailboxes, with several Gateways', () => {
     expect(wazo.releases.every(r => !r)).toBe(true)
     // Meant: the next synchronisation is given those counts; it found them, they go, and nothing is held any more.
     const res = await app.inject({ method: 'POST', url: '/api/v1/admin/voicemail/release', headers: as('root'), payload: { park: 3, of: 4 } })
-    expect([res.statusCode, res.json()]).toEqual([202, { release: 'asked', applied: 'at the next synchronisation of the mailboxes' }])
+    expect([res.statusCode, res.json()]).toEqual([202, { release: 'asked', applied: 'at the next synchronisation of the mailboxes', effect: { park: expect.stringMatching(/reversible/) } }])
     await until('the release', () => wazo.releases.includes(JSON.stringify({ park: 3, of: 4 })))
     await until('nothing held', () => (void held().then(h => (seen = h)), !seen.heldBack && !seen.release))
     expect(wazo.releases.filter(r => r)).toHaveLength(1)
@@ -1543,7 +1697,8 @@ if (process.env.TEST_DATABASE_URL) {
 
     it('holds back the mailboxes of a directory come back with two of six people, their rows kept in voicemail_boxes', async () => {
       await massGoneThroughTheGateway(db())
-      expect(await rows()).toHaveLength(2)
+      // The two kept, and the one listed again after the release, at their own mailbox.
+      expect((await rows()).map(r => r.split('>')[0])).toEqual(['201', '202', '204'])
     }, 15_000)
 
     it("never lets a round of one Gateway undo another Gateway's withdrawal made between its last read of the holders and its write", async () => {

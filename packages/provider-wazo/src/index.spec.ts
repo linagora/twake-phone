@@ -241,7 +241,7 @@ describe('WazoVoicemail, the mailboxes', () => {
     expect(four.map(h => wazo.nameOf(h.userId))).toEqual(four.map(() => 'TwakePhone'))
     await vm.syncMailboxes([])
     expect(logs.filter(l => /held back/.test(l))).toHaveLength(1)
-    expect(logs.find(l => /held back/.test(l))).toMatch(/4 of 4 of people who hold no extension still reached at the one they had/)
+    expect(logs.find(l => /held back/.test(l))).toMatch(/4 of 4 of people who hold no extension now \(0 new holder\(s\) without a mailbox meanwhile\)/)
     // It came back: nothing held any more.
     expect((await vm.syncMailboxes(four)).heldBack).toBeUndefined()
     // An administrator says they left, having seen four of four: what they saw goes, nothing
@@ -276,12 +276,36 @@ describe('WazoVoicemail, the mailboxes', () => {
     const held = await other.syncMailboxes([], { reached: boxes })
     expect([held.heldBack, held.boxes]).toEqual([{ park: 4, of: 4 }, boxes])
     expect(four.map(h => wazo.nameOf(h.userId))).toEqual(four.map(() => 'TwakePhone'))
-    // Reached nowhere any more (the SIP server's rows gone): the people gone are set aside, whatever their count. The
-    // Gateway never takes those rows away before a round (only an extension given to someone else is withdrawn at once):
-    // its test of a directory come back half empty goes through the directory's synchronisation, the withdrawal and the
-    // round, and the round holds the mass back.
-    expect((await other.syncMailboxes([], { reached: [] })).heldBack).toBeUndefined()
+    // Reached nowhere any more (the SIP server's rows gone, withdrawn while the round failed): held back all the same,
+    // counted on the mailboxes in use (eighth review 11a, n°7).
+    const unreached = await other.syncMailboxes([], { reached: [] })
+    expect([unreached.heldBack, unreached.boxes]).toEqual([{ park: 4, of: 4 }, []])
+    expect(four.map(h => wazo.nameOf(h.userId))).toEqual(four.map(() => 'TwakePhone'))
+  })
+
+  it('holds back the same people under new ids (an id attribute switched): nobody new given a mailbox, nothing set aside, until it is said or they come back (eighth review 11a, n°2)', async () => {
+    const { vm, wazo } = make()
+    const four = ['102', '103', '104', '105'].map((extension, i) => ({ extension, userId: `u${i}` }))
+    await vm.syncMailboxes(four)
+    wazo.state.messages.set(wazo.boxOf('u2')!.id, [wazo.msg('m-u2')])
+    // The ids switched (uid to entryUUID): each extension given to a new id. No row stays at the old mailboxes.
+    const renamed = four.map(h => ({ ...h, userId: `uuid-${h.userId}` }))
+    for (let round = 0; round < 3; round++) {
+      const held = await vm.syncMailboxes(renamed, { reached: [] })
+      expect([held.heldBack, held.boxes]).toEqual([{ park: 4, of: 4 }, []])
+    }
+    expect(wazo.state.voicemails.map(v => v.name)).toEqual(four.map(() => 'TwakePhone'))
+    // Switched back: each one's own again, messages and all.
+    const back = await vm.syncMailboxes(four)
+    expect([back.heldBack, back.boxes.map(b => b.extension)]).toEqual([undefined, ['102', '103', '104', '105']])
+    expect(wazo.state.messages.get(wazo.boxOf('u2')!.id)).toHaveLength(1)
+    // Said to be meant: set aside (theirs again if they come back), a mailbox of their own for each new id.
+    await vm.syncMailboxes(renamed, { reached: [] })
+    const letGo = await vm.syncMailboxes(renamed, { reached: [], release: { park: 4, of: 4 } })
+    expect([letGo.released, letGo.boxes.map(b => b.extension)]).toEqual([true, ['102', '103', '104', '105']])
     expect(four.every(h => wazo.nameOf(h.userId)!.startsWith('TwakePhone aside '))).toBe(true)
+    expect(wazo.state.messages.get(wazo.boxOf('u2')!.id)).toHaveLength(1)
+    expect(renamed.map(h => wazo.nameOf(h.userId))).toEqual(four.map(() => 'TwakePhone'))
   })
 
   it('holds back from three people gone, and more than half: two of four go, three of six go, three of five wait', async () => {
@@ -298,14 +322,19 @@ describe('WazoVoicemail, the mailboxes', () => {
     expect(await outcome(3, 3)).toEqual([3, 0])
   })
 
-  it('sets aside at once, whatever the mass, the mailboxes of people whose extension someone else holds now', async () => {
+  it('sets aside at once the mailboxes of a few people whose extension someone else holds now, each newcomer their own; a mass of them is held back', async () => {
     const { vm, wazo } = make()
-    const three = ['102', '103', '104'].map((extension, i) => ({ extension, userId: `o${i}` }))
-    await vm.syncMailboxes(three)
-    // Three others hold those extensions now: nothing is held back, each has their own mailbox there.
-    const res = await vm.syncMailboxes(three.map((h, i) => ({ extension: h.extension, userId: `n${i}` })))
-    expect([res.heldBack, res.boxes.map(b => b.mailbox)]).toEqual([undefined, ['n0', 'n1', 'n2'].map(u => `${numberOf(u)}@${CONTEXT}`)])
-    expect(three.map(h => wazo.nameOf(h.userId)!.startsWith('TwakePhone aside '))).toEqual([true, true, true])
+    const five = ['102', '103', '104', '105', '106'].map((extension, i) => ({ extension, userId: `o${i}` }))
+    await vm.syncMailboxes(five)
+    // Two others hold two of those extensions now: not a mass, each has their own mailbox there.
+    const next = five.map((h, i) => (i < 2 ? { extension: h.extension, userId: `n${i}` } : h))
+    const res = await vm.syncMailboxes(next)
+    expect([res.heldBack, res.boxes.filter(b => ['102', '103'].includes(b.extension)).map(b => b.mailbox)]).toEqual([undefined, ['n0', 'n1'].map(u => `${numberOf(u)}@${CONTEXT}`)])
+    expect(five.map(h => wazo.nameOf(h.userId)!.startsWith('TwakePhone aside '))).toEqual([true, true, false, false, false])
+    // Three of the five others at once, not reached any more: counted on the mailboxes, held back (eighth review 11a, n°2).
+    const mass = await vm.syncMailboxes(next.map((h, i) => (i >= 2 ? { extension: h.extension, userId: `n${i}` } : h)), { reached: [] })
+    expect(mass.heldBack).toEqual({ park: 3, of: 5 })
+    expect(five.slice(2).map(h => wazo.nameOf(h.userId))).toEqual(['TwakePhone', 'TwakePhone', 'TwakePhone'])
   })
 
   it('stops before its next change once it may no longer write, asked again once the token is in hand, and purges nothing more', async () => {

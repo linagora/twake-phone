@@ -103,6 +103,17 @@ export const voicemailMismatch = (voicemail: { maxMessageSec?: number } | undefi
 }
 
 /**
+ * How long a person the directory stops listing must be confirmed absent, at every synchronisation, before their id
+ * listed again is taken for someone else's (DirectorySync's HolderRecord: a mailbox of their own, the previous holder's
+ * set aside): VOICEMAIL_GRACE_DAYS (7 by default), a day at least.
+ */
+export const absenceMsOf = (env: NodeJS.ProcessEnv) => {
+  const raw = env.VOICEMAIL_GRACE_DAYS
+  const days = raw === undefined || raw === '' || !/^[0-9]+$/.test(raw) ? 7 : Number(raw)
+  return Math.max(days, 1) * 86_400_000
+}
+
+/**
  * VOICEMAIL_RETENTION_DAYS: how long a message is kept (30 days by default; 0: no purge by age, but the mailbox of anyone
  * without an extension past VOICEMAIL_GRACE_DAYS then goes with its messages).
  */
