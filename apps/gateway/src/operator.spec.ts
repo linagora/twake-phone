@@ -4,11 +4,11 @@ import { OvhOperator } from '@twake/provider-ovh'
 import type { OperatorProvider, ProviderFactory, TelephonyProvider } from '@twake/telephony-provider-sdk'
 import type { DidRange, Trunk, TrunkInput } from '@twake/telephony-types'
 import { pilotRules, startFakeOvh, type FakeOvh } from '../../../packages/provider-ovh/test/fake-ovh.mjs'
-import { buildApp } from './app.js'
+import { buildApp, restoreRefusalOf } from './app.js'
 import { TicketStore } from './auth.js'
 import { StoreDirectory } from './directory.js'
 import { EventBus } from './events.js'
-import { OperatorSync, erasedNumbersOf, matchesFallback } from './operator.js'
+import { OPERATOR_KEPT_MS, OperatorSync, erasedNumbersOf, matchesFallback } from './operator.js'
 import { ProviderRegistry } from './registry.js'
 import { MemoryStore } from './store/memory.js'
 import type { TrunkRecord } from './store/types.js'
@@ -48,6 +48,15 @@ describe('what the platform keeps in step with the operator', () => {
     return { f, ovh, store, sync, said, logger, advance: (ms: number) => (t += ms), at: () => t }
   }
   const puts = (f: FakeOvh) => f.requests.filter(r => r.method === 'PUT' && r.status === 200).map(r => r.path)
+  /** Resolves once `key` of tenant A is written to the store (fourth review 10b, n°9: a gate, not a fixed wait). */
+  const writing = (store: MemoryStore, key: string) =>
+    new Promise<void>(resolve => {
+      const put = store.putOperatorState.bind(store)
+      store.putOperatorState = async (tenantId, k, value) => {
+        await put(tenantId, k, value)
+        if (tenantId === 'A' && k === key) resolve()
+      }
+    })
 
   it('compares what is asked with each forward read, field by field: its nature, its number, its delay (review 10b, n°4 and n°15)', () => {
     expect(matchesFallback(ASKED, SET as never)).toBe(true)
@@ -590,7 +599,7 @@ describe('what the platform keeps in step with the operator', () => {
     await store.deleteHistory('A', 'jean', await erasedNumbersOf(store, 'A', 'jean'))
     await store.upsertMapping({ tenantId: 'A', userId: 'jean', extension: '104' })
     await store.upsertMapping({ tenantId: 'A', userId: 'carol', extension: '101' })
-    await store.deleteMapping('A', 'paul')
+    await store.deleteMapping('A', 'paul', { left: true })
     await store.upsertMapping({ tenantId: 'A', userId: 'lea', extension: '102' })
     // Calls of before, listed late by OVH: to Jean's number, to Paul's.
     f.addConsumption(ACCOUNT, LINE, { calling: '0033639980002', called: '0033199000101', creationDatetime: '2026-10-17T13:30:00+02:00', duration: 0, wayType: 'incoming' })
@@ -643,8 +652,9 @@ describe('what the platform keeps in step with the operator', () => {
     const round = a.round('A')
     await held.at
     await store.upsertTrunks([{ tenantId: 'A', id: 'main', config: config({ operator: { lines: [LINE, LINE2] } }) }])
+    const owed = writing(store, `remove:${LINE2}`)
     const removing = a.removeForwards('A', [LINE, LINE2], 'main')
-    await new Promise(r => setTimeout(r, 50))
+    await owed
     held.release()
     await round
     // Both removed, said so: nothing left at OVH, nothing owed.
@@ -803,8 +813,9 @@ describe('what the platform keeps in step with the operator', () => {
     const round = a.round('A')
     await held.at
     await store.upsertTrunks([{ tenantId: 'A', id: 'main', config: config({ operator: { lines: [LINE] } }) }])
+    const owed = writing(store, `remove:${LINE}`)
     const removing = a.removeForwards('A', [LINE], 'main')
-    await new Promise(r => setTimeout(r, 50))
+    await owed
     // Nothing more written while the round holds the turn.
     expect(puts(f)).toEqual([OPTIONS(LINE)])
     held.release()
@@ -896,6 +907,149 @@ describe('what the platform keeps in step with the operator', () => {
     expect(sync.keptOfErasure('B')).toBeUndefined()
     const kept = JSON.stringify([...(store as unknown as { operatorCdrs: Map<string, unknown> }).operatorCdrs.values()])
     expect([kept.includes('39980055'), kept.includes('39980077')]).toEqual([false, true])
+  })
+
+  it('lets a removal go only as it was read: one written again on another Gateway meanwhile stays, and is done (fourth review 10b, n°6, M1, M2 and M17)', async () => {
+    const { f, ovh, store, sync, logger } = await setup()
+    const main = (fallback?: typeof ASKED) => [{ tenantId: 'A', id: 'main', config: config({ operator: { lines: [LINE], ...(fallback ? { fallback } : {}) } }) }]
+    await store.upsertTrunks(main(ASKED))
+    await sync.round('A')
+    // Removed while OVH is down (owed), then asked again.
+    await store.upsertTrunks(main())
+    f.state.down = true
+    expect(await sync.removeForwards('A', [LINE], 'main')).toHaveLength(1)
+    await store.upsertTrunks(main(ASKED))
+    // The round of the one that leads: held once its removal has read the trunks (asked again), before it lets it go.
+    let reads = 0
+    let release!: () => void
+    let reached!: () => void
+    const held = new Promise<void>(r => (release = r))
+    const at = new Promise<void>(r => (reached = r))
+    const leaderStore = new Proxy(store, {
+      get: (target, key) => {
+        const v = Reflect.get(target, key) as unknown
+        if (typeof v !== 'function') return v
+        if (key !== 'listTrunks') return (v as (...a: unknown[]) => unknown).bind(target)
+        return async (...args: unknown[]) => {
+          const got = await (v as (...a: unknown[]) => Promise<unknown>).apply(target, args)
+          if (++reads === 2) {
+            reached()
+            await held
+          }
+          return got
+        }
+      }
+    })
+    const leader = new OperatorSync({ store: leaderStore, operators: new Map([['A', ovh]]), logger, now: () => Date.parse(T) })
+    const round = leader.round('A')
+    await at
+    // Meanwhile on Gateway B: unticked again and removed again, OVH still down: owed again, written as it was.
+    await store.upsertTrunks(main())
+    expect(await sync.removeForwards('A', [LINE], 'main')).toHaveLength(1)
+    release()
+    await expect(round).rejects.toThrow('operator: not read (unreachable)')
+    // What B wrote stays, and is done once OVH answers.
+    expect((await sync.status('A'))?.removals?.map(r => r.line)).toEqual([LINE])
+    f.state.down = false
+    await sync.round('A')
+    expect([f.options(ACCOUNT, LINE)!.forwardBackup, f.options(ACCOUNT, LINE)!.forwardNoReply]).toEqual([false, false])
+    expect((await sync.status('A'))?.removals).toBeUndefined()
+  })
+
+  it('removes on a trunk that asks no fallback only what was read there: changed in the manager since, left as it is (fourth review 10b, n°6, M24)', async () => {
+    const { f, store, sync } = await setup({ [LINE]: { options: { forwardBackup: true, forwardBackupNature: 'number', forwardBackupNumber: '0033639980002' } }, [LINE2]: {} })
+    await store.upsertTrunks([{ tenantId: 'A', id: 'main', config: config({ operator: { lines: [LINE] } }) }])
+    await sync.round('A')
+    // Changed in the manager after the screen read it, before the administrator removes it.
+    Object.assign(f.options(ACCOUNT, LINE)!, { forwardBackupNature: 'voicemail' })
+    const before = puts(f).length
+    expect(await sync.removeForwards('A', [LINE], 'main')).toEqual([])
+    expect(puts(f)).toHaveLength(before)
+    expect(f.options(ACCOUNT, LINE)).toMatchObject({ forwardBackup: true, forwardBackupNature: 'voicemail' })
+    expect((await sync.status('A'))?.closedRemovals?.map(r => [r.line, r.outcome])).toEqual([[LINE, 'changed']])
+  })
+
+  it('takes what the operator kept of a write of the platform for the platform\'s, never for a change in the manager (fourth review 10b, n°4, M19)', async () => {
+    const { f, store, sync, said } = await setup({ [LINE]: { options: { forwardNoReply: true, forwardNoReplyNature: 'voicemail', forwardNoReplyDelay: 20 } }, [LINE2]: {} })
+    await store.upsertTrunks([{ tenantId: 'A', id: 'main', config: config({ operator: { lines: [LINE], fallback: ASKED } }) }])
+    await sync.round('A')
+    // OVH rounds the delay of the voicemail it is given back: 30 s, not 20.
+    f.state.normalize = c => (c.forwardNoReplyDelay === 20 ? { ...c, forwardNoReplyDelay: 30 } : c)
+    await store.upsertTrunks([{ tenantId: 'A', id: 'main', config: config({ operator: { lines: [LINE] } }) }])
+    expect((await sync.removeForwards('A', [LINE], 'main')).map(r => [r.line, r.error])).toEqual([[LINE, 'refused']])
+    expect(f.options(ACCOUNT, LINE)).toMatchObject({ forwardBackup: false, forwardNoReply: true, forwardNoReplyNature: 'voicemail', forwardNoReplyDelay: 30 })
+    // The next round removes it, as said: what the platform wrote there, not a change in the manager.
+    await sync.round('A')
+    expect([f.options(ACCOUNT, LINE)!.forwardBackup, f.options(ACCOUNT, LINE)!.forwardNoReply]).toEqual([false, false])
+    const status = await sync.status('A')
+    expect([status?.removals, status?.closedRemovals]).toEqual([undefined, [{ line: LINE, at: T, outcome: 'done', trunkId: 'main', unrestored: 'refused' }]])
+    expect(await store.listAlerts('A')).toEqual([])
+    expect(said.map(([, , m]) => m)).toContain('operator: the operator did not keep the forwards of before, the fallback removed without them at the next round')
+  })
+
+  it('never puts back a forward of before the rules of the platform refuse: said first, then done without it (fourth review 10b, n°3)', async () => {
+    const restorable = async (_tenantId: string, number: string) => (number === '+33199000101' ? ('loop' as const) : undefined)
+    const { f, store, sync, said } = await setup(
+      {
+        [LINE]: { options: { forwardBackup: true, forwardBackupNature: 'number', forwardBackupNumber: '0033199000101' } },
+        [LINE2]: { options: { forwardBackup: true, forwardBackupNature: 'number', forwardBackupNumber: '0033639980002' } }
+      },
+      { restorable }
+    )
+    await store.upsertTrunks([{ tenantId: 'A', id: 'main', config: config({ operator: { lines: [LINE, LINE2], fallback: ASKED } }) }])
+    await sync.round('A')
+    expect((await sync.status('A'))?.trunks[0]!.lines.map(l => l.originalRefused)).toEqual(['loop', undefined])
+    await store.upsertTrunks([{ tenantId: 'A', id: 'main', config: config({ operator: { lines: [LINE, LINE2] } }) }])
+    expect(await sync.removeForwards('A', [LINE, LINE2], 'main')).toEqual([])
+    expect([f.options(ACCOUNT, LINE)!.forwardBackup, f.options(ACCOUNT, LINE)!.forwardNoReply]).toEqual([false, false])
+    expect(f.options(ACCOUNT, LINE2)).toMatchObject({ forwardBackup: true, forwardBackupNature: 'number', forwardBackupNumber: '0033639980002', forwardNoReply: false })
+    expect((await sync.status('A'))?.closedRemovals).toEqual([
+      { line: LINE, at: T, outcome: 'done', trunkId: 'main', unrestored: 'loop' },
+      { line: LINE2, at: T, outcome: 'done', trunkId: 'main', restored: true }
+    ])
+    expect(said.filter(([l]) => l === 'warn').map(([, o, m]) => [m, (o as { why?: string }).why])).toContainEqual([
+      'operator: the forwards of before not put back on a line: they would loop to the platform, or go where its trunk may not call',
+      'loop'
+    ])
+  })
+
+  it('never brings back a call erased once what the erasure kept is purged: a record pending past it is nobody\'s, its numbers gone (fourth review 10b, n°1, R4-5)', async () => {
+    const { f, store, sync, advance, at } = await setup()
+    await store.upsertTrunks([{ tenantId: 'A', id: 'main', config: config({ operator: { lines: [LINE] } }) }])
+    await store.upsertDid({ tenantId: 'A', id: 'desk', trunkId: 'main', first: '+33199000101', last: '+33199000101', target: '101' })
+    await store.upsertMapping({ tenantId: 'A', userId: 'jean', extension: '101' })
+    // Received while the platform could not be reached; Jean erases his history; the record read a minute later.
+    await store.deleteHistory('A', 'jean', await erasedNumbersOf(store, 'A', 'jean'), sync.keptOfErasure('A'))
+    advance(60_000)
+    f.addConsumption(ACCOUNT, LINE, { calling: '0033639980001', called: '0033199000101', creationDatetime: '2026-10-17T13:59:00+02:00', duration: 12, wayType: 'incoming' })
+    await sync.round('A')
+    // Then four days without a round (no keys, or stopped), the purge going on all the same.
+    advance(OPERATOR_KEPT_MS + 3_600_000)
+    expect(await store.purgeErasures(new Date(at() - OPERATOR_KEPT_MS).toISOString())).toBeGreaterThan(0)
+    expect(await store.historyErasedAt('A', 'jean')).toBeUndefined()
+    await sync.round('A')
+    expect((await store.listHistory('A', 'jean')).items).toEqual([])
+    expect((await sync.status('A'))?.cdrs.stats).toMatchObject({ total: 1, orphan: 0, erased: 1, pending: 0 })
+    const kept = JSON.stringify([...(store as unknown as { operatorCdrs: Map<string, unknown> }).operatorCdrs.values()])
+    expect(kept.includes('39980001')).toBe(false)
+  })
+
+  it('keeps the erasure of whom the directory gives another extension: a record of before read later is still erased (fourth review 10b, n°2, R4-6)', async () => {
+    const { f, store, sync, advance } = await setup()
+    await store.upsertTrunks([{ tenantId: 'A', id: 'main', config: config({ operator: { lines: [LINE] } }) }])
+    await store.upsertDid({ tenantId: 'A', id: 'desk', trunkId: 'main', first: '+33199000101', last: '+33199000101', target: '101' })
+    await store.upsertMapping({ tenantId: 'A', userId: 'jean', extension: '101' })
+    await store.deleteHistory('A', 'jean', await erasedNumbersOf(store, 'A', 'jean'), sync.keptOfErasure('A'))
+    // Given 105 by the directory: the old extension let go first, as the synchronisation does.
+    await store.deleteMapping('A', 'jean')
+    await store.upsertMapping({ tenantId: 'A', userId: 'jean', extension: '105' })
+    f.addConsumption(ACCOUNT, LINE, { calling: '0033639980001', called: '0033199000101', creationDatetime: '2026-10-17T13:59:00+02:00', duration: 12, wayType: 'incoming' })
+    await sync.round('A')
+    advance(61_000)
+    await sync.round('A')
+    expect((await sync.status('A'))?.cdrs.stats).toMatchObject({ erased: 1, unmatchedInbound: 0, orphan: 0 })
+    const kept = JSON.stringify([...(store as unknown as { operatorCdrs: Map<string, unknown> }).operatorCdrs.values()])
+    expect(kept.includes('39980001')).toBe(false)
   })
 })
 
@@ -1126,6 +1280,39 @@ describe('the routes of the operator', () => {
     expect((await app.inject({ url: '/api/v1/calls/history', headers: as('jean') })).json().items).toEqual([])
     expect((await app.inject({ url: '/api/v1/admin/operator', headers: admin })).json().cdrs.stats).toMatchObject({ total: 1, erased: 1, unmatchedInbound: 0, orphan: 0 })
     expect(JSON.stringify([...(store as unknown as { operatorCdrs: Map<string, unknown> }).operatorCdrs.values()])).not.toContain('39980001')
+    await app.close()
+  })
+
+  it('never puts back a forward of before to a number of the platform, nor one its trunk may not call, and says it before (fourth review 10b, n°3)', async () => {
+    const { app, f, store, admin } = await setup()
+    Object.assign(f.options(ACCOUNT, LINE)!, { forwardBackup: true, forwardBackupNature: 'number', forwardBackupNumber: '0033199000101' })
+    Object.assign(f.options(ACCOUNT, LINE2)!, { forwardBackup: true, forwardBackupNature: 'number', forwardBackupNumber: '00442079460123' })
+    expect((await app.inject({ method: 'PUT', url: '/api/v1/admin/trunks/main', headers: admin, payload: { ...trunk, operator: { lines: [LINE, LINE2], fallback: ASKED } } })).statusCode).toBe(201)
+    // The number LINE forwarded to became a direct number of the platform since; LINE2's is abroad, the trunk calls
+    // France only.
+    expect((await app.inject({ method: 'PUT', url: '/api/v1/admin/dids/desk', headers: admin, payload: { trunkId: 'main', first: '+33199000101', target: '101' } })).statusCode).toBe(201)
+    const lines = async () => ((await app.inject({ url: '/api/v1/admin/operator', headers: admin })).json<{ trunks: { lines: { originalRefused?: string }[] }[] }>()).trunks[0]!.lines.map(l => l.originalRefused)
+    expect(await lines()).toEqual(['loop', 'outbound'])
+    // The rules, number by number: the trunk's lines and number, what it may call (premium never, overseas, here Mayotte's
+    // 0639, and abroad as it allows).
+    const refusal = restoreRefusalOf(store)
+    expect(await Promise.all(['+33199000100', '0033199000200', '+33899000000', '+33639980002', '+33199000555'].map(n => refusal('A', n, 'main')))).toEqual(['loop', 'loop', 'outbound', 'outbound', undefined])
+    // Allowed to call abroad, elsewhere: still not; there: LINE2's put back, never LINE's.
+    const elsewhere = { ...trunk, allowed: ['fixed', 'mobile', 'freephone', 'standard-rate', 'international'], countries: ['32'] }
+    expect((await app.inject({ method: 'PUT', url: '/api/v1/admin/trunks/main', headers: admin, payload: { ...elsewhere, operator: { lines: [LINE, LINE2], fallback: ASKED } } })).statusCode).toBe(200)
+    expect(await lines()).toEqual(['loop', 'outbound'])
+    const abroad = { ...elsewhere, countries: ['44'] }
+    expect((await app.inject({ method: 'PUT', url: '/api/v1/admin/trunks/main', headers: admin, payload: { ...abroad, operator: { lines: [LINE, LINE2], fallback: ASKED } } })).statusCode).toBe(200)
+    expect(await lines()).toEqual(['loop', undefined])
+    const removed = await app.inject({ method: 'DELETE', url: '/api/v1/admin/trunks/main/operator/fallback', headers: admin })
+    expect([removed.statusCode, removed.json().pending]).toEqual([200, []])
+    expect([f.options(ACCOUNT, LINE)!.forwardBackup, f.options(ACCOUNT, LINE)!.forwardNoReply]).toEqual([false, false])
+    expect(f.options(ACCOUNT, LINE2)).toMatchObject({ forwardBackup: true, forwardBackupNumber: '00442079460123', forwardNoReply: false })
+    const closed = (await app.inject({ url: '/api/v1/admin/operator', headers: admin })).json().closedRemovals as { line: string; unrestored?: string; restored?: true }[]
+    expect(closed.map(c => [c.line, c.unrestored, c.restored]).sort()).toEqual([
+      [LINE, 'loop', undefined],
+      [LINE2, undefined, true]
+    ])
     await app.close()
   })
 

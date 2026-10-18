@@ -581,8 +581,12 @@ export interface Store {
   upsertMapping(mapping: UserMapping): Promise<void>
   /** Every mapping of a tenant, by user id. */
   listMappings(tenantId: string): Promise<UserMapping[]>
-  /** Their erasure (historyErasedAt, numbersErasedAt) goes with them (third review 10b, n°3): neither who nor their numbers. */
-  deleteMapping(tenantId: string, userId: string): Promise<void>
+  /**
+   * Their extension let go. Their erasure (historyErasedAt, numbersErasedAt) goes with them only when they `left` (the
+   * account removed, third review 10b, n°3: neither who nor their numbers); kept otherwise, until purged (fourth review
+   * n°2: given another extension, a record read later of a call from before is still told erased).
+   */
+  deleteMapping(tenantId: string, userId: string, opts?: { left?: boolean }): Promise<void>
 
   /** Idempotent on (tenant, user, callId). */
   addHistory(entry: HistoryEntry): Promise<void>

@@ -120,13 +120,16 @@ export class MemoryStore implements Store {
     return [...this.mappings.values()].filter(m => m.tenantId === tenantId).sort((a, b) => a.userId.localeCompare(b.userId)).map(m => ({ ...m }))
   }
 
-  async deleteMapping(tenantId: string, userId: string) {
+  async deleteMapping(tenantId: string, userId: string, opts: { left?: boolean } = {}) {
     const before = this.mappings.get(key(tenantId, userId))
     if (before) this.changed(tenantId, 'extension', before.extension, before.extension)
     this.mappings.delete(key(tenantId, userId))
-    // Their erasure goes with them (third review 10b, n°3): neither who nor their numbers are kept.
-    this.erasures.delete(key(tenantId, userId))
-    this.erasedNumbers.delete(key(tenantId, userId))
+    // Their erasure goes with them once they left (third review 10b, n°3): neither who nor their numbers are kept.
+    // Given another extension, it stays (fourth review n°2).
+    if (opts.left) {
+      this.erasures.delete(key(tenantId, userId))
+      this.erasedNumbers.delete(key(tenantId, userId))
+    }
     // What was told of their presence goes with them (it is kept otherwise, whatever its age).
     this.webhookState.delete(key(tenantId, `presence:${userId}`))
   }

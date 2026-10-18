@@ -117,7 +117,12 @@ export interface OperatorLine {
    * removed, if the platform can write it (to a number, the voicemail or a fax). Absent: not known (nothing put back).
    */
   original?: OperatorLineForwards
+  /** Why it will not be put back (fourth review 10b, n°3): it would bring the calls back to the platform, or go where the trunk may not call. */
+  originalRefused?: OperatorRestoreRefusal
 }
+
+/** Why the forwards of before a line are not put back (fourth review 10b, n°3). */
+export type OperatorRestoreRefusal = 'loop' | 'outbound'
 
 /** What is set at the operator on a line now (POST /admin/operator/lines), or why it could not be read. */
 export interface OperatorLineRead {
@@ -138,6 +143,8 @@ export interface OperatorRemoval {
   error?: OperatorProblem
   /** What it puts back (third review 10b, n°8): what was there before the platform took the line. */
   original?: OperatorLineForwards
+  /** Why that will not be put back (fourth review 10b, n°3). */
+  originalRefused?: OperatorRestoreRefusal
 }
 
 /**
@@ -151,6 +158,8 @@ export interface OperatorClosedRemoval {
   outcome: 'done' | 'changed' | 'gone' | 'abandoned'
   trunkId?: string
   restored?: true
+  /** Done without the forwards of before (fourth review 10b, n°3 and n°4): refused by the rules, or not kept by the operator (`refused`). */
+  unrestored?: OperatorRestoreRefusal | 'refused'
 }
 
 /** The operator of the trunks, as the administration shows it (GET /admin/operator). */

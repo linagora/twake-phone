@@ -4,6 +4,7 @@ import {
   TRUNK_OUTBOUND_CLASSES,
   formatNumber,
   type OperatorClosedRemoval,
+  type OperatorRestoreRefusal,
   type OperatorForward,
   type OperatorLine,
   type OperatorLineForwards,
@@ -75,9 +76,11 @@ const writable = (f: OperatorLineForwards) => [f.onUnavailable, f.onNoAnswer].ev
  * platform took it; that they are not known, or go elsewhere than the platform can write, and stay gone; nothing when
  * there were none.
  */
-const restoreOf = (line: string, original: OperatorLineForwards | undefined, t: T) => {
+const restoreOf = (line: string, original: OperatorLineForwards | undefined, t: T, refused?: OperatorRestoreRefusal) => {
   if (!original) return t('admin.operator.restoreUnknown', { line })
   if (!original.onUnavailable && !original.onNoAnswer) return undefined
+  // Refused by the rules of the platform (fourth review 10b, n°3): a loop to it, or where its trunk may not call.
+  if (refused) return t(`admin.operator.restoreRefused.${refused}`, { line, forwards: forwardsOf(original, t) })
   return writable(original) ? t('admin.operator.restoreLine', { line, forwards: forwardsOf(original, t) }) : t('admin.operator.restoreOther', { line, forwards: forwardsOf(original, t) })
 }
 
@@ -125,7 +128,7 @@ const Removals = ({ removals, onAbandon, busy }: { removals: OperatorRemoval[]; 
           <li key={r.line}>
             {t('admin.operator.removal', { line: r.line, since: at.format(new Date(r.since)) })}
             {r.error ? <span className="state state-error"> · {t(`admin.operator.err.${r.error}` as Key)}</span> : null}
-            {restoreOf(r.line, r.original, t) ? <> · {restoreOf(r.line, r.original, t)}</> : null}{' '}
+            {restoreOf(r.line, r.original, t, r.originalRefused) ? <> · {restoreOf(r.line, r.original, t, r.originalRefused)}</> : null}{' '}
             <ConfirmDelete
               label={t('admin.operator.abandonOf', { line: r.line })}
               question={t('admin.operator.abandonConfirm', { line: r.line })}
@@ -153,7 +156,7 @@ const ClosedRemovals = ({ removals }: { removals: OperatorClosedRemoval[] }) => 
       <ul className="plain" aria-label={t('admin.operator.closedRemovals')}>
         {removals.map(r => (
           <li key={r.line} className={r.outcome === 'changed' || r.outcome === 'gone' ? 'state state-error' : undefined}>
-            {t(`admin.operator.closed.${r.outcome === 'done' && r.restored ? 'restored' : r.outcome}` as Key, { line: r.line, at: at.format(new Date(r.at)) })}
+            {t(`admin.operator.closed.${r.outcome === 'done' && r.restored ? 'restored' : r.outcome === 'done' && r.unrestored ? `unrestored.${r.unrestored}` : r.outcome}` as Key, { line: r.line, at: at.format(new Date(r.at)) })}
           </li>
         ))}
       </ul>
@@ -466,11 +469,14 @@ export const Trunks = () => {
     const lines = operator.trunks?.find(o => o.id === trunk.id)?.lines ?? []
     return lines.some(l => !!l.forwards?.onUnavailable || !!l.forwards?.onNoAnswer) || !!operator.removals?.some(r => trunk.operator!.lines.includes(r.line))
   }
-  /** What removing the fallback of the trunk puts back on its lines, or that it cannot (third review 10b, n°8). */
+  /**
+   * What removing the fallback of the trunk puts back on its lines, or that it cannot (third review 10b, n°8): those it
+   * keeps one on, and those it kept one on before it was unticked (fourth review n°7).
+   */
   const restoring = (trunk: Trunk) =>
     (operator?.trunks?.find(o => o.id === trunk.id)?.lines ?? [])
-      .filter(l => l.managed)
-      .map(l => restoreOf(l.line, l.original, t))
+      .filter(l => l.managed || !!l.original)
+      .map(l => restoreOf(l.line, l.original, t, l.originalRefused))
       .filter(s => !!s)
       .join(' ')
   return (
@@ -539,7 +545,7 @@ export const Trunks = () => {
                   {removable(trunk) ? (
                     <ConfirmDelete
                       label={t('admin.operator.removeOf', { id: trunk.id })}
-                      question={[t(trunk.operator?.fallback ? 'admin.operator.removeConfirm' : 'admin.operator.removeConfirmSet', { id: trunk.id }), trunk.operator?.fallback ? restoring(trunk) : ''].filter(s => !!s).join(' ')}
+                      question={[t(trunk.operator?.fallback ? 'admin.operator.removeConfirm' : 'admin.operator.removeConfirmSet', { id: trunk.id }), restoring(trunk)].filter(s => !!s).join(' ')}
                       action="admin.operator.remove"
                       yes="admin.operator.removeYes"
                       tone="plain"

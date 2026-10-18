@@ -367,13 +367,19 @@ export const storeContract = (name: string, make: () => Promise<Store>) =>
       await s.close()
     })
 
-    it('forgets the erasure of a person with them: neither who nor their numbers (third review 10b, n°3)', async () => {
+    it('forgets the erasure of a person once they left, neither who nor their numbers; keeps it when given another extension (third review 10b, n°3; fourth n°2)', async () => {
       const s = await make()
       await s.upsertMapping({ tenantId: 'A', userId: 'jean', extension: '102' })
       await s.upsertMapping({ tenantId: 'A', userId: 'paul', extension: '103' })
       await s.deleteHistory('A', 'jean', ['+33199000102'])
       await s.deleteHistory('A', 'paul', ['+33199000103'])
+      // Given another extension (the directory lets the old one go first): the erasure stays, its numbers too.
       await s.deleteMapping('A', 'jean')
+      await s.upsertMapping({ tenantId: 'A', userId: 'jean', extension: '105' })
+      expect(await s.historyErasedAt('A', 'jean')).toBeDefined()
+      expect([...(await s.numbersErasedAt('A', ['+33199000102'])).keys()]).toEqual(['+33199000102'])
+      // Left: gone with him.
+      await s.deleteMapping('A', 'jean', { left: true })
       expect(await s.historyErasedAt('A', 'jean')).toBeUndefined()
       expect([...(await s.numbersErasedAt('A', ['+33199000102', '+33199000103'])).keys()]).toEqual(['+33199000103'])
       expect(await s.historyErasedAt('A', 'paul')).toBeDefined()

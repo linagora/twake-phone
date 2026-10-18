@@ -38,6 +38,30 @@ if (process.env.TEST_DATABASE_URL) {
       }
     })
 
+    // Whatever the DateStyle and TimeZone of the session (fourth review 10b, n°8): "IST" of a time sent back as text
+    // was read as Israel's, 3 h 30 off.
+    it('claims at the time asked under another DateStyle and an abbreviated time zone, and reads in ISO', async () => {
+      const url = new URL(process.env.TEST_DATABASE_URL!)
+      url.searchParams.set('options', '-c DateStyle=SQL,DMY -c TimeZone=Asia/Kolkata')
+      const store = new PgStore(url.toString())
+      await store.migrate()
+      const tenant = `style-${Date.now()}`
+      const id = `wh_${(Date.now() + 1).toString(16).padStart(16, '0').slice(-16)}`
+      const now = new Date().toISOString()
+      try {
+        const pool = (store as unknown as { pool: pg.Pool }).pool
+        expect((await pool.query<{ d: string; z: string }>("SELECT current_setting('DateStyle') AS d, current_setting('TimeZone') AS z")).rows[0]).toEqual({ d: 'ISO, MDY', z: 'Asia/Kolkata' })
+        await store.addWebhookSubscription({ tenantId: tenant, id, url: 'https://crm.example.org/in', events: ['call.missed'], enabled: true, secretEnc: 'enc', failures: 0, createdAt: now, updatedAt: now }, 20)
+        await store.enqueueWebhookEvent(tenant, 'evt_1', 'call.missed', '{}', '2020-01-01T10:00:00.000100Z')
+        await store.enqueueWebhookEvent(tenant, 'evt_2', 'call.missed', '{}', '2020-01-01T12:00:00.000000Z')
+        const claimed = await store.claimWebhookDeliveries(10, { perSubscription: 10, perTenant: 10, maxAttempts: 9 }, { now: '2020-01-01T10:00:00.000900Z', leaseUntil: '2020-01-01T10:01:00.000900Z' })
+        expect(claimed.filter(d => d.tenantId === tenant).map(d => d.eventId)).toEqual(['evt_1'])
+      } finally {
+        await store.deleteWebhookSubscription(tenant, id)
+        await store.close()
+      }
+    })
+
     it('costs what is claimed, not what waits: 100 000 pending deliveries, half of them paused, a claim within a bound', async () => {
       const store = new PgStore(process.env.TEST_DATABASE_URL!)
       await store.migrate()

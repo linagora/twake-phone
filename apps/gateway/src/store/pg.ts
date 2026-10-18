@@ -113,6 +113,11 @@ const deliveryOf = (r: DeliveryRow): WebhookDeliveryRecord => ({
 const NEW_DELIVERY_ID = "'dlv_' || replace(gen_random_uuid()::text, '-', '')"
 /** Deliveries removed per statement by the purge. */
 const PURGE_BATCH = 5_000
+/**
+ * A time written to the microsecond in UTC, whatever the DateStyle and TimeZone of the session (fourth review 10b,
+ * n°8): `::text` follows DateStyle, and an abbreviated zone (IST) is read back as another one.
+ */
+const UTC_TEXT = 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
 
 const toEntry = (r: HistoryRow): HistoryEntry => ({
   tenantId: r.tenant_id,
@@ -172,6 +177,9 @@ export class PgStore implements Store {
   constructor(connectionString: string) {
     this.pool = new pg.Pool({ connectionString, max: 10 })
     this.leasePool = new pg.Pool({ connectionString, max: 1 })
+    // Times read and written in ISO whatever the server's or the role's DateStyle (fourth review 10b, n°8): pg reads
+    // ISO dates only, and a time sent back as text must read as the same one. Queued before any query of the client.
+    for (const pool of [this.pool, this.leasePool]) pool.on('connect', client => void client.query("SET DateStyle = 'ISO, MDY'").catch(() => undefined))
   }
 
   /**
@@ -283,7 +291,7 @@ export class PgStore implements Store {
     return rows.map(r => this.mapping(r)!)
   }
 
-  async deleteMapping(tenantId: string, userId: string) {
+  async deleteMapping(tenantId: string, userId: string, opts: { left?: boolean } = {}) {
     // What was told of their presence goes with them (it is kept otherwise, whatever its age).
     await this.inTransaction(async client => {
       // Its extension changes hands (second review 10b, n°3).
@@ -292,8 +300,9 @@ export class PgStore implements Store {
         [tenantId, userId]
       )
       await client.query('DELETE FROM user_mappings WHERE tenant_id = $1 AND user_id = $2', [tenantId, userId])
-      // Their erasure goes with them (third review 10b, n°3): neither who nor their numbers are kept.
-      await client.query('DELETE FROM history_erasures WHERE tenant_id = $1 AND user_id = $2', [tenantId, userId])
+      // Their erasure goes with them once they left (third review 10b, n°3): neither who nor their numbers are kept.
+      // Given another extension, it stays (fourth review n°2).
+      if (opts.left) await client.query('DELETE FROM history_erasures WHERE tenant_id = $1 AND user_id = $2', [tenantId, userId])
       await client.query('DELETE FROM webhook_state WHERE tenant_id = $1 AND subject = $2', [tenantId, `presence:${userId}`])
     })
   }
@@ -1182,9 +1191,10 @@ export class PgStore implements Store {
     return this.inTransaction(async client => {
       // Kept as the database writes them, to the microsecond: read into a Date (milliseconds), the time of the claim
       // would fall before a delivery queued in its last millisecond, left out of a claim it is due for (second review
-      // 10b: one of two deliveries just queued claimed, 20 times in 300 on a fast database).
+      // 10b: one of two deliveries just queued claimed, 20 times in 300 on a fast database). Written in UTC (UTC_TEXT), not
+      // as `::text`, which follows the session's DateStyle.
       const { rows: times } = await client.query<{ now: string; lease: string }>(
-        "SELECT coalesce($1::timestamptz, now())::text AS now, coalesce($2::timestamptz, coalesce($1::timestamptz, now()) + $3 * interval '1 millisecond')::text AS lease",
+        `SELECT to_char(coalesce($1::timestamptz, now()) AT TIME ZONE 'UTC', '${UTC_TEXT}') AS now, to_char(coalesce($2::timestamptz, coalesce($1::timestamptz, now()) + $3 * interval '1 millisecond') AT TIME ZONE 'UTC', '${UTC_TEXT}') AS lease`,
         [at?.now ?? null, at?.leaseUntil ?? null, caps.leaseMs ?? 60_000]
       )
       const { now, lease } = times[0]!

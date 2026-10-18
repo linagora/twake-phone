@@ -5,7 +5,7 @@ import websocket from '@fastify/websocket'
 import swagger from '@fastify/swagger'
 import swaggerUi from '@fastify/swagger-ui'
 import { LiveKitError, PIN_DIGITS, maskNumber, splitParticipantId, verifyWebhook, type LiveKitConferenceBridge, type MeetApi, type MeetRoom, type ParticipantCall } from '@twake/conference-livekit'
-import { REPLACES } from '@twake/provider-opensips'
+import { OUTBOUND_ALLOWED, REPLACES, classify, countryAllowed } from '@twake/provider-opensips'
 import type { DialedParticipant, MediaProvider, OperatorProvider, RoomCallGrantToken, TelephonyProvider } from '@twake/telephony-provider-sdk'
 import { EXTENSION_FORMAT, FRAUD_DEFAULTS, OUTBOUND_CAP_DEFAULTS, isReservedNumber, type CallDirection, type DidRange, type Endpoint, type ForwardingRules, type Presence, type PresenceStatus, type RingGroup, type TelephonyEvent, type TrunkStatus, type User } from '@twake/telephony-types'
 import { adminPolicyFromEnv, isAdmin, type AdminPolicy } from './admin.js'
@@ -20,7 +20,7 @@ import { ENDED_TTL_SEC, MISSED_TTL_SEC, type PushMessage, type WebPush } from '.
 import type { ProviderRegistry } from './registry.js'
 import { securityHeadersFor, type SecurityOptions } from './security.js'
 import { TrunkWatch } from './trunk-health.js'
-import { OPERATOR_KEPT_MS, OperatorRoundError, OperatorSync, askKey, erasedNumbersOf, type OperatorRemoval } from './operator.js'
+import { OPERATOR_KEPT_MS, OperatorRoundError, OperatorSync, askKey, erasedNumbersOf, type OperatorRemoval, type OperatorRestoreRefusal } from './operator.js'
 import { e164Of } from './e164.js'
 import { encrypt } from './crypto.js'
 import { newWebhookSecret, parseWebhookDomains } from './webhook-delivery.js'
@@ -61,6 +61,26 @@ const erasedRemoteKey = (secretsKey: Buffer | undefined) => {
   const key = Buffer.from(hkdfSync('sha256', secretsKey, Buffer.alloc(0), 'twake-phone: erased calls', 32))
   return (tenantId: string, number: string) => createHmac('sha256', key).update(`${tenantId}\u0000${number}`).digest('hex')
 }
+/**
+ * Why a forward of before to `number` may not be put back on a line of trunk `trunkId` (fourth review 10b, n°3): the
+ * rules a fallback at the operator is held to (OPERATOR_FALLBACK_LOOP: a direct number, a line or the number of a
+ * trunk), and what the trunk may call (step 6: premium numbers never, overseas and international ones as it allows; its
+ * defaults when it is gone).
+ */
+export const restoreRefusalOf =
+  (store: Store) =>
+  async (tenantId: string, number: string, trunkId?: string): Promise<OperatorRestoreRefusal | undefined> => {
+    const n = e164Of(number)
+    if (inDids((await store.listDids(tenantId)).map(publicDid), n)) return 'loop'
+    const trunks = await store.listTrunks(tenantId)
+    if (trunks.some(t => [...(t.config.operator?.lines ?? []), ...(t.config.defaultNumber ? [t.config.defaultNumber] : [])].some(l => e164Of(l) === n))) return 'loop'
+    const trunk = trunks.find(t => t.id === trunkId)
+    const kind = classify(n)
+    const allowed: readonly string[] = trunk?.config.allowed ?? OUTBOUND_ALLOWED
+    if (!kind || !allowed.includes(kind.class)) return 'outbound'
+    if (kind.class === 'international' && !countryAllowed(kind.number, trunk?.config.countries ?? [])) return 'outbound'
+    return undefined
+  }
 /** The cursor of a page of alerts (`next`, `before`): the last repeat (ms) and id of the last alert of the page. */
 const ALERT_CURSOR = /^([0-9]{1,15})-([1-9][0-9]{0,17})$/
 /**
@@ -900,6 +920,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         ...(options.operatorSyncMs ? { everyMs: options.operatorSyncMs } : {}),
         ...(options.operatorSettleMs !== undefined ? { settleMs: options.operatorSettleMs } : {}),
         ...(remoteKey ? { remoteKey } : {}),
+        restorable: restoreRefusalOf(store),
         logger: app.log
       })
     : undefined
