@@ -15,6 +15,13 @@ describe('historyEntryFor', () => {
     expect(historyEntryFor('A', 'bob', ended(call))).not.toHaveProperty('conference')
   })
 
+  it('says a call a mailbox took is one (step 11a): answered for the caller, missed for the person called', () => {
+    const call = { id: 'c', remoteNumber: '102', startedAt: '2026-10-05T10:00:00.000Z', voicemail: true }
+    expect(historyEntryFor('A', 'alice', ended({ ...call, direction: 'outbound', state: 'ended', connectedAt: '2026-10-05T10:04:50.000Z' }))).toMatchObject({ voicemail: true, answered: true, durationSec: 10 })
+    expect(historyEntryFor('A', 'bob', ended({ ...call, direction: 'inbound', state: 'missed' }))).toMatchObject({ voicemail: true, answered: false, state: 'missed' })
+    expect(historyEntryFor('A', 'bob', ended({ id: 'd', direction: 'inbound', state: 'missed', remoteNumber: '101' }))).not.toHaveProperty('voicemail')
+  })
+
   it('records an unanswered call with no duration', () => {
     const e = historyEntryFor('A', 'alice', ended({ id: 'c', direction: 'inbound', state: 'missed', remoteNumber: '102' }))
     expect(e).toMatchObject({ answered: false, durationSec: 0, state: 'missed' })

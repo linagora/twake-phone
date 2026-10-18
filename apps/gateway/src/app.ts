@@ -350,7 +350,9 @@ const publicEntry = (e: HistoryEntry) => ({
   answered: e.answered,
   // Missed: the phone rang and nobody took the call. One the user declined (state `rejected`) is not.
   missed: isMissed(e),
-  ...(e.conference ? { conference: true } : {})
+  ...(e.conference ? { conference: true } : {}),
+  // Taken by a mailbox (step 11a): the caller left a message, or the person called has one.
+  ...(e.voicemail ? { voicemail: true } : {})
 })
 
 export const buildApp = async (registry: ProviderRegistry, options: BuildOptions = {}) => {

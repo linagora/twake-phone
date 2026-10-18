@@ -1,0 +1,39 @@
+# wazo-calld (ADR 0021): the voicemail API provider-wazo reads (messages, recordings, folders) and the events of a new
+# message, from the spool shared with Asterisk.
+debug: false
+log_level: info
+rest_api:
+  listen: 127.0.0.1
+  port: 9500
+auth:
+  host: 127.0.0.1
+  port: 9497
+  prefix: null
+  https: false
+  key_file: /var/lib/wazo-auth-keys/wazo-calld-key.yml
+confd:
+  host: 127.0.0.1
+  port: 9486
+  prefix: null
+  https: false
+bus:
+  host: 127.0.0.1
+  port: 5672
+ari:
+  connection:
+    base_url: http://127.0.0.1:5039
+amid:
+  host: 127.0.0.1
+  port: 9491
+  prefix: null
+  https: false
+phoned:
+  host: 127.0.0.1
+  port: 9498
+call_logd:
+  host: 127.0.0.1
+  port: 9298
+  prefix: null
+  https: false
+service_discovery:
+  enabled: false

@@ -18,7 +18,8 @@ import type {
   TelephonyEvent,
   Trunk,
   TrunkStatus,
-  User
+  User,
+  Voicemail
 } from '@twake/telephony-types'
 
 /** An event plus the provider-side identity (User.extension) it concerns; the Gateway maps it back to a Twake user. */
@@ -85,6 +86,12 @@ export interface TelephonyProvider {
    * there; undefined when it cannot say. The Gateway compares it with its own at its start.
    */
   getMeetAccess?(): Promise<{ number?: string } | undefined>
+  /**
+   * The mailboxes of the tenant (step 11a, ADR 0021), as the voicemail server named them (VoicemailProvider's
+   * syncMailboxes): replaces the list. A call to one of these extensions that nobody answers, that its "do not disturb"
+   * refuses, busy or that reaches nobody goes to `mailbox`; an extension not in it has none.
+   */
+  setVoicemailBoxes?(boxes: VoicemailBox[]): Promise<void>
   /** Where the calls of the user's extension go (capability `forwarding`). */
   getForwarding?(user: User): Promise<ForwardingRules>
   /** Replaces those rules; targets are extensions the Gateway checked. */
@@ -124,6 +131,41 @@ export interface TelephonyProvider {
   transfer(callId: string, destination: string): Promise<void>
   sendDTMF(callId: string, digits: string): Promise<void>
   subscribe(): AsyncIterable<RoutedEvent>
+}
+
+/** A person's mailbox, where the SIP server sends the calls of `extension` it cannot get through (step 11a). */
+export interface VoicemailBox {
+  extension: string
+  /** The voicemail server's own address of the mailbox (`number@context` for Wazo's Asterisk); opaque to the Gateway. */
+  mailbox: string
+}
+
+/**
+ * The voicemail server of a tenant (step 11a, ADR 0021; Wazo's, provider-wazo): one mailbox per extension, for the
+ * person who holds it, and the messages left there. A mailbox is its holder's: when an extension passes to someone
+ * else, its messages go with the old mailbox, never to the new holder.
+ */
+export interface VoicemailProvider {
+  readonly id: string
+  getStatus(): ProviderStatus
+  /** Why the status is not CONNECTED, in a few words without addresses or secrets. */
+  getStatusReason?(): string | undefined
+  /**
+   * Who holds each extension of the tenant now: each gets a mailbox (made, or kept with its messages), the others go
+   * (with theirs). Returns the mailboxes, for the SIP server (TelephonyProvider's setVoicemailBoxes).
+   */
+  syncMailboxes(holders: { extension: string; userId: string; displayName?: string }[]): Promise<VoicemailBox[]>
+  /** The messages of the mailbox of `extension`, newest first; none when it has no mailbox. */
+  listMessages(extension: string): Promise<Voicemail[]>
+  /** The recording of a message (WAV), undefined when the mailbox of `extension` has no such message. */
+  getRecording(extension: string, id: string): Promise<{ contentType: string; body: Uint8Array } | undefined>
+  /** Marks a message as read (listened to); false when the mailbox of `extension` has no such message. */
+  markRead(extension: string, id: string): Promise<boolean>
+  /** Deletes a message; false when the mailbox of `extension` has no such message. */
+  deleteMessage(extension: string, id: string): Promise<boolean>
+  /** The `voicemail.*` events, per extension (a message left, read, deleted), whichever screen or phone did it. */
+  subscribe(): AsyncIterable<RoutedEvent>
+  close(): Promise<void>
 }
 
 export interface MediaProvider {

@@ -1,0 +1,29 @@
+# wazo-confd for the development and CI stack (ADR 0021): Wazo's configuration API (the users and voicemails
+# provider-wazo writes), on the loopback. Its sysconfd is wazo-sysconfd.py of this stack (voicemail reloads, a mailbox
+# emptied); there is no provd (Wazo provisions no phone here).
+debug: false
+log_level: info
+rest_api:
+  listen: 127.0.0.1
+  port: 9486
+db_uri: postgresql://asterisk:proformatique@127.0.0.1:54330/asterisk?application_name=wazo-confd
+auth:
+  host: 127.0.0.1
+  port: 9497
+  prefix: null
+  https: false
+  key_file: /var/lib/wazo-auth-keys/wazo-confd-key.yml
+bus:
+  host: 127.0.0.1
+  port: 5672
+ari:
+  host: 127.0.0.1
+  port: 5039
+provd:
+  host: 127.0.0.1
+  port: 8666
+sysconfd:
+  host: 127.0.0.1
+  port: 8668
+service_discovery:
+  enabled: false

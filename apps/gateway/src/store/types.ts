@@ -35,6 +35,8 @@ export interface HistoryEntry {
   answered: boolean
   /** A conference's call (step 8b, ADR 0019): the room called the person in the place of a call of theirs. */
   conference?: boolean
+  /** A call a mailbox took (step 11a, ADR 0021): answered by it for the caller, missed for the person called. */
+  voicemail?: boolean
 }
 
 /** A missed call: inbound, never answered, and not declined by the user (state `missed`, not `rejected`). */

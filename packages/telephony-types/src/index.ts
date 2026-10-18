@@ -372,6 +372,28 @@ export interface Call {
    * them in it. `remoteNumber` is then whoever made the conference (themselves, for that person).
    */
   conference?: boolean
+  /**
+   * The call went to the mailbox of the extension dialled (step 11a, ADR 0021): nobody answered it, refused it or could
+   * be reached, and the voicemail server took it. For the caller it was answered (by the mailbox); for the callee it is
+   * a missed call, whose message, if one was left, is in their mailbox (`Voicemail`).
+   */
+  voicemail?: boolean
+}
+
+/**
+ * A message left in a person's mailbox (step 11a, ADR 0021), as their Messagerie shows it: who left it (`from`, an
+ * extension or an E.164 number, absent when the caller hid it; `fromName`, as the directory or the operator named
+ * them), when, how long, and whether it was listened to. Its audio is read apart (GET /v1/voicemails/{id}/audio).
+ */
+export interface Voicemail {
+  /** Opaque, stable for the life of the message. */
+  id: string
+  from?: string
+  fromName?: string
+  receivedAt: string
+  durationSec: number
+  /** Not yet marked as read (listened to). */
+  unread: boolean
 }
 
 export interface OriginateRequest {
@@ -417,6 +439,11 @@ export interface Capabilities {
    */
   outboundPolicy?: boolean
   conference: { dialIn: boolean; dialOut: boolean }
+  /**
+   * Each person has a mailbox (step 11a, ADR 0021): a call nobody answers, refused by their "do not disturb", busy or
+   * that reaches nobody goes there, and they read their messages (`Voicemail`, the `voicemail.*` events).
+   */
+  voicemail?: boolean
 }
 
 /** Media plane description handed to the client; opaque to the Gateway. */
@@ -486,6 +513,12 @@ export type TelephonyEvent =
   | { type: 'conference.participant.joined' | 'conference.participant.left'; timestamp: string; payload: { participant: ConferenceParticipant } }
   /** For the administrators, never the person: a volume threshold crossed or a cap reached (step 6b). */
   | { type: 'alert.raised'; timestamp: string; payload: { alert: TelephonyAlert } }
+  /**
+   * The person's mailbox (step 11a): a message left (`voicemail.created`), marked as read (`voicemail.updated`), or
+   * deleted (`voicemail.deleted`, its id only), from any of their screens.
+   */
+  | { type: 'voicemail.created' | 'voicemail.updated'; timestamp: string; payload: { voicemail: Voicemail } }
+  | { type: 'voicemail.deleted'; timestamp: string; payload: { id: string } }
 
 export type ProviderStatus = 'CONNECTED' | 'DEGRADED' | 'DISCONNECTED' | 'ERROR'
 

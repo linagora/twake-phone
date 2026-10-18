@@ -39,6 +39,11 @@ interface TrackedCall {
    * neither told of it nor busy with it (their own is the call of the room to them).
    */
   conference?: boolean
+  /**
+   * The mailbox of the callee (the extension dialled) took the call (step 11a, ADR 0021; E_TWAKEPHONE_VOICEMAIL): for
+   * the caller it is answered, for the callee a missed call, told then, whatever rang; the callee is not busy with it.
+   */
+  voicemail?: boolean
 }
 
 /** What the SIP server knows of an extension: registered or not, in a call or not. */
@@ -393,6 +398,24 @@ export class CallTracker {
         this.emit(who, { type: 'call.wake', timestamp: this.now(), payload: { call: this.toCall(call, who, 'ringing'), waitSec, ...(call.group ? { group: call.dialled } : {}) } })
         return
       }
+      case 'E_TWAKEPHONE_VOICEMAIL': {
+        // The mailbox of `callee`, the extension dialled, answered (step 11a): nobody of theirs answered, refused or
+        // could be reached (`code`: what the caller would have been told). Whoever a forward made ring before has the
+        // call missed (or declined); the callee too, at once (their phone is free: the mailbox has the call); the caller
+        // is in a call, with the mailbox.
+        const call = this.find(p, now)
+        if (!call || call.connectedAt || call.group || call.conference) return
+        const code = Number(p.code) || 0
+        this.moveTo(call, userOf(str(p.callee)), code, now)
+        if (call.rang) this.count(call.callee, -1)
+        call.rang = false
+        call.woken?.delete(call.callee)
+        call.voicemail = true
+        call.connectedAt = now
+        if (call.callee !== call.caller) this.emit(call.callee, { type: 'call.ended', timestamp: now, payload: { call: { ...this.toCall(call, call.callee, DECLINED.has(code) ? 'rejected' : 'missed', now), connectedAt: undefined } } })
+        this.tell(call, call.caller, 'call.connected', 'connected')
+        break
+      }
       case 'E_TWAKEPHONE_RINGING': {
         const call = this.find(p, now)
         // A group call: `callee` is the member whose phone rings.
@@ -420,9 +443,10 @@ export class CallTracker {
         const created = epochMs(p.created)
         const call = this.find(p, created !== undefined ? iso(created) : now)
         if (!call) return
-        // Answered (by the member acc names, for a group whose answer was not told): both sides knew of it.
+        // Answered (by the member acc names, for a group whose answer was not told): both sides knew of it. By the
+        // callee's mailbox (step 11a): the callee was told already, and was never busy with it.
         if (call.group && !call.connectedAt) this.memberAnswers(call, userOf(str(p.callee)))
-        this.rings(call)
+        if (!call.voicemail) this.rings(call)
         const answeredMs = epochMs(p.time)
         const ms = num(p.ms_duration)
         const sec = num(p.duration)
@@ -619,6 +643,7 @@ export class CallTracker {
     const outbound = viewer === c.caller
     return {
       ...(c.conference ? { conference: true } : {}),
+      ...(c.voicemail ? { voicemail: true } : {}),
       id: c.id,
       direction: outbound ? 'outbound' : 'inbound',
       state,
@@ -649,7 +674,7 @@ export class CallTracker {
     const rang = [...(c.group?.ringing ?? [])]
     for (const m of rang) this.count(m, -1)
     c.group?.ringing.clear()
-    const callee = (c.conference || c.callee !== c.caller) && (c.rang || !!c.woken?.has(c.callee))
+    const callee = !c.voicemail && (c.conference || c.callee !== c.caller) && (c.rang || !!c.woken?.has(c.callee))
     const members = [...new Set([...rang, ...[...(c.woken ?? [])].filter(m => m !== c.callee && m !== c.caller)])]
     if (tombstone) {
       this.ended.add(c.id)

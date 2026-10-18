@@ -1,0 +1,24 @@
+# wazo-amid (ADR 0021): Asterisk's AMI events onto Wazo's bus (MessageWaiting, a new message, which wazo-calld turns
+# into its voicemail events), and its actions over REST.
+debug: false
+ami:
+  host: 127.0.0.1
+  port: 5038
+  # The account docker/wazo/asterisk/entrypoint.sh writes (development and CI only).
+  username: wazo_amid
+  password: twake-wazo-dev-only-ami
+ajam:
+  host: 127.0.0.1
+  port: 5039
+auth:
+  host: 127.0.0.1
+  port: 9497
+  prefix: null
+  https: false
+  key_file: /var/lib/wazo-auth-keys/wazo-amid-key.yml
+bus:
+  host: 127.0.0.1
+  port: 5672
+rest_api:
+  listen: 127.0.0.1
+  port: 9491

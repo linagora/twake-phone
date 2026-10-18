@@ -92,6 +92,18 @@ export const storeContract = (name: string, make: () => Promise<Store>) =>
       await s.close()
     })
 
+    it('keeps whether a mailbox took a call (step 11a), and only then says so', async () => {
+      const s = await make()
+      await s.addHistory(entry({ callId: 'vm', voicemail: true, answered: true, durationSec: 12 }))
+      await s.addHistory(entry({ callId: 'plain', startedAt: '2026-10-05T09:00:00.000Z' }))
+      const { items } = await s.listHistory('A', 'alice')
+      expect(items.map(e => [e.callId, e.voicemail, e.answered])).toEqual([
+        ['vm', true, true],
+        ['plain', undefined, expect.any(Boolean)]
+      ])
+      await s.close()
+    })
+
     it('is idempotent on the call id', async () => {
       const s = await make()
       await s.addHistory(entry({}))

@@ -504,6 +504,66 @@ describe('CallTracker', () => {
     expect(calls()).toEqual([])
   })
 
+  it('makes a call a mailbox took (step 11a) answered for the caller, with the mailbox, and missed (or declined) for the extension dialled and whoever rang before', () => {
+    const { tracker, calls, presences, events, clear } = make()
+    for (const ext of ['101', '102', '103']) tracker.handle('E_UL_CONTACT_INSERT', contact(ext, `sip:${ext}@x.invalid`))
+    clear()
+    const vm = (callid: string, code: string, greeting = 'unavailable') => ({ callid, caller: '101', callee: '102', dialled: '102', greeting, code })
+    // "Do not disturb": 102's phone never rang, its mailbox answers; 102 is never busy with it.
+    tracker.handle('E_TWAKEPHONE_CALLING', call('v1', '101', '102'))
+    tracker.handle('E_TWAKEPHONE_VOICEMAIL', vm('v1', '480'))
+    expect(calls()).toEqual(['101:call.created:outbound:102:new', '102:call.ended:inbound:101:missed', '101:call.connected:outbound:102:connected'])
+    const connected = events.find(e => e.event.type === 'call.connected')!.event.payload as { call: { voicemail?: boolean; connectedAt?: string } }
+    expect(connected.call).toMatchObject({ voicemail: true })
+    expect(connected.call.connectedAt).toBeDefined()
+    const told = events.find(e => e.extension === '102')!.event.payload as { call: { voicemail?: boolean; connectedAt?: string } }
+    expect(told.call).toMatchObject({ voicemail: true })
+    expect(told.call.connectedAt).toBeUndefined()
+    expect(tracker.activeCalls().find(c => c.id === 'v1')).toMatchObject({ voicemail: true, state: 'connected' })
+    clear()
+    // The message left, the caller hangs up: the CDR ends it for the caller only.
+    tracker.handle('E_ACC_CDR', cdr('v1', '101', '102', 12, 1792000805))
+    expect(calls()).toEqual(['101:call.ended:outbound:102:ended'])
+    expect(presences()).toEqual(['101:available'])
+    expect(tracker.activeCalls()).toEqual([])
+    clear()
+    // No answer: 102's phone rang (busy meanwhile), free again once its mailbox answers.
+    tracker.handle('E_TWAKEPHONE_CALLING', call('v2', '101', '102'))
+    tracker.handle('E_TWAKEPHONE_RINGING', call('v2', '101', '102'))
+    tracker.handle('E_TWAKEPHONE_VOICEMAIL', vm('v2', '408'))
+    expect(calls().slice(-2)).toEqual(['102:call.ended:inbound:101:missed', '101:call.connected:outbound:102:connected'])
+    expect(presences()).toEqual(['101:busy', '102:busy', '102:available'])
+    tracker.handle('E_ACC_CDR', cdr('v2', '101', '102', 5, 1792000905))
+    clear()
+    // Forwarded on no answer to 103, who did not answer either: missed for 103 and for 102, the caller still sees 102.
+    tracker.handle('E_TWAKEPHONE_CALLING', { ...call('v3', '101', '103'), dialled: '102' })
+    tracker.handle('E_TWAKEPHONE_RINGING', call('v3', '101', '103'))
+    clear()
+    tracker.handle('E_TWAKEPHONE_VOICEMAIL', vm('v3', '408'))
+    expect(calls()).toEqual(['103:call.ended:inbound:101:missed', '102:call.ended:inbound:101:missed', '101:call.connected:outbound:102:connected'])
+    expect(presences()).toEqual(['103:available'])
+    tracker.handle('E_ACC_CDR', cdr('v3', '101', '102', 5, 1792001005))
+    clear()
+    // Declined (603): a declined call for 102, its "busy" greeting for the caller.
+    tracker.handle('E_TWAKEPHONE_CALLING', call('v4', '101', '102'))
+    tracker.handle('E_TWAKEPHONE_RINGING', call('v4', '101', '102'))
+    tracker.handle('E_TWAKEPHONE_VOICEMAIL', vm('v4', '603', 'busy'))
+    expect(calls().slice(-2)).toEqual(['102:call.ended:inbound:101:rejected', '101:call.connected:outbound:102:connected'])
+    clear()
+    // Told once: a second event of the same call, or one of a call already answered, tells nothing.
+    tracker.handle('E_TWAKEPHONE_VOICEMAIL', vm('v4', '603', 'busy'))
+    tracker.handle('E_TWAKEPHONE_CALLING', call('v5', '101', '102'))
+    tracker.handle('E_TWAKEPHONE_RINGING', call('v5', '101', '102'))
+    tracker.handle('E_TWAKEPHONE_ANSWERED', call('v5', '101', '102'))
+    clear()
+    tracker.handle('E_TWAKEPHONE_VOICEMAIL', vm('v5', '408'))
+    tracker.handle('E_TWAKEPHONE_VOICEMAIL', { callid: 'nope', code: '408' })
+    expect(calls()).toEqual([])
+    // Its CALLING lost: the call is made from the event, which names both sides.
+    tracker.handle('E_TWAKEPHONE_VOICEMAIL', vm('v6', '480'))
+    expect(calls()).toEqual(['102:call.ended:inbound:101:missed', '101:call.connected:outbound:102:connected'])
+  })
+
   it('ends what the user chose at its date: told when it comes, never in force after it', () => {
     let t = Date.parse('2026-10-14T18:00:00.000Z')
     const told: string[] = []

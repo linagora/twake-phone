@@ -1,0 +1,1 @@
+db_uri: postgresql://asterisk:proformatique@127.0.0.1:54330/asterisk?application_name=wazo-confd

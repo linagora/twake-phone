@@ -1,10 +1,11 @@
-import type { CallParties, MediaProvider, ProviderFactory, RoomCallGrant, RoomCallGrantToken, RoutedEvent, TelephonyProvider } from '@twake/telephony-provider-sdk'
+import type { CallParties, MediaProvider, ProviderFactory, RoomCallGrant, RoomCallGrantToken, RoutedEvent, TelephonyProvider, VoicemailBox } from '@twake/telephony-provider-sdk'
 import type { Call, Capabilities, DidRange, Endpoint, ForwardingRules, MediaSession, OriginateRequest, OutboundAssignment, OutboundPolicy, OutboundProfile, Presence, ProviderStatus, RingGroup, Trunk, TrunkStatus, User } from '@twake/telephony-types'
 import type { CallGroups } from './call-groups.js'
 import type { CallRules } from './call-rules.js'
 import type { PushTargets } from './push-targets.js'
 import type { DialOutGrants } from './dial-out-grants.js'
 import type { OutboundTables } from './outbound.js'
+import type { VoicemailBoxes } from './voicemail-boxes.js'
 import { trunkStatusFrom, type TrunkTables } from './trunks.js'
 import { OpensipsEvents, parseDlgContext, parseDlgList, parseUlDump, type EventsLogger } from './events.js'
 import { AsyncQueue } from './queue.js'
@@ -18,6 +19,7 @@ export { CallGroups, CALL_GROUPS_SCHEMA, DISPLAY_NAMES_SCHEMA, GROUP_MEMBERS_MAX
 export { PushTargets, PUSH_TARGETS_SCHEMA, type PushTargetsOptions } from './push-targets.js'
 export { DialOutGrants, DIAL_OUT_GRANTS_SCHEMA, GRANT_HEADER, GRANT_TTL_SEC, JOIN_HEADER, JOIN_TOKEN, REPLACES, type DialOutGrantsOptions } from './dial-out-grants.js'
 export { AsyncQueue } from './queue.js'
+export { VoicemailBoxes, VOICEMAIL_BOXES_SCHEMA, MAILBOX, type VoicemailBoxesOptions } from './voicemail-boxes.js'
 export { TrunkTables, TRUNK_SCHEMA, TRUNK_SQL, DEFAULT_TRUNK_SOCKET, SOURCES_SET, DISPATCHER_TABLE_VERSION, DIALPLAN_TABLE_VERSION, REGISTRANT_TABLE_VERSION, codecFlags, projectTrunks, trunkSecret, trunkStatusFrom, type TrunkTablesOptions } from './trunks.js'
 export { OutboundTables, OUTBOUND_SCHEMA, ACC_EXTERNAL_SQL, FRAUD_PROFILE, FRAUD_RULE_INTERNATIONAL, FRAUD_RULE_NATIONAL, FRAUD_TABLE_VERSION, FRAUD_OVERSEAS_PREFIXES, DR_TABLE_VERSIONS, DIALOG_TABLE_VERSION, OUTBOUND_TIME_ZONE, CAP_MAX, PROFILE_ID, fraudRow, projectOutbound, type OutboundTablesOptions } from './outbound.js'
 export { DIALPLAN_RULES, DIALPLAN_SQL, DP_CLASSIFY, DP_INBOUND, DP_NORMALISE, OUTBOUND_ALLOWABLE, OUTBOUND_ALLOWED, classify, countryAllowed, translate, type DialplanRule, type NumberClass } from './numbering.js'
@@ -30,7 +32,8 @@ export const PROBE_EVENT = 'E_TWAKEPHONE_PROBE'
 
 /**
  * The events the Gateway listens to: registrations and their refreshes (usrloc), our own call events (opensips.cfg.tpl),
- * the CDRs and missed calls (acc), the thresholds crossed (fraud_detection) and the caps reached (step 6b).
+ * the CDRs and missed calls (acc), the thresholds crossed (fraud_detection) and the caps reached (step 6b). A call a
+ * mailbox took (step 11a) is E_TWAKEPHONE_VOICEMAIL.
  */
 export const SUBSCRIBED_EVENTS = [
   'E_UL_CONTACT_INSERT',
@@ -43,6 +46,7 @@ export const SUBSCRIBED_EVENTS = [
   'E_TWAKEPHONE_FORWARDED',
   'E_TWAKEPHONE_DND',
   'E_TWAKEPHONE_WAKE',
+  'E_TWAKEPHONE_VOICEMAIL',
   PROBE_EVENT,
   'E_ACC_CDR',
   'E_ACC_MISSED_EVENT',
@@ -111,6 +115,11 @@ export interface OpensipsConfig {
    * its fraud_detection reloads the thresholds through the MI when they change. Without it, what the trunks allow.
    */
   outbound?: OutboundTables
+  /**
+   * The mailboxes OpenSIPS sends the calls nothing else takes to (step 11a, ADR 0021; `voicemail_boxes`), as the
+   * voicemail server named them. Without it, or without a mailbox for an extension, its calls end as before.
+   */
+  voicemailBoxes?: VoicemailBoxes
   /**
    * The SIP accounts (`subscriber`) OpenSIPS authenticates and routes by: `reconcile` removes those the Gateway
    * wrote for a user who no longer holds the extension, and returns their extensions (SubscriberProvisioner's
@@ -350,6 +359,16 @@ export class OpensipsProvider implements TelephonyProvider, MediaProvider {
   async setWakeableOne(holder: { extension: string; userId: string }, on: boolean) {
     if (!this.config.pushTargets) return
     await this.config.pushTargets.setOne(holder, on && !!this.events)
+  }
+
+  /**
+   * The mailboxes of the tenant (step 11a): written in `voicemail_boxes`, which OpenSIPS reads with the rules of the
+   * extension dialled. One it could not read (not digits, not `number@context`) is left out, and said.
+   */
+  async setVoicemailBoxes(boxes: VoicemailBox[]) {
+    if (!this.config.voicemailBoxes) return
+    const { skipped } = await this.config.voicemailBoxes.set(boxes)
+    if (skipped.length) (this.config.logger ?? console).warn(`OpenSIPS: ${skipped.length} mailbox(es) left out, not an extension of digits and a mailbox OpenSIPS reads: ${skipped.map(b => b.extension.slice(0, 20)).join(', ')}`)
   }
 
   /**
