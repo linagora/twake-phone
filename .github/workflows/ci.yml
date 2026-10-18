@@ -101,7 +101,8 @@ jobs:
           node-version: 22
           cache: yarn
       # La stack SIP d'abord (`--wait` bloque jusqu'aux healthchecks) : OpenSIPS 3.6 (image officielle + modules
-      # WSS, TLS, PostgreSQL), rtpengine en espace utilisateur, PostgreSQL avec la table `subscriber`. Réseau hôte.
+      # WSS, TLS, PostgreSQL), rtpengine en espace utilisateur, PostgreSQL avec la table `subscriber`, et Wazo 26.10 pour
+      # les messageries (étape 11a, ADR 0021 : images officielles épinglées par empreinte). Réseau hôte.
       - name: Stack SIP (Docker Compose)
         run: docker compose -f docker/docker-compose.sip.yml up --build --wait --wait-timeout 300
       - run: yarn install --frozen-lockfile
@@ -142,17 +143,18 @@ jobs:
         env:
           OPENSIPS_DB_URL: postgres://twake:twake@127.0.0.1:54320/twake
           OPENSIPS_RESTART: docker compose -f docker/docker-compose.sip.yml kill -s KILL opensips && docker compose -f docker/docker-compose.sip.yml up -d --wait --wait-timeout 120 opensips
-      - name: e2e SIP (trois personnes dans ${{ matrix.browser }}, micro simulé, OpenSIPS et rtpengine en Docker)
+      - name: e2e SIP (trois personnes dans ${{ matrix.browser }}, micro simulé, OpenSIPS, rtpengine et Wazo en Docker)
         run: node apps/web/test/sip.e2e.mjs
         env:
           BROWSER: ${{ matrix.browser }}
           SIP_WSS_URL: wss://127.0.0.1:8089
           OPENSIPS_DB_URL: postgres://twake:twake@127.0.0.1:54320/twake
-      # Service par service (étape 8 : LiveKit et LiveKit SIP écrivent beaucoup), la fin de chacun.
+      # Service par service (étape 8 : LiveKit et LiveKit SIP écrivent beaucoup), la fin de chacun ; Wazo (étape 11a) :
+      # l'Asterisk des messageries et les services que la passerelle appelle.
       - name: Journaux de la stack SIP en cas d'échec
         if: failure()
         run: |
-          for service in opensips rtpengine livekit-sip livekit; do
+          for service in opensips rtpengine livekit-sip livekit wazo-asterisk wazo-calld wazo-confd wazo-websocketd wazo-auth wazo-bootstrap; do
             echo "::group::$service"
             docker compose -f docker/docker-compose.sip.yml logs --no-color --timestamps --tail 300 "$service"
             echo "::endgroup::"

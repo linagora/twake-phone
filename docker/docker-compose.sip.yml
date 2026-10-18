@@ -145,15 +145,19 @@ services:
   # wazo-amid (9491), wazo-calld (9500), wazo-websocketd (9502), and two stand-ins of this stack: the accounts
   # wazo-auth-keys makes on a Wazo (wazo-bootstrap) and the part of wazo-sysconfd wazo-confd uses (8668). Passwords
   # and keys are this stack's own, or Wazo's defaults, for development and CI only (as twake:twake for PostgreSQL).
+  # Their healthchecks run every 2 s while they start (start_interval), then every minute: run every 2 s, they kept a CPU
+  # of the CI's runner busy, which the browsers and LiveKit SIP (it refuses calls on a loaded machine) need.
   wazo-db:
     image: wazoplatform/wazo-confd-db:latest@sha256:76b5e45d790496c338ae4ec4a69cfbb7a0e1fe6cf4bf9e522c73409f517a1243
     command: ["-p", "54330", "-c", "listen_addresses=127.0.0.1"]
     network_mode: host
     healthcheck:
       test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-p", "54330", "-U", "asterisk"]
-      interval: 2s
+      interval: 60s
+      start_period: 5m
+      start_interval: 2s
       timeout: 3s
-      retries: 30
+      retries: 3
 
   # Wazo's bus, the loopback only (AMQP, and Erlang's port mapper and distribution port).
   rabbitmq:
@@ -165,9 +169,11 @@ services:
     network_mode: host
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "-q", "check_port_connectivity"]
-      interval: 3s
+      interval: 60s
+      start_period: 5m
+      start_interval: 2s
       timeout: 10s
-      retries: 40
+      retries: 3
 
   wazo-auth:
     image: wazoplatform/wazo-auth:wazo-26.10@sha256:eafaa41b1839feed8f6f9cf1be69c847d06ee0bf0481d467a6045cf13a4de3a0
@@ -185,9 +191,11 @@ services:
     network_mode: host
     healthcheck:
       test: ["CMD", "python3", "/twake/healthcheck.py", "http://127.0.0.1:9497/0.1/backends"]
-      interval: 2s
+      interval: 60s
+      start_period: 5m
+      start_interval: 2s
       timeout: 3s
-      retries: 60
+      retries: 3
 
   wazo-bootstrap:
     image: wazoplatform/wazo-auth:wazo-26.10@sha256:eafaa41b1839feed8f6f9cf1be69c847d06ee0bf0481d467a6045cf13a4de3a0
@@ -208,9 +216,11 @@ services:
     network_mode: host
     healthcheck:
       test: ["CMD", "test", "-f", "/var/lib/wazo-auth-keys/.ready"]
-      interval: 2s
+      interval: 60s
+      start_period: 5m
+      start_interval: 2s
       timeout: 3s
-      retries: 90
+      retries: 3
 
   wazo-confd:
     image: wazoplatform/wazo-confd:wazo-26.10@sha256:88af7c18e792d46f0c8ec484639f0d815aaf5f5d9ce848e2e95ec84e6851aa17
@@ -227,9 +237,11 @@ services:
     network_mode: host
     healthcheck:
       test: ["CMD", "python3", "/twake/healthcheck.py", "tcp:127.0.0.1:9486"]
-      interval: 2s
+      interval: 60s
+      start_period: 5m
+      start_interval: 2s
       timeout: 3s
-      retries: 60
+      retries: 3
 
   wazo-confgend:
     image: wazoplatform/wazo-confgend:wazo-26.10@sha256:d0e3544fdbe5d0c30a3d862dadd6cfedb525a105c8cfda4d14a3c58b9cb0d4fc
@@ -244,9 +256,11 @@ services:
     network_mode: host
     healthcheck:
       test: ["CMD", "python3", "/twake/healthcheck.py", "tcp:127.0.0.1:8669"]
-      interval: 2s
+      interval: 60s
+      start_period: 5m
+      start_interval: 2s
       timeout: 3s
-      retries: 60
+      retries: 3
 
   wazo-asterisk:
     image: wazoplatform/asterisk:wazo-26.10@sha256:dd39add1852b5115cff318cf0ec25e1d2052d67c30f1e30827721a3b335ffb2d
@@ -272,9 +286,11 @@ services:
     network_mode: host
     healthcheck:
       test: ["CMD", "asterisk", "-rx", "core waitfullybooted"]
-      interval: 2s
+      interval: 60s
+      start_period: 5m
+      start_interval: 2s
       timeout: 5s
-      retries: 60
+      retries: 3
 
   wazo-sysconfd:
     image: wazoplatform/wazo-calld:wazo-26.10@sha256:b7d9f603949572c3e6c398adbdb0361f33b30d6ea41b58aceaaaa7dc0c7c4000
@@ -294,9 +310,11 @@ services:
     network_mode: host
     healthcheck:
       test: ["CMD", "python3", "/twake/healthcheck.py", "http://127.0.0.1:8668/status-check"]
-      interval: 2s
+      interval: 60s
+      start_period: 5m
+      start_interval: 2s
       timeout: 3s
-      retries: 30
+      retries: 3
 
   wazo-amid:
     image: wazoplatform/wazo-amid:wazo-26.10@sha256:0101380b19e712d9ac06f91720dc5131d6d3f9adb0072b3e59aa959918979ee0
@@ -314,9 +332,11 @@ services:
     network_mode: host
     healthcheck:
       test: ["CMD", "python3", "/twake/healthcheck.py", "tcp:127.0.0.1:9491"]
-      interval: 2s
+      interval: 60s
+      start_period: 5m
+      start_interval: 2s
       timeout: 3s
-      retries: 60
+      retries: 3
 
   wazo-calld:
     image: wazoplatform/wazo-calld:wazo-26.10@sha256:b7d9f603949572c3e6c398adbdb0361f33b30d6ea41b58aceaaaa7dc0c7c4000
@@ -335,9 +355,11 @@ services:
     network_mode: host
     healthcheck:
       test: ["CMD", "python3", "/twake/healthcheck.py", "tcp:127.0.0.1:9500"]
-      interval: 2s
+      interval: 60s
+      start_period: 5m
+      start_interval: 2s
       timeout: 3s
-      retries: 60
+      retries: 3
 
   wazo-websocketd:
     image: wazoplatform/wazo-websocketd:wazo-26.10@sha256:2f652d120bff8829f7be1407d06280981198d04c97160eb76b1240645935c718
@@ -353,9 +375,11 @@ services:
     network_mode: host
     healthcheck:
       test: ["CMD", "python3", "/twake/healthcheck.py", "tcp:127.0.0.1:9502"]
-      interval: 2s
+      interval: 60s
+      start_period: 5m
+      start_interval: 2s
       timeout: 3s
-      retries: 60
+      retries: 3
 
   opensips:
     build: ./opensips

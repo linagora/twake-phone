@@ -100,7 +100,10 @@ rtpend = ${WAZO_RTP_MAX}
 icesupport = yes
 EOF
 
-# wazo-amid's account (Wazo's packaging leaves it to the machine's setup), on the loopback.
+# The AMI, on the loopback: wazo-amid's account only, with this stack's password and the rights and filters Wazo gives
+# it. The image's manager.d/01-xivo.conf has that account with Wazo's public default password, read after this file
+# (the last definition wins), and accounts of services this stack does not run: it goes.
+rm -f /etc/asterisk/manager.d/01-xivo.conf
 cat > /etc/asterisk/manager.d/01-wazo.conf <<EOF
 [general]
 enabled = yes
@@ -111,8 +114,11 @@ port = 5038
 secret = ${WAZO_AMI_PASSWORD}
 deny = 0.0.0.0/0.0.0.0
 permit = 127.0.0.1/255.255.255.255
-read = all
+read = system,call,agent,user,config,dialplan,dtmf
 write = all
+eventfilter = !Event: ExtensionStatus
+eventfilter = !Event: Newexten
+eventfilter = !Event: VarSet
 EOF
 
 # Wazo's database (queue_log, CEL), on the port of this stack: the image's odbc.ini names PostgreSQL's default port.
