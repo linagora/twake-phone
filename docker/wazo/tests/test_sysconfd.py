@@ -1,4 +1,4 @@
-"""docker/wazo/sysconfd.py (second review 11a, n°6, n°13 and n°16; third review n°4 and n°13): its HTTP side as wazo-confd and a browser reach
+"""docker/wazo/sysconfd.py (second review 11a, n°6, n°13 and n°16; third review n°13; fourth review n°1 and n°15): its HTTP side as wazo-confd and a browser reach
 it, against an AMI and a wazo-confgend of this test, on the loopback.
 
     python3 -I -m unittest discover -s docker/wazo/tests
@@ -16,7 +16,6 @@ from socketserver import StreamRequestHandler, ThreadingTCPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SPOOL = tempfile.mkdtemp()
-QUARANTINE = os.path.join(SPOOL, '.quarantine')
 os.environ.update({'SYSCONFD_AMI_PASSWORD': 'not-a-real-secret', 'SYSCONFD_SPOOL': SPOOL})
 spec = importlib.util.spec_from_file_location('sysconfd', os.path.join(HERE, '..', 'sysconfd.py'))
 sysconfd = importlib.util.module_from_spec(spec)
@@ -151,7 +150,6 @@ class Sysconfd(unittest.TestCase):
         sysconfd.CONFGEND = self.confgend.address
         for entry in os.listdir(SPOOL):
             shutil.rmtree(os.path.join(SPOOL, entry))
-        sysconfd.QUARANTINE = QUARANTINE
 
     def tearDown(self):
         for server in (self.ami.server, self.confgend.server):
@@ -190,7 +188,8 @@ class Sysconfd(unittest.TestCase):
         self.assertFalse(os.path.exists(box))
 
     def test_a_mailbox_out_of_the_spool_is_refused(self):
-        for query in ('context=..&mailbox=102', f'context={CONTEXT}&mailbox=../../etc', 'context=a/b&mailbox=1', f'context={CONTEXT}&mailbox='):
+        # A final newline too (fourth review 11a, n°15): the names are matched whole.
+        for query in ('context=..&mailbox=102', f'context={CONTEXT}&mailbox=../../etc', 'context=a/b&mailbox=1', f'context={CONTEXT}&mailbox=', f'context={CONTEXT}&mailbox=102%0A', f'context={CONTEXT}%0A&mailbox=102'):
             self.assertEqual(self.request('GET', f'/delete_voicemail?{query}')[0], 400, query)
             self.assertEqual(self.request('GET', f'/move_voicemail?old_{query.replace("&", "&old_")}&new_context={CONTEXT}&new_mailbox=105')[0], 400, query)
 
@@ -203,35 +202,28 @@ class Sysconfd(unittest.TestCase):
         self.assertEqual(sorted(os.listdir(os.path.join(SPOOL, CONTEXT, '105', 'INBOX'))), ['msg0000.txt', 'msg0000.wav'])
         # A mailbox with no message yet has no folder: nothing to move.
         self.assertEqual(self.request('GET', f'/move_voicemail?old_context={CONTEXT}&old_mailbox=103&new_context={CONTEXT}&new_mailbox=106')[0], 200)
-        # Folders without a message at the target: replaced.
-        self.mailbox('107')
-        self.mailbox('108', 'msg0000.wav')
-        self.assertEqual(self.request('GET', f'/move_voicemail?old_context={CONTEXT}&old_mailbox=108&new_context={CONTEXT}&new_mailbox=107')[0], 200)
-        self.assertEqual(os.listdir(os.path.join(SPOOL, CONTEXT, '107', 'INBOX')), ['msg0000.wav'])
-
-    # Third review 11a, n°4: wazo-confd committed the move before it asks; the messages follow the mailbox, whatever.
-    def test_messages_under_the_target_go_to_the_quarantine_and_the_mailbox_moves_there_with_its_own(self):
+    # Fourth review 11a, n°1: as wazo-sysconfd's own source, no more (the Gateway never moves a mailbox).
+    def test_a_move_replaces_whatever_the_target_held_as_wazo_sysconfd_does(self):
         self.mailbox('102', 'msg0000.wav')
         self.mailbox('105', 'msg0000.wav', 'msg0001.wav')
         status, body = self.request('GET', f'/move_voicemail?old_context={CONTEXT}&old_mailbox=102&new_context={CONTEXT}&new_mailbox=105')
         self.assertEqual(status, 200, body)
-        # At 105, only the mailbox's own message; nothing left at 102 for a mailbox made there later.
+        # At 105, the mailbox moved there and nothing else (rm -rf, then mv); nothing left at 102; no copy anywhere.
         self.assertEqual(os.listdir(os.path.join(SPOOL, CONTEXT, '105', 'INBOX')), ['msg0000.wav'])
         self.assertFalse(os.path.exists(os.path.join(SPOOL, CONTEXT, '102')))
-        # What was at 105, kept out of the spool Asterisk reads, whole.
-        [kept] = os.listdir(os.path.join(QUARANTINE, CONTEXT))
-        self.assertRegex(kept, r'^105\.[0-9]{8}T[0-9]{6}Z\.[0-9a-f]{8}$')
-        self.assertEqual(sorted(os.listdir(os.path.join(QUARANTINE, CONTEXT, kept, 'INBOX'))), ['msg0000.wav', 'msg0001.wav'])
-        # A mailbox with no message yet (no folder) moved onto messages: they go too, it shows none of them.
+        self.assertEqual(sorted(os.listdir(SPOOL)), [CONTEXT])
+        self.assertEqual(sorted(os.listdir(os.path.join(SPOOL, CONTEXT))), ['105'])
+        # A mailbox with no folder moved onto messages: nothing done, they stay where they were (wazo-sysconfd too).
         self.mailbox('106', 'msg0000.wav')
         self.assertEqual(self.request('GET', f'/move_voicemail?old_context={CONTEXT}&old_mailbox=103&new_context={CONTEXT}&new_mailbox=106')[0], 200)
-        self.assertFalse(os.path.exists(os.path.join(SPOOL, CONTEXT, '106')))
-        self.assertEqual(len(os.listdir(os.path.join(QUARANTINE, CONTEXT))), 2)
-        # The quarantine is no mailbox: wazo-confd cannot name it.
-        self.assertEqual(self.request('GET', f'/delete_voicemail?context=.quarantine&mailbox=105')[0], 400)
+        self.assertEqual(os.listdir(os.path.join(SPOOL, CONTEXT, '106', 'INBOX')), ['msg0000.wav'])
         # A move onto itself changes nothing.
         self.assertEqual(self.request('GET', f'/move_voicemail?old_context={CONTEXT}&old_mailbox=105&new_context={CONTEXT}&new_mailbox=105')[0], 200)
         self.assertEqual(os.listdir(os.path.join(SPOOL, CONTEXT, '105', 'INBOX')), ['msg0000.wav'])
+        # A deletion takes the whole folder, and one with none is no error.
+        self.assertEqual(self.request('GET', f'/delete_voicemail?context={CONTEXT}&mailbox=105')[0], 200)
+        self.assertFalse(os.path.exists(os.path.join(SPOOL, CONTEXT, '105')))
+        self.assertEqual(self.request('GET', f'/delete_voicemail?context={CONTEXT}&mailbox=105')[0], 200)
 
     # The Asterisk commands (review 11a, n°22; second review n°16; third review n°13: AMI actions, never the CLI).
     def test_a_command_runs_on_its_own_account_with_no_event_as_the_reload_of_its_module(self):

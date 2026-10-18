@@ -13,7 +13,7 @@ const until = async (what: string, fn: () => boolean, timeout = 3_000) => {
 }
 
 /** A Gateway's leases of the mailboxes of A, at the weight `weight()` says. */
-const gateway = (store: Pick<MemoryStore, 'takeWebhookLease' | 'clock'>, holder: string, weight: () => VoicemailWeight, ms = 300) => {
+const gateway = (store: Pick<MemoryStore, 'takeWebhookLease' | 'clock'>, holder: string, weight: () => VoicemailWeight | Promise<VoicemailWeight>, ms = 300) => {
   const leads: number[] = []
   const leases = new VoicemailLeases({ store, holder, ms, tenants: () => [['A', weight()] as const], onLead: () => void leads.push(Date.now()), logger: quiet })
   return { leases, leads }
@@ -90,5 +90,43 @@ describe('the leases of the mailboxes (third review 11a, n°2, n°3 and n°11)',
     await until('it writes again', () => g.leases.mayWrite('A') && g.leads.length === 2, 1_000)
     expect(g.leads).toHaveLength(2)
     await g.leases.stop()
+  })
+
+  it('asks what each Gateway can do at each renewal, an answer that comes later or fails included (fourth review 11a, n°3)', async () => {
+    const store = new MemoryStore()
+    let asked = 0
+    let reaches = false
+    // Its voicemail server asked anew each time (a request, not what its last one left): slow, failing, then answering.
+    const g = gateway(store, 'gw_1', () => (asked++ === 0 ? Promise.reject(new Error('timed out')) : sleep(20).then(() => (reaches ? 2 : 1))))
+    g.leases.start()
+    await until('it writes, at 1', () => g.leases.mayWrite('A'))
+    // It does not reach it yet: weighed 1, so a Gateway at 1 cannot take it over, one at 2 could.
+    expect(await store.takeWebhookLease(voicemailRole('A'), 'gw_2', 300, 1)).toBeNull()
+    // It reaches it: asked again at the next renewal, weighed 2, so that one at 2 cannot take it over either.
+    reaches = true
+    const n = asked
+    await until('asked again', () => asked >= n + 2)
+    expect(await store.takeWebhookLease(voicemailRole('A'), 'gw_2', 300, 2)).toBeNull()
+    expect(g.leases.mayWrite('A')).toBe(true)
+    await g.leases.stop()
+  })
+
+  it('gives each lease taken a fencing token greater than the last, the same while it is kept (fourth review 11a, n°2)', async () => {
+    const store = new MemoryStore()
+    let firstWeight: VoicemailWeight = 2
+    const first = gateway(store, 'gw_1', () => firstWeight)
+    first.leases.start()
+    await until('the first writes', () => first.leases.mayWrite('A'))
+    const one = first.leases.fence('A')!
+    await sleep(250)
+    expect(first.leases.fence('A')).toBe(one)
+    const second = gateway(store, 'gw_2', () => 2)
+    second.leases.start()
+    firstWeight = 1
+    await until('the second writes', () => second.leases.mayWrite('A'), 2_000)
+    expect(second.leases.fence('A')).toBeGreaterThan(one)
+    expect(first.leases.fence('A')).toBeUndefined()
+    await first.leases.stop()
+    await second.leases.stop()
   })
 })

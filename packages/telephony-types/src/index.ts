@@ -244,8 +244,11 @@ export interface TelephonyAlert {
    * (`reconciliation`, `value` the percentage, `threshold` 99); a removal of the forwards of a line there (third
    * review 10b, n°2 and n°4, `number` the line): left as it was because someone changed it in the manager since
    * (`removal-changed`), let go because the operator no longer has the line (`removal-gone`), owed for over a day
-   * (`removal-late`). `voicemail`: raised by the Gateway (step 11a, third review n°11): the synchronisation of the
-   * mailboxes fails since `value` minutes (`sync-failing`).
+   * (`removal-late`). `voicemail` (step 11a): raised by the Gateway, the synchronisation of the mailboxes fails since
+   * `value` minutes (`sync-failing`, third review n°11), or keeps leaving out `value` mailboxes the voicemail server
+   * refuses (`boxes-refused`, fourth review n°12); raised by the SIP server, the callers with no number reached their
+   * cap at the mailbox of `extension`, at the same time (`hidden-calls`) or in the hour (`hidden-hour`, fourth review
+   * n°8).
    */
   kind: 'fraud-warning' | 'fraud-critical' | 'limit' | 'rights' | 'emergency' | 'meet' | 'webhook' | 'operator' | 'voicemail'
   param: string

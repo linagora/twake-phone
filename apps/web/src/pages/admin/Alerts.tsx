@@ -7,7 +7,7 @@ import type { Key } from '../../i18n/index.js'
 import { useT } from '../../i18n/useT.js'
 
 const KINDS: NonNullable<AlertFilter['kind']>[] = ['fraud-warning', 'fraud-critical', 'limit', 'rights', 'emergency', 'meet', 'webhook', 'operator', 'voicemail']
-const PARAMS = [...FRAUD_PARAMS, ...OUTBOUND_CAPS, ...TRUNK_OUTBOUND_CLASSES, 'premium', 'burst', 'pin-tries', 'meet-calls', 'call-diverted', 'trunk-changed', 'disabled', 'unauthorized', 'forbidden', 'reconciliation', 'removal-changed', 'removal-gone', 'removal-late']
+const PARAMS = [...FRAUD_PARAMS, ...OUTBOUND_CAPS, ...TRUNK_OUTBOUND_CLASSES, 'premium', 'burst', 'pin-tries', 'meet-calls', 'call-diverted', 'trunk-changed', 'disabled', 'unauthorized', 'forbidden', 'reconciliation', 'removal-changed', 'removal-gone', 'removal-late', 'sync-failing', 'boxes-refused', 'hidden-calls', 'hidden-hour']
 const PAGE = 25
 /** How long after an answer the first page is read again while shown: a repeat counted meanwhile is seen (review 7 n°2). */
 export const ALERTS_REFRESH_MS = 30_000
@@ -22,7 +22,8 @@ const INITIAL = { kind: ALL, param: ALL, state: 'open' }
  * subscription disabled after a day of failed deliveries (review 10a, n°1) or with too many waiting (second review, n°12),
  * or the operator of the trunks refusing its keys or reconciling too few calls (review 10b, n°12), or a removal of a
  * forward there left as changed, let go, or late (third review 10b, n°2 and n°4), or the mailboxes not synchronised
- * with the voicemail server for a while (third review 11a, n°11).
+ * with the voicemail server for a while (third review 11a, n°11), some it keeps refusing, or the callers with no
+ * number at the cap of a mailbox (fourth review 11a, n°8 and n°12).
  */
 const paramKey = (alert: Pick<AdminAlert, 'kind' | 'param'>): Key | undefined => {
   if ((FRAUD_PARAMS as readonly string[]).includes(alert.param)) return `admin.fraud.${alert.param}` as Key
@@ -42,8 +43,12 @@ const paramKey = (alert: Pick<AdminAlert, 'kind' | 'param'>): Key | undefined =>
   if (alert.param === 'removal-changed') return 'admin.alert.operatorRemovalChanged'
   if (alert.param === 'removal-gone') return 'admin.alert.operatorRemovalGone'
   if (alert.param === 'removal-late') return 'admin.alert.operatorRemovalLate'
-  // The mailboxes not synchronised for a while (third review 11a, n°11).
+  // The mailboxes not synchronised for a while (third review 11a, n°11), some the voicemail server keeps refusing, or
+  // the callers with no number at the cap of a mailbox (fourth review 11a, n°8 and n°12).
   if (alert.param === 'sync-failing') return 'admin.alert.voicemailSyncFailing'
+  if (alert.param === 'boxes-refused') return 'admin.alert.voicemailBoxesRefused'
+  if (alert.param === 'hidden-calls') return 'admin.alert.voicemailHiddenCalls'
+  if (alert.param === 'hidden-hour') return 'admin.alert.voicemailHiddenHour'
   if ((TRUNK_OUTBOUND_CLASSES as readonly string[]).includes(alert.param) || alert.param === 'premium') return `admin.class.${alert.param}` as Key
   return undefined
 }
@@ -209,7 +214,9 @@ export const Alerts = () => {
     const key = paramKey(a)
     const name = key ? t(key) : a.param
     const scope = a.kind === 'limit' && a.scope ? ` (${t(a.scope === 'tenant' ? 'admin.alert.scopeTenant' : 'admin.alert.scopeUser')})` : ''
-    const value = a.value !== undefined && a.threshold !== undefined ? ` : ${t('admin.alert.valueOf', { value: a.value, threshold: a.threshold })}` : ''
+    // A value with no threshold said as it is (the minutes a synchronisation fails, the mailboxes refused: fourth review
+    // 11a, n°12).
+    const value = a.value === undefined ? '' : a.threshold !== undefined ? ` : ${t('admin.alert.valueOf', { value: a.value, threshold: a.threshold })}` : ` : ${a.value}`
     return `${name}${scope}${value}`
   }
   const opt = (value: string, label: string) => ({ value, label })

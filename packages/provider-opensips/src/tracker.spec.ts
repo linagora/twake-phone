@@ -748,6 +748,21 @@ describe('CallTracker', () => {
     ])
   })
 
+  it('tells the administrators when the callers with no number reach their cap at a mailbox, under its extension (step 11a, fourth review n°8)', () => {
+    const { tracker, events, clear } = make()
+    clear()
+    tracker.handle('E_TWAKEPHONE_VMCAP', { param: 'hidden-calls', extension: '101', value: '5', threshold: '5' })
+    tracker.handle('E_TWAKEPHONE_VMCAP', { param: 'hidden-hour', extension: '102', value: 11, threshold: 10 })
+    // Nothing that is no extension, nor another cap.
+    tracker.handle('E_TWAKEPHONE_VMCAP', { param: 'hidden-calls', extension: '*hidden:101', value: 5 })
+    tracker.handle('E_TWAKEPHONE_VMCAP', { param: 'calls', extension: '101', value: 5 })
+    tracker.handle('E_TWAKEPHONE_VMCAP', { param: 'hidden-calls' })
+    expect(events.map(e => [e.extension, e.event.type === 'alert.raised' && e.event.payload.alert])).toEqual([
+      ['101', { kind: 'voicemail', param: 'hidden-calls', scope: 'tenant', extension: '101', value: 5, threshold: 5 }],
+      ['102', { kind: 'voicemail', param: 'hidden-hour', scope: 'tenant', extension: '102', value: 11, threshold: 10 }]
+    ])
+  })
+
   it('forgets the emergency calls older than the window, on the clock it was given (review 6b, n°11, n°21)', () => {
     const events: unknown[] = []
     let t = Date.parse('2026-10-14T18:00:00.000Z')

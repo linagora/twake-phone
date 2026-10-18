@@ -107,14 +107,18 @@ export interface TelephonyProvider {
   /**
    * The mailboxes of the tenant (step 11a, ADR 0022), as the voicemail server named them (VoicemailProvider's
    * syncMailboxes): replaces the list. A call to one of these extensions that nobody answers, that its "do not disturb"
-   * refuses, busy or that reaches nobody goes to `mailbox`; an extension not in it has none.
+   * refuses, busy or that reaches nobody goes to `mailbox`; an extension not in it has none. With `write` (fourth
+   * review 11a, n°2), the SIP server itself refuses a write under an older lease than the last one written (it rejects,
+   * `code` VOICEMAIL_FENCED), and leaves out the extensions withdrawn since `write.since` (`withdrawn`).
    */
-  setVoicemailBoxes?(boxes: VoicemailBox[]): Promise<void>
+  setVoicemailBoxes?(boxes: VoicemailBox[], write?: VoicemailBoxesWrite): Promise<{ withdrawn?: string[] } | void>
   /**
    * These extensions lose their mailbox at once, the others keep theirs (second review 11a, n°3): what a Gateway does
-   * as soon as it gave an extension to someone else, before the voicemail server has moved anything.
+   * as soon as it gave an extension to someone else. Each withdrawal is numbered (voicemailMark).
    */
   withdrawVoicemailBoxes?(extensions: string[]): Promise<void>
+  /** The number of the last withdrawal of mailboxes (fourth review 11a, n°2): read before the holders, for `write.since`. */
+  voicemailMark?(): Promise<number>
   /** Where the calls of the user's extension go (capability `forwarding`). */
   getForwarding?(user: User): Promise<ForwardingRules>
   /** Replaces those rules; targets are extensions the Gateway checked. */
@@ -156,6 +160,16 @@ export interface TelephonyProvider {
   subscribe(): AsyncIterable<RoutedEvent>
 }
 
+/**
+ * How a write of the mailboxes is checked by the SIP server itself (fourth review 11a, n°2): `fence`, the fencing token
+ * of the writer's lease (a later lease has a greater one), `since`, the last withdrawal it had seen before it read the
+ * holders (voicemailMark).
+ */
+export interface VoicemailBoxesWrite {
+  fence?: number
+  since?: number
+}
+
 /** A person's mailbox, where the SIP server sends the calls of `extension` it cannot get through (step 11a). */
 export interface VoicemailBox {
   extension: string
@@ -164,16 +178,16 @@ export interface VoicemailBox {
 }
 
 /**
- * Whose mailbox: the extension, and the person the Gateway holds it for now. The mailbox of an extension is only ever
- * read for its holder: an extension just given to someone else still has the old holder's until the next
- * syncMailboxes, and nobody hears another's messages.
+ * Whose mailbox: the person the Gateway holds the extension for now. A mailbox is a person's, whatever extension they
+ * hold (fourth review 11a, n°1): nobody hears another's messages, and an extension given to someone else never shows
+ * them the previous holder's.
  */
 export interface VoicemailOwner {
   extension: string
   userId: string
   /**
-   * The mailbox an event was of (RoutedEvent's `mailbox`): `owns` then says whether that very mailbox is at the
-   * extension and the person's, read again from the voicemail server (another Gateway may have moved it).
+   * The mailbox an event was of (RoutedEvent's `mailbox`): `owns` then says whether that very mailbox is the person's,
+   * read again from the voicemail server.
    */
   mailbox?: string
 }
@@ -182,11 +196,12 @@ export interface VoicemailOwner {
 export interface VoicemailSync {
   /** The mailboxes, for the SIP server (TelephonyProvider's setVoicemailBoxes). */
   boxes: VoicemailBox[]
-  /** The mailboxes the voicemail server refused to make, move or set aside (each one said in the log): tried again later. */
+  /** The mailboxes the voicemail server refused to make or change (each one said in the log): tried again later. */
   failed: number
   /**
    * What was held back, too many at once (second review 11a, n°9): `park`, mailboxes of people who no longer hold an
-   * extension, left where they are; `remove`, mailboxes aside past their grace period, kept. Until `release`.
+   * extension, still reached at the extension they had; `remove`, mailboxes aside past their grace period, kept. Until
+   * `release`.
    */
   heldBack?: VoicemailHeldBack
   /** The release given (VoicemailSyncOptions' `release`) was applied: what it named was done. */
@@ -202,8 +217,8 @@ export interface VoicemailHeldBack {
 
 export interface VoicemailSyncOptions {
   /**
-   * Called once the voicemail server was read and before it is changed, with the mailboxes already at their holder's
-   * extension: the SIP server keeps only those meanwhile (second review 11a, n°3).
+   * Called once the voicemail server was read and before it is changed, with the mailboxes already their holder's at
+   * the extensions they hold: the SIP server keeps only those meanwhile (second review 11a, n°3).
    */
   beforeChanges?(boxes: VoicemailBox[]): Promise<void>
   /**
@@ -220,9 +235,10 @@ export interface VoicemailSyncOptions {
 }
 
 /**
- * The voicemail server of a tenant (step 11a, ADR 0022; Wazo's, provider-wazo): one mailbox per extension, for the
- * person who holds it, and the messages left there. A mailbox is its holder's: when an extension passes to someone
- * else, its messages go with the old mailbox, never to the new holder.
+ * The voicemail server of a tenant (step 11a, ADR 0022; Wazo's, provider-wazo): one mailbox per person who holds an
+ * extension, and the messages left there. A mailbox is its holder's, not an extension's (fourth review 11a, n°1): when
+ * they take another extension it is reached there, messages and all; when an extension passes to someone else, they
+ * get theirs, never the previous holder's.
  */
 export interface VoicemailProvider {
   readonly id: string
@@ -232,16 +248,21 @@ export interface VoicemailProvider {
   /** Why the status is not CONNECTED, in a few words without addresses or secrets. */
   getStatusReason?(): string | undefined
   /**
-   * Who holds each extension of the tenant now: each gets a mailbox (kept, moved with its messages from the extension
-   * its holder had, or made). The others are set aside with their messages, out of reach of any call, and removed only
-   * after a grace period if their holder has not come back. Returns the mailboxes, for the SIP server
-   * (TelephonyProvider's setVoicemailBoxes), and what failed or was held back. One mailbox the server refuses is left
-   * out, the others done.
+   * A light request to the voicemail server now (fourth review 11a, n°3): getStatus says what came of it. Rejects when
+   * it did not answer.
+   */
+  probe?(): Promise<void>
+  /**
+   * Who holds each extension of the tenant now: each person gets their mailbox (kept, or made), reached at the
+   * extensions they hold. Those of people who hold none are set aside with their messages, out of reach of any call,
+   * and removed only once past a grace period and without a message left (the retention period's). Returns the
+   * mailboxes by extension, for the SIP server (TelephonyProvider's setVoicemailBoxes), and what failed or was held
+   * back. One mailbox the server refuses is left out, the others done.
    */
   syncMailboxes(holders: { extension: string; userId: string; displayName?: string }[], options?: VoicemailSyncOptions): Promise<VoicemailSync>
   /**
-   * Whether the mailbox of `owner.extension` is `owner.userId`'s (the events of a mailbox go to its holder only); with
-   * `owner.mailbox`, whether that mailbox is (read again from the voicemail server).
+   * Whether `owner.userId` has a mailbox (the events of a mailbox go to its holder only); with `owner.mailbox`, whether
+   * that mailbox is theirs (read again from the voicemail server).
    */
   owns(owner: VoicemailOwner): Promise<boolean>
   /** The messages of the owner's mailbox, newest first; none when they have no mailbox. */
@@ -255,7 +276,7 @@ export interface VoicemailProvider {
   markRead(owner: VoicemailOwner, id: string): Promise<boolean>
   /** Deletes a message; false when the owner's mailbox has no such message. */
   deleteMessage(owner: VoicemailOwner, id: string): Promise<boolean>
-  /** Deletes every message of the person, in any mailbox held for them (step 10's erasure); how many. */
+  /** Deletes every message of the person, in their mailbox, set aside or not (step 10's erasure); how many. */
   eraseMessages(owner: Pick<VoicemailOwner, 'userId'>): Promise<number>
   /**
    * Deletes the messages left before `before`, in every mailbox (the retention period); how many. `mayWrite` is asked
@@ -263,8 +284,9 @@ export interface VoicemailProvider {
    */
   purgeMessages(before: Date, options?: { mayWrite?(): boolean }): Promise<number>
   /**
-   * The `voicemail.*` events, by the extension of the mailbox (a message left, read, deleted), whichever screen or
-   * phone did it. The Gateway tells them to the extension's holder if it is the mailbox's (owns).
+   * The `voicemail.*` events, by an extension the mailbox's holder held at the last synchronisation (a message left,
+   * read, deleted), whichever screen or phone did it. The Gateway tells them to the extension's holder if the mailbox
+   * is theirs (owns).
    */
   subscribe(): AsyncIterable<RoutedEvent>
   close(): Promise<void>

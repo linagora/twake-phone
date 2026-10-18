@@ -4,7 +4,10 @@ import type { Store } from './store/types.js'
 // holds the lease `voicemail:<tenant>` of the store (takeWebhookLease, the lease of step 10a), within its write
 // window only. Only a Gateway with a voicemail server for the tenant takes it: one without never writes
 // `voicemail_boxes`. One whose voicemail server answers and whose events are heard takes it at once from one that has
-// one it does not reach: the mailboxes never wait behind a Gateway that cannot do them.
+// one it does not reach: the mailboxes never wait behind a Gateway that cannot do them. What each can do is asked anew
+// at each renewal (fourth review 11a, n°3: a request to the voicemail server, not what its last request left). The
+// lease's fencing token (`fence`, when its holder may write from: a later lease has a greater one) goes with each write
+// of `voicemail_boxes`, where the database refuses one older than the last written (fourth review n°2).
 
 /** The role of the lease of the mailboxes of `tenantId`. */
 export const voicemailRole = (tenantId: string) => `voicemail:${tenantId}`
@@ -19,10 +22,13 @@ export interface VoicemailLeaseOptions {
   store: Pick<Store, 'takeWebhookLease' | 'clock'>
   /** Who this Gateway is for the lease. */
   holder: string
-  /** How long the lease is taken for: 45 s by default (renewed every third; a write may take 10 s, a third is 15 s). */
+  /**
+   * How long the lease is taken for: 45 s by default (renewed every third; a write to the voicemail server, its retries
+   * included, takes 10 s at most: provider-wazo's writeTimeoutMs; a third is 15 s).
+   */
   ms?: number
-  /** The tenants this Gateway may write the mailboxes of, and what it can do for each. */
-  tenants: () => Iterable<readonly [tenantId: string, weight: VoicemailWeight]>
+  /** The tenants this Gateway may write the mailboxes of, and what it can do for each (asked at each renewal). */
+  tenants: () => Iterable<readonly [tenantId: string, weight: VoicemailWeight | Promise<VoicemailWeight>]>
   /** Called when this Gateway may write the mailboxes of `tenantId` from now on (its write window opened). */
   onLead: (tenantId: string) => void
   logger: { info(obj: object, msg: string): void; warn(obj: object, msg: string): void; error(obj: object, msg: string): void }
@@ -70,6 +76,14 @@ export class VoicemailLeases {
     this.timer.unref()
   }
 
+  /**
+   * The fencing token of the lease of `tenantId` held now (when its write window opened, on the store's clock):
+   * unchanged while this Gateway keeps it, greater for each lease taken after it, by any Gateway.
+   */
+  fence(tenantId: string) {
+    return this.held.get(tenantId)?.writeFrom
+  }
+
   /** Takes or renews the leases (one renewal at a time), reading the store's clock again. */
   renew(): Promise<void> {
     this.renewal ??= this.renewAll().finally(() => (this.renewal = undefined))
@@ -90,7 +104,9 @@ export class VoicemailLeases {
       return
     }
     const seen = new Set<string>()
-    for (const [tenantId, weight] of this.options.tenants()) {
+    // What it can do for each, asked of all at once (each answer bounded by whoever asks it).
+    const weighed = await Promise.all([...this.options.tenants()].map(async ([tenantId, weight]) => [tenantId, await Promise.resolve(weight).catch(() => 1 as const)] as const))
+    for (const [tenantId, weight] of weighed) {
       if (weight === undefined || this.closed) continue
       seen.add(tenantId)
       try {

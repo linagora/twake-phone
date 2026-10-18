@@ -371,6 +371,20 @@ export class CallTracker {
         this.emit(number, { type: 'alert.raised', timestamp: now, payload: { alert } })
         return
       }
+      case 'E_TWAKEPHONE_VMCAP': {
+        // The mailbox of `extension` (step 11a, fourth review n°8), for the administrators: the callers with no number
+        // at all reached their cap there, at the same time (hidden-calls) or in the hour (hidden-hour); the next ones
+        // get what they would have had without it.
+        const extension = str(p.extension)
+        if (!/^[0-9]{1,40}$/.test(extension)) return
+        const param = str(p.param)
+        if (param !== 'hidden-calls' && param !== 'hidden-hour') return
+        const value = num(p.value)
+        const threshold = num(p.threshold)
+        const alert: TelephonyAlert = { kind: 'voicemail', param, scope: 'tenant', extension, ...(value !== undefined ? { value } : {}), ...(threshold !== undefined ? { threshold } : {}) }
+        this.emit(extension, { type: 'alert.raised', timestamp: now, payload: { alert } })
+        return
+      }
       case 'E_TWAKEPHONE_EMERGENCY': {
         // Never refused, never counted by a cap: emergency calls in a row from one extension (EMERGENCY_BURST within
         // EMERGENCY_BURST_WINDOW_MS) are told to the administrators, each one from there on.

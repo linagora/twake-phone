@@ -1,4 +1,4 @@
-import type { CallParties, MediaProvider, ProviderFactory, RoomCallGrant, RoomCallGrantToken, RoutedEvent, TelephonyProvider, VoicemailBox } from '@twake/telephony-provider-sdk'
+import type { CallParties, MediaProvider, ProviderFactory, RoomCallGrant, RoomCallGrantToken, RoutedEvent, TelephonyProvider, VoicemailBox, VoicemailBoxesWrite } from '@twake/telephony-provider-sdk'
 import type { Call, Capabilities, DidRange, Endpoint, ForwardingRules, MediaSession, OriginateRequest, OutboundAssignment, OutboundPolicy, OutboundProfile, Presence, ProviderStatus, RingGroup, Trunk, TrunkStatus, User } from '@twake/telephony-types'
 import type { CallGroups } from './call-groups.js'
 import type { CallRules } from './call-rules.js'
@@ -19,7 +19,7 @@ export { CallGroups, CALL_GROUPS_SCHEMA, DISPLAY_NAMES_SCHEMA, GROUP_MEMBERS_MAX
 export { PushTargets, PUSH_TARGETS_SCHEMA, type PushTargetsOptions } from './push-targets.js'
 export { DialOutGrants, DIAL_OUT_GRANTS_SCHEMA, GRANT_HEADER, GRANT_TTL_SEC, JOIN_HEADER, JOIN_TOKEN, REPLACES, type DialOutGrantsOptions } from './dial-out-grants.js'
 export { AsyncQueue } from './queue.js'
-export { VoicemailBoxes, VOICEMAIL_BOXES_SCHEMA, MAILBOX, type VoicemailBoxesOptions } from './voicemail-boxes.js'
+export { VoicemailBoxes, VoicemailFenced, VOICEMAIL_BOXES_SCHEMA, MAILBOX, type VoicemailBoxesOptions } from './voicemail-boxes.js'
 export { TrunkTables, TRUNK_SCHEMA, TRUNK_SQL, DEFAULT_TRUNK_SOCKET, SOURCES_SET, DISPATCHER_TABLE_VERSION, DIALPLAN_TABLE_VERSION, REGISTRANT_TABLE_VERSION, codecFlags, projectTrunks, trunkSecret, trunkStatusFrom, type TrunkTablesOptions } from './trunks.js'
 export { OutboundTables, OUTBOUND_SCHEMA, ACC_EXTERNAL_SQL, FRAUD_PROFILE, FRAUD_RULE_INTERNATIONAL, FRAUD_RULE_NATIONAL, FRAUD_TABLE_VERSION, FRAUD_OVERSEAS_PREFIXES, DR_TABLE_VERSIONS, DIALOG_TABLE_VERSION, OUTBOUND_TIME_ZONE, CAP_MAX, PROFILE_ID, fraudRow, projectOutbound, type OutboundTablesOptions } from './outbound.js'
 export { DIALPLAN_RULES, DIALPLAN_SQL, DP_CLASSIFY, DP_INBOUND, DP_NORMALISE, OUTBOUND_ALLOWABLE, OUTBOUND_ALLOWED, classify, countryAllowed, translate, type DialplanRule, type NumberClass } from './numbering.js'
@@ -33,7 +33,7 @@ export const PROBE_EVENT = 'E_TWAKEPHONE_PROBE'
 /**
  * The events the Gateway listens to: registrations and their refreshes (usrloc), our own call events (opensips.cfg.tpl),
  * the CDRs and missed calls (acc), the thresholds crossed (fraud_detection) and the caps reached (step 6b). A call a
- * mailbox took (step 11a) is E_TWAKEPHONE_VOICEMAIL.
+ * mailbox took (step 11a) is E_TWAKEPHONE_VOICEMAIL; the callers with no number at a mailbox's cap, E_TWAKEPHONE_VMCAP.
  */
 export const SUBSCRIBED_EVENTS = [
   'E_UL_CONTACT_INSERT',
@@ -55,7 +55,8 @@ export const SUBSCRIBED_EVENTS = [
   'E_TWAKEPHONE_LIMIT',
   'E_TWAKEPHONE_RIGHTS',
   'E_TWAKEPHONE_EMERGENCY',
-  'E_TWAKEPHONE_PIN'
+  'E_TWAKEPHONE_PIN',
+  'E_TWAKEPHONE_VMCAP'
 ]
 
 // Everything OpenSIPS-specific stays inside this package: the Gateway and the app only see the provider contract.
@@ -363,17 +364,24 @@ export class OpensipsProvider implements TelephonyProvider, MediaProvider {
 
   /**
    * The mailboxes of the tenant (step 11a): written in `voicemail_boxes`, which OpenSIPS reads with the rules of the
-   * extension dialled. One it could not read (not digits, not `number@context`) is left out, and said.
+   * extension dialled. One it could not read (not digits, not `number@context`) is left out, and said. Checked in the
+   * database, in the transaction of the write (fourth review 11a, n°2): `write.fence` and `write.since` (VoicemailBoxes).
    */
-  async setVoicemailBoxes(boxes: VoicemailBox[]) {
+  async setVoicemailBoxes(boxes: VoicemailBox[], write?: VoicemailBoxesWrite) {
     if (!this.config.voicemailBoxes) return
-    const { skipped } = await this.config.voicemailBoxes.set(boxes)
+    const { skipped, withdrawn } = await this.config.voicemailBoxes.set(boxes, write)
     if (skipped.length) (this.config.logger ?? console).warn(`OpenSIPS: ${skipped.length} mailbox(es) left out, not an extension of digits and a mailbox OpenSIPS reads: ${skipped.map(b => b.extension.slice(0, 20)).join(', ')}`)
+    return { withdrawn }
   }
 
-  /** These extensions lose their mailbox at once (`voicemail_boxes`), the others keep theirs. */
+  /** These extensions lose their mailbox at once (`voicemail_boxes`), the others keep theirs; the withdrawal numbered. */
   async withdrawVoicemailBoxes(extensions: string[]) {
     await this.config.voicemailBoxes?.withdraw(extensions)
+  }
+
+  /** The number of the last withdrawal (VoicemailBoxes' mark): 0 without a table of the mailboxes. */
+  async voicemailMark() {
+    return (await this.config.voicemailBoxes?.mark()) ?? 0
   }
 
   /**

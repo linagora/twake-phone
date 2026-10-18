@@ -142,9 +142,14 @@ EOF
 
 # The AMI, on the loopback: wazo-amid's account, with this stack's password and the rights and filters Wazo gives it,
 # and the account of this stack's wazo-sysconfd (docker/wazo/sysconfd.py, second review 11a, n°16): no event, and the
-# privileges of the AMI actions it runs only (third review n°13), never `command` (the whole CLI): `system` for Reload
-# (it also allows ModuleLoad and the like, on the modules), `reporting` for VoicemailUsersList. A development and CI
-# stack's (ADR 0022): its password is in the compose file, for any process on the loopback of the host. The image's
+# privileges of the AMI actions it runs only (third review n°13), never `command` (the whole CLI): `system` for Reload,
+# `reporting` for VoicemailUsersList. Asterisk has nothing finer for Reload: `system` also lets the account read any
+# configuration file (GetConfig, GetConfigJSON: this one, with wazo-amid's password, included), load a module
+# (ModuleLoad), hang up a channel (Hangup, AbsoluteTimeout) and add or remove a dialplan extension
+# (DialplanExtensionAdd, DialplanExtensionRemove); it is refused Command, Originate and UpdateConfig (fourth review
+# n°9: the e2e checks both against this Asterisk). A development and CI stack's only (ADR 0022): a real Wazo's
+# wazo-sysconfd runs `asterisk -rx` on its machine, with no such account; its password is in the compose file, for
+# any process on the loopback of the host. The image's
 # manager.d/01-xivo.conf has wazo-amid's account with Wazo's public default password,
 # read after this file (the last definition wins), and accounts of services this stack does not run: it goes.
 rm -f /etc/asterisk/manager.d/01-xivo.conf

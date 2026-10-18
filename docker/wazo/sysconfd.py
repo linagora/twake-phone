@@ -12,18 +12,22 @@ listens on (a DNS name made to point to the loopback), so that no web page opene
 An Asterisk command is answered once Asterisk answered it (its ActionID), and fails when Asterisk refused it. It logs
 in with an AMI account of its own and no event (second review 11a, n°16), and runs each command as the AMI action
 that does it, never through the CLI (third review 11a, n°13): the module reloads (Reload, the `system` privilege) and
-the list of the mailboxes (VoicemailUsersList, `reporting`); the account has no other (`write = system,reporting`:
-docker/wazo/asterisk/entrypoint.sh). `voicemail reload` fails as well when Asterisk does not have, after it, every
-mailbox wazo-confgend gave before it (a reload that could not read its configuration still says Success).
+the list of the mailboxes (VoicemailUsersList, `reporting`). The account (`write = system,reporting`:
+docker/wazo/asterisk/entrypoint.sh) is refused `Command`, `Originate` and `UpdateConfig`, but `system` lets it do more
+than this needs (fourth review 11a, n°9): read any configuration file (GetConfig, GetConfigJSON, the manager's
+included), load a module (ModuleLoad), hang up a channel (Hangup, AbsoluteTimeout), add or remove a dialplan extension
+(DialplanExtensionAdd and DialplanExtensionRemove). Asterisk has no finer privilege for Reload: the account and its
+password exist on the development and CI stack only, on the loopback, for this stand-in; a real Wazo's wazo-sysconfd
+runs its commands with `asterisk -rx` on its own machine, and no TwakePhone account is made in its AMI. The e2e
+proves against this stack's Asterisk what the account is refused and what it is let do. `voicemail reload` fails as
+well when Asterisk does not have, after it, every mailbox wazo-confgend gave before it (a reload that could not read
+its configuration still says Success).
 
-A mailbox moves with its messages, whatever its target holds (third review 11a, n°4). wazo-confd commits its database
-before it asks this (its `after_request`: commit_database, then flush_sysconfd), and a failure here reaches nobody:
-the mailbox is at the new number for Wazo whatever is answered. Messages already under the target number (left by a
-mailbox there before, a restore, a hand) would show in the mailbox moved there, someone else's: they go to the
-quarantine first, out of the spool Asterisk reads (SYSCONFD_QUARANTINE, `.quarantine` in the spool by default, on the
-same volume: `<context>/<number>.<time>.<id>` there), said in the log, for an operator to look at; then the mailbox
-moves. The old number keeps nothing: the whole folder goes, so a mailbox made there later finds none of its
-messages. The Gateway checks each mailbox it moved or made against the messages it had (provider-wazo).
+The mailboxes' directories, as wazo-sysconfd itself does it (its source, wazo_sysconfd/plugins/asterisk/asterisk.py:
+fourth review 11a, n°1): a mailbox deleted loses its folder (rmtree); a mailbox moved (wazo-confd asks it only when
+its number or context changed, after its database committed) replaces whatever is under the target (rm -rf, then mv),
+and nothing when it had no folder. No quarantine: the Gateway never changes a mailbox's number (a person's mailbox
+keeps its number whatever extension they hold, provider-wazo), so nothing here moves on a real Wazo either.
 
 Standard library only: it runs with the Python of a Wazo image, on the loopback.
 """
@@ -34,7 +38,6 @@ import re
 import shutil
 import socket
 import sys
-import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -45,8 +48,6 @@ AMI_USER = os.environ.get('SYSCONFD_AMI_USER', 'twake_sysconfd')
 AMI_PASSWORD = os.environ['SYSCONFD_AMI_PASSWORD']
 CONFGEND = os.environ.get('SYSCONFD_CONFGEND', '127.0.0.1:8669')
 SPOOL = os.environ.get('SYSCONFD_SPOOL', '/var/spool/asterisk/voicemail')
-# Out of the spool Asterisk reads (no context has that name: NAME refuses it), on its volume (a move is a rename).
-QUARANTINE = os.environ.get('SYSCONFD_QUARANTINE', os.path.join(SPOOL, '.quarantine'))
 # The commands wazo-confd sends after a change to voicemails, users and lines, each the module the AMI reloads for it.
 RELOADS = {
     'voicemail reload': 'app_voicemail.so',
@@ -59,10 +60,11 @@ RELOADS = {
 COMMANDS = set(RELOADS)
 # Modules a Wazo may not load (SCCP phones): not there, nothing to reload, as the CLI says it.
 OPTIONAL = {'chan_sccp.so'}
-NAME = re.compile(r'^[A-Za-z0-9_-]{1,79}$')
+# Matched whole (fullmatch: `$` would take a final newline, fourth review 11a, n°15).
+NAME = re.compile(r'[A-Za-z0-9_-]{1,79}')
 # The Host of wazo-confd's requests: the address it was given (its configuration's sysconfd host and port).
 ALLOWED_HOSTS = {LISTEN.lower(), f'localhost:{LISTEN.rsplit(":", 1)[1]}'}
-NUMBER = re.compile(r'^[0-9]{1,40}$')
+NUMBER = re.compile(r'[0-9]{1,40}')
 
 
 def log(message):
@@ -100,7 +102,7 @@ def mailboxes_of(conf):
         if section in (None, 'general', 'zonemessages') or '=>' not in line:
             continue
         number = line.split('=>', 1)[0].strip()
-        if NUMBER.match(number):
+        if NUMBER.fullmatch(number):
             found.add((section, number))
     return found
 
@@ -110,7 +112,7 @@ def mailboxes_listed(entries):
     found = set()
     for entry in entries:
         context, number = entry.get('VMContext', ''), entry.get('VoiceMailbox', '')
-        if NAME.match(context) and NUMBER.match(number):
+        if NAME.fullmatch(context) and NUMBER.fullmatch(number):
             found.add((context, number))
     return found
 
@@ -206,18 +208,9 @@ def ami_command(command):
 
 
 def mailbox_dir(context, mailbox):
-    if not NAME.match(context or '') or not NUMBER.match(mailbox or ''):
+    if not NAME.fullmatch(context or '') or not NUMBER.fullmatch(mailbox or ''):
         return None
     return os.path.join(SPOOL, context, mailbox)
-
-
-def quarantine(path, context, mailbox):
-    """The folder of a mailbox number moved out of the spool Asterisk reads; where it went."""
-    stamp = time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())
-    target = os.path.join(QUARANTINE, context, f'{mailbox}.{stamp}.{uuid.uuid4().hex[:8]}')
-    os.makedirs(os.path.dirname(target), exist_ok=True)
-    os.rename(path, target)
-    return target
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -252,7 +245,8 @@ class Handler(BaseHTTPRequestHandler):
             path = mailbox_dir(q.get('context'), q.get('mailbox'))
             if not path:
                 return self.answer(400, {'error': 'invalid mailbox'})
-            shutil.rmtree(path, ignore_errors=True)
+            if os.path.exists(path):
+                shutil.rmtree(path)
             log(f'mailbox {q["mailbox"]}@{q["context"]} removed from the spool')
             return self.answer()
         if url.path == '/move_voicemail':
@@ -260,18 +254,10 @@ class Handler(BaseHTTPRequestHandler):
             new = mailbox_dir(q.get('new_context'), q.get('new_mailbox'))
             if not old or not new:
                 return self.answer(400, {'error': 'invalid mailbox'})
-            if old == new:
+            # As wazo-sysconfd: nothing without a folder at the old number; else the target replaced, whatever it held.
+            if old == new or not os.path.exists(old):
                 return self.answer()
-            # What is under the target number is nobody's now: out of the spool, before anything shows it.
-            if os.path.exists(new):
-                if any(files for _, _, files in os.walk(new)):
-                    where = quarantine(new, q['new_context'], q['new_mailbox'])
-                    log(f'mailbox {q["new_mailbox"]}@{q["new_context"]}: messages already there, put in quarantine at {where} before mailbox {q["old_mailbox"]}@{q["old_context"]} moves there')
-                else:
-                    # Only folders, no message: nothing of anyone's is lost.
-                    shutil.rmtree(new)
-            if not os.path.isdir(old):
-                return self.answer()
+            shutil.rmtree(new, ignore_errors=True)
             os.makedirs(os.path.dirname(new), exist_ok=True)
             os.rename(old, new)
             log(f'mailbox {q["old_mailbox"]}@{q["old_context"]} moved to {q["new_mailbox"]}@{q["new_context"]}')

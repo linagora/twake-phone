@@ -267,10 +267,11 @@ if [ "$VOICEMAIL_MAX_CALL_SEC" -lt 30 ] || [ "$VOICEMAIL_MAX_CALL_SEC" -gt 3600 
   echo "VOICEMAIL_MAX_CALL_SEC must be 30 to 3600 seconds" >&2; exit 1
 fi
 # The calls to the mailboxes (second review 11a, n°10; third review n°7): VOICEMAIL_CALLS_PER_CALLER of one caller at
-# the same time, 2 by default (1 to 20); VOICEMAIL_CALLS_HIDDEN of all those who hide their number together, 5 by
+# the same time, 2 by default (1 to 20; a number the operator hides at the caller's request counts as that caller's:
+# fourth review 11a, n°8); VOICEMAIL_CALLS_HIDDEN of all those with no number at all to one mailbox, together, 5 by
 # default (1 to VOICEMAIL_CALLS_ALL); VOICEMAIL_CALLS_ALL of all callers, 30 by default (VOICEMAIL_CALLS_PER_CALLER to
-# 10000); VOICEMAIL_CALLS_PER_HOUR of one caller (those who hide their number together) to the same mailbox in an
-# hour, 10 by default (1 to 1000).
+# 10000); VOICEMAIL_CALLS_PER_HOUR of one caller (those with no number, together, per mailbox) to the same mailbox in
+# an hour, 10 by default (1 to 1000).
 : "${VOICEMAIL_CALLS_PER_CALLER:=2}"
 : "${VOICEMAIL_CALLS_HIDDEN:=5}"
 : "${VOICEMAIL_CALLS_ALL:=30}"

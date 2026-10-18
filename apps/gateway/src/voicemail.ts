@@ -83,7 +83,6 @@ export const wazoFromEnv = (env: NodeJS.ProcessEnv, secretsKey: Buffer | undefin
 /** The key of the prints of the holders of the mailboxes in Wazo, derived from SECRETS_KEY for that use only. */
 export const holderSecretOf = (secretsKey: Buffer) => Buffer.from(hkdfSync('sha256', secretsKey, Buffer.alloc(0), 'twake-phone: holders of mailboxes', 32))
 
-/** VOICEMAIL_RETENTION_DAYS: how long a message is kept (30 days by default; 0: for good). */
 /**
  * What differs between this Gateway's mailboxes and what OpenSIPS has of them (third review 11a, n°3 and n°10), said at
  * its start: OpenSIPS sends no call to the mailboxes while this Gateway has a voicemail server, or sends them while it
@@ -100,6 +99,7 @@ export const voicemailMismatch = (voicemail: { maxMessageSec?: number } | undefi
   return []
 }
 
+/** VOICEMAIL_RETENTION_DAYS: how long a message is kept (30 days by default; 0: for good). */
 export const retentionDaysOf = (env: NodeJS.ProcessEnv) => {
   const raw = env.VOICEMAIL_RETENTION_DAYS
   if (raw === undefined || raw === '') return 30

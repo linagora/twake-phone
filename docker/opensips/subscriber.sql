@@ -641,6 +641,17 @@ CREATE TABLE IF NOT EXISTS voicemail_boxes (
     mailbox VARCHAR(128) NOT NULL,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL
 );
+CREATE TABLE IF NOT EXISTS voicemail_writers (
+    tenant_id TEXT PRIMARY KEY NOT NULL,
+    fence BIGINT DEFAULT 0 NOT NULL,
+    withdrawals BIGINT DEFAULT 0 NOT NULL
+);
+CREATE TABLE IF NOT EXISTS voicemail_withdrawals (
+    tenant_id TEXT NOT NULL,
+    extension VARCHAR(64) NOT NULL,
+    seq BIGINT NOT NULL,
+    PRIMARY KEY (tenant_id, extension)
+);
 ALTER TABLE subscriber ADD COLUMN IF NOT EXISTS holder TEXT;
 ALTER TABLE acc ADD COLUMN IF NOT EXISTS caller VARCHAR(64) DEFAULT '' NOT NULL;
 ALTER TABLE acc ADD COLUMN IF NOT EXISTS callee VARCHAR(64) DEFAULT '' NOT NULL;

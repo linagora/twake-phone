@@ -67,6 +67,8 @@ TWAKE_ACL = [
     'confd.users.create',
     'confd.users.read',
     'confd.users.*.read',
+    # The description of a holder's user: where their mailbox is reached, or since when it is set aside.
+    'confd.users.*.update',
     'confd.users.*.delete',
     'confd.users.*.voicemails.*.update',
     'confd.users.*.voicemails.delete',
