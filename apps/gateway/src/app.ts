@@ -7,7 +7,7 @@ import swagger from '@fastify/swagger'
 import swaggerUi from '@fastify/swagger-ui'
 import { LiveKitError, PIN_DIGITS, maskNumber, splitParticipantId, verifyWebhook, type LiveKitConferenceBridge, type MeetApi, type MeetRoom, type ParticipantCall } from '@twake/conference-livekit'
 import { OUTBOUND_ALLOWED, REPLACES, classify, countryAllowed } from '@twake/provider-opensips'
-import type { DialedParticipant, MediaProvider, OperatorProvider, RoomCallGrantToken, TelephonyProvider, VoicemailProvider, VoicemailSync } from '@twake/telephony-provider-sdk'
+import type { DialedParticipant, MediaProvider, OperatorProvider, RoomCallGrantToken, TelephonyProvider, VoicemailBox, VoicemailProvider, VoicemailSync } from '@twake/telephony-provider-sdk'
 import { EXTENSION_FORMAT, FRAUD_DEFAULTS, OUTBOUND_CAP_DEFAULTS, isReservedNumber, type CallDirection, type DidRange, type Endpoint, type ForwardingRules, type Presence, type PresenceStatus, type RingGroup, type TelephonyEvent, type TrunkStatus, type User } from '@twake/telephony-types'
 import { adminPolicyFromEnv, isAdmin, type AdminPolicy } from './admin.js'
 import { authenticatorFromEnv, TicketStore, type Authenticator, type Identity } from './auth.js'
@@ -27,6 +27,7 @@ import { encrypt } from './crypto.js'
 import { newWebhookSecret, parseWebhookDomains } from './webhook-delivery.js'
 import { presenceEvent, webhookEventsFor } from './webhook-events.js'
 import { VOICEMAIL_ID } from './voicemail.js'
+import { VoicemailLeases, type VoicemailWeight } from './voicemail-lease.js'
 import { DELIVERY_CURSOR, DELIVERY_ID, MAX_WEBHOOKS, WEBHOOK_ID, WEBHOOK_SECRET_GRACE_MS, WEBHOOK_SENDS_PER_MINUTE, WEBHOOK_TENANT_SENDS_PER_MINUTE, WebhookHub, parseSubscription, publicDelivery, publicSubscription, secretContext, type WebhookHubOptions } from './webhooks.js'
 import { MAX_DIDS, MAX_TRUNKS, TRUNK_ID, defaultTrunk, inDids, parseDid, parseOperatorLines, parseTrunk, providerTrunks, publicDid, publicTrunk, trunkRecord } from './trunks.js'
 import { EMPTY_OUTBOUND, PROFILE_ID, outboundVersion, parseOutbound, staleOutbound, type Outbound } from './outbound.js'
@@ -41,7 +42,7 @@ const OPERATOR_SYNCS_PER_MINUTE = 2
 const OPERATOR_READS_PER_MINUTE = 10
 
 /** What the SIP server raises for the administrators (TelephonyAlert). */
-const ALERT_KINDS = ['fraud-warning', 'fraud-critical', 'limit', 'rights', 'emergency', 'meet', 'webhook', 'operator'] as const
+const ALERT_KINDS = ['fraud-warning', 'fraud-critical', 'limit', 'rights', 'emergency', 'meet', 'webhook', 'operator', 'voicemail'] as const
 /** An extension as the log names it: the same short hash for the same tenant and extension, never the extension. */
 /**
  * The extension of an alert in the log (second review 6b, n°7): a keyed hash (HMAC-SHA-256, with a key the Gateway
@@ -122,6 +123,16 @@ const RESTORE_RETRY_MS = [1_000, 5_000, 15_000, 30_000]
  */
 const VOICEMAIL_HELD = 'voicemail:held'
 const VOICEMAIL_RELEASE = 'voicemail:release'
+/** The releases of the guard asked (third review 11a, n°6), newest first, VOICEMAIL_RELEASES_KEPT of them. */
+const VOICEMAIL_RELEASES = 'voicemail:releases'
+const VOICEMAIL_RELEASES_KEPT = 20
+/** The last change of the holders of the mailboxes, marked by the Gateway that made it (third review 11a, n°5). */
+const VOICEMAIL_CHANGED = 'voicemail:changed'
+/** How many times a withdrawal of mailboxes from the SIP server is tried before it is left to the next round. */
+const VOICEMAIL_WITHDRAW_TRIES = 5
+/** A release of the guard asked: the counts the administrator saw, who, when. */
+type ReleaseAsked = { park?: number; remove?: number; of: number; by: string; at: string }
+type ReleaseRecord = ReleaseAsked & { applied: boolean; done: string }
 type HeldBack = { park?: number; remove?: number; of?: number; since?: string }
 /** How long someone found without an extension keeps their browsers' subscriptions (BuildOptions.pushPurgeGraceMs). */
 const PUSH_PURGE_GRACE_MS = 3_600_000
@@ -252,6 +263,12 @@ export interface BuildOptions {
   voicemailSyncMs?: number
   /** How long the answer of the SIP server on the mailboxes (getVoicemailAccess) is kept: 2 minutes by default. */
   voicemailAccessCacheMs?: number
+  /** How long the lease of the mailboxes of a tenant is taken for (VoicemailLeases): 45 s by default (tests). */
+  voicemailLeaseMs?: number
+  /** How often the Gateway that writes the mailboxes looks for a change of holders another Gateway marked: 2 s. */
+  voicemailChangeMs?: number
+  /** How long the synchronisation of the mailboxes fails before the administrators are told (an alert): 15 minutes. */
+  voicemailAlertMs?: number
   /**
    * The operator of the trunks of each tenant that has one (step 10b, ADR 0021: OVHcloud for the organisation of the
    * pilot), read every `operatorSyncMs` (10 minutes by default; 0: never on a schedule) by the Gateway that leads:
@@ -732,31 +749,82 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
   }
   // The mailboxes (step 11a, ADR 0022): one for each holder of an extension, made, moved or set aside as the
   // extensions pass from one person to another, then handed to the SIP server, which sends there the calls nobody
-  // takes. By the Gateway that leads only (second review 11a, n°1: the lease of the changes of state, as the
-  // operator's rounds; any Gateway without the hub): when it takes the lease, when its directory changed who holds
-  // which extension, and every voicemailSyncMs (n°8). One synchronisation at a time per tenant, retried until it holds
-  // (Wazo may start after the Gateway); a change heard meanwhile asks one more round. Out of the tenant's turn (review
-  // 11a, n°1): only what is handed to the SIP server takes it.
+  // takes. Written by the Gateway that holds the lease of the mailboxes of the tenant (VoicemailLeases: third review
+  // 11a, n°2, n°3 and n°11): only one with a voicemail server for it (one without never writes `voicemail_boxes`), one
+  // that reaches it before one that does not, and within the lease's write window only, asked again before each write
+  // to the voicemail server and to the SIP server: a Gateway that lost the lease mid-round stops there, and consumes
+  // nothing of an administrator's release. It synchronises when it takes the lease, when a directory (its own, or
+  // another Gateway's: the mark VOICEMAIL_CHANGED, third review n°5) changed who holds which extension, when an
+  // administrator lets go what was held back, and every voicemailSyncMs (second review n°8). One synchronisation at a
+  // time per tenant, retried until it holds (Wazo may start after the Gateway); a change heard meanwhile asks one more
+  // round; failing for voicemailAlertMs, an alert for the administrators (third review n°11). Out of the tenant's turn
+  // (review 11a, n°1): only what is handed to the SIP server takes it.
   //
-  // An extension given to someone else never sends a call to the previous holder's mailbox (n°3): the Gateway that
-  // made the change, whichever it is, withdraws that mailbox from the SIP server at once; a synchronisation hands the
-  // SIP server, before it changes anything in the voicemail server, the mailboxes already at their holder's extension
-  // only, and withdraws after it those whose holder changed meanwhile. One that fails empties nothing (n°1).
-  const leadsVoicemail = () => !hub || hub.leading
+  // An extension given to someone else never sends a call to the previous holder's mailbox (second review n°3): the
+  // Gateway that made the change, whichever it is, withdraws that mailbox from the SIP server at once (tried again if
+  // it fails), and marks the change for the Gateway that writes the mailboxes. A synchronisation hands the SIP server,
+  // before it changes anything in the voicemail server, the mailboxes already at their holder's extension only; and
+  // whatever it hands it, before and after its changes, leaves out an extension given to someone else (or to nobody)
+  // since it read the holders, read again in the tenant's turn, just before it writes: a withdrawal, made in that turn
+  // once the holder changed in the store, is never undone by a round older than it (third review n°1). It withdraws
+  // after it those whose holder changed meanwhile. One that fails empties nothing (second review n°1).
   const withdrawVoicemail = async (tenantId: string, provider: TelephonyProvider, extensions: string[]) => {
     if (!extensions.length || !provider.withdrawVoicemailBoxes) return
-    await inTurn(tenantId, async () => provider.withdrawVoicemailBoxes?.(extensions)).catch((err: unknown) => app.log.error({ err, tenantId }, 'mailboxes of extensions given to someone else not withdrawn from the SIP server'))
+    for (let attempt = 0; ; attempt++) {
+      try {
+        await inTurn(tenantId, async () => provider.withdrawVoicemailBoxes?.(extensions))
+        break
+      } catch (err) {
+        if (closing || attempt >= VOICEMAIL_WITHDRAW_TRIES - 1) {
+          app.log.error({ err, tenantId }, 'mailboxes of extensions given to someone else not withdrawn from the SIP server: the Gateway that writes the mailboxes leaves them out at its round')
+          break
+        }
+        const delay = voicemailRetryMs[Math.min(attempt, voicemailRetryMs.length - 1)]!
+        app.log.warn({ err, tenantId }, `mailboxes of extensions given to someone else not withdrawn from the SIP server, retrying in ${delay / 1000} s`)
+        await new Promise(resolve => setTimeout(resolve, delay).unref())
+      }
+    }
+    // For the Gateway that writes the mailboxes, whichever it is: it synchronises at its next look (voicemailChangeMs).
+    await store.putOperatorState(tenantId, VOICEMAIL_CHANGED, { at: new Date().toISOString(), extensions }).catch((err: unknown) => app.log.error({ err, tenantId }, 'the change of the holders of the mailboxes not marked for the Gateway that writes them'))
   }
+  const voicemailLeases = new VoicemailLeases({
+    store,
+    holder: `gw_${randomBytes(8).toString('hex')}`,
+    ...(options.voicemailLeaseMs !== undefined ? { ms: options.voicemailLeaseMs } : {}),
+    // A tenant whose provider started here, for which this Gateway has a voicemail server: 2 it answers and its events
+    // are heard, 1 otherwise.
+    tenants: () => [...started.keys()].map(tenantId => [tenantId, voicemailWeight(tenantId)] as const),
+    onLead: tenantId => {
+      const provider = started.get(tenantId)
+      // The last change marked, read first: the round that follows covers it, the next look any made after.
+      if (provider)
+        void store
+          .getOperatorState(tenantId, VOICEMAIL_CHANGED)
+          .then(
+            mark => void changeSeen.set(tenantId, markOf(mark)),
+            () => undefined
+          )
+          .then(() => syncVoicemail(tenantId, provider))
+      if (purgeTimer) void purgeVoicemail(tenantId)
+    },
+    logger: app.log
+  })
+  const voicemailWeight = (tenantId: string): VoicemailWeight => {
+    const vm = options.voicemail?.(tenantId)
+    if (!vm) return undefined
+    return vm.getStatus() === 'CONNECTED' ? 2 : 1
+  }
+  const mayWriteVoicemail = (tenantId: string) => voicemailLeases.mayWrite(tenantId)
   const syncingVoicemail = new Map<string, { again: boolean }>()
   const voicemailRetryMs = options.voicemailRetryMs ?? RESTORE_RETRY_MS
+  /** Since when the synchronisation of each tenant fails, and whether the administrators were told. */
+  const voicemailFailing = new Map<string, { since: number; told: boolean }>()
+  const voicemailAlertMs = options.voicemailAlertMs ?? 15 * 60_000
   const syncVoicemail = async (tenantId: string, provider: TelephonyProvider): Promise<void> => {
-    if (!leadsVoicemail()) return
     const vm = options.voicemail?.(tenantId)
-    // No voicemail server for the tenant: what the SIP server kept of one before is emptied (review 11a, n°14).
-    if (!vm) {
-      if (provider.setVoicemailBoxes) await inTurn(tenantId, async () => provider.setVoicemailBoxes?.([])).catch((err: unknown) => app.log.error({ err, tenantId }, 'mailboxes of before not taken from the SIP server'))
-      return
-    }
+    // Without a voicemail server for the tenant, this Gateway leaves `voicemail_boxes` alone (third review 11a, n°3):
+    // one that has one writes it. Without the lease, no round (the loop below asks it before each).
+    if (!vm || !provider.setVoicemailBoxes) return
     const running = syncingVoicemail.get(tenantId)
     if (running) {
       running.again = true
@@ -766,17 +834,26 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
     syncingVoicemail.set(tenantId, state)
     let attempt = 0
     try {
-      while (state.again && !closing && leadsVoicemail()) {
+      while (state.again && !closing && mayWriteVoicemail(tenantId)) {
         state.again = false
         try {
           const mappings = await store.listMappings(tenantId)
           const holderAt = new Map(mappings.map(m => [m.extension, m.userId]))
-          const release = await store.getOperatorState(tenantId, VOICEMAIL_RELEASE)
+          /** What the SIP server is handed, as said above: never an extension withdrawn or given to someone else since. */
+          const handOver = (boxes: VoicemailBox[]) =>
+            inTurn(tenantId, async () => {
+              if (!mayWriteVoicemail(tenantId)) throw new Error('the mailboxes are no longer written by this Gateway')
+              const now = new Map((await store.listMappings(tenantId)).map(m => [m.extension, m.userId]))
+              const kept = boxes.filter(b => now.get(b.extension) === holderAt.get(b.extension))
+              if (kept.length < boxes.length) state.again = true
+              await provider.setVoicemailBoxes?.(kept)
+            })
+          const asked = (await store.getOperatorState(tenantId, VOICEMAIL_RELEASE)) as ReleaseAsked | undefined
           const done = await vm.syncMailboxes(
             mappings.map(m => ({ extension: m.extension, userId: m.userId, ...(m.displayName ? { displayName: m.displayName } : {}) })),
-            { beforeChanges: async boxes => inTurn(tenantId, async () => provider.setVoicemailBoxes?.(boxes)), ...(release ? { release: true } : {}) }
+            { beforeChanges: handOver, mayWrite: () => mayWriteVoicemail(tenantId), ...(asked ? { release: { ...(asked.park !== undefined ? { park: asked.park } : {}), ...(asked.remove !== undefined ? { remove: asked.remove } : {}), of: asked.of } } : {}) }
           )
-          await inTurn(tenantId, async () => provider.setVoicemailBoxes?.(done.boxes))
+          await handOver(done.boxes)
           // A holder changed meanwhile, on whatever Gateway: its extension loses the mailbox again, one more round.
           const now = new Map((await store.listMappings(tenantId)).map(m => [m.extension, m.userId]))
           const moved = done.boxes.filter(b => now.get(b.extension) !== holderAt.get(b.extension)).map(b => b.extension)
@@ -784,13 +861,19 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
             await withdrawVoicemail(tenantId, provider, moved)
             state.again = true
           }
-          await keepHeldBack(tenantId, done.heldBack, release)
+          await keepHeldBack(tenantId, done, asked)
           attempt = 0
+          voicemailFailing.delete(tenantId)
         } catch (err) {
           if (closing) return
+          if (!mayWriteVoicemail(tenantId)) {
+            app.log.warn({ tenantId }, 'mailboxes: this Gateway no longer writes them, its synchronisation stopped there')
+            return
+          }
           state.again = true
           const delay = voicemailRetryMs[Math.min(attempt++, voicemailRetryMs.length - 1)]!
           app.log.error({ err, tenantId }, `mailboxes not synchronised with the voicemail server (the SIP server keeps what it had), retrying in ${delay / 1000} s`)
+          await failingVoicemail(tenantId)
           await new Promise(resolve => setTimeout(resolve, delay).unref())
         }
       }
@@ -798,16 +881,36 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
       syncingVoicemail.delete(tenantId)
     }
   }
+  /** A synchronisation that keeps failing, voicemailAlertMs since its first failure: the administrators are told, once. */
+  const failingVoicemail = async (tenantId: string) => {
+    const failing = voicemailFailing.get(tenantId) ?? { since: Date.now(), told: false }
+    voicemailFailing.set(tenantId, failing)
+    if (failing.told || Date.now() - failing.since < voicemailAlertMs) return
+    failing.told = true
+    const minutes = Math.floor((Date.now() - failing.since) / 60_000)
+    app.log.warn({ tenantId, minutes }, 'mailboxes: their synchronisation fails, the administrators are told')
+    await store.addAlert({ tenantId, at: new Date().toISOString(), alert: { kind: 'voicemail', param: 'sync-failing', scope: 'tenant', value: minutes } }).catch((err: unknown) => app.log.error({ err, tenantId }, 'could not record the alert'))
+  }
   /**
    * What a synchronisation held back, too many at once (second review 11a, n°9), kept for the administrators (GET
-   * /admin/voicemail) until one of them says it is meant (POST /admin/voicemail/release), which the next one honours.
+   * /admin/voicemail) until one of them says that very mass is meant (POST /admin/voicemail/release, the counts they
+   * saw: third review n°6). The release asked is used once by the next round, whether that round found what it named
+   * (let go) or another mass (held back again, for them to see), and kept in the history of the releases with who
+   * asked it. By the Gateway that writes the mailboxes only (n°2).
    */
-  const keepHeldBack = async (tenantId: string, heldBack: VoicemailSync['heldBack'], release: unknown) => {
+  const keepHeldBack = async (tenantId: string, done: VoicemailSync, asked: ReleaseAsked | undefined) => {
+    if (!mayWriteVoicemail(tenantId)) return
+    const heldBack = done.heldBack
     const before = (await store.getOperatorState(tenantId, VOICEMAIL_HELD)) as HeldBack | undefined
     if (heldBack) {
       if (before?.park !== heldBack.park || before?.remove !== heldBack.remove || before?.of !== heldBack.of) await store.putOperatorState(tenantId, VOICEMAIL_HELD, { ...heldBack, since: before?.since ?? new Date().toISOString() })
     } else if (before) await store.deleteOperatorState(tenantId, VOICEMAIL_HELD)
-    if (release) await store.deleteOperatorState(tenantId, VOICEMAIL_RELEASE, release)
+    if (!asked || !(await store.deleteOperatorState(tenantId, VOICEMAIL_RELEASE, asked))) return
+    const applied = !!done.released
+    const history = ((await store.getOperatorState(tenantId, VOICEMAIL_RELEASES)) as ReleaseRecord[] | undefined) ?? []
+    await store.putOperatorState(tenantId, VOICEMAIL_RELEASES, [{ ...asked, applied, done: new Date().toISOString() }, ...history].slice(0, VOICEMAIL_RELEASES_KEPT))
+    if (applied) app.log.warn({ tenantId, by: asked.by, park: asked.park, remove: asked.remove, of: asked.of }, 'mailboxes held back let go, as an administrator asked')
+    else app.log.warn({ tenantId, by: asked.by, park: asked.park, remove: asked.remove, of: asked.of }, 'the release an administrator asked not applied: the synchronisation found another mass, held back again')
   }
   const syncAllVoicemail = () => {
     for (const [tenantId, provider] of started) void syncVoicemail(tenantId, provider)
@@ -815,29 +918,50 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
   const voicemailSyncEvery = options.voicemailSyncMs ?? 5 * 60_000
   const voicemailSyncTimer = options.voicemail && voicemailSyncEvery > 0 ? setInterval(syncAllVoicemail, voicemailSyncEvery) : undefined
   voicemailSyncTimer?.unref()
-  // The retention period of the messages (review 11a, n°10): those older are deleted, every voicemailPurgeMs, by the
-  // Gateway that leads (second review 11a, n°1).
+  // The changes of holders marked by any Gateway (withdrawVoicemail), looked at by the one that writes the mailboxes.
+  const changeSeen = new Map<string, string | undefined>()
+  const markOf = (mark: unknown) => (mark as { at?: string } | undefined)?.at
+  const voicemailChangeEvery = options.voicemailChangeMs ?? 2_000
+  const voicemailChangeTimer =
+    options.voicemail && voicemailChangeEvery > 0
+      ? setInterval(() => {
+          for (const [tenantId, provider] of started) {
+            if (!mayWriteVoicemail(tenantId)) {
+              changeSeen.delete(tenantId)
+              continue
+            }
+            void store
+              .getOperatorState(tenantId, VOICEMAIL_CHANGED)
+              .then(mark => {
+                const at = markOf(mark)
+                if (changeSeen.has(tenantId) && changeSeen.get(tenantId) === at) return
+                changeSeen.set(tenantId, at)
+                void syncVoicemail(tenantId, provider)
+              })
+              .catch((err: unknown) => app.log.error({ err, tenantId }, 'the changes of the holders of the mailboxes not read'))
+          }
+        }, voicemailChangeEvery)
+      : undefined
+  voicemailChangeTimer?.unref()
+  // The retention period of the messages (review 11a, n°10): those older are deleted, every voicemailPurgeMs and when
+  // it takes the lease, by the Gateway that writes the mailboxes (asked before each deletion: third review n°2).
   const retentionMs = (options.voicemailRetentionDays ?? 30) * 86_400_000
-  const purgeVoicemail = async () => {
-    if (!leadsVoicemail()) return
-    for (const vm of heardVoicemail) {
+  const purgeVoicemail = async (only?: string) => {
+    const done = new Set<VoicemailProvider>()
+    for (const tenantId of only ? [only] : [...started.keys()]) {
+      const vm = options.voicemail?.(tenantId)
+      if (!vm || done.has(vm) || !mayWriteVoicemail(tenantId)) continue
+      done.add(vm)
       try {
-        await vm.purgeMessages(new Date(Date.now() - retentionMs))
+        await vm.purgeMessages(new Date(Date.now() - retentionMs), { mayWrite: () => mayWriteVoicemail(tenantId) })
       } catch (err) {
-        app.log.error({ err }, 'messages past the retention period not deleted, again at the next round')
+        app.log.error({ err, tenantId }, 'messages past the retention period not deleted, again at the next round')
       }
     }
   }
   const purgeEvery = options.voicemailPurgeMs ?? 6 * 3_600_000
-  let purgedOnce = false
   const purgeTimer = options.voicemail && retentionMs > 0 && purgeEvery > 0 ? setInterval(() => void purgeVoicemail(), purgeEvery) : undefined
   purgeTimer?.unref()
-  // This Gateway leads from now on: the mailboxes of every tenant, and the messages past their time.
-  hub?.onLead(tenants => {
-    if (tenants) return
-    syncAllVoicemail()
-    if (purgeTimer) void purgeVoicemail()
-  })
   /** The events of each voicemail server, heard once whatever the providers of its tenant (re)made. */
   const heardVoicemail = new Set<VoicemailProvider>()
   const hearVoicemail = (tenantId: string) => {
@@ -855,6 +979,8 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
     })().catch(err => app.log.error({ err }, 'voicemail event stream failed'))
   }
   const started = new Map<string, TelephonyProvider>()
+  // The leases of the mailboxes, taken and renewed from now on (with a voicemail server only: one without takes none).
+  if (options.voicemail) voicemailLeases.start()
   // The trunks and direct numbers the store keeps (step 6, ADR 0016): handed to the provider when it starts, in the
   // tenant's turn, retried until it holds (its database may be late). What it already has is not written again.
   const trunksFor = async (tenantId: string) => ({ trunks: providerTrunks(await store.listTrunks(tenantId), options.secretsKey), dids: (await store.listDids(tenantId)).map(publicDid) })
@@ -1013,9 +1139,9 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
   options.directorySync?.onChange((tenantId, extensions) => {
     const provider = started.get(tenantId)
     if (provider) void restorePresences(tenantId, provider)
-    // The extensions given to someone else lose their mailbox at once, whatever Gateway leads (second review 11a, n°3).
-    if (provider && options.voicemail?.(tenantId)) void withdrawVoicemail(tenantId, provider, extensions).then(() => syncVoicemail(tenantId, provider))
-    else if (provider) void syncVoicemail(tenantId, provider)
+    // The extensions given to someone else lose their mailbox at once, whatever Gateway made the change (second review
+    // 11a, n°3), and the one that writes the mailboxes hears of it (third review n°5).
+    if (provider) void withdrawVoicemail(tenantId, provider, extensions).then(() => syncVoicemail(tenantId, provider))
     // Extensions given to someone else, or to nobody: what was heard of them before is forgotten.
     void checkedPresences(tenantId).catch((err: unknown) => app.log.error({ err, tenantId }, 'presences not checked against the directory'))
   })
@@ -1024,10 +1150,8 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
     void restorePresences(tenantId, provider)
     void syncVoicemail(tenantId, provider)
     hearVoicemail(tenantId)
-    if (heardVoicemail.size && purgeTimer && !purgedOnce) {
-      purgedOnce = true
-      void purgeVoicemail()
-    }
+    // Its lease of the mailboxes asked at once (it may have none to take: another Gateway writes them).
+    if (options.voicemail?.(tenantId)) void voicemailLeases.renew()
     void restoreTrunks(tenantId, provider)
     void restoreOutbound(tenantId, provider)
     void (async () => {
@@ -1147,6 +1271,8 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
     clearInterval(alertPurge)
     clearInterval(purgeTimer)
     clearInterval(voicemailSyncTimer)
+    clearInterval(voicemailChangeTimer)
+    await voicemailLeases.stop()
     trunkWatch?.stop()
     // Its round under way ends first: the store is closed after (review 10b, n°25).
     await operatorSync?.stop()
@@ -1722,27 +1848,36 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
       })
       // The mailboxes (second review 11a, n°9): what their synchronisation held back, too many at once (mailboxes of
       // people who no longer hold an extension, left where they are; mailboxes aside past their grace period, kept),
-      // and an administrator's word that it is meant: the next synchronisation lets them go (202, at once on the
-      // Gateway that leads; 409 VOICEMAIL_NOTHING_HELD when nothing is).
-      const voicemailOf = (user: User) => {
-        if (!options.voicemail?.(user.tenantId)) throw Object.assign(new Error('Voicemail is not available on this platform'), { statusCode: 501 })
-      }
+      // and an administrator's word that the mass they saw is meant (third review n°6: its counts, `park`, `remove` and
+      // `of`, as GET gave them; 409 VOICEMAIL_HELD_CHANGED when what is held is no longer that, VOICEMAIL_NOTHING_HELD
+      // when nothing is). The next synchronisation, by whichever Gateway writes the mailboxes, lets it go if it finds
+      // that mass, holds it back again otherwise (202: asked, applied at the next synchronisation, n°15). Read from the
+      // store: the same answer on every Gateway. The releases asked are kept, with who asked them and what came of it.
       v1.get('/admin/voicemail', async req => {
         const user = await administrator(req)
-        voicemailOf(user)
         const held = (await store.getOperatorState(user.tenantId, VOICEMAIL_HELD)) as HeldBack | undefined
-        const release = await store.getOperatorState(user.tenantId, VOICEMAIL_RELEASE)
-        return { ...(held ? { heldBack: held } : {}), ...(release ? { release: 'asked' } : {}) }
+        const release = (await store.getOperatorState(user.tenantId, VOICEMAIL_RELEASE)) as ReleaseAsked | undefined
+        const releases = ((await store.getOperatorState(user.tenantId, VOICEMAIL_RELEASES)) as ReleaseRecord[] | undefined) ?? []
+        return { ...(held ? { heldBack: held } : {}), ...(release ? { release: { ...release, state: 'asked' } } : {}), ...(releases.length ? { releases } : {}) }
       })
-      v1.post('/admin/voicemail/release', async (req, reply) => {
+      v1.post<{ Body: { park?: unknown; remove?: unknown; of?: unknown } }>('/admin/voicemail/release', async (req, reply) => {
         const user = await administrator(req)
-        voicemailOf(user)
-        if (!(await store.getOperatorState(user.tenantId, VOICEMAIL_HELD))) return reply.code(409).send({ statusCode: 409, code: 'VOICEMAIL_NOTHING_HELD', error: 'Conflict', message: 'Nothing is held back' })
-        await store.putOperatorState(user.tenantId, VOICEMAIL_RELEASE, { at: new Date().toISOString(), by: user.id })
-        req.log.warn({ tenantId: user.tenantId }, 'mailboxes held back let go by an administrator')
+        const held = (await store.getOperatorState(user.tenantId, VOICEMAIL_HELD)) as HeldBack | undefined
+        if (!held) return reply.code(409).send({ statusCode: 409, code: 'VOICEMAIL_NOTHING_HELD', error: 'Conflict', message: 'Nothing is held back' })
+        const body = req.body ?? {}
+        const count = (v: unknown) => (v === undefined ? undefined : Number.isSafeInteger(v) && (v as number) >= 0 ? (v as number) : NaN)
+        const seen = { park: count(body.park), remove: count(body.remove), of: count(body.of) }
+        if ([seen.park, seen.remove, seen.of].some(n => Number.isNaN(n)) || seen.of === undefined)
+          return reply.code(400).send({ statusCode: 400, code: 'VOICEMAIL_RELEASE_COUNTS', error: 'Bad Request', message: 'Give the counts held back as GET /admin/voicemail says them: park, remove, of' })
+        if (seen.park !== held.park || seen.remove !== held.remove || seen.of !== held.of) return reply.code(409).send({ statusCode: 409, code: 'VOICEMAIL_HELD_CHANGED', error: 'Conflict', message: 'What is held back changed since: read it again', heldBack: held })
+        const asked: ReleaseAsked = { ...(held.park !== undefined ? { park: held.park } : {}), ...(held.remove !== undefined ? { remove: held.remove } : {}), of: held.of, by: user.id, at: new Date().toISOString() }
+        await store.putOperatorState(user.tenantId, VOICEMAIL_RELEASE, asked)
+        req.log.warn({ tenantId: user.tenantId, by: user.id, park: asked.park, remove: asked.remove, of: asked.of }, 'mailboxes held back: an administrator says it is meant')
+        // The Gateway that writes the mailboxes synchronises at its next look, whichever it is (this one at once).
+        await store.putOperatorState(user.tenantId, VOICEMAIL_CHANGED, { at: asked.at, release: true })
         const provider = started.get(user.tenantId)
         if (provider) void syncVoicemail(user.tenantId, provider)
-        return reply.code(202).send({ release: 'asked' })
+        return reply.code(202).send({ release: 'asked', applied: 'at the next synchronisation of the mailboxes' })
       })
       v1.get('/admin/dids', async req => {
         const user = await administrator(req)

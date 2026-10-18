@@ -932,7 +932,7 @@ export class MemoryStore implements Store {
     const margin = Math.floor(ms / 3)
     const writeFrom = !lease ? now : lease.holder === holder ? lease.writeFrom : Math.max(now, Math.min(lease.writeUntil, now) + margin)
     this.leases.set(role, { holder, until: now + ms, heard, writeFrom, writeUntil: now + ms - margin })
-    return { writeFrom: new Date(writeFrom).toISOString() }
+    return { writeFrom: new Date(writeFrom).toISOString(), writeUntil: new Date(now + ms - margin).toISOString() }
   }
 
   async listWebhookStates(tenantId: string, prefix: string) {

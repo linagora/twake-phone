@@ -222,6 +222,15 @@ modparam("cfgutils", "shvset", "no11_until=i:0")
 # Wazo's Asterisk heard nothing from (a mailbox called, no answer at all within 2 s): the mailboxes are left out 30 s
 # ($shv(wazo_mute_until), failure_route[voicemail_failed]), the calls get their refusal at once (review 11a, n°14).
 modparam("cfgutils", "shvset", "wazo_mute_until=i:0")
+# The bounds of the calls to the mailboxes (route[voicemail]), for the calls to come once changed (MI shv_set; the e2e
+# lowers the caps a moment): VOICEMAIL_MAX_CALL_SEC, which the Gateway reads (shv_get) and compares with the longest
+# message of its voicemail server at its start (third review 11a, n°10); VOICEMAIL_CALLS_PER_CALLER,
+# VOICEMAIL_CALLS_HIDDEN, VOICEMAIL_CALLS_ALL and VOICEMAIL_CALLS_PER_HOUR (n°7).
+modparam("cfgutils", "shvset", "vm_max_sec=i:${VOICEMAIL_MAX_CALL_SEC}")
+modparam("cfgutils", "shvset", "vm_per_caller=i:${VOICEMAIL_CALLS_PER_CALLER}")
+modparam("cfgutils", "shvset", "vm_hidden=i:${VOICEMAIL_CALLS_HIDDEN}")
+modparam("cfgutils", "shvset", "vm_calls_all=i:${VOICEMAIL_CALLS_ALL}")
+modparam("cfgutils", "shvset", "vm_per_hour=i:${VOICEMAIL_CALLS_PER_HOUR}")
 
 #### Calls to someone without a window (step 5, ADR 0015): when the extension a call reaches has no registered window
 #### and its holder has a browser to wake (`push_targets`, written by the Gateway for a person with a push
@@ -3481,10 +3490,14 @@ route[relay_failed] {
 # A mailbox that does not answer within 2 s (Wazo down, a row of voicemail_boxes out of date) is left for the refusal,
 # and when nothing at all came back from Asterisk, every mailbox is left out the next 30 s (n°14). The greeting says
 # whether the caller is outside (`;caller=external`): the extension is never spelled out to them (n°12). Bounded as
-# Meet's access number is (second review 11a, n°10): VOICEMAIL_CALLS_PER_CALLER calls of one caller to the mailboxes
-# at the same time (those who hide their number together, under VOICEMAIL_CALLS_ALL), VOICEMAIL_CALLS_ALL of all
-# callers, and VOICEMAIL_CALLS_PER_HOUR calls of one caller to the same mailbox in an hour (one caller filling a
-# mailbox fills it for everyone); past one, the refusal the call would have had without the mailbox.
+# Meet's access number is (second review 11a, n°10; third review n°7), $shv(vm_*): VOICEMAIL_CALLS_PER_CALLER calls of
+# one caller to the mailboxes at the same time, VOICEMAIL_CALLS_HIDDEN of all those who hide their number together (one
+# caller for the caps, `*hidden`: they never take every place), VOICEMAIL_CALLS_ALL of all callers, and
+# VOICEMAIL_CALLS_PER_HOUR calls of one caller (those who hide their number together, again) to the same mailbox in an
+# hour (one caller filling a mailbox fills it for everyone; the hour from the first of them: cache_add keeps the
+# lifetime it began with); past one, the refusal the call would have had without the mailbox. A call is counted in the
+# hour only once it has its place, and counted out again when the mailbox does not take it (route[voicemail_undo]):
+# a call refused for want of a place, or that rtpengine or Asterisk failed, counts for nothing.
 # $param(1): the greeting; $avp(vm_then), $avp(vm_code), $avp(vm_reason): that refusal. Ends the script when the
 # mailbox is called; -1 otherwise.
 route[voicemail] {
@@ -3495,32 +3508,40 @@ route[voicemail] {
 	if ($avp(rtp_on) == NULL && !has_body_part("application/sdp"))
 		return(-1);
 	$avp(vm_used) = 1;
-	$var(vm_who) = "other";
-	if ($avp(caller) =~ "^[A-Za-z0-9._+-]{1,64}$")
+	# Those who hide their number (anonymous, or a caller that is no number) are one caller for the caps: `*hidden`,
+	# which no caller's own number is.
+	$var(vm_who) = "*hidden";
+	$var(vm_cap) = $shv(vm_hidden);
+	if ($avp(caller) =~ "^[A-Za-z0-9._+-]{1,64}$" && $avp(caller) != "anonymous") {
 		$var(vm_who) = $avp(caller);
-	$var(vm_cap) = ${VOICEMAIL_CALLS_PER_CALLER};
-	if ($var(vm_who) == "anonymous" || $var(vm_who) == "other") {
-		$var(vm_cap) = ${VOICEMAIL_CALLS_ALL};
-	} else {
-		$var(vm_n) = 0;
-		cache_add("local", "vm:h:$var(vm_who):$avp(dialled)", 1, 3600, $var(vm_n));
-		if ($var(vm_n) > ${VOICEMAIL_CALLS_PER_HOUR}) {
-			xlog("L_NOTICE", "call $ci: the mailbox of $avp(dialled) left out, $var(vm_n) calls of this caller to it in an hour\n");
-			return(-1);
-		}
+		$var(vm_cap) = $shv(vm_per_caller);
 	}
-	# The calls to the mailboxes at the same time, this one counted in only if there is room, under a lock: of two calls
-	# at once, one counts the other. Its dialog leaves the profiles when it ends.
+	# The calls to the mailboxes at the same time, and of this caller to this mailbox in the hour, under a lock: of two
+	# calls at once, one counts the other. This one counted in only if there is room for it in both; its dialog leaves
+	# the profiles when it ends, the hour keeps it unless the mailbox does not take it.
 	$var(vm_room) = 0;
+	$var(vm_n) = 0;
 	get_static_lock("vm_count");
 	get_profile_size("vm_caller", "$var(vm_who)", $var(vm_mine));
 	get_profile_size("vm_all", , $var(vm_all));
-	if ($var(vm_mine) < $var(vm_cap) && $var(vm_all) < ${VOICEMAIL_CALLS_ALL}) {
-		set_dlg_profile("vm_caller", "$var(vm_who)");
-		set_dlg_profile("vm_all");
-		$var(vm_room) = 1;
+	if ($var(vm_mine) < $var(vm_cap) && $var(vm_all) < $shv(vm_calls_all)) {
+		cache_add("local", "vm:h:$var(vm_who):$avp(dialled)", 1, 3600, $var(vm_n));
+		if ($var(vm_n) > $shv(vm_per_hour)) {
+			cache_sub("local", "vm:h:$var(vm_who):$avp(dialled)", 1, 3600, $var(vm_left));
+			$var(vm_room) = -1;
+		} else {
+			set_dlg_profile("vm_caller", "$var(vm_who)");
+			set_dlg_profile("vm_all");
+			$(avp(vm_hour)[*]) = NULL;
+			$avp(vm_hour) = "vm:h:" + $var(vm_who) + ":" + $avp(dialled);
+			$var(vm_room) = 1;
+		}
 	}
 	release_static_lock("vm_count");
+	if ($var(vm_room) == -1) {
+		xlog("L_NOTICE", "call $ci: the mailbox of $avp(dialled) left out, $var(vm_n) calls of this caller to it in an hour\n");
+		return(-1);
+	}
 	if ($var(vm_room) == 0) {
 		xlog("L_WARN", "call $ci: the mailbox of $avp(dialled) left out, $var(vm_mine) calls of this caller and $var(vm_all) of all callers to the mailboxes at the same time\n");
 		return(-1);
@@ -3538,6 +3559,7 @@ route[voicemail] {
 		route(rtp_flags, 0);
 		if (!rtpengine_offer("$var(rtp_flags)")) {
 			xlog("L_ERR", "call $ci: rtpengine offer for the mailbox of $avp(dialled) failed\n");
+			route(voicemail_unhour);
 			return(-1);
 		}
 		$avp(rtp_on) = 1;
@@ -3568,8 +3590,8 @@ route[voicemail] {
 		append_hf("X-Twake-Voicemail: $param(1);caller=external\r\n");
 	else
 		append_hf("X-Twake-Voicemail: $param(1)\r\n");
-	if ($DLG_timeout == NULL || $DLG_timeout > ${VOICEMAIL_MAX_CALL_SEC})
-		$DLG_timeout = ${VOICEMAIL_MAX_CALL_SEC};
+	if ($DLG_timeout == NULL || $DLG_timeout > $shv(vm_max_sec))
+		$DLG_timeout = $shv(vm_max_sec);
 	# Asterisk answers at once (100 Trying within 2 s, then its 200); the ringing delay of a forward does not apply.
 	$T_fr_timeout = 2;
 	$T_fr_inv_timeout = 15;
@@ -3587,8 +3609,10 @@ route[voicemail] {
 # The mailbox did not take the call: it is back where it was, for its refusal (its `via` and its lifetime too). The
 # headers appended for Asterisk stay on the request (second review 11a, n°17): remove_hf sees the headers received
 # only, never those append_hf added, and what route[voicemail] appended is not undone. No path relays the request after
-# this route (each one replies, or ends): none reaches anyone else.
+# this route (each one replies, or ends): none reaches anyone else. Nor does it count in the caller's hour (third review
+# 11a, n°7).
 route[voicemail_undo] {
+	route(voicemail_unhour);
 	$(avp(voicemail)[*]) = NULL;
 	$dlg_val(voicemail) = "0";
 	$(avp(callee)[*]) = NULL;
@@ -3600,6 +3624,14 @@ route[voicemail_undo] {
 	if ($avp(vm_timeout) != NULL && $avp(vm_timeout) > 0)
 		$DLG_timeout = $avp(vm_timeout);
 	$dlg_val(callee) = $avp(vm_from);
+}
+
+# A call the mailbox did not take, counted out of the hour of its caller (route[voicemail]), once.
+route[voicemail_unhour] {
+	if ($avp(vm_hour) == NULL)
+		return;
+	cache_sub("local", "$avp(vm_hour)", 1, 3600, $var(vm_left));
+	$(avp(vm_hour)[*]) = NULL;
 }
 
 failure_route[voicemail_failed] {

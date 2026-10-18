@@ -868,6 +868,8 @@
   "admin.alert.operatorRemovalChanged": "Renvoi d'une ligne changé chez l'opérateur depuis la demande de retrait : laissé tel quel",
   "admin.alert.operatorRemovalGone": "Retrait d'un renvoi abandonné : l'opérateur ne connaît plus la ligne",
   "admin.alert.operatorRemovalLate": "Renvoi d'une ligne à retirer chez l'opérateur depuis plus d'un jour",
+  "admin.alert.kind.voicemail": "Messagerie vocale",
+  "admin.alert.voicemailSyncFailing": "Les boîtes vocales ne sont plus synchronisées avec le serveur de messagerie (minutes d'échec)",
   "admin.operator.restoreRefused.loop": "Ligne {line} : ses renvois d'avant la plateforme ({forwards}) ne seront pas remis : ils ramèneraient les appels vers la plateforme.",
   "admin.operator.restoreRefused.outbound": "Ligne {line} : ses renvois d'avant la plateforme ({forwards}) ne seront pas remis : ils vont vers un numéro que son trunk n'appelle pas.",
   "admin.operator.closed.unrestored.loop": "Ligne {line} : renvoi retiré le {at}, ses renvois d'avant non remis (ils ramèneraient les appels vers la plateforme)",

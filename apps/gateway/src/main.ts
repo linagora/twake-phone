@@ -12,7 +12,7 @@ import { WebPush, parsePushServices, parseVapidSubject } from './push.js'
 import { ProviderRegistry } from './registry.js'
 import { PgStore } from './store/pg.js'
 import { trunkFromEnv, trunkRecord } from './trunks.js'
-import { retentionDaysOf, wazoFromEnv } from './voicemail.js'
+import { retentionDaysOf, voicemailMismatch, wazoFromEnv } from './voicemail.js'
 import { networkInterfaces } from 'node:os'
 import { denyNetworks, parsePorts, parseTenantNetworks } from './webhook-delivery.js'
 
@@ -230,5 +230,11 @@ setTimeout(() => {
       for (const what of meetAccessMismatch(accessNumber, sip)) console.warn(`WARNING: ${what}`)
     })
     .catch((err: unknown) => console.warn(`WARNING: the access number of the meeting rooms not compared with OpenSIPS's: ${err instanceof Error ? err.message : String(err)}`))
+  // The mailboxes likewise (third review 11a, n°3 and n°10): OpenSIPS's own bound of a call to one, not this Gateway's.
+  void Promise.resolve(registry.forTenant(tenant).getVoicemailSettings?.())
+    .then(sip => {
+      for (const what of voicemailMismatch(voicemail, sip)) console.warn(`WARNING: ${what}`)
+    })
+    .catch((err: unknown) => console.warn(`WARNING: the mailboxes not compared with OpenSIPS's: ${err instanceof Error ? err.message : String(err)}`))
 }, 10_000).unref()
 await app.listen({ host: env.HOST ?? '0.0.0.0', port: Number(env.PORT ?? 8080) })

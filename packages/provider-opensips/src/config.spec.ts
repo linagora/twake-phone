@@ -180,32 +180,46 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     }
     // The headers appended are not undone by remove_hf (n°17): the undo does not pretend to.
     expect(section('route[voicemail_undo]', 'failure_route[voicemail_failed]')).not.toContain('remove_hf(')
-    // Bounded as Meet is (n°10): the calls of a caller and of all at the same time, under a lock, counted only if there
-    // is room; those of a caller to one mailbox in an hour.
+    // Bounded as Meet is (n°10; third review n°7): the calls of a caller, of those who hide their number together, and
+    // of all at the same time, and those of a caller to one mailbox in an hour, under a lock; counted in the hour only
+    // once the call has its place, counted out when the mailbox does not take it.
     expect(cfg).toContain('modparam("dialog", "profiles_with_value", "trunk_caller;meet_caller;vm_caller")')
     expect(cfg).toContain('modparam("dialog", "profiles_no_value", "trunk_out;trunk_emergency;meet_all;vm_all")')
-    expect(vm).toContain('if ($var(vm_mine) < $var(vm_cap) && $var(vm_all) < 30) {\n\t\tset_dlg_profile("vm_caller", "$var(vm_who)");\n\t\tset_dlg_profile("vm_all");')
-    expect(vm.indexOf('get_static_lock("vm_count");')).toBeLessThan(vm.indexOf('get_profile_size("vm_caller"'))
-    expect(vm.indexOf('release_static_lock("vm_count");')).toBeGreaterThan(vm.indexOf('set_dlg_profile("vm_all");'))
-    expect(vm).toContain('$var(vm_cap) = 2;')
-    expect(vm).toContain('cache_add("local", "vm:h:$var(vm_who):$avp(dialled)", 1, 3600, $var(vm_n));\n\t\tif ($var(vm_n) > 10) {')
+    expect(vm).toContain('$var(vm_who) = "*hidden";\n\t$var(vm_cap) = $shv(vm_hidden);\n\tif ($avp(caller) =~ "^[A-Za-z0-9._+-]{1,64}$" && $avp(caller) != "anonymous") {\n\t\t$var(vm_who) = $avp(caller);\n\t\t$var(vm_cap) = $shv(vm_per_caller);')
+    const room = vm.slice(vm.indexOf('get_static_lock("vm_count");'), vm.indexOf('release_static_lock("vm_count");'))
+    expect(room).toContain('if ($var(vm_mine) < $var(vm_cap) && $var(vm_all) < $shv(vm_calls_all)) {\n\t\tcache_add("local", "vm:h:$var(vm_who):$avp(dialled)", 1, 3600, $var(vm_n));\n\t\tif ($var(vm_n) > $shv(vm_per_hour)) {\n\t\t\tcache_sub("local", "vm:h:$var(vm_who):$avp(dialled)", 1, 3600, $var(vm_left));')
+    expect(room.indexOf('get_profile_size("vm_caller"')).toBeLessThan(room.indexOf('cache_add('))
+    expect(room.indexOf('cache_add(')).toBeLessThan(room.indexOf('set_dlg_profile("vm_all");'))
+    expect(room).toContain('$avp(vm_hour) = "vm:h:" + $var(vm_who) + ":" + $avp(dialled);')
+    expect(vm.split('cache_add(').length).toBe(2)
+    expect(vm.indexOf('if ($var(vm_room) == -1) {')).toBeLessThan(vm.indexOf('t_relay()'))
     expect(vm.indexOf('if ($var(vm_room) == 0) {')).toBeLessThan(vm.indexOf('t_relay()'))
-    const capped = render({ WAZO_SIP: '192.0.2.30:5100', VOICEMAIL_CALLS_PER_CALLER: '1', VOICEMAIL_CALLS_ALL: '5', VOICEMAIL_CALLS_PER_HOUR: '3' }).cfg
-    expect(capped).toContain('$var(vm_cap) = 1;')
-    expect(capped).toContain('$var(vm_all) < 5) {')
-    expect(capped).toContain('if ($var(vm_n) > 3) {')
+    // Counted out of the hour when rtpengine fails, and in the undo (Asterisk silent, refused, t_relay failed), once.
+    expect(vm).toContain('failed\\n");\n\t\t\troute(voicemail_unhour);\n\t\t\treturn(-1);')
+    expect(section('route[voicemail_undo]', 'failure_route[voicemail_failed]')).toContain('route[voicemail_undo] {\n\troute(voicemail_unhour);')
+    expect(section('route[voicemail_unhour]', 'failure_route[voicemail_failed]')).toContain('if ($avp(vm_hour) == NULL)\n\t\treturn;\n\tcache_sub("local", "$avp(vm_hour)", 1, 3600, $var(vm_left));\n\t$(avp(vm_hour)[*]) = NULL;')
+    // The caps and the bound in shared variables, for the calls to come (MI shv_set) and for the Gateway (shv_get).
+    expect(cfg).toContain('modparam("cfgutils", "shvset", "vm_per_caller=i:2")')
+    expect(cfg).toContain('modparam("cfgutils", "shvset", "vm_hidden=i:5")')
+    expect(cfg).toContain('modparam("cfgutils", "shvset", "vm_calls_all=i:30")')
+    expect(cfg).toContain('modparam("cfgutils", "shvset", "vm_per_hour=i:10")')
+    expect(cfg).toContain('modparam("cfgutils", "shvset", "vm_max_sec=i:300")')
+    const capped = render({ WAZO_SIP: '192.0.2.30:5100', VOICEMAIL_CALLS_PER_CALLER: '1', VOICEMAIL_CALLS_HIDDEN: '2', VOICEMAIL_CALLS_ALL: '5', VOICEMAIL_CALLS_PER_HOUR: '3' }).cfg
+    for (const shv of ['vm_per_caller=i:1', 'vm_hidden=i:2', 'vm_calls_all=i:5', 'vm_per_hour=i:3']) expect(capped).toContain(`modparam("cfgutils", "shvset", "${shv}")`)
     for (const [env, message] of [
       [{ VOICEMAIL_CALLS_PER_CALLER: '0' }, /VOICEMAIL_CALLS_PER_CALLER must be 1 to 20/],
       [{ VOICEMAIL_CALLS_PER_CALLER: '4', VOICEMAIL_CALLS_ALL: '3' }, /VOICEMAIL_CALLS_ALL must be VOICEMAIL_CALLS_PER_CALLER to 10000/],
+      [{ VOICEMAIL_CALLS_HIDDEN: '0' }, /VOICEMAIL_CALLS_HIDDEN must be 1 to VOICEMAIL_CALLS_ALL/],
+      [{ VOICEMAIL_CALLS_HIDDEN: '31' }, /VOICEMAIL_CALLS_HIDDEN must be 1 to VOICEMAIL_CALLS_ALL/],
       [{ VOICEMAIL_CALLS_PER_HOUR: 'x' }, /VOICEMAIL_CALLS_PER_HOUR must be a number/]
     ] as const)
       expect(render({ WAZO_SIP: '192.0.2.30:5100', ...env }).stderr).toMatch(message)
     // A caller from outside is said as such: the greeting never spells the extension to them (review 11a, n°12).
     expect(vm).toContain('if ($dlg_val(trunk) == "caller")\n\t\tappend_hf("X-Twake-Voicemail: $param(1);caller=external\\r\\n");')
     // Bounded (n°3): VOICEMAIL_MAX_CALL_SEC (300 s by default); a mailbox that does not answer at once is left (n°14).
-    expect(vm).toContain('if ($DLG_timeout == NULL || $DLG_timeout > 300)\n\t\t$DLG_timeout = 300;')
+    expect(vm).toContain('if ($DLG_timeout == NULL || $DLG_timeout > $shv(vm_max_sec))\n\t\t$DLG_timeout = $shv(vm_max_sec);')
     expect(vm).toContain('$T_fr_timeout = 2;')
-    expect(render({ WAZO_SIP: '192.0.2.30:5100', VOICEMAIL_MAX_CALL_SEC: '120' }).cfg).toContain('$DLG_timeout = 120;')
+    expect(render({ WAZO_SIP: '192.0.2.30:5100', VOICEMAIL_MAX_CALL_SEC: '120' }).cfg).toContain('modparam("cfgutils", "shvset", "vm_max_sec=i:120")')
     expect(render({ WAZO_SIP: '192.0.2.30:5100', VOICEMAIL_MAX_CALL_SEC: '10' }).stderr).toMatch(/VOICEMAIL_MAX_CALL_SEC must be 30 to 3600/)
     // Given back as it was when the mailbox does not answer (n°23): the way the call went, and its lifetime.
     expect(vm.indexOf('$avp(vm_via) = $acc_extra(via);')).toBeLessThan(vm.indexOf('$acc_extra(via) = "voicemail";'))

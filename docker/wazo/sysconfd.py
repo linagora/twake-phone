@@ -10,11 +10,20 @@ wazo-confd's requests carry no credentials (as with Wazo's own wazo-sysconfd, on
 (review 11a, n°22), those that say where they come from (Origin, Sec-Fetch-Site) or name another host than the one it
 listens on (a DNS name made to point to the loopback), so that no web page opened on this machine deletes a mailbox.
 An Asterisk command is answered once Asterisk answered it (its ActionID), and fails when Asterisk refused it. It logs
-in with an AMI account of its own, Asterisk commands only, and no event (second review 11a, n°16). `voicemail reload`
-fails as well when Asterisk does not have, after it, every mailbox wazo-confgend gave before it (a reload that could
-not read its configuration still says Success). A mailbox is moved only where there is none: a target that has
-messages already answers 409 (second review 11a, n°6), wazo-confd's request then fails instead of the messages staying
-under the old number unseen.
+in with an AMI account of its own and no event (second review 11a, n°16), and runs each command as the AMI action
+that does it, never through the CLI (third review 11a, n°13): the module reloads (Reload, the `system` privilege) and
+the list of the mailboxes (VoicemailUsersList, `reporting`); the account has no other (`write = system,reporting`:
+docker/wazo/asterisk/entrypoint.sh). `voicemail reload` fails as well when Asterisk does not have, after it, every
+mailbox wazo-confgend gave before it (a reload that could not read its configuration still says Success).
+
+A mailbox moves with its messages, whatever its target holds (third review 11a, n°4). wazo-confd commits its database
+before it asks this (its `after_request`: commit_database, then flush_sysconfd), and a failure here reaches nobody:
+the mailbox is at the new number for Wazo whatever is answered. Messages already under the target number (left by a
+mailbox there before, a restore, a hand) would show in the mailbox moved there, someone else's: they go to the
+quarantine first, out of the spool Asterisk reads (SYSCONFD_QUARANTINE, `.quarantine` in the spool by default, on the
+same volume: `<context>/<number>.<time>.<id>` there), said in the log, for an operator to look at; then the mailbox
+moves. The old number keeps nothing: the whole folder goes, so a mailbox made there later finds none of its
+messages. The Gateway checks each mailbox it moved or made against the messages it had (provider-wazo).
 
 Standard library only: it runs with the Python of a Wazo image, on the loopback.
 """
@@ -25,6 +34,7 @@ import re
 import shutil
 import socket
 import sys
+import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -35,8 +45,20 @@ AMI_USER = os.environ.get('SYSCONFD_AMI_USER', 'twake_sysconfd')
 AMI_PASSWORD = os.environ['SYSCONFD_AMI_PASSWORD']
 CONFGEND = os.environ.get('SYSCONFD_CONFGEND', '127.0.0.1:8669')
 SPOOL = os.environ.get('SYSCONFD_SPOOL', '/var/spool/asterisk/voicemail')
-# The commands wazo-confd sends after a change to voicemails, users and lines.
-COMMANDS = {'voicemail reload', 'module reload res_pjsip.so', 'module reload chan_sccp.so', 'dialplan reload', 'module reload app_queue.so', 'module reload features'}
+# Out of the spool Asterisk reads (no context has that name: NAME refuses it), on its volume (a move is a rename).
+QUARANTINE = os.environ.get('SYSCONFD_QUARANTINE', os.path.join(SPOOL, '.quarantine'))
+# The commands wazo-confd sends after a change to voicemails, users and lines, each the module the AMI reloads for it.
+RELOADS = {
+    'voicemail reload': 'app_voicemail.so',
+    'module reload res_pjsip.so': 'res_pjsip.so',
+    'module reload chan_sccp.so': 'chan_sccp.so',
+    'dialplan reload': 'pbx_config.so',
+    'module reload app_queue.so': 'app_queue.so',
+    'module reload features': 'features',
+}
+COMMANDS = set(RELOADS)
+# Modules a Wazo may not load (SCCP phones): not there, nothing to reload, as the CLI says it.
+OPTIONAL = {'chan_sccp.so'}
 NAME = re.compile(r'^[A-Za-z0-9_-]{1,79}$')
 # The Host of wazo-confd's requests: the address it was given (its configuration's sysconfd host and port).
 ALLOWED_HOSTS = {LISTEN.lower(), f'localhost:{LISTEN.rsplit(":", 1)[1]}'}
@@ -83,19 +105,25 @@ def mailboxes_of(conf):
     return found
 
 
-def mailboxes_shown(output):
-    """The mailboxes `voicemail show users` lists, as {(context, number)}."""
+def mailboxes_listed(entries):
+    """The mailboxes the AMI's VoicemailUsersList listed (its VoicemailUserEntry events), as {(context, number)}."""
     found = set()
-    for line in output:
-        f = line.split()
-        if len(f) >= 2 and NAME.match(f[0]) and NUMBER.match(f[1]):
-            found.add((f[0], f[1]))
+    for entry in entries:
+        context, number = entry.get('VMContext', ''), entry.get('VoiceMailbox', '')
+        if NAME.match(context) and NUMBER.match(number):
+            found.add((context, number))
     return found
 
 
-def ami_commands(commands):
-    """Runs Asterisk commands through the AMI, in one session, with no event (Events: off): the output of each, once
-    Asterisk answered it (the block of its ActionID); AmiError when Asterisk refused one (the next ones not run)."""
+def fields(block):
+    """An AMI block as {key: value}."""
+    return dict(line.split(': ', 1) for line in block if ': ' in line)
+
+
+def ami_actions(actions):
+    """Runs AMI actions, in one session, with no event (Events: off): the answer of each, once Asterisk answered it
+    (the block of its ActionID; for a list, its entries too, until its EventList completes); AmiError when Asterisk
+    refused one (the next ones not run), unless it is a reload of an OPTIONAL module that is not there."""
     host, port = AMI.rsplit(':', 1)
     with socket.create_connection((host, int(port)), timeout=10) as s:
         f = s.makefile('rwb')
@@ -122,34 +150,56 @@ def ami_commands(commands):
                 if f'ActionID: {action_id}' in block and any(line.startswith('Response: ') for line in block):
                     return block
             raise AmiError('no answer from the AMI')
+        def entries_of(action_id):
+            # The entries of a list, its own (its ActionID), until it says it is complete: 100000 at most.
+            entries = []
+            for _ in range(100_000):
+                block = fields(read())
+                if block.get('ActionID') != action_id:
+                    continue
+                if block.get('EventList') == 'Complete':
+                    return entries
+                entries.append(block)
+            raise AmiError('a list of the AMI that never ends')
         login = uuid.uuid4().hex
         send(['Action: Login', f'ActionID: {login}', f'Username: {AMI_USER}', f'Secret: {AMI_PASSWORD}', 'Events: off'])
         if 'Response: Success' not in answer_of(login):
             raise PermissionError('AMI refused the login')
-        outputs = []
-        for command in commands:
+        answers = []
+        for lines in actions:
             action = uuid.uuid4().hex
-            send(['Action: Command', f'ActionID: {action}', f'Command: {command}'])
-            answer = answer_of(action)
-            if 'Response: Error' in answer:
-                message = next((line[len('Message: '):] for line in answer if line.startswith('Message: ')), 'refused')
-                raise AmiError(f'Asterisk refused {command!r}: {message}')
-            outputs.append([line[len('Output: '):] for line in answer if line.startswith('Output: ')])
+            send(lines + [f'ActionID: {action}'])
+            answer = fields(answer_of(action))
+            name = lines[0].split(': ', 1)[1]
+            if answer.get('Response') == 'Error':
+                message = answer.get('Message', 'refused')
+                module = next((line.split(': ', 1)[1] for line in lines if line.startswith('Module: ')), None)
+                if name == 'Reload' and module in OPTIONAL and message == 'No such module':
+                    answers.append(answer)
+                    continue
+                raise AmiError(f'Asterisk refused {name} {module or ""}: {message}'.replace('  ', ' '))
+            if answer.get('EventList') == 'start':
+                answer['entries'] = entries_of(action)
+            answers.append(answer)
         send(['Action: Logoff'])
-        return outputs
+        return answers
+
+
+def reload_action(module):
+    return ['Action: Reload', f'Module: {module}']
 
 
 def ami_command(command):
-    """Runs an Asterisk command: `voicemail reload` checked by `voicemail show users` after it (every mailbox
-    wazo-confgend gave before it is in Asterisk), AmiError otherwise."""
+    """Runs one of the COMMANDS, as the AMI reload of its module: `voicemail reload` checked by the mailboxes Asterisk
+    lists after it (every mailbox wazo-confgend gave before it is there), AmiError otherwise."""
     if command != 'voicemail reload':
-        return ami_commands([command])[0]
+        return ami_actions([reload_action(RELOADS[command])])[0]
     try:
         expected = mailboxes_of(confgend('asterisk/voicemail.conf'))
     except OSError as err:
         raise AmiError(f'wazo-confgend not reached, voicemail reload not run: {err}') from err
-    reloaded, shown = ami_commands([command, 'voicemail show users'])
-    missing = expected - mailboxes_shown(shown)
+    reloaded, listed = ami_actions([reload_action(RELOADS[command]), ['Action: VoicemailUsersList']])
+    missing = expected - mailboxes_listed(listed.get('entries', []))
     if missing:
         raise AmiError(f'voicemail reload: {len(missing)} mailbox(es) of wazo-confgend not in Asterisk after it, as {", ".join(sorted(f"{n}@{c}" for c, n in missing)[:5])}')
     return reloaded
@@ -159,6 +209,15 @@ def mailbox_dir(context, mailbox):
     if not NAME.match(context or '') or not NUMBER.match(mailbox or ''):
         return None
     return os.path.join(SPOOL, context, mailbox)
+
+
+def quarantine(path, context, mailbox):
+    """The folder of a mailbox number moved out of the spool Asterisk reads; where it went."""
+    stamp = time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())
+    target = os.path.join(QUARANTINE, context, f'{mailbox}.{stamp}.{uuid.uuid4().hex[:8]}')
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    os.rename(path, target)
+    return target
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -201,16 +260,20 @@ class Handler(BaseHTTPRequestHandler):
             new = mailbox_dir(q.get('new_context'), q.get('new_mailbox'))
             if not old or not new:
                 return self.answer(400, {'error': 'invalid mailbox'})
-            if not os.path.isdir(old):
+            if old == new:
                 return self.answer()
+            # What is under the target number is nobody's now: out of the spool, before anything shows it.
             if os.path.exists(new):
                 if any(files for _, _, files in os.walk(new)):
-                    log(f'mailbox {q["old_mailbox"]}@{q["old_context"]} not moved: {q["new_mailbox"]}@{q["new_context"]} has messages already')
-                    return self.answer(409, {'error': 'the target mailbox has messages already'})
-                # Only folders, no message: nothing of anyone's is lost.
-                shutil.rmtree(new)
+                    where = quarantine(new, q['new_context'], q['new_mailbox'])
+                    log(f'mailbox {q["new_mailbox"]}@{q["new_context"]}: messages already there, put in quarantine at {where} before mailbox {q["old_mailbox"]}@{q["old_context"]} moves there')
+                else:
+                    # Only folders, no message: nothing of anyone's is lost.
+                    shutil.rmtree(new)
+            if not os.path.isdir(old):
+                return self.answer()
             os.makedirs(os.path.dirname(new), exist_ok=True)
-            shutil.move(old, new)
+            os.rename(old, new)
             log(f'mailbox {q["old_mailbox"]}@{q["old_context"]} moved to {q["new_mailbox"]}@{q["new_context"]}')
             return self.answer()
         log(f'GET {url.path}: nothing to do here')

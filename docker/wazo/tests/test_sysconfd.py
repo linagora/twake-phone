@@ -1,4 +1,4 @@
-"""docker/wazo/sysconfd.py (second review 11a, n°6, n°13 and n°16): its HTTP side as wazo-confd and a browser reach
+"""docker/wazo/sysconfd.py (second review 11a, n°6, n°13 and n°16; third review n°4 and n°13): its HTTP side as wazo-confd and a browser reach
 it, against an AMI and a wazo-confgend of this test, on the loopback.
 
     python3 -I -m unittest discover -s docker/wazo/tests
@@ -16,6 +16,7 @@ from socketserver import StreamRequestHandler, ThreadingTCPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SPOOL = tempfile.mkdtemp()
+QUARANTINE = os.path.join(SPOOL, '.quarantine')
 os.environ.update({'SYSCONFD_AMI_PASSWORD': 'not-a-real-secret', 'SYSCONFD_SPOOL': SPOOL})
 spec = importlib.util.spec_from_file_location('sysconfd', os.path.join(HERE, '..', 'sysconfd.py'))
 sysconfd = importlib.util.module_from_spec(spec)
@@ -33,19 +34,19 @@ eu-fr = Europe/Paris|'vm-received' q 'digits/at' kM
 101 => ,Alice Martin,,,maxmsg=50
 102 => ,Jean Dupont,,,maxmsg=50
 '''
-SHOW_USERS = ['Context    Mbox  User                      Zone       NewMsg',
-              f'{CONTEXT} 101   Alice Martin                              0',
-              f'{CONTEXT} 102   Jean Dupont                               0',
-              '2 voicemail users configured.']
+# What VoicemailUsersList lists: one entry per mailbox (and another context's, which says nothing of these).
+LISTED = [{'VMContext': CONTEXT, 'VoiceMailbox': '101'}, {'VMContext': CONTEXT, 'VoiceMailbox': '102'}, {'VMContext': 'default', 'VoiceMailbox': '1234'}]
 
 
 class FakeAmi:
-    """An AMI: the banner, a Login, then Commands, answered as `answers` says ({command: (response, output, events
-    before)}). It keeps the blocks it was sent."""
+    """An AMI: the banner, a Login, then Reloads and VoicemailUsersList, answered as `answers` says ({module:
+    (response, message, events before)}) and `listed`. Any other action is refused as Asterisk refuses an action the
+    account has no privilege for. It keeps the blocks it was sent."""
 
     def __init__(self):
         self.blocks = []
         self.answers = {}
+        self.listed = list(LISTED)
         self.refuse_login = False
         ami = self
 
@@ -82,12 +83,21 @@ class FakeAmi:
                 if action == 'Login':
                     ok = not ami.refuse_login and block.get('Secret') == 'not-a-real-secret'
                     self.send([f'Response: {"Success" if ok else "Error"}', f'ActionID: {action_id}', 'Message: Authentication accepted' if ok else 'Message: Authentication failed'])
-                elif action == 'Command':
-                    response, output, events = ami.answers.get(block['Command'], ('Success', [], 0))
+                elif action == 'Reload':
+                    response, message, events = ami.answers.get(block.get('Module'), ('Success', 'Module Reloaded', 0))
                     for i in range(events):
                         self.send(['Event: Newchannel', f'Channel: PJSIP/opensips-{i:08x}'])
                     if events < 1000:
-                        self.send([f'Response: {response}', f'ActionID: {action_id}', 'Message: Command output follows' if response == 'Success' else 'Message: Command not found'] + [f'Output: {o}' for o in output])
+                        self.send([f'Response: {response}', f'ActionID: {action_id}', f'Message: {message}'])
+                elif action == 'VoicemailUsersList':
+                    self.send(['Response: Success', f'ActionID: {action_id}', 'EventList: start', 'Message: Voicemail user list will follow'])
+                    # Another session's list in between: not this one's.
+                    self.send(['Event: VoicemailUserEntry', 'ActionID: someone-else', f'VMContext: {CONTEXT}', 'VoiceMailbox: 102'])
+                    for entry in ami.listed:
+                        self.send(['Event: VoicemailUserEntry', f'ActionID: {action_id}'] + [f'{k}: {v}' for k, v in entry.items()])
+                    self.send(['Event: VoicemailUserEntryComplete', f'ActionID: {action_id}', 'EventList: Complete', f'ListItems: {len(ami.listed)}'])
+                else:
+                    self.send(['Response: Error', f'ActionID: {action_id}', 'Message: Permission denied'])
 
         self.server = ThreadingTCPServer(('127.0.0.1', 0), Handler)
         self.server.daemon_threads = True
@@ -95,7 +105,8 @@ class FakeAmi:
         self.address = f'127.0.0.1:{self.server.server_address[1]}'
 
     def commands(self):
-        return [b['Command'] for b in self.blocks if b.get('Action') == 'Command']
+        """The actions after the login, as "Reload <module>" or the action's name."""
+        return [f'Reload {b["Module"]}' if b['Action'] == 'Reload' else b['Action'] for b in self.blocks if b.get('Action') not in ('Login', 'Logoff')]
 
 
 class FakeConfgend:
@@ -140,6 +151,7 @@ class Sysconfd(unittest.TestCase):
         sysconfd.CONFGEND = self.confgend.address
         for entry in os.listdir(SPOOL):
             shutil.rmtree(os.path.join(SPOOL, entry))
+        sysconfd.QUARANTINE = QUARANTINE
 
     def tearDown(self):
         for server in (self.ami.server, self.confgend.server):
@@ -197,35 +209,58 @@ class Sysconfd(unittest.TestCase):
         self.assertEqual(self.request('GET', f'/move_voicemail?old_context={CONTEXT}&old_mailbox=108&new_context={CONTEXT}&new_mailbox=107')[0], 200)
         self.assertEqual(os.listdir(os.path.join(SPOOL, CONTEXT, '107', 'INBOX')), ['msg0000.wav'])
 
-    def test_a_mailbox_is_not_moved_onto_messages_409(self):
+    # Third review 11a, n°4: wazo-confd committed the move before it asks; the messages follow the mailbox, whatever.
+    def test_messages_under_the_target_go_to_the_quarantine_and_the_mailbox_moves_there_with_its_own(self):
         self.mailbox('102', 'msg0000.wav')
         self.mailbox('105', 'msg0000.wav', 'msg0001.wav')
         status, body = self.request('GET', f'/move_voicemail?old_context={CONTEXT}&old_mailbox=102&new_context={CONTEXT}&new_mailbox=105')
-        self.assertEqual(status, 409, body)
-        self.assertEqual(os.listdir(os.path.join(SPOOL, CONTEXT, '102', 'INBOX')), ['msg0000.wav'])
-        self.assertEqual(sorted(os.listdir(os.path.join(SPOOL, CONTEXT, '105', 'INBOX'))), ['msg0000.wav', 'msg0001.wav'])
+        self.assertEqual(status, 200, body)
+        # At 105, only the mailbox's own message; nothing left at 102 for a mailbox made there later.
+        self.assertEqual(os.listdir(os.path.join(SPOOL, CONTEXT, '105', 'INBOX')), ['msg0000.wav'])
+        self.assertFalse(os.path.exists(os.path.join(SPOOL, CONTEXT, '102')))
+        # What was at 105, kept out of the spool Asterisk reads, whole.
+        [kept] = os.listdir(os.path.join(QUARANTINE, CONTEXT))
+        self.assertRegex(kept, r'^105\.[0-9]{8}T[0-9]{6}Z\.[0-9a-f]{8}$')
+        self.assertEqual(sorted(os.listdir(os.path.join(QUARANTINE, CONTEXT, kept, 'INBOX'))), ['msg0000.wav', 'msg0001.wav'])
+        # A mailbox with no message yet (no folder) moved onto messages: they go too, it shows none of them.
+        self.mailbox('106', 'msg0000.wav')
+        self.assertEqual(self.request('GET', f'/move_voicemail?old_context={CONTEXT}&old_mailbox=103&new_context={CONTEXT}&new_mailbox=106')[0], 200)
+        self.assertFalse(os.path.exists(os.path.join(SPOOL, CONTEXT, '106')))
+        self.assertEqual(len(os.listdir(os.path.join(QUARANTINE, CONTEXT))), 2)
+        # The quarantine is no mailbox: wazo-confd cannot name it.
+        self.assertEqual(self.request('GET', f'/delete_voicemail?context=.quarantine&mailbox=105')[0], 400)
+        # A move onto itself changes nothing.
+        self.assertEqual(self.request('GET', f'/move_voicemail?old_context={CONTEXT}&old_mailbox=105&new_context={CONTEXT}&new_mailbox=105')[0], 200)
+        self.assertEqual(os.listdir(os.path.join(SPOOL, CONTEXT, '105', 'INBOX')), ['msg0000.wav'])
 
-    # The Asterisk commands (review 11a, n°22; second review n°16).
-    def test_a_command_runs_on_its_own_account_with_no_event(self):
-        self.ami.answers['dialplan reload'] = ('Success', ['Dialplan reloaded.'], 0)
-        self.assertEqual(self.request('POST', '/exec_request_handlers', '{"ipbx": ["dialplan reload", "core stop now"]}')[0], 200)
+    # The Asterisk commands (review 11a, n°22; second review n°16; third review n°13: AMI actions, never the CLI).
+    def test_a_command_runs_on_its_own_account_with_no_event_as_the_reload_of_its_module(self):
+        self.assertEqual(self.request('POST', '/exec_request_handlers', '{"ipbx": ["dialplan reload", "core stop now", "module reload features", "module reload res_pjsip.so", "module reload app_queue.so"]}')[0], 200)
         login = self.ami.blocks[0]
         self.assertEqual((login['Action'], login['Username'], login['Events']), ('Login', 'twake_sysconfd', 'off'))
-        # Only the commands of the list.
-        self.assertEqual(self.ami.commands(), ['dialplan reload'])
+        # Only the commands of the list, each the reload of its module; no Command action, ever.
+        self.assertEqual(self.ami.commands(), ['Reload pbx_config.so', 'Reload features', 'Reload res_pjsip.so', 'Reload app_queue.so'])
+        self.assertFalse(any(b.get('Action') == 'Command' for b in self.ami.blocks))
+
+    def test_a_module_a_wazo_may_not_load_is_nothing_to_reload_any_other_missing_fails(self):
+        self.ami.answers['chan_sccp.so'] = ('Error', 'No such module', 0)
+        self.assertEqual(self.request('POST', '/exec_request_handlers', '{"ipbx": ["module reload chan_sccp.so", "dialplan reload"]}')[0], 200)
+        self.assertEqual(self.ami.commands(), ['Reload chan_sccp.so', 'Reload pbx_config.so'])
+        self.ami.answers['pbx_config.so'] = ('Error', 'No such module', 0)
+        self.assertEqual(self.request('POST', '/exec_request_handlers', '{"ipbx": ["dialplan reload"]}')[0], 500)
 
     def test_a_command_asterisk_refuses_or_does_not_answer_fails_500(self):
-        self.ami.answers['dialplan reload'] = ('Error', [], 0)
+        self.ami.answers['pbx_config.so'] = ('Error', 'An unknown error occurred', 0)
         status, body = self.request('POST', '/exec_request_handlers', '{"ipbx": ["dialplan reload", "module reload res_pjsip.so"]}')
         self.assertEqual(status, 500, body)
-        self.assertIn('refused', body)
+        self.assertIn('refused Reload pbx_config.so', body)
         # The next ones are not run.
-        self.assertEqual(self.ami.commands(), ['dialplan reload'])
+        self.assertEqual(self.ami.commands(), ['Reload pbx_config.so'])
         # Events, and never the answer: an error, not a wait.
-        self.ami.answers['dialplan reload'] = ('Success', [], 1000)
+        self.ami.answers['pbx_config.so'] = ('Success', 'Module Reloaded', 1000)
         self.assertEqual(self.request('POST', '/exec_request_handlers', '{"ipbx": ["dialplan reload"]}')[0], 500)
         # Under the bound, the answer after the events is found.
-        self.ami.answers['dialplan reload'] = ('Success', [], 50)
+        self.ami.answers['pbx_config.so'] = ('Success', 'Module Reloaded', 50)
         self.assertEqual(self.request('POST', '/exec_request_handlers', '{"ipbx": ["dialplan reload"]}')[0], 200)
 
     def test_a_login_refused_or_an_ami_out_of_reach_fails_500(self):
@@ -236,12 +271,12 @@ class Sysconfd(unittest.TestCase):
         self.assertEqual(self.request('POST', '/exec_request_handlers', '{"ipbx": ["dialplan reload"]}')[0], 500)
 
     def test_a_voicemail_reload_is_checked_by_the_mailboxes_asterisk_has_after_it(self):
-        self.ami.answers['voicemail show users'] = ('Success', SHOW_USERS, 0)
         self.assertEqual(self.request('POST', '/exec_request_handlers', '{"ipbx": ["voicemail reload"]}')[0], 200)
         self.assertEqual(self.confgend.asked, ['asterisk/voicemail.conf'])
-        self.assertEqual(self.ami.commands(), ['voicemail reload', 'voicemail show users'])
-        # A reload that said Success but did not read the configuration: Jean's mailbox is not in Asterisk.
-        self.ami.answers['voicemail show users'] = ('Success', SHOW_USERS[:2] + ['1 voicemail users configured.'], 0)
+        self.assertEqual(self.ami.commands(), ['Reload app_voicemail.so', 'VoicemailUsersList'])
+        # A reload that said Success but did not read the configuration: Jean's mailbox is not in Asterisk (the entry of
+        # another session's list, at 102 or not, says nothing of this one's).
+        self.ami.listed = [e for e in LISTED if e['VoiceMailbox'] != '102']
         status, body = self.request('POST', '/exec_request_handlers', '{"ipbx": ["voicemail reload"]}')
         self.assertEqual(status, 500, body)
         self.assertIn(f'102@{CONTEXT}', body)
@@ -252,9 +287,9 @@ class Sysconfd(unittest.TestCase):
         self.assertEqual(self.request('POST', '/exec_request_handlers', '{"ipbx": ["voicemail reload"]}')[0], 500)
         self.assertEqual(self.ami.commands(), [])
 
-    def test_the_mailboxes_of_a_voicemail_conf_and_of_voicemail_show_users(self):
+    def test_the_mailboxes_of_a_voicemail_conf_and_of_the_amis_list(self):
         self.assertEqual(sysconfd.mailboxes_of(VOICEMAIL_CONF), {(CONTEXT, '101'), (CONTEXT, '102')})
-        self.assertEqual(sysconfd.mailboxes_shown(SHOW_USERS), {(CONTEXT, '101'), (CONTEXT, '102')})
+        self.assertEqual(sysconfd.mailboxes_listed(LISTED + [{'VMContext': '../x', 'VoiceMailbox': '1'}, {'VMContext': CONTEXT}]), {(CONTEXT, '101'), (CONTEXT, '102'), ('default', '1234')})
 
 
 if __name__ == '__main__':

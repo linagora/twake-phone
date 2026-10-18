@@ -123,19 +123,28 @@ class CheckLoopback(unittest.TestCase):
         # Another SIP transport than the one Asterisk was told to bind.
         self.assertEqual(check_loopback.check({'wazo-asterisk': [(pid, 'asterisk')]}, f'127.0.0.1:{ports[0] + 1}', self.as_asterisk)[0], {})
 
-    def test_one_per_family_an_ephemeral_port_udp_only(self):
-        # A free UDP port below the ephemeral range.
+    def fixed_port(self):
+        """A free UDP port below the ephemeral range (ip_local_port_range)."""
         low, _ = check_loopback.ephemeral()
-        fixed = None
         for port in range(low - 1, max(1024, low - 2000), -1):
             try:
                 with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
                     s.bind(('0.0.0.0', port))
-                fixed = port
-                break
+                return port
             except OSError:
                 continue
-        self.assertIsNotNone(fixed)
+        self.fail('no free port below the ephemeral range')
+
+    def test_the_only_listener_on_every_address_at_a_fixed_port_fails_in_the_ioqueue_of_asterisk(self):
+        # Third review 11a, n°9: everything of PJSIP's DNS client but its port, one outside ip_local_port_range.
+        fixed = self.fixed_port()
+        pid, ports = self.listener([{'address': '127.0.0.1', 'epoll': 0}, {'address': '0.0.0.0', 'port': fixed, 'epoll': 0}])
+        allowed, bad, _ = check_loopback.check({'wazo-asterisk': [(pid, 'asterisk')]}, f'127.0.0.1:{ports[0]}', self.as_asterisk)
+        self.assertEqual(allowed, {})
+        self.assertEqual(bad, [f'wazo-asterisk (asterisk, pid {pid}): udp 0.0.0.0:{fixed}'])
+
+    def test_one_per_family_an_ephemeral_port_udp_only(self):
+        fixed = self.fixed_port()
         pid, ports = self.listener([
             {'address': '127.0.0.1', 'epoll': 0},
             {'address': '0.0.0.0', 'epoll': 0},

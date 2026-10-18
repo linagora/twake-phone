@@ -1361,7 +1361,11 @@ export const storeContract = (name: string, make: () => Promise<Store>) =>
       await new Promise(r => setTimeout(r, wait + 20))
       expect(await write('gw_two')).not.toBeNull()
       // Its renewal keeps the time it writes from, and writes until a third of the lease before its end.
-      expect((await s.takeWebhookLease(WEBHOOK_STATE_ROLE, 'gw_two', 600, 2))!.writeFrom).toBe(taken!.writeFrom)
+      const renewed = await s.takeWebhookLease(WEBHOOK_STATE_ROLE, 'gw_two', 600, 2)
+      expect(renewed!.writeFrom).toBe(taken!.writeFrom)
+      const left = Date.parse(renewed!.writeUntil) - Date.parse(await s.clock())
+      expect(left).toBeGreaterThan(300)
+      expect(left).toBeLessThanOrEqual(400)
       // Given back: another one takes it at once, and writes a third of its lease later (what was under way done).
       expect(await s.takeWebhookLease(WEBHOOK_STATE_ROLE, 'gw_two', 0)).toBeNull()
       const next = await s.takeWebhookLease(WEBHOOK_STATE_ROLE, 'gw_one', 600, 1)

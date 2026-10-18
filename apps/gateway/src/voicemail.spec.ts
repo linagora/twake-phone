@@ -10,8 +10,8 @@ import { DirectorySync } from './directory-sync.js'
 import { EventBus } from './events.js'
 import { ProviderRegistry } from './registry.js'
 import { MemoryStore } from './store/memory.js'
-import { holderSecretOf, retentionDaysOf, wazoFromEnv } from './voicemail.js'
-import { WEBHOOK_STATE_ROLE } from './store/types.js'
+import { holderSecretOf, retentionDaysOf, voicemailMismatch, wazoFromEnv } from './voicemail.js'
+import { voicemailRole } from './voicemail-lease.js'
 
 const until = async (what: string, fn: () => boolean, timeout = 3_000) => {
   const start = Date.now()
@@ -36,25 +36,44 @@ const fakeVoicemail = () => {
   let down = false
   /** What the next synchronisations hold back (second review 11a, n°9), and the `release` each one was given. */
   let heldBack: VoicemailSync['heldBack']
-  const releases: boolean[] = []
+  const releases: string[] = []
   /** Called during a synchronisation, after the reads (another Gateway changing a holder meanwhile). */
   let during: (() => Promise<void>) | undefined
+  /** Called once the voicemail server is written, before the synchronisation answers. */
+  let after: (() => Promise<void>) | undefined
+  /** What a synchronisation given a release finds held back instead (the mass changed since the administrator saw it). */
+  let atRelease: VoicemailSync['heldBack']
+  /** Synchronisations waiting for `hold`'s gate. */
+  let waiting = 0
   const owned: VoicemailOwner[] = []
+  /** The id of the mailbox at each extension (`box-<extension>-<holder>`), as the events name it. */
+  const boxIds = new Map<string, string>()
   const mine = (o: VoicemailOwner) => holders.get(o.extension) === o.userId
   const vm: VoicemailProvider = {
     id: 'fake-wazo',
     getStatus: () => (down ? 'DISCONNECTED' : 'CONNECTED'),
     getStatusReason: () => (down ? 'voicemail server not reached' : undefined),
     async syncMailboxes(list, options = {}) {
-      if (gate) await gate
-      if (fail-- > 0) throw new Error('voicemail server not reached')
+      if (gate) {
+        waiting++
+        await gate
+        waiting--
+      }
+      if (fail-- > 0 || down) throw new Error('voicemail server not reached')
       syncs.push(list.map(h => `${h.extension}=${h.userId}`).sort().join(','))
-      releases.push(!!options.release)
+      releases.push(options.release ? JSON.stringify(options.release) : '')
       // Before any change: the mailboxes already at their holder's extension.
       await options.beforeChanges?.(list.filter(h => holders.get(h.extension) === h.userId).map(h => ({ extension: h.extension, mailbox: `${h.extension}@ctx` })))
       await during?.()
-      // Let go: what was held back is done.
-      if (options.release) heldBack = undefined
+      // As the provider: nothing written once it may no longer write.
+      if (options.mayWrite && !options.mayWrite()) throw new Error('stopped: the mailboxes are no longer this Gateway\'s to write')
+      if (options.release && atRelease) {
+        heldBack = atRelease
+        atRelease = undefined
+      }
+      // Let go: what was held back is done, when the release names exactly that.
+      const released = !!heldBack && !!options.release && JSON.stringify(options.release) === JSON.stringify(heldBack)
+      if (released) heldBack = undefined
       const held = heldBack
       for (const [ext, user] of [...holders]) {
         if (list.some(h => h.extension === ext && h.userId === user)) continue
@@ -66,11 +85,16 @@ const fakeVoicemail = () => {
         holders.set(h.extension, h.userId)
         messages.set(h.extension, [])
       }
-      return { boxes: list.map(h => ({ extension: h.extension, mailbox: `${h.extension}@ctx` })), failed: 0, ...(held ? { heldBack: held } : {}) }
+      for (const h of list) if (!boxIds.has(h.extension)) boxIds.set(h.extension, `box-${h.extension}-${h.userId}`)
+      for (const ext of [...boxIds.keys()]) if (!holders.has(ext)) boxIds.delete(ext)
+      for (const h of list) boxIds.set(h.extension, `box-${h.extension}-${h.userId}`)
+      await after?.()
+      return { boxes: list.map(h => ({ extension: h.extension, mailbox: `${h.extension}@ctx` })), failed: 0, ...(held ? { heldBack: held } : {}), ...(released ? { released: true } : {}) }
     },
+    // With the mailbox of an event: that very mailbox must be the one at the extension, the person's (as provider-wazo).
     owns: async o => {
       owned.push(o)
-      return mine(o)
+      return mine(o) && (o.mailbox === undefined || boxIds.get(o.extension) === o.mailbox)
     },
     async listMessages(o) {
       if (down) throw new Error('fetch failed')
@@ -136,12 +160,16 @@ const fakeVoicemail = () => {
   return {
     vm,
     holders,
+    boxIds,
     messages,
     syncs,
     releases,
     owned,
     holdBack: (h: VoicemailSync['heldBack']) => void (heldBack = h),
     duringSync: (fn: (() => Promise<void>) | undefined) => void (during = fn),
+    afterSync: (fn: (() => Promise<void>) | undefined) => void (after = fn),
+    foundAtRelease: (h: VoicemailSync['heldBack']) => void (atRelease = h),
+    waiting: () => waiting,
     emit,
     purges,
     erased,
@@ -165,6 +193,8 @@ const sipServer = (withMailboxes = true, access?: boolean | 'error') => {
   /** What the SIP server was told, in order. */
   const order: string[] = []
   const asked = { access: 0 }
+  /** Called at each set, after it is written (a test acting between two writes); withdrawals that fail first. */
+  const hooks: { onSet?: (boxes: VoicemailBox[]) => Promise<void>; failWithdraw: number } = { failWithdraw: 0 }
   const provider = {
     ...(access !== undefined
       ? {
@@ -184,8 +214,10 @@ const sipServer = (withMailboxes = true, access?: boolean | 'error') => {
           setVoicemailBoxes: async (boxes: VoicemailBox[]) => {
             given.push(boxes)
             order.push(`set ${boxes.map(b => b.extension).join(',')}`)
+            await hooks.onSet?.(boxes)
           },
           withdrawVoicemailBoxes: async (extensions: string[]) => {
+            if (hooks.failWithdraw-- > 0) throw new Error('database down a moment')
             withdrawn.push(extensions)
             order.push(`withdraw ${extensions.join(',')}`)
           }
@@ -195,14 +227,16 @@ const sipServer = (withMailboxes = true, access?: boolean | 'error') => {
     close: async () => {}
   }
   const factory: ProviderFactory<unknown> = { type: 'sip', create: () => provider as unknown as TelephonyProvider }
-  return { factory, given, withdrawn, asked, order }
+  return { factory, given, withdrawn, asked, order, hooks }
 }
 
-const setup = async (opts: { withMailboxes?: boolean; access?: boolean | 'error'; voicemail?: boolean; directorySync?: DirectorySync; store?: MemoryStore; slow?: boolean; retentionDays?: number; purgeMs?: number; syncMs?: number; hub?: boolean; accessCacheMs?: number } = {}) => {
+const setup = async (opts: { withMailboxes?: boolean; access?: boolean | 'error'; voicemail?: boolean | 'other-tenant'; directorySync?: DirectorySync; store?: MemoryStore; slow?: boolean; retentionDays?: number; purgeMs?: number; syncMs?: number; hub?: boolean; accessCacheMs?: number; changeMs?: number; alertMs?: number; mapped?: boolean } = {}) => {
   process.env.AUTH_MODE = 'dev'
   const store = opts.store ?? new MemoryStore()
-  await store.upsertMapping({ tenantId: 'A', userId: 'alice', extension: '101', displayName: 'Alice Martin' })
-  await store.upsertMapping({ tenantId: 'A', userId: 'jean', extension: '102' })
+  if (opts.mapped !== false) {
+    await store.upsertMapping({ tenantId: 'A', userId: 'alice', extension: '101', displayName: 'Alice Martin' })
+    await store.upsertMapping({ tenantId: 'A', userId: 'jean', extension: '102' })
+  }
   const sip = sipServer(opts.withMailboxes ?? true, opts.access)
   const wazo = fakeVoicemail()
   const release = opts.slow ? wazo.hold() : undefined
@@ -213,15 +247,20 @@ const setup = async (opts: { withMailboxes?: boolean; access?: boolean | 'error'
     bus,
     directory: new StoreDirectory(store),
     tickets: new TicketStore(),
-    ...(opts.voicemail === false ? {} : { voicemail: (t: string) => (t === 'A' ? wazo.vm : undefined) }),
+    // 'other-tenant': a voicemail server for another tenant only, none for A.
+    ...(opts.voicemail === false ? {} : { voicemail: (t: string) => (t === (opts.voicemail === 'other-tenant' ? 'B' : 'A') ? wazo.vm : undefined) }),
     ...(opts.directorySync ? { directorySync: opts.directorySync } : {}),
     admin: { adminRole: 'twakephone-admin', adminUsers: new Set(['A:root']) },
     ...(opts.retentionDays !== undefined ? { voicemailRetentionDays: opts.retentionDays } : {}),
     ...(opts.purgeMs !== undefined ? { voicemailPurgeMs: opts.purgeMs } : {}),
     ...(opts.syncMs !== undefined ? { voicemailSyncMs: opts.syncMs } : {}),
     ...(opts.accessCacheMs !== undefined ? { voicemailAccessCacheMs: opts.accessCacheMs } : {}),
-    // The hub of the webhooks: its lease says which Gateway synchronises the mailboxes (second review 11a, n°1).
+    ...(opts.changeMs !== undefined ? { voicemailChangeMs: opts.changeMs } : {}),
+    ...(opts.alertMs !== undefined ? { voicemailAlertMs: opts.alertMs } : {}),
+    // The hub of the webhooks (its lease no longer says who writes the mailboxes: their own does, third review 11a).
     ...(opts.hub ? { secretsKey: randomBytes(32), webhooks: { pollMs: 20, stateLeaseMs: 300, streamSettleMs: 0 }, trunkWatchMs: 0 } : {}),
+    // The lease of the mailboxes, short: renewed every 100 ms, the next holder writing 100 ms after the last one could.
+    voicemailLeaseMs: 300,
     voicemailRetryMs: [20]
   })
   if (opts.hub) await app.ready()
@@ -234,6 +273,12 @@ const setup = async (opts: { withMailboxes?: boolean; access?: boolean | 'error'
   }
   return { app, as, store, sip, wazo, heard, release }
 }
+
+const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
+/** Another Gateway takes the lease of the mailboxes of A (a greater weight: at once). */
+const steal = (store: MemoryStore) => store.takeWebhookLease(voicemailRole('A'), 'gw_other', 60_000, 99)
+/** A change of holder marked by another Gateway (VOICEMAIL_CHANGED): the one that writes the mailboxes synchronises. */
+const changed = (store: MemoryStore) => store.putOperatorState('A', 'voicemail:changed', { at: `${Date.now()}-${Math.random()}` })
 
 const message = (id: string, over: Partial<Voicemail> = {}): Voicemail => ({ id, from: '101', fromName: 'Alice Martin', receivedAt: '2026-10-18T02:12:04.000Z', durationSec: 7, unread: true, ...over })
 
@@ -347,11 +392,15 @@ describe('the mailboxes (step 11a)', () => {
     await said.app.close()
   })
 
-  it('empties what the SIP server kept of mailboxes when the Gateway starts without a voicemail server (review 11a, n°14)', async () => {
-    const { app, sip } = await setup({ voicemail: false })
-    await until('the empty list', () => sip.given.length === 1)
-    expect(sip.given).toEqual([[]])
-    await app.close()
+  it('leaves the mailboxes of the SIP server alone when the Gateway has no voicemail server (third review 11a, n°3)', async () => {
+    for (const voicemail of [false, 'other-tenant'] as const) {
+      const { app, sip, store } = await setup({ voicemail })
+      await sleep(300)
+      expect([sip.given, sip.withdrawn]).toEqual([[], []])
+      // It takes no lease of the mailboxes: another Gateway takes it at once, at the lowest weight.
+      expect(await store.takeWebhookLease(voicemailRole('A'), 'gw_other', 300, 1)).toBeTruthy()
+      await app.close()
+    }
   })
 
   it("streams a recording, and breaks the answer off when it passes the provider's bound (review 11a, n°3)", async () => {
@@ -473,66 +522,284 @@ describe('the mailboxes (step 11a)', () => {
 })
 
 describe('the mailboxes, with several Gateways (second review 11a)', () => {
-  it('synchronises them and purges the messages on the Gateway that leads only, from when it takes the lease (n°1)', async () => {
+  it('synchronises them and purges the messages on the Gateway that holds the lease of the mailboxes only, from when it takes it (n°1; third review, n°2)', async () => {
     const store = new MemoryStore()
-    // Another Gateway leads when this one starts.
-    expect(await store.takeWebhookLease(WEBHOOK_STATE_ROLE, 'gw_other', 60_000, 99)).toBeTruthy()
-    const { app, wazo, sip } = await setup({ store, hub: true, syncMs: 30, purgeMs: 30 })
+    // Another Gateway writes them when this one starts.
+    expect(await store.takeWebhookLease(voicemailRole('A'), 'gw_other', 60_000, 99)).toBeTruthy()
+    const { app, wazo, sip } = await setup({ store, syncMs: 30, purgeMs: 30 })
     await new Promise(r => setTimeout(r, 250))
     expect(wazo.syncs).toEqual([])
     expect(wazo.purges).toEqual([])
     expect(sip.given).toEqual([])
     // It lets the lease go: this one takes it, synchronises and purges.
-    await store.takeWebhookLease(WEBHOOK_STATE_ROLE, 'gw_other', 0)
+    await store.takeWebhookLease(voicemailRole('A'), 'gw_other', 0)
     await until('the mailboxes', () => sip.given.length >= 2, 5_000)
     expect(wazo.syncs[0]).toBe('101=alice,102=jean')
     await until('a purge', () => wazo.purges.length >= 1)
     await app.close()
   })
 
-  it('leaves the mailboxes of the SIP server alone on a Gateway that does not lead, even with no voicemail server of its own (n°1)', async () => {
+  it('never lets a Gateway without a voicemail server write the mailboxes, nor stop the one that has one (third review 11a, n°3)', async () => {
     const store = new MemoryStore()
-    expect(await store.takeWebhookLease(WEBHOOK_STATE_ROLE, 'gw_other', 60_000, 99)).toBeTruthy()
-    const { app, sip } = await setup({ store, hub: true, voicemail: false })
-    await new Promise(r => setTimeout(r, 250))
-    expect(sip.given).toEqual([])
-    // Once it leads, it says the SIP server has none.
-    await store.takeWebhookLease(WEBHOOK_STATE_ROLE, 'gw_other', 0)
-    await until('the mailboxes emptied', () => sip.given.length >= 1, 5_000)
-    expect(sip.given[0]).toEqual([])
+    const people = [
+      { id: 'alice', displayName: 'Alice Martin', numbers: [{ type: 'extension' as const, number: '101' }] },
+      { id: 'jean', displayName: 'Jean', numbers: [{ type: 'extension' as const, number: '102' }] }
+    ]
+    const directory = { listAll: async () => people } as unknown as ContactDirectory
+    const directorySync = new DirectorySync({ store, directory, tenantId: 'A' })
+    const without = await setup({ store, voicemail: false, directorySync })
+    const withWazo = await setup({ store, mapped: false, changeMs: 30 })
+    await until('the mailboxes, by the Gateway with Wazo', () => withWazo.sip.given.length >= 2, 5_000)
+    await directorySync.run()
+    await sleep(300)
+    expect([without.sip.given, without.sip.withdrawn]).toEqual([[], []])
+    // The one with Wazo goes on writing them: a change of holder, on the Gateway without Wazo, is withdrawn there at
+    // once (an extension given to someone else never sends calls to the previous holder) and written by the other.
+    people[1] = { id: 'marie', displayName: 'Marie', numbers: [{ type: 'extension' as const, number: '102' }] }
+    await directorySync.run()
+    await until('the withdrawal', () => without.sip.withdrawn.some(w => w.includes('102')))
+    await until('written by the one with Wazo', () => withWazo.wazo.syncs.some(s => s.includes('102=marie')) && withWazo.sip.given.at(-1)!.some(b => b.extension === '102'))
+    expect(without.sip.given).toEqual([])
+    await withWazo.app.close()
+    await without.app.close()
+  })
+
+  it('gives the mailboxes to a Gateway that reaches its voicemail server over one that does not (third review 11a, n°11)', async () => {
+    const store = new MemoryStore()
+    const first = await setup({ store })
+    await until('the mailboxes, by the first', () => first.sip.given.length >= 2, 5_000)
+    // Its Wazo goes away: it can no longer synchronise; a second one, whose Wazo answers, takes them over.
+    first.wazo.down(true)
+    const second = await setup({ store, mapped: false, syncMs: 50 })
+    await until('the mailboxes, by the second', () => second.wazo.syncs.length >= 1 && second.sip.given.length >= 2, 5_000)
+    const n = first.wazo.syncs.length
+    first.wazo.down(false)
+    await new Promise(r => setTimeout(r, 300))
+    // The first, whose Wazo is back, does not take them back (the same weight: the holder keeps the lease).
+    expect(first.wazo.syncs.length).toBe(n)
+    await first.app.close()
+    await second.app.close()
+  })
+
+  it('stops before the voicemail server writes once it lost the lease mid-round, and leaves the release asked (third review 11a, n°2)', async () => {
+    const store = new MemoryStore()
+    const { app, as, wazo, sip } = await setup({ store, changeMs: 30 })
+    await until('the mailboxes', () => sip.given.length >= 2)
+    const held = async () => (await app.inject({ url: '/api/v1/admin/voicemail', headers: as('root') })).json()
+    wazo.holdBack({ park: 3, of: 4 })
+    await changed(store)
+    let seen: { heldBack?: unknown; release?: unknown } = {}
+    await until('held back', () => (void held().then(h => (seen = h)), !!seen.heldBack))
+    // The round the release asks loses the lease once it read the holders, before the voicemail server changes anything.
+    wazo.duringSync(async () => {
+      wazo.duringSync(undefined)
+      await steal(store)
+      await sleep(250)
+    })
+    const syncs = wazo.syncs.length
+    const sets = sip.given.length
+    expect((await app.inject({ method: 'POST', url: '/api/v1/admin/voicemail/release', headers: as('root'), payload: { park: 3, of: 4 } })).statusCode).toBe(202)
+    await until('the round', () => wazo.syncs.length > syncs)
+    await sleep(500)
+    // One round, stopped there: the mailboxes at their holder handed before, nothing after; no other round.
+    expect(wazo.syncs.length).toBe(syncs + 1)
+    expect(wazo.releases.at(-1)).toBe(JSON.stringify({ park: 3, of: 4 }))
+    expect(sip.given.length).toBe(sets + 1)
+    // The release is left for the Gateway that writes them now, and what was held stays held.
+    expect(await held()).toMatchObject({ heldBack: { park: 3, of: 4 }, release: { park: 3, of: 4, by: 'root', state: 'asked' } })
     await app.close()
   })
 
-  it('tells the voicemail server which mailbox an event was of, for it to say whether it is the holder\'s (n°2)', async () => {
+  it('hands the SIP server nothing more once it lost the lease after the voicemail server wrote (third review 11a, n°2)', async () => {
+    const store = new MemoryStore()
+    const { app, wazo, sip } = await setup({ store, changeMs: 30 })
+    await until('the mailboxes', () => sip.given.length >= 2)
+    await sleep(100)
+    wazo.afterSync(async () => {
+      wazo.afterSync(undefined)
+      await steal(store)
+      await sleep(250)
+    })
+    const syncs = wazo.syncs.length
+    const sets = sip.given.length
+    await changed(store)
+    await until('the round', () => wazo.syncs.length > syncs)
+    await sleep(500)
+    expect(wazo.syncs.length).toBe(syncs + 1)
+    expect(sip.given.length).toBe(sets + 1)
+    await app.close()
+  })
+
+  it('starts no other round once it lost the lease after its last write, though one more was asked, and keeps nothing of it (third review 11a, n°2)', async () => {
+    const store = new MemoryStore()
+    const { app, as, wazo, sip } = await setup({ store, changeMs: 30 })
+    await until('the mailboxes', () => sip.given.length >= 2)
+    await sleep(100)
+    // The round: Jean leaves 102 to Marie meanwhile (one more round asked), the lease lost right after the last write.
+    wazo.duringSync(async () => {
+      wazo.duringSync(undefined)
+      await store.deleteMapping('A', 'jean')
+      await store.upsertMapping({ tenantId: 'A', userId: 'marie', extension: '102' })
+    })
+    wazo.holdBack({ park: 1, of: 2 })
+    const sets = sip.given.length
+    sip.hooks.onSet = async () => {
+      if (sip.given.length !== sets + 2) return
+      await steal(store)
+      await sleep(250)
+    }
+    const syncs = wazo.syncs.length
+    await changed(store)
+    await until('the round', () => sip.given.length >= sets + 2)
+    await sleep(500)
+    expect(wazo.syncs.length).toBe(syncs + 1)
+    expect(sip.given.length).toBe(sets + 2)
+    // Withdrawn all the same (any Gateway withdraws), and what the round held back not kept: no longer its to say.
+    expect(sip.withdrawn.at(-1)).toEqual(['102'])
+    expect((await app.inject({ url: '/api/v1/admin/voicemail', headers: as('root') })).json()).toEqual({})
+    await app.close()
+  })
+
+  it('hears of a change of holder another Gateway made, at once, and tries a withdrawal that failed again (third review 11a, n°5)', async () => {
+    const store = new MemoryStore()
+    const people = [
+      { id: 'alice', displayName: 'Alice Martin', numbers: [{ type: 'extension' as const, number: '101' }] },
+      { id: 'jean', displayName: 'Jean', numbers: [{ type: 'extension' as const, number: '102' }] }
+    ]
+    const directory = { listAll: async () => people } as unknown as ContactDirectory
+    const leader = await setup({ store, changeMs: 30 })
+    await until('the mailboxes', () => leader.sip.given.length >= 2, 5_000)
+    // Another Gateway, which does not write the mailboxes, hears the directory give 102 to Marie.
+    const directorySync = new DirectorySync({ store, directory, tenantId: 'A' })
+    const other = await setup({ store, mapped: false, directorySync })
+    await directorySync.run()
+    other.sip.hooks.failWithdraw = 1
+    people[1] = { id: 'marie', displayName: 'Marie', numbers: [{ type: 'extension' as const, number: '102' }] }
+    await directorySync.run()
+    // It withdraws 102 there (once more after a failure), and the one that writes them gives Marie hers.
+    await until('the withdrawal', () => other.sip.withdrawn.some(w => w.includes('102')), 5_000)
+    await until('the leader synchronises', () => leader.wazo.syncs.some(s => s.includes('102=marie')), 5_000)
+    expect(other.wazo.syncs).toEqual([])
+    await other.app.close()
+    await leader.app.close()
+  })
+
+  it('never undoes a withdrawal with a round that read the holders before it (third review 11a, n°1)', async () => {
+    const store = new MemoryStore()
+    const people = [
+      { id: 'alice', displayName: 'Alice Martin', numbers: [{ type: 'extension' as const, number: '101' }] },
+      { id: 'jean', displayName: 'Jean', numbers: [{ type: 'extension' as const, number: '102' }] }
+    ]
+    const directory = { listAll: async () => people } as unknown as ContactDirectory
+    const directorySync = new DirectorySync({ store, directory, tenantId: 'A' })
+    const { app, wazo, sip } = await setup({ store, directorySync, changeMs: 30 })
+    await until('the mailboxes', () => sip.given.length >= 2)
+    await directorySync.run()
+    await until('idle', () => wazo.syncs.length >= 2 && wazo.waiting() === 0)
+    await sleep(100)
+    // A round waits for a slow Wazo, its holders read (Jean at 102, his mailbox there). Meanwhile 102 passes to Marie.
+    const release = wazo.hold()
+    await changed(store)
+    await until('the round waiting', () => wazo.waiting() === 1)
+    sip.order.length = 0
+    people[1] = { id: 'marie', displayName: 'Marie', numbers: [{ type: 'extension' as const, number: '102' }] }
+    await directorySync.run()
+    await until('the withdrawal', () => sip.order.includes('withdraw 102'))
+    release()
+    await until('the round with Marie', () => sip.order.includes('set 101,102'), 5_000)
+    // Between the withdrawal and the round that read Marie at 102, nothing hands 102 to the SIP server: not the
+    // older round's list before its changes, nor its list after them.
+    const from = sip.order.indexOf('withdraw 102')
+    const last = sip.order.indexOf('set 101,102')
+    expect(sip.order.slice(from, last).filter(o => o.startsWith('set') && o.includes('102'))).toEqual([])
+    // The older round handed its list before its changes, without 102, then the one after them, without 102 too.
+    expect(sip.order.slice(from, last).filter(o => o.startsWith('set')).length).toBeGreaterThanOrEqual(2)
+    expect(wazo.syncs.at(-1)).toBe('101=alice,102=marie')
+    expect(wazo.holders.get('102')).toBe('marie')
+    await app.close()
+  })
+
+  it('tells the administrators when the synchronisation keeps failing (third review 11a, n°11)', async () => {
+    const store = new MemoryStore()
+    const { app, wazo } = await setup({ store, alertMs: 60 })
+    wazo.failNext(1_000)
+    let alerted = false
+    await until('the alert', () => (void store.listAlerts('A').then(a => (alerted = a.some(x => x.alert.kind === 'voicemail' && x.alert.param === 'sync-failing'))), alerted), 5_000)
+    const alerts = await store.listAlerts('A')
+    expect(alerts.filter(a => a.alert.kind === 'voicemail')).toHaveLength(1)
+    await app.close()
+  })
+
+  it('tells the voicemail server which mailbox an event was of, for it to say whether it is the holder\'s (n°2; third review, n°12)', async () => {
     const { app, wazo, sip, heard } = await setup()
     await until('the mailboxes', () => sip.given.length === 2)
     const jean = heard('jean')
-    wazo.emit({ extension: '102', mailbox: '7', event: { type: 'voicemail.created', timestamp: '2026-10-18T02:12:07.000Z', payload: { voicemail: message('m1') } } })
+    // A mailbox that is no longer the one at 102 (moved by another Gateway, or someone else's): told to nobody.
+    wazo.emit({ extension: '102', mailbox: 'box-102-someone', event: { type: 'voicemail.created', timestamp: '2026-10-18T02:12:06.000Z', payload: { voicemail: message('m0') } } })
+    wazo.emit({ extension: '102', mailbox: wazo.boxIds.get('102')!, event: { type: 'voicemail.created', timestamp: '2026-10-18T02:12:07.000Z', payload: { voicemail: message('m1') } } })
     await until('the event', () => jean.length === 1)
-    expect(wazo.owned).toEqual([{ extension: '102', userId: 'jean', mailbox: '7' }])
+    expect(jean.map(e => (e.payload as { voicemail: { id: string } }).voicemail.id)).toEqual(['m1'])
+    expect(wazo.owned).toEqual([
+      { extension: '102', userId: 'jean', mailbox: 'box-102-someone' },
+      { extension: '102', userId: 'jean', mailbox: 'box-102-jean' }
+    ])
     await app.close()
   })
 
-  it('keeps what a synchronisation held back for the administrators, and lets it go when one of them says so (n°9)', async () => {
+  it('keeps what a synchronisation held back for the administrators, and lets go the very mass one of them saw (n°9; third review, n°6 and n°15)', async () => {
     const { app, as, wazo, sip } = await setup({ syncMs: 40 })
     await until('the mailboxes', () => sip.given.length >= 2)
     expect((await app.inject({ url: '/api/v1/admin/voicemail', headers: as('root') })).json()).toEqual({})
-    expect((await app.inject({ method: 'POST', url: '/api/v1/admin/voicemail/release', headers: as('root') })).json()).toMatchObject({ code: 'VOICEMAIL_NOTHING_HELD' })
+    expect((await app.inject({ method: 'POST', url: '/api/v1/admin/voicemail/release', headers: as('root'), payload: { park: 3, of: 4 } })).json()).toMatchObject({ code: 'VOICEMAIL_NOTHING_HELD' })
+    // Administrators only, to read it and to let it go.
     expect((await app.inject({ url: '/api/v1/admin/voicemail', headers: as('jean') })).statusCode).toBe(403)
     // The next synchronisation holds three of four back: kept, with when it started.
     wazo.holdBack({ park: 3, of: 4 })
     const held = async () => (await app.inject({ url: '/api/v1/admin/voicemail', headers: as('root') })).json()
-    let seen: { heldBack?: { park?: number; of?: number; since?: string } } = {}
+    let seen: { heldBack?: { park?: number; of?: number; since?: string }; release?: unknown; releases?: { applied: boolean; by: string; park?: number; of: number }[] } = {}
     await until('held back', () => (void held().then(h => (seen = h)), !!seen.heldBack))
     expect(seen.heldBack).toMatchObject({ park: 3, of: 4, since: expect.any(String) })
     expect(wazo.releases.every(r => !r)).toBe(true)
-    // An administrator says it is meant: the next synchronisation lets them go, and nothing is held any more.
-    const res = await app.inject({ method: 'POST', url: '/api/v1/admin/voicemail/release', headers: as('root') })
-    expect([res.statusCode, res.json()]).toEqual([202, { release: 'asked' }])
-    await until('the release', () => wazo.releases.includes(true))
-    await until('nothing held', () => (void held().then(h => (seen = h)), !seen.heldBack && !('release' in seen)))
+    expect((await app.inject({ method: 'POST', url: '/api/v1/admin/voicemail/release', headers: as('jean'), payload: { park: 3, of: 4 } })).statusCode).toBe(403)
+    // The counts seen are said, and must be what is held now.
+    expect((await app.inject({ method: 'POST', url: '/api/v1/admin/voicemail/release', headers: as('root') })).json()).toMatchObject({ code: 'VOICEMAIL_RELEASE_COUNTS' })
+    expect((await app.inject({ method: 'POST', url: '/api/v1/admin/voicemail/release', headers: as('root'), payload: { park: 'all', of: 4 } })).statusCode).toBe(400)
+    const changed = await app.inject({ method: 'POST', url: '/api/v1/admin/voicemail/release', headers: as('root'), payload: { park: 2, of: 4 } })
+    expect([changed.statusCode, changed.json().code, changed.json().heldBack]).toEqual([409, 'VOICEMAIL_HELD_CHANGED', expect.objectContaining({ park: 3, of: 4 })])
+    expect(wazo.releases.every(r => !r)).toBe(true)
+    // Meant: the next synchronisation is given those counts; it found them, they go, and nothing is held any more.
+    const res = await app.inject({ method: 'POST', url: '/api/v1/admin/voicemail/release', headers: as('root'), payload: { park: 3, of: 4 } })
+    expect([res.statusCode, res.json()]).toEqual([202, { release: 'asked', applied: 'at the next synchronisation of the mailboxes' }])
+    await until('the release', () => wazo.releases.includes(JSON.stringify({ park: 3, of: 4 })))
+    await until('nothing held', () => (void held().then(h => (seen = h)), !seen.heldBack && !seen.release))
     expect(wazo.releases.filter(r => r)).toHaveLength(1)
+    expect(seen.releases).toEqual([expect.objectContaining({ park: 3, of: 4, by: 'root', applied: true })])
+    // Another mass appears; a release asked for it finds yet another at the next round: not applied, held again, said.
+    wazo.holdBack({ park: 4, of: 5 })
+    await until('held back again', () => (void held().then(h => (seen = h)), !!seen.heldBack))
+    wazo.foundAtRelease({ park: 5, of: 5 })
+    expect((await app.inject({ method: 'POST', url: '/api/v1/admin/voicemail/release', headers: as('root'), payload: { park: 4, of: 5 } })).statusCode).toBe(202)
+    await until('the release used', () => (void held().then(h => (seen = h)), (seen.releases?.length ?? 0) === 2))
+    expect(seen.releases![0]).toMatchObject({ park: 4, of: 5, applied: false })
+    await until('held back with what it found', () => (void held().then(h => (seen = h)), (seen.heldBack)?.park === 5))
     await app.close()
+  })
+
+  it('answers the administrators from the store on every Gateway, one without a voicemail server too (third review 11a, n°15)', async () => {
+    const store = new MemoryStore()
+    const leader = await setup({ store, changeMs: 30, syncMs: 0 })
+    await until('the mailboxes', () => leader.sip.given.length >= 2)
+    leader.wazo.holdBack({ park: 3, of: 4 })
+    await store.upsertMapping({ tenantId: 'A', userId: 'bob', extension: '103' })
+    await store.putOperatorState('A', 'voicemail:changed', { at: new Date().toISOString() })
+    const without = await setup({ store, voicemail: false, mapped: false })
+    let seen: { heldBack?: unknown } = {}
+    await until('held back, read on the other', () => (void without.app.inject({ url: '/api/v1/admin/voicemail', headers: without.as('root') }).then(r => (seen = r.json())), !!seen.heldBack), 5_000)
+    // Let go there: the Gateway that writes the mailboxes hears of it at its next look.
+    expect((await without.app.inject({ method: 'POST', url: '/api/v1/admin/voicemail/release', headers: without.as('root'), payload: { park: 3, of: 4 } })).statusCode).toBe(202)
+    await until('the release, on the leader', () => leader.wazo.releases.includes(JSON.stringify({ park: 3, of: 4 })), 5_000)
+    await without.app.close()
+    await leader.app.close()
   })
 
   it('reads whether the SIP server sends calls to the mailboxes once in a while, and says nothing when it did not answer (n°21)', async () => {
@@ -550,6 +817,19 @@ describe('the mailboxes, with several Gateways (second review 11a)', () => {
     await fresh.app.inject({ url: '/api/v1/capabilities', headers: fresh.as('jean') })
     expect(fresh.sip.asked.access).toBe(2)
     await fresh.app.close()
+  })
+})
+
+describe('voicemailMismatch (third review 11a, n°3 and n°10)', () => {
+  it("says at the start what differs from OpenSIPS's view of the mailboxes, its own bound of a call to one", () => {
+    expect(voicemailMismatch({ maxMessageSec: 180 }, { on: true, maxCallSec: 300 })).toEqual([])
+    expect(voicemailMismatch({ maxMessageSec: 300 }, { on: true, maxCallSec: 300 })).toEqual([])
+    expect(voicemailMismatch({ maxMessageSec: 180 }, { on: true, maxCallSec: 120 })).toEqual([expect.stringMatching(/^VOICEMAIL_MAX_SEC \(180 s\) is longer than OpenSIPS lets a call to a mailbox last \(its VOICEMAIL_MAX_CALL_SEC, 120 s\)/)])
+    expect(voicemailMismatch({ maxMessageSec: 180 }, { on: true })).toEqual([])
+    expect(voicemailMismatch({ maxMessageSec: 180 }, { on: false, maxCallSec: 300 })).toEqual([expect.stringMatching(/OpenSIPS sends no call to the mailboxes/)])
+    expect(voicemailMismatch(undefined, { on: true, maxCallSec: 300 })).toEqual([expect.stringMatching(/this Gateway has no voicemail server/)])
+    expect(voicemailMismatch(undefined, { on: false })).toEqual([])
+    expect(voicemailMismatch({ maxMessageSec: 600 }, undefined)).toEqual([])
   })
 })
 

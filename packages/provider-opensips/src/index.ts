@@ -400,6 +400,19 @@ export class OpensipsProvider implements TelephonyProvider, MediaProvider {
   }
 
   /**
+   * What OpenSIPS has of the mailboxes (third review 11a, n°10): whether it sends calls to them (wazo_on), and the
+   * longest such a call lasts (vm_max_sec, VOICEMAIL_MAX_CALL_SEC), its shared variables (MI shv_get). Undefined when it
+   * cannot be asked or did not say; `maxCallSec` undefined from an OpenSIPS that does not have it.
+   */
+  async getVoicemailSettings(): Promise<{ on: boolean; maxCallSec?: number } | undefined> {
+    const vars = await this.sharedVariables()
+    const on = vars?.find(v => v.name === 'wazo_on')?.value
+    if (on === undefined) return undefined
+    const max = Number(vars?.find(v => v.name === 'vm_max_sec')?.value)
+    return { on: Number(on) === 1, ...(Number.isSafeInteger(max) && max > 0 ? { maxCallSec: max } : {}) }
+  }
+
+  /**
    * OpenSIPS's shared variables (MI shv_get), undefined when it cannot be asked. OpenSIPS 3.6 answers a list of lists
    * of them (found by the SIP e2e: read as `{ VARs }` only, nothing was ever found); `{ VARs }` is read as well.
    */

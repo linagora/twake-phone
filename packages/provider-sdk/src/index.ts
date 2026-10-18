@@ -100,6 +100,11 @@ export interface TelephonyProvider {
    */
   getVoicemailAccess?(): Promise<boolean | undefined>
   /**
+   * What the SIP server has of the mailboxes (third review 11a, n°10): whether it sends calls to them, and the longest
+   * such a call lasts, in seconds; undefined when it cannot say. The Gateway says at its start when its own differ.
+   */
+  getVoicemailSettings?(): Promise<{ on: boolean; maxCallSec?: number } | undefined>
+  /**
    * The mailboxes of the tenant (step 11a, ADR 0022), as the voicemail server named them (VoicemailProvider's
    * syncMailboxes): replaces the list. A call to one of these extensions that nobody answers, that its "do not disturb"
    * refuses, busy or that reaches nobody goes to `mailbox`; an extension not in it has none.
@@ -183,7 +188,16 @@ export interface VoicemailSync {
    * What was held back, too many at once (second review 11a, n°9): `park`, mailboxes of people who no longer hold an
    * extension, left where they are; `remove`, mailboxes aside past their grace period, kept. Until `release`.
    */
-  heldBack?: { park?: number; remove?: number; of: number }
+  heldBack?: VoicemailHeldBack
+  /** The release given (VoicemailSyncOptions' `release`) was applied: what it named was done. */
+  released?: boolean
+}
+
+/** What a synchronisation held back (VoicemailSync's `heldBack`), as it counted it. */
+export interface VoicemailHeldBack {
+  park?: number
+  remove?: number
+  of: number
 }
 
 export interface VoicemailSyncOptions {
@@ -192,8 +206,17 @@ export interface VoicemailSyncOptions {
    * extension: the SIP server keeps only those meanwhile (second review 11a, n°3).
    */
   beforeChanges?(boxes: VoicemailBox[]): Promise<void>
-  /** What was held back (heldBack) goes this time: an administrator said it was meant. */
-  release?: boolean
+  /**
+   * What was held back goes this time: an administrator said it was meant, having seen these counts (third review 11a,
+   * n°6). Applied only when the synchronisation finds exactly what was seen (VoicemailSync's `released`): a different
+   * mass, larger or not, is held back again for them to see.
+   */
+  release?: VoicemailHeldBack
+  /**
+   * Asked before each change of the voicemail server (third review 11a, n°2): false, the synchronisation stops there
+   * and rejects (the Gateway lost the right to write the mailboxes).
+   */
+  mayWrite?(): boolean
 }
 
 /**
@@ -203,6 +226,8 @@ export interface VoicemailSyncOptions {
  */
 export interface VoicemailProvider {
   readonly id: string
+  /** The longest a message lasts, in seconds, when the provider bounds it (compared with the SIP server's calls). */
+  readonly maxMessageSec?: number
   getStatus(): ProviderStatus
   /** Why the status is not CONNECTED, in a few words without addresses or secrets. */
   getStatusReason?(): string | undefined
@@ -232,8 +257,11 @@ export interface VoicemailProvider {
   deleteMessage(owner: VoicemailOwner, id: string): Promise<boolean>
   /** Deletes every message of the person, in any mailbox held for them (step 10's erasure); how many. */
   eraseMessages(owner: Pick<VoicemailOwner, 'userId'>): Promise<number>
-  /** Deletes the messages left before `before`, in every mailbox (the retention period); how many. */
-  purgeMessages(before: Date): Promise<number>
+  /**
+   * Deletes the messages left before `before`, in every mailbox (the retention period); how many. `mayWrite` is asked
+   * before each deletion: false, it stops there.
+   */
+  purgeMessages(before: Date, options?: { mayWrite?(): boolean }): Promise<number>
   /**
    * The `voicemail.*` events, by the extension of the mailbox (a message left, read, deleted), whichever screen or
    * phone did it. The Gateway tells them to the extension's holder if it is the mailbox's (owns).

@@ -94,6 +94,16 @@ export class WazoError extends Error {
   }
 }
 
+/**
+ * A synchronisation or a purge stopped before its next change: the Gateway may no longer write the mailboxes
+ * (VoicemailSyncOptions' mayWrite, third review 11a, n°2).
+ */
+export class WazoStopped extends Error {
+  constructor() {
+    super('the mailboxes are no longer this Gateway\'s to write: stopped before the next change')
+  }
+}
+
 /** A mailbox number as Wazo's Asterisk takes it, and as OpenSIPS reads it (provider-opensips' MAILBOX). */
 const NUMBER = /^[0-9]{1,40}$/
 /** A message id as wazo-calld makes them (`1792289524-00000004`): nothing else reaches a URL. */
@@ -113,6 +123,8 @@ const PARKED = /^0000([0-9]{10})([0-9]{10})$/
 const parkedNumber = (at: number, id: number) => `0000${String(Math.floor(at / 1000)).padStart(10, '0')}${String(id).padStart(10, '0')}`
 const PAGE = 500
 const DAY_MS = 86_400_000
+/** How long the mailbox an event was read with stands for `owns` of that event (the same mailbox, read once). */
+const EVENT_READ_MS = 2_000
 
 interface WazoContext {
   id: number
@@ -150,6 +162,12 @@ interface WazoFolder {
 }
 
 const str = (v: unknown, max: number) => (typeof v === 'string' ? v.trim().slice(0, max) : '')
+
+/**
+ * Whom a mailbox is for: the first of its users that stands for someone (its `userfield` one of ours), '' when none
+ * does. The one rule, for the synchronisation, the routes and the events alike (third review 11a, n°14).
+ */
+const holderIn = (vm: WazoMailbox, userOf: (uuid: string) => WazoUser | undefined) => (vm.users ?? []).map(u => userOf(u.uuid)?.userfield).find(f => f?.startsWith(HOLDER)) ?? ''
 
 /** A message as the Gateway shows it: who left it (an extension or a number, never Asterisk's "unknown"), when, how long. */
 export const voicemailOf = (m: WazoMessage, folder: Pick<WazoFolder, 'type'> | undefined): Voicemail => {
@@ -248,7 +266,8 @@ export class WazoVoicemail implements VoicemailProvider {
   private readonly now: () => number
   private readonly graceMs: number
   private readonly maxMessages: number
-  private readonly maxMessageSec: number
+  /** The longest a message lasts, in seconds (maxsecs of each mailbox). */
+  readonly maxMessageSec: number
   private readonly maxSilenceSec: number
   private readonly maxRecordingBytes: number
   private token: { value: string; renewAt: number } | undefined
@@ -272,6 +291,10 @@ export class WazoVoicemail implements VoicemailProvider {
   private reason: string | undefined
   /** What the last synchronisation held back, as said in the log (said again only when it changes). */
   private heldNote: string | undefined
+  /** The last read of each mailbox an event was of (mailboxById), for the `owns` of that event. */
+  private readonly readForEvent = new Map<number, { at: number; box: { vm: WazoMailbox; holder: string } | undefined }>()
+  /** The events of each mailbox, told one after the other in the order wazo-websocketd sent them (third review, n°8). */
+  private readonly eventChains = new Map<number, Promise<void>>()
 
   constructor(private readonly config: WazoConfig) {
     this.id = config.id ?? 'wazo'
@@ -423,12 +446,13 @@ export class WazoVoicemail implements VoicemailProvider {
    * review 11a, n°1): the oldest of that label is the one, read again after making it, and the one made here goes if
    * it is not.
    */
-  private async contextOf(): Promise<WazoContext> {
+  private async contextOf(beforeWrite?: () => void): Promise<WazoContext> {
     if (this.context) return this.context
     const label = this.config.contextLabel ?? 'TwakePhone'
     const ours = async () => (await this.list<WazoContext>('/contexts')).filter(c => c.label === label && (c.type ?? 'internal') === 'internal').sort((a, b) => a.id - b.id)[0]
     let found = await ours()
     if (!found) {
+      beforeWrite?.()
       const made = await this.json<WazoContext>(`${this.config.confdUrl}/contexts`, 'POST', { label, type: 'internal' })
       found = await ours()
       if (!found) throw new WazoError(502, 'the context of the mailboxes is not found after it was made')
@@ -504,24 +528,32 @@ export class WazoVoicemail implements VoicemailProvider {
    * Before any change, `beforeChanges` hears the mailboxes already at their holder's extension (the SIP server keeps
    * only those meanwhile: second review 11a, n°3). One mailbox Wazo refuses to change (a 4xx) is said and left out,
    * the others done (n°8). Too many at once (more than two, and more than half of the mailboxes at an extension: a
-   * directory that came back short, a wrong tenant) is held back until `release` (n°9): the mailboxes of the people
-   * gone stay where they are, reached as before; those past their grace period stay aside. Said once, not at each
-   * synchronisation.
+   * directory that came back short, a wrong tenant) is held back until `release` names exactly that (n°9; third review,
+   * n°6): the mailboxes of the people gone stay where they are, reached as before; those past their grace period stay
+   * aside. Said once, not at each synchronisation. `mayWrite` is asked before each change (third review, n°2).
+   *
+   * A mailbox only ever shows its holder's messages (third review 11a, n°4): one made that has messages already (left
+   * in the spool under its number), or one moved that came with messages it did not have, is let go of its holder and
+   * set aside, nobody's (removed after the grace period); its holder gets a new one.
    */
   async syncMailboxes(holders: { extension: string; userId: string; displayName?: string }[], options: VoicemailSyncOptions = {}): Promise<VoicemailSync> {
-    const context = await this.contextOf()
+    const guard = () => {
+      if (options.mayWrite && !options.mayWrite()) throw new WazoStopped()
+    }
+    const context = await this.contextOf(guard)
     const now = this.now()
     const wanted = new Map<string, { key: string; name: string }>()
     for (const h of holders) if (NUMBER.test(h.extension) && !PARKED.test(h.extension)) wanted.set(h.extension, { key: this.key(h.userId), name: str(h.displayName, 80) || h.extension })
     const keys = new Set([...wanted.values()].map(w => w.key))
     let users = await this.list<WazoUser>('/users?recurse=false')
     const mailboxes = (await this.list<WazoMailbox>('/voicemails?recurse=false')).filter(v => v.context === context.name)
-    const holderOf = (vm: WazoMailbox) => (vm.users ?? []).map(u => users.find(x => x.uuid === u.uuid)?.userfield).find(f => f?.startsWith(HOLDER))
+    const holderOf = (vm: WazoMailbox) => holderIn(vm, uuid => users.find(x => x.uuid === uuid))
     const boxes: VoicemailBox[] = []
-    const counts = { made: 0, moved: 0, parked: 0, removed: 0 }
+    const counts = { made: 0, moved: 0, parked: 0, removed: 0, isolated: 0 }
     let failed = 0
     /** One change of one mailbox: a refusal of Wazo (4xx) is said and counted, Wazo down stops the synchronisation. */
     const attempt = async (what: string, change: () => Promise<void>) => {
+      guard()
       try {
         await change()
         return true
@@ -532,6 +564,18 @@ export class WazoVoicemail implements VoicemailProvider {
         return false
       }
     }
+    /** A mailbox let go of its users and set aside, nobody's: its messages are nobody's here (third review 11a, n°4). */
+    const isolate = async (vm: WazoMailbox) => {
+      for (const u of vm.users ?? []) {
+        guard()
+        await this.json(`${this.config.confdUrl}/users/${u.uuid}/voicemails`, 'DELETE')
+        users = users.map(x => (x.uuid === u.uuid ? { ...x, voicemail: null } : x))
+      }
+      vm.users = []
+      guard()
+      await this.renumber(vm, parkedNumber(now, vm.id), 'TwakePhone', context.name)
+      counts.isolated++
+    }
     // At their holder's extension: they stay.
     const kept = new Map<number, { vm: WazoMailbox; want: { key: string; name: string } }>()
     for (const vm of mailboxes) {
@@ -541,14 +585,19 @@ export class WazoVoicemail implements VoicemailProvider {
       wanted.delete(vm.number)
     }
     // The others at an extension go aside, their extension free for its holder now; but not those of people gone
-    // (their holder holds no extension, nobody holds theirs) when too many go at once.
+    // (their holder holds no extension, nobody holds theirs) when too many go at once, unless an administrator said
+    // that very mass is meant.
     const active = mailboxes.filter(vm => !PARKED.test(vm.number))
+    const release = options.release
+    const sameOf = release !== undefined && release.of === active.length
     const toPark = active.filter(vm => !kept.has(vm.id))
-    const gone = toPark.filter(vm => !wanted.has(vm.number) && !keys.has(holderOf(vm) ?? ''))
-    const holdPark = !options.release && gone.length > 2 && gone.length * 2 > active.length
+    const gone = toPark.filter(vm => !wanted.has(vm.number) && !keys.has(holderOf(vm)))
+    const tooManyGone = gone.length > 2 && gone.length * 2 > active.length
+    const parkReleased = tooManyGone && sameOf && release?.park === gone.length
+    const holdPark = tooManyGone && !parkReleased
     const stay = new Set(holdPark ? gone.map(vm => vm.id) : [])
     const reachable = [...kept.values()].map(k => k.vm).concat(active.filter(vm => stay.has(vm.id)))
-    for (const vm of reachable) this.remember(vm.number, vm.id, holderOf(vm) ?? '')
+    for (const vm of reachable) this.remember(vm.number, vm.id, holderOf(vm))
     await options.beforeChanges?.(reachable.map(vm => ({ extension: vm.number, mailbox: `${vm.number}@${context.name}` })))
     for (const { vm, want } of kept.values()) {
       if (!this.bounded(vm) || vm.name !== want.name) await attempt(`the bounds of mailbox ${vm.id}`, () => this.renumber(vm, vm.number, want.name, context.name))
@@ -567,17 +616,50 @@ export class WazoVoicemail implements VoicemailProvider {
     for (const [extension, want] of wanted) {
       const theirs = aside.find(vm => holderOf(vm) === want.key)
       if (theirs) {
-        if (!(await attempt(`moving mailbox ${theirs.id}`, () => this.renumber(theirs, extension, want.name, context.name)))) continue
+        let had = new Set<string>()
+        const moved = await attempt(`moving mailbox ${theirs.id}`, async () => {
+          had = await this.messageIdsOf(theirs.id)
+          await this.renumber(theirs, extension, want.name, context.name)
+        })
+        if (!moved) continue
         aside.splice(aside.indexOf(theirs), 1)
-        this.remember(extension, theirs.id, want.key)
-        boxes.push({ extension, mailbox: `${extension}@${context.name}` })
-        counts.moved++
-        continue
+        const has = await this.messageIdsOf(theirs.id)
+        const lost = [...had].filter(id => !has.has(id)).length
+        if (lost) {
+          failed++
+          this.log.error(`Wazo: ${lost} message(s) of mailbox ${theirs.id} did not move with it to ${extension} (left in the spool under its number of before, nobody's)`)
+        }
+        if (![...has].some(id => !had.has(id))) {
+          this.remember(extension, theirs.id, want.key)
+          boxes.push({ extension, mailbox: `${extension}@${context.name}` })
+          counts.moved++
+          continue
+        }
+        // It came with messages it did not have (the spool under the extension had some): nobody's.
+        failed++
+        this.log.error(`Wazo: mailbox ${theirs.id} moved to ${extension} shows messages it did not have (left in the spool under that number): set aside, nobody's, and a new one made`)
+        if (!(await attempt(`setting mailbox ${theirs.id} aside, nobody's`, () => isolate(theirs)))) continue
       }
       const made = await attempt(`the mailbox of ${extension}`, async () => {
         const user = users.find(u => u.userfield === want.key && !u.voicemail) ?? (await this.json<WazoUser>(`${this.config.confdUrl}/users`, 'POST', { firstname: want.name.slice(0, 128), userfield: want.key }))
         if (!users.some(u => u.uuid === user.uuid)) users = [...users, { ...user, voicemail: null }]
-        const vm = await this.json<WazoMailbox>(`${this.config.confdUrl}/voicemails`, 'POST', { name: want.name, number: extension, context: context.name, ask_password: false, ...this.bounds() })
+        // Made where the spool still has messages (third review 11a, n°4): those are nobody's here. The mailbox is set
+        // aside before anyone has it (nobody's), and made again, once.
+        let vm: WazoMailbox | undefined
+        for (let round = 0; !vm; round++) {
+          guard()
+          const fresh = await this.json<WazoMailbox>(`${this.config.confdUrl}/voicemails`, 'POST', { name: want.name, number: extension, context: context.name, ask_password: false, ...this.bounds() })
+          if (!(await this.messageIdsOf(fresh.id)).size) {
+            vm = fresh
+            break
+          }
+          this.log.error(`Wazo: the mailbox made at ${extension} shows messages already (left in the spool under that number): set aside, nobody's`)
+          guard()
+          await this.renumber(fresh, parkedNumber(now, fresh.id), 'TwakePhone', context.name)
+          counts.isolated++
+          if (round > 0) throw new WazoError(409, `the spool under ${extension} keeps messages of before`)
+        }
+        guard()
         await this.json(`${this.config.confdUrl}/users/${user.uuid}/voicemails/${vm.id}`, 'PUT')
         users = [...users.filter(u => u.uuid !== user.uuid), { ...user, voicemail: { id: vm.id } }]
         this.remember(extension, vm.id, want.key)
@@ -587,9 +669,11 @@ export class WazoVoicemail implements VoicemailProvider {
       counts.made++
     }
     // Aside past the grace period: removed, unless too many at once (more than two, and more than half of the mailboxes
-    // reached now).
+    // reached now), unless an administrator said that very mass is meant.
     const expired = aside.filter(vm => Number(PARKED.exec(vm.number)?.[1] ?? Infinity) * 1000 + this.graceMs <= now)
-    const holdRemove = !options.release && expired.length > 2 && expired.length * 2 > boxes.length
+    const tooManyExpired = expired.length > 2 && expired.length * 2 > boxes.length
+    const removeReleased = tooManyExpired && sameOf && release?.remove === expired.length
+    const holdRemove = tooManyExpired && !removeReleased
     if (!holdRemove) {
       for (const vm of expired) {
         if (!(await attempt(`removing mailbox ${vm.id}`, () => this.removeMailbox(vm, users)))) continue
@@ -598,7 +682,8 @@ export class WazoVoicemail implements VoicemailProvider {
         users = users.flatMap(u => ((vm.users ?? []).some(x => x.uuid === u.uuid) ? (u.userfield?.startsWith(HOLDER) ? [] : [{ ...u, voicemail: null }]) : [u]))
       }
     }
-    // A user of ours left without a mailbox (one whose making stopped half-way): removed.
+    // A user of ours left without a mailbox (one whose making stopped half-way, one whose mailbox was set aside nobody's):
+    // removed.
     for (const u of users) {
       if (!u.userfield?.startsWith(HOLDER) || u.voicemail) continue
       await attempt(`removing a user without a mailbox`, () => this.json(`${this.config.confdUrl}/users/${u.uuid}`, 'DELETE'))
@@ -610,9 +695,15 @@ export class WazoVoicemail implements VoicemailProvider {
         `Wazo: too many mailboxes at once, held back until an administrator says it is meant:${holdPark ? ` ${gone.length} of ${active.length} of people who hold no extension left where they are` : ''}${holdRemove ? ` ${expired.length} set aside past their grace period kept` : ''}`
       )
     this.heldNote = note
-    if (counts.made || counts.moved || counts.parked || counts.removed)
-      this.log.info(`Wazo: ${counts.made} mailbox(es) made, ${counts.moved} moved to their holder's extension, ${counts.parked} set aside, ${counts.removed} removed (set aside longer than the grace period), ${aside.length - counts.removed} aside`)
-    return { boxes: boxes.sort((a, b) => a.extension.localeCompare(b.extension)), failed, ...(heldBack ? { heldBack } : {}) }
+    if (release && !parkReleased && !removeReleased) this.log.warn(`Wazo: the release of ${JSON.stringify(release)} not applied: this synchronisation did not find that (${note ?? 'nothing held back'})`)
+    if (counts.made || counts.moved || counts.parked || counts.removed || counts.isolated)
+      this.log.info(`Wazo: ${counts.made} mailbox(es) made, ${counts.moved} moved to their holder's extension, ${counts.parked} set aside, ${counts.removed} removed (set aside longer than the grace period), ${counts.isolated} set aside nobody's (messages that were not theirs), ${aside.length - counts.removed} aside`)
+    return { boxes: boxes.sort((a, b) => a.extension.localeCompare(b.extension)), failed, ...(heldBack ? { heldBack } : {}), ...(parkReleased || removeReleased ? { released: true } : {}) }
+  }
+
+  /** The ids of the messages of a mailbox, as wazo-calld lists them (none when it has no spool yet). */
+  private async messageIdsOf(voicemailId: number) {
+    return new Set((await this.rawMessagesOf(voicemailId)).map(({ m }) => m.id))
   }
 
   /** The mailbox of an extension in Wazo now, and whom it is for (another Gateway may have made or moved it since). */
@@ -625,11 +716,20 @@ export class WazoVoicemail implements VoicemailProvider {
       if (known) this.forget(known.id)
       return undefined
     }
-    const uuid = vm.users?.[0]?.uuid
-    const user = uuid ? await this.json<WazoUser>(`${this.config.confdUrl}/users/${uuid}`) : undefined
-    const holder = user?.userfield?.startsWith(HOLDER) ? user.userfield : ''
+    const holder = await this.holderOfBox(vm)
     this.remember(extension, vm.id, holder)
     return { id: vm.id, holder }
+  }
+
+  /** Whom a mailbox is for, its users read from wazo-confd one by one (holderIn: the first of ours). */
+  private async holderOfBox(vm: WazoMailbox) {
+    const read = new Map<string, WazoUser>()
+    for (const u of vm.users ?? []) {
+      const user = await this.json<WazoUser>(`${this.config.confdUrl}/users/${u.uuid}`)
+      if (user) read.set(u.uuid, user)
+      if (user?.userfield?.startsWith(HOLDER)) break
+    }
+    return holderIn(vm, uuid => read.get(uuid))
   }
 
   /**
@@ -645,8 +745,20 @@ export class WazoVoicemail implements VoicemailProvider {
     return box?.holder === holder ? box.id : undefined
   }
 
-  /** A mailbox of the context as Wazo has it now, by its id, and whom it is for; undefined when it has none such. */
-  private async mailboxById(voicemailId: number) {
+  /**
+   * A mailbox of the context as Wazo has it now, by its id, and whom it is for; undefined when it has none such.
+   * `reuseMs`: one read that long ago stands (the event's own read, for its `owns`: third review 11a, n°8).
+   */
+  private async mailboxById(voicemailId: number, reuseMs = 0): Promise<{ vm: WazoMailbox; holder: string } | undefined> {
+    const recent = this.readForEvent.get(voicemailId)
+    if (recent && this.now() - recent.at <= reuseMs) return recent.box
+    const box = await this.readMailbox(voicemailId)
+    this.readForEvent.set(voicemailId, { at: this.now(), box })
+    if (this.readForEvent.size > 1_000) this.readForEvent.delete(this.readForEvent.keys().next().value!)
+    return box
+  }
+
+  private async readMailbox(voicemailId: number) {
     const context = await this.contextOf()
     const res = await this.request(`${this.config.confdUrl}/voicemails/${voicemailId}`)
     if (res.status === 404) {
@@ -660,9 +772,7 @@ export class WazoVoicemail implements VoicemailProvider {
     }
     const vm = (await res.json()) as WazoMailbox
     if (vm.context !== context.name || !NUMBER.test(vm.number ?? '')) return undefined
-    const uuid = vm.users?.[0]?.uuid
-    const user = uuid ? await this.json<WazoUser>(`${this.config.confdUrl}/users/${uuid}`) : undefined
-    return { vm, holder: user?.userfield?.startsWith(HOLDER) ? user.userfield : '' }
+    return { vm, holder: await this.holderOfBox(vm) }
   }
 
   /**
@@ -674,7 +784,7 @@ export class WazoVoicemail implements VoicemailProvider {
     if (owner.mailbox === undefined) return (await this.voicemailIdOf(owner)) !== undefined
     const id = /^[0-9]{1,15}$/.test(owner.mailbox) ? Number(owner.mailbox) : NaN
     if (!Number.isSafeInteger(id) || !NUMBER.test(owner.extension) || PARKED.test(owner.extension)) return false
-    const now = await this.mailboxById(id)
+    const now = await this.mailboxById(id, EVENT_READ_MS)
     if (!now) return false
     this.remember(now.vm.number, id, now.holder)
     // Set aside, its number is out of the extensions: never the owner's extension.
@@ -800,7 +910,7 @@ export class WazoVoicemail implements VoicemailProvider {
    * The messages left before `before`, in every mailbox of the context (those aside too): the retention period. One
    * without a date (Wazo gave none) is not taken for one of 1970: it stays, and it is said (second review 11a, n°22).
    */
-  async purgeMessages(before: Date): Promise<number> {
+  async purgeMessages(before: Date, options: { mayWrite?(): boolean } = {}): Promise<number> {
     const context = await this.contextOf()
     const limit = before.getTime() / 1000
     const mailboxes = (await this.list<WazoMailbox>('/voicemails?recurse=false')).filter(v => v.context === context.name)
@@ -812,7 +922,9 @@ export class WazoVoicemail implements VoicemailProvider {
           undated++
           continue
         }
-        if (m.timestamp < limit && (await this.deleteFrom(vm.id, m.id))) purged++
+        if (m.timestamp >= limit) continue
+        if (options.mayWrite && !options.mayWrite()) throw new WazoStopped()
+        if (await this.deleteFrom(vm.id, m.id)) purged++
       }
     if (purged) this.log.info(`Wazo: ${purged} message(s) older than the retention period deleted`)
     if (undated) this.log.warn(`Wazo: ${undated} message(s) without a date left out of the retention period (delete them in Wazo if they are old)`)
@@ -894,7 +1006,31 @@ export class WazoVoicemail implements VoicemailProvider {
       return
     }
     if (msg.op !== 'event' || !msg.data?.name || !(msg.data.name in EVENTS)) return
-    void this.onEvent(EVENTS[msg.data.name as keyof typeof EVENTS], msg.data.data ?? {}).catch((err: unknown) => this.log.warn(`Wazo: voicemail event not told: ${err instanceof Error ? err.message : String(err)}`))
+    const type = EVENTS[msg.data.name as keyof typeof EVENTS]
+    const payload = msg.data.data ?? {}
+    // One mailbox's events one after the other, as they came (a `created` never told after its `deleted`); those of
+    // different mailboxes side by side.
+    const key = Number(payload.voicemail_id)
+    const chain = (this.eventChains.get(key) ?? Promise.resolve()).then(() => this.tellEvent(type, payload))
+    this.eventChains.set(key, chain)
+    void chain.finally(() => {
+      if (this.eventChains.get(key) === chain) this.eventChains.delete(key)
+    })
+  }
+
+  /** An event told, its mailbox read again once more a moment later when Wazo did not answer, then given up (said). */
+  private async tellEvent(type: (typeof EVENTS)[keyof typeof EVENTS], data: Record<string, unknown>) {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await this.onEvent(type, data)
+      } catch (err) {
+        if (attempt > 0 || this.closed) {
+          this.log.warn(`Wazo: voicemail event not told: ${err instanceof Error ? err.message : String(err)}`)
+          return
+        }
+        await new Promise(resolve => setTimeout(resolve, this.config.reconnectMs?.[0] ?? 1_000).unref?.())
+      }
+    }
   }
 
   private async onEvent(type: (typeof EVENTS)[keyof typeof EVENTS], data: Record<string, unknown>) {

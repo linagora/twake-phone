@@ -478,10 +478,12 @@ export interface WebhookSendQuota {
 
 /**
  * The lease of a role taken or renewed (takeWebhookLease): its holder writes from `writeFrom` (on the store's
- * clock), once what the previous holder was writing is done.
+ * clock), once what the previous holder was writing is done, and until `writeUntil` (a third of the lease before its
+ * end: the next holder writes a third later still), unless it renews it meanwhile.
  */
 export interface WebhookLease {
   writeFrom: string
+  writeUntil: string
 }
 
 /**

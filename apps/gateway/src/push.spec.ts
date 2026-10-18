@@ -192,8 +192,8 @@ describe('/me/push-subscriptions and the calls woken for', () => {
     const webPush = make(store)
     const bus = new EventBus()
     // A synchronisation of the directory that changed who holds which extension, told when the test says so.
-    const changed: ((tenantId: string) => void)[] = []
-    const directorySync = { onChange: (cb: (tenantId: string) => void) => void changed.push(cb) } as unknown as NonNullable<Parameters<typeof buildApp>[1]>['directorySync']
+    const changed: ((tenantId: string, extensions: string[]) => void)[] = []
+    const directorySync = { onChange: (cb: (tenantId: string, extensions: string[]) => void) => void changed.push(cb) } as unknown as NonNullable<Parameters<typeof buildApp>[1]>['directorySync']
     const app = await buildApp(registry, {
       store,
       bus,
@@ -206,7 +206,7 @@ describe('/me/push-subscriptions and the calls woken for', () => {
     })
     registry.startAll()
     const as = (user: string, tenant = 'A') => ({ 'x-dev-user': user, 'x-dev-tenant': tenant })
-    const directoryChanged = (tenantId = 'A') => changed.forEach(cb => cb(tenantId))
+    const directoryChanged = (tenantId = 'A') => changed.forEach(cb => cb(tenantId, []))
     return { app, as, store, rec, bus, webPush, directoryChanged }
   }
 

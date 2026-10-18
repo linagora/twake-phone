@@ -244,9 +244,10 @@ export interface TelephonyAlert {
    * (`reconciliation`, `value` the percentage, `threshold` 99); a removal of the forwards of a line there (third
    * review 10b, n°2 and n°4, `number` the line): left as it was because someone changed it in the manager since
    * (`removal-changed`), let go because the operator no longer has the line (`removal-gone`), owed for over a day
-   * (`removal-late`).
+   * (`removal-late`). `voicemail`: raised by the Gateway (step 11a, third review n°11): the synchronisation of the
+   * mailboxes fails since `value` minutes (`sync-failing`).
    */
-  kind: 'fraud-warning' | 'fraud-critical' | 'limit' | 'rights' | 'emergency' | 'meet' | 'webhook' | 'operator'
+  kind: 'fraud-warning' | 'fraud-critical' | 'limit' | 'rights' | 'emergency' | 'meet' | 'webhook' | 'operator' | 'voicemail'
   param: string
   scope?: 'user' | 'tenant'
   value?: number

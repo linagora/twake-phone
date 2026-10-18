@@ -16,6 +16,12 @@ by its shape (second review 11a, n°4): a UDP socket on 0.0.0.0 (or ::) at a por
 and watched by the same epoll instance (PJSIP's ioqueue) as the SIP transport Asterisk was told to bind
 (WAZO_SIP_LISTEN of the container). One per family at most. Another process, even one named asterisk, a socket of
 Asterisk outside PJSIP's ioqueue, a second one of a family, one at a fixed port: each fails.
+
+What stays (third review 11a, n°9): that socket is a real UDP listener on every address, reading DNS answers from
+any source, as PJSIP's resolver does on any Asterisk. It cannot be taken away from here: without a nameserver in
+/etc/resolv.conf, the C library falls back to 127.0.0.1 and PJSIP makes its socket all the same (tried on this
+stack's image); res_resolver_unbound is not in Wazo's Asterisk. The stack is a development and CI one (ADR 0022);
+on a Wazo, Asterisk's host firewall is Wazo's.
 """
 import ipaddress
 import json

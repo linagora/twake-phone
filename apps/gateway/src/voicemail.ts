@@ -84,6 +84,22 @@ export const wazoFromEnv = (env: NodeJS.ProcessEnv, secretsKey: Buffer | undefin
 export const holderSecretOf = (secretsKey: Buffer) => Buffer.from(hkdfSync('sha256', secretsKey, Buffer.alloc(0), 'twake-phone: holders of mailboxes', 32))
 
 /** VOICEMAIL_RETENTION_DAYS: how long a message is kept (30 days by default; 0: for good). */
+/**
+ * What differs between this Gateway's mailboxes and what OpenSIPS has of them (third review 11a, n°3 and n°10), said at
+ * its start: OpenSIPS sends no call to the mailboxes while this Gateway has a voicemail server, or sends them while it
+ * has none (it then leaves `voicemail_boxes` to a Gateway that has one), or ends a call to a mailbox before the
+ * longest message is left (VOICEMAIL_MAX_SEC against OpenSIPS's own VOICEMAIL_MAX_CALL_SEC, not this Gateway's copy).
+ * Nothing when OpenSIPS could not say.
+ */
+export const voicemailMismatch = (voicemail: { maxMessageSec?: number } | undefined, sip: { on: boolean; maxCallSec?: number } | undefined): string[] => {
+  if (!sip) return []
+  if (!voicemail) return sip.on ? ['OpenSIPS sends calls to the mailboxes (WAZO_SIP) but this Gateway has no voicemail server (WAZO_*): it leaves voicemail_boxes to a Gateway that has one, and the mailboxes stay as they are without one'] : []
+  if (!sip.on) return ['this Gateway has a voicemail server (WAZO_*) but OpenSIPS sends no call to the mailboxes (its WAZO_SIP is empty): nobody reaches them']
+  const max = voicemail.maxMessageSec
+  if (max !== undefined && sip.maxCallSec !== undefined && max > sip.maxCallSec) return [`VOICEMAIL_MAX_SEC (${max} s) is longer than OpenSIPS lets a call to a mailbox last (its VOICEMAIL_MAX_CALL_SEC, ${sip.maxCallSec} s): a message that long is cut; make them agree`]
+  return []
+}
+
 export const retentionDaysOf = (env: NodeJS.ProcessEnv) => {
   const raw = env.VOICEMAIL_RETENTION_DAYS
   if (raw === undefined || raw === '') return 30

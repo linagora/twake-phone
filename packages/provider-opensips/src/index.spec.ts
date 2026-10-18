@@ -458,6 +458,16 @@ describe('OpensipsProvider call rules', () => {
     sips.state.shv = [{ name: 'meet_on', type: 1, value: 1 }]
     expect(await p.getVoicemailAccess()).toBeUndefined()
     expect(await make().getVoicemailAccess()).toBeUndefined()
+    // With the longest call to a mailbox (third review 11a, n°10), as the Gateway compares it at its start.
+    sips.state.shv = [{ name: 'wazo_on', type: 1, value: 1 }, { name: 'vm_max_sec', type: 1, value: 120 }]
+    expect(await p.getVoicemailSettings()).toEqual({ on: true, maxCallSec: 120 })
+    sips.state.shv = [{ name: 'wazo_on', type: 1, value: 0 }]
+    expect(await p.getVoicemailSettings()).toEqual({ on: false })
+    sips.state.shv = [{ name: 'wazo_on', type: 1, value: 1 }, { name: 'vm_max_sec', type: 1, value: 'x' }]
+    expect(await p.getVoicemailSettings()).toEqual({ on: true })
+    sips.state.shv = [{ name: 'meet_on', type: 1, value: 1 }]
+    expect(await p.getVoicemailSettings()).toBeUndefined()
+    expect(await make().getVoicemailSettings()).toBeUndefined()
   })
 
   it('asks OpenSIPS how the trunks are doing (step 7): its servers and registrations, nothing else of its answers', async () => {

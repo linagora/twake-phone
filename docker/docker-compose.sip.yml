@@ -291,7 +291,8 @@ services:
       # This stack's own passwords: the ARI account of wazo-calld and wazo-confd, the database's (set by wazo-db's healthcheck).
       WAZO_ARI_PASSWORD: twake-wazo-dev-only-ari
       WAZO_DB_PASSWORD: twake-wazo-dev-only-db
-      # The AMI account of wazo-sysconfd below (Asterisk commands only, no event: second review 11a, n°16).
+      # The AMI account of wazo-sysconfd below (module reloads and the list of the mailboxes only, no event: second
+      # review 11a, n°16, third review n°13).
       WAZO_SYSCONFD_AMI_PASSWORD: twake-wazo-dev-only-sysconfd
       # The longest a call to a mailbox lasts (review 11a, n°3), as OpenSIPS bounds it.
       VOICEMAIL_MAX_CALL_SEC: ${VOICEMAIL_MAX_CALL_SEC:-300}
@@ -464,9 +465,10 @@ services:
       WAZO_PORT: ${WAZO_PORT:-5095}
       # The longest a call to a mailbox lasts (review 11a, n°3); Asterisk bounds it too.
       VOICEMAIL_MAX_CALL_SEC: ${VOICEMAIL_MAX_CALL_SEC:-300}
-      # The calls to the mailboxes at once per caller and for all, and per hour of a known caller to one mailbox
-      # (second review 11a, n°10).
+      # The calls to the mailboxes at once per caller, of those who hide their number together and for all, and per
+      # hour of a caller to one mailbox (second review 11a, n°10; third review n°7).
       VOICEMAIL_CALLS_PER_CALLER: ${VOICEMAIL_CALLS_PER_CALLER:-2}
+      VOICEMAIL_CALLS_HIDDEN: ${VOICEMAIL_CALLS_HIDDEN:-5}
       VOICEMAIL_CALLS_ALL: ${VOICEMAIL_CALLS_ALL:-30}
       VOICEMAIL_CALLS_PER_HOUR: ${VOICEMAIL_CALLS_PER_HOUR:-10}
     network_mode: host

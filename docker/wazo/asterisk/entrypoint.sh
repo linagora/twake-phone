@@ -13,7 +13,7 @@
 #   WAZO_CONFGEND      wazo-confgend (ip:port, 127.0.0.1:8669 by default)
 #   WAZO_AMI_PASSWORD  the password of wazo-amid's AMI account (this stack's own, as in wazo-amid's configuration)
 #   WAZO_SYSCONFD_AMI_PASSWORD
-#                      the password of the AMI account of docker/wazo/sysconfd.py (its own: Asterisk commands, no event)
+#                      the password of the AMI account of docker/wazo/sysconfd.py (its own: reloads, no event)
 #   WAZO_ARI_PASSWORD  the password of the ARI account of wazo-calld and wazo-confd (this stack's own, as in theirs)
 #   WAZO_DB            Wazo's database (ip:port, 127.0.0.1:54330 by default), WAZO_DB_PASSWORD its password
 #   VOICEMAIL_MAX_CALL_SEC
@@ -141,8 +141,11 @@ icesupport = yes
 EOF
 
 # The AMI, on the loopback: wazo-amid's account, with this stack's password and the rights and filters Wazo gives it,
-# and the account of this stack's wazo-sysconfd (docker/wazo/sysconfd.py: Asterisk commands only, and no event, second
-# review 11a, n°16). The image's manager.d/01-xivo.conf has wazo-amid's account with Wazo's public default password,
+# and the account of this stack's wazo-sysconfd (docker/wazo/sysconfd.py, second review 11a, n°16): no event, and the
+# privileges of the AMI actions it runs only (third review n°13), never `command` (the whole CLI): `system` for Reload
+# (it also allows ModuleLoad and the like, on the modules), `reporting` for VoicemailUsersList. A development and CI
+# stack's (ADR 0022): its password is in the compose file, for any process on the loopback of the host. The image's
+# manager.d/01-xivo.conf has wazo-amid's account with Wazo's public default password,
 # read after this file (the last definition wins), and accounts of services this stack does not run: it goes.
 rm -f /etc/asterisk/manager.d/01-xivo.conf
 cat > /etc/asterisk/manager.d/01-wazo.conf <<EOF
@@ -166,7 +169,7 @@ secret = ${WAZO_SYSCONFD_AMI_PASSWORD}
 deny = 0.0.0.0/0.0.0.0
 permit = 127.0.0.1/255.255.255.255
 read =
-write = command
+write = system,reporting
 EOF
 
 # The HTTP server of ARI, on the loopback (the image's says so; written here so that nothing else decides it), and the
