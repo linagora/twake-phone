@@ -116,7 +116,7 @@ export interface OpensipsConfig {
    */
   outbound?: OutboundTables
   /**
-   * The mailboxes OpenSIPS sends the calls nothing else takes to (step 11a, ADR 0021; `voicemail_boxes`), as the
+   * The mailboxes OpenSIPS sends the calls nothing else takes to (step 11a, ADR 0022; `voicemail_boxes`), as the
    * voicemail server named them. Without it, or without a mailbox for an extension, its calls end as before.
    */
   voicemailBoxes?: VoicemailBoxes

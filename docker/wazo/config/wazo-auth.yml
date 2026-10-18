@@ -1,4 +1,4 @@
-# wazo-auth for the development and CI stack (docker-compose.sip.yml, ADR 0021): on the loopback, Wazo's database and
+# wazo-auth for the development and CI stack (docker-compose.sip.yml, ADR 0022): on the loopback, Wazo's database and
 # bus of this stack. Its first user (`bootstrap_user_*`, every right) is what wazo-bootstrap makes the service accounts
 # with; development values only, as the database's.
 debug: false

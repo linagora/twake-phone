@@ -1,4 +1,4 @@
-# wazo-confd for the development and CI stack (ADR 0021): Wazo's configuration API (the users and voicemails
+# wazo-confd for the development and CI stack (ADR 0022): Wazo's configuration API (the users and voicemails
 # provider-wazo writes), on the loopback. Its sysconfd is wazo-sysconfd.py of this stack (voicemail reloads, a mailbox
 # emptied); there is no provd (Wazo provisions no phone here).
 debug: false

@@ -1,4 +1,4 @@
-# wazo-calld (ADR 0021): the voicemail API provider-wazo reads (messages, recordings, folders) and the events of a new
+# wazo-calld (ADR 0022): the voicemail API provider-wazo reads (messages, recordings, folders) and the events of a new
 # message, from the spool shared with Asterisk.
 debug: false
 log_level: info

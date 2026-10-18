@@ -1,4 +1,4 @@
-# wazo-confgend (ADR 0021): renders Asterisk's voicemail.conf (and its modules.conf, at its start) from Wazo's database.
+# wazo-confgend (ADR 0022): renders Asterisk's voicemail.conf (and its modules.conf, at its start) from Wazo's database.
 debug: false
 listen_address: 127.0.0.1
 listen_port: 8669

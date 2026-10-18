@@ -6,8 +6,8 @@ import { useGateway } from '../../gateway.js'
 import type { Key } from '../../i18n/index.js'
 import { useT } from '../../i18n/useT.js'
 
-const KINDS: NonNullable<AlertFilter['kind']>[] = ['fraud-warning', 'fraud-critical', 'limit', 'rights', 'emergency', 'meet', 'webhook']
-const PARAMS = [...FRAUD_PARAMS, ...OUTBOUND_CAPS, ...TRUNK_OUTBOUND_CLASSES, 'premium', 'burst', 'pin-tries', 'meet-calls', 'call-diverted', 'trunk-changed', 'disabled']
+const KINDS: NonNullable<AlertFilter['kind']>[] = ['fraud-warning', 'fraud-critical', 'limit', 'rights', 'emergency', 'meet', 'webhook', 'operator']
+const PARAMS = [...FRAUD_PARAMS, ...OUTBOUND_CAPS, ...TRUNK_OUTBOUND_CLASSES, 'premium', 'burst', 'pin-tries', 'meet-calls', 'call-diverted', 'trunk-changed', 'disabled', 'unauthorized', 'forbidden', 'reconciliation', 'removal-changed', 'removal-gone', 'removal-late']
 const PAGE = 25
 /** How long after an answer the first page is read again while shown: a repeat counted meanwhile is seen (review 7 n°2). */
 export const ALERTS_REFRESH_MS = 30_000
@@ -19,7 +19,9 @@ const INITIAL = { kind: ALL, param: ALL, state: 'open' }
  * What an alert's `param` names, in words: a threshold, a cap, a class of numbers, a burst of emergency calls, the
  * tries of a room's PIN by phone, the calls to the rooms at the same time, or a room's call that did not go where the
  * Gateway sent it (review 8b, n°3: its grant taken by another call, or LiveKit's trunk pointed elsewhere), or a webhook
- * subscription disabled after a day of failed deliveries (review 10a, n°1) or with too many waiting (second review, n°12).
+ * subscription disabled after a day of failed deliveries (review 10a, n°1) or with too many waiting (second review, n°12),
+ * or the operator of the trunks refusing its keys or reconciling too few calls (review 10b, n°12), or a removal of a
+ * forward there left as changed, let go, or late (third review 10b, n°2 and n°4).
  */
 const paramKey = (alert: Pick<AdminAlert, 'kind' | 'param'>): Key | undefined => {
   if ((FRAUD_PARAMS as readonly string[]).includes(alert.param)) return `admin.fraud.${alert.param}` as Key
@@ -31,6 +33,14 @@ const paramKey = (alert: Pick<AdminAlert, 'kind' | 'param'>): Key | undefined =>
   if (alert.param === 'trunk-changed') return 'admin.alert.trunkChanged'
   if (alert.param === 'disabled') return 'admin.alert.webhookDisabled'
   if (alert.param === 'backlog') return 'admin.alert.webhookBacklog'
+  // The operator of the trunks (review 10b, n°12): its keys refused round after round, too few records reconciled.
+  if (alert.param === 'unauthorized') return 'admin.alert.operatorUnauthorized'
+  if (alert.param === 'forbidden') return 'admin.alert.operatorForbidden'
+  if (alert.param === 'reconciliation') return 'admin.alert.operatorReconciliation'
+  // A removal of a forward at the operator (third review 10b, n°2 and n°4): changed there since, the line unknown, late.
+  if (alert.param === 'removal-changed') return 'admin.alert.operatorRemovalChanged'
+  if (alert.param === 'removal-gone') return 'admin.alert.operatorRemovalGone'
+  if (alert.param === 'removal-late') return 'admin.alert.operatorRemovalLate'
   if ((TRUNK_OUTBOUND_CLASSES as readonly string[]).includes(alert.param) || alert.param === 'premium') return `admin.class.${alert.param}` as Key
   return undefined
 }

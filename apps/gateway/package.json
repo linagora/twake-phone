@@ -20,6 +20,7 @@
     "@fastify/websocket": "^11.0.0",
     "@twake/conference-livekit": "*",
     "@twake/provider-opensips": "*",
+    "@twake/provider-ovh": "*",
     "@twake/provider-wazo": "*",
     "@twake/telephony-provider-sdk": "*",
     "@twake/telephony-types": "*",

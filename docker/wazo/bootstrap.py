@@ -1,4 +1,4 @@
-"""The accounts of the Wazo of the development and CI stack (ADR 0021), as wazo-auth-keys makes them on a Wazo.
+"""The accounts of the Wazo of the development and CI stack (ADR 0022), as wazo-auth-keys makes them on a Wazo.
 
 wazo-confd, wazo-calld, wazo-amid and wazo-websocketd each get an internal account in wazo-auth with the rights
 wazo-auth-keys gives them (its config.yml, tag wazo-26.10), its key written where the service reads it. TwakePhone's

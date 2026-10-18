@@ -40,7 +40,7 @@ interface TrackedCall {
    */
   conference?: boolean
   /**
-   * The mailbox of the callee (the extension dialled) took the call (step 11a, ADR 0021; E_TWAKEPHONE_VOICEMAIL): for
+   * The mailbox of the callee (the extension dialled) took the call (step 11a, ADR 0022; E_TWAKEPHONE_VOICEMAIL): for
    * the caller it is answered, for the callee a missed call, told then, whatever rang; the callee is not busy with it.
    */
   voicemail?: boolean

@@ -42,6 +42,20 @@ describe('DirectorySync', () => {
     expect(await store.getMappingByUser('acme', 'dave')).toBeNull()
   })
 
+  it('keeps the erasure of a history of whom it gives another extension, or none, and forgets it of whom left (fourth review 10b, n°2)', async () => {
+    const people = [person('alice', 'Alice Martin', '101'), person('bob', 'Bob Durand', '102'), person('dave', 'Dave', '104')]
+    const { store, directory, sync } = setup(people)
+    await sync.run()
+    for (const [userId, number] of [['alice', '+33199000101'], ['bob', '+33199000102'], ['dave', '+33199000104']] as const) await store.deleteHistory('acme', userId, [number])
+    // Alice moves to 105, Bob loses his extension, Dave leaves.
+    people.splice(0, 3, person('alice', 'Alice Martin', '105'), person('bob', 'Bob Durand'))
+    directory.listAll = async () => people
+    await sync.run()
+    expect(await store.getMappingByUser('acme', 'alice')).toMatchObject({ extension: '105' })
+    expect([!!(await store.historyErasedAt('acme', 'alice')), !!(await store.historyErasedAt('acme', 'bob')), !!(await store.historyErasedAt('acme', 'dave'))]).toEqual([true, true, false])
+    expect([...(await store.numbersErasedAt('acme', ['+33199000101', '+33199000102', '+33199000104'])).keys()].sort()).toEqual(['+33199000101', '+33199000102'])
+  })
+
   it('lets two people swap extensions', async () => {
     const people = [person('alice', 'Alice', '101'), person('bob', 'Bob', '102')]
     const { store, directory, sync } = setup(people)

@@ -18,7 +18,7 @@
 # route[meet_source]): a call to the access number (MEET_NUMBER) goes to it, which asks for the room's PIN; a call it
 # places for a room (dial-out) answers our challenge, is the call of the person who asked for it (their extension in
 # the From) and follows the path of a call from their phone, the rules of the calls to the public network included.
-# Step 11a (ADR 0021): a call that nothing else takes (a "do not disturb", busy or declined, no answer, nobody to ring,
+# Step 11a (ADR 0022): a call that nothing else takes (a "do not disturb", busy or declined, no answer, nobody to ring,
 # after the forwards and the fallback of a direct number) goes to the mailbox of the extension dialled
 # (`voicemail_boxes`, written by the Gateway), on Wazo's Asterisk, on a UDP socket of its own (route[voicemail]).
 # Everything in here is OpenSIPS-specific; the Gateway only knows `provider-opensips`.
@@ -65,7 +65,7 @@ socket=udp:${TRUNK_LISTEN_IP}:${TRUNK_PORT}${TRUNK_SOCKET_AS}
 # The socket of LiveKit SIP (step 8, ADR 0018): it hears LiveKit SIP's address only (MEET_SIP). None at all when Meet is
 # off (MEET_ON 0, entrypoint.sh). On the loopback by default, like the others.
 ${MEET_SOCKET}
-# The socket of Wazo's Asterisk (step 11a, ADR 0021): it hears that Asterisk only (WAZO_SIP), and only within the calls
+# The socket of Wazo's Asterisk (step 11a, ADR 0022): it hears that Asterisk only (WAZO_SIP), and only within the calls
 # this OpenSIPS sent to a mailbox. None at all when Wazo is off (WAZO_ON 0, entrypoint.sh).
 ${WAZO_SOCKET}
 
@@ -214,7 +214,7 @@ modparam("cfgutils", "shvset", "meet_number=s:${MEET_NUMBER}")
 # The longest a call with LiveKit SIP lasts (MEET_MAX_CALL_SEC): for the calls to come once changed (MI shv_set; the e2e
 # shortens it a moment).
 modparam("cfgutils", "shvset", "meet_max_sec=i:${MEET_MAX_CALL_SEC}")
-# Whether the mailboxes of Wazo are on (step 11a, ADR 0021): WAZO_SIP set (entrypoint.sh). Off, no query names
+# Whether the mailboxes of Wazo are on (step 11a, ADR 0022): WAZO_SIP set (entrypoint.sh). Off, no query names
 # `voicemail_boxes`. When the database says that table is missing, the mailboxes are left out 30 s ($shv(no11_until)),
 # as the tables of step 4c.
 modparam("cfgutils", "shvset", "wazo_on=i:${WAZO_ON}")
@@ -460,7 +460,7 @@ route {
 		$var(meet) = 1;
 	}
 
-	# The socket of Wazo's Asterisk (step 11a, ADR 0021) hears that Asterisk only (WAZO_SIP), any port, and nothing when
+	# The socket of Wazo's Asterisk (step 11a, ADR 0022) hears that Asterisk only (WAZO_SIP), any port, and nothing when
 	# Wazo is off. It never places a call (below); in a call to a mailbox, only its side speaks from there.
 	$var(wazo) = 0;
 	if ($socket_in(ip) == "${WAZO_LISTEN_IP}" && $socket_in(port) == ${WAZO_PORT}) {
@@ -3462,7 +3462,7 @@ route[relay_failed] {
 	exit;
 }
 
-#### Voicemail (step 11a, ADR 0021) ####################################################################################
+#### Voicemail (step 11a, ADR 0022) ####################################################################################
 # A call nothing else takes goes to the mailbox of the extension dialled ($avp(dialled), whatever forward the call
 # followed), read with its rules ($avp(vm_box), route[rules_next]), on Wazo's Asterisk (WAZO_SIP), from Wazo's socket:
 # a "do not disturb" (route[dnd_reply]), nobody to ring (route[unreachable]), no window reached (route[relay_failed]),

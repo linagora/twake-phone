@@ -15,12 +15,14 @@ import {
   checkProfile,
   checkTrunk,
   didRefusal,
+  droppedOperatorLines,
   emptyDid,
   emptyProfile,
   emptyTrunk,
   fraudForm,
   groupRefusal,
   limitsRefusal,
+  newOperatorLines,
   normaliseNumber,
   parseMembers,
   profileRefusal,
@@ -122,6 +124,37 @@ describe('the trunk form (step 7)', () => {
     expect(checkTrunk({ ...intl, countries: '4, 44' }, { ids: [] }).problems.countries?.key).toBe('admin.trunk.err.countriesPrefix')
     expect(checkTrunk({ ...intl, countries: '33' }, { ids: [] }).problems.countries?.key).toBe('admin.trunk.err.countries')
     expect(checkTrunk({ ...operator, countries: '32' }, { ids: [] }).problems.countries?.key).toBe('admin.trunk.err.countriesWithout')
+  })
+
+  it('asks the word of the administrator before a first fallback at the operator replaces what is set there (review 10b, n°13)', () => {
+    const managed: TrunkForm = { ...operator, operatorLines: '0033199000100', fallbackManaged: true, operatorNumber: '+33639980001', onUnavailable: true }
+    expect(checkTrunk(managed, { ids: [] }).problems).toEqual({ replaceConfirmed: { key: 'admin.trunk.err.replaceConfirmed' } })
+    expect(checkTrunk({ ...managed, replaceConfirmed: true }, { ids: [] }).input?.operator).toEqual({ lines: ['0033199000100'], fallback: { number: '+33639980001', onUnavailable: true } })
+    // Kept already: nothing more to confirm; none asked: neither.
+    expect(checkTrunk(managed, { current: { ...kept, operator: { lines: ['0033199000100'], fallback: { number: '+33639980001', onUnavailable: true } } }, ids: ['operator'] }).problems).toEqual({})
+    expect(checkTrunk({ ...managed, fallbackManaged: false }, { ids: [] }).problems).toEqual({})
+    expect(trunkRefusal(refused(409, 'OPERATOR_LINE_SHARED', 'operator.lines: trunk b keeps another fallback on 0033199000100: one fallback a line'))).toEqual({ field: 'form', problem: { key: 'admin.err.operatorLineShared' } })
+  })
+
+  it('asks the same word for a line added to a trunk that keeps a fallback, and names the lines dropped (second review 10b, n°8, n°9)', () => {
+    const current: Trunk = { ...kept, operator: { lines: ['0033199000100', '0033199000200'], fallback: { number: '+33639980001', onUnavailable: true } } }
+    const managed: TrunkForm = { ...operator, operatorLines: '0033199000100, 0033199000300', fallbackManaged: true, operatorNumber: '+33639980001', onUnavailable: true }
+    expect(newOperatorLines(managed, current)).toEqual(['0033199000300'])
+    expect(droppedOperatorLines(managed, current)).toEqual(['0033199000200'])
+    expect(checkTrunk(managed, { current, ids: ['operator'] }).problems).toEqual({ replaceConfirmed: { key: 'admin.trunk.err.replaceConfirmed' } })
+    expect(checkTrunk({ ...managed, replaceConfirmed: true }, { current, ids: ['operator'] }).problems).toEqual({})
+    // A first fallback: all its lines; none asked: none; a trunk that asks none loses nothing.
+    expect(newOperatorLines(managed, null)).toEqual(['0033199000100', '0033199000300'])
+    expect(newOperatorLines({ ...managed, fallbackManaged: false }, current)).toEqual([])
+    expect(droppedOperatorLines(managed, { ...current, operator: { lines: current.operator!.lines } })).toEqual([])
+    // Unticked, the lines kept lose nothing at saving; those dropped do.
+    expect(droppedOperatorLines({ ...managed, fallbackManaged: false }, current)).toEqual(['0033199000200'])
+  })
+
+  it('says a round of the operator that failed (second review 10b, n°6), and a loop either way (n°7)', () => {
+    expect(trunkRefusal(refused(502, 'OPERATOR_ROUND', 'The operator could not be read'))).toEqual({ field: 'form', problem: { key: 'admin.err.operatorRound' } })
+    expect(trunkRefusal(refused(504, 'OPERATOR_ROUND', 'The operator was not read in time'))).toEqual({ field: 'form', problem: { key: 'admin.err.operatorRound' } })
+    expect(trunkRefusal(refused(409, 'OPERATOR_FALLBACK_LOOP', '+33199000300 is the fallback trunk a keeps at the operator: it cannot be a line or the number of a trunk'))).toEqual({ field: 'form', problem: { key: 'admin.err.operatorLoop' } })
   })
 
   it('refuses what the Gateway refuses: a short number as fallback, a bad port, a period out of bounds', () => {

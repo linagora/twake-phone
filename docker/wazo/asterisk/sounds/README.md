@@ -1,4 +1,4 @@
-# Annonces de la messagerie de la stack (étape 11a, ADR 0021)
+# Annonces de la messagerie de la stack (étape 11a, ADR 0022)
 
 L'image d'Asterisk de Wazo (`wazoplatform/asterisk`) n'a aucun fichier de son : sur une installation de Wazo, ses paquets de sons les apportent. Sans eux, `VoiceMail()` s'arrête sur la première annonce qui manque. La stack de développement et de CI monte donc ici, en `fr_FR`, les seules annonces qu'une boîte joue quand un correspondant laisse un message :
 

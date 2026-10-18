@@ -18,7 +18,7 @@
 # the rooms' calls go to it (5090) with the credentials below. The keys and the password are this stack's own, for
 # development and CI only (as twake:twake for PostgreSQL); a deployment sets its own.
 #
-# The mailboxes (step 11a, ADR 0021): Wazo Platform 26.10, its official images, the services a mailbox needs only
+# The mailboxes (step 11a, ADR 0022): Wazo Platform 26.10, its official images, the services a mailbox needs only
 # (below, before OpenSIPS); OpenSIPS sends it the calls nothing else takes, from its socket 5095, to its Asterisk (5100).
 # The platform's identity in Wazo (step 11a, XIVO_UUID of each of its services): the one its database image was made with.
 x-wazo-uuid: &wazo-uuid 50f01d62-b7e9-4485-8fb4-f47d46206def
@@ -137,7 +137,7 @@ services:
       timeout: 3s
       retries: 30
 
-  # Wazo Platform (step 11a, ADR 0021): the voicemail of the people of the platform, behind OpenSIPS, which sends it
+  # Wazo Platform (step 11a, ADR 0022): the voicemail of the people of the platform, behind OpenSIPS, which sends it
   # the calls nobody takes (do not disturb, busy, no answer, nobody there) on a UDP socket of its own (WAZO_PORT,
   # 5095). Wazo's official images of release 26.10, pinned by digest (its database's only by digest: it has no other
   # tag), on the loopback, each on its port: Wazo's database (54330), its bus (RabbitMQ, 5672), wazo-auth (9497),
@@ -434,7 +434,7 @@ services:
       # The database connections of each SIP process for its asynchronous reads (1 to 32): PostgreSQL's max_connections
       # must hold ten times as many and more (above). trunk.sip.mjs lowers it a moment to play what happens past them.
       DB_MAX_ASYNC_CONNECTIONS: ${DB_MAX_ASYNC_CONNECTIONS:-8}
-      # Wazo's Asterisk (step 11a, ADR 0021): its address (empty: no mailboxes), and OpenSIPS's socket for it, the only
+      # Wazo's Asterisk (step 11a, ADR 0022): its address (empty: no mailboxes), and OpenSIPS's socket for it, the only
       # party it takes calls from (its WAZO_OPENSIPS).
       WAZO_SIP: ${WAZO_SIP-127.0.0.1:5100}
       WAZO_LISTEN_IP: ${WAZO_LISTEN_IP:-127.0.0.1}

@@ -12,7 +12,7 @@
   ],
   "scripts": {
     "build": "yarn workspaces run build",
-    "typecheck": "tsc -b packages/telephony-types packages/provider-sdk packages/telephony-client packages/softphone packages/phone-link packages/provider-opensips packages/provider-wazo packages/conference-livekit apps/gateway && tsc -p apps/web --noEmit && tsc -p tsconfig.eslint.json",
+    "typecheck": "tsc -b packages/telephony-types packages/provider-sdk packages/telephony-client packages/softphone packages/phone-link packages/provider-opensips packages/provider-ovh packages/provider-wazo packages/conference-livekit apps/gateway && tsc -p apps/web --noEmit && tsc -p tsconfig.eslint.json",
     "lint": "eslint . --max-warnings 0",
     "test": "vitest run",
     "dev:gateway": "yarn workspace @twake/telephony-gateway dev",

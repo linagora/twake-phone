@@ -1,5 +1,5 @@
 #!/bin/bash
-# Asterisk of Wazo (wazoplatform/asterisk, ADR 0021) for the development and CI stack: Wazo's own configuration, with
+# Asterisk of Wazo (wazoplatform/asterisk, ADR 0022) for the development and CI stack: Wazo's own configuration, with
 # what this stack replaces. Wazo's packaging includes every file of /etc/asterisk/*.d; the files written here take the
 # place of Wazo's for the SIP side (a single trunk, OpenSIPS's socket for Wazo), the media and the dialplan (calls
 # OpenSIPS sends to a mailbox), and add the AMI account of wazo-amid. The voicemails come from Wazo's database through

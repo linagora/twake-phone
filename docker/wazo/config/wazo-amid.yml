@@ -1,4 +1,4 @@
-# wazo-amid (ADR 0021): Asterisk's AMI events onto Wazo's bus (MessageWaiting, a new message, which wazo-calld turns
+# wazo-amid (ADR 0022): Asterisk's AMI events onto Wazo's bus (MessageWaiting, a new message, which wazo-calld turns
 # into its voicemail events), and its actions over REST.
 debug: false
 ami:

@@ -21,6 +21,8 @@ vi.mock('../../gateway.js', () => ({ useGateway: () => gateway }))
 
 const refused = (status: number, code: string, detail: string) => Object.assign(new Error(detail), { status, code, detail })
 const flush = () => act(async () => new Promise<void>(resolve => setTimeout(resolve, 0)))
+/** Past the moment the trunk form waits for the typing to stop before reading the operator's lines again. */
+const settle = () => act(async () => new Promise<void>(resolve => setTimeout(resolve, 350)))
 
 /** Types into a field as a person does: React hears the input event. */
 const type = (el: Element | null, value: string) => {
@@ -81,6 +83,11 @@ const client = (over: Record<string, unknown> = {}) =>
     getTrunkStatus: vi.fn(async () => ({ available: true, items: [{ id: 'operator', registration: { state: 'registered' }, servers: [{ address: 'sip.operator.example', state: 'up' }] }] })),
     setTrunk: vi.fn(),
     deleteTrunk: vi.fn(),
+    getOperatorStatus: vi.fn(async () => ({ configured: false })),
+    syncOperator: vi.fn(),
+    readOperatorLines: vi.fn(async () => ({ items: [] })),
+    removeOperatorFallback: vi.fn(),
+    abandonOperatorRemoval: vi.fn(),
     listDids: vi.fn(async () => ({ items: [] as DidRange[] })),
     setDid: vi.fn(),
     deleteDid: vi.fn(),
@@ -236,7 +243,7 @@ describe('the administration screens (step 7)', () => {
   }
 
   it('puts the focus back on the delete button when told no or Escape, and on what is said once deleted (review 7 n°3)', async () => {
-    const deleteTrunk = vi.fn(async () => undefined)
+    const deleteTrunk = vi.fn(async () => [])
     admin({ deleteTrunk })
     await render('/admin/trunks', <Trunks />)
     const del = () => $('[aria-label="Supprimer le trunk operator"]')
@@ -326,6 +333,321 @@ describe('the administration screens (step 7)', () => {
     await submit($('form'))
     await flush()
     expect(setTrunk).toHaveBeenCalledWith('operator', expect.objectContaining({ auth: 'ip', password: null }))
+  })
+
+  it('keeps the fallback at the operator from the trunk form, checks its delay, and shows each line and the records (step 10b)', async () => {
+    const setTrunk = vi.fn(async () => trunk)
+    const forward = { nature: 'number' as const, number: '+33639980001' }
+    const status = {
+      configured: true,
+      operator: 'ovh',
+      trunks: [
+        {
+          id: 'operator',
+          lines: [
+            { line: '0033199000100', managed: true, inSync: true, readAt: '2026-10-17T10:00:00.000Z', restoredAt: '2026-10-17T10:00:00.000Z', forwards: { onUnavailable: forward, onNoAnswer: { ...forward, afterSec: 150 } } },
+            // Each forward as it is (review 10b, n°4): the voicemail, two numbers.
+            { line: '0033199000200', managed: false, readAt: '2026-10-17T10:00:00.000Z', forwards: { onUnavailable: { nature: 'voicemail' as const }, onNoAnswer: { nature: 'number' as const, number: '+33639980002', afterSec: 30 } } },
+            { line: '0033199000300', managed: true, inSync: false, error: 'refused' as const, rejected: true as const, readAt: '2026-10-17T10:00:00.000Z', forwards: {} },
+            { line: '0033199000400', managed: true, inSync: false, error: 'conflict' as const, readAt: '2026-10-17T10:00:00.000Z', forwards: {} }
+          ]
+        }
+      ],
+      cdrs: { readAt: '2026-10-17T10:00:00.000Z', read: 3, lines: [{ line: '0033199000999', error: 'not-found' as const }], since: '2026-10-10T10:00:00.000Z', stats: { total: 7, matched: 1, orphan: 1, unmatchedInbound: 1, unmatchedOutbound: 0, forwarded: 1, pending: 0, invalid: 1, erased: 2 } }
+    }
+    const syncOperator = vi
+      .fn()
+      .mockRejectedValueOnce(refused(429, 'OPERATOR_RATE', 'The operator was read a moment ago: wait a minute'))
+      .mockRejectedValueOnce(refused(502, 'OPERATOR_ROUND', 'The operator could not be read'))
+    const readOperatorLines = vi.fn(async () => ({ items: [{ line: '0033199000100', forwards: { onUnavailable: { nature: 'voicemail' as const } } }] }))
+    admin({ setTrunk, getOperatorStatus: vi.fn(async () => status), syncOperator, readOperatorLines })
+    await render('/admin/trunks', <Trunks />)
+    const line = $('[aria-label="Lignes chez l\'opérateur"]')?.textContent
+    expect(line).toContain('Ligne 0033199000100 : renvoi sur indisponibilité vers +33 6 39 98 00 01 ; renvoi après 150 s sans réponse vers +33 6 39 98 00 01 · renvoi de repli en place')
+    expect(line).toContain("changé chez l'opérateur, remis en place le")
+    expect(line).toContain('Ligne 0033199000200 : renvoi sur indisponibilité vers la messagerie ; renvoi après 30 s sans réponse vers +33 6 39 98 00 02 · renvoi réglé hors de la plateforme')
+    expect(line).toContain("Ligne 0033199000300 : aucun renvoi · l'opérateur n'a pas gardé ce réglage : enregistrez le trunk pour réessayer")
+    expect(line).toContain('Ligne 0033199000400 : aucun renvoi · deux trunks demandent deux renvois différents sur cette ligne')
+    const records = $('[aria-labelledby="operator"]')?.textContent
+    expect(records).toContain("Reçus par l'opérateur seul1")
+    expect(records).toContain("Ligne 0033199000999 : ligne inconnue de l'opérateur")
+    expect(records).toContain('Illisibles1')
+    expect(records).toContain('Effacés avec un historique2')
+    // Of the calls OVH recorded, those the platform could have had (second review 10b, n°5: the orphan, its forward, the
+    // erased and the unreadable aside): one in two reconciled.
+    expect(records).toMatch(/Taux de rapprochement50\s%/)
+    click(button(host, "Relire l'opérateur maintenant"))
+    await flush()
+    expect(syncOperator).toHaveBeenCalledTimes(1)
+    expect($('[aria-labelledby="operator"]')?.textContent).toContain('patientez une minute')
+    // A round that failed is said so (n°6), never as read.
+    click(button(host, "Relire l'opérateur maintenant"))
+    await flush()
+    expect(syncOperator).toHaveBeenCalledTimes(2)
+    expect($('[aria-labelledby="operator"] [role="alert"]')?.textContent).toBe("L'opérateur n'a pas pu être relu, ou pas à temps : les chiffres affichés sont ceux du relevé précédent.")
+
+    click($('[aria-label="Modifier le trunk operator"]'))
+    await flush()
+    type($('#trunk-operatorLines'), '0033199000100')
+    click($('#trunk-fallbackManaged'))
+    await settle()
+    // A first fallback: what OVH has on the line now, read and shown, replaced on the administrator's word (review 10b,
+    // n°13), and said once read (second review n°17).
+    expect(readOperatorLines).toHaveBeenCalledWith(['0033199000100'])
+    expect($('[aria-label="Réglé chez l\'opérateur maintenant"]')?.textContent).toBe('Ligne 0033199000100 : renvoi sur indisponibilité vers la messagerie')
+    expect($('[aria-label="Réglé chez l\'opérateur maintenant"]')?.parentElement?.getAttribute('role')).toBe('status')
+    // Unavailability by default; on no answer, the delay must leave the 120 s of the inside first.
+    expect(($('#trunk-onUnavailable') as HTMLInputElement).checked).toBe(true)
+    click($('#trunk-onNoAnswer'))
+    type($('#trunk-noAnswerAfterSec'), '120')
+    await submit($('form'))
+    expect(setTrunk).not.toHaveBeenCalled()
+    expect($('#trunk-replaceConfirmed-error')?.textContent).toContain('Cochez cette case pour remplacer')
+    expect($('#trunk-operatorNumber-error')?.textContent).toContain('format international')
+    expect($('#trunk-noAnswerAfterSec-error')?.textContent).toContain('de 121 à 600')
+    expect(document.activeElement?.id).toBe('trunk-replaceConfirmed')
+    click($('#trunk-replaceConfirmed'))
+    type($('#trunk-operatorNumber'), '06 39 98 00 01')
+    type($('#trunk-noAnswerAfterSec'), '150')
+    await submit($('form'))
+    await flush()
+    expect(setTrunk).toHaveBeenCalledWith('operator', expect.objectContaining({ operator: { lines: ['0033199000100'], fallback: { number: '+33639980001', onUnavailable: true, noAnswerAfterSec: 150 } } }))
+  })
+
+  it('removes the fallback a trunk keeps at the operator on demand, once confirmed, and says it goes with the trunk (review 10b, n°13)', async () => {
+    const managed: Trunk = { ...trunk, operator: { lines: ['0033199000100'], fallback: { number: '+33639980001', onUnavailable: true } } }
+    const removeOperatorFallback = vi
+      .fn()
+      .mockResolvedValueOnce({ trunk: { ...trunk, operator: { lines: ['0033199000100'] } }, pending: [] })
+      .mockResolvedValueOnce({ trunk: { ...trunk, operator: { lines: ['0033199000100'] } }, pending: [{ line: '0033199000100', since: '2026-10-17T10:00:00.000Z', error: 'unreachable' }] })
+    // What was there before the platform took the line (third review 10b, n°8): put back, and said so first.
+    const status = {
+      configured: true,
+      operator: 'ovh',
+      trunks: [{ id: 'operator', lines: [{ line: '0033199000100', managed: true, inSync: true, original: { onNoAnswer: { nature: 'voicemail' as const, afterSec: 20 } } }] }],
+      cdrs: { since: '2026-10-10T10:00:00.000Z', stats: { total: 0, matched: 0, orphan: 0, unmatchedInbound: 0, unmatchedOutbound: 0, forwarded: 0, pending: 0, invalid: 0, erased: 0 } }
+    }
+    admin({ listTrunks: vi.fn(async () => ({ items: [managed] })), getOperatorStatus: vi.fn(async () => status), removeOperatorFallback })
+    await render('/admin/trunks', <Trunks />)
+    click($('[aria-label="Supprimer le trunk operator"]'))
+    expect($('[role="group"]')?.getAttribute('aria-label')).toBe(
+      "Supprimer le trunk operator et ses numéros directs ? Le renvoi de repli qu'il tient chez l'opérateur sera retiré de ses lignes. Ligne 0033199000100 : ses renvois d'avant la plateforme seront remis (renvoi après 20 s sans réponse vers la messagerie)."
+    )
+    click(button(host, 'Non, garder'))
+    click($('[aria-label="Retirer le renvoi de repli du trunk operator chez l\'opérateur"]'))
+    expect($('[role="group"]')?.getAttribute('aria-label')).toBe(
+      "Retirer le renvoi de repli des lignes du trunk operator chez l'opérateur ? La plateforme ne le tiendra plus. Ligne 0033199000100 : ses renvois d'avant la plateforme seront remis (renvoi après 20 s sans réponse vers la messagerie)."
+    )
+    expect(removeOperatorFallback).not.toHaveBeenCalled()
+    click(button(host, 'Oui, retirer'))
+    await flush()
+    expect(removeOperatorFallback).toHaveBeenCalledWith('operator')
+    expect(document.activeElement?.textContent).toBe("Le renvoi de repli du trunk operator a été retiré chez l'opérateur.")
+    // Not done yet at the operator (second review 10b, n°1): said so, never as removed.
+    click($('[aria-label="Retirer le renvoi de repli du trunk operator chez l\'opérateur"]'))
+    click(button(host, 'Oui, retirer'))
+    await flush()
+    expect(removeOperatorFallback).toHaveBeenCalledTimes(2)
+    expect(document.activeElement?.getAttribute('role')).toBe('alert')
+    expect(document.activeElement?.textContent).toBe("Le trunk operator ne tient plus de renvoi de repli, mais l'opérateur ne l'a pas encore retiré de 0033199000100 : la plateforme réessaie à chaque relevé.")
+    // Editing a trunk that keeps one already: nothing more to confirm, unless a line is added (n°9).
+    click($('[aria-label="Modifier le trunk operator"]'))
+    await flush()
+    expect($('#trunk-replaceConfirmed')).toBeNull()
+  })
+
+  it('reads, shows and asks before replacing what is set on a line added to a trunk that keeps a fallback, and says what the lines dropped lose (second review 10b, n°8, n°9)', async () => {
+    const managed: Trunk = { ...trunk, operator: { lines: ['0033199000100'], fallback: { number: '+33639980001', onUnavailable: true } } }
+    const status = { configured: true, operator: 'ovh', trunks: [{ id: 'operator', lines: [{ line: '0033199000100', managed: true, inSync: true }] }] }
+    const readOperatorLines = vi.fn(async (lines: string[]) => ({ items: lines.map(line => ({ line, forwards: { onUnavailable: { nature: 'voicemail' as const } } })) }))
+    const setTrunk = vi.fn(async () => managed)
+    admin({ listTrunks: vi.fn(async () => ({ items: [managed] })), getOperatorStatus: vi.fn(async () => status), readOperatorLines, setTrunk })
+    await render(
+      '/admin/trunks',
+      <>
+        <LangSwitch />
+        <Trunks />
+      </>
+    )
+    click($('[aria-label="Modifier le trunk operator"]'))
+    await settle()
+    expect(readOperatorLines).not.toHaveBeenCalled()
+    type($('#trunk-operatorLines'), '0033199000100, 0033199000200')
+    await settle()
+    // Only the line added is read, shown and to be confirmed.
+    expect(readOperatorLines).toHaveBeenCalledTimes(1)
+    expect(readOperatorLines).toHaveBeenCalledWith(['0033199000200'])
+    expect($('[aria-label="Réglé chez l\'opérateur maintenant"]')?.textContent).toBe('Ligne 0033199000200 : renvoi sur indisponibilité vers la messagerie')
+    expect(host.textContent).toContain("Réglé chez l'opérateur maintenant, sur les lignes que ce trunk ne tient pas encore")
+    type($('#trunk-operatorNumber'), '06 39 98 00 01')
+    await submit($('form'))
+    expect(setTrunk).not.toHaveBeenCalled()
+    expect($('#trunk-replaceConfirmed-error')?.textContent).toContain('Cochez cette case pour remplacer')
+    click($('#trunk-replaceConfirmed'))
+    // Another line instead: read again, and the word given no longer holds.
+    type($('#trunk-operatorLines'), '0033199000300')
+    await settle()
+    expect(readOperatorLines).toHaveBeenLastCalledWith(['0033199000300'])
+    expect($('[aria-label="Réglé chez l\'opérateur maintenant"]')?.textContent).toBe('Ligne 0033199000300 : renvoi sur indisponibilité vers la messagerie')
+    expect(($('#trunk-replaceConfirmed') as HTMLInputElement).checked).toBe(false)
+    // The line dropped loses the forward, said before saving.
+    expect(host.textContent).toContain("À l'enregistrement, le renvoi de repli que ce trunk tient sera retiré chez l'opérateur de : 0033199000100.")
+    click($('#trunk-replaceConfirmed'))
+    await submit($('form'))
+    await flush()
+    expect(setTrunk).toHaveBeenCalledWith('operator', expect.objectContaining({ operator: { lines: ['0033199000300'], fallback: { number: '+33639980001', onUnavailable: true } } }))
+    // Unticked, what is set there stays: said so.
+    click($('[aria-label="Modifier le trunk operator"]'))
+    await flush()
+    click($('#trunk-fallbackManaged'))
+    expect(host.textContent).toContain("Décoché, le renvoi posé reste chez l'opérateur sur 0033199000100 : « Retirer le renvoi chez l'opérateur », dans la liste des trunks, l'enlève.")
+    // The separator in the words of each language (n°17).
+    click(button(host, 'English'))
+    await flush()
+    expect($('[aria-label="Lines at the operator"]')?.textContent).toMatch(/^Line 0033199000100: /)
+  })
+
+  it('offers to remove what is left at the operator once a trunk no longer asks a fallback, and shows the removals owed (second review 10b, n°1, n°8)', async () => {
+    const left: Trunk = { ...trunk, operator: { lines: ['0033199000100'] } }
+    const quiet: Trunk = { ...trunk, id: 'quiet', operator: { lines: ['0033199000200'] } }
+    const status = {
+      configured: true,
+      operator: 'ovh',
+      trunks: [
+        { id: 'operator', lines: [{ line: '0033199000100', managed: false, readAt: '2026-10-17T10:00:00.000Z', forwards: { onUnavailable: { nature: 'number' as const, number: '+33639980001' } } }] },
+        { id: 'quiet', lines: [{ line: '0033199000200', managed: false, readAt: '2026-10-17T10:00:00.000Z', forwards: {} }] }
+      ],
+      removals: [{ line: '0033199000900', since: '2026-10-17T10:00:00.000Z', trunkId: 'gone', error: 'unreachable' as const }],
+      cdrs: { since: '2026-10-10T10:00:00.000Z', stats: { total: 0, matched: 0, orphan: 0, unmatchedInbound: 0, unmatchedOutbound: 0, forwarded: 0, pending: 0, invalid: 0, erased: 0 } }
+    }
+    const deleteTrunk = vi.fn(async () => [{ line: '0033199000200', since: '2026-10-17T10:00:00.000Z' }])
+    admin({ listTrunks: vi.fn(async () => ({ items: [left, quiet] })), getOperatorStatus: vi.fn(async () => status), deleteTrunk })
+    await render('/admin/trunks', <Trunks />)
+    // A forward left there, read: it can be removed; none on the other trunk's line: nothing to remove.
+    click($('[aria-label="Retirer le renvoi de repli du trunk operator chez l\'opérateur"]'))
+    expect($('[role="group"]')?.getAttribute('aria-label')).toBe("Retirer les renvois posés chez l'opérateur sur les lignes du trunk operator ? Ceux qu'un autre trunk tient restent.")
+    click(button(host, 'Non, garder'))
+    expect($('[aria-label="Retirer le renvoi de repli du trunk quiet chez l\'opérateur"]')).toBeNull()
+    // The removals owed, a deleted trunk's too.
+    expect($('[aria-label="Renvois pas encore retirés chez l\'opérateur"]')?.textContent).toMatch(
+      /^Ligne 0033199000900 : à retirer depuis le 17\/10\/2026 .* · l'API de l'opérateur ne répond pas · Ligne 0033199000900 : ses renvois d'avant la plateforme ne sont pas connus, ils ne seront pas remis\. Abandonner$/
+    )
+    // Deleted, its forward not removed yet: said so.
+    click($('[aria-label="Supprimer le trunk quiet"]'))
+    click(button(host, 'Oui, supprimer'))
+    await flush()
+    expect(deleteTrunk).toHaveBeenCalledWith('quiet')
+    expect(document.activeElement?.textContent).toBe("Trunk quiet supprimé. L'opérateur n'a pas encore retiré son renvoi de repli de 0033199000200 : la plateforme réessaie à chaque relevé.")
+  })
+
+  it('lets a removal go once confirmed, shows what became of the last ones, and says a line dropped not removed yet (third review 10b, n°2, n°4, n°8, n°11)', async () => {
+    const managed: Trunk = { ...trunk, operator: { lines: ['0033199000100', '0033199000200', '0033199000300'], fallback: { number: '+33639980001', onUnavailable: true } } }
+    const status = {
+      configured: true,
+      operator: 'ovh',
+      trunks: [
+        {
+          id: 'operator',
+          lines: [
+            { line: '0033199000100', managed: true, inSync: true },
+            { line: '0033199000200', managed: true, inSync: true, original: { onNoAnswer: { nature: 'other' as const, afterSec: 20 } } },
+            { line: '0033199000300', managed: true, inSync: true, original: {} }
+          ]
+        }
+      ],
+      removals: [{ line: '0033199000900', since: '2026-10-17T10:00:00.000Z', trunkId: 'gone', error: 'not-found' as const, original: { onUnavailable: { nature: 'voicemail' as const } } }],
+      closedRemovals: [
+        { line: '0033199000800', at: '2026-10-17T11:00:00.000Z', outcome: 'changed' as const, trunkId: 'gone' },
+        { line: '0033199000700', at: '2026-10-17T10:30:00.000Z', outcome: 'done' as const, restored: true as const }
+      ],
+      cdrs: { since: '2026-10-10T10:00:00.000Z', stats: { total: 0, matched: 0, orphan: 0, unmatchedInbound: 0, unmatchedOutbound: 0, forwarded: 0, pending: 0, invalid: 0, erased: 0 } }
+    }
+    const abandonOperatorRemoval = vi.fn(async () => undefined)
+    const setTrunk = vi.fn(async () => ({ ...managed, pending: [{ line: '0033199000300', since: '2026-10-17T12:00:00.000Z', error: 'unreachable' }] }))
+    admin({ listTrunks: vi.fn(async () => ({ items: [managed] })), getOperatorStatus: vi.fn(async () => status), abandonOperatorRemoval, setTrunk })
+    await render('/admin/trunks', <Trunks />)
+    // What is put back, what cannot be, what is not known; nothing said of a line that had none.
+    click($('[aria-label="Retirer le renvoi de repli du trunk operator chez l\'opérateur"]'))
+    expect($('[role="group"]')?.getAttribute('aria-label')).toBe(
+      "Retirer le renvoi de repli des lignes du trunk operator chez l'opérateur ? La plateforme ne le tiendra plus. Ligne 0033199000100 : ses renvois d'avant la plateforme ne sont pas connus, ils ne seront pas remis. Ligne 0033199000200 : ses renvois d'avant la plateforme (renvoi après 20 s sans réponse vers une autre destination) vont où elle ne sait pas écrire, ils ne seront pas remis."
+    )
+    click(button(host, 'Non, garder'))
+    expect($('[aria-label="Renvois pas encore retirés chez l\'opérateur"]')?.textContent).toContain("Ligne 0033199000900 : ses renvois d'avant la plateforme seront remis (renvoi sur indisponibilité vers la messagerie).")
+    expect($('[aria-label="Retraits des 7 derniers jours"]')?.textContent).toMatch(/^Ligne 0033199000800 : changée dans le manager de l'opérateur depuis la demande, laissée telle quelle le 17\/10\/2026 .*Ligne 0033199000700 : renvoi retiré le 17\/10\/2026 .*, ses renvois d'avant remis$/)
+    // Let go, once confirmed.
+    click($('[aria-label="Abandonner le retrait du renvoi de la ligne 0033199000900"]'))
+    expect($('[role="group"]')?.getAttribute('aria-label')).toBe("Abandonner le retrait du renvoi de la ligne 0033199000900 ? La plateforme n'y écrira plus rien, et ce qui y est réglé chez l'opérateur reste.")
+    expect(abandonOperatorRemoval).not.toHaveBeenCalled()
+    click(button(host, 'Oui, abandonner'))
+    await flush()
+    expect(abandonOperatorRemoval).toHaveBeenCalledWith('0033199000900')
+    expect(document.activeElement?.textContent).toBe("Retrait de la ligne 0033199000900 abandonné : ce qui y est réglé chez l'opérateur reste.")
+    // Saved, a line dropped whose fallback the operator did not remove yet: said so, never as saved alone.
+    click($('[aria-label="Modifier le trunk operator"]'))
+    await flush()
+    type($('#trunk-operatorLines'), '0033199000100, 0033199000200')
+    await submit($('form'))
+    await flush()
+    expect(setTrunk).toHaveBeenCalled()
+    expect(host.textContent).toContain("Trunk operator enregistré. L'opérateur n'a pas encore retiré son renvoi de repli de 0033199000300 : la plateforme réessaie à chaque relevé.")
+  })
+
+  it('says what a removal puts back on a trunk unticked too, what the rules of the platform keep it from putting back, and that it was not (fourth review 10b, n°3, n°4, n°7)', async () => {
+    // Unticked: the fallback left at the operator, the forwards of before kept.
+    const left: Trunk = { ...trunk, operator: { lines: ['0033199000100', '0033199000200', '0033199000300'] } }
+    const status = {
+      configured: true,
+      operator: 'ovh',
+      trunks: [
+        {
+          id: 'operator',
+          lines: [
+            { line: '0033199000100', managed: false, readAt: '2026-10-17T10:00:00.000Z', forwards: { onUnavailable: { nature: 'number' as const, number: '+33639980001' } }, original: { onNoAnswer: { nature: 'voicemail' as const, afterSec: 20 } } },
+            { line: '0033199000200', managed: false, readAt: '2026-10-17T10:00:00.000Z', forwards: {}, original: { onUnavailable: { nature: 'number' as const, number: '+33199000101' } }, originalRefused: 'loop' as const },
+            { line: '0033199000300', managed: false, readAt: '2026-10-17T10:00:00.000Z', forwards: {} }
+          ]
+        }
+      ],
+      removals: [{ line: '0033199000900', since: '2026-10-17T10:00:00.000Z', original: { onUnavailable: { nature: 'number' as const, number: '+33899000000' } }, originalRefused: 'outbound' as const }],
+      closedRemovals: [
+        { line: '0033199000800', at: '2026-10-17T11:00:00.000Z', outcome: 'done' as const, unrestored: 'refused' as const },
+        { line: '0033199000700', at: '2026-10-17T10:30:00.000Z', outcome: 'done' as const, unrestored: 'loop' as const }
+      ],
+      cdrs: { since: '2026-10-10T10:00:00.000Z', stats: { total: 0, matched: 0, orphan: 0, unmatchedInbound: 0, unmatchedOutbound: 0, forwarded: 0, pending: 0, invalid: 0, erased: 0 } }
+    }
+    admin({ listTrunks: vi.fn(async () => ({ items: [left] })), getOperatorStatus: vi.fn(async () => status) })
+    await render('/admin/trunks', <Trunks />)
+    click($('[aria-label="Retirer le renvoi de repli du trunk operator chez l\'opérateur"]'))
+    expect($('[role="group"]')?.getAttribute('aria-label')).toBe(
+      "Retirer les renvois posés chez l'opérateur sur les lignes du trunk operator ? Ceux qu'un autre trunk tient restent. Ligne 0033199000100 : ses renvois d'avant la plateforme seront remis (renvoi après 20 s sans réponse vers la messagerie). Ligne 0033199000200 : ses renvois d'avant la plateforme (renvoi sur indisponibilité vers +33 1 99 00 01 01) ne seront pas remis : ils ramèneraient les appels vers la plateforme."
+    )
+    click(button(host, 'Non, garder'))
+    expect($('[aria-label="Renvois pas encore retirés chez l\'opérateur"]')?.textContent).toContain("ne seront pas remis : ils vont vers un numéro que son trunk n'appelle pas.")
+    expect($('[aria-label="Retraits des 7 derniers jours"]')?.textContent).toMatch(
+      /^Ligne 0033199000800 : renvoi retiré le 17\/10\/2026 .*, ses renvois d'avant non remis \(l'opérateur ne les a pas gardés tels quels\)Ligne 0033199000700 : renvoi retiré le 17\/10\/2026 .*, ses renvois d'avant non remis \(ils ramèneraient les appels vers la plateforme\)$/
+    )
+  })
+
+  it('offers no fallback at the operator without one, and puts the refusal of a direct number on the form (step 10b)', async () => {
+    const setTrunk = vi.fn(async () => {
+      throw refused(409, 'OPERATOR_FALLBACK_LOOP', 'operator.fallback.number: +33199000101 is one of the direct numbers of this platform')
+    })
+    admin({ setTrunk })
+    await render('/admin/trunks', <Trunks />)
+    expect($('#operator')).toBeNull()
+    expect(($('#trunk-fallbackManaged') as HTMLInputElement).disabled).toBe(true)
+    expect($('#trunk-fallbackManaged-hint')?.textContent).toContain("Aucun accès à l'API de l'opérateur")
+    // Lines alone: their records are reconciled, the fallback left as it is there.
+    click($('[aria-label="Modifier le trunk operator"]'))
+    await flush()
+    type($('#trunk-operatorLines'), '0033199000100, 0033199000100')
+    await submit($('form'))
+    expect($('#trunk-operatorLines-error')?.textContent).toContain('sans doublon')
+    type($('#trunk-operatorLines'), '0033199000100')
+    await submit($('form'))
+    await flush()
+    expect(setTrunk).toHaveBeenCalledWith('operator', expect.objectContaining({ operator: { lines: ['0033199000100'] } }))
+    expect(text()).toContain('numéro direct de la plateforme')
   })
 
   it("shows the whole setting an assignment made, another administrator's change included, and sends that with its version (review 7 n°1, 11; review 7 bis n°1)", async () => {

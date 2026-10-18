@@ -1,4 +1,4 @@
-# ADR 0021 : La messagerie vocale sur Wazo derrière OpenSIPS : un socket à lui, la boîte de l'extension composée quand rien d'autre ne prend l'appel, une boîte par titulaire
+# ADR 0022 : La messagerie vocale sur Wazo derrière OpenSIPS : un socket à lui, la boîte de l'extension composée quand rien d'autre ne prend l'appel, une boîte par titulaire
 
 Date : 2026-10-18. État : proposée. Décidée à la PR de l'étape 11a, dans le fil de discussion du projet (ligne « 11. Wazo » du plan, découpée en 11a à 11d dans `stories/etape-11-wazo.md`) ; précise l'ADR 0005 pour la messagerie ; remplacé par : aucun.
 

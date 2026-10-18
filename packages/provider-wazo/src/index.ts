@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto'
 import type { RoutedEvent, VoicemailBox, VoicemailOwner, VoicemailProvider } from '@twake/telephony-provider-sdk'
 import type { ProviderStatus, Voicemail } from '@twake/telephony-types'
 
-// Everything about Wazo Platform lives here (step 11a, ADR 0021): the Gateway only sees a VoicemailProvider. Wazo's own
+// Everything about Wazo Platform lives here (step 11a, ADR 0022): the Gateway only sees a VoicemailProvider. Wazo's own
 // words (users, voicemails, folders, contexts) stay inside this package.
 //
 // One Wazo context (`internal`, labelled TwakePhone by default) holds the mailboxes of a tenant: one per extension,
@@ -168,7 +168,7 @@ const EVENTS = {
 } as const
 
 /**
- * The mailboxes of a tenant on Wazo Platform (step 11a, ADR 0021): made and removed as the extensions pass from one
+ * The mailboxes of a tenant on Wazo Platform (step 11a, ADR 0022): made and removed as the extensions pass from one
  * person to another (syncMailboxes), their messages read, marked as read and deleted (wazo-calld), and a message left,
  * read or deleted anywhere told as it happens (wazo-websocketd).
  */

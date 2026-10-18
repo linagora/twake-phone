@@ -244,6 +244,14 @@ services:
       # The platform's public addresses a webhook must never reach, even inside the networks above (its entry point,
       # services that trust this host's address); the addresses of this host's own interfaces are always refused.
       WEBHOOK_DENY_NETWORKS:
+      # OVHcloud, the operator of the trunks (step 10b, ADR 0021): the keys of an application and its consumer key,
+      # and the billing account whose lines carry the trunks (all four, or none: no operator). OVH_ENDPOINT: ovh-eu by
+      # default, ovh-ca or ovh-us, nothing else (no URL; alone, it stops the Gateway). Kept in .env only, never in the database.
+      OVH_APPLICATION_KEY:
+      OVH_APPLICATION_SECRET:
+      OVH_CONSUMER_KEY:
+      OVH_BILLING_ACCOUNT:
+      OVH_ENDPOINT:
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/ready').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"]
       start_period: 120s

@@ -142,16 +142,17 @@ export const CheckGroup = <V extends string>({ id, legend, values, chosen, label
   </fieldset>
 )
 
-export const CheckBox = ({ id, label, checked, onChange, hint, disabled }: { id: string; label: string; checked: boolean; onChange: (v: boolean) => void; hint?: string; disabled?: boolean }) => (
+export const CheckBox = ({ id, label, checked, onChange, hint, error, disabled }: { id: string; label: string; checked: boolean; onChange: (v: boolean) => void; hint?: string; error?: string; disabled?: boolean }) => (
   <div className="field">
     <label className="check" htmlFor={id}>
-      <input type="checkbox" id={id} checked={checked} disabled={disabled} onChange={e => onChange(e.target.checked)} aria-describedby={hint ? `${id}-hint` : undefined} /> {label}
+      <input type="checkbox" id={id} checked={checked} disabled={disabled} onChange={e => onChange(e.target.checked)} aria-invalid={error ? true : undefined} aria-describedby={describedBy(hint && `${id}-hint`, error && `${id}-error`)} /> {label}
     </label>
     {hint ? (
       <span id={`${id}-hint`} className="badge">
         {hint}
       </span>
     ) : null}
+    <FieldError id={id} error={error} />
   </div>
 )
 

@@ -1,9 +1,26 @@
-import { clampLimit, isDeclined, isMissed, type HistoryEntry, type HistoryPage, type HistoryQuery, type ConferenceRecord, type AlertRecord, type AlertQuery, type DidRecord, type OutboundHand, type OutboundRecord, type OutboundRules, ALERT_DEDUP_MS, alertKey, type ProviderRecord, type StoredAlert, type PushSaveResult, type PushSubscriptionRecord, type Store, type TrunkRecord, type UserMapping, type UserPresenceRecord, type VapidKeysRecord, type ClaimedDelivery, type WebhookAttemptResult, type WebhookClaimCaps, type WebhookClaimTime, allocateClaims, type WebhookDeliveryQuery, type WebhookLease, type WebhookSendQuota, type WebhookDeliveryRecord, type WebhookQueueOptions, type WebhookStateChange, type WebhookStateEvent, type WebhookSubscriptionRecord, WEBHOOK_STATE_ROLE } from './types.js'
+import type { OperatorCdr } from '@twake/telephony-types'
+import { clampLimit, isDeclined, isMissed, type HistoryEntry, type HistoryNearQuery, type HistoryPage, type HistoryQuery, type OperatorCdrOutcome, type OperatorCdrRecord, type OperatorCdrStats, type ConferenceRecord, type AlertRecord, type AlertQuery, type DidRecord, type OutboundHand, type OutboundRecord, type OutboundRules, ALERT_DEDUP_MS, alertKey, type ProviderRecord, type StoredAlert, type PushSaveResult, type PushSubscriptionRecord, type Store, type TrunkRecord, type UserMapping, type UserPresenceRecord, type VapidKeysRecord, type ClaimedDelivery, type ErasedCall, type ErasedCallsKept, type WebhookAttemptResult, type WebhookClaimCaps, type WebhookClaimTime, allocateClaims, type WebhookDeliveryQuery, type WebhookLease, type WebhookSendQuota, type WebhookDeliveryRecord, type WebhookQueueOptions, type WebhookStateChange, type WebhookStateEvent, type WebhookSubscriptionRecord, WEBHOOK_STATE_ROLE } from './types.js'
 import type { WebhookEventType } from '@twake/telephony-types'
 import { randomBytes } from 'node:crypto'
 import { EMPTY_OUTBOUND, outboundVersion, staleOutbound } from '../outbound.js'
+import { e164Of } from '../e164.js'
+import { RECONCILE_EARLY_MS, RECONCILE_LATE_MS, remoteOf } from '../reconcile.js'
 
 const key = (...parts: string[]) => parts.join('\u0000')
+/** Two JSON values alike, whatever the order of their keys (as PostgreSQL compares jsonb). */
+const canonical = (v: unknown): unknown =>
+  Array.isArray(v) ? v.map(canonical) : v && typeof v === 'object' ? Object.fromEntries(Object.keys(v).sort().map(k => [k, canonical((v as Record<string, unknown>)[k])])) : v
+const sameJson = (a: unknown, b: unknown) => JSON.stringify(canonical(a)) === JSON.stringify(canonical(JSON.parse(JSON.stringify(b))))
+/** A change of hands of an extension or a range of direct numbers (second review 10b, n°3). */
+interface NumberChange {
+  tenantId: string
+  kind: 'extension' | 'did'
+  first: string
+  last: string
+  at: string
+}
+const inRange = (c: Pick<NumberChange, 'first' | 'last'>, n: string) => c.first.length === n.length && c.first <= n && n <= c.last
+const overlaps = (a: Pick<NumberChange, 'first' | 'last'>, b: Pick<NumberChange, 'first' | 'last'>) => a.first.length === b.first.length && a.first <= b.last && b.first <= a.last
 type MemoryDelivery = WebhookDeliveryRecord & { claim?: string; subjectUser?: string; eraseBody?: boolean }
 
 export const matchesHistory = (e: HistoryEntry, q: HistoryQuery): boolean => {
@@ -18,6 +35,10 @@ export const matchesHistory = (e: HistoryEntry, q: HistoryQuery): boolean => {
   if (q.before && e.startedAt >= q.before) return false
   return true
 }
+
+/** The order of historyNear: by start, call, then person. */
+const nearOrder = (a: Pick<HistoryEntry, 'startedAt' | 'callId' | 'userId'>, b: Pick<HistoryEntry, 'startedAt' | 'callId' | 'userId'>) =>
+  a.startedAt !== b.startedAt ? (a.startedAt < b.startedAt ? -1 : 1) : a.callId !== b.callId ? (a.callId < b.callId ? -1 : 1) : a.userId === b.userId ? 0 : a.userId < b.userId ? -1 : 1
 
 /** In-memory store for tests and single-process development. Same contract as PgStore. */
 export class MemoryStore implements Store {
@@ -43,6 +64,17 @@ export class MemoryStore implements Store {
   private leases = new Map<string, { holder: string; until: number; heard: number; writeFrom: number; writeUntil: number }>()
   /** When deliveries were last taken of each subscription (claimWebhookDeliveries). */
   private claimedAt = new Map<string, string>()
+  /** The operator's records of calls (step 10b), and when each was read (ms). */
+  private operatorCdrs = new Map<string, OperatorCdrRecord & { readAt: number }>()
+  /** When each person last erased their history (review 10b, n°1), and their direct numbers then (second review, n°3). */
+  private erasures = new Map<string, string>()
+  private erasedNumbers = new Map<string, readonly string[]>()
+  /** When erased entries were, without a number (second review, n°2); when numbers changed hands (n°3). */
+  private erasedCallList: (ErasedCall & { tenantId: string })[] = []
+  private numberChanges: NumberChange[] = []
+  /** What the platform knows of its operator (review 10b, n°8), as JSON; the uses counted of each quota (ms). */
+  private operatorState = new Map<string, string>()
+  private operatorQuota = new Map<string, number[]>()
 
   constructor(private readonly now: () => number = Date.now) {}
 
@@ -71,15 +103,33 @@ export class MemoryStore implements Store {
         throw new Error('extension already mapped to another user of this tenant')
       }
     }
+    const before = this.mappings.get(key(mapping.tenantId, mapping.userId))
+    if (before?.extension !== mapping.extension) {
+      // The extension it had changes hands; the one it takes too, when someone held it lately.
+      if (before) this.changed(mapping.tenantId, 'extension', before.extension, before.extension)
+      if (this.numberChanges.some(c => c.tenantId === mapping.tenantId && c.kind === 'extension' && c.first === mapping.extension)) this.changed(mapping.tenantId, 'extension', mapping.extension, mapping.extension)
+    }
     this.mappings.set(key(mapping.tenantId, mapping.userId), { source: 'manual', ...mapping })
+  }
+
+  private changed(tenantId: string, kind: NumberChange['kind'], first: string, last: string) {
+    this.numberChanges.push({ tenantId, kind, first, last, at: new Date(this.now()).toISOString() })
   }
 
   async listMappings(tenantId: string) {
     return [...this.mappings.values()].filter(m => m.tenantId === tenantId).sort((a, b) => a.userId.localeCompare(b.userId)).map(m => ({ ...m }))
   }
 
-  async deleteMapping(tenantId: string, userId: string) {
+  async deleteMapping(tenantId: string, userId: string, opts: { left?: boolean } = {}) {
+    const before = this.mappings.get(key(tenantId, userId))
+    if (before) this.changed(tenantId, 'extension', before.extension, before.extension)
     this.mappings.delete(key(tenantId, userId))
+    // Their erasure goes with them once they left (third review 10b, n°3): neither who nor their numbers are kept.
+    // Given another extension, it stays (fourth review n°2).
+    if (opts.left) {
+      this.erasures.delete(key(tenantId, userId))
+      this.erasedNumbers.delete(key(tenantId, userId))
+    }
     // What was told of their presence goes with them (it is kept otherwise, whatever its age).
     this.webhookState.delete(key(tenantId, `presence:${userId}`))
   }
@@ -98,7 +148,38 @@ export class MemoryStore implements Store {
     return { items, ...(all.length > limit ? { next: items.at(-1)!.startedAt } : {}) }
   }
 
-  async deleteHistory(tenantId: string, userId: string) {
+  async deleteHistory(tenantId: string, userId: string, numbers: readonly string[] = [], kept?: ErasedCallsKept) {
+    const at = new Date(this.now()).toISOString()
+    this.erasures.set(key(tenantId, userId), at)
+    this.erasedNumbers.set(key(tenantId, userId), [...numbers])
+    const entries = [...this.history.values()].filter(e => e.tenantId === tenantId && e.userId === userId)
+    const calls = new Set(entries.map(e => e.callId))
+    // Only as asked (third review 10b, n°3): an organisation with an operator, the entries a record read later may be of.
+    if (kept)
+      for (const e of entries)
+        if (e.startedAt >= kept.since)
+          this.erasedCallList.push({ tenantId, direction: e.direction, startedAt: e.startedAt, endedAt: e.endedAt ?? e.startedAt, ...(kept.keyOf ? { remoteKey: kept.keyOf(e164Of(e.remoteNumber)) } : {}) })
+    const wanted = new Set(numbers)
+    // One of their entries would take it (second review 10b, n°2): same way, same number, the window of matchCdrs.
+    const taken = (r: OperatorCdrRecord) => {
+      const remote = remoteOf(r)
+      const start = Date.parse(r.startedAt)
+      return (
+        !!remote &&
+        entries.some(e => e.direction === r.direction && e164Of(e.remoteNumber) === e164Of(remote) && start >= Date.parse(e.startedAt) - RECONCILE_EARLY_MS && start <= Date.parse(e.endedAt ?? e.startedAt) + RECONCILE_LATE_MS)
+      )
+    }
+    // The operator's records of their calls keep no number of them (kept as read, never read again).
+    for (const r of this.operatorCdrs.values()) {
+      if (r.tenantId !== tenantId) continue
+      const linked = r.userId === userId || (!!r.callId && calls.has(r.callId))
+      const theirs = r.startedAt < at && ((!!r.calling && wanted.has(r.calling)) || (!!r.called && wanted.has(r.called)))
+      const pending = !r.outcome && taken(r)
+      if (!linked && !theirs && !pending) continue
+      if (!r.outcome && (theirs || pending)) r.outcome = 'erased'
+      delete r.calling
+      delete r.called
+    }
     let n = 0
     for (const [k, e] of this.history) {
       if (e.tenantId !== tenantId || e.userId !== userId) continue
@@ -106,6 +187,175 @@ export class MemoryStore implements Store {
       n++
     }
     return n
+  }
+
+  async historyErasedAt(tenantId: string, userId: string) {
+    return this.erasures.get(key(tenantId, userId))
+  }
+
+  async numbersErasedAt(tenantId: string, numbers: readonly string[]) {
+    const out = new Map<string, string>()
+    for (const [k, list] of this.erasedNumbers) {
+      if (k.split('\u0000')[0] !== tenantId) continue
+      const at = this.erasures.get(k)!
+      for (const n of numbers) if (list.includes(n) && (out.get(n) ?? '') < at) out.set(n, at)
+    }
+    return out
+  }
+
+  async erasedCalls(tenantId: string, from: string, to: string) {
+    return this.erasedCallList.filter(c => c.tenantId === tenantId && c.startedAt >= from && c.startedAt <= to).map(({ tenantId: _t, ...c }) => ({ ...c }))
+  }
+
+  async numberChangedAt(tenantId: string, extension: string, number: string) {
+    let at: string | undefined
+    for (const c of this.numberChanges) {
+      if (c.tenantId !== tenantId) continue
+      if (c.kind === 'extension' ? c.first === extension : inRange(c, number)) at = !at || c.at > at ? c.at : at
+    }
+    return at
+  }
+
+  async knownOperatorCdrs(tenantId: string, operator: string, ids: readonly string[]) {
+    return ids.filter(id => this.operatorCdrs.has(key(tenantId, operator, id)))
+  }
+
+  async addOperatorCdrs(tenantId: string, operator: string, cdrs: readonly OperatorCdr[]) {
+    for (const c of cdrs) {
+      const k = key(tenantId, operator, c.id)
+      if (!this.operatorCdrs.has(k)) this.operatorCdrs.set(k, { ...structuredClone(c), tenantId, operator, readAt: this.now() })
+    }
+  }
+
+  async pendingOperatorCdrs(tenantId: string, operator: string, readBefore: string, limit: number) {
+    const before = Date.parse(readBefore)
+    return [...this.operatorCdrs.values()]
+      .filter(r => r.tenantId === tenantId && r.operator === operator && !r.outcome && r.readAt < before)
+      .sort((a, b) => (a.startedAt < b.startedAt ? -1 : a.startedAt > b.startedAt ? 1 : a.id < b.id ? -1 : 1))
+      .slice(0, limit)
+      .map(({ readAt: _at, ...r }) => ({ ...r }))
+  }
+
+  async historyNear(tenantId: string, q: HistoryNearQuery) {
+    const remotes = q.remotes && new Set(q.remotes)
+    return [...this.history.values()]
+      .filter(
+        e =>
+          e.tenantId === tenantId &&
+          e.direction === q.direction &&
+          !e.operatorOnly &&
+          (q.reconciled || !e.operatorCdr) &&
+          (!q.userId || e.userId === q.userId) &&
+          (!remotes || remotes.has(e164Of(e.remoteNumber))) &&
+          e.startedAt >= q.from &&
+          e.startedAt <= q.to &&
+          (!q.after || nearOrder(e, q.after) > 0)
+      )
+      .sort(nearOrder)
+      .slice(0, q.limit)
+      .map(e => ({ ...e }))
+  }
+
+  async operatorForwardsNear(tenantId: string, operator: string, line: string, from: string, to: string) {
+    return [...this.operatorCdrs.values()]
+      .filter(r => r.tenantId === tenantId && r.operator === operator && r.line === line && r.forwarded && r.startedAt >= from && r.startedAt <= to)
+      .sort((a, b) => (a.startedAt < b.startedAt ? -1 : a.startedAt > b.startedAt ? 1 : a.id < b.id ? -1 : 1))
+      .map(({ readAt: _at, ...r }) => ({ ...r }))
+  }
+
+  async settleOperatorCdrs(tenantId: string, operator: string, outcomes: readonly OperatorCdrOutcome[]) {
+    for (const o of outcomes) {
+      const r = this.operatorCdrs.get(key(tenantId, operator, o.id))
+      if (!r || r.outcome) continue
+      // Never in the history of a person who erased it since the call (review 10b, n°1), whatever the caller said.
+      const erased = o.outcome === 'orphan' && o.entry ? this.erasures.get(key(tenantId, o.entry.userId)) : undefined
+      if (o.erase || o.outcome === 'erased' || (erased && erased >= o.entry!.startedAt)) {
+        delete r.calling
+        delete r.called
+        if (o.outcome !== 'matched') {
+          r.outcome = o.outcome === 'forwarded' || o.outcome === 'invalid' ? o.outcome : 'erased'
+          continue
+        }
+      }
+      if (o.outcome === 'matched' && o.callId) {
+        const entries = [...this.history.values()].filter(e => e.tenantId === tenantId && e.callId === o.callId && !e.operatorCdr && !e.operatorOnly)
+        if (!entries.length) {
+          r.outcome = 'unmatched'
+          continue
+        }
+        for (const e of entries) Object.assign(e, { operator, operatorCdr: o.id })
+        Object.assign(r, { outcome: 'matched', callId: o.callId })
+      } else if (o.outcome === 'orphan' && o.entry) {
+        await this.addHistory({ ...o.entry, tenantId, operator, operatorCdr: o.id, operatorOnly: true })
+        Object.assign(r, { outcome: 'orphan', callId: o.entry.callId, userId: o.entry.userId })
+      } else r.outcome = o.outcome === 'forwarded' || o.outcome === 'invalid' ? o.outcome : 'unmatched'
+    }
+  }
+
+  async operatorCdrStats(tenantId: string, operator: string, since: string): Promise<OperatorCdrStats> {
+    const stats: OperatorCdrStats = { total: 0, matched: 0, orphan: 0, unmatchedInbound: 0, unmatchedOutbound: 0, forwarded: 0, pending: 0, invalid: 0, erased: 0 }
+    for (const r of this.operatorCdrs.values()) {
+      if (r.tenantId !== tenantId || r.operator !== operator || r.startedAt < since) continue
+      stats.total++
+      if (!r.outcome) stats.pending++
+      else if (r.outcome === 'unmatched') stats[r.direction === 'inbound' ? 'unmatchedInbound' : 'unmatchedOutbound']++
+      else stats[r.outcome]++
+    }
+    return stats
+  }
+
+  async purgeErasures(before: string) {
+    const was = this.erasedCallList.length + this.numberChanges.length + this.erasures.size
+    this.erasedCallList = this.erasedCallList.filter(c => c.startedAt >= before)
+    this.numberChanges = this.numberChanges.filter(c => c.at >= before)
+    for (const [k, at] of this.erasures)
+      if (at < before) {
+        this.erasures.delete(k)
+        this.erasedNumbers.delete(k)
+      }
+    return was - (this.erasedCallList.length + this.numberChanges.length + this.erasures.size)
+  }
+
+  async purgeOperatorCdrs(before: string) {
+    let n = 0
+    for (const [k, r] of this.operatorCdrs) {
+      if (r.startedAt >= before) continue
+      this.operatorCdrs.delete(k)
+      n++
+    }
+    return n
+  }
+
+  async getOperatorState(tenantId: string, k: string): Promise<unknown> {
+    const v = this.operatorState.get(key(tenantId, k))
+    return v === undefined ? undefined : JSON.parse(v)
+  }
+
+  async listOperatorState(tenantId: string, prefix: string) {
+    return [...this.operatorState]
+      .map(([k, v]) => ({ k: k.split('\u0000'), v }))
+      .filter(({ k }) => k[0] === tenantId && k[1]!.startsWith(prefix))
+      .map(({ k, v }) => ({ key: k[1]!, value: JSON.parse(v) as unknown }))
+      .sort((a, b) => (a.key < b.key ? -1 : 1))
+  }
+
+  async putOperatorState(tenantId: string, k: string, value: unknown) {
+    this.operatorState.set(key(tenantId, k), JSON.stringify(value))
+  }
+
+  async deleteOperatorState(tenantId: string, k: string, ifValue?: unknown) {
+    const v = this.operatorState.get(key(tenantId, k))
+    if (v === undefined || (ifValue !== undefined && !sameJson(JSON.parse(v), ifValue))) return false
+    return this.operatorState.delete(key(tenantId, k))
+  }
+
+  async takeOperatorQuota(tenantId: string, k: string, windowMs: number, max: number) {
+    const t = this.now()
+    const used = (this.operatorQuota.get(key(tenantId, k)) ?? []).filter(at => at > t - windowMs)
+    const ok = used.length < max
+    if (ok) used.push(t)
+    this.operatorQuota.set(key(tenantId, k), used)
+    return ok
   }
 
   async listFavorites(tenantId: string, userId: string) {
@@ -251,7 +501,11 @@ export class MemoryStore implements Store {
   async deleteTrunk(tenantId: string, id: string) {
     const before = this.trunks.length
     this.trunks = this.trunks.filter(t => !(t.tenantId === tenantId && t.id === id))
-    for (const [k, d] of this.dids) if (d.tenantId === tenantId && d.trunkId === id) this.dids.delete(k)
+    for (const [k, d] of this.dids)
+      if (d.tenantId === tenantId && d.trunkId === id) {
+        this.changed(tenantId, 'did', d.first, d.last)
+        this.dids.delete(k)
+      }
     return this.trunks.length < before
   }
 
@@ -261,10 +515,19 @@ export class MemoryStore implements Store {
 
   async upsertDid(record: DidRecord) {
     if (!this.trunks.some(t => t.tenantId === record.tenantId && t.id === record.trunkId)) throw new Error(`no trunk ${record.trunkId} in this tenant`)
+    const before = this.dids.get(key(record.tenantId, record.id))
+    const same = before && before.first === record.first && before.last === record.last && before.target === record.target && (before.suffixDigits ?? 0) === (record.suffixDigits ?? 0)
+    if (!same) {
+      // What it rang changes hands; the numbers it takes too, when they changed hands lately.
+      if (before) this.changed(record.tenantId, 'did', before.first, before.last)
+      if (this.numberChanges.some(c => c.tenantId === record.tenantId && c.kind === 'did' && overlaps(c, record))) this.changed(record.tenantId, 'did', record.first, record.last)
+    }
     this.dids.set(key(record.tenantId, record.id), { ...record })
   }
 
   async deleteDid(tenantId: string, id: string) {
+    const before = this.dids.get(key(tenantId, id))
+    if (before) this.changed(tenantId, 'did', before.first, before.last)
     return this.dids.delete(key(tenantId, id))
   }
 

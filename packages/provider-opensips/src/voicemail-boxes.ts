@@ -1,7 +1,7 @@
 import type { VoicemailBox } from '@twake/telephony-provider-sdk'
 import type { Queryable } from './subscriber.js'
 
-// Everything about the `voicemail_boxes` table lives here (step 11a, ADR 0021): the Gateway writes the mailbox of each
+// Everything about the `voicemail_boxes` table lives here (step 11a, ADR 0022): the Gateway writes the mailbox of each
 // extension as the voicemail server named it (Wazo's `number@context`); opensips.cfg.tpl reads it with the rules of
 // the extension dialled and sends the call nothing else takes there (route[voicemail]).
 

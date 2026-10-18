@@ -224,7 +224,7 @@ else
   MEET_SIP=meet.invalid
 fi
 unset MEET_SIP_PASSWORD
-# The mailboxes of Wazo (step 11a, ADR 0021): Wazo's Asterisk, at WAZO_SIP (an IPv4 address and its port), takes the
+# The mailboxes of Wazo (step 11a, ADR 0022): Wazo's Asterisk, at WAZO_SIP (an IPv4 address and its port), takes the
 # calls nothing else takes, on a UDP socket of OpenSIPS of its own (WAZO_LISTEN_IP:WAZO_PORT, the loopback and 5095 by
 # default), which hears that address only and none of whose requests places a call. WAZO_SIP empty (the default):
 # Wazo is off, OpenSIPS has no socket for it and never reads `voicemail_boxes`.

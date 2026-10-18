@@ -1,4 +1,4 @@
-"""What wazo-confd asks of wazo-sysconfd, for the development and CI stack (ADR 0021).
+"""What wazo-confd asks of wazo-sysconfd, for the development and CI stack (ADR 0022).
 
 On a Wazo, wazo-sysconfd (root, the machine's own configuration) runs the Asterisk commands that apply a change made
 through wazo-confd and removes a deleted mailbox's spool; it has no image (it manages the host). This stands in for the

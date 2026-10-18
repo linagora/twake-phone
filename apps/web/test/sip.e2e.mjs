@@ -32,7 +32,7 @@
 //   MEET_SIP_USER, MEET_SIP_PASSWORD     the account those calls answer OpenSIPS's challenge with (default the stack's)
 //   MEET_NUMBER          the access number of the rooms (default 8000)
 //
-// Step 11a (ADR 0021): the mailboxes, on the Wazo of the same stack, behind OpenSIPS (the Gateway with provider-wazo):
+// Step 11a (ADR 0022): the mailboxes, on the Wazo of the same stack, behind OpenSIPS (the Gateway with provider-wazo):
 //   WAZO_AUTH_URL, WAZO_CONFD_URL, WAZO_CALLD_URL, WAZO_WEBSOCKETD_URL  its APIs (default the stack's, on the loopback)
 //   WAZO_USER, WAZO_PASSWORD             the Gateway's account in Wazo (default the stack's development one)
 import { randomBytes } from 'node:crypto'
@@ -2891,7 +2891,7 @@ try {
     expectEqual(`${ended.endStatus} ${ended.endReason}`, '404 unavailable', 'how the call to 101 ended after Alice signed out')
     await jean.page.getByText('101 est injoignable.').waitFor()
   })
-  // ---- Step 11a (ADR 0021): the mailboxes, on Wazo behind OpenSIPS ----------------------------------------------
+  // ---- Step 11a (ADR 0022): the mailboxes, on Wazo behind OpenSIPS ----------------------------------------------
   /** The tenant's rows of voicemail_boxes, as "extension mailbox". */
   const mailboxRows = async () => (await db.query('SELECT extension, mailbox FROM voicemail_boxes WHERE tenant_id = $1 ORDER BY extension', [TENANT])).rows
   /** RTP flows both ways on the call of `who` (with a mailbox: its greeting one way, the caller's voice the other). */

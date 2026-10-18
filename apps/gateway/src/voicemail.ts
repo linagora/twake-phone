@@ -1,6 +1,6 @@
 import { WazoVoicemail, type WazoLogger } from '@twake/provider-wazo'
 
-// The voicemail server of the platform (step 11a, ADR 0021): Wazo Platform, for the tenant of a single-tenant stack
+// The voicemail server of the platform (step 11a, ADR 0022): Wazo Platform, for the tenant of a single-tenant stack
 // (DEFAULT_TENANT), from the environment. The routes are in app.ts (/v1/voicemails).
 
 /** A message id as it may reach the voicemail server: the provider checks it again. */

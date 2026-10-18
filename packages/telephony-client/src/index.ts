@@ -1,4 +1,4 @@
-import type { Call, Capabilities, ConferenceParticipant, Contact, DialInConfiguration, DidRange, ForwardingRules, FraudRule, MediaSession, OutboundAssignment, OutboundCaps, OutboundPolicy, OutboundProfile, Presence, PresenceStatus, RingGroup, TelephonyAlert, TelephonyEvent, Trunk, TrunkInput, TrunkStatus, Voicemail, WebhookEventType } from '@twake/telephony-types'
+import type { Call, Capabilities, ConferenceParticipant, Contact, DialInConfiguration, DidRange, ForwardingRules, FraudRule, MediaSession, OperatorLineForwards, OutboundAssignment, OutboundCaps, OutboundPolicy, OutboundProfile, Presence, PresenceStatus, RingGroup, TelephonyAlert, TelephonyEvent, Trunk, TrunkInput, TrunkStatus, Voicemail, WebhookEventType } from '@twake/telephony-types'
 
 export type {
   Contact,
@@ -7,6 +7,10 @@ export type {
   ForwardingRules,
   FraudRule,
   FraudThreshold,
+  OperatorFallback,
+  OperatorForward,
+  OperatorForwardNature,
+  OperatorLineForwards,
   OutboundAssignment,
   OutboundCaps,
   OutboundPolicy,
@@ -18,6 +22,7 @@ export type {
   TrunkCodec,
   TrunkInput,
   TrunkNumberFormat,
+  TrunkOperator,
   TrunkOutboundClass,
   TrunkRegistrationState,
   TrunkServerState,
@@ -31,6 +36,8 @@ export {
   EXTENSION_FORMAT,
   FRAUD_DEFAULTS,
   FRAUD_PARAMS,
+  OPERATOR_NO_ANSWER_MAX_SEC,
+  OPERATOR_NO_ANSWER_MIN_SEC,
   OUTBOUND_CAPS,
   OUTBOUND_CAP_DEFAULTS,
   RESERVED_NUMBER,
@@ -73,6 +80,108 @@ export interface HistoryItem {
   conference?: boolean
   /** Taken by a mailbox (step 11a): the caller left a message (or could have), the person called has it. */
   voicemail?: boolean
+  /**
+   * Where the call is known from (step 10b): `opensips`, the SIP server; with the operator (`ovh`) when its record of
+   * the call was reconciled with it; the operator alone for a call the platform never had (received while it could
+   * not be reached).
+   */
+  sources?: string[]
+  /**
+   * Known from the operator alone, and forwarded there to the fallback number (second review 10b, n°4): the platform
+   * could not be reached, the phone did not ring; missed, whoever took it at the fallback.
+   */
+  forwardedToFallback?: boolean
+}
+
+/**
+ * Why the operator could not be read or written (OperatorErrorCode of the Gateway), or why a line is not kept as
+ * asked: two trunks ask two fallbacks of it (`conflict`).
+ */
+export type OperatorProblem = 'unauthorized' | 'forbidden' | 'not-found' | 'refused' | 'rate' | 'unreachable' | 'conflict'
+
+/** One line of a trunk at the operator, as the platform last saw it (step 10b). */
+export interface OperatorLine {
+  line: string
+  /** The forwards set there, each as it is (to a number, the voicemail...), as last read. */
+  forwards?: OperatorLineForwards
+  /** A trunk asks the Gateway to keep its fallback there. */
+  managed: boolean
+  /** What is there is what is asked (absent: not read since it was asked). */
+  inSync?: boolean
+  readAt?: string
+  appliedAt?: string
+  /** When the Gateway found it changed there (the manager) and put it back. */
+  restoredAt?: string
+  error?: OperatorProblem
+  /** The operator did not keep what was asked: not written again until the trunk is saved. */
+  rejected?: true
+  /**
+   * What was there before the platform first wrote its fallback (third review 10b, n°8): put back when the fallback is
+   * removed, if the platform can write it (to a number, the voicemail or a fax). Absent: not known (nothing put back).
+   */
+  original?: OperatorLineForwards
+  /** Why it will not be put back (fourth review 10b, n°3): it would bring the calls back to the platform, or go where the trunk may not call. */
+  originalRefused?: OperatorRestoreRefusal
+}
+
+/** Why the forwards of before a line are not put back (fourth review 10b, n°3). */
+export type OperatorRestoreRefusal = 'loop' | 'outbound'
+
+/** What is set at the operator on a line now (POST /admin/operator/lines), or why it could not be read. */
+export interface OperatorLineRead {
+  line: string
+  forwards?: OperatorLineForwards
+  error?: OperatorProblem
+}
+
+/**
+ * A removal of the forwards of a line at the operator not done yet (second review 10b, n°1): kept by the Gateway and
+ * tried again at each round until the operator has it, whatever became of the trunk that asked it.
+ */
+export interface OperatorRemoval {
+  line: string
+  since: string
+  trunkId?: string
+  triedAt?: string
+  error?: OperatorProblem
+  /** What it puts back (third review 10b, n°8): what was there before the platform took the line. */
+  original?: OperatorLineForwards
+  /** Why that will not be put back (fourth review 10b, n°3). */
+  originalRefused?: OperatorRestoreRefusal
+}
+
+/**
+ * What became of a removal of the last days (third review 10b, n°2 and n°4): done (`restored`: the forwards of before
+ * put back), left as it was because someone changed it in the manager since (`changed`), let go because the operator
+ * has no such line (`gone`), or by an administrator (`abandoned`).
+ */
+export interface OperatorClosedRemoval {
+  line: string
+  at: string
+  outcome: 'done' | 'changed' | 'gone' | 'abandoned'
+  trunkId?: string
+  restored?: true
+  /** Done without the forwards of before (fourth review 10b, n°3 and n°4): refused by the rules, or not kept by the operator (`refused`). */
+  unrestored?: OperatorRestoreRefusal | 'refused'
+}
+
+/** The operator of the trunks, as the administration shows it (GET /admin/operator). */
+export interface OperatorStatus {
+  configured: boolean
+  operator?: string
+  trunks?: { id: string; lines: OperatorLine[] }[]
+  /** The removals at the operator still owed. */
+  removals?: OperatorRemoval[]
+  /** What became of the removals of the last days, the latest first. */
+  closedRemovals?: OperatorClosedRemoval[]
+  cdrs?: {
+    readAt?: string
+    read?: number
+    /** The lines whose records could not be read, and why. */
+    lines?: { line: string; error: OperatorProblem }[]
+    since: string
+    stats: { total: number; matched: number; orphan: number; unmatchedInbound: number; unmatchedOutbound: number; forwarded: number; pending: number; invalid: number; erased: number }
+  }
 }
 
 export interface HistoryFilter {
@@ -320,14 +429,49 @@ export class TelephonyClient {
     return this.request<{ available: boolean; items: TrunkStatus[] }>('/admin/trunks/status')
   }
 
-  /** Creates or replaces a trunk; `password` absent keeps the one kept, `null` removes it. Refusals carry a `code`. */
+  /**
+   * Creates or replaces a trunk; `password` absent keeps the one kept, `null` removes it. Refusals carry a `code`.
+   * `pending`: the removals at the operator of the lines it no longer names not done yet (202, third review 10b, n°11).
+   */
   setTrunk(id: string, trunk: TrunkInput) {
-    return this.request<Trunk>(`/admin/trunks/${encodeURIComponent(id)}`, { method: 'PUT', body: JSON.stringify(trunk) })
+    return this.request<Trunk & { pending?: OperatorRemoval[] }>(`/admin/trunks/${encodeURIComponent(id)}`, { method: 'PUT', body: JSON.stringify(trunk) })
   }
 
-  /** Removes a trunk and its direct numbers (409 TRUNK_DEFAULT: the default trunk while another one is left). */
-  async deleteTrunk(id: string) {
-    await this.request<void>(`/admin/trunks/${encodeURIComponent(id)}`, { method: 'DELETE' })
+  /** The operator of the trunks (step 10b): its lines, their fallback, the records of calls reconciled. */
+  getOperatorStatus() {
+    return this.request<OperatorStatus>('/admin/operator')
+  }
+
+  /** Reads the operator now (429 OPERATOR_RATE: a moment ago already). */
+  syncOperator() {
+    return this.request<OperatorStatus>('/admin/operator/sync', { method: 'POST' })
+  }
+
+  /** What is set at the operator on these lines now, read only (shown before a first fallback replaces it). */
+  readOperatorLines(lines: string[]) {
+    return this.request<{ items: OperatorLineRead[] }>('/admin/operator/lines', { method: 'POST', body: JSON.stringify({ lines }) })
+  }
+
+  /**
+   * The trunk no longer asks a fallback at the operator, and the forwards of its lines are removed there. `pending`:
+   * the removals the operator does not have yet (202), tried again at each round.
+   */
+  removeOperatorFallback(trunkId: string) {
+    return this.request<{ trunk: Trunk; pending: OperatorRemoval[] }>(`/admin/trunks/${encodeURIComponent(trunkId)}/operator/fallback`, { method: 'DELETE' })
+  }
+
+  /** Lets a removal at the operator go (third review 10b, n°4): nothing more is written on that line (404: none owed). */
+  async abandonOperatorRemoval(line: string): Promise<void> {
+    await this.request<void>(`/admin/operator/removals/${encodeURIComponent(line)}`, { method: 'DELETE' })
+  }
+
+  /**
+   * Removes a trunk and its direct numbers (409 TRUNK_DEFAULT: the default trunk while another one is left). Returns
+   * the removals of its fallback at the operator not done yet (202), none when all is done.
+   */
+  async deleteTrunk(id: string): Promise<OperatorRemoval[]> {
+    const res = await this.request<{ pending?: OperatorRemoval[] } | undefined>(`/admin/trunks/${encodeURIComponent(id)}`, { method: 'DELETE' })
+    return res?.pending ?? []
   }
 
   listDids() {

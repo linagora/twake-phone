@@ -1,4 +1,4 @@
-# wazo-websocketd (ADR 0021): Wazo's events over a WebSocket, where provider-wazo hears the new messages.
+# wazo-websocketd (ADR 0022): Wazo's events over a WebSocket, where provider-wazo hears the new messages.
 debug: false
 websocket:
   listen: 127.0.0.1

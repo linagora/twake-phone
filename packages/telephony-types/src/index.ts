@@ -239,8 +239,14 @@ export interface TelephonyAlert {
    * n°3), a room's call whose grant another call took (`call-diverted`: ended), or LiveKit's outbound trunk found
    * pointed elsewhere than the SIP server (`trunk-changed`: written back, the call not placed). `webhook`: raised by
    * the Gateway's webhook hub (step 10a), a subscription disabled after failing for a day in a row (`param` 'disabled').
+   * `operator`: raised by the Gateway (step 10b, review n°12): the operator refuses its keys (`unauthorized`) or their
+   * rights (`forbidden`) round after round, or the records of calls reconciled fall under FR-D4's 99 %
+   * (`reconciliation`, `value` the percentage, `threshold` 99); a removal of the forwards of a line there (third
+   * review 10b, n°2 and n°4, `number` the line): left as it was because someone changed it in the manager since
+   * (`removal-changed`), let go because the operator no longer has the line (`removal-gone`), owed for over a day
+   * (`removal-late`).
    */
-  kind: 'fraud-warning' | 'fraud-critical' | 'limit' | 'rights' | 'emergency' | 'meet' | 'webhook'
+  kind: 'fraud-warning' | 'fraud-critical' | 'limit' | 'rights' | 'emergency' | 'meet' | 'webhook' | 'operator'
   param: string
   scope?: 'user' | 'tenant'
   value?: number
@@ -306,8 +312,81 @@ export interface Trunk {
    * unreachable, ADR 0017), never here.
    */
   fallbackTarget?: string
+  /** What the Gateway knows of the trunk at its operator (step 10b, ADR 0021): its lines there, the fallback it keeps there. */
+  operator?: TrunkOperator
   /** Read only. */
   hasPassword?: boolean
+}
+
+/**
+ * A trunk at its operator (step 10b, ADR 0021): the operator's lines that carry its calls, by the name of their
+ * service there (OVHcloud: as its manager shows it, `0033972000000`; one line for a trunk offer, or one per number),
+ * whose records of calls (CDR) are read and reconciled with the history, and the fallback the Gateway keeps there.
+ */
+export interface TrunkOperator {
+  lines: string[]
+  /**
+   * The forward the operator applies to the calls of these lines (its own, ADR 0017: the one that works when the
+   * platform cannot be reached), which the Gateway sets there and puts back when someone changed it in the
+   * operator's manager. Absent: the Gateway leaves what is set there untouched.
+   */
+  fallback?: OperatorFallback
+}
+
+/**
+ * The fallback forward of an operator's line: `number` (E.164, required when one of the two is on) is called when
+ * the platform cannot be reached (`onUnavailable`) and when nobody answered within `noAnswerAfterSec` (more than
+ * OPERATOR_NO_ANSWER_MIN_SEC: the fallback inside rings first, ADR 0017). Both off: no forward.
+ */
+export interface OperatorFallback {
+  number?: string
+  onUnavailable: boolean
+  noAnswerAfterSec?: number
+}
+
+/** The delay of a forward on no answer at the operator is more than this (s): the target and the fallback inside ring 60 s each first (ADR 0017). */
+export const OPERATOR_NO_ANSWER_MIN_SEC = 120
+/** And at most this (s). */
+export const OPERATOR_NO_ANSWER_MAX_SEC = 600
+
+/** Where a forward set at the operator sends the calls: a number, the line's voicemail, a fax, or something else. */
+export type OperatorForwardNature = 'number' | 'voicemail' | 'fax' | 'other'
+
+/** One forward set at the operator, as read there: where it sends the calls, and the number for `number`. */
+export interface OperatorForward {
+  nature: OperatorForwardNature
+  number?: string
+}
+
+/**
+ * What a line forwards at the operator, as read there (review 10b, n°4: each forward as it is, never folded into one
+ * fallback): on unavailability (`onUnavailable`) and on no answer after `afterSec` (`onNoAnswer`). Absent: off.
+ */
+export interface OperatorLineForwards {
+  onUnavailable?: OperatorForward
+  onNoAnswer?: OperatorForward & { afterSec: number }
+}
+
+/**
+ * A record of a call by the operator (CDR, step 10b): on one of its lines (`line`), in E.164 where the number is one
+ * (`anonymous`, a short number... as the operator wrote them otherwise), started at `startedAt`, `durationSec` in
+ * communication (0: not answered).
+ */
+export interface OperatorCdr {
+  id: string
+  line: string
+  direction: CallDirection
+  calling: string
+  called: string
+  startedAt: string
+  durationSec: number
+  /** A forward the operator placed itself (to the fallback number, ADR 0017): the platform never saw it. */
+  forwarded?: true
+  /**
+   * The operator's record could not be read as a call (a date without its offset, an unknown way): kept so as not to
+   * read it again, never reconciled (`startedAt` is then when it was read). Why, in a few words.
+   */
+  invalid?: string
 }
 
 /** What an administrator writes: the trunk without its id, with a password to keep (or to change, or `null` to remove). */
@@ -373,7 +452,7 @@ export interface Call {
    */
   conference?: boolean
   /**
-   * The call went to the mailbox of the extension dialled (step 11a, ADR 0021): nobody answered it, refused it or could
+   * The call went to the mailbox of the extension dialled (step 11a, ADR 0022): nobody answered it, refused it or could
    * be reached, and the voicemail server took it. For the caller it was answered (by the mailbox); for the callee it is
    * a missed call, whose message, if one was left, is in their mailbox (`Voicemail`).
    */
@@ -381,7 +460,7 @@ export interface Call {
 }
 
 /**
- * A message left in a person's mailbox (step 11a, ADR 0021), as their Messagerie shows it: who left it (`from`, an
+ * A message left in a person's mailbox (step 11a, ADR 0022), as their Messagerie shows it: who left it (`from`, an
  * extension or an E.164 number, absent when the caller hid it; `fromName`, as the directory or the operator named
  * them), when, how long, and whether it was listened to. Its audio is read apart (GET /v1/voicemails/{id}/audio).
  */
@@ -440,7 +519,7 @@ export interface Capabilities {
   outboundPolicy?: boolean
   conference: { dialIn: boolean; dialOut: boolean }
   /**
-   * Each person has a mailbox (step 11a, ADR 0021): a call nobody answers, refused by their "do not disturb", busy or
+   * Each person has a mailbox (step 11a, ADR 0022): a call nobody answers, refused by their "do not disturb", busy or
    * that reaches nobody goes there, and they read their messages (`Voicemail`, the `voicemail.*` events).
    */
   voicemail?: boolean
@@ -563,8 +642,30 @@ export interface WebhookCall {
   outcome?: WebhookCallOutcome
   /** A conference's call (step 8b): the room called this person. */
   conference?: true
-  /** Where TwakePhone knows the call from: `opensips` now, `ovh` too once its CDRs are reconciled (step 10b). */
+  /**
+   * Where TwakePhone knows the call from: `opensips`, the SIP server, as it happens. The operator's records come
+   * later (step 10b: read every 10 minutes) and are reconciled in the history (`GET /calls/history`, its `sources`),
+   * not told again.
+   */
   source: string[]
+}
+
+/**
+ * Where the operator sends a trunk's calls for one of its forwards, as last read on every line of the trunk: to a
+ * number, the voicemail, a fax, somewhere else (`other`), nowhere (`none`: off), or not the same on every line (`mixed`).
+ */
+export type WebhookForwardTarget = OperatorForwardNature | 'none' | 'mixed'
+
+/**
+ * The fallback forwards set at the operator for a trunk's lines (step 10b), as last read there: where the callers go
+ * while the platform cannot be reached (`on_unavailable`), and when nobody answers (`on_no_answer`, after
+ * `no_answer_after_sec`, the longest of the lines). Never a number. Absent when the trunk's operator is not known (no
+ * lines, no operator configured) or a line was never read.
+ */
+export interface WebhookTrunkFallback {
+  on_unavailable: WebhookForwardTarget
+  on_no_answer: WebhookForwardTarget
+  no_answer_after_sec?: number
 }
 
 /** A trunk's health as the Gateway reads it (step 10a): `down` when no call goes through it, `degraded` when one of its servers is out. */
@@ -591,6 +692,7 @@ export type WebhookEvent =
         previous?: TrunkHealth
         registration?: TrunkRegistrationState
         servers: { address: string; state: TrunkServerState }[]
+        fallback?: WebhookTrunkFallback
       }
     })
   /**
@@ -607,6 +709,7 @@ export type WebhookEvent =
         removed?: true
         registration?: TrunkRegistrationState
         servers: { address: string; state: TrunkServerState }[]
+        fallback?: WebhookTrunkFallback
       }
     })
   /** What an administrator sends from the administration to check a subscription. */

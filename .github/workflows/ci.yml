@@ -102,7 +102,7 @@ jobs:
           cache: yarn
       # La stack SIP d'abord (`--wait` bloque jusqu'aux healthchecks) : OpenSIPS 3.6 (image officielle + modules
       # WSS, TLS, PostgreSQL), rtpengine en espace utilisateur, PostgreSQL avec la table `subscriber`, et Wazo 26.10 pour
-      # les messageries (étape 11a, ADR 0021 : images officielles épinglées par empreinte). Réseau hôte.
+      # les messageries (étape 11a, ADR 0022 : images officielles épinglées par empreinte). Réseau hôte.
       - name: Stack SIP (Docker Compose)
         run: docker compose -f docker/docker-compose.sip.yml up --build --wait --wait-timeout 300
       - run: yarn install --frozen-lockfile
