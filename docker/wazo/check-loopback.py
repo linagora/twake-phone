@@ -6,18 +6,18 @@ Every socket a process of a Wazo service (and of its bus and database) listens o
 /proc (the processes of each container, as `docker top` gives them, their sockets, the tables of their network
 namespace): one bound to an address other than 127.0.0.0/8 or ::1, any address included (0.0.0.0, ::), is printed
 and the check fails. Root reads the sockets of the other processes. Exits 0 when all of them are on the loopback. CI
-runs it once the stack is up and again after the SIP e2e (second review 11a, n°4), with what the calls opened since.
+runs it once the stack is up and again after the SIP e2e, with what the calls opened since.
 
 One exception, named: the DNS client of Asterisk's PJSIP (res_pjsip makes it whatever its configuration, bound to
 0.0.0.0 on an ephemeral port, for the answers to its own queries, and on :: as well where the host has IPv6, as a CI
 runner does; it makes none here, every address being an IP). It is recognised by what only PJSIP's own socket is, not
-by its shape (second review 11a, n°4): a UDP socket on 0.0.0.0 (or ::) at a port of the ephemeral range
+by its shape: a UDP socket on 0.0.0.0 (or ::) at a port of the ephemeral range
 (ip_local_port_range), of the process that runs Asterisk's binary (/usr/sbin/asterisk, with PJSIP's library mapped),
 and watched by the same epoll instance (PJSIP's ioqueue) as the SIP transport Asterisk was told to bind
 (WAZO_SIP_LISTEN of the container). One per family at most. Another process, even one named asterisk, a socket of
 Asterisk outside PJSIP's ioqueue, a second one of a family, one at a fixed port: each fails.
 
-What stays (third review 11a, n°9): that socket is a real UDP listener on every address, reading DNS answers from
+What stays: that socket is a real UDP listener on every address, reading DNS answers from
 any source, as PJSIP's resolver does on any Asterisk. It cannot be taken away from here: without a nameserver in
 /etc/resolv.conf, the C library falls back to 127.0.0.1 and PJSIP makes its socket all the same (tried on this
 stack's image); res_resolver_unbound is not in Wazo's Asterisk. The stack is a development and CI one (ADR 0022);

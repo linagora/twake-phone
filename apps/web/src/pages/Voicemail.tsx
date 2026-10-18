@@ -37,12 +37,12 @@ type FocusTarget = { listen: string } | { remove: string } | { confirm: string }
  * The person's mailbox (step 11a): the messages left when they could not answer, newest first, as they arrive. Each is
  * listened to in the page, marked as read, deleted, or its caller called back.
  *
- * Accessibility (review 11a, n°19 and 25): a message's duration is said with its word (a visually hidden text, the
+ * Accessibility: a message's duration is said with its word (a visually hidden text, the
  * clock hidden from assistive tech); what changes without the person (a message arriving) and what an action did
  * (deleted, marked as read) is said in the status region, each time, even with the same words; an action that takes
  * its button away gives the focus to the next message, or the previous one, or the title. The recordings have no
  * transcription before step 11b (RGAA 4.1: a derogation, ADR 0022). Each button names its message with who left it and
- * when (second review 11a, n°15: two messages of the same caller are two); a deletion, for good, is confirmed first;
+ * when (two messages of the same caller are two); a deletion, for good, is confirmed first;
  * a recording asked before the one asked last is not played.
  */
 export const VoicemailPage = () => {

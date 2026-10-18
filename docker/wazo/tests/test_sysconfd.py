@@ -1,4 +1,4 @@
-"""docker/wazo/sysconfd.py (second review 11a, n°6, n°13 and n°16; third review n°13; fourth review n°1 and n°15): its HTTP side as wazo-confd and a browser reach
+"""docker/wazo/sysconfd.py: its HTTP side as wazo-confd and a browser reach
 it, against an AMI and a wazo-confgend of this test, on the loopback.
 
     python3 -I -m unittest discover -s docker/wazo/tests
@@ -174,7 +174,7 @@ class Sysconfd(unittest.TestCase):
                 f.write('RIFF')
         return os.path.join(SPOOL, CONTEXT, number)
 
-    # The refusal of a browser's requests (review 11a, n°22).
+    # The refusal of a browser's requests.
     def test_a_request_of_a_web_page_or_for_another_host_is_refused_and_does_nothing(self):
         box = self.mailbox('102', 'msg0000.wav')
         for headers in ({'Origin': 'https://example.test'}, {'Sec-Fetch-Site': 'cross-site'}, {'Sec-Fetch-Mode': 'no-cors'}, {'Host': f'rebind.example.test:{self.port}'}, {'Host': '127.0.0.1:1'}):
@@ -188,12 +188,12 @@ class Sysconfd(unittest.TestCase):
         self.assertFalse(os.path.exists(box))
 
     def test_a_mailbox_out_of_the_spool_is_refused(self):
-        # A final newline too (fourth review 11a, n°15): the names are matched whole.
+        # A final newline too: the names are matched whole.
         for query in ('context=..&mailbox=102', f'context={CONTEXT}&mailbox=../../etc', 'context=a/b&mailbox=1', f'context={CONTEXT}&mailbox=', f'context={CONTEXT}&mailbox=102%0A', f'context={CONTEXT}%0A&mailbox=102'):
             self.assertEqual(self.request('GET', f'/delete_voicemail?{query}')[0], 400, query)
             self.assertEqual(self.request('GET', f'/move_voicemail?old_{query.replace("&", "&old_")}&new_context={CONTEXT}&new_mailbox=105')[0], 400, query)
 
-    # The move of a mailbox (second review 11a, n°6).
+    # The move of a mailbox.
     def test_a_mailbox_moves_with_its_messages_where_there_is_none(self):
         self.mailbox('102', 'msg0000.wav', 'msg0000.txt')
         status, _ = self.request('GET', f'/move_voicemail?old_context={CONTEXT}&old_mailbox=102&new_context={CONTEXT}&new_mailbox=105')
@@ -202,7 +202,7 @@ class Sysconfd(unittest.TestCase):
         self.assertEqual(sorted(os.listdir(os.path.join(SPOOL, CONTEXT, '105', 'INBOX'))), ['msg0000.txt', 'msg0000.wav'])
         # A mailbox with no message yet has no folder: nothing to move.
         self.assertEqual(self.request('GET', f'/move_voicemail?old_context={CONTEXT}&old_mailbox=103&new_context={CONTEXT}&new_mailbox=106')[0], 200)
-    # Fourth review 11a, n°1: as wazo-sysconfd's own source, no more (the Gateway never moves a mailbox).
+    # as wazo-sysconfd's own source, no more (the Gateway never moves a mailbox).
     def test_a_move_replaces_whatever_the_target_held_as_wazo_sysconfd_does(self):
         self.mailbox('102', 'msg0000.wav')
         self.mailbox('105', 'msg0000.wav', 'msg0001.wav')
@@ -225,7 +225,7 @@ class Sysconfd(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(SPOOL, CONTEXT, '105')))
         self.assertEqual(self.request('GET', f'/delete_voicemail?context={CONTEXT}&mailbox=105')[0], 200)
 
-    # The Asterisk commands (review 11a, n°22; second review n°16; third review n°13: AMI actions, never the CLI).
+    # The Asterisk commands (AMI actions, never the CLI).
     def test_a_command_runs_on_its_own_account_with_no_event_as_the_reload_of_its_module(self):
         self.assertEqual(self.request('POST', '/exec_request_handlers', '{"ipbx": ["dialplan reload", "core stop now", "module reload features", "module reload res_pjsip.so", "module reload app_queue.so"]}')[0], 200)
         login = self.ami.blocks[0]

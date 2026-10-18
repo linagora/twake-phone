@@ -1,239 +1,20 @@
 import { createHash } from 'node:crypto'
-import { readFileSync } from 'node:fs'
 import { afterEach, describe, expect, it } from 'vitest'
+import { CONTEXT, fakeWazo as fakeWazoOf, made } from '../test/fake-wazo.js'
 import { MESSAGE_ID, WazoStopped, WazoVoicemail, holderKey as keyedWith, mailboxNumber, voicemailOf, type Fetch, type WebSocketLike } from './index.js'
 
 /** The key of the prints of the holders, as the Gateway derives it from SECRETS_KEY (a fake one). */
 const SECRET = Buffer.alloc(32, 7)
 const holderKey = (userId: string) => keyedWith(SECRET, userId)
-/** The number of a person's mailbox (fourth review 11a, n°1). */
+/** The number of a person's mailbox. */
 const numberOf = (userId: string) => mailboxNumber(holderKey(userId))
 const DAY = 86_400_000
 
-/**
- * The rights of the Gateway's account in Wazo, as the stack gives them (docker/wazo/bootstrap.py, TWAKE_ACL): the fake
- * Wazo refuses (401) any request they do not cover, as wazo-auth's token check does.
- */
-const ACL = [.../TWAKE_ACL = \[([\s\S]*?)\n\]/.exec(readFileSync(new URL('../../../docker/wazo/bootstrap.py', import.meta.url), 'utf8'))![1]!.matchAll(/^\s*'([^']+)',/gm)].map(m => m[1]!)
-const ACTIONS: Record<string, string> = { GET: 'read', POST: 'create', PUT: 'update', DELETE: 'delete' }
-/** Whether one of the rights covers this one (`*`: one part, `#`: any number of them). */
-const covers = (acl: string[], wanted: string) =>
-  acl.some(a => new RegExp(`^${a.split('.').map(p => (p === '*' ? '[^.]+' : p === '#' ? '.*' : p.replace(/[-]/g, '\\$&'))).join('\\.')}$`).test(wanted))
-/** The right a request to wazo-confd (1.1) or wazo-calld (1.0) needs. */
-const rightOf = (method: string, path: string) => {
-  const parts = path.split('/').filter(Boolean).slice(1)
-  return [path.startsWith('/1.1/') ? 'confd' : 'calld', ...parts, ACTIONS[method]!].join('.')
-}
 /** Every fake Wazo made: none may have been asked for anything outside the rights. */
-const made: { denied: string[] }[] = []
 afterEach(() => {
   for (const state of made.splice(0)) expect(state.denied).toEqual([])
 })
-
-// A Wazo as its APIs answered on the Docker stack (wazo 26.10: wazo-auth, wazo-confd, wazo-calld, wazo-websocketd),
-// trimmed to what this package reads, in memory. What it answers is a copy (as JSON over HTTP would be): nothing the
-// provider changes in what it was given changes Wazo (fourth review 11a, n°11).
-const CONTEXT = 'ctx-None-internal-210d0144-9bcc-45c1-b36b-317577cedc2f'
-const folderTypes = [
-  { id: 1, type: 'new', name: 'inbox' },
-  { id: 2, type: 'old', name: 'old' },
-  { id: 3, type: 'urgent', name: 'urgent' },
-  { id: 4, type: 'other', name: 'work' }
-]
-type Message = { id: string; folder: number; caller_id_num: string | null; caller_id_name: string | null; timestamp: number; duration: number }
-
-const fakeWazo = () => {
-  const state = {
-    contexts: [] as { id: number; name: string; label: string; type: string }[],
-    users: [] as { uuid: string; firstname: string; userfield: string | null; voicemail: { id: number } | null }[],
-    voicemails: [] as { id: number; number: string; context: string; name: string; max_messages: number | null; options: [string, string][]; users: { uuid: string }[] }[],
-    messages: new Map<number, Message[]>(),
-    tokens: 0,
-    expired: new Set<string>(),
-    requests: [] as string[],
-    /** Each request with its query (what a search asked). */
-    urls: [] as string[],
-    /** The requests outside the rights of the Gateway's account (refused, 401): there must be none. */
-    denied: [] as string[],
-    down: false,
-    /** A recording sent without its length (chunked). */
-    noLength: false,
-    /** The length a recording says it has (its own by default). */
-    lengthSaid: undefined as number | undefined,
-    /** Mailboxes whose changes Wazo refuses (400), by id; numbers at which it refuses to make one. */
-    refuse: new Set<number>(),
-    refuseNumbers: new Set<string>(),
-    /** Every change of a mailbox's number (wazo-sysconfd's move_voicemail): there must be none (fourth review, n°1). */
-    moves: [] as string[],
-    /** The next read of a mailbox by its id waits this long (ms), once; the next ones fail (503), `failRead` times. */
-    slowRead: 0,
-    failRead: 0,
-    /** wazo-auth's answer waits this long (ms); each request of wazo-confd too. */
-    tokenMs: 0,
-    confdMs: 0,
-    /** The next request that starts so ("METHOD /path") is refused once, its token expired (401). */
-    expireOn: undefined as string | undefined
-  }
-  let next = 1
-  const json = (status: number, body?: unknown) => {
-    const copy = body === undefined ? undefined : structuredClone(body)
-    return { status, headers: { get: (n: string) => (n === 'content-type' ? 'application/json' : null) }, json: async () => copy, text: async () => JSON.stringify(copy ?? ''), body: null }
-  }
-  const wait = (ms: number, signal?: AbortSignal) =>
-    new Promise<void>((resolve, reject) => {
-      const t = setTimeout(resolve, ms)
-      signal?.addEventListener('abort', () => {
-        clearTimeout(t)
-        reject(signal.reason instanceof Error ? signal.reason : new Error(String(signal.reason)))
-      })
-    })
-  const fetch: Fetch = async (url, init) => {
-    if (state.down) throw new TypeError('fetch failed')
-    const u = new URL(url)
-    const path = u.pathname
-    state.requests.push(`${init.method} ${path}`)
-    state.urls.push(`${init.method} ${path}${u.search}`)
-    const body = init.body ? JSON.parse(init.body) : undefined
-    if (path === '/0.1/token') {
-      if (state.tokenMs) await wait(state.tokenMs, init.signal)
-      if (init.headers.authorization !== `Basic ${Buffer.from('twakephone:not-a-real-password').toString('base64')}`) return json(401)
-      expect(typeof body.expiration).toBe('number')
-      return json(200, { data: { token: `tok-${++state.tokens}` } })
-    }
-    const token = init.headers['x-auth-token']
-    if (!token?.startsWith('tok-') || state.expired.has(token)) return json(401)
-    if (!covers(ACL, rightOf(init.method, path))) {
-      state.denied.push(`${init.method} ${path}`)
-      return json(401)
-    }
-    if (state.confdMs && path.startsWith('/1.1')) await wait(state.confdMs, init.signal)
-    if (state.expireOn && `${init.method} ${path}`.startsWith(state.expireOn)) {
-      state.expireOn = undefined
-      state.expired.add(token)
-      return json(401)
-    }
-    const page = <T>(items: T[]) => json(200, { total: items.length, items: items.slice(Number(u.searchParams.get('offset') ?? 0), Number(u.searchParams.get('offset') ?? 0) + Number(u.searchParams.get('limit') ?? 1000)) })
-    let m: RegExpExecArray | null
-    if (path === '/1.1/contexts' && init.method === 'GET') return page(state.contexts)
-    if (path === '/1.1/contexts' && init.method === 'POST') {
-      // The first one as on the Docker stack; another (two Gateways at their first start) named after its id.
-      const id = next++
-      const c = { id, name: state.contexts.length ? `ctx-None-internal-${id}` : CONTEXT, label: body.label, type: body.type }
-      state.contexts.push(c)
-      return json(201, c)
-    }
-    if ((m = /^\/1\.1\/contexts\/(\d+)$/.exec(path)) && init.method === 'DELETE') {
-      state.contexts = state.contexts.filter(c => c.id !== Number(m![1]))
-      return json(204)
-    }
-    if (path === '/1.1/users' && init.method === 'GET') {
-      // As wazo-confd: a search matches part of the name or the userfield (among others).
-      const search = u.searchParams.get('search')
-      return page(state.users.filter(x => !search || x.firstname.includes(search) || (x.userfield ?? '').includes(search)))
-    }
-    if (path === '/1.1/users' && init.method === 'POST') {
-      const user = { uuid: `00000000-0000-4000-8000-${String(next++).padStart(12, '0')}`, firstname: body.firstname, userfield: body.userfield ?? null, voicemail: null }
-      state.users.push(user)
-      return json(201, user)
-    }
-    if ((m = /^\/1\.1\/users\/([^/]+)$/.exec(path)) && init.method === 'GET') {
-      const user = state.users.find(x => x.uuid === m![1])
-      return user ? json(200, user) : json(404, ['Resource Not Found'])
-    }
-    if ((m = /^\/1\.1\/users\/([^/]+)$/.exec(path)) && init.method === 'DELETE') {
-      state.users = state.users.filter(x => x.uuid !== m![1])
-      return json(204)
-    }
-    if ((m = /^\/1\.1\/users\/([^/]+)\/voicemails\/(\d+)$/.exec(path)) && init.method === 'PUT') {
-      const user = state.users.find(x => x.uuid === m![1])!
-      user.voicemail = { id: Number(m[2]) }
-      state.voicemails.find(v => v.id === Number(m![2]))!.users.push({ uuid: user.uuid })
-      return json(204)
-    }
-    if ((m = /^\/1\.1\/users\/([^/]+)\/voicemails$/.exec(path)) && init.method === 'DELETE') {
-      const user = state.users.find(x => x.uuid === m![1])!
-      for (const v of state.voicemails) v.users = v.users.filter(x => x.uuid !== user.uuid)
-      user.voicemail = null
-      return json(204)
-    }
-    if (path === '/1.1/voicemails' && init.method === 'GET') {
-      const search = u.searchParams.get('search')
-      return page(state.voicemails.filter(v => !search || v.number.includes(search)))
-    }
-    if (path === '/1.1/voicemails' && init.method === 'POST') {
-      if (state.refuseNumbers.has(body.number)) return json(400, ['Resource Error - refused'])
-      if (state.voicemails.some(v => v.number === body.number && v.context === body.context)) return json(400, ['Resource Error - Voicemail already exists'])
-      const vm = { id: next++, number: body.number, context: body.context, name: body.name, max_messages: body.max_messages ?? null, options: body.options ?? [], users: [] }
-      state.voicemails.push(vm)
-      state.messages.set(vm.id, [])
-      return json(201, vm)
-    }
-    if ((m = /^\/1\.1\/voicemails\/(\d+)$/.exec(path)) && init.method === 'GET') {
-      if (state.failRead > 0) {
-        state.failRead--
-        return json(503, ['Service Unavailable'])
-      }
-      if (state.slowRead) {
-        const ms = state.slowRead
-        state.slowRead = 0
-        await new Promise(r => setTimeout(r, ms))
-      }
-      const vm = state.voicemails.find(v => v.id === Number(m![1]))
-      return vm ? json(200, vm) : json(404, ['Resource Not Found'])
-    }
-    if ((m = /^\/1\.1\/voicemails\/(\d+)$/.exec(path)) && init.method === 'PUT') {
-      if (state.refuse.has(Number(m[1]))) return json(400, ['Resource Error - refused'])
-      const vm = state.voicemails.find(v => v.id === Number(m![1]))
-      if (!vm) return json(404, ['Resource Not Found'])
-      if (state.voicemails.some(v => v !== vm && v.number === body.number && v.context === body.context)) return json(400, ['Resource Error - Voicemail already exists'])
-      // Another number: wazo-sysconfd's move_voicemail, as its source does it (rm -rf of the target, then mv).
-      if (body.number !== vm.number) state.moves.push(`${vm.number}>${body.number}`)
-      Object.assign(vm, { number: body.number, context: body.context, name: body.name, max_messages: body.max_messages ?? null, options: body.options ?? [] })
-      return json(204)
-    }
-    if ((m = /^\/1\.1\/voicemails\/(\d+)$/.exec(path)) && init.method === 'DELETE') {
-      const vm = state.voicemails.find(v => v.id === Number(m![1]))!
-      if (vm.users.length) return json(400, ['Resource Error - Voicemail is associated with a User'])
-      state.voicemails = state.voicemails.filter(v => v !== vm)
-      state.messages.delete(vm.id)
-      return json(204)
-    }
-    if ((m = /^\/1\.0\/voicemails\/(\d+)$/.exec(path))) {
-      const msgs = state.messages.get(Number(m[1]))
-      if (!msgs) return json(404, { message: 'No such voicemail' })
-      return json(200, { id: Number(m[1]), folders: folderTypes.map(f => ({ ...f, messages: msgs.filter(x => x.folder === f.id).map(({ folder: _, ...x }) => ({ ...x, empty: false, transcription: null })) })) })
-    }
-    if ((m = /^\/1\.0\/voicemails\/(\d+)\/messages\/([^/]+)(\/recording)?$/.exec(path))) {
-      const msgs = state.messages.get(Number(m[1]))
-      const msg = msgs?.find(x => x.id === m![2])
-      if (!msgs || !msg) return json(404, { message: 'No such message' })
-      if (m[3]) {
-        const bytes = new TextEncoder().encode(`RIFF${msg.id}`)
-        // Sent in two pieces, as a stream.
-        const body = (async function* () {
-          yield bytes.slice(0, 4)
-          yield bytes.slice(4)
-        })()
-        return { status: 200, headers: { get: (n: string) => (n === 'content-type' ? 'audio/wav' : n === 'content-length' && !state.noLength ? String(state.lengthSaid ?? bytes.length) : null) }, json: async () => ({}), text: async () => '', body }
-      }
-      if (init.method === 'PUT') {
-        msg.folder = body.folder_id
-        return json(204)
-      }
-      if (init.method === 'DELETE') {
-        state.messages.set(Number(m[1]), msgs.filter(x => x !== msg))
-        return json(204)
-      }
-    }
-    return json(404, { path })
-  }
-  made.push(state)
-  /** The mailbox at a person's number, and its name (TwakePhone, or since when it is aside). */
-  const boxOf = (userId: string) => state.voicemails.find(v => v.number === numberOf(userId))
-  const nameOf = (userId: string) => boxOf(userId)?.name
-  const msg = (id: string, over: Partial<Message> = {}): Message => ({ id, folder: 1, caller_id_num: '101', caller_id_name: null, timestamp: 1, duration: 3, ...over })
-  return { state, fetch, boxOf, nameOf, msg }
-}
+const fakeWazo = () => fakeWazoOf(numberOf)
 
 /** wazo-websocketd as it spoke on the Docker stack: init, then the subscriptions and start, then the events. */
 const fakeSockets = () => {
@@ -342,13 +123,13 @@ describe('WazoVoicemail, the mailboxes', () => {
     ])
     expect(wazo.state.voicemails.map(v => v.name)).toEqual(['TwakePhone', 'TwakePhone'])
     expect(JSON.stringify(wazo.state)).not.toContain('Dupont')
-    // Nothing of the person's id in Wazo: a print of it keyed with a key Wazo never has (review 11a, n°9), not the plain
+    // Nothing of the person's id in Wazo: a print of it keyed with a key Wazo never has, not the plain
     // hash that trying the directory's ids gives back.
     expect(holderKey('jean')).toMatch(/^twakephone:[0-9a-f]{40}$/)
     expect(holderKey('jean')).not.toBe(keyedWith(Buffer.alloc(32, 8), 'jean'))
     expect(holderKey('jean')).not.toContain(createHash('sha256').update('jean').digest('hex').slice(0, 40))
     expect(JSON.stringify(wazo.state)).not.toContain('"jean"')
-    // Each mailbox has its bounds (review 11a, n°3): 50 messages, 3 minutes each, 10 s of silence end one.
+    // Each mailbox has its bounds: 50 messages, 3 minutes each, 10 s of silence end one.
     expect(wazo.state.voicemails.map(v => [v.max_messages, v.options])).toEqual([
       [50, [['maxsecs', '180'], ['maxsilence', '10']]],
       [50, [['maxsecs', '180'], ['maxsilence', '10']]]
@@ -363,7 +144,7 @@ describe('WazoVoicemail, the mailboxes', () => {
     expect(wazo.state.requests.slice(before).filter(r => !r.startsWith('GET'))).toEqual([])
   })
 
-  it('keeps a person their mailbox, messages and all, when they take another extension, and when two swap theirs: no mailbox ever changes number, Wazo moves nothing in its spool (fourth review 11a, n°1)', async () => {
+  it('keeps a person their mailbox, messages and all, when they take another extension, and when two swap theirs: no mailbox ever changes number, Wazo moves nothing in its spool', async () => {
     const { vm, wazo } = make()
     await vm.syncMailboxes([jean, alice])
     const jeans = wazo.boxOf('jean')!
@@ -384,7 +165,7 @@ describe('WazoVoicemail, the mailboxes', () => {
     ])
     expect((await vm.listMessages({ extension: '103', userId: 'jean' })).map(m => m.id)).toEqual(['1-1'])
     expect((await vm.listMessages({ extension: '104', userId: 'alice' })).map(m => m.id)).toEqual(['2-2'])
-    // The whole plan renumbered: everyone still holds an extension, nothing held back (third review 11a, n°12).
+    // The whole plan renumbered: everyone still holds an extension, nothing held back.
     const res = await vm.syncMailboxes([
       { extension: '203', userId: 'jean' },
       { extension: '204', userId: 'alice' }
@@ -423,7 +204,7 @@ describe('WazoVoicemail, the mailboxes', () => {
     expect(wazo.state.moves).toEqual([])
   })
 
-  it('keeps a mailbox set aside with its messages until the retention period deleted them, past the grace period too, and gives it back to its holder who comes back, at whatever extension (fourth review 11a, n°1)', async () => {
+  it('keeps a mailbox set aside with its messages until the retention period deleted them, past the grace period too, and gives it back to its holder who comes back, at whatever extension', async () => {
     const time = clock()
     const { vm, wazo } = make({ now: time.now })
     await vm.syncMailboxes([jean, alice])
@@ -449,7 +230,7 @@ describe('WazoVoicemail, the mailboxes', () => {
     expect(wazo.state.users.map(u => u.userfield)).toEqual([holderKey('alice')])
   })
 
-  it('holds back the mailboxes of more than two people gone at once, more than half of those reached, until it is said to be meant (second review 11a, n°9)', async () => {
+  it('holds back the mailboxes of more than two people gone at once, more than half of those reached, until it is said to be meant', async () => {
     const time = clock()
     const { vm, wazo, logs } = make({ now: time.now })
     const four = ['102', '103', '104', '105'].map((extension, i) => ({ extension, userId: `u${i}` }))
@@ -463,7 +244,7 @@ describe('WazoVoicemail, the mailboxes', () => {
     expect(logs.find(l => /held back/.test(l))).toMatch(/4 of 4 of people who hold no extension still reached at the one they had/)
     // It came back: nothing held any more.
     expect((await vm.syncMailboxes(four)).heldBack).toBeUndefined()
-    // An administrator says they left, having seen four of four (third review 11a, n°6): what they saw goes, nothing
+    // An administrator says they left, having seen four of four: what they saw goes, nothing
     // else. A release of another mass (three of four, four of five) lets nothing go: held back again, said.
     for (const release of [{ park: 3, of: 4 }, { park: 4, of: 5 }, { remove: 4, of: 4 }]) {
       const again = await vm.syncMailboxes([], { release })
@@ -493,12 +274,15 @@ describe('WazoVoicemail, the mailboxes', () => {
     const held = await other.syncMailboxes([], { reached: boxes })
     expect([held.heldBack, held.boxes]).toEqual([{ park: 4, of: 4 }, boxes])
     expect(four.map(h => wazo.nameOf(h.userId))).toEqual(four.map(() => 'TwakePhone'))
-    // Reached nowhere any more (the SIP server's rows gone): the people gone are set aside, whatever their count.
+    // Reached nowhere any more (the SIP server's rows gone): the people gone are set aside, whatever their count. The
+    // Gateway never takes those rows away before a round (only an extension given to someone else is withdrawn at once):
+    // its test of a directory come back half empty goes through the directory's synchronisation, the withdrawal and the
+    // round, and the round holds the mass back.
     expect((await other.syncMailboxes([], { reached: [] })).heldBack).toBeUndefined()
     expect(four.every(h => wazo.nameOf(h.userId)!.startsWith('TwakePhone aside '))).toBe(true)
   })
 
-  it('holds back from three people gone, and more than half: two of four go, three of six go, three of five wait (the bound of n°9)', async () => {
+  it('holds back from three people gone, and more than half: two of four go, three of six go, three of five wait', async () => {
     const outcome = async (total: number, leaving: number) => {
       const { vm, wazo } = make()
       const all = Array.from({ length: total }, (_, i) => ({ extension: String(110 + i), userId: `p${i}` }))
@@ -522,7 +306,7 @@ describe('WazoVoicemail, the mailboxes', () => {
     expect(three.map(h => wazo.nameOf(h.userId)!.startsWith('TwakePhone aside '))).toEqual([true, true, true])
   })
 
-  it('stops before its next change once it may no longer write, asked again once the token is in hand, and purges nothing more (third review 11a, n°2; fourth review n°4)', async () => {
+  it('stops before its next change once it may no longer write, asked again once the token is in hand, and purges nothing more', async () => {
     const { vm, wazo } = make()
     await vm.syncMailboxes([jean])
     // It may write once more: Marie's user made, then nothing (no mailbox for her). Asked before the change, and
@@ -551,7 +335,7 @@ describe('WazoVoicemail, the mailboxes', () => {
     expect(wazo.state.messages.get(box.id)).toHaveLength(1)
   })
 
-  it('bounds a write whole, its token and its retry after a 401 included, below the margin of the lease (fourth review 11a, n°4)', async () => {
+  it('bounds a write whole, its token and its retry after a 401 included, below the margin of the lease', async () => {
     const { vm, wazo } = make({ writeTimeoutMs: 120, requestTimeoutMs: 1_000 })
     await vm.syncMailboxes([jean])
     // A request of wazo-confd that takes 50 ms and is refused (401: its token expired), a token that takes 50 ms, the
@@ -615,7 +399,7 @@ describe('WazoVoicemail, the mailboxes', () => {
     expect(w3.state.voicemails.map(v => v.number).sort()).toEqual(['n0', ...nine.slice(3).map(h => h.userId)].map(numberOf).sort())
   })
 
-  it('tells the SIP side the mailboxes already their holder\'s before it changes anything, at the extension they hold now (second review 11a, n°3)', async () => {
+  it('tells the SIP side the mailboxes already their holder\'s before it changes anything, at the extension they hold now', async () => {
     const { vm, wazo } = make()
     await vm.syncMailboxes([jean, alice])
     let seen: { boxes: unknown; writes: number } | undefined
@@ -632,7 +416,7 @@ describe('WazoVoicemail, the mailboxes', () => {
     expect(writes(wazo).length).toBeGreaterThan(before)
   })
 
-  it('leaves out a mailbox Wazo refuses to make, does the others, and asks again after a wait that grows (second review 11a, n°8; fourth review n°6)', async () => {
+  it('leaves out a mailbox Wazo refuses to make, does the others, and asks again after a wait that grows', async () => {
     const time = clock()
     const { vm, wazo, logs } = make({ now: time.now })
     await vm.syncMailboxes([jean])
@@ -683,7 +467,7 @@ describe('WazoVoicemail, the mailboxes', () => {
     expect([changed.boxes.map(b => b.extension), changed.failed]).toEqual([['102', '104'], 1])
   })
 
-  it('makes one context only when two Gateways start at once, and one mailbox per person (second review 11a, n°1)', async () => {
+  it('makes one context only when two Gateways start at once, and one mailbox per person', async () => {
     const a = make()
     const b = new WazoVoicemail({ authUrl: 'http://wazo.test:9497/0.1', confdUrl: 'http://wazo.test:9486/1.1', calldUrl: 'http://wazo.test:9500/1.0', websocketdUrl: 'ws://wazo.test:9502/', username: 'twakephone', password: 'not-a-real-password', holderSecret: SECRET, fetch: a.wazo.fetch, logger: { info() {}, warn() {}, error() {} } })
     await Promise.all([a.vm.syncMailboxes([jean]), b.syncMailboxes([jean])].map(p => p.catch(() => undefined)))
@@ -702,7 +486,7 @@ describe('WazoVoicemail, the mailboxes', () => {
     await vm.syncMailboxes([jean])
     expect([box.max_messages, box.options, box.number]).toEqual([20, [['maxsecs', '120'], ['maxsilence', '5']], numberOf('jean')])
     expect(() => make({ maxMessages: 0 })).toThrow(/maxMessages/)
-    // A message longer than a call to a mailbox lasts: refused at the start (second review 11a, n°11).
+    // A message longer than a call to a mailbox lasts: refused at the start.
     expect(() => make({ maxMessageSec: 600, maxCallSec: 300 })).toThrow(/longer than a call to a mailbox lasts/)
     expect(() => make({ maxMessageSec: 600 })).not.toThrow()
     expect(() => make({ holderSecret: Buffer.alloc(8) })).toThrow(/holderSecret/)
@@ -738,7 +522,7 @@ describe('WazoVoicemail, the mailboxes', () => {
     expect(wazo.state.tokens).toBe(2)
   })
 
-  it('says it is disconnected, and why in a few words, when Wazo cannot be reached or refuses its account; asked, it asks Wazo now (fourth review 11a, n°3)', async () => {
+  it('says it is disconnected, and why in a few words, when Wazo cannot be reached or refuses its account; asked, it asks Wazo now', async () => {
     const down = make()
     down.wazo.state.down = true
     await expect(down.vm.syncMailboxes([])).rejects.toThrow(/voicemail server not reached/)
@@ -838,7 +622,7 @@ describe('WazoVoicemail, the bounds and the erasure of the messages', () => {
     return { ...t, box }
   }
 
-  it('refuses a recording larger than its bound before reading it, and cuts one that says nothing of its length (review 11a, n°3)', async () => {
+  it('refuses a recording larger than its bound before reading it, and cuts one that says nothing of its length', async () => {
     const { vm, wazo } = await withMessage({ maxRecordingBytes: 10 })
     await expect(vm.getRecording(jean, '1792289524-00000004')).rejects.toMatchObject({ status: 502, message: /larger than 10 bytes/ })
     wazo.state.noLength = true
@@ -850,7 +634,7 @@ describe('WazoVoicemail, the bounds and the erasure of the messages', () => {
     expect(await read((await ok.getRecording(jean, '1792289524-00000004'))!.body)).toBe('RIFF1792289524-00000004')
   })
 
-  it('bounds a recording on the longest call to a mailbox, not on the longest message now (second review 11a, n°11)', async () => {
+  it('bounds a recording on the longest call to a mailbox, not on the longest message now', async () => {
     // Messages of 60 s now; one of 5 minutes left before (the call's bound) is still read; past the call's bound and
     // its margin, refused.
     const { vm, wazo } = await withMessage({ maxMessageSec: 60 })
@@ -913,7 +697,7 @@ describe('WazoVoicemail, the bounds and the erasure of the messages', () => {
     expect(await vm.purgeMessages(new Date(1792290000 * 1000))).toBe(1)
     expect(wazo.state.messages.get(box.id)!.map(m => m.id)).toEqual(['1792300000-00000005'])
     expect(logs.some(l => /1 message\(s\) older than the retention period deleted/.test(l))).toBe(true)
-    // One without a date (second review 11a, n°22): not one of 1970, it stays, and it is said.
+    // One without a date: not one of 1970, it stays, and it is said.
     wazo.state.messages.get(box.id)!.push({ id: '0-0', folder: 1, caller_id_num: '101', caller_id_name: null, timestamp: undefined as unknown as number, duration: 2 })
     expect(await vm.purgeMessages(new Date(1792290000 * 1000))).toBe(0)
     expect(wazo.state.messages.get(box.id)!.map(m => m.id)).toEqual(['1792300000-00000005', '0-0'])
@@ -949,16 +733,30 @@ describe('WazoVoicemail, the bounds and the erasure of the messages', () => {
     expect(done.at(-1)).toBe(`DELETE /1.1/voicemails/${jeans.id}`)
     expect(logs.some(l => /1 removed \(aside past the grace period, 1 message\(s\) with them: no retention period\)/.test(l))).toBe(true)
   })
+
+  it('never removes a mailbox with its messages in the round that set it aside, whatever its grace period', async () => {
+    const time = clock()
+    const { vm, wazo } = make({ now: time.now, graceMs: 0 })
+    await vm.syncMailboxes([jean, alice])
+    const jeans = wazo.boxOf('jean')!
+    wazo.state.messages.get(jeans.id)!.push(wazo.msg('1-1', { timestamp: Math.floor(time.at / 1000) }))
+    // Jean between two extensions a round: his mailbox aside, his message kept; back, it is his again.
+    await vm.syncMailboxes([alice], { removeAsideWithMessages: true })
+    expect(wazo.boxOf('jean')?.name).toMatch(/^TwakePhone aside /)
+    expect(wazo.state.messages.get(jeans.id)!.map(m => m.id)).toEqual(['1-1'])
+    await vm.syncMailboxes([{ extension: '105', userId: 'jean' }, alice], { removeAsideWithMessages: true })
+    expect([wazo.boxOf('jean')?.name, wazo.state.messages.get(jeans.id)!.map(m => m.id)]).toEqual(['TwakePhone', ['1-1']])
+  })
 })
 
 describe('WazoVoicemail, the events', () => {
-  it('renews its token at four fifths of its life while it hears the events, even when no request needs one (review 11a, n°8)', async () => {
+  it('renews its token at four fifths of its life while it hears the events, even when no request needs one', async () => {
     const { vm, wazo, ws } = make({ tokenTtlSec: 0.05 })
     await vm.syncMailboxes([])
     vm.subscribe()
     await tick(5)
     expect(wazo.state.tokens).toBe(1)
-    // Several cycles (second review 11a, n°12): each renewal arms the next one, the WebSocket hears each token.
+    // Several cycles: each renewal arms the next one, the WebSocket hears each token.
     await tick(200)
     expect(wazo.state.tokens).toBeGreaterThanOrEqual(4)
     for (const token of ['tok-2', 'tok-3', 'tok-4']) expect(ws.sockets[0]!.sent).toContainEqual({ op: 'token', data: { token } })
@@ -982,7 +780,7 @@ describe('WazoVoicemail, the events', () => {
     expect((await next).done).toBe(true)
   })
 
-  it('tells a message as the extension its holder holds, whatever Gateway synchronised, and owns says whose mailbox it is (second review 11a, n°2)', async () => {
+  it('tells a message as the extension its holder holds, whatever Gateway synchronised, and owns says whose mailbox it is', async () => {
     const a = make()
     await a.vm.syncMailboxes([jean])
     const jeans = a.wazo.boxOf('jean')!
@@ -1009,7 +807,7 @@ describe('WazoVoicemail, the events', () => {
     await a.vm.close()
   })
 
-  it('tells nothing of a mailbox of nobody, and finds the holder among its users whatever their order (third review 11a, n°12 and n°14)', async () => {
+  it('tells nothing of a mailbox of nobody, and finds the holder among its users whatever their order', async () => {
     const { vm, wazo, ws } = make()
     await vm.syncMailboxes([jean])
     const jeans = wazo.boxOf('jean')!
@@ -1063,7 +861,7 @@ describe('WazoVoicemail, the events', () => {
     await vm.close()
   })
 
-  it("tells a mailbox's events in the order they came, its mailbox read once for the event and its owns, read again past that, and once more when Wazo did not answer (third review 11a, n°8; fourth review n°11)", async () => {
+  it("tells a mailbox's events in the order they came, its mailbox read once for the event and its owns, read again past that, and once more when Wazo did not answer", async () => {
     const time = clock()
     const { vm, wazo, ws, logs } = make({ now: time.now })
     await vm.syncMailboxes([jean])

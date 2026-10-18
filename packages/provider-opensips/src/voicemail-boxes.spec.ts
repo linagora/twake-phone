@@ -64,7 +64,7 @@ describe('VoicemailBoxes', () => {
     await expect(new VoicemailBoxes({ pool: { query: none.pool.query } }).set([])).rejects.toThrow(/a transaction/)
   })
 
-  it('withdraws the mailboxes of some extensions of its tenant only, never one that is no extension, numbering the withdrawal (second review 11a, n°3; fourth review n°2)', async () => {
+  it('withdraws the mailboxes of some extensions of its tenant only, never one that is no extension, numbering the withdrawal', async () => {
     const db = recorder([], { fence: '0', withdrawals: '6' })
     await new VoicemailBoxes({ pool: db.pool, tenantId: 'A' }).withdraw(['102', "1' OR '1'='1", '102'])
     expect(db.queries.slice(3, 6)).toEqual([
@@ -130,7 +130,7 @@ if (process.env.TEST_DATABASE_URL) {
       expect((await pool.query("SELECT to_regclass('voicemail_boxes') IS NULL AS missing")).rows[0].missing).toBe(false)
     })
 
-    it('never lets a write that read the holders before a withdrawal undo it, whichever Gateway withdrew (fourth review 11a, n°2)', async () => {
+    it('never lets a write that read the holders before a withdrawal undo it, whichever Gateway withdrew', async () => {
       // Two Gateways, each its own pool: A writes the mailboxes, B withdraws 9202 once it gave it to someone else.
       const other = new pg.Pool({ connectionString: process.env.TEST_DATABASE_URL, max: 2, options: '-c search_path=spec_voicemail_boxes' })
       try {
@@ -163,7 +163,7 @@ if (process.env.TEST_DATABASE_URL) {
       }
     })
 
-    it('refuses a write under an older lease than the last one written, and leaves the rows as they were (fourth review 11a, n°2)', async () => {
+    it('refuses a write under an older lease than the last one written, and leaves the rows as they were', async () => {
       const a = new VoicemailBoxes({ pool, ready, tenantId: 'spec-D' })
       await a.set([{ extension: '9301', mailbox: '9301@d' }], { fence: 100 })
       // A later lease writes; the older one's write that comes after is refused, whole.

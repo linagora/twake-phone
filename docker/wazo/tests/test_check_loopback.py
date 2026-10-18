@@ -1,4 +1,4 @@
-"""docker/wazo/check-loopback.py (second review 11a, n°4 and n°13), on processes of this test: no Docker, no root.
+"""docker/wazo/check-loopback.py, on processes of this test: no Docker, no root.
 
     python3 -I -m unittest discover -s docker/wazo/tests
 
@@ -86,7 +86,7 @@ class CheckLoopback(unittest.TestCase):
         self.fail('the listener did not start')
 
     def test_a_listener_on_every_address_named_asterisk_fails(self):
-        # The case of the second review: the shape of the DNS client, from another program.
+        # The case of the shape of the DNS client, from another program.
         pid, ports = self.listener([{'address': '0.0.0.0'}])
         allowed, bad, _ = check_loopback.check({'wazo-asterisk': [(pid, 'asterisk')]}, '127.0.0.1:5100')
         self.assertEqual(allowed, {})
@@ -136,7 +136,7 @@ class CheckLoopback(unittest.TestCase):
         self.fail('no free port below the ephemeral range')
 
     def test_the_only_listener_on_every_address_at_a_fixed_port_fails_in_the_ioqueue_of_asterisk(self):
-        # Third review 11a, n°9: everything of PJSIP's DNS client but its port, one outside ip_local_port_range.
+        # everything of PJSIP's DNS client but its port, one outside ip_local_port_range.
         fixed = self.fixed_port()
         pid, ports = self.listener([{'address': '127.0.0.1', 'epoll': 0}, {'address': '0.0.0.0', 'port': fixed, 'epoll': 0}])
         allowed, bad, _ = check_loopback.check({'wazo-asterisk': [(pid, 'asterisk')]}, f'127.0.0.1:{ports[0]}', self.as_asterisk)

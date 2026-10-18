@@ -246,7 +246,8 @@ export interface TelephonyAlert {
    * (`removal-changed`), let go because the operator no longer has the line (`removal-gone`), owed for over a day
    * (`removal-late`). `voicemail` (step 11a): raised by the Gateway, the synchronisation of the mailboxes fails since
    * `value` minutes (`sync-failing`), the SIP server's database refused its write under the lease it holds
-   * (`sync-fenced`), or it keeps leaving out `value` mailboxes the voicemail server refuses (`boxes-refused`); raised by
+   * (`sync-fenced`), or it keeps leaving out `value` mailboxes the voicemail server refuses (`boxes-refused`), or it holds back `value`
+   * mailboxes of `threshold` reached, too many set aside or removed at once (`held-back`); raised by
    * the SIP server, a call to the mailbox of `extension` refused for a cap, `value` of `threshold`: of the callers with
    * no number there, at the same time (`hidden-calls`) or in the hour (`hidden-hour`), of those with no number to all
    * the mailboxes (`hidden-all`), or of all callers (`calls-all`).
@@ -648,7 +649,7 @@ export interface WebhookCall {
   /** A conference's call (step 8b): the room called this person. */
   conference?: true
   /**
-   * The call went to a mailbox (step 11a, review n°11): nobody took it, the voicemail server did. For the caller,
+   * The call went to a mailbox (step 11a): nobody took it, the voicemail server did. For the caller,
    * `answered_at` and `outcome: answered` are the mailbox's answer, not the person's; for the callee it is missed.
    */
   voicemail?: true

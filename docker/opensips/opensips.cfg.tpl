@@ -220,12 +220,12 @@ modparam("cfgutils", "shvset", "meet_max_sec=i:${MEET_MAX_CALL_SEC}")
 modparam("cfgutils", "shvset", "wazo_on=i:${WAZO_ON}")
 modparam("cfgutils", "shvset", "no11_until=i:0")
 # Wazo's Asterisk heard nothing from (a mailbox called, no answer at all within 2 s): the mailboxes are left out 30 s
-# ($shv(wazo_mute_until), failure_route[voicemail_failed]), the calls get their refusal at once (review 11a, n°14).
+# ($shv(wazo_mute_until), failure_route[voicemail_failed]), the calls get their refusal at once.
 modparam("cfgutils", "shvset", "wazo_mute_until=i:0")
 # The bounds of the calls to the mailboxes (route[voicemail]), for the calls to come once changed (MI shv_set; the e2e
 # lowers the caps a moment): VOICEMAIL_MAX_CALL_SEC, which the Gateway reads (shv_get) and compares with the longest
-# message of its voicemail server at its start (third review 11a, n°10); VOICEMAIL_CALLS_PER_CALLER,
-# VOICEMAIL_CALLS_HIDDEN, VOICEMAIL_CALLS_HIDDEN_ALL, VOICEMAIL_CALLS_ALL and VOICEMAIL_CALLS_PER_HOUR (n°7); the key
+# message of its voicemail server at its start; VOICEMAIL_CALLS_PER_CALLER,
+# VOICEMAIL_CALLS_HIDDEN, VOICEMAIL_CALLS_HIDDEN_ALL, VOICEMAIL_CALLS_ALL and VOICEMAIL_CALLS_PER_HOUR; the key
 # of the prints the caps count the callers by (VOICEMAIL_CALLER_KEY, drawn by entrypoint.sh at each start).
 modparam("cfgutils", "shvset", "vm_max_sec=i:${VOICEMAIL_MAX_CALL_SEC}")
 modparam("cfgutils", "shvset", "vm_per_caller=i:${VOICEMAIL_CALLS_PER_CALLER}")
@@ -3497,10 +3497,10 @@ route[relay_failed] {
 # CDR, `via` voicemail); for the extension dialled it is a missed call. A mailbox that does not answer gives the caller
 # what it would have had without it (failure_route[voicemail_failed]): the same refusal, the same missed call.
 # A call to a mailbox lasts VOICEMAIL_MAX_CALL_SEC at most ($DLG_timeout; a call from the operator then ends with a BYE
-# both ways, B; Asterisk hangs up its side at that bound too, and records VOICEMAIL_MAX_SEC at most: review 11a, n°3).
+# both ways, B; Asterisk hangs up its side at that bound too, and records VOICEMAIL_MAX_SEC at most).
 # A mailbox that does not answer within 2 s (Wazo down, a row of voicemail_boxes out of date) is left for the refusal,
-# and when nothing at all came back from Asterisk, every mailbox is left out the next 30 s (n°14). The greeting says
-# whether the caller is outside (`;caller=external`): the extension is never spelled out to them (n°12). Bounded as
+# and when nothing at all came back from Asterisk, every mailbox is left out the next 30 s. The greeting says
+# whether the caller is outside (`;caller=external`): the extension is never spelled out to them. Bounded as
 # Meet's access number is, $shv(vm_*): VOICEMAIL_CALLS_PER_CALLER calls of one caller to the mailboxes at the same
 # time, VOICEMAIL_CALLS_ALL of all callers, and VOICEMAIL_CALLS_PER_HOUR calls of one caller to the same mailbox in an
 # hour (one caller filling a mailbox fills it for everyone; the hour from the first of them: cache_add keeps the
@@ -3584,10 +3584,13 @@ route[voicemail] {
 			route(voicemail_alert, "calls-all", $var(vm_all), $shv(vm_calls_all));
 		} else {
 			if ($var(vm_anon) == 1) {
-				if ($var(vm_nobody) >= $shv(vm_hidden_all))
-					route(voicemail_alert, "hidden-all", $var(vm_nobody), $shv(vm_hidden_all));
-				else
+				# Their share at 0: the mailboxes closed to them on purpose, nothing to tell.
+				if ($var(vm_nobody) >= $shv(vm_hidden_all)) {
+					if ($shv(vm_hidden_all) > 0)
+						route(voicemail_alert, "hidden-all", $var(vm_nobody), $shv(vm_hidden_all));
+				} else {
 					route(voicemail_alert, "hidden-calls", $var(vm_mine), $var(vm_cap));
+				}
 			}
 		}
 		return(-1);
@@ -3653,10 +3656,9 @@ route[voicemail] {
 }
 
 # The mailbox did not take the call: it is back where it was, for its refusal (its `via` and its lifetime too). The
-# headers appended for Asterisk stay on the request (second review 11a, n°17): remove_hf sees the headers received
+# headers appended for Asterisk stay on the request: remove_hf sees the headers received
 # only, never those append_hf added, and what route[voicemail] appended is not undone. No path relays the request after
-# this route (each one replies, or ends): none reaches anyone else. Nor does it count in the caller's hour (third review
-# 11a, n°7).
+# this route (each one replies, or ends): none reaches anyone else. Nor does it count in the caller's hour.
 route[voicemail_undo] {
 	route(voicemail_unhour);
 	$(avp(voicemail)[*]) = NULL;
@@ -3674,7 +3676,7 @@ route[voicemail_undo] {
 
 # A call the mailbox did not take, counted out of the hour of its caller (route[voicemail]), once. Past the hour (the
 # key gone meanwhile), cache_sub would leave -1 there for a new hour (OpenSIPS 3.6, cachedb_local: a cache_add of -1),
-# one call more in the next one: removed instead (fourth review 11a, n°7). Under the lock of the count.
+# one call more in the next one: removed instead. Under the lock of the count.
 route[voicemail_unhour] {
 	if ($avp(vm_hour) == NULL)
 		return;
@@ -3715,7 +3717,7 @@ route[voicemail_alert] {
 
 failure_route[voicemail_failed] {
 	$var(relay_request) = 0;
-	# Cancelled by the caller before the mailbox answered: it stays counted in their hour (fourth review 11a, n°7).
+	# Cancelled by the caller before the mailbox answered: it stays counted in their hour.
 	if (t_was_cancelled()) {
 		rtpengine_delete();
 		route(account_missed);
@@ -3806,11 +3808,11 @@ onreply_route[rtp] {
 	# The mailbox answered (step 11a, route[voicemail]): told once, as itself, never as a ringing or an answer of the
 	# callee; nobody's identity is asserted to the caller.
 	if ($avp(voicemail) != NULL) {
-		# Nothing says to the caller what answered (second review 11a, n°19): neither Asterisk's software nor that it is a
+		# Nothing says to the caller what answered: neither Asterisk's software nor that it is a
 		# mailbox.
 		remove_hf("Server");
 		remove_hf("User-Agent");
-		# The caller's window says whose mailbox it hears (review 11a, n°26): Twake-Voicemail, never to the operator.
+		# The caller's window says whose mailbox it hears: Twake-Voicemail, never to the operator.
 		if ($rs >= 200 && $rs < 300 && $dlg_val(trunk) != "caller")
 			append_hf("Twake-Voicemail: 1\r\n");
 		if ($rs >= 200 && $rs < 300 && $avp(vm_answered) == NULL) {
@@ -4004,7 +4006,7 @@ failure_route[call_failed] {
 		}
 		# A call from the operator: the fallback of its direct number (never after the group declined, above).
 		route(did_fallback, "the group did not answer", "480");
-		# That fallback was this group, nobody of which answered (review 11a, n°6): the mailbox of the extension the
+		# That fallback was this group, nobody of which answered: the mailbox of the extension the
 		# number rings, as after a fallback to an extension (route[voicemail] takes no group's call: the group is set
 		# aside while it is tried, given back if the mailbox is not called).
 		if ($avp(fb_used) != NULL && $avp(vm_box) != NULL) {

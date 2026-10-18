@@ -8,7 +8,7 @@ const isVoicemailEvent = (event: TelephonyEvent) => event.type === 'voicemail.cr
 /**
  * The tab « Messagerie vocale » (step 11a): whether the platform has a mailbox for this person (capability
  * `voicemail`), and how many of their messages are not listened to. Read at the start and again each time the event
- * stream is established (second review 11a, n°14: a Gateway out a moment at the start no longer hides the tab until the
+ * stream is established (a Gateway out a moment at the start no longer hides the tab until the
  * page is reloaded; an outage is tried again with a backoff), the count again at each message left, read or deleted,
  * on whatever screen.
  */

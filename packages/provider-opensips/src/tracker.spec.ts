@@ -564,7 +564,7 @@ describe('CallTracker', () => {
     expect(calls()).toEqual(['102:call.ended:inbound:101:missed', '101:call.connected:outbound:102:connected'])
   })
 
-  it('makes the call of a direct number its fallback group did not answer, taken by the mailbox (second review 11a, n°5), missed for each member and for the extension the number rings', () => {
+  it('makes the call of a direct number its fallback group did not answer, taken by the mailbox, missed for each member and for the extension the number rings', () => {
     const { tracker, calls, presences, events, clear } = make()
     for (const ext of ['102', '104', '105']) tracker.handle('E_UL_CONTACT_INSERT', contact(ext, `sip:${ext}@x.invalid`))
     clear()
@@ -748,7 +748,7 @@ describe('CallTracker', () => {
     ])
   })
 
-  it('tells the administrators when the callers with no number reach their cap at a mailbox, under its extension (step 11a, fourth review n°8)', () => {
+  it('tells the administrators when the callers with no number reach their cap at a mailbox, under its extension (step 11a)', () => {
     const { tracker, events, clear } = make()
     clear()
     tracker.handle('E_TWAKEPHONE_VMCAP', { param: 'hidden-calls', extension: '101', value: '5', threshold: '5' })

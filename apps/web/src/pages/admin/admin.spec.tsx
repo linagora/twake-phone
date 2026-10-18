@@ -242,7 +242,7 @@ describe('the administration screens (step 7)', () => {
     gateway = { client: client(over), me: { id: 'alice', displayName: 'Alice', features: { admin: true } }, meError: null }
   }
 
-  it('names the alerts of the mailboxes in words, and lets each be picked as a cause (fourth review 11a, n°8 and n°12)', async () => {
+  it('names the alerts of the mailboxes in words, and lets each be picked as a cause', async () => {
     const at = { at: '2026-10-18T08:00:00.000Z', lastAt: '2026-10-18T08:05:00.000Z', count: 1 }
     const listAlerts = vi.fn(async () => ({
       items: [
@@ -255,7 +255,7 @@ describe('the administration screens (step 7)', () => {
     expect(text()).toContain('Des boîtes vocales que le serveur de messagerie refuse toujours de créer ou de modifier (combien) : 2')
     expect(text()).toContain("Les appelants sans numéro ont atteint leur plafond d'appels simultanés vers cette boîte : 5 pour 5")
     const causes = [...host.querySelectorAll('option')].map(o => o.value)
-    for (const param of ['sync-failing', 'sync-fenced', 'boxes-refused', 'hidden-calls', 'hidden-hour', 'hidden-all', 'calls-all']) expect(causes).toContain(param)
+    for (const param of ['sync-failing', 'sync-fenced', 'boxes-refused', 'hidden-calls', 'hidden-hour', 'hidden-all', 'calls-all', 'held-back']) expect(causes).toContain(param)
   })
 
   it('puts the focus back on the delete button when told no or Escape, and on what is said once deleted (review 7 n°3)', async () => {

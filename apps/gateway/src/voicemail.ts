@@ -19,13 +19,14 @@ export const VOICEMAIL_ID = /^[0-9A-Za-z_-]{1,64}$/
  *                        the most messages a mailbox keeps (50), the longest a message lasts in seconds (180);
  *   VOICEMAIL_MAX_CALL_SEC
  *                        the longest a call to a mailbox lasts (300), as OpenSIPS and Asterisk have it: VOICEMAIL_MAX_SEC
- *                        above it is refused (the call would cut the message first: second review 11a, n°11), and the
+ *                        above it is refused (the call would cut the message first), and the
  *                        recordings handed out are bounded on it;
  *   VOICEMAIL_GRACE_DAYS how long the mailbox of someone who holds no extension any more is kept aside, with its
- *                        messages, in case they come back (7).
+ *                        messages, in case they come back (7). With VOICEMAIL_RETENTION_DAYS=0 (no retention period),
+ *                        the mailbox goes with its messages once past it: 1 day at least then.
  *
  * SECRETS_KEY is required with it: Wazo knows the holder of a mailbox only by a print of their id keyed with a key
- * derived from it (review 11a, n°9).
+ * derived from it.
  */
 export const wazoFromEnv = (env: NodeJS.ProcessEnv, secretsKey: Buffer | undefined, logger?: WazoLogger): WazoVoicemail | undefined => {
   const base = env.WAZO_URL?.replace(/\/+$/, '')
@@ -64,6 +65,8 @@ export const wazoFromEnv = (env: NodeJS.ProcessEnv, secretsKey: Buffer | undefin
   if (maxCallSec < 30) throw new Error('Wazo: VOICEMAIL_MAX_CALL_SEC must be 30 to 3600 seconds')
   if ((maxMessageSec ?? 180) > maxCallSec) throw new Error(`Wazo: VOICEMAIL_MAX_SEC (${maxMessageSec ?? 180} s) is longer than a call to a mailbox lasts (VOICEMAIL_MAX_CALL_SEC, ${maxCallSec} s): the call would cut the message`)
   const graceDays = env.VOICEMAIL_GRACE_DAYS === '0' ? 0 : whole('VOICEMAIL_GRACE_DAYS', 365)
+  // Without a retention period, a mailbox aside goes with its messages once past its grace period: a day at least.
+  if (graceDays === 0 && retentionDaysOf(env) === 0) throw new Error('Wazo: VOICEMAIL_GRACE_DAYS must be at least 1 day with VOICEMAIL_RETENTION_DAYS=0 (the mailbox of someone without an extension then goes with its messages once past it)')
   return new WazoVoicemail({
     ...urls,
     authUrl: urls.authUrl.replace(/\/+$/, ''),
@@ -84,7 +87,7 @@ export const wazoFromEnv = (env: NodeJS.ProcessEnv, secretsKey: Buffer | undefin
 export const holderSecretOf = (secretsKey: Buffer) => Buffer.from(hkdfSync('sha256', secretsKey, Buffer.alloc(0), 'twake-phone: holders of mailboxes', 32))
 
 /**
- * What differs between this Gateway's mailboxes and what OpenSIPS has of them (third review 11a, n°3 and n°10), said at
+ * What differs between this Gateway's mailboxes and what OpenSIPS has of them, said at
  * its start: OpenSIPS sends no call to the mailboxes while this Gateway has a voicemail server, or sends them while it
  * has none (it then leaves `voicemail_boxes` to a Gateway that has one), or ends a call to a mailbox before the
  * longest message is left (VOICEMAIL_MAX_SEC against OpenSIPS's own VOICEMAIL_MAX_CALL_SEC, not this Gateway's copy).

@@ -425,7 +425,7 @@ export class CallTracker {
         const call = this.find(p, now)
         if (!call || call.connectedAt || call.conference) return
         // The fallback group of a direct number nobody of which answered, then the mailbox of the extension the number
-        // rings (second review 11a, n°5): each member whose phone rang has the call missed, never taken by a colleague;
+        // rings: each member whose phone rang has the call missed, never taken by a colleague;
         // the call is no group's any more.
         if (call.group) this.leaveGroup(call, now)
         const code = Number(p.code) || 0

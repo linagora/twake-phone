@@ -144,13 +144,13 @@ services:
   # wazo-confd (9486), wazo-confgend (8669), Asterisk (5100/udp SIP, 5038 AMI, 5039 ARI, 32000-32100/udp RTP),
   # wazo-amid (9491), wazo-calld (9500), wazo-websocketd (9502), and two stand-ins of this stack: the accounts
   # wazo-auth-keys makes on a Wazo (wazo-bootstrap) and the part of wazo-sysconfd wazo-confd uses (8668). Nothing
-  # listens off the loopback (docker/wazo/check-loopback.py, a step of the CI: review 11a, n°4). Passwords and keys are
+  # listens off the loopback (docker/wazo/check-loopback.py, a step of the CI). Passwords and keys are
   # this stack's own, never Wazo's nor RabbitMQ's public defaults (the database's, ARI's, the bus's guest), for
   # development and CI only (as twake:twake for PostgreSQL).
   # Their healthchecks run every 2 s while they start (start_interval, Docker Engine 25 or later: an older one ignores
   # it and checks every minute only, the stack then taking minutes to start), then every minute: run every 2 s, they
   # kept a CPU of the CI's runner busy, which the browsers and LiveKit SIP (it refuses calls on a loaded machine) need.
-  # Its image has no other tag than latest, which moves: the digest is what is used (review 11a, n°16), the tag only
+  # Its image has no other tag than latest, which moves: the digest is what is used, the tag only
   # says which repository. Its account's password is Wazo's public default (proformatique): the healthcheck sets this
   # stack's own before it says healthy, so before any service of Wazo connects (a database kept by a restart has it).
   wazo-db:
@@ -291,10 +291,9 @@ services:
       # This stack's own passwords: the ARI account of wazo-calld and wazo-confd, the database's (set by wazo-db's healthcheck).
       WAZO_ARI_PASSWORD: twake-wazo-dev-only-ari
       WAZO_DB_PASSWORD: twake-wazo-dev-only-db
-      # The AMI account of wazo-sysconfd below (module reloads and the list of the mailboxes only, no event: second
-      # review 11a, n°16, third review n°13).
+      # The AMI account of wazo-sysconfd below (module reloads and the list of the mailboxes only, no event).
       WAZO_SYSCONFD_AMI_PASSWORD: twake-wazo-dev-only-sysconfd
-      # The longest a call to a mailbox lasts (review 11a, n°3), as OpenSIPS bounds it.
+      # The longest a call to a mailbox lasts, as OpenSIPS bounds it.
       VOICEMAIL_MAX_CALL_SEC: ${VOICEMAIL_MAX_CALL_SEC:-300}
     volumes:
       - ./wazo/asterisk/entrypoint.sh:/twake/entrypoint.sh:ro
@@ -463,13 +462,14 @@ services:
       WAZO_SIP: ${WAZO_SIP-127.0.0.1:5100}
       WAZO_LISTEN_IP: ${WAZO_LISTEN_IP:-127.0.0.1}
       WAZO_PORT: ${WAZO_PORT:-5095}
-      # The longest a call to a mailbox lasts (review 11a, n°3); Asterisk bounds it too.
+      # The longest a call to a mailbox lasts; Asterisk bounds it too.
       VOICEMAIL_MAX_CALL_SEC: ${VOICEMAIL_MAX_CALL_SEC:-300}
-      # The calls to the mailboxes at once per caller, of those who hide their number together and for all, and per
-      # hour of a caller to one mailbox (second review 11a, n°10; third review n°7).
+      # The calls to the mailboxes at once per caller, of those with no number at a mailbox and at all of them, and for
+      # all, and per hour of a caller to one mailbox. VOICEMAIL_CALLS_HIDDEN_ALL empty: entrypoint.sh takes a third of
+      # VOICEMAIL_CALLS_ALL.
       VOICEMAIL_CALLS_PER_CALLER: ${VOICEMAIL_CALLS_PER_CALLER:-2}
       VOICEMAIL_CALLS_HIDDEN: ${VOICEMAIL_CALLS_HIDDEN:-5}
-      VOICEMAIL_CALLS_HIDDEN_ALL: ${VOICEMAIL_CALLS_HIDDEN_ALL:-10}
+      VOICEMAIL_CALLS_HIDDEN_ALL: ${VOICEMAIL_CALLS_HIDDEN_ALL:-}
       VOICEMAIL_CALLS_ALL: ${VOICEMAIL_CALLS_ALL:-30}
       VOICEMAIL_CALLS_PER_HOUR: ${VOICEMAIL_CALLS_PER_HOUR:-10}
     network_mode: host

@@ -29,7 +29,7 @@ export const Layout = () => {
   const navigate = useNavigate()
   const name = displayNameFor(me, state.status === 'signed-in' ? state.user : null)
   // The mailbox (step 11a) shows only where the platform has one for this person (capability `voicemail`), with the
-  // number of messages not listened to (second review 11a, n°14), said in the link's name.
+  // number of messages not listened to, said in the link's name.
   const voicemail = useVoicemailTab(client, me?.extension, onConnected, onEvent)
   // The administration link shows only to administrators; the Gateway refuses the others anyway.
   const links = LINKS.filter(([to]) => (to !== '/admin' || me?.features?.admin) && (to !== '/voicemail' || (voicemail.on && me?.extension)))

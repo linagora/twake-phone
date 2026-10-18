@@ -83,10 +83,21 @@ export class DirectorySync {
 
   /**
    * Called after a run that created, changed or removed a mapping (who holds which extension changed), with the
-   * extensions that passed to someone else or to nobody (their mailbox is withdrawn at once: second review 11a, n°3).
+   * extensions that passed to someone else or to nobody (their mailbox is withdrawn at once).
    */
   onChange(listener: (tenantId: string, extensions: string[]) => void) {
     this.listeners.push(listener)
+  }
+
+  /**
+   * Whether the directory still lists this person (they have an account there, a new extension to come perhaps), as
+   * it answers now; undefined for a tenant it does not synchronise.
+   */
+  async lists(tenantId: string, userId: string): Promise<boolean | undefined> {
+    if (tenantId !== this.opts.tenantId) return undefined
+    const { directory } = this.opts
+    const people = typeof directory.getMany === 'function' ? await directory.getMany(tenantId, [userId]) : ((await directory.listAll?.(tenantId)) ?? [])
+    return people.some(p => p.id === userId)
   }
 
   status(): SyncStatus {

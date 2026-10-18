@@ -876,6 +876,7 @@
   "admin.alert.voicemailHiddenHour": "Les appelants sans numéro ont atteint leur plafond d'appels dans l'heure vers cette boîte",
   "admin.alert.voicemailHiddenAll": "Les appelants sans numéro ont atteint leur plafond d'appels simultanés vers l'ensemble des boîtes",
   "admin.alert.voicemailCallsAll": "Toutes les places d'appels vers les boîtes vocales sont prises : les appelants ont ce qu'ils auraient eu sans boîte",
+  "admin.alert.voicemailHeldBack": "Des boîtes vocales sont retenues : trop de personnes sans poste d'un coup ; un administrateur le confirme par /api/v1/admin/voicemail (combien, sur combien)",
   "admin.operator.restoreRefused.loop": "Ligne {line} : ses renvois d'avant la plateforme ({forwards}) ne seront pas remis : ils ramèneraient les appels vers la plateforme.",
   "admin.operator.restoreRefused.outbound": "Ligne {line} : ses renvois d'avant la plateforme ({forwards}) ne seront pas remis : ils vont vers un numéro que son trunk n'appelle pas.",
   "admin.operator.closed.unrestored.loop": "Ligne {line} : renvoi retiré le {at}, ses renvois d'avant non remis (ils ramèneraient les appels vers la plateforme)",

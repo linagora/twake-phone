@@ -19,7 +19,7 @@ const gateway = (store: Pick<MemoryStore, 'takeWebhookLease' | 'clock'>, holder:
   return { leases, leads }
 }
 
-describe('the leases of the mailboxes (third review 11a, n°2, n°3 and n°11)', () => {
+describe('the leases of the mailboxes', () => {
   it('lets one Gateway write at a time, and the one that reaches its voicemail server take over without any overlap', async () => {
     const store = new MemoryStore()
     let firstWeight: VoicemailWeight = 2
@@ -92,7 +92,7 @@ describe('the leases of the mailboxes (third review 11a, n°2, n°3 and n°11)',
     await g.leases.stop()
   })
 
-  it('asks what each Gateway can do at each renewal, an answer that comes later or fails included (fourth review 11a, n°3)', async () => {
+  it('asks what each Gateway can do at each renewal, an answer that comes later or fails included', async () => {
     const store = new MemoryStore()
     let asked = 0
     let reaches = false
@@ -111,7 +111,40 @@ describe('the leases of the mailboxes (third review 11a, n°2, n°3 and n°11)',
     await g.leases.stop()
   })
 
-  it('gives each lease taken a fencing token greater than the last, the same while it is kept (fourth review 11a, n°2)', async () => {
+  it('gives the lease back after the renewal under way, which never sets again a window the store says given back', async () => {
+    const store = new MemoryStore()
+    let gate: Promise<void> | undefined
+    let open: () => void = () => {}
+    let waiting = false
+    const held = {
+      clock: () => store.clock(),
+      takeWebhookLease: async (...a: Parameters<MemoryStore['takeWebhookLease']>) => {
+        if (gate && a[2] > 0) {
+          waiting = true
+          await gate
+        }
+        return store.takeWebhookLease(...a)
+      }
+    }
+    const g = gateway(held, 'gw_1', () => 2, 3_000)
+    g.leases.start()
+    await until('it writes', () => g.leases.mayWrite('A'))
+    // A renewal held at the store, and the SIP server's refusal meanwhile.
+    gate = new Promise<void>(resolve => (open = resolve))
+    const renewal = g.leases.renew()
+    await until('the renewal at the store', () => waiting)
+    const dropped = g.leases.drop('A')
+    await sleep(20)
+    gate = undefined
+    open()
+    await Promise.all([renewal, dropped])
+    expect([g.leases.fence('A'), g.leases.mayWrite('A')]).toEqual([undefined, false])
+    // Given back in the store too: another one takes it at once.
+    expect(await store.takeWebhookLease(voicemailRole('A'), 'gw_2', 3_000, 0)).toBeTruthy()
+    await g.leases.stop()
+  })
+
+  it('gives each lease taken a fencing token greater than the last, the same while it is kept', async () => {
     const store = new MemoryStore()
     let firstWeight: VoicemailWeight = 2
     const first = gateway(store, 'gw_1', () => firstWeight)

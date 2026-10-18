@@ -4,7 +4,7 @@
 # place of Wazo's for the SIP side (a single trunk, OpenSIPS's socket for Wazo), the media and the dialplan (calls
 # OpenSIPS sends to a mailbox), and add the AMI accounts of wazo-amid and of this stack's wazo-sysconfd. The voicemails
 # come from Wazo's database through wazo-confgend, as on a Wazo (voicemail.d/01-wazo.conf), with the format of the
-# recordings set here (wav: what the Gateway's bound on a recording's size counts, review 11a, n°11); so does
+# recordings set here (wav: what the Gateway's bound on a recording's size counts); so does
 # modules.conf, read once here.
 #
 #   WAZO_SIP_LISTEN    where Asterisk takes SIP (ip:port, UDP; 127.0.0.1:5100 by default)
@@ -19,12 +19,12 @@
 #   VOICEMAIL_MAX_CALL_SEC
 #                      the longest a call to a mailbox lasts, Asterisk's side (300 s by default, OpenSIPS's too)
 #
-# Everything it listens on is on the loopback (review 11a, n°4: docker/wazo/check-loopback.py says so in CI): SIP and
+# Everything it listens on is on the loopback (docker/wazo/check-loopback.py says so in CI): SIP and
 # its media where they are told, the AMI and the HTTP server of ARI (127.0.0.1:5039), and no channel or service this
 # stack does not use (IAX2, SCCP, DUNDi). One socket only is on every address (one per family: 0.0.0.0, and :: where
 # the host has IPv6), which this Asterisk always makes: the DNS client of PJSIP (an ephemeral port that takes the
 # answers to its own queries; it makes none here, every address being an IP). It keeps no call log of its own (CDR, CEL,
-# queue_log: review 11a, n°10 and second review n°20) and does not trace the dialplan to its log (no -v): the history of
+# queue_log) and does not trace the dialplan to its log (no -v): the history of
 # the calls is the Gateway's, and the number of a caller is not in Docker's log. Its SIP answers name no software
 # (user_agent; OpenSIPS takes Server and User-Agent off what it relays to the operator anyway).
 set -euo pipefail
@@ -67,7 +67,7 @@ EOF
 chmod 755 /usr/bin/wazo-confgen
 
 # The mailboxes, from Wazo's database, with the format of the recordings this stack's Gateway expects whatever Wazo's
-# configuration says (wav: 8 kHz, 16 bits, 16000 bytes a second; second review 11a, n°11).
+# configuration says (wav: 8 kHz, 16 bits, 16000 bytes a second).
 cat > /usr/bin/twake-voicemail-conf <<'EOF'
 #!/bin/bash
 set -o pipefail
@@ -141,13 +141,13 @@ icesupport = yes
 EOF
 
 # The AMI, on the loopback: wazo-amid's account, with this stack's password and the rights and filters Wazo gives it,
-# and the account of this stack's wazo-sysconfd (docker/wazo/sysconfd.py, second review 11a, n°16): no event, and the
-# privileges of the AMI actions it runs only (third review n°13), never `command` (the whole CLI): `system` for Reload,
+# and the account of this stack's wazo-sysconfd (docker/wazo/sysconfd.py): no event, and the
+# privileges of the AMI actions it runs only, never `command` (the whole CLI): `system` for Reload,
 # `reporting` for VoicemailUsersList. Asterisk has nothing finer for Reload: `system` also lets the account read any
 # configuration file (GetConfig, GetConfigJSON: this one, with wazo-amid's password, included), load a module
 # (ModuleLoad), hang up a channel (Hangup, AbsoluteTimeout) and add or remove a dialplan extension
-# (DialplanExtensionAdd, DialplanExtensionRemove); it is refused Command, Originate and UpdateConfig (fourth review
-# n°9: the e2e checks both against this Asterisk). A development and CI stack's only (ADR 0022): a real Wazo's
+# (DialplanExtensionAdd, DialplanExtensionRemove); it is refused Command, Originate and UpdateConfig (the
+# e2e checks both against this Asterisk). A development and CI stack's only (ADR 0022): a real Wazo's
 # wazo-sysconfd runs `asterisk -rx` on its machine, with no such account; its password is in the compose file, for
 # any process on the loopback of the host. The image's
 # manager.d/01-xivo.conf has wazo-amid's account with Wazo's public default password,
@@ -191,7 +191,7 @@ EOF
 sed -i -E "s/^password[[:space:]]*=.*/password = ${WAZO_ARI_PASSWORD}/" /etc/asterisk/ari.d/01-wazo.conf
 grep -q "^password = ${WAZO_ARI_PASSWORD}\$" /etc/asterisk/ari.d/01-wazo.conf || { echo "the ARI account was not found in ari.d/01-wazo.conf" >&2; exit 1; }
 # No call log of Asterisk's own (CDR, CEL, queue_log): neither in Wazo's database nor in a file. The image's CDR are
-# off already; written here so that nothing else decides it (second review 11a, n°20).
+# off already; written here so that nothing else decides it.
 cat > /etc/asterisk/cdr.d/01-wazo.conf <<EOF
 [general]
 enable = no

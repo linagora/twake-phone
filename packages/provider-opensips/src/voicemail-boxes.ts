@@ -5,7 +5,7 @@ import type { Queryable } from './subscriber.js'
 // extension as the voicemail server named it (Wazo's `number@context`); opensips.cfg.tpl reads it with the rules of
 // the extension dialled and sends the call nothing else takes there (route[voicemail]).
 //
-// Several Gateways write it (fourth review 11a, n°2): any of them withdraws an extension given to someone else, the one
+// Several Gateways write it: any of them withdraws an extension given to someone else, the one
 // that holds the lease of the mailboxes writes them all. The database itself keeps a round older than a withdrawal, or
 // than another Gateway's lease, from undoing it: each withdrawal leaves its number (`voicemail_withdrawals`), and a
 // write says the last one it had seen before it read the holders and the fencing token of its lease
@@ -17,6 +17,13 @@ import type { Queryable } from './subscriber.js'
  * database), the Gateway only ever touches its own tenant's rows. `voicemail_writers` and `voicemail_withdrawals` are
  * the Gateway's only (OpenSIPS never reads them).
  */
+/**
+ * How an operator puts the fence of a tenant back (`$1` its id), once they know no Gateway of another stack writes its
+ * mailboxes there (a store put back, a stack moved): the fence only, the numbering of the withdrawals kept, so that a
+ * withdrawal made while the writes were refused is still left out once, and no round sees it again.
+ */
+export const VOICEMAIL_FENCE_RESET = 'UPDATE voicemail_writers SET fence = 0 WHERE tenant_id = $1'
+
 export const VOICEMAIL_BOXES_SCHEMA = `
 CREATE TABLE IF NOT EXISTS voicemail_boxes (
     extension VARCHAR(64) PRIMARY KEY NOT NULL,
@@ -42,7 +49,7 @@ const EXTENSION = /^[0-9]{1,40}$/
 /** A mailbox address as OpenSIPS keeps it (its query reads nothing else): the number, `@`, the context. */
 export const MAILBOX = /^[0-9]{1,40}@[A-Za-z0-9_-]{1,79}$/
 
-/** A write refused: a Gateway that holds a later lease of the mailboxes wrote them (fourth review 11a, n°2). */
+/** A write refused: a Gateway that holds a later lease of the mailboxes wrote them. */
 export class VoicemailFenced extends Error {
   readonly code = 'VOICEMAIL_FENCED'
   constructor(
@@ -150,7 +157,7 @@ export class VoicemailBoxes {
   }
 
   /**
-   * These extensions of the tenant lose their mailbox, the others keep theirs (second review 11a, n°3), and each keeps
+   * These extensions of the tenant lose their mailbox, the others keep theirs, and each keeps
    * the number of this withdrawal for the rounds that read their holder before (`set`'s `since`). Any Gateway withdraws:
    * no fence.
    */

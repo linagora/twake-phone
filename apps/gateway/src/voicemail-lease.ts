@@ -1,6 +1,6 @@
 import type { Store } from './store/types.js'
 
-// Which Gateway writes the mailboxes of a tenant (step 11a, ADR 0022; third review 11a, n°2, n°3 and n°11): the one that
+// Which Gateway writes the mailboxes of a tenant (step 11a, ADR 0022): the one that
 // holds the lease `voicemail:<tenant>` of the store (takeWebhookLease, the lease of step 10a), within its write
 // window only. Only a Gateway with a voicemail server for the tenant takes it: one without never writes
 // `voicemail_boxes`. One whose voicemail server answers and whose events are heard takes it at once from one that has
@@ -62,7 +62,7 @@ export class VoicemailLeases {
   /**
    * Whether this Gateway may write the mailboxes of `tenantId` now (in Wazo, in `voicemail_boxes`, the release of the
    * guard): it holds the lease, its window opened and has not closed, whatever its reckoning of the store's clock is
-   * off by. Asked before each write (third review 11a, n°2): a Gateway that lost the lease mid-round stops there.
+   * off by. Asked before each write: a Gateway that lost the lease mid-round stops there.
    */
   mayWrite(tenantId: string) {
     const lease = this.held.get(tenantId)
@@ -90,6 +90,8 @@ export class VoicemailLeases {
    * written there). The next renewal takes a new one, if this Gateway is still the one to write.
    */
   async drop(tenantId: string) {
+    // A renewal under way first: one that ended after this would set again a window the store says given back.
+    await this.renewal?.catch(() => undefined)
     clearTimeout(this.timers.get(tenantId))
     this.timers.delete(tenantId)
     if (!this.held.delete(tenantId)) return

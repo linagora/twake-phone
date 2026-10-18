@@ -19,7 +19,7 @@ export { CallGroups, CALL_GROUPS_SCHEMA, DISPLAY_NAMES_SCHEMA, GROUP_MEMBERS_MAX
 export { PushTargets, PUSH_TARGETS_SCHEMA, type PushTargetsOptions } from './push-targets.js'
 export { DialOutGrants, DIAL_OUT_GRANTS_SCHEMA, GRANT_HEADER, GRANT_TTL_SEC, JOIN_HEADER, JOIN_TOKEN, REPLACES, type DialOutGrantsOptions } from './dial-out-grants.js'
 export { AsyncQueue } from './queue.js'
-export { VoicemailBoxes, VoicemailFenced, VOICEMAIL_BOXES_SCHEMA, MAILBOX, type VoicemailBoxesOptions } from './voicemail-boxes.js'
+export { VoicemailBoxes, VoicemailFenced, VOICEMAIL_BOXES_SCHEMA, VOICEMAIL_FENCE_RESET, MAILBOX, type VoicemailBoxesOptions } from './voicemail-boxes.js'
 export { TrunkTables, TRUNK_SCHEMA, TRUNK_SQL, DEFAULT_TRUNK_SOCKET, SOURCES_SET, DISPATCHER_TABLE_VERSION, DIALPLAN_TABLE_VERSION, REGISTRANT_TABLE_VERSION, codecFlags, projectTrunks, trunkSecret, trunkStatusFrom, type TrunkTablesOptions } from './trunks.js'
 export { OutboundTables, OUTBOUND_SCHEMA, ACC_EXTERNAL_SQL, FRAUD_PROFILE, FRAUD_RULE_INTERNATIONAL, FRAUD_RULE_NATIONAL, FRAUD_TABLE_VERSION, FRAUD_OVERSEAS_PREFIXES, DR_TABLE_VERSIONS, DIALOG_TABLE_VERSION, OUTBOUND_TIME_ZONE, CAP_MAX, PROFILE_ID, fraudRow, projectOutbound, type OutboundTablesOptions } from './outbound.js'
 export { DIALPLAN_RULES, DIALPLAN_SQL, DP_CLASSIFY, DP_INBOUND, DP_NORMALISE, OUTBOUND_ALLOWABLE, OUTBOUND_ALLOWED, classify, countryAllowed, translate, type DialplanRule, type NumberClass } from './numbering.js'
@@ -365,7 +365,7 @@ export class OpensipsProvider implements TelephonyProvider, MediaProvider {
   /**
    * The mailboxes of the tenant (step 11a): written in `voicemail_boxes`, which OpenSIPS reads with the rules of the
    * extension dialled. One it could not read (not digits, not `number@context`) is left out, and said. Checked in the
-   * database, in the transaction of the write (fourth review 11a, n°2): `write.fence` and `write.since` (VoicemailBoxes).
+   * database, in the transaction of the write: `write.fence` and `write.since` (VoicemailBoxes).
    */
   async setVoicemailBoxes(boxes: VoicemailBox[], write?: VoicemailBoxesWrite) {
     if (!this.config.voicemailBoxes) return
@@ -413,7 +413,7 @@ export class OpensipsProvider implements TelephonyProvider, MediaProvider {
   }
 
   /**
-   * What OpenSIPS has of the mailboxes (third review 11a, n°10): whether it sends calls to them (wazo_on), and the
+   * What OpenSIPS has of the mailboxes: whether it sends calls to them (wazo_on), and the
    * longest such a call lasts (vm_max_sec, VOICEMAIL_MAX_CALL_SEC), its shared variables (MI shv_get). Undefined when it
    * cannot be asked or did not say; `maxCallSec` undefined from an OpenSIPS that does not have it.
    */

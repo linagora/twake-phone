@@ -258,7 +258,7 @@ else
   # Never reached (WAZO_ON 0), still a valid URI.
   WAZO_SIP=wazo.invalid
 fi
-# The longest a call to a mailbox lasts (review 11a, n°3): the greeting, VOICEMAIL_MAX_SEC of message, the goodbye.
+# The longest a call to a mailbox lasts: the greeting, VOICEMAIL_MAX_SEC of message, the goodbye.
 : "${VOICEMAIL_MAX_CALL_SEC:=300}"
 case "$VOICEMAIL_MAX_CALL_SEC" in
   '' | *[!0-9]*) echo "VOICEMAIL_MAX_CALL_SEC must be a number of seconds" >&2; exit 1 ;;
@@ -266,9 +266,9 @@ esac
 if [ "$VOICEMAIL_MAX_CALL_SEC" -lt 30 ] || [ "$VOICEMAIL_MAX_CALL_SEC" -gt 3600 ]; then
   echo "VOICEMAIL_MAX_CALL_SEC must be 30 to 3600 seconds" >&2; exit 1
 fi
-# The calls to the mailboxes (second review 11a, n°10; third review n°7): VOICEMAIL_CALLS_PER_CALLER of one caller at
-# the same time, 2 by default (1 to 20; a number the operator hides at the caller's request counts as that caller's:
-# fourth review 11a, n°8); VOICEMAIL_CALLS_HIDDEN of all those with no number at all to one mailbox, together, 5 by
+# The calls to the mailboxes: VOICEMAIL_CALLS_PER_CALLER of one caller at
+# the same time, 2 by default (1 to 20; a number the operator hides at the caller's request counts as that caller's);
+# VOICEMAIL_CALLS_HIDDEN of all those with no number at all to one mailbox, together, 5 by
 # default (1 to VOICEMAIL_CALLS_ALL); VOICEMAIL_CALLS_HIDDEN_ALL of those with no number to all the mailboxes, a third
 # of VOICEMAIL_CALLS_ALL by default (0 to half of it: the callers with a number always keep places); VOICEMAIL_CALLS_ALL
 # of all callers, 30 by default (VOICEMAIL_CALLS_PER_CALLER to 10000); VOICEMAIL_CALLS_PER_HOUR of one caller (those

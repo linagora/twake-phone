@@ -7,7 +7,7 @@ import { useVoicemailTab } from './voicemailTab.js'
 
 const v = (id: string, unread = true): Voicemail => ({ id, from: '101', receivedAt: '2026-10-18T02:12:07.000Z', durationSec: 7, unread })
 
-describe('the tab « Messagerie vocale » (second review 11a, n°14)', () => {
+describe('the tab « Messagerie vocale »', () => {
   let root: Root
   let host: HTMLDivElement
   let actEnvironment: unknown

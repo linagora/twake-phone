@@ -7,14 +7,14 @@ Asterisk's AMI), GET /delete_voicemail and GET /move_voicemail (the mailbox's di
 Anything else is answered 200 and written to the log, as nothing of it applies here.
 
 wazo-confd's requests carry no credentials (as with Wazo's own wazo-sysconfd, on the loopback): a browser's are refused
-(review 11a, n°22), those that say where they come from (Origin, Sec-Fetch-Site) or name another host than the one it
+, those that say where they come from (Origin, Sec-Fetch-Site) or name another host than the one it
 listens on (a DNS name made to point to the loopback), so that no web page opened on this machine deletes a mailbox.
 An Asterisk command is answered once Asterisk answered it (its ActionID), and fails when Asterisk refused it. It logs
-in with an AMI account of its own and no event (second review 11a, n°16), and runs each command as the AMI action
-that does it, never through the CLI (third review 11a, n°13): the module reloads (Reload, the `system` privilege) and
+in with an AMI account of its own and no event, and runs each command as the AMI action
+that does it, never through the CLI: the module reloads (Reload, the `system` privilege) and
 the list of the mailboxes (VoicemailUsersList, `reporting`). The account (`write = system,reporting`:
 docker/wazo/asterisk/entrypoint.sh) is refused `Command`, `Originate` and `UpdateConfig`, but `system` lets it do more
-than this needs (fourth review 11a, n°9): read any configuration file (GetConfig, GetConfigJSON, the manager's
+than this needs: read any configuration file (GetConfig, GetConfigJSON, the manager's
 included), load a module (ModuleLoad), hang up a channel (Hangup, AbsoluteTimeout), add or remove a dialplan extension
 (DialplanExtensionAdd and DialplanExtensionRemove). Asterisk has no finer privilege for Reload: the account and its
 password exist on the development and CI stack only, on the loopback, for this stand-in; a real Wazo's wazo-sysconfd
@@ -23,8 +23,8 @@ proves against this stack's Asterisk what the account is refused and what it is 
 well when Asterisk does not have, after it, every mailbox wazo-confgend gave before it (a reload that could not read
 its configuration still says Success).
 
-The mailboxes' directories, as wazo-sysconfd itself does it (its source, wazo_sysconfd/plugins/asterisk/asterisk.py:
-fourth review 11a, n°1): a mailbox deleted loses its folder (rmtree); a mailbox moved (wazo-confd asks it only when
+The mailboxes' directories, as wazo-sysconfd itself does it (its source, wazo_sysconfd/plugins/asterisk/asterisk.py):
+a mailbox deleted loses its folder (rmtree); a mailbox moved (wazo-confd asks it only when
 its number or context changed, after its database committed) replaces whatever is under the target (rm -rf, then mv),
 and nothing when it had no folder. No quarantine: the Gateway never changes a mailbox's number (a person's mailbox
 keeps its number whatever extension they hold, provider-wazo), so nothing here moves on a real Wazo either.
@@ -60,7 +60,7 @@ RELOADS = {
 COMMANDS = set(RELOADS)
 # Modules a Wazo may not load (SCCP phones): not there, nothing to reload, as the CLI says it.
 OPTIONAL = {'chan_sccp.so'}
-# Matched whole (fullmatch: `$` would take a final newline, fourth review 11a, n°15).
+# Matched whole (fullmatch: `$` would take a final newline).
 NAME = re.compile(r'[A-Za-z0-9_-]{1,79}')
 # The Host of wazo-confd's requests: the address it was given (its configuration's sysconfd host and port).
 ALLOWED_HOSTS = {LISTEN.lower(), f'localhost:{LISTEN.rsplit(":", 1)[1]}'}

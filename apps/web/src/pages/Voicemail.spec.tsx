@@ -39,7 +39,7 @@ vi.mock('react-router-dom', () => ({ useNavigate: () => () => undefined }))
 const i18n = { lang: 'fr', t: (key: string, vars?: Record<string, string>) => (vars ? `${key} ${Object.values(vars).join(' | ')}` : key) }
 vi.mock('../i18n/useT.js', () => ({ useT: () => i18n }))
 
-describe('the Messagerie vocale page (review 11a, n°19 and 25)', () => {
+describe('the Messagerie vocale page', () => {
   let root: Root
   let host: HTMLDivElement
   let actEnvironment: unknown
@@ -135,7 +135,7 @@ describe('the Messagerie vocale page (review 11a, n°19 and 25)', () => {
     await render()
     send({ type: 'voicemail.created', timestamp: at, payload: { voicemail: v('a', at) } })
     const once = status()
-    // One unread: its own words (second review 11a, n°15), not « (1 non lus) ».
+    // One unread: its own words, not « (1 non lus) ».
     expect(once).toMatch(/^voicemail\.arrivedOne 101 \| \d{2}:\d{2} \| 1\s?$/)
     send({ type: 'voicemail.created', timestamp: at, payload: { voicemail: v('b', at) } })
     expect(status()).toMatch(/^voicemail\.arrived 101 .*\| 2\s?$/)
@@ -173,7 +173,7 @@ describe('the Messagerie vocale page (review 11a, n°19 and 25)', () => {
     expect(status()).toContain('voicemail.deleted 103')
   })
 
-  it('names each message by who left it and when: two of the same caller are two (second review 11a, n°15)', async () => {
+  it('names each message by who left it and when: two of the same caller are two', async () => {
     lists = [[v('b', '2026-10-18T02:13:00.000Z'), v('a', at)]]
     await render()
     const names = [...host.querySelectorAll('button')].map(b => b.getAttribute('aria-label'))
@@ -181,7 +181,7 @@ describe('the Messagerie vocale page (review 11a, n°19 and 25)', () => {
     expect(buttonOf('a', 'voicemail.listenTo')!.getAttribute('aria-label')).toMatch(/^voicemail\.listenTo 101 \| .*\d{2}:\d{2}$/)
   })
 
-  it('deletes only once it is confirmed, and gives the focus back to « Supprimer » when it is not (second review 11a, n°15)', async () => {
+  it('deletes only once it is confirmed, and gives the focus back to « Supprimer » when it is not', async () => {
     lists = [[v('a', at)]]
     deleteVoicemail.mockClear()
     await render()
@@ -198,7 +198,7 @@ describe('the Messagerie vocale page (review 11a, n°19 and 25)', () => {
     expect(ids()).toEqual([])
   })
 
-  it('plays the message asked last, not the answer that came last (second review 11a, n°15)', async () => {
+  it('plays the message asked last, not the answer that came last', async () => {
     lists = [[v('b', '2026-10-18T02:13:00.000Z'), v('a', at)]]
     let slow!: (b: Blob) => void
     getVoicemailAudio.mockImplementationOnce(() => new Promise<Blob>(resolve => (slow = resolve)))

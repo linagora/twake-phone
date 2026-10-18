@@ -437,7 +437,7 @@ describe('OpensipsProvider call rules', () => {
     expect(await make().getMeetAccess()).toBeUndefined()
   })
 
-  it('reads whether OpenSIPS sends calls to the mailboxes, or says it cannot (step 11a, review n°13)', async () => {
+  it('reads whether OpenSIPS sends calls to the mailboxes, or says it cannot (step 11a)', async () => {
     const sips = await fakeOpensips()
     cleanups.push(sips.close)
     const p = new OpensipsProvider({ websocketUrl: 'wss://sip.example.test', domain: 'sip.example.test', sipSecretFor: async () => 's', events: { miUrl: sips.url, timeoutMs: 300 }, logger: { info: () => undefined, warn: () => undefined } })
@@ -458,7 +458,7 @@ describe('OpensipsProvider call rules', () => {
     sips.state.shv = [{ name: 'meet_on', type: 1, value: 1 }]
     expect(await p.getVoicemailAccess()).toBeUndefined()
     expect(await make().getVoicemailAccess()).toBeUndefined()
-    // With the longest call to a mailbox (third review 11a, n°10), as the Gateway compares it at its start.
+    // With the longest call to a mailbox, as the Gateway compares it at its start.
     sips.state.shv = [{ name: 'wazo_on', type: 1, value: 1 }, { name: 'vm_max_sec', type: 1, value: 120 }]
     expect(await p.getVoicemailSettings()).toEqual({ on: true, maxCallSec: 120 })
     sips.state.shv = [{ name: 'wazo_on', type: 1, value: 0 }]
