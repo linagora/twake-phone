@@ -42,7 +42,10 @@
 //   SYNAPSE_URL          the homeserver's client-server API (default http://127.0.0.1:8008)
 //   SYNAPSE_REGISTRATION_SECRET  its registration_shared_secret (default the stack's, docker/synapse/homeserver.yaml)
 // The caller of the demo of step 11b says apps/web/test/fixtures/caller-message.wav (« Bonjour Jean, ici Paul. Merci de
-// me rappeler demain matin. », made as the stack's prompts are, docker/wazo/asterisk/sounds/README.md, speed 135).
+// me rappeler demain matin. »): SVOX Pico's French voice (Apache 2.0; pico2wave -l fr-FR of libttspico-utils
+// 1.0+git20130326), brought to a telephone's band by ffmpeg (-ar 8000, highpass=200, lowpass=3400, 16 bits, mono), 4.8 s.
+// A voice closer to a person's than eSpeak's (the prompts of the stack), which the small model of the stack's LinTO STT
+// does not recognise.
 // Asterisk's CLI (its dialplan, a trace of the calls to the mailboxes) and its spool are read in the stack's container
 // (docker compose -f docker/docker-compose.sip.yml exec wazo-asterisk; COMPOSE_PROJECT_NAME as Docker Compose reads
 // it), and docker/wazo/check-loopback.py runs during a call to a mailbox (as root: sudo -n when this is not root).
@@ -119,7 +122,8 @@ const SYNAPSE_URL = process.env.SYNAPSE_URL ?? 'http://127.0.0.1:8008'
 const SYNAPSE_SECRET = process.env.SYNAPSE_REGISTRATION_SECRET ?? 'twake-synapse-dev-only-registration'
 const MATRIX_SERVER = 'twakephone.test'
 /** What the caller of the demo of step 11b says, 8 kHz. */
-const CALLER_MESSAGE = wavSamples(readFileSync(new URL('./fixtures/caller-message.wav', import.meta.url)))
+const CALLER_WAV = readFileSync(new URL('./fixtures/caller-message.wav', import.meta.url))
+const CALLER_MESSAGE = wavSamples(CALLER_WAV)
 const PRESENCE_MS = Number(process.env.SIP_E2E_PRESENCE_MS) || 3_000
 
 const freePort = () =>
@@ -3373,7 +3377,7 @@ try {
       const answeredAt = Date.now()
       expectEqual(answer.status, 200, "the mailbox's answer to the operator")
       expectEqual(await jean.page.getByTestId('incoming-call').count(), 0, 'incoming calls on Jean side')
-      // After the beep: the caller's words (4.6 s), then a second of silence before hanging up.
+      // After the beep: the caller's words (4.8 s), then a second of silence before hanging up.
       await sleep(Math.max(0, answeredAt + greetingMs() + 500 - Date.now()))
       await placed.media.say(CALLER_MESSAGE)
       await sleep(1_000)
@@ -3396,7 +3400,11 @@ try {
     console.log(`     transcription: « ${served.text} »`)
     // Not a word-for-word check (a small model, a synthetic voice through a telephone line): words of the phrase heard.
     const heard = ['bonjour', 'jean', 'paul', 'merci', 'rappeler', 'demain', 'matin'].filter(w => served.text.toLowerCase().includes(w))
-    if (heard.length < 2) throw new Error(`the transcription « ${served.text} » has ${heard.length} word(s) of the phrase said, 2 at least expected`)
+    if (heard.length < 2) {
+      // What LinTO hears of the phrase itself, not through the line: tells the line from the voice.
+      const direct = await new LintoTranscription({ url: LINTO_URL, timeoutMs: 60_000 }).transcribe(new Uint8Array(CALLER_WAV)).then(r => r.text, err => `(${err.message})`)
+      throw new Error(`the transcription « ${served.text} » has ${heard.length} word(s) of the phrase said, 2 at least expected (of the recording itself, not through the line: « ${direct} »)`)
+    }
     expectEqual((await transcript.textContent()).trim(), `Transcription : « ${served.text} »`, 'the transcription in the Messagerie vocale')
     await jean.page.locator('[aria-live=polite]').filter({ hasText: /transcrit\.\s?$/ }).waitFor({ timeout: 10_000 })
     // The bot's notice: in one room only, the bot's with Jean (invited), nobody else in it.

@@ -4,10 +4,12 @@
 # its own model (a larger one, LinTO's own), mounted at MODEL_PATH.
 FROM lintoai/linto-stt-kaldi:2.1.1@sha256:fc9dce8b9fce5beca6f5eefadf0f8f6599dc99c8c154ba505164800f64891d2b
 
-# The model, checked against its print before it is unpacked.
+# The model, checked against its SHA-256 before it is unpacked: the build fails on any other file. Another model takes
+# both build arguments.
 ARG VOSK_MODEL=vosk-model-small-fr-0.22
+ARG VOSK_MODEL_SHA256=cabf6180e177eb9b3a9a9d43a437bd5e549f3a7d09525e5d69a3fed787be12ad
 ADD https://alphacephei.com/vosk/models/${VOSK_MODEL}.zip /tmp/model.zip
-RUN python -c "import hashlib; print('${VOSK_MODEL}.zip sha256', hashlib.sha256(open('/tmp/model.zip', 'rb').read()).hexdigest())" \
+RUN python -c "import hashlib, sys; d = hashlib.sha256(open('/tmp/model.zip', 'rb').read()).hexdigest(); print('${VOSK_MODEL}.zip sha256', d); sys.exit(0 if d == '${VOSK_MODEL_SHA256}' else 'not the expected model')" \
  && python -c "import zipfile; zipfile.ZipFile('/tmp/model.zip').extractall('/opt')" \
  && mv /opt/${VOSK_MODEL} /opt/model \
  && rm /tmp/model.zip
