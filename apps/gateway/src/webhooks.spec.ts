@@ -113,7 +113,9 @@ describe('a subscription as written', () => {
     }
     expect(code({ url: 'https://crm.example.org/in', events: [] })).toBe('WEBHOOK_EVENTS')
     expect(code({ url: 'https://crm.example.org/in', events: ['call.everything'] })).toBe('WEBHOOK_EVENTS')
-    expect(code({ url: 'https://crm.example.org/in', events: ['voicemail.created'] })).toBe('WEBHOOK_EVENTS')
+    expect(code({ url: 'https://crm.example.org/in', events: ['quality.alert'] })).toBe('WEBHOOK_EVENTS')
+    // Emitted since step 11b: taken.
+    expect(parseSubscription({ url: 'https://crm.example.org/in', events: ['voicemail.transcribed', 'voicemail.created'] }, domains, {}).events).toEqual(['voicemail.created', 'voicemail.transcribed'])
     expect(code({ url: 'https://crm.example.org/in', events: ['webhook.test'] })).toBe('WEBHOOK_EVENTS')
     expect(code({ url: 'https://crm.example.org/in', events: ['call.missed'], description: 'a\nb' })).toBe('WEBHOOK_DESCRIPTION')
     expect(code({ url: 'https://crm.example.org/in', events: ['call.missed'], enabled: 'yes' })).toBe('WEBHOOK_INVALID')

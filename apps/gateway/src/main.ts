@@ -13,6 +13,7 @@ import { ProviderRegistry } from './registry.js'
 import { PgStore } from './store/pg.js'
 import { trunkFromEnv, trunkRecord } from './trunks.js'
 import { absenceMsOf, holderRecordKeepMsOf, retentionDaysOf, voicemailMismatch, wazoFromEnv } from './voicemail.js'
+import { matrixFromEnv, transcriptionFromEnv } from './voicemail-transcripts.js'
 import { networkInterfaces } from 'node:os'
 import { denyNetworks, parsePorts, parseTenantNetworks } from './webhook-delivery.js'
 
@@ -193,6 +194,15 @@ if (ovh) console.info(`OVHcloud: the operator of the trunks of ${JSON.stringify(
 const voicemail = wazoFromEnv(env, key)
 const voicemailRetentionDays = retentionDaysOf(env)
 if (!voicemail) console.warn('WARNING: no mailboxes (WAZO_URL or the URLs of its APIs, WAZO_USER, WAZO_PASSWORD): a call nobody takes is not taken by a mailbox')
+// The transcription of the messages (step 11b, ADR 0023): LinTO STT at LINTO_URL; the bot's notices in Twake Chat:
+// MATRIX_HOMESERVER_URL and MATRIX_BOT_TOKEN (the bot's access token: the environment only), each person's Matrix id
+// from the directory (LDAP_ATTR_MATRIX) or MATRIX_USER_TEMPLATE (voicemail-transcripts.ts). Only with the mailboxes.
+const transcription = transcriptionFromEnv(env, !!voicemail)
+const notices = matrixFromEnv(env, !!voicemail)
+if (transcription) console.info(`voicemail transcription: on, messages of ${transcription.maxSec} s at most, ${transcription.queueMax} waiting at most`)
+if (voicemail && !transcription) console.warn('WARNING: the messages are not transcribed (LINTO_URL)')
+if (notices && !env.LDAP_ATTR_MATRIX && !notices.userTemplate) console.warn("WARNING: the bot knows nobody's Matrix account: set LDAP_ATTR_MATRIX or MATRIX_USER_TEMPLATE")
+if (notices && !notices.appUrl) console.warn("WARNING: the bot's notices carry no link to TwakePhone: set APP_URL (or an https origin in CORS_ORIGINS)")
 const hstsMaxAge = env.HSTS_MAX_AGE ? Number(env.HSTS_MAX_AGE) : undefined
 if (hstsMaxAge !== undefined && !(Number.isInteger(hstsMaxAge) && hstsMaxAge >= 0)) throw new Error('HSTS_MAX_AGE must be a number of seconds')
 const app = await buildApp(registry, {
@@ -207,7 +217,9 @@ const app = await buildApp(registry, {
   webhooks: { policy: { allowHttp: webhookHttp, ...(webhookPorts ? { ports: webhookPorts } : {}) }, open: webhookOpen, deny: webhookDeny },
   ...(ovh ? { operators: new Map([[tenant, ovh]]) } : {}),
   ...(conference ? { conference } : {}),
-  ...(voicemail ? { voicemail: (t: string) => (t === tenant ? voicemail : undefined), voicemailRetentionDays } : {})
+  ...(voicemail ? { voicemail: (t: string) => (t === tenant ? voicemail : undefined), voicemailRetentionDays } : {}),
+  ...(transcription ? { transcription } : {}),
+  ...(notices ? { notices: { ...notices, ...(contacts && env.LDAP_ATTR_MATRIX ? { matrixIdOf: (t: string, userId: string) => contacts.matrixIdOf(t, userId) } : {}) } } : {})
 })
 directorySync?.useLogger(app.log)
 app.addHook('onClose', async () => voicemail?.close())
@@ -237,4 +249,10 @@ setTimeout(() => {
     })
     .catch((err: unknown) => console.warn(`WARNING: the mailboxes not compared with OpenSIPS's: ${err instanceof Error ? err.message : String(err)}`))
 }, 10_000).unref()
+// The transcription service and the bot, asked once at the start: what is wrong is said now, not at the first message.
+void transcription?.provider.probe?.().catch((err: unknown) => console.warn(`WARNING: LinTO STT does not answer yet (LINTO_URL): ${err instanceof Error ? err.message : String(err)}`))
+void notices?.bot.probe().then(
+  () => notices.bot.whoami().then(me => console.info(`Matrix: the bot is ${me.userId}`)),
+  (err: unknown) => console.warn(`WARNING: the Matrix bot cannot reach its homeserver or its token is refused: ${err instanceof Error ? err.message : String(err)}`)
+)
 await app.listen({ host: env.HOST ?? '0.0.0.0', port: Number(env.PORT ?? 8080) })

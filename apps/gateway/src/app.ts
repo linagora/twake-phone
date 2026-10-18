@@ -25,9 +25,10 @@ import { OPERATOR_KEPT_MS, OperatorRoundError, OperatorSync, askKey, erasedNumbe
 import { e164Of } from './e164.js'
 import { encrypt } from './crypto.js'
 import { newWebhookSecret, parseWebhookDomains } from './webhook-delivery.js'
-import { presenceEvent, webhookEventsFor } from './webhook-events.js'
+import { eventId, presenceEvent, webhookEventsFor } from './webhook-events.js'
 import { VOICEMAIL_ID } from './voicemail.js'
-import { VoicemailLeases, type VoicemailWeight } from './voicemail-lease.js'
+import { VoicemailLeases, voicemailRole, type VoicemailWeight } from './voicemail-lease.js'
+import { TranscriptWatcher, VoicemailTranscripts, publicTranscript, userOfHolder, type NoticeSettings, type TranscriptionSettings } from './voicemail-transcripts.js'
 import { DELIVERY_CURSOR, DELIVERY_ID, MAX_WEBHOOKS, WEBHOOK_ID, WEBHOOK_SECRET_GRACE_MS, WEBHOOK_SENDS_PER_MINUTE, WEBHOOK_TENANT_SENDS_PER_MINUTE, WebhookHub, parseSubscription, publicDelivery, publicSubscription, secretContext, type WebhookHubOptions } from './webhooks.js'
 import { MAX_DIDS, MAX_TRUNKS, TRUNK_ID, defaultTrunk, inDids, parseDid, parseOperatorLines, parseTrunk, providerTrunks, publicDid, publicTrunk, trunkRecord } from './trunks.js'
 import { EMPTY_OUTBOUND, PROFILE_ID, outboundVersion, parseOutbound, staleOutbound, type Outbound } from './outbound.js'
@@ -282,6 +283,22 @@ export interface BuildOptions {
   voicemailChangeMs?: number
   /** How long the synchronisation of the mailboxes fails before the administrators are told (an alert): 15 minutes. */
   voicemailAlertMs?: number
+  /**
+   * The transcription of the messages (step 11b, ADR 0023: LinTO STT), done by the Gateway that writes the mailboxes,
+   * shown in the person's Messagerie vocale. Absent: none.
+   */
+  transcription?: TranscriptionSettings
+  /**
+   * The bot's notice of each message in Twake Chat (step 11b): to the Matrix account of the mailbox's holder, the one
+   * the directory gives them (`matrixIdOf`) or MATRIX_USER_TEMPLATE's. Absent: none.
+   */
+  notices?: NoticeSettings & { matrixIdOf?: (tenantId: string, userId: string) => Promise<string | undefined> }
+  /** The waits of the transcriptions and notices, and how often what is due is looked at (tests: VoicemailTranscripts). */
+  transcriptRetryMs?: number[]
+  noticeRetryMs?: number[]
+  transcriptEveryMs?: number
+  /** How often each Gateway looks for transcriptions done, for its screens (TranscriptWatcher): 2 s by default. */
+  transcriptWatchMs?: number
   /**
    * The operator of the trunks of each tenant that has one (step 10b, ADR 0021: OVHcloud for the organisation of the
    * pilot), read every `operatorSyncMs` (10 minutes by default; 0: never on a schedule) by the Gateway that leads:
@@ -659,6 +676,9 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
       await within(store.addAlert({ tenantId, at: event.timestamp, alert }), historyWriteMs, 'alert write').catch(err => app.log.error({ err, tenantId }, 'could not record the alert'))
       return
     }
+    // A message gone (step 11b), whoever's it was: its transcription goes and the bot's notice is withdrawn, by the
+    // Gateway that writes the mailboxes (the others: nothing).
+    if (event.type === 'voicemail.deleted') void transcripts.deleted(tenantId, event.payload.id).catch((err: unknown) => app.log.error({ err, tenantId }, 'voicemail transcription not erased'))
     const userId = await dir.userIdForExtension(tenantId, extension)
     if (!userId) return
     // A mailbox's news (step 11a): for its holder only, never for someone the extension was just given to (the
@@ -666,7 +686,26 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
     // server has it now: another Gateway may have moved it.
     if (event.type === 'voicemail.created' || event.type === 'voicemail.updated' || event.type === 'voicemail.deleted') {
       const vm = options.voicemail?.(tenantId)
-      if (vm && (await vm.owns({ extension, userId: await holderIdFor(tenantId, userId), ...(mailbox !== undefined ? { mailbox } : {}) }))) bus.publish(tenantId, userId, event)
+      const holder = await holderIdFor(tenantId, userId)
+      if (!vm || !(await vm.owns({ extension, userId: holder, ...(mailbox !== undefined ? { mailbox } : {}) }))) return
+      if (event.type !== 'voicemail.created') {
+        bus.publish(tenantId, userId, event)
+        return
+      }
+      // A new message (step 11b): its screens told its transcription is on its way, the subscribers told of it (once,
+      // whichever Gateway hears it: eventId), and it is transcribed and told in Chat by the Gateway that writes the
+      // mailboxes.
+      const v = event.payload.voicemail
+      const transcript = transcripts.initial(v)
+      bus.publish(tenantId, userId, transcript ? { ...event, payload: { voicemail: { ...v, transcript } } } : event)
+      void publish(tenantId, {
+        id: eventId(tenantId, 'voicemail.created', v.id, holder),
+        type: 'voicemail.created',
+        occurred_at: event.timestamp,
+        tenant: tenantId,
+        voicemail: { id: v.id, user: userId, extension, ...(v.from ? { from: v.from } : {}), received_at: v.receivedAt, duration_sec: v.durationSec }
+      })
+      void transcripts.heard(tenantId, extension, holder, v).catch((err: unknown) => app.log.error({ err, tenantId }, 'voicemail transcription not asked'))
       return
     }
     // A call held for someone without a window: their browsers are woken (not awaited: the stream goes on).
@@ -830,9 +869,10 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
       }
     }
   }
+  const voicemailHolder = `gw_${randomBytes(8).toString('hex')}`
   const voicemailLeases = new VoicemailLeases({
     store,
-    holder: `gw_${randomBytes(8).toString('hex')}`,
+    holder: voicemailHolder,
     ...(options.voicemailLeaseMs !== undefined ? { ms: options.voicemailLeaseMs } : {}),
     // A tenant whose provider started here, for which this Gateway has a voicemail server: 2 it answers and its events
     // are heard, 1 otherwise, asked anew at each renewal.
@@ -852,6 +892,8 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
           )
           .then(() => syncVoicemail(tenantId, provider))
       if (purgeTimer) void purgeVoicemail(tenantId)
+      // The transcriptions and notices left by the one that wrote before (step 11b): this one goes on with them.
+      transcripts.kick(tenantId)
     },
     logger: app.log
   })
@@ -865,6 +907,68 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
     return answers && vm.getStatus() === 'CONNECTED' ? 2 : 1
   }
   const mayWriteVoicemail = (tenantId: string) => voicemailLeases.mayWrite(tenantId)
+  /**
+   * What the administrators are told of the transcriptions and notices (kind `voicemail`, step 11b): once an hour at
+   * most for each, a queue full or a service down stays one alert, not one per message.
+   */
+  const transcriptAlerted = new Map<string, number>()
+  const transcriptAlert = async (tenantId: string, param: 'transcription-busy' | 'transcription-failed' | 'notice-failed', value: number) => {
+    const k = `${tenantId}\u0000${param}`
+    const last = transcriptAlerted.get(k)
+    if (last !== undefined && Date.now() - last < 3_600_000) return
+    transcriptAlerted.set(k, Date.now())
+    app.log.warn({ tenantId, alert: { kind: 'voicemail', param, value } }, `telephony alert: voicemail ${param}`)
+    await store.addAlert({ tenantId, at: new Date().toISOString(), alert: { kind: 'voicemail', param, scope: 'tenant', value } }).catch((err: unknown) => app.log.error({ err, tenantId }, 'could not record the alert'))
+  }
+  // The transcription of the messages and the bot's notices (step 11b, ADR 0023), by the Gateway that writes the
+  // mailboxes, under its lease: each write of the store made under its generation, refused there once another holds it.
+  const transcripts = new VoicemailTranscripts(
+    {
+      store,
+      voicemail: tenantId => options.voicemail?.(tenantId),
+      ...(options.transcription ? { transcription: options.transcription } : {}),
+      ...(options.notices ? { notices: { ...options.notices, matrixIdOf: options.notices.matrixIdOf ?? (async () => undefined) } } : {}),
+      lease: tenantId => {
+        const generation = mayWriteVoicemail(tenantId) ? voicemailLeases.fence(tenantId) : undefined
+        return generation === undefined ? undefined : { role: voicemailRole(tenantId), holder: voicemailHolder, generation }
+      },
+      holderIdFor,
+      // Settled (done, or none and why): the subscribers told, once, never with the text.
+      onSettled: (tenantId, r) => {
+        const transcript = publicTranscript(r)
+        if (!transcript || transcript.status === 'pending') return
+        void publish(tenantId, {
+          id: eventId(tenantId, 'voicemail.transcribed', r.messageId, r.holder),
+          type: 'voicemail.transcribed',
+          occurred_at: new Date().toISOString(),
+          tenant: tenantId,
+          voicemail: { id: r.messageId, user: userOfHolder(r.holder), extension: r.extension },
+          transcript: { status: transcript.status, ...(transcript.reason ? { reason: transcript.reason } : {}) }
+        })
+      },
+      alert: transcriptAlert,
+      ...(pseudonym ? { pseudonym } : {}),
+      log: app.log,
+      ...(options.transcriptRetryMs ? { retryMs: options.transcriptRetryMs } : {}),
+      ...(options.noticeRetryMs ? { noticeRetryMs: options.noticeRetryMs } : {}),
+      ...(options.transcriptEveryMs !== undefined ? { everyMs: options.transcriptEveryMs } : {})
+    },
+    () => started.keys()
+  )
+  // Every Gateway tells its own screens of the transcriptions done, whichever Gateway did them (the EventBus is this
+  // process's only).
+  const transcriptWatcher =
+    options.voicemail && options.transcription
+      ? new TranscriptWatcher({
+          store,
+          tenants: () => started.keys(),
+          listening: (tenantId, userId) => bus.listening(tenantId, userId),
+          holderIdFor,
+          publish: (tenantId, userId, event) => bus.publish(tenantId, userId, event),
+          log: app.log,
+          ...(options.transcriptWatchMs !== undefined ? { everyMs: options.transcriptWatchMs } : {})
+        })
+      : undefined
   /** The SIP server refused the write: a Gateway that holds a later lease wrote the mailboxes. */
   const fenced = (err: unknown) => (err as { code?: unknown } | null)?.code === 'VOICEMAIL_FENCED'
   /**
@@ -1053,8 +1157,11 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
       const epoch = (value as { epoch?: unknown } | undefined)?.epoch
       const holder = typeof epoch === 'number' ? holderIdOf(userId, { epoch }) : await holderIdFor(tenantId, userId)
       const erased = await vm.eraseMessages({ userId: holder }, { mayWrite: () => mayWriteVoicemail(tenantId) })
+      // Their transcriptions too (step 11b), the bot's notices withdrawn at once: rejected under a lease lost, the
+      // erasure stays asked for the next round.
+      const transcribed = await transcripts.erase(tenantId, holder)
       await store.deleteOperatorState(tenantId, key, value)
-      app.log.info({ tenantId, erased }, 'mailboxes: the messages of a person erased, as asked')
+      app.log.info({ tenantId, erased, transcribed }, 'mailboxes: the messages of a person erased, as asked')
     }
   }
   /** An erasure of the messages of `userId` asked, for the Gateway that writes the mailboxes (at its next look). */
@@ -1143,7 +1250,10 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
     const done = new Set<VoicemailProvider>()
     for (const tenantId of only ? [only] : [...started.keys()]) {
       const vm = options.voicemail?.(tenantId)
-      if (!vm || done.has(vm) || !mayWriteVoicemail(tenantId)) continue
+      if (!vm || !mayWriteVoicemail(tenantId)) continue
+      // The transcriptions of the messages past it (step 11b), each tenant's, the bot's notices withdrawn.
+      await transcripts.expire(tenantId, new Date(Date.now() - retentionMs)).catch((err: unknown) => app.log.error({ err, tenantId }, 'transcriptions past the retention period not erased, again at the next round'))
+      if (done.has(vm)) continue
       done.add(vm)
       try {
         await vm.purgeMessages(new Date(Date.now() - retentionMs), { mayWrite: () => mayWriteVoicemail(tenantId) })
@@ -1462,6 +1572,8 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
     hub?.start()
     trunkWatch?.start()
     if (options.operatorSyncMs !== 0) operatorSync?.start()
+    transcripts.start()
+    void transcriptWatcher?.start()
   })
   app.addHook('onClose', async () => {
     closing = true
@@ -1472,6 +1584,9 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
     clearInterval(purgeTimer)
     clearInterval(voicemailSyncTimer)
     clearInterval(voicemailChangeTimer)
+    transcriptWatcher?.stop()
+    // A transcription or a notice under way ends first: nothing written after (and nothing under a lease given back).
+    await transcripts.stop()
     await voicemailLeases.stop()
     // A round of the mailboxes under way ends first, its write in the SIP server's database included: none after.
     await Promise.all([...syncingVoicemail.values()].map(s => s.ended))
@@ -1555,7 +1670,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         // A mailbox (step 11a): with a voicemail server for the tenant, and a SIP server that sends calls to it.
         // Its shared variable says so when it can: a SIP server started without Wazo has none.
         const voicemail = !!options.voicemail?.(user.tenantId) && !!provider.setVoicemailBoxes && !!user.extension && (await voicemailOn(user.tenantId, provider))
-        return { ...caps, conference: { dialIn: enabled, dialOut: enabled }, ...(voicemail ? { voicemail: true } : {}) }
+        return { ...caps, conference: { dialIn: enabled, dialOut: enabled }, ...(voicemail ? { voicemail: true, ...(transcripts.transcribes ? { voicemailTranscription: true } : {}) } : {}) }
       })
 
       // What the others see, and what the person chose (`choice`: kept in the store, with its end and message).
@@ -2458,7 +2573,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         const { user, provider } = await who(req)
         const vm = options.voicemail?.(user.tenantId)
         if (!vm || !provider.setVoicemailBoxes) throw Object.assign(new Error('Voicemail is not available on this platform'), { statusCode: 501 })
-        return { vm, owner: user.extension ? { extension: user.extension, userId: await holderIdFor(user.tenantId, user.id) } : undefined }
+        return { vm, tenantId: user.tenantId, owner: user.extension ? { extension: user.extension, userId: await holderIdFor(user.tenantId, user.id) } : undefined }
       }
       const unreachable = (err: unknown): never => {
         app.log.warn({ err }, 'voicemail server failed')
@@ -2466,8 +2581,22 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
       }
       const noMessage = () => Object.assign(new Error('Message not found'), { statusCode: 404 })
       v1.get('/voicemails', async req => {
-        const { vm, owner } = await mailboxOf(req)
-        return { items: owner ? await vm.listMessages(owner).catch(unreachable) : [] }
+        const { vm, tenantId, owner } = await mailboxOf(req)
+        if (!owner) return { items: [] }
+        const items = await vm.listMessages(owner).catch(unreachable)
+        if (!transcripts.on || !items.length) return { items }
+        // Each one's transcription (step 11b): this holder's only, as the store keeps it (none for one never heard).
+        const kept = await store.listTranscripts(tenantId, owner.userId, items.map(v => v.id)).catch((err: unknown) => {
+          req.log.warn({ err }, 'transcriptions not read')
+          return []
+        })
+        const byId = new Map(kept.map(r => [r.messageId, publicTranscript(r)] as const))
+        return {
+          items: items.map(v => {
+            const transcript = byId.get(v.id)
+            return transcript ? { ...v, transcript } : v
+          })
+        }
       })
       v1.get<{ Params: { id: string } }>('/voicemails/:id/audio', async (req, reply) => {
         const { vm, owner } = await mailboxOf(req)
@@ -2487,8 +2616,10 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         return reply.code(204).send()
       })
       v1.delete<{ Params: { id: string } }>('/voicemails/:id', async (req, reply) => {
-        const { vm, owner } = await mailboxOf(req)
+        const { vm, tenantId, owner } = await mailboxOf(req)
         if (!owner || !VOICEMAIL_ID.test(req.params.id) || !(await vm.deleteMessage(owner, req.params.id).catch(unreachable))) throw noMessage()
+        // Its transcription and the bot's notice too, at once when this Gateway writes the mailboxes (else at the event).
+        void transcripts.deleted(tenantId, req.params.id).catch((err: unknown) => req.log.error({ err }, 'voicemail transcription not erased'))
         return reply.code(204).send()
       })
 

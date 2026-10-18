@@ -581,6 +581,61 @@ export const ALERT_DEDUP_MS = 3_600_000
 /** What makes two alerts the same one. */
 export const alertKey = (a: TelephonyAlert) => [a.kind, a.param, a.scope ?? '', a.extension ?? ''].join('|')
 
+/**
+ * The lease a write is made under (step 11b): `holder` holds the lease of `role` (takeWebhookLease) taken at
+ * `generation` (its fencing token), within its write window, or the store writes nothing.
+ */
+export interface FencedLease {
+  role: string
+  holder: string
+  generation: number
+}
+
+/**
+ * What became of a message's transcription (step 11b, ADR 0023): on its way (`pending`), its text (`done`), none
+ * (`none`, `reason` why), or erased (`erased`: its text gone, its notice still to withdraw).
+ */
+export type TranscriptStatus = 'pending' | 'done' | 'none' | 'erased'
+/**
+ * The bot's notice of the message in Chat: to send (`pending`), sent (`sent`, `noticeRoom` and `noticeEvent` say
+ * where), none (`none`: no bot, no Matrix account, the message gone), to withdraw (`redact`, then the row goes).
+ */
+export type TranscriptNotice = 'pending' | 'sent' | 'none' | 'redact'
+
+/**
+ * A message of a mailbox the Gateway transcribes and tells the bot of (step 11b): by tenant, holder (the id the
+ * mailboxes know them by, HolderRecord) and message. `extension`: where its mailbox was reached when it was left (to
+ * read its recording); `receivedAt`: when (the retention period).
+ */
+export interface TranscriptRecord {
+  tenantId: string
+  holder: string
+  messageId: string
+  extension: string
+  receivedAt: string
+  status: TranscriptStatus
+  reason?: 'too-long' | 'busy' | 'failed'
+  text?: string
+  /** The tries of the transcription so far, and when the next one is due. */
+  attempts: number
+  nextAt: string
+  notice: TranscriptNotice
+  noticeRoom?: string
+  noticeEvent?: string
+  /** On the store's clock: when it last changed (the Gateways tell the change to the holder's screens). */
+  updatedAt: string
+}
+
+/** A message to transcribe (addTranscript): `pending`, or `none` with why. */
+export type NewTranscript = Pick<TranscriptRecord, 'tenantId' | 'holder' | 'messageId' | 'extension' | 'receivedAt'> & {
+  status: 'pending' | 'none'
+  reason?: 'too-long' | 'busy' | 'failed'
+  notice: 'pending' | 'none'
+}
+
+/** A change of a transcription (updateTranscript). */
+export type TranscriptChange = Partial<Pick<TranscriptRecord, 'status' | 'reason' | 'text' | 'attempts' | 'nextAt' | 'notice' | 'noticeRoom' | 'noticeEvent'>>
+
 export interface Store {
   listProviders(): Promise<ProviderRecord[]>
   upsertProvider(record: ProviderRecord): Promise<void>
@@ -664,6 +719,34 @@ export interface Store {
   deleteOperatorState(tenantId: string, key: string, ifValue?: unknown): Promise<boolean>
   /** Counts one more use of `key` for the tenant, unless `max` were counted in the last `windowMs` (false), whatever Gateway asks. */
   takeOperatorQuota(tenantId: string, key: string, windowMs: number, max: number): Promise<boolean>
+
+  /**
+   * The transcriptions of the messages (step 11b, ADR 0023), written under the lease of the mailboxes (`lease`, its
+   * fencing token): nothing is written, and the answer says `fenced`, when its holder no longer holds it at that
+   * generation within its write window. A message already there is left as it is (`exists`); a `pending` one past
+   * `maxPending` pending ones of the tenant is kept as `none`, `busy` (the answer says `busy`).
+   */
+  addTranscript(record: NewTranscript, lease: FencedLease, maxPending: number): Promise<'added' | 'exists' | 'busy' | 'fenced'>
+  /** Changes one; false when it is not there, or under a lease no longer held (nothing written). Dated on the store's clock. */
+  updateTranscript(tenantId: string, holder: string, messageId: string, change: TranscriptChange, lease: FencedLease): Promise<boolean>
+  /** Removes one (its notice withdrawn); false when it is not there, or under a lease no longer held. */
+  deleteTranscript(tenantId: string, holder: string, messageId: string, lease: FencedLease): Promise<boolean>
+  /**
+   * Erases the transcriptions of the tenant that match: of one holder (`holder`), one message (`messageId`, of that
+   * holder or of whoever: the ids of a voicemail server are its own), or received before `before` (the retention period). Each one's text goes at once; one whose
+   * notice was sent stays as `erased`, its notice to withdraw (`redact`), the others go. How many; null when the
+   * lease is no longer held (nothing written).
+   */
+  eraseTranscripts(tenantId: string, match: { holder?: string; messageId?: string; before?: string }, lease: FencedLease): Promise<number | null>
+  /** A holder's transcriptions (of `messageIds` when given), erased ones left out. */
+  listTranscripts(tenantId: string, holder: string, messageIds?: string[]): Promise<TranscriptRecord[]>
+  /**
+   * What is due (its next try, `nextAt`, come), oldest first, `limit` at most: a transcription pending, a notice to send
+   * once the transcription is no longer pending, a notice to withdraw (due at once when erased).
+   */
+  dueTranscripts(tenantId: string, limit: number): Promise<TranscriptRecord[]>
+  /** The transcriptions of the tenant that changed after `since` (store's clock) and are `done` or `none`, oldest change first. */
+  transcriptsChangedSince(tenantId: string, since: string, limit: number): Promise<TranscriptRecord[]>
 
   /** Favourite contacts of a user, oldest first. Ids are the directory's; the store never interprets them. */
   listFavorites(tenantId: string, userId: string): Promise<string[]>

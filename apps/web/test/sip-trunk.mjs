@@ -49,6 +49,26 @@ const alaw = sample => {
 }
 /** 20 ms of a 440 Hz tone at 8 kHz, in A-law: what the operator's side says. */
 const TONE = Buffer.from(Array.from({ length: 160 }, (_, i) => alaw(Math.round(8000 * Math.sin((2 * Math.PI * 440 * i) / 8000)))))
+/** 20 ms of silence in A-law. */
+const SILENCE = Buffer.alloc(160, 0xd5)
+/** The 16-bit samples of a WAV at 8 kHz, mono (as Asterisk's prompts): what a caller says (step 11b). */
+export const wavSamples = buf => {
+  if (buf.toString('ascii', 0, 4) !== 'RIFF' || buf.toString('ascii', 8, 12) !== 'WAVE') throw new Error('not a WAV')
+  let at = 12
+  let format
+  while (at + 8 <= buf.length) {
+    const id = buf.toString('ascii', at, at + 4)
+    const size = buf.readUInt32LE(at + 4)
+    if (id === 'fmt ') format = { channels: buf.readUInt16LE(at + 10), rate: buf.readUInt32LE(at + 12), bits: buf.readUInt16LE(at + 22) }
+    if (id === 'data') {
+      if (!format || format.channels !== 1 || format.rate !== 8000 || format.bits !== 16) throw new Error('a WAV of 8 kHz, 16 bits, mono expected')
+      const data = buf.subarray(at + 8, at + 8 + size)
+      return Array.from({ length: data.length >> 1 }, (_, i) => data.readInt16LE(2 * i))
+    }
+    at += 8 + size + (size & 1)
+  }
+  throw new Error('a WAV without data')
+}
 
 /** Our SDP: A-law and DTMF events, on the payload type the offer gave them when we answer one (`events`). */
 const sdpFor = (port, sessionId, version = 1, events = 101) =>
@@ -88,6 +108,9 @@ const media = async () => {
   })
   let timer
   let target
+  /** What is said instead of the tone (step 11b: a phrase), 20 ms at a time, then silence; until then, the tone. */
+  const said = []
+  let quiet = false
   const ssrc = randomBytes(4).readUInt32BE(0)
   let seq = Math.floor(Math.random() * 1000)
   let ts = Math.floor(Math.random() * 100000)
@@ -107,9 +130,17 @@ const media = async () => {
         header.writeUInt32BE(ts >>> 0, 4)
         header.writeUInt32BE(ssrc, 8)
         ts += 160
-        socket.send(Buffer.concat([header, TONE]), target.port, target.host)
+        socket.send(Buffer.concat([header, said.shift() ?? (quiet ? SILENCE : TONE)]), target.port, target.host)
         stats.sent++
       }, 20)
+    },
+    /**
+     * Says `samples` (16-bit, 8 kHz: wavSamples) instead of the tone, then silence; resolves once it is all sent.
+     */
+    async say(samples) {
+      for (let i = 0; i < samples.length; i += 160) said.push(Buffer.from(Array.from({ length: 160 }, (_, j) => alaw(samples[i + j] ?? 0))))
+      quiet = true
+      while (said.length) await new Promise(resolve => setTimeout(resolve, 20))
     },
     /**
      * Types `digits` (0-9, *, #) as RFC 4733 events on payload type `pt` (step 8: a room's PIN), between the tone's

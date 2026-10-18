@@ -35,6 +35,14 @@
 // Step 11a (ADR 0022): the mailboxes, on the Wazo of the same stack, behind OpenSIPS (the Gateway with provider-wazo):
 //   WAZO_AUTH_URL, WAZO_CONFD_URL, WAZO_CALLD_URL, WAZO_WEBSOCKETD_URL  its APIs (default the stack's, on the loopback)
 //   WAZO_USER, WAZO_PASSWORD             the Gateway's account in Wazo (default the stack's development one)
+// Step 11b (ADR 0023): each message transcribed by the LinTO STT of the same stack, the bot's notice of it in the
+// stack's Matrix homeserver (Synapse), where this process makes the bot's account and those of the cast (its
+// shared-secret registration): the bot's access token is the one Synapse gives at its registration, never written.
+//   LINTO_URL            LinTO STT's HTTP API (default http://127.0.0.1:8090)
+//   SYNAPSE_URL          the homeserver's client-server API (default http://127.0.0.1:8008)
+//   SYNAPSE_REGISTRATION_SECRET  its registration_shared_secret (default the stack's, docker/synapse/homeserver.yaml)
+// The caller of the demo of step 11b says apps/web/test/fixtures/caller-message.wav (« Bonjour Jean, ici Paul. Merci de
+// me rappeler demain matin. », made as the stack's prompts are, docker/wazo/asterisk/sounds/README.md, speed 135).
 // Asterisk's CLI (its dialplan, a trace of the calls to the mailboxes) and its spool are read in the stack's container
 // (docker compose -f docker/docker-compose.sip.yml exec wazo-asterisk; COMPOSE_PROJECT_NAME as Docker Compose reads
 // it), and docker/wazo/check-loopback.py runs during a call to a mailbox (as root: sudo -n when this is not root).
@@ -55,6 +63,8 @@ import { DEFAULT_ATTRIBUTES, LdapDirectory } from '../../gateway/dist/ldap-direc
 import { storedOpensipsFactory } from '../../gateway/dist/providers.js'
 import { WazoVoicemail, holderKey, mailboxNumber } from '../../../packages/provider-wazo/dist/index.js'
 import { holderSecretOf } from '../../gateway/dist/voicemail.js'
+import { MatrixBot } from '../../gateway/dist/matrix.js'
+import { LintoTranscription } from '../../../packages/transcription-linto/dist/index.js'
 import { ProviderRegistry } from '../../gateway/dist/registry.js'
 import { SubscriberProvisioner } from '../../../packages/provider-opensips/dist/subscriber.js'
 import { MemoryStore } from '../../gateway/dist/store/memory.js'
@@ -66,7 +76,7 @@ import { startOidcMock } from './oidc-mock.mjs'
 import { serveApp } from '../server/serve.mjs'
 import { sipPhone } from './sip-phone.mjs'
 import { sipUa } from './sip-ua.mjs'
-import { plainRtp, startOperator } from './sip-trunk.mjs'
+import { plainRtp, startOperator, wavSamples } from './sip-trunk.mjs'
 
 const AUDIENCE = 'twakephone-gateway'
 const RESOURCE = 'https://gateway.twakephone.test'
@@ -103,6 +113,13 @@ const WAZO = {
 }
 const TENANT = 'e2e'
 const BROWSER = process.env.BROWSER ?? 'chromium'
+// Step 11b: LinTO STT and the Matrix homeserver of the stack.
+const LINTO_URL = process.env.LINTO_URL ?? 'http://127.0.0.1:8090'
+const SYNAPSE_URL = process.env.SYNAPSE_URL ?? 'http://127.0.0.1:8008'
+const SYNAPSE_SECRET = process.env.SYNAPSE_REGISTRATION_SECRET ?? 'twake-synapse-dev-only-registration'
+const MATRIX_SERVER = 'twakephone.test'
+/** What the caller of the demo of step 11b says, 8 kHz. */
+const CALLER_MESSAGE = wavSamples(readFileSync(new URL('./fixtures/caller-message.wav', import.meta.url)))
 const PRESENCE_MS = Number(process.env.SIP_E2E_PRESENCE_MS) || 3_000
 
 const freePort = () =>
@@ -329,6 +346,31 @@ const wazo = new WazoVoicemail({
   // What it says while out of reach is what the steps expect; once reachable, everything.
   logger: { info: () => {}, warn: m => wazoOpen && console.log(`[wazo] ${m}`), error: m => console.log(`[wazo] ${m}`) }
 })
+// Step 11b: the client-server API of the stack's homeserver, as a person's Twake Chat (or the bot) calls it.
+const matrix = async (token, method, path, body) => {
+  const res = await fetch(`${SYNAPSE_URL}/_matrix/client/v3${path}`, {
+    method,
+    headers: { ...(token ? { authorization: `Bearer ${token}` } : {}), ...(body ? { 'content-type': 'application/json' } : {}) },
+    ...(body ? { body: JSON.stringify(body) } : {})
+  })
+  const json = await res.json().catch(() => ({}))
+  if (!res.ok) throw new Error(`Matrix ${method} ${path.split('?')[0]}: ${res.status} ${json.errcode ?? ''}`)
+  return json
+}
+/**
+ * An account of the homeserver, made by its shared-secret registration (its admin API), or signed in to when an earlier
+ * run made it (its volume kept): its access token.
+ */
+const matrixAccount = async localpart => {
+  const password = `e2e-${localpart}-not-a-secret`
+  const url = `${SYNAPSE_URL}/_synapse/admin/v1/register`
+  const { nonce } = await (await fetch(url)).json()
+  const mac = createHmac('sha1', SYNAPSE_SECRET).update([nonce, localpart, password, 'notadmin'].join('\u0000')).digest('hex')
+  const made = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ nonce, username: localpart, password, admin: false, mac }) })
+  if (made.ok) return (await made.json()).access_token
+  return (await matrix(undefined, 'POST', '/login', { type: 'm.login.password', identifier: { type: 'm.id.user', user: localpart }, password })).access_token
+}
+const matrixTokens = Object.fromEntries(await Promise.all(['twakephone-bot', 'amartin', 'jdupont', 'bdurand', 'accueil'].map(async u => [u, await matrixAccount(u)])))
 const gateway = await buildApp(registry, {
   auth,
   store,
@@ -342,7 +384,10 @@ const gateway = await buildApp(registry, {
   trunkWatchMs: 2_000,
   voicemail: tenantId => (tenantId === TENANT ? wazo : undefined),
   // A synchronisation of the mailboxes that failed (Wazo out of reach) is tried again every 2 s here (the steps wait for it, not for the 30 s of the Gateway's default).
-  voicemailRetryMs: [1_000, 2_000]
+  voicemailRetryMs: [1_000, 2_000],
+  // Step 11b: LinTO STT of the stack, the bot on its homeserver, each person's Matrix id from their uid.
+  transcription: { provider: new LintoTranscription({ url: LINTO_URL, timeoutMs: 60_000 }), maxSec: 180, queueMax: 100, maxBytes: 180 * 24_000 + 65_536 },
+  notices: { bot: new MatrixBot({ homeserverUrl: SYNAPSE_URL, token: matrixTokens['twakephone-bot'] }), userTemplate: `@{uid}:${MATRIX_SERVER}`, appUrl: appOrigin, timeZone: 'Europe/Paris' }
 })
 // LiveKit's webhooks as the Gateway answered them: signed with its key, each one 204.
 const livekitWebhooks = []
@@ -3312,6 +3357,104 @@ try {
     expectEqual(await usage(), used, 'outbound_usage (the caps)')
     expectEqual((await store.listAlerts(TENANT, { limit: 100 })).filter(a => a.lastAt > started).map(a => `${a.alert.kind} ${a.alert.param}`), [], 'alerts since the call')
     expectEqual((await jeanApi('DELETE', `/voicemails/${message.id}`)).statusCode, 204, 'DELETE of the message')
+  })
+  await step('step 11b, the demo: Jean does not want to be disturbed and looks at his Messagerie vocale; the operator calls his direct number from +33 6 39 98 00 11 and the caller leaves a message in French; it arrives in Jean\'s Messagerie vocale, transcribed by LinTO STT, the text under it; the bot tells Jean in Twake Chat (his Matrix account on the stack\'s homeserver), in a room of his own with it: caller, time, duration, the text and the link to listen to it in TwakePhone; nothing for Bob nor Alice; Jean deletes the message: the notice is withdrawn in Chat', async () => {
+    const jeanApi = await asPerson(jean)
+    const bobApi = await asPerson(bob)
+    const aliceApi = await asPerson(alice)
+    // Réglages first (where the status is set), then his Messagerie vocale, which he keeps looking at.
+    await setStatus(jean, 'Ne pas déranger')
+    await jean.page.getByRole('link', { name: /^Messagerie vocale/ }).click()
+    await jean.page.getByRole('heading', { level: 1, name: 'Messagerie vocale' }).waitFor()
+    const started = new Date().toISOString()
+    try {
+      const placed = await operator.call('+33199000102', { from: '+33639980011', ruri: TRUNK_LOGIN })
+      const answer = await placed.final
+      const answeredAt = Date.now()
+      expectEqual(answer.status, 200, "the mailbox's answer to the operator")
+      expectEqual(await jean.page.getByTestId('incoming-call').count(), 0, 'incoming calls on Jean side')
+      // After the beep: the caller's words (4.6 s), then a second of silence before hanging up.
+      await sleep(Math.max(0, answeredAt + greetingMs() + 500 - Date.now()))
+      await placed.media.say(CALLER_MESSAGE)
+      await sleep(1_000)
+      expectEqual((await placed.hangup()).status, 200, 'answer to the operator BYE')
+    } catch (err) {
+      await setStatus(jean, 'Disponible')
+      throw err
+    }
+    // In his Messagerie vocale as he looks at it, then its transcription under it, said to assistive tech.
+    // (Available again only at the end: setting it leaves the Messagerie vocale.)
+    const item = await until("the caller's message in Jean's mailbox", async () => (await jeanApi('GET', '/voicemails')).json().items.find(i => i.from === '+33639980011') ?? null, { timeout: 20_000 })
+    const shown = jean.page.locator(`[data-testid=voicemail][data-id="${item.id}"]`)
+    await shown.waitFor({ timeout: 10_000 })
+    const transcript = shown.locator('[data-testid=voicemail-transcript][data-status=done]')
+    await transcript.waitFor({ timeout: 60_000 })
+    const served = await until('the transcription as the Gateway serves it', async () => {
+      const v = (await jeanApi('GET', '/voicemails')).json().items.find(i => i.id === item.id)
+      return v?.transcript?.status === 'done' ? v.transcript : null
+    })
+    console.log(`     transcription: « ${served.text} »`)
+    // Not a word-for-word check (a small model, a synthetic voice through a telephone line): words of the phrase heard.
+    const heard = ['bonjour', 'jean', 'paul', 'merci', 'rappeler', 'demain', 'matin'].filter(w => served.text.toLowerCase().includes(w))
+    if (heard.length < 2) throw new Error(`the transcription « ${served.text} » has ${heard.length} word(s) of the phrase said, 2 at least expected`)
+    expectEqual((await transcript.textContent()).trim(), `Transcription : « ${served.text} »`, 'the transcription in the Messagerie vocale')
+    await jean.page.locator('[aria-live=polite]').filter({ hasText: /transcrit\.\s?$/ }).waitFor({ timeout: 10_000 })
+    // The bot's notice: in one room only, the bot's with Jean (invited), nobody else in it.
+    const bot = matrixTokens['twakephone-bot']
+    const found = await until("the bot's notice of the message", async () => {
+      for (const roomId of (await matrix(bot, 'GET', '/joined_rooms')).joined_rooms) {
+        const { chunk } = await matrix(bot, 'GET', `/rooms/${encodeURIComponent(roomId)}/messages?dir=b&limit=50`)
+        const notices = chunk.filter(e => e.type === 'm.room.message' && String(e.content?.body ?? '').includes('+33639980011'))
+        if (notices.length) return { roomId, notices }
+      }
+      return null
+    }, { timeout: 30_000 })
+    expectEqual(found.notices.length, 1, "the bot's notices of the message")
+    const [notice] = found.notices
+    const body = notice.content.body
+    console.log(`     notice: ${body.replace(/\n/g, ' | ')}`)
+    expectEqual(notice.content.msgtype, 'm.notice', 'the kind of message the bot sends')
+    for (const part of ['Nouveau message vocal de +33639980011', `durée 0:0`, `Transcription : « ${served.text} »`, `Écouter dans TwakePhone : ${appOrigin}/voicemail`]) {
+      if (!body.includes(part)) throw new Error(`the notice « ${body} » does not say « ${part} »`)
+    }
+    const members = (await matrix(bot, 'GET', `/rooms/${encodeURIComponent(found.roomId)}/members`)).chunk.filter(e => ['join', 'invite'].includes(e.content.membership)).map(e => e.state_key).sort()
+    expectEqual(members, [`@jdupont:${MATRIX_SERVER}`, `@twakephone-bot:${MATRIX_SERVER}`], 'the people of the room of the notice')
+    // Jean's Twake Chat: invited to it, he joins and reads the notice.
+    const jeanMx = matrixTokens.jdupont
+    const { rooms } = await matrix(jeanMx, 'GET', '/sync?timeout=0')
+    const room = found.roomId
+    if (!rooms?.invite?.[room] && !rooms?.join?.[room]) throw new Error("Jean's Twake Chat has no invitation of the bot's room")
+    if (rooms?.invite?.[room]) await matrix(jeanMx, 'POST', `/join/${encodeURIComponent(room)}`, {})
+    const read = (await matrix(jeanMx, 'GET', `/rooms/${encodeURIComponent(room)}/messages?dir=b&limit=50`)).chunk.find(e => e.event_id === notice.event_id)
+    expectEqual(read?.content?.body, body, 'the notice as Jean reads it in Chat')
+    // Nobody else: Bob and Alice in no room of that notice, their mailboxes without the message.
+    for (const [who, token] of [['Bob', matrixTokens.bdurand], ['Alice', matrixTokens.amartin]]) {
+      const theirs = await matrix(token, 'GET', '/sync?timeout=0')
+      if (theirs.rooms?.invite?.[room] || theirs.rooms?.join?.[room]) throw new Error(`${who} is in the room of Jean's notice`)
+      await matrix(token, 'GET', `/rooms/${encodeURIComponent(room)}/messages?dir=b&limit=5`).then(
+        () => {
+          throw new Error(`${who} reads the room of Jean's notice`)
+        },
+        err => {
+          if (!/: 403 M_FORBIDDEN/.test(err.message)) throw err
+        }
+      )
+    }
+    for (const [who, api] of [['Bob', bobApi], ['Alice', aliceApi]]) {
+      const { items } = (await api('GET', '/voicemails')).json()
+      expectEqual(items.some(i => i.id === item.id), false, `Jean's message in ${who}'s mailbox`)
+    }
+    expectEqual((await store.listAlerts(TENANT, { limit: 100 })).filter(a => a.lastAt > started && a.alert.kind === 'voicemail').map(a => a.alert.param), [], 'voicemail alerts since the call')
+    // Jean deletes it: the notice withdrawn (redacted) in Chat, its transcription gone.
+    await shown.getByRole('button', { name: /^Supprimer le message de / }).click()
+    await shown.getByRole('button', { name: /^Confirmer la suppression du message de / }).click()
+    await shown.waitFor({ state: 'detached', timeout: 10_000 })
+    await until('the notice withdrawn in Chat', async () => {
+      const e = await matrix(jeanMx, 'GET', `/rooms/${encodeURIComponent(room)}/event/${encodeURIComponent(notice.event_id)}`)
+      return e.unsigned?.redacted_because && !e.content?.body ? e : null
+    }, { timeout: 20_000 })
+    expectEqual((await jeanApi('GET', '/voicemails')).json().items.some(i => i.id === item.id), false, "the message in Jean's mailbox after he deleted it")
+    await setStatus(jean, 'Disponible')
   })
   await step('step 11a: the operator calls the desk\'s direct number +33 1 99 00 01 04 (the desk signed out: nobody to reach), whose fallback is the ring group 210 of Bob, in a call with Jean (his window answers busy at once): the mailbox of 104 takes the call; for the desk it is a missed call, nobody of the group took it, the message is the desk\'s', async () => {
     const api = await asPerson(alice)

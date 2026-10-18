@@ -451,3 +451,19 @@ export interface ProviderFactory<C = unknown> {
   readonly type: string
   create(config: C, context?: ProviderContext): TelephonyProvider & Partial<MediaProvider>
 }
+
+/**
+ * A speech-to-text service (step 11b, ADR 0023; LinTO STT's, transcription-linto): a recording in, what it says out.
+ * The Gateway hands it the messages of the mailboxes, one at a time, never more than its bound; it never logs what goes
+ * in nor what comes out. Its errors say what failed in a few words, never a body of the service nor the audio.
+ */
+export interface TranscriptionProvider {
+  readonly id: string
+  /**
+   * What the recording says (a WAV, `audio`, whole): its text, the words joined (empty when nothing was heard). Rejects
+   * when the service did not answer within its bound or refused the recording.
+   */
+  transcribe(audio: Uint8Array, options?: { contentType?: string; signal?: AbortSignal }): Promise<{ text: string }>
+  /** A light request to the service: rejects when it does not answer. */
+  probe?(): Promise<void>
+}

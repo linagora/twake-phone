@@ -887,5 +887,17 @@
   "admin.operator.closed.unrestored.refused": "Line {line}: forward removed on {at}, its forwards from before not put back (the operator did not keep them as they were)",
   "voicemail.deleted": "Message from {who} deleted.",
   "voicemail.markedRead": "Message from {who} marked as read.",
-  "call.voicemailOf": "Voicemail of {who}"
+  "call.voicemailOf": "Voicemail of {who}",
+  "voicemail.transcriptLabel": "Transcript:",
+  "voicemail.transcriptPending": "on its way…",
+  "voicemail.transcriptEmpty": "no speech recognised.",
+  "voicemail.transcriptTooLong": "none, the message is too long to be transcribed.",
+  "voicemail.transcriptBusy": "none, too many messages were waiting for theirs.",
+  "voicemail.transcriptFailed": "none, the transcription service could not transcribe it.",
+  "voicemail.transcribedSaid": "Message from {who} transcribed.",
+  "admin.webhooks.event.voicemail.created": "Voicemail received",
+  "admin.webhooks.event.voicemail.transcribed": "Voicemail transcribed",
+  "admin.alert.voicemailTranscriptionBusy": "Too many messages were waiting for their transcription: the next ones are not transcribed (how many at most)",
+  "admin.alert.voicemailTranscriptionFailed": "The transcription service (LinTO) could not transcribe a message after several tries",
+  "admin.alert.voicemailNoticeFailed": "The bot could not send the notice of a message to Twake Chat after several tries"
 }

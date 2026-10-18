@@ -37,6 +37,11 @@ export interface LdapDirectoryConfig {
   /** PEM of the CA that signed the server certificate (ldaps), when it is not in the system store. */
   ca?: string
   rejectUnauthorized?: boolean
+  /**
+   * The attribute that holds a person's Matrix user id (step 11b, LDAP_ATTR_MATRIX): where the bot of TwakePhone writes
+   * to them in Twake Chat. Read for that only, never shown in the directory.
+   */
+  matrixAttribute?: string
 }
 
 export const DEFAULT_ATTRIBUTES: LdapAttributes = { id: 'uid', name: 'cn', surname: 'sn', givenName: 'givenName', email: 'mail', phone: 'telephoneNumber', mobile: 'mobile', extension: '', department: 'ou', title: 'title' }
@@ -143,6 +148,10 @@ export class LdapDirectory implements ContactDirectory {
 
   /** One bound connection per request: simple, and immune to a connection the server dropped meanwhile. */
   private async query(filter: string, sizeLimit: number, paged = false): Promise<Contact[]> {
+    return (await this.entries(filter, sizeLimit, paged, this.attributes())).map(e => contactOf(e, this.config.attributes)).filter((c): c is Contact => c !== null)
+  }
+
+  private async entries(filter: string, sizeLimit: number, paged: boolean, attributes: string[]): Promise<Entry[]> {
     const tls = { ...(this.config.ca ? { ca: this.config.ca } : {}), ...(this.config.rejectUnauthorized === false ? { rejectUnauthorized: false } : {}) }
     const client = new Client({
       url: this.config.url,
@@ -155,13 +164,13 @@ export class LdapDirectory implements ContactDirectory {
       const { searchEntries } = await client.search(this.config.baseDn, {
         scope: 'sub',
         filter,
-        attributes: this.attributes(),
+        attributes,
         sizeLimit,
         // A full listing may take a while on a large directory; a lookup must not. Both limits (server and client) agree.
         timeLimit: paged ? Math.ceil((this.config.listTimeoutMs ?? 120_000) / 1000) : 10,
         ...(paged ? { paged: { pageSize: PAGE } } : {})
       })
-      return searchEntries.map(e => contactOf(e, this.config.attributes)).filter((c): c is Contact => c !== null)
+      return searchEntries
     } finally {
       await client.unbind().catch(() => undefined)
     }
@@ -193,14 +202,28 @@ export class LdapDirectory implements ContactDirectory {
     }
     return ids.flatMap(id => index.get(id) ?? [])
   }
+
+  /**
+   * The Matrix user id the directory gives the person (`matrixAttribute`), undefined when it gives none, or when the
+   * attribute is not set; its first value only.
+   */
+  async matrixIdOf(_tenantId: TenantId, userId: string): Promise<string | undefined> {
+    const attr = this.config.matrixAttribute
+    if (!attr) return undefined
+    const [entry] = await this.entries(`(&${this.userFilter}${escapeFilter`(${this.config.attributes.id}=${userId})`})`, 2, false, [this.config.attributes.id, attr])
+    if (!entry) return undefined
+    const e = lowered(entry)
+    if (e[this.config.attributes.id.toLowerCase()]?.[0] !== userId) return undefined
+    return e[attr.toLowerCase()]?.[0]
+  }
 }
 
 /**
  * LDAP_URL enables the directory, for the tenant LDAP_TENANT (default: DEFAULT_TENANT, else "default").
  * LDAP_BIND_DN and LDAP_BIND_PASSWORD (an account allowed to read people), LDAP_BASE_DN, LDAP_USER_FILTER
  * (default: inetOrgPerson entries), LDAP_ATTR_* to map the schema (ID, NAME, SURNAME, GIVENNAME, EMAIL, PHONE, MOBILE,
- * EXTENSION, DEPARTMENT, TITLE; "" disables one), LDAP_TLS_CA_FILE for a private CA, LDAP_TLS_REJECT_UNAUTHORIZED=0
- * only on a dev box. `warn` receives what a production deployment should not do.
+ * EXTENSION, DEPARTMENT, TITLE; "" disables one; MATRIX, the Matrix user id of step 11b, none by default),
+ * LDAP_TLS_CA_FILE for a private CA, LDAP_TLS_REJECT_UNAUTHORIZED=0 only on a dev box. `warn` receives what a production deployment should not do.
  */
 export const ldapDirectoryFromEnv = (env: NodeJS.ProcessEnv, warn: (message: string) => void = message => console.warn(message)): LdapDirectory | undefined => {
   if (!env.LDAP_URL) return undefined
@@ -221,6 +244,7 @@ export const ldapDirectoryFromEnv = (env: NodeJS.ProcessEnv, warn: (message: str
       phone: attr('phone'), mobile: attr('mobile'), extension: attr('extension'), department: attr('department'), title: attr('title')
     },
     ...(env.LDAP_TLS_CA_FILE ? { ca: readFileSync(env.LDAP_TLS_CA_FILE, 'utf8') } : {}),
-    ...(env.LDAP_TLS_REJECT_UNAUTHORIZED === '0' ? { rejectUnauthorized: false } : {})
+    ...(env.LDAP_TLS_REJECT_UNAUTHORIZED === '0' ? { rejectUnauthorized: false } : {}),
+    ...(env.LDAP_ATTR_MATRIX ? { matrixAttribute: env.LDAP_ATTR_MATRIX } : {})
   })
 }

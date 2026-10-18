@@ -20,6 +20,10 @@
 #
 # The mailboxes (step 11a, ADR 0022): Wazo Platform 26.10, its official images, the services a mailbox needs only
 # (below, before OpenSIPS); OpenSIPS sends it the calls nothing else takes, from its socket 5095, to its Asterisk (5100).
+#
+# The transcription of the messages and the bot (step 11b, ADR 0023): LinTO STT (its Kaldi engine, the smallest French
+# model: docker/linto/Dockerfile), its HTTP API on 8090; a Matrix homeserver (Synapse, 8008) where the bot of
+# TwakePhone tells each person of their messages, as in Twake Chat. Both on the loopback.
 # The platform's identity in Wazo (step 11a, XIVO_UUID of each of its services): the one its database image was made with.
 x-wazo-uuid: &wazo-uuid 50f01d62-b7e9-4485-8fb4-f47d46206def
 
@@ -404,6 +408,37 @@ services:
       timeout: 3s
       retries: 3
 
+  # Step 11b (ADR 0023): LinTO STT, its HTTP API (POST /transcribe) on the loopback, the Gateway's LINTO_URL
+  # (http://127.0.0.1:8090). A message of a few seconds is transcribed in a second or two.
+  linto-stt:
+    build: ./linto
+    network_mode: host
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/healthcheck', timeout=3)"]
+      interval: 60s
+      start_period: 3m
+      start_interval: 2s
+      timeout: 5s
+      retries: 3
+
+  # Step 11b: the Matrix homeserver of the bot's notices (docker/synapse/homeserver.yaml), its client-server API on the
+  # loopback (http://127.0.0.1:8008), no federation. Its keys are made at its first start, in its volume.
+  synapse:
+    image: matrixdotorg/synapse:v1.163.0@sha256:e98ab72138d90fa8b8876c6421fe78a9fdb181c0d7cc690ad740e5173e0c65e6
+    entrypoint: ["/bin/sh", "-c", "python -m synapse.app.homeserver --config-path /config/homeserver.yaml --generate-keys && exec python -m synapse.app.homeserver --config-path /config/homeserver.yaml"]
+    volumes:
+      - ./synapse/homeserver.yaml:/config/homeserver.yaml:ro
+      - ./synapse/log.config:/config/log.config:ro
+      - synapse-data:/data
+    network_mode: host
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8008/health"]
+      interval: 60s
+      start_period: 3m
+      start_interval: 2s
+      timeout: 5s
+      retries: 3
+
   opensips:
     build: ./opensips
     depends_on:
@@ -480,7 +515,8 @@ services:
       retries: 30
 
 # Wazo (step 11a): the keys of its services, made by wazo-bootstrap; the mailboxes, shared by Asterisk, wazo-calld and
-# wazo-sysconfd. Both go with `down -v`.
+# wazo-sysconfd. Synapse's (step 11b): its keys, its database, the rooms and messages of the bot. All go with `down -v`.
 volumes:
   wazo-auth-keys:
   wazo-voicemail:
+  synapse-data:
