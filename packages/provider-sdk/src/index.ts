@@ -290,6 +290,11 @@ export interface VoicemailProvider {
    * that mailbox is theirs (read again from the voicemail server).
    */
   owns(owner: VoicemailOwner): Promise<boolean>
+  /**
+   * Whether a mailbox as the SIP server has it (VoicemailBox's `mailbox`) is this person's, without a request: an
+   * extension given back to them whose row is already there is not withdrawn first.
+   */
+  mailboxIsOf?(mailbox: string, userId: string): boolean
   /** The messages of the owner's mailbox, newest first; none when they have no mailbox. */
   listMessages(owner: VoicemailOwner): Promise<Voicemail[]>
   /**

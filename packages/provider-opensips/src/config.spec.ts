@@ -246,7 +246,9 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
       [{ VOICEMAIL_CALLS_HIDDEN: '31' }, /VOICEMAIL_CALLS_HIDDEN must be 1 to VOICEMAIL_CALLS_ALL/],
       [{ VOICEMAIL_CALLS_PER_HOUR: 'x' }, /VOICEMAIL_CALLS_PER_HOUR must be a number/],
       [{ VOICEMAIL_CALLS_HIDDEN_ALL: '16' }, /VOICEMAIL_CALLS_HIDDEN_ALL must be 0 to half of VOICEMAIL_CALLS_ALL/],
-      [{ VOICEMAIL_CALLS_HIDDEN_ALL: 'x' }, /VOICEMAIL_CALLS_HIDDEN_ALL must be a number/]
+      [{ VOICEMAIL_CALLS_HIDDEN_ALL: 'x' }, /VOICEMAIL_CALLS_HIDDEN_ALL must be a number/],
+      // The variable that is wrong is the one named, not the share reckoned from it.
+      [{ VOICEMAIL_CALLS_ALL: 'x' }, /^VOICEMAIL_CALLS_ALL must be a number of calls\n$/]
     ] as const)
       expect(render({ WAZO_SIP: '192.0.2.30:5100', ...env }).stderr).toMatch(message)
     // A caller from outside is said as such: the greeting never spells the extension to them.

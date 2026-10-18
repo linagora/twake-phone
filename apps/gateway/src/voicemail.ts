@@ -102,7 +102,10 @@ export const voicemailMismatch = (voicemail: { maxMessageSec?: number } | undefi
   return []
 }
 
-/** VOICEMAIL_RETENTION_DAYS: how long a message is kept (30 days by default; 0: for good). */
+/**
+ * VOICEMAIL_RETENTION_DAYS: how long a message is kept (30 days by default; 0: no purge by age, but the mailbox of anyone
+ * without an extension past VOICEMAIL_GRACE_DAYS then goes with its messages).
+ */
 export const retentionDaysOf = (env: NodeJS.ProcessEnv) => {
   const raw = env.VOICEMAIL_RETENTION_DAYS
   if (raw === undefined || raw === '') return 30

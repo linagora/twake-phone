@@ -268,6 +268,8 @@ describe('WazoVoicemail, the mailboxes', () => {
     const { vm, wazo } = make()
     const four = ['102', '103', '104', '105'].map((extension, i) => ({ extension, userId: `u${i}` }))
     const { boxes } = await vm.syncMailboxes(four)
+    // A row of the SIP server is a person's at their number only.
+    expect([vm.mailboxIsOf(boxes[0]!.mailbox, 'u0'), vm.mailboxIsOf(boxes[0]!.mailbox, 'u1')]).toEqual([true, false])
     // Another Gateway, which never synchronised: the SIP server says the four are reached; a directory that came back
     // empty sets none aside.
     const other = new WazoVoicemail({ authUrl: 'http://wazo.test:9497/0.1', confdUrl: 'http://wazo.test:9486/1.1', calldUrl: 'http://wazo.test:9500/1.0', websocketdUrl: 'ws://wazo.test:9502/', username: 'twakephone', password: 'not-a-real-password', holderSecret: SECRET, fetch: wazo.fetch, logger: { info() {}, warn() {}, error() {} } })

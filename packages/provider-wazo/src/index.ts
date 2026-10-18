@@ -836,6 +836,11 @@ export class WazoVoicemail implements VoicemailProvider {
    * Whether the owner has a mailbox. With `owner.mailbox` (an event's), whether that very mailbox is theirs, as Wazo has
    * it now: at their number, its user standing for them.
    */
+  /** A mailbox of the SIP server (`number@context`) is a person's when it is at their number, which is theirs only. */
+  mailboxIsOf(mailbox: string, userId: string) {
+    return mailbox.split('@')[0] === mailboxNumber(this.key(userId))
+  }
+
   async owns(owner: VoicemailOwner) {
     if (owner.mailbox === undefined) return (await this.voicemailIdOf(owner)) !== undefined
     const id = /^[0-9]{1,15}$/.test(owner.mailbox) ? Number(owner.mailbox) : NaN

@@ -72,7 +72,7 @@ export class DirectorySync {
   private last: SyncReport | undefined
   private timer: NodeJS.Timeout | undefined
   private intervalMs: number | undefined
-  private readonly listeners: ((tenantId: string, extensions: string[]) => void)[] = []
+  private readonly listeners: ((tenantId: string, extensions: string[], left: string[]) => void)[] = []
 
   constructor(private readonly opts: DirectorySyncOptions) {}
 
@@ -83,9 +83,10 @@ export class DirectorySync {
 
   /**
    * Called after a run that created, changed or removed a mapping (who holds which extension changed), with the
-   * extensions that passed to someone else or to nobody (their mailbox is withdrawn at once).
+   * extensions that passed to someone else or to nobody (those given to someone else lose their mailbox at once), and
+   * the people who left the directory.
    */
-  onChange(listener: (tenantId: string, extensions: string[]) => void) {
+  onChange(listener: (tenantId: string, extensions: string[], left: string[]) => void) {
     this.listeners.push(listener)
   }
 
@@ -288,6 +289,7 @@ export class DirectorySync {
 
     // Rows that go, first: that frees the extensions before they are given to someone else (two people swapping).
     const listed = new Set(people.map(p => p.id))
+    const left = [...released].filter(userId => !listed.has(userId)).sort()
     for (const userId of released) {
       // Their erasure goes only when they left the directory (fourth review 10b, n°2): given another extension, or
       // none, it stays (until purged).
@@ -317,7 +319,7 @@ export class DirectorySync {
     if (report.created || report.updated || report.removed || released.size) {
       for (const listener of this.listeners) {
         try {
-          listener(tenantId, [...changed].sort())
+          listener(tenantId, [...changed].sort(), left)
         } catch (err) {
           this.opts.log?.error({ err }, 'directory synchronisation: a listener failed')
         }

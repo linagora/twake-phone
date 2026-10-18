@@ -1,6 +1,6 @@
 import { randomBytes } from 'node:crypto'
 import pg from 'pg'
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import { VOICEMAIL_BOXES_SCHEMA, VOICEMAIL_FENCE_RESET, VoicemailBoxes } from '@twake/provider-opensips'
 import { WazoVoicemail, holderKey, mailboxNumber, type WebSocketLike } from '@twake/provider-wazo'
 import type { ProviderFactory, RoutedEvent, TelephonyProvider, VoicemailBox, VoicemailBoxesWrite, VoicemailOwner, VoicemailProvider, VoicemailSubscribeOptions, VoicemailSync, VoicemailSyncOptions } from '@twake/telephony-provider-sdk'
@@ -127,6 +127,7 @@ const fakeVoicemail = () => {
       await after?.()
       return { boxes: list.map(h => ({ extension: h.extension, mailbox: boxOf(h.userId) })), failed: refused, ...(held ? { heldBack: held } : {}), ...(released ? { released: true } : {}) }
     },
+    mailboxIsOf: (mailbox, userId) => mailbox === boxOf(userId),
     // With the mailbox of an event: that very mailbox must be the one at the extension, the person's (as provider-wazo).
     owns: async o => {
       owned.push(o)
@@ -378,31 +379,50 @@ const steal = (store: MemoryStore) => store.takeWebhookLease(voicemailRole('A'),
 /** A change of holder marked by another Gateway (VOICEMAIL_CHANGED): the one that writes the mailboxes synchronises. */
 const changed = (store: MemoryStore) => store.putOperatorState('A', 'voicemail:changed', { at: `${Date.now()}-${Math.random()}` })
 
+type Person = { id: string; displayName: string; numbers: { type: 'extension'; number: string }[] }
+const person = (id: string, extension: string): Person => ({ id, displayName: `Person ${id}`, numbers: [{ type: 'extension', number: extension }] })
+
 /**
- * The guard of a mass set aside, through the Gateway's own path, against provider-wazo and a Wazo in memory: six
- * people of the directory have their mailbox; the directory comes back with two of them (a filter changed, an OU
- * moved). The synchronisation of the directory removes the four mappings; their extensions, left to nobody, keep their
- * row (no withdrawal); the round finds four of six still reached there: held back, the administrators told, nothing
- * set aside, each still reached; let go once an administrator says that very mass is meant. `db`: `voicemail_boxes`
- * on PostgreSQL.
+ * The Gateway's own path against provider-wazo and a Wazo in memory: the directory lists `people` (`list` changes it,
+ * then synchronises it), each of them given a mailbox. `db`: `voicemail_boxes` on PostgreSQL.
  */
-const massGoneThroughTheGateway = async (db?: VoicemailBoxes) => {
+const throughTheGateway = async (people: Person[], db?: VoicemailBoxes) => {
   const secret = Buffer.alloc(32, 9)
   const wazo = fakeWazo(userId => mailboxNumber(holderKey(secret, userId)))
   // A wazo-websocketd that never answers: the events are no part of this.
   const quiet = (): WebSocketLike => ({ onopen: null, onmessage: null, onclose: null, onerror: null, send() {}, close() {} })
   const vm = new WazoVoicemail({ authUrl: 'http://wazo.test:9497/0.1', confdUrl: 'http://wazo.test:9486/1.1', calldUrl: 'http://wazo.test:9500/1.0', websocketdUrl: 'ws://wazo.test:9502/', username: 'twakephone', password: 'not-a-real-password', holderSecret: secret, fetch: wazo.fetch, webSocket: quiet, logger: { info() {}, warn() {}, error() {} } })
   const store = new MemoryStore()
-  const six = Array.from({ length: 6 }, (_, i) => ({ id: `p${i}`, displayName: `Person ${i}`, numbers: [{ type: 'extension' as const, number: String(201 + i) }] }))
-  let listed = six
+  let listed = people
   const directory = { listAll: async () => listed } as unknown as ContactDirectory
   const directorySync = new DirectorySync({ store, directory, tenantId: 'A' })
   await directorySync.run()
   const { app, sip, as } = await setup({ store, directorySync, mapped: false, voicemailProvider: vm, changeMs: 30, ...(db ? { db } : {}) })
   const reached = () => (sip.given.at(-1) ?? []).map(b => b.extension).sort()
-  await until('the six mailboxes reached', () => reached().length === 6 && wazo.state.voicemails.length === 6, 5_000)
-  listed = six.slice(0, 2)
-  await directorySync.run()
+  await until('the mailboxes reached', () => reached().length === people.length && wazo.state.voicemails.length === people.length, 5_000)
+  const list = async (now: Person[]) => {
+    listed = now
+    await directorySync.run()
+  }
+  /** The messages in the mailbox at the number of `userId`. */
+  const messagesOf = (userId: string) => wazo.state.messages.get(wazo.boxOf(userId)!.id) ?? []
+  return { wazo, store, app, sip, as, reached, list, messagesOf }
+}
+
+/**
+ * The guard of a mass set aside, through the Gateway's own path: six people of the directory have their mailbox; the
+ * directory comes back with two of them (a filter changed, an OU moved). The synchronisation of the directory removes
+ * the four mappings; their extensions, left to nobody, keep their row (no withdrawal); the round finds four of six
+ * still reached there: held back, the administrators told, nothing set aside, each still reached, no message erased.
+ * Then `release`: let go once an administrator says that very mass is meant (set aside, and the messages of those who
+ * left the directory erased); or `return`: the directory comes back whole, nothing withdrawn on the way (each row
+ * already at its holder's own mailbox), nothing erased. `db`: `voicemail_boxes` on PostgreSQL.
+ */
+const massGoneThroughTheGateway = async (db?: VoicemailBoxes, then: 'release' | 'return' = 'release') => {
+  const six = Array.from({ length: 6 }, (_, i) => person(`p${i}`, String(201 + i)))
+  const { wazo, store, app, sip, as, reached, list, messagesOf } = await throughTheGateway(six, db)
+  messagesOf('p3').push(wazo.msg('m-p3'))
+  await list(six.slice(0, 2))
   expect((await store.listMappings('A')).map(m => m.extension)).toEqual(['201', '202'])
   await until('held back', async () => !!(await store.getOperatorState('A', 'voicemail:held')), 5_000)
   expect(await store.getOperatorState('A', 'voicemail:held')).toMatchObject({ park: 4, of: 6 })
@@ -412,10 +432,23 @@ const massGoneThroughTheGateway = async (db?: VoicemailBoxes) => {
   expect(wazo.state.voicemails.map(v => v.name)).toEqual(six.map(() => 'TwakePhone'))
   expect(sip.withdrawn.flat()).toEqual([])
   expect(reached()).toEqual(six.map(p => p.numbers[0]!.number))
-  // An administrator says those four left: set aside, no longer reached.
-  expect((await app.inject({ method: 'POST', url: '/api/v1/admin/voicemail/release', headers: as('root'), payload: { park: 4, of: 6 } })).statusCode).toBe(202)
-  await until('set aside', () => wazo.state.voicemails.filter(v => v.name.startsWith('TwakePhone aside ')).length === 4, 5_000)
-  await until('no longer reached', () => reached().join() === '201,202', 5_000)
+  expect(messagesOf('p3')).toHaveLength(1)
+  if (then === 'return') {
+    // The directory whole again: each of the four back at the extension whose row is already at their mailbox.
+    await list(six)
+    await until('no longer held back', async () => !(await store.getOperatorState('A', 'voicemail:held')), 5_000)
+    await until('nothing asked any more', async () => (await store.listOperatorState('A', 'voicemail:erase:')).length === 0, 5_000)
+    expect(sip.withdrawn.flat()).toEqual([])
+    expect(reached()).toEqual(six.map(p => p.numbers[0]!.number))
+    expect(messagesOf('p3')).toHaveLength(1)
+  } else {
+    // An administrator says those four left: set aside, no longer reached, and their messages erased (they left the
+    // directory: their id may be someone else's later).
+    expect((await app.inject({ method: 'POST', url: '/api/v1/admin/voicemail/release', headers: as('root'), payload: { park: 4, of: 6 } })).statusCode).toBe(202)
+    await until('set aside', () => wazo.state.voicemails.filter(v => v.name.startsWith('TwakePhone aside ')).length === 4, 5_000)
+    await until('no longer reached', () => reached().join() === '201,202', 5_000)
+    await until('their messages erased', () => messagesOf('p3').length === 0, 5_000)
+  }
   await app.close()
   for (const state of made.splice(0)) expect(state.denied).toEqual([])
 }
@@ -595,13 +628,17 @@ describe('the mailboxes (step 11a)', () => {
     expect(wazo.erased).toEqual([])
     expect(wazo.messages.get('102')).toHaveLength(1)
     expect((await store.listOperatorState('A', 'voicemail:erase:')).map(e => e.key)).toEqual(['voicemail:erase:jean'])
-    // Two an hour here: the third refused, 429, nothing asked.
+    // Two an hour here: the third erases the history all the same, and asks nothing of the voicemail server.
     expect((await app.inject({ method: 'DELETE', url: '/api/v1/me/history', headers: as('jean') })).statusCode).toBe(200)
+    const before = await store.getOperatorState('A', 'voicemail:erase:jean')
+    await store.addHistory({ tenantId: 'A', userId: 'jean', callId: 'c-1', direction: 'inbound', remoteNumber: '101', startedAt: '2026-10-18T08:00:00.000Z', durationSec: 0, state: 'ended', answered: false })
     const third = await app.inject({ method: 'DELETE', url: '/api/v1/me/history', headers: as('jean') })
-    expect([third.statusCode, third.json().code]).toEqual([429, 'ERASURE_RATE'])
-    expect((await app.inject({ method: 'DELETE', url: '/api/v1/me/history', headers: as('alice') })).statusCode).toBe(200)
+    expect([third.statusCode, third.json()]).toEqual([200, { deleted: 1, voicemailErasure: 'limited' }])
+    expect(await store.getOperatorState('A', 'voicemail:erase:jean')).toEqual(before)
+    const erasure = async (user: string) => (await app.inject({ method: 'DELETE', url: '/api/v1/me/history', headers: as(user) })).json().voicemailErasure
+    expect(await erasure('alice')).toBe('asked')
     // Someone whose id is `admin` has their own count, not the administrators' of the tenant.
-    expect((await app.inject({ method: 'DELETE', url: '/api/v1/me/history', headers: as('admin') })).statusCode).toBe(200)
+    expect(await erasure('admin')).toBe('asked')
     await app.close()
   })
 
@@ -611,7 +648,7 @@ describe('the mailboxes (step 11a)', () => {
     await app.close()
   })
 
-  it('keeps an erasure asked again while the round erased, for the next round', async () => {
+  it('keeps an erasure asked again while the round erased, for the next round, even in the same millisecond', async () => {
     const { app, as, wazo, sip } = await setup({ changeMs: 30 })
     await until('the mailboxes', () => sip.given.length === 2)
     let again = true
@@ -620,10 +657,98 @@ describe('the mailboxes (step 11a)', () => {
       again = false
       expect((await app.inject({ method: 'DELETE', url: '/api/v1/me/history', headers: as('jean') })).statusCode).toBe(200)
     })
-    expect((await app.inject({ method: 'DELETE', url: '/api/v1/me/history', headers: as('jean') })).statusCode).toBe(200)
-    await until('erased twice', () => wazo.erased.filter(u => u === 'jean').length === 2, 10_000)
+    // The clock stopped: both asked at the same millisecond, told apart by their own mark only.
+    vi.useFakeTimers({ toFake: ['Date'], now: Date.now() })
+    try {
+      expect((await app.inject({ method: 'DELETE', url: '/api/v1/me/history', headers: as('jean') })).statusCode).toBe(200)
+      let n = 0
+      while (wazo.erased.filter(u => u === 'jean').length < 2 && n++ < 1_000) await sleep(10)
+      expect(wazo.erased.filter(u => u === 'jean')).toHaveLength(2)
+    } finally {
+      vi.useRealTimers()
+    }
     await app.close()
-  }, 15_000)
+  }, 20_000)
+
+  it('keeps an erasure a person asked before they left the directory as it was: done even while a mass is held back', async () => {
+    const store = new MemoryStore()
+    let people: Person[] = [person('alice', '101'), person('jean', '102')]
+    const directorySync = new DirectorySync({ store, directory: { listAll: async () => people } as unknown as ContactDirectory, tenantId: 'A' })
+    await directorySync.run()
+    const { app, as, wazo, sip } = await setup({ store, directorySync, mapped: false, changeMs: 30 })
+    await until('the mailboxes', () => sip.given.length >= 2)
+    // Asked while another Gateway writes the mailboxes, then Jean leaves; a mass held back when this one writes again.
+    await steal(store)
+    await sleep(150)
+    expect((await app.inject({ method: 'DELETE', url: '/api/v1/me/history', headers: as('jean') })).json().voicemailErasure).toBe('asked')
+    people = [person('alice', '101')]
+    await directorySync.run()
+    await sleep(50)
+    wazo.holdBack({ park: 3, of: 4 })
+    await store.takeWebhookLease(voicemailRole('A'), 'gw_other', 0)
+    await until('erased', () => wazo.erased.includes('jean'), 3_000)
+    await app.close()
+  })
+
+  it('withdraws every extension changed when the store does not say who holds them', async () => {
+    const store = new MemoryStore()
+    let people: Person[] = [person('alice', '101'), person('jean', '102')]
+    const directorySync = new DirectorySync({ store, directory: { listAll: async () => people } as unknown as ContactDirectory, tenantId: 'A' })
+    await directorySync.run()
+    const { app, sip } = await setup({ store, directorySync, mapped: false, changeMs: 30 })
+    await until('the mailboxes', () => sip.given.length >= 2)
+    store.getMappingByExtension = async () => {
+      throw new Error('store out of reach')
+    }
+    // Jean leaves: his extension, left to nobody, keeps its row unless the holders cannot be read.
+    people = [person('alice', '101')]
+    await directorySync.run()
+    await until('withdrawn', () => sip.withdrawn.flat().includes('102'))
+    await app.close()
+  })
+
+  it('withdraws the extensions left to nobody once the synchronisation has failed a while, never a mass, held back or not', async () => {
+    const store = new MemoryStore()
+    for (const [userId, extension] of [['bob', '103'], ['paul', '104'], ['luc', '105']] as const) await store.upsertMapping({ tenantId: 'A', userId, extension })
+    const { app, wazo, sip } = await setup({ store, changeMs: 30, alertMs: 400 })
+    await until('the mailboxes', () => sip.given.length >= 2 && sip.given.at(-1)!.length === 5)
+    await sleep(50)
+    // Jean holds no extension any more, the voicemail server's API down from now on: nothing before voicemailAlertMs.
+    wazo.failNext(1_000_000)
+    await store.deleteMapping('A', 'jean')
+    await changed(store)
+    await sleep(150)
+    expect(sip.withdrawn.flat()).toEqual([])
+    // Two more: three of five rows, a mass, kept for the round past it too.
+    for (const userId of ['paul', 'luc']) await store.deleteMapping('A', userId)
+    await sleep(400)
+    expect(sip.withdrawn.flat()).toEqual([])
+    // Two of them back: one left to nobody, but a mass held back since: kept too.
+    await store.upsertMapping({ tenantId: 'A', userId: 'paul', extension: '104' })
+    await store.upsertMapping({ tenantId: 'A', userId: 'luc', extension: '105' })
+    await store.putOperatorState('A', 'voicemail:held', { park: 3, of: 5, since: new Date().toISOString() })
+    await sleep(200)
+    expect(sip.withdrawn.flat()).toEqual([])
+    await store.deleteOperatorState('A', 'voicemail:held')
+    await until('withdrawn', () => sip.withdrawn.flat().includes('102'))
+    expect(sip.withdrawn.flat()).toEqual(['102'])
+    await app.close()
+  })
+
+  it('tells each guard of a mass held back on its own: those set aside of those reached, those removed', async () => {
+    const { app, wazo, sip, store } = await setup({ changeMs: 30 })
+    await until('the mailboxes', () => sip.given.length >= 2)
+    const told = async () => (await store.listAlerts('A', {})).filter(a => a.alert.param.startsWith('held-back')).map(a => [a.alert.param, a.alert.value, a.alert.threshold])
+    wazo.holdBack({ remove: 3, of: 4 })
+    await changed(store)
+    await until('told', async () => (await told()).length > 0)
+    expect(await told()).toEqual([['held-back-remove', 3, undefined]])
+    wazo.holdBack({ park: 4, remove: 5, of: 6 })
+    await changed(store)
+    await until('told again', async () => (await told()).length === 2)
+    expect((await told()).sort()).toEqual([['held-back', 4, 6], ['held-back-remove', 5, undefined]].sort())
+    await app.close()
+  })
 
   it('erases the messages of someone who left, as an administrator asks, never those of someone who holds an extension or the directory still lists, a few an hour', async () => {
     const store = new MemoryStore()
@@ -646,14 +771,16 @@ describe('the mailboxes (step 11a)', () => {
     const asked = await erase('paul')
     expect([asked.statusCode, asked.json().erasure]).toEqual([202, 'asked'])
     await until('the erasure', () => wazo.erased.includes('paul'))
-    // Three an hour here for the administrators of the tenant (marie's counted): the fourth refused, nothing asked.
+    // Three an hour here for the administrators of the tenant, those asked only (marie's refusal costs none): the
+    // fourth refused, nothing asked.
     expect((await erase('paul')).statusCode).toBe(202)
+    expect((await erase('louise')).statusCode).toBe(202)
     const past = await erase('pierre')
     expect([past.statusCode, past.json().code]).toEqual([429, 'ERASURE_RATE'])
     await sleep(100)
     expect(wazo.erased.includes('pierre')).toBe(false)
     // Someone whose id is `admin` has their own count, apart from the administrators' spent here.
-    expect((await app.inject({ method: 'DELETE', url: '/api/v1/me/history', headers: as('admin') })).statusCode).toBe(200)
+    expect((await app.inject({ method: 'DELETE', url: '/api/v1/me/history', headers: as('admin') })).json().voicemailErasure).toBe('asked')
     await app.close()
   })
 
@@ -729,6 +856,28 @@ describe('the mailboxes (step 11a)', () => {
 
   it('holds back the mailboxes of a directory come back with two of six people, through the synchronisation of the directory and the round, tells the administrators, and lets them go once one says it is meant', async () => {
     await massGoneThroughTheGateway()
+  }, 15_000)
+
+  it('withdraws nothing when a directory come back half empty is whole again, its rows already at their holders', async () => {
+    await massGoneThroughTheGateway(undefined, 'return')
+  }, 15_000)
+
+  it("erases the messages of someone who left the directory once their mailbox is set aside: a newcomer given their id never hears them", async () => {
+    const { wazo, store, app, reached, list, messagesOf } = await throughTheGateway([person('p0', '201'), person('p1', '202'), person('p2', '203')])
+    messagesOf('p1').push(wazo.msg('m-p1'))
+    messagesOf('p2').push(wazo.msg('m-p2'))
+    // p2 leaves the directory; p1, still in it, has no extension for a while: theirs kept, set aside.
+    await list([person('p0', '201'), { ...person('p1', '202'), numbers: [] }])
+    await until('set aside', () => !!wazo.nameOf('p2')?.startsWith('TwakePhone aside ') && !!wazo.nameOf('p1')?.startsWith('TwakePhone aside '), 5_000)
+    await until('their messages erased', () => messagesOf('p2').length === 0, 5_000)
+    expect(messagesOf('p1')).toHaveLength(1)
+    expect(await store.listOperatorState('A', 'voicemail:erase:')).toEqual([])
+    // Someone new, given the same id: the mailbox at that id's number comes back to them, empty.
+    await list([person('p0', '201'), { ...person('p1', '202'), numbers: [] }, person('p2', '204')])
+    await until('theirs', () => wazo.nameOf('p2') === 'TwakePhone' && reached().includes('204'), 5_000)
+    expect(messagesOf('p2')).toEqual([])
+    await app.close()
+    for (const state of made.splice(0)) expect(state.denied).toEqual([])
   }, 15_000)
 
   it('synchronises the mailboxes again once the directory changed who holds which extension', async () => {
@@ -1142,6 +1291,28 @@ describe('the mailboxes, at the junction with the providers', () => {
     sip.hooks.fenceNext = 2
     await changed(store)
     await until('told again', async () => (await told())[0] === 2, 3_000)
+    await app.close()
+  })
+
+  it('forgets a refusal of long ago: refused once, the lease lost, refused once more past voicemailAlertMs is no alarm', async () => {
+    const { app, sip, store } = await setup({ changeMs: 30, alertMs: 200 })
+    await until('the mailboxes', () => sip.given.length >= 2)
+    await sleep(100)
+    const fence = sip.writes.at(-1)!.fence!
+    const told = async () => (await store.listAlerts('A', {})).filter(a => a.alert.param === 'sync-fenced')
+    sip.hooks.fenceNext = 1
+    await changed(store)
+    await until('the refusal', () => sip.hooks.fenceNext === 0)
+    // Another Gateway takes the lease for its weight before this one writes again, and gives it back later.
+    await steal(store)
+    await sleep(400)
+    sip.hooks.fenceNext = 1
+    await store.takeWebhookLease(voicemailRole('A'), 'gw_other', 0)
+    await changed(store)
+    await until('refused once more', () => sip.hooks.fenceNext === 0, 3_000)
+    await until('written under a later lease', () => sip.writes.at(-1)!.fence! > fence + 1 && sip.errors.length === 0, 3_000)
+    await sleep(200)
+    expect(await told()).toEqual([])
     await app.close()
   })
 

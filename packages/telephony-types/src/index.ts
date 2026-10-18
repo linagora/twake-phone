@@ -247,7 +247,8 @@ export interface TelephonyAlert {
    * (`removal-late`). `voicemail` (step 11a): raised by the Gateway, the synchronisation of the mailboxes fails since
    * `value` minutes (`sync-failing`), the SIP server's database refused its write under the lease it holds
    * (`sync-fenced`), or it keeps leaving out `value` mailboxes the voicemail server refuses (`boxes-refused`), or it holds back `value`
-   * mailboxes of `threshold` reached, too many set aside or removed at once (`held-back`); raised by
+   * mailboxes of `threshold` reached, too many set aside at once (`held-back`), or `value` mailboxes past their grace
+   * period, too many removed at once (`held-back-remove`); raised by
    * the SIP server, a call to the mailbox of `extension` refused for a cap, `value` of `threshold`: of the callers with
    * no number there, at the same time (`hidden-calls`) or in the hour (`hidden-hour`), of those with no number to all
    * the mailboxes (`hidden-all`), or of all callers (`calls-all`).

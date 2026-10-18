@@ -7,7 +7,7 @@ import type { Key } from '../../i18n/index.js'
 import { useT } from '../../i18n/useT.js'
 
 const KINDS: NonNullable<AlertFilter['kind']>[] = ['fraud-warning', 'fraud-critical', 'limit', 'rights', 'emergency', 'meet', 'webhook', 'operator', 'voicemail']
-const PARAMS = [...FRAUD_PARAMS, ...OUTBOUND_CAPS, ...TRUNK_OUTBOUND_CLASSES, 'premium', 'burst', 'pin-tries', 'meet-calls', 'call-diverted', 'trunk-changed', 'disabled', 'unauthorized', 'forbidden', 'reconciliation', 'removal-changed', 'removal-gone', 'removal-late', 'sync-failing', 'sync-fenced', 'boxes-refused', 'hidden-calls', 'hidden-hour', 'hidden-all', 'calls-all', 'held-back']
+const PARAMS = [...FRAUD_PARAMS, ...OUTBOUND_CAPS, ...TRUNK_OUTBOUND_CLASSES, 'premium', 'burst', 'pin-tries', 'meet-calls', 'call-diverted', 'trunk-changed', 'disabled', 'unauthorized', 'forbidden', 'reconciliation', 'removal-changed', 'removal-gone', 'removal-late', 'sync-failing', 'sync-fenced', 'boxes-refused', 'hidden-calls', 'hidden-hour', 'hidden-all', 'calls-all', 'held-back', 'held-back-remove']
 const PAGE = 25
 /** How long after an answer the first page is read again while shown: a repeat counted meanwhile is seen (review 7 n°2). */
 export const ALERTS_REFRESH_MS = 30_000
@@ -55,6 +55,7 @@ const paramKey = (alert: Pick<AdminAlert, 'kind' | 'param'>): Key | undefined =>
   if (alert.param === 'calls-all') return 'admin.alert.voicemailCallsAll'
   // Too many mailboxes set aside or removed at once: held back until an administrator confirms.
   if (alert.param === 'held-back') return 'admin.alert.voicemailHeldBack'
+  if (alert.param === 'held-back-remove') return 'admin.alert.voicemailHeldBackRemove'
   if ((TRUNK_OUTBOUND_CLASSES as readonly string[]).includes(alert.param) || alert.param === 'premium') return `admin.class.${alert.param}` as Key
   return undefined
 }
