@@ -17,6 +17,10 @@ export const VOICEMAIL_ID = /^[0-9A-Za-z_-]{1,64}$/
  *                        the Gateway's account in Wazo (wazo-auth), in the tenant whose mailboxes these are;
  *   VOICEMAIL_MAX_MESSAGES, VOICEMAIL_MAX_SEC
  *                        the most messages a mailbox keeps (50), the longest a message lasts in seconds (180);
+ *   VOICEMAIL_MAX_CALL_SEC
+ *                        the longest a call to a mailbox lasts (300), as OpenSIPS and Asterisk have it: VOICEMAIL_MAX_SEC
+ *                        above it is refused (the call would cut the message first: second review 11a, n°11), and the
+ *                        recordings handed out are bounded on it;
  *   VOICEMAIL_GRACE_DAYS how long the mailbox of someone who holds no extension any more is kept aside, with its
  *                        messages, in case they come back (7).
  *
@@ -56,6 +60,9 @@ export const wazoFromEnv = (env: NodeJS.ProcessEnv, secretsKey: Buffer | undefin
   }
   const maxMessages = whole('VOICEMAIL_MAX_MESSAGES', 9999)
   const maxMessageSec = whole('VOICEMAIL_MAX_SEC', 3600)
+  const maxCallSec = whole('VOICEMAIL_MAX_CALL_SEC', 3600) ?? 300
+  if (maxCallSec < 30) throw new Error('Wazo: VOICEMAIL_MAX_CALL_SEC must be 30 to 3600 seconds')
+  if ((maxMessageSec ?? 180) > maxCallSec) throw new Error(`Wazo: VOICEMAIL_MAX_SEC (${maxMessageSec ?? 180} s) is longer than a call to a mailbox lasts (VOICEMAIL_MAX_CALL_SEC, ${maxCallSec} s): the call would cut the message`)
   const graceDays = env.VOICEMAIL_GRACE_DAYS === '0' ? 0 : whole('VOICEMAIL_GRACE_DAYS', 365)
   return new WazoVoicemail({
     ...urls,
@@ -67,6 +74,7 @@ export const wazoFromEnv = (env: NodeJS.ProcessEnv, secretsKey: Buffer | undefin
     holderSecret: holderSecretOf(secretsKey),
     ...(maxMessages !== undefined ? { maxMessages } : {}),
     ...(maxMessageSec !== undefined ? { maxMessageSec } : {}),
+    maxCallSec,
     ...(graceDays !== undefined ? { graceMs: graceDays * 86_400_000 } : {}),
     ...(logger ? { logger } : {})
   })

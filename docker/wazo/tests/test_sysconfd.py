@@ -1,0 +1,261 @@
+"""docker/wazo/sysconfd.py (second review 11a, n°6, n°13 and n°16): its HTTP side as wazo-confd and a browser reach
+it, against an AMI and a wazo-confgend of this test, on the loopback.
+
+    python3 -I -m unittest discover -s docker/wazo/tests
+"""
+import http.client
+import importlib.util
+import os
+import shutil
+import socket
+import tempfile
+import threading
+import unittest
+from http.server import ThreadingHTTPServer
+from socketserver import StreamRequestHandler, ThreadingTCPServer
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+SPOOL = tempfile.mkdtemp()
+os.environ.update({'SYSCONFD_AMI_PASSWORD': 'not-a-real-secret', 'SYSCONFD_SPOOL': SPOOL})
+spec = importlib.util.spec_from_file_location('sysconfd', os.path.join(HERE, '..', 'sysconfd.py'))
+sysconfd = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(sysconfd)
+sysconfd.log = lambda message: None
+
+CONTEXT = 'ctx-twake'
+VOICEMAIL_CONF = f'''[general]
+format = wav
+
+[zonemessages]
+eu-fr = Europe/Paris|'vm-received' q 'digits/at' kM
+
+[{CONTEXT}]
+101 => ,Alice Martin,,,maxmsg=50
+102 => ,Jean Dupont,,,maxmsg=50
+'''
+SHOW_USERS = ['Context    Mbox  User                      Zone       NewMsg',
+              f'{CONTEXT} 101   Alice Martin                              0',
+              f'{CONTEXT} 102   Jean Dupont                               0',
+              '2 voicemail users configured.']
+
+
+class FakeAmi:
+    """An AMI: the banner, a Login, then Commands, answered as `answers` says ({command: (response, output, events
+    before)}). It keeps the blocks it was sent."""
+
+    def __init__(self):
+        self.blocks = []
+        self.answers = {}
+        self.refuse_login = False
+        ami = self
+
+        class Handler(StreamRequestHandler):
+            def handle(self):
+                try:
+                    self.session()
+                except (ConnectionResetError, BrokenPipeError):
+                    pass  # sysconfd gave up on an AMI that does not answer
+
+            def session(self):
+                self.wfile.write(b'Asterisk Call Manager/9.0.0\r\n')
+                block = {}
+                while True:
+                    line = self.rfile.readline()
+                    if not line:
+                        return
+                    line = line.decode().rstrip('\r\n')
+                    if line:
+                        key, _, value = line.partition(': ')
+                        block[key] = value
+                        continue
+                    if not block:
+                        continue
+                    ami.blocks.append(block)
+                    self.reply(block)
+                    block = {}
+
+            def send(self, lines):
+                self.wfile.write(('\r\n'.join(lines) + '\r\n\r\n').encode())
+
+            def reply(self, block):
+                action, action_id = block.get('Action'), block.get('ActionID')
+                if action == 'Login':
+                    ok = not ami.refuse_login and block.get('Secret') == 'not-a-real-secret'
+                    self.send([f'Response: {"Success" if ok else "Error"}', f'ActionID: {action_id}', 'Message: Authentication accepted' if ok else 'Message: Authentication failed'])
+                elif action == 'Command':
+                    response, output, events = ami.answers.get(block['Command'], ('Success', [], 0))
+                    for i in range(events):
+                        self.send(['Event: Newchannel', f'Channel: PJSIP/opensips-{i:08x}'])
+                    if events < 1000:
+                        self.send([f'Response: {response}', f'ActionID: {action_id}', 'Message: Command output follows' if response == 'Success' else 'Message: Command not found'] + [f'Output: {o}' for o in output])
+
+        self.server = ThreadingTCPServer(('127.0.0.1', 0), Handler)
+        self.server.daemon_threads = True
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.address = f'127.0.0.1:{self.server.server_address[1]}'
+
+    def commands(self):
+        return [b['Command'] for b in self.blocks if b.get('Action') == 'Command']
+
+
+class FakeConfgend:
+    """wazo-confgend: the name of a file, then the file, and the connection closed."""
+
+    def __init__(self):
+        self.conf = VOICEMAIL_CONF
+        self.asked = []
+        confgend = self
+
+        class Handler(StreamRequestHandler):
+            def handle(self):
+                confgend.asked.append(self.request.recv(1024).decode())
+                self.wfile.write(confgend.conf.encode())
+
+        self.server = ThreadingTCPServer(('127.0.0.1', 0), Handler)
+        self.server.daemon_threads = True
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.address = f'127.0.0.1:{self.server.server_address[1]}'
+
+
+class Sysconfd(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.http = ThreadingHTTPServer(('127.0.0.1', 0), sysconfd.Handler)
+        cls.http.daemon_threads = True
+        threading.Thread(target=cls.http.serve_forever, daemon=True).start()
+        cls.port = cls.http.server_address[1]
+        # The Host wazo-confd names: the address it was given.
+        sysconfd.ALLOWED_HOSTS = {f'127.0.0.1:{cls.port}', f'localhost:{cls.port}'}
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.http.shutdown()
+        cls.http.server_close()
+        shutil.rmtree(SPOOL, ignore_errors=True)
+
+    def setUp(self):
+        self.ami = FakeAmi()
+        self.confgend = FakeConfgend()
+        sysconfd.AMI = self.ami.address
+        sysconfd.CONFGEND = self.confgend.address
+        for entry in os.listdir(SPOOL):
+            shutil.rmtree(os.path.join(SPOOL, entry))
+
+    def tearDown(self):
+        for server in (self.ami.server, self.confgend.server):
+            server.shutdown()
+            server.server_close()
+
+    def request(self, method, path, body=None, headers=None):
+        conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=15)
+        try:
+            all_headers = {'Content-Type': 'application/json', **(headers or {})}
+            conn.request(method, path, body=body, headers=all_headers)
+            res = conn.getresponse()
+            return res.status, res.read().decode()
+        finally:
+            conn.close()
+
+    def mailbox(self, number, *messages):
+        path = os.path.join(SPOOL, CONTEXT, number, 'INBOX')
+        os.makedirs(path, exist_ok=True)
+        for m in messages:
+            with open(os.path.join(path, m), 'w') as f:
+                f.write('RIFF')
+        return os.path.join(SPOOL, CONTEXT, number)
+
+    # The refusal of a browser's requests (review 11a, n°22).
+    def test_a_request_of_a_web_page_or_for_another_host_is_refused_and_does_nothing(self):
+        box = self.mailbox('102', 'msg0000.wav')
+        for headers in ({'Origin': 'https://example.test'}, {'Sec-Fetch-Site': 'cross-site'}, {'Sec-Fetch-Mode': 'no-cors'}, {'Host': f'rebind.example.test:{self.port}'}, {'Host': '127.0.0.1:1'}):
+            for method, path, body in (('GET', f'/delete_voicemail?context={CONTEXT}&mailbox=102', None), ('POST', '/exec_request_handlers', '{"ipbx": ["voicemail reload"]}'), ('DELETE', '/anything', None)):
+                status, _ = self.request(method, path, body, headers)
+                self.assertEqual(status, 403, (headers, method, path))
+        self.assertTrue(os.path.isdir(box))
+        self.assertEqual(self.ami.blocks, [])
+        # wazo-confd's own: the mailbox goes.
+        self.assertEqual(self.request('GET', f'/delete_voicemail?context={CONTEXT}&mailbox=102')[0], 200)
+        self.assertFalse(os.path.exists(box))
+
+    def test_a_mailbox_out_of_the_spool_is_refused(self):
+        for query in ('context=..&mailbox=102', f'context={CONTEXT}&mailbox=../../etc', 'context=a/b&mailbox=1', f'context={CONTEXT}&mailbox='):
+            self.assertEqual(self.request('GET', f'/delete_voicemail?{query}')[0], 400, query)
+            self.assertEqual(self.request('GET', f'/move_voicemail?old_{query.replace("&", "&old_")}&new_context={CONTEXT}&new_mailbox=105')[0], 400, query)
+
+    # The move of a mailbox (second review 11a, n°6).
+    def test_a_mailbox_moves_with_its_messages_where_there_is_none(self):
+        self.mailbox('102', 'msg0000.wav', 'msg0000.txt')
+        status, _ = self.request('GET', f'/move_voicemail?old_context={CONTEXT}&old_mailbox=102&new_context={CONTEXT}&new_mailbox=105')
+        self.assertEqual(status, 200)
+        self.assertFalse(os.path.exists(os.path.join(SPOOL, CONTEXT, '102')))
+        self.assertEqual(sorted(os.listdir(os.path.join(SPOOL, CONTEXT, '105', 'INBOX'))), ['msg0000.txt', 'msg0000.wav'])
+        # A mailbox with no message yet has no folder: nothing to move.
+        self.assertEqual(self.request('GET', f'/move_voicemail?old_context={CONTEXT}&old_mailbox=103&new_context={CONTEXT}&new_mailbox=106')[0], 200)
+        # Folders without a message at the target: replaced.
+        self.mailbox('107')
+        self.mailbox('108', 'msg0000.wav')
+        self.assertEqual(self.request('GET', f'/move_voicemail?old_context={CONTEXT}&old_mailbox=108&new_context={CONTEXT}&new_mailbox=107')[0], 200)
+        self.assertEqual(os.listdir(os.path.join(SPOOL, CONTEXT, '107', 'INBOX')), ['msg0000.wav'])
+
+    def test_a_mailbox_is_not_moved_onto_messages_409(self):
+        self.mailbox('102', 'msg0000.wav')
+        self.mailbox('105', 'msg0000.wav', 'msg0001.wav')
+        status, body = self.request('GET', f'/move_voicemail?old_context={CONTEXT}&old_mailbox=102&new_context={CONTEXT}&new_mailbox=105')
+        self.assertEqual(status, 409, body)
+        self.assertEqual(os.listdir(os.path.join(SPOOL, CONTEXT, '102', 'INBOX')), ['msg0000.wav'])
+        self.assertEqual(sorted(os.listdir(os.path.join(SPOOL, CONTEXT, '105', 'INBOX'))), ['msg0000.wav', 'msg0001.wav'])
+
+    # The Asterisk commands (review 11a, n°22; second review n°16).
+    def test_a_command_runs_on_its_own_account_with_no_event(self):
+        self.ami.answers['dialplan reload'] = ('Success', ['Dialplan reloaded.'], 0)
+        self.assertEqual(self.request('POST', '/exec_request_handlers', '{"ipbx": ["dialplan reload", "core stop now"]}')[0], 200)
+        login = self.ami.blocks[0]
+        self.assertEqual((login['Action'], login['Username'], login['Events']), ('Login', 'twake_sysconfd', 'off'))
+        # Only the commands of the list.
+        self.assertEqual(self.ami.commands(), ['dialplan reload'])
+
+    def test_a_command_asterisk_refuses_or_does_not_answer_fails_500(self):
+        self.ami.answers['dialplan reload'] = ('Error', [], 0)
+        status, body = self.request('POST', '/exec_request_handlers', '{"ipbx": ["dialplan reload", "module reload res_pjsip.so"]}')
+        self.assertEqual(status, 500, body)
+        self.assertIn('refused', body)
+        # The next ones are not run.
+        self.assertEqual(self.ami.commands(), ['dialplan reload'])
+        # Events, and never the answer: an error, not a wait.
+        self.ami.answers['dialplan reload'] = ('Success', [], 1000)
+        self.assertEqual(self.request('POST', '/exec_request_handlers', '{"ipbx": ["dialplan reload"]}')[0], 500)
+        # Under the bound, the answer after the events is found.
+        self.ami.answers['dialplan reload'] = ('Success', [], 50)
+        self.assertEqual(self.request('POST', '/exec_request_handlers', '{"ipbx": ["dialplan reload"]}')[0], 200)
+
+    def test_a_login_refused_or_an_ami_out_of_reach_fails_500(self):
+        self.ami.refuse_login = True
+        self.assertEqual(self.request('POST', '/exec_request_handlers', '{"ipbx": ["dialplan reload"]}')[0], 500)
+        self.ami.server.shutdown()
+        self.ami.server.server_close()
+        self.assertEqual(self.request('POST', '/exec_request_handlers', '{"ipbx": ["dialplan reload"]}')[0], 500)
+
+    def test_a_voicemail_reload_is_checked_by_the_mailboxes_asterisk_has_after_it(self):
+        self.ami.answers['voicemail show users'] = ('Success', SHOW_USERS, 0)
+        self.assertEqual(self.request('POST', '/exec_request_handlers', '{"ipbx": ["voicemail reload"]}')[0], 200)
+        self.assertEqual(self.confgend.asked, ['asterisk/voicemail.conf'])
+        self.assertEqual(self.ami.commands(), ['voicemail reload', 'voicemail show users'])
+        # A reload that said Success but did not read the configuration: Jean's mailbox is not in Asterisk.
+        self.ami.answers['voicemail show users'] = ('Success', SHOW_USERS[:2] + ['1 voicemail users configured.'], 0)
+        status, body = self.request('POST', '/exec_request_handlers', '{"ipbx": ["voicemail reload"]}')
+        self.assertEqual(status, 500, body)
+        self.assertIn(f'102@{CONTEXT}', body)
+        # wazo-confgend out of reach: no reload (Asterisk would read nothing).
+        self.ami.blocks.clear()
+        self.confgend.server.shutdown()
+        self.confgend.server.server_close()
+        self.assertEqual(self.request('POST', '/exec_request_handlers', '{"ipbx": ["voicemail reload"]}')[0], 500)
+        self.assertEqual(self.ami.commands(), [])
+
+    def test_the_mailboxes_of_a_voicemail_conf_and_of_voicemail_show_users(self):
+        self.assertEqual(sysconfd.mailboxes_of(VOICEMAIL_CONF), {(CONTEXT, '101'), (CONTEXT, '102')})
+        self.assertEqual(sysconfd.mailboxes_shown(SHOW_USERS), {(CONTEXT, '101'), (CONTEXT, '102')})
+
+
+if __name__ == '__main__':
+    unittest.main()

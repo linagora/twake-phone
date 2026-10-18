@@ -49,6 +49,12 @@ jobs:
         run: yarn test
         env:
           TEST_DATABASE_URL: postgres://twake:twake@localhost:5432/twake_test
+      # Les scripts Python de la stack Wazo (seconde revue 11a, n°13) : le remplaçant de wazo-sysconfd (refus des
+      # requêtes de navigateur, échecs de l'AMI, déplacement d'une boîte) et le contrôle d'écoute (n°4 : un faux
+      # Asterisk qui écoute partout échoue). Bibliothèque standard seulement, sans Docker.
+      - name: Tests Python de la stack Wazo (sysconfd.py, check-loopback.py)
+        if: ${{ !cancelled() }}
+        run: python3 -I -m unittest discover -s docker/wazo/tests -v
       - name: Cache de Chromium (clé = version de playwright-core)
         id: chromium-cache
         uses: actions/cache@v4
@@ -107,7 +113,9 @@ jobs:
         run: docker compose -f docker/docker-compose.sip.yml up --build --wait --wait-timeout 300
       # Chaque socket des services Wazo (bus et base compris), lu dans /proc : hors de 127.0.0.0/8 et ::1, le job échoue.
       # Seule exception nommée, le client DNS de PJSIP dans Asterisk (UDP sur 0.0.0.0 et, le runner ayant IPv6, sur ::,
-      # un port éphémère chacun) : ADR 0022.
+      # un port éphémère chacun), reconnue par ce qu'une autre écoute ne peut pas imiter (seconde revue 11a, n°4) : le
+      # binaire d'Asterisk, et l'epoll de PJSIP qui surveille aussi son transport SIP (ADR 0022). Rejoué pendant un
+      # appel vers une boîte (l'e2e SIP) et après l'e2e.
       - name: Wazo n'écoute que sur la boucle locale (revue 11a, n°4)
         run: sudo python3 -I docker/wazo/check-loopback.py docker/docker-compose.sip.yml
       - run: yarn install --frozen-lockfile
@@ -154,6 +162,9 @@ jobs:
           BROWSER: ${{ matrix.browser }}
           SIP_WSS_URL: wss://127.0.0.1:8089
           OPENSIPS_DB_URL: postgres://twake:twake@127.0.0.1:54320/twake
+      # Ce que les appels de l'e2e ont ouvert depuis le premier contrôle (seconde revue 11a, n°4).
+      - name: Wazo n'écoute toujours que sur la boucle locale, après l'e2e SIP
+        run: sudo python3 -I docker/wazo/check-loopback.py docker/docker-compose.sip.yml
       # Service par service (étape 8 : LiveKit et LiveKit SIP écrivent beaucoup), la fin de chacun ; Wazo (étape 11a) :
       # l'Asterisk des messageries et les services que la passerelle appelle.
       - name: Journaux de la stack SIP en cas d'échec

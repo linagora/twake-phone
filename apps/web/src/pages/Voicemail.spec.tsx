@@ -59,10 +59,16 @@ describe('the Messagerie vocale page (review 11a, n°19 and 25)', () => {
   const flush = () => act(() => vi.advanceTimersByTimeAsync(0))
   const status = () => host.querySelector('[data-testid="voicemail-status"]')!.textContent
   const ids = () => [...host.querySelectorAll('[data-testid="voicemail"]')].map(li => li.getAttribute('data-id'))
-  const button = (label: string) => [...host.querySelectorAll('button')].find(b => b.getAttribute('aria-label') === label)!
-  const click = async (label: string) => {
-    await act(async () => button(label).click())
+  /** The button of a message whose name starts with `key` (the translator's key, then who and when). */
+  const buttonOf = (id: string, key: string) => [...host.querySelectorAll(`[data-id="${id}"] button`)].find(b => b.getAttribute('aria-label')?.startsWith(`${key} `)) as HTMLButtonElement | undefined
+  const click = async (id: string, key: string) => {
+    await act(async () => buttonOf(id, key)!.click())
     await flush()
+  }
+  /** « Supprimer », then its confirmation. */
+  const remove = async (id: string) => {
+    await click(id, 'voicemail.deleteWho')
+    await click(id, 'voicemail.confirmDelete')
   }
   const render = async () => {
     await act(async () => root.render(<VoicemailPage />))
@@ -129,20 +135,19 @@ describe('the Messagerie vocale page (review 11a, n°19 and 25)', () => {
     await render()
     send({ type: 'voicemail.created', timestamp: at, payload: { voicemail: v('a', at) } })
     const once = status()
-    expect(once).toMatch(/^voicemail\.arrived 101 \| \d{2}:\d{2} \| 1\s?$/)
+    // One unread: its own words (second review 11a, n°15), not « (1 non lus) ».
+    expect(once).toMatch(/^voicemail\.arrivedOne 101 \| \d{2}:\d{2} \| 1\s?$/)
     send({ type: 'voicemail.created', timestamp: at, payload: { voicemail: v('b', at) } })
-    expect(status()).toMatch(/\| 2\s?$/)
+    expect(status()).toMatch(/^voicemail\.arrived 101 .*\| 2\s?$/)
     expect(status()).not.toBe(once)
   })
 
   it('lets the recording listened to before go when another is', async () => {
     lists = [[v('b', '2026-10-18T02:13:00.000Z'), v('a', at)]]
     await render()
-    await click('voicemail.listenTo 101')
+    await click('b', 'voicemail.listenTo')
     expect(revoked).toEqual([])
-    const listens = [...host.querySelectorAll('button')].filter(b => b.getAttribute('aria-label') === 'voicemail.listenTo 101')
-    await act(async () => listens[1]!.click())
-    await flush()
+    await click('a', 'voicemail.listenTo')
     expect(revoked).toEqual(['blob:m1'])
     act(() => root.unmount())
     expect(revoked).toEqual(['blob:m1', 'blob:m2'])
@@ -153,18 +158,58 @@ describe('the Messagerie vocale page (review 11a, n°19 and 25)', () => {
     lists = [[{ ...v('c', '2026-10-18T02:14:00.000Z'), from: '103' }, { ...v('b', '2026-10-18T02:13:00.000Z'), from: '102' }, v('a', at)]]
     await render()
     const listenOf = (id: string) => host.querySelector(`[data-id="${id}"] button`)
-    await click('voicemail.markReadWho 102')
+    await click('b', 'voicemail.markReadWho')
     expect(document.activeElement).toBe(listenOf('b'))
     expect(status()).toContain('voicemail.markedRead 102')
-    await click('voicemail.deleteWho 102')
+    await remove('b')
     expect(ids()).toEqual(['c', 'a'])
     expect(document.activeElement).toBe(listenOf('a'))
     expect(status()).toContain('voicemail.deleted 102')
-    await click('voicemail.deleteWho 101')
+    await remove('a')
     expect(document.activeElement).toBe(listenOf('c'))
-    await click('voicemail.deleteWho 103')
+    await remove('c')
     expect(ids()).toEqual([])
     expect(document.activeElement).toBe(host.querySelector('h1'))
     expect(status()).toContain('voicemail.deleted 103')
+  })
+
+  it('names each message by who left it and when: two of the same caller are two (second review 11a, n°15)', async () => {
+    lists = [[v('b', '2026-10-18T02:13:00.000Z'), v('a', at)]]
+    await render()
+    const names = [...host.querySelectorAll('button')].map(b => b.getAttribute('aria-label'))
+    expect(new Set(names).size).toBe(names.length)
+    expect(buttonOf('a', 'voicemail.listenTo')!.getAttribute('aria-label')).toMatch(/^voicemail\.listenTo 101 \| .*\d{2}:\d{2}$/)
+  })
+
+  it('deletes only once it is confirmed, and gives the focus back to « Supprimer » when it is not (second review 11a, n°15)', async () => {
+    lists = [[v('a', at)]]
+    deleteVoicemail.mockClear()
+    await render()
+    await click('a', 'voicemail.deleteWho')
+    expect(deleteVoicemail).not.toHaveBeenCalled()
+    expect(document.activeElement).toBe(buttonOf('a', 'voicemail.confirmDelete'))
+    expect(host.querySelector('[role="group"]')!.getAttribute('aria-label')).toMatch(/^voicemail\.confirmDeleteWho 101 /)
+    await click('a', 'voicemail.keepWho')
+    expect(deleteVoicemail).not.toHaveBeenCalled()
+    expect(ids()).toEqual(['a'])
+    expect(document.activeElement).toBe(buttonOf('a', 'voicemail.deleteWho'))
+    await remove('a')
+    expect(deleteVoicemail).toHaveBeenCalledWith('a')
+    expect(ids()).toEqual([])
+  })
+
+  it('plays the message asked last, not the answer that came last (second review 11a, n°15)', async () => {
+    lists = [[v('b', '2026-10-18T02:13:00.000Z'), v('a', at)]]
+    let slow!: (b: Blob) => void
+    getVoicemailAudio.mockImplementationOnce(() => new Promise<Blob>(resolve => (slow = resolve)))
+    await render()
+    await click('b', 'voicemail.listenTo')
+    await click('a', 'voicemail.listenTo')
+    slow(new Blob(['RIFF']))
+    await flush()
+    const audio = host.querySelectorAll('[data-testid="voicemail-audio"]')
+    expect(audio).toHaveLength(1)
+    expect(audio[0]!.closest('[data-id]')!.getAttribute('data-id')).toBe('a')
+    expect(made).toHaveLength(1)
   })
 })

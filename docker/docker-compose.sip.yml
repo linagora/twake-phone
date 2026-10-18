@@ -291,6 +291,8 @@ services:
       # This stack's own passwords: the ARI account of wazo-calld and wazo-confd, the database's (set by wazo-db's healthcheck).
       WAZO_ARI_PASSWORD: twake-wazo-dev-only-ari
       WAZO_DB_PASSWORD: twake-wazo-dev-only-db
+      # The AMI account of wazo-sysconfd below (Asterisk commands only, no event: second review 11a, n°16).
+      WAZO_SYSCONFD_AMI_PASSWORD: twake-wazo-dev-only-sysconfd
       # The longest a call to a mailbox lasts (review 11a, n°3), as OpenSIPS bounds it.
       VOICEMAIL_MAX_CALL_SEC: ${VOICEMAIL_MAX_CALL_SEC:-300}
     volumes:
@@ -319,7 +321,11 @@ services:
       XIVO_UUID: *wazo-uuid
       SYSCONFD_LISTEN: 127.0.0.1:8668
       SYSCONFD_AMI: 127.0.0.1:5038
-      SYSCONFD_AMI_PASSWORD: twake-wazo-dev-only-ami
+      # Its own AMI account (wazo-asterisk's WAZO_SYSCONFD_AMI_PASSWORD), not wazo-amid's.
+      SYSCONFD_AMI_USER: twake_sysconfd
+      SYSCONFD_AMI_PASSWORD: twake-wazo-dev-only-sysconfd
+      # Where it reads the mailboxes a voicemail reload must give Asterisk.
+      SYSCONFD_CONFGEND: 127.0.0.1:8669
     volumes:
       - ./wazo/sysconfd.py:/twake/sysconfd.py:ro
       - ./wazo/healthcheck.py:/twake/healthcheck.py:ro
@@ -458,6 +464,11 @@ services:
       WAZO_PORT: ${WAZO_PORT:-5095}
       # The longest a call to a mailbox lasts (review 11a, n°3); Asterisk bounds it too.
       VOICEMAIL_MAX_CALL_SEC: ${VOICEMAIL_MAX_CALL_SEC:-300}
+      # The calls to the mailboxes at once per caller and for all, and per hour of a known caller to one mailbox
+      # (second review 11a, n°10).
+      VOICEMAIL_CALLS_PER_CALLER: ${VOICEMAIL_CALLS_PER_CALLER:-2}
+      VOICEMAIL_CALLS_ALL: ${VOICEMAIL_CALLS_ALL:-30}
+      VOICEMAIL_CALLS_PER_HOUR: ${VOICEMAIL_CALLS_PER_HOUR:-10}
     network_mode: host
     healthcheck:
       test: ["CMD-SHELL", "test -p /tmp/opensips_fifo"]

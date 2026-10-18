@@ -28,7 +28,11 @@ const fakeWazo = () => {
     requests: [] as string[],
     down: false,
     /** A recording sent without its length (chunked). */
-    noLength: false
+    noLength: false,
+    /** The length a recording says it has (its own by default). */
+    lengthSaid: undefined as number | undefined,
+    /** Mailboxes whose changes Wazo refuses (400), by id. */
+    refuse: new Set<number>()
   }
   let next = 1
   const json = (status: number, body?: unknown) => ({ status, headers: { get: (n: string) => (n === 'content-type' ? 'application/json' : null) }, json: async () => body, text: async () => JSON.stringify(body ?? ''), body: null })
@@ -49,9 +53,15 @@ const fakeWazo = () => {
     let m: RegExpExecArray | null
     if (path === '/1.1/contexts' && init.method === 'GET') return page(state.contexts)
     if (path === '/1.1/contexts' && init.method === 'POST') {
-      const c = { id: next++, name: CONTEXT, label: body.label, type: body.type }
+      // The first one as on the Docker stack; another (two Gateways at their first start) named after its id.
+      const id = next++
+      const c = { id, name: state.contexts.length ? `ctx-None-internal-${id}` : CONTEXT, label: body.label, type: body.type }
       state.contexts.push(c)
       return json(201, c)
+    }
+    if ((m = /^\/1\.1\/contexts\/(\d+)$/.exec(path)) && init.method === 'DELETE') {
+      state.contexts = state.contexts.filter(c => c.id !== Number(m![1]))
+      return json(204)
     }
     if (path === '/1.1/users' && init.method === 'GET') return page(state.users)
     if (path === '/1.1/users' && init.method === 'POST') {
@@ -90,7 +100,12 @@ const fakeWazo = () => {
       state.messages.set(vm.id, [])
       return json(201, vm)
     }
+    if ((m = /^\/1\.1\/voicemails\/(\d+)$/.exec(path)) && init.method === 'GET') {
+      const vm = state.voicemails.find(v => v.id === Number(m![1]))
+      return vm ? json(200, vm) : json(404, ['Resource Not Found'])
+    }
     if ((m = /^\/1\.1\/voicemails\/(\d+)$/.exec(path)) && init.method === 'PUT') {
+      if (state.refuse.has(Number(m[1]))) return json(400, ['Resource Error - refused'])
       // Another number: Wazo moves the messages with the mailbox (wazo-sysconfd), its id stays.
       const vm = state.voicemails.find(v => v.id === Number(m![1]))
       if (!vm) return json(404, ['Resource Not Found'])
@@ -121,7 +136,7 @@ const fakeWazo = () => {
           yield bytes.slice(0, 4)
           yield bytes.slice(4)
         })()
-        return { status: 200, headers: { get: (n: string) => (n === 'content-type' ? 'audio/wav' : n === 'content-length' && !state.noLength ? String(bytes.length) : null) }, json: async () => ({}), text: async () => '', body }
+        return { status: 200, headers: { get: (n: string) => (n === 'content-type' ? 'audio/wav' : n === 'content-length' && !state.noLength ? String(state.lengthSaid ?? bytes.length) : null) }, json: async () => ({}), text: async () => '', body }
       }
       if (init.method === 'PUT') {
         msg.folder = body.folder_id
@@ -210,7 +225,7 @@ describe('WazoVoicemail, the mailboxes', () => {
   it('makes one mailbox per extension in a context of its own, for a user that stands for its holder, and keeps it at the next sync', async () => {
     const { vm, wazo } = make()
     expect(vm.getStatus()).toBe('DISCONNECTED')
-    const boxes = await vm.syncMailboxes([
+    const { boxes, failed } = await vm.syncMailboxes([
       { extension: '102', userId: 'jean', displayName: 'Jean Dupont' },
       { extension: '103', userId: 'alice' },
       // Not a number Asterisk's mailboxes take: left out.
@@ -220,6 +235,7 @@ describe('WazoVoicemail, the mailboxes', () => {
       { extension: '102', mailbox: `102@${CONTEXT}` },
       { extension: '103', mailbox: `103@${CONTEXT}` }
     ])
+    expect(failed).toBe(0)
     expect(vm.getStatus()).toBe('CONNECTED')
     expect(wazo.state.contexts).toMatchObject([{ label: 'TwakePhone', type: 'internal' }])
     expect(wazo.state.users.map(u => [u.firstname, u.userfield])).toEqual([
@@ -243,7 +259,7 @@ describe('WazoVoicemail, the mailboxes', () => {
     ])
     // Again: nothing made, nothing removed.
     const before = wazo.state.requests.length
-    expect(await vm.syncMailboxes([{ extension: '103', userId: 'alice' }, { extension: '102', userId: 'jean', displayName: 'Jean Dupont' }])).toEqual(boxes)
+    expect((await vm.syncMailboxes([{ extension: '103', userId: 'alice' }, { extension: '102', userId: 'jean', displayName: 'Jean Dupont' }])).boxes).toEqual(boxes)
     expect(wazo.state.requests.slice(before).filter(r => !r.startsWith('GET'))).toEqual([])
   })
 
@@ -299,7 +315,7 @@ describe('WazoVoicemail, the mailboxes', () => {
     wazo.state.messages.get(jeans.id)!.push({ id: '1-1', folder: 1, caller_id_num: '101', caller_id_name: null, timestamp: 1, duration: 3 })
     wazo.state.messages.get(alices.id)!.push({ id: '2-2', folder: 1, caller_id_num: '104', caller_id_name: null, timestamp: 2, duration: 4 })
     // Jean takes 104: his mailbox goes there, messages and all, the same one.
-    expect(await vm.syncMailboxes([{ extension: '104', userId: 'jean' }, alice])).toEqual([
+    expect((await vm.syncMailboxes([{ extension: '104', userId: 'jean' }, alice])).boxes).toEqual([
       { extension: '103', mailbox: `103@${CONTEXT}` },
       { extension: '104', mailbox: `104@${CONTEXT}` }
     ])
@@ -333,24 +349,112 @@ describe('WazoVoicemail, the mailboxes', () => {
     expect((await vm.listMessages({ extension: '106', userId: 'jean' })).map(m => m.id)).toEqual(['1-1'])
   })
 
-  it('removes none of the mailboxes past their grace period when more than half of them would go at once, and says so', async () => {
+  it('holds back the mailboxes of more than two people gone at once, more than half of those at an extension, until it is said to be meant (second review 11a, n°9)', async () => {
     const time = clock()
     const { vm, wazo, logs } = make({ now: time.now })
     const four = ['102', '103', '104', '105'].map((extension, i) => ({ extension, userId: `u${i}` }))
     await vm.syncMailboxes(four)
-    // A directory that came back empty: set aside, never removed while it lasts.
-    await vm.syncMailboxes([])
-    time.at += 8 * DAY
-    await vm.syncMailboxes([])
-    expect(wazo.state.voicemails).toHaveLength(4)
-    expect(logs.some(l => /4 of 4 mailboxes .* none removed/.test(l))).toBe(true)
-    // It came back: each one has theirs again. Then one leaves for good.
-    await vm.syncMailboxes(four)
+    // A directory that came back empty: nothing set aside, each mailbox still reached at its extension; said once.
+    const held = await vm.syncMailboxes([])
+    expect(held).toEqual({ boxes: four.map(h => ({ extension: h.extension, mailbox: `${h.extension}@${CONTEXT}` })), failed: 0, heldBack: { park: 4, of: 4 } })
     expect(wazo.state.voicemails.map(v => v.number).sort()).toEqual(['102', '103', '104', '105'])
-    await vm.syncMailboxes(four.slice(1))
+    await vm.syncMailboxes([])
+    expect(logs.filter(l => /held back/.test(l))).toHaveLength(1)
+    expect(logs.find(l => /held back/.test(l))).toMatch(/4 of 4 of people who hold no extension left where they are/)
+    // It came back: nothing held any more.
+    expect((await vm.syncMailboxes(four)).heldBack).toBeUndefined()
+    // An administrator says they left: set aside. Past the grace period, the four would go at once, none reached: kept
+    // until said again.
+    expect((await vm.syncMailboxes([], { release: true })).boxes).toEqual([])
+    expect(wazo.state.voicemails.every(v => v.number.startsWith('0000'))).toBe(true)
     time.at += 8 * DAY
-    await vm.syncMailboxes(four.slice(1))
-    expect(wazo.state.voicemails.map(v => v.number).sort()).toEqual(['103', '104', '105'])
+    expect((await vm.syncMailboxes([])).heldBack).toEqual({ remove: 4, of: 0 })
+    expect(wazo.state.voicemails).toHaveLength(4)
+    await vm.syncMailboxes([], { release: true })
+    expect(wazo.state.voicemails).toEqual([])
+  })
+
+  it('holds back from three people gone, and more than half: two of four go, three of six go, three of five wait (the bound of n°9)', async () => {
+    const outcome = async (total: number, leaving: number) => {
+      const { vm, wazo } = make()
+      const all = Array.from({ length: total }, (_, i) => ({ extension: String(110 + i), userId: `p${i}` }))
+      await vm.syncMailboxes(all)
+      const { heldBack } = await vm.syncMailboxes(all.slice(leaving))
+      return [heldBack?.park ?? 0, wazo.state.voicemails.filter(v => v.number.startsWith('0000')).length]
+    }
+    expect(await outcome(4, 2)).toEqual([0, 2])
+    expect(await outcome(6, 3)).toEqual([0, 3])
+    expect(await outcome(5, 3)).toEqual([3, 0])
+    expect(await outcome(3, 3)).toEqual([3, 0])
+  })
+
+  it('removes the mailboxes aside past their grace period one by one when few go at once, the bound counted on those reached', async () => {
+    const time = clock()
+    const { vm, wazo } = make({ now: time.now })
+    const six = ['102', '103', '104', '105', '106', '107'].map((extension, i) => ({ extension, userId: `u${i}` }))
+    await vm.syncMailboxes(six)
+    // Three leave (three of six: not more than half), set aside.
+    await vm.syncMailboxes(six.slice(3))
+    time.at += 8 * DAY
+    // Past the grace period, three would go against three mailboxes reached: more than half of those, held back.
+    expect((await vm.syncMailboxes(six.slice(3))).heldBack).toEqual({ remove: 3, of: 3 })
+    expect(wazo.state.voicemails).toHaveLength(6)
+    // Two only: they go.
+    const { vm: other, wazo: w2 } = make({ now: time.now })
+    await other.syncMailboxes(six)
+    time.at -= 8 * DAY
+    await other.syncMailboxes(six.slice(2))
+    time.at += 8 * DAY
+    expect((await other.syncMailboxes(six.slice(2))).heldBack).toBeUndefined()
+    expect(w2.state.voicemails.map(v => v.number).sort()).toEqual(['104', '105', '106', '107'])
+    // Three against six reached: half, not more than half: they go.
+    const nine = ['102', '103', '104', '105', '106', '107', '108', '109', '110'].map((extension, i) => ({ extension, userId: `n${i}` }))
+    const { vm: third, wazo: w3 } = make({ now: time.now })
+    time.at -= 8 * DAY
+    await third.syncMailboxes(nine)
+    await third.syncMailboxes(nine.slice(3))
+    time.at += 8 * DAY
+    expect((await third.syncMailboxes(nine.slice(3))).heldBack).toBeUndefined()
+    expect(w3.state.voicemails.map(v => v.number).sort()).toEqual(['105', '106', '107', '108', '109', '110'])
+  })
+
+  it('tells the SIP side the mailboxes at their holder only, before it changes anything (second review 11a, n°3)', async () => {
+    const { vm, wazo } = make()
+    await vm.syncMailboxes([jean, alice])
+    const writes = () => wazo.state.requests.filter(r => !r.startsWith('GET')).length
+    let seen: { boxes: unknown; writes: number } | undefined
+    // 102 passes to Marie: before Jean's mailbox is set aside (and Marie's made), the SIP side keeps 103 only.
+    const before = writes()
+    await vm.syncMailboxes([{ extension: '102', userId: 'marie' }, alice], { beforeChanges: async boxes => void (seen = { boxes, writes: writes() }) })
+    expect(seen).toEqual({ boxes: [{ extension: '103', mailbox: `103@${CONTEXT}` }], writes: before })
+    expect(writes()).toBeGreaterThan(before)
+  })
+
+  it('leaves out a mailbox Wazo refuses to change, and does the others (second review 11a, n°8)', async () => {
+    const { vm, wazo, logs } = make()
+    await vm.syncMailboxes([jean, alice])
+    const jeans = wazo.state.voicemails.find(v => v.number === '102')!
+    wazo.state.refuse.add(jeans.id)
+    // Jean leaves, Marie takes 102, Bob comes at 104: Jean's mailbox cannot be set aside, so 102 has none (never
+    // Jean's for Marie), Bob gets his.
+    const res = await vm.syncMailboxes([{ extension: '102', userId: 'marie' }, alice, { extension: '104', userId: 'bob' }])
+    expect(res.boxes.map(b => b.extension)).toEqual(['103', '104'])
+    expect(res.failed).toBe(2)
+    expect(logs.some(l => /setting mailbox \d+ aside not done/.test(l))).toBe(true)
+    expect(await vm.owns({ extension: '102', userId: 'marie' })).toBe(false)
+    // Wazo takes it again: Marie has hers.
+    wazo.state.refuse.clear()
+    expect((await vm.syncMailboxes([{ extension: '102', userId: 'marie' }, alice, { extension: '104', userId: 'bob' }])).boxes.map(b => b.extension)).toEqual(['102', '103', '104'])
+    expect(await vm.owns({ extension: '102', userId: 'marie' })).toBe(true)
+  })
+
+  it('makes one context only when two Gateways start at once, and both synchronise (second review 11a, n°1)', async () => {
+    const a = make()
+    const b = new WazoVoicemail({ authUrl: 'http://wazo.test:9497/0.1', confdUrl: 'http://wazo.test:9486/1.1', calldUrl: 'http://wazo.test:9500/1.0', websocketdUrl: 'ws://wazo.test:9502/', username: 'twakephone', password: 'not-a-real-password', holderSecret: SECRET, fetch: a.wazo.fetch, logger: { info() {}, warn() {}, error() {} } })
+    await Promise.all([a.vm.syncMailboxes([jean]), b.syncMailboxes([jean])].map(p => p.catch(() => undefined)))
+    expect(a.wazo.state.contexts.map(c => c.name)).toEqual([CONTEXT])
+    expect((await b.syncMailboxes([jean])).boxes).toEqual([{ extension: '102', mailbox: `102@${CONTEXT}` }])
+    expect(a.wazo.state.voicemails.map(v => [v.number, v.context])).toEqual([['102', CONTEXT]])
   })
 
   it('sets the bounds of a mailbox again when they changed in Wazo, and takes them from its configuration', async () => {
@@ -363,6 +467,9 @@ describe('WazoVoicemail, the mailboxes', () => {
     await vm.syncMailboxes([jean])
     expect([box.max_messages, box.options]).toEqual([20, [['maxsecs', '120'], ['maxsilence', '5']]])
     expect(() => make({ maxMessages: 0 })).toThrow(/maxMessages/)
+    // A message longer than a call to a mailbox lasts: refused at the start (second review 11a, n°11).
+    expect(() => make({ maxMessageSec: 600, maxCallSec: 300 })).toThrow(/longer than a call to a mailbox lasts/)
+    expect(() => make({ maxMessageSec: 600 })).not.toThrow()
     expect(() => make({ holderSecret: Buffer.alloc(8) })).toThrow(/holderSecret/)
   })
 
@@ -505,6 +612,19 @@ describe('WazoVoicemail, the bounds and the erasure of the messages', () => {
     expect(await read((await ok.getRecording(jean, '1792289524-00000004'))!.body)).toBe('RIFF1792289524-00000004')
   })
 
+  it('bounds a recording on the longest call to a mailbox, not on the longest message now (second review 11a, n°11)', async () => {
+    // Messages of 60 s now; one of 5 minutes left before (the call's bound) is still read; past the call's bound and
+    // its margin, refused.
+    const { vm, wazo } = await withMessage({ maxMessageSec: 60 })
+    wazo.state.lengthSaid = 300 * 16_000 + 44
+    expect((await vm.getRecording(jean, '1792289524-00000004'))?.size).toBe(300 * 16_000 + 44)
+    wazo.state.lengthSaid = Math.ceil(300 * 16_000 * 1.5) + 65_537
+    await expect(vm.getRecording(jean, '1792289524-00000004')).rejects.toMatchObject({ status: 502 })
+    const { vm: longer, wazo: w2 } = await withMessage({ maxMessageSec: 60, maxCallSec: 900 })
+    w2.state.lengthSaid = 900 * 16_000 + 44
+    expect((await longer.getRecording(jean, '1792289524-00000004'))?.size).toBe(900 * 16_000 + 44)
+  })
+
   it("erases every message of a person, in the mailbox of their extension and those set aside, nobody else's (review 11a, n°10)", async () => {
     const { vm, wazo, box } = await withMessage()
     // Jean held 105 too, left it: its mailbox is aside with a message.
@@ -528,6 +648,11 @@ describe('WazoVoicemail, the bounds and the erasure of the messages', () => {
     expect(await vm.purgeMessages(new Date(1792290000 * 1000))).toBe(1)
     expect(wazo.state.messages.get(box.id)!.map(m => m.id)).toEqual(['1792300000-00000005'])
     expect(logs.some(l => /1 message\(s\) older than the retention period deleted/.test(l))).toBe(true)
+    // One without a date (second review 11a, n°22): not one of 1970, it stays, and it is said.
+    wazo.state.messages.get(box.id)!.push({ id: '0-0', folder: 1, caller_id_num: '101', caller_id_name: null, timestamp: undefined as unknown as number, duration: 2 })
+    expect(await vm.purgeMessages(new Date(1792290000 * 1000))).toBe(0)
+    expect(wazo.state.messages.get(box.id)!.map(m => m.id)).toEqual(['1792300000-00000005', '0-0'])
+    expect(logs.some(l => /1 message\(s\) without a date left out/.test(l))).toBe(true)
   })
 })
 
@@ -538,9 +663,10 @@ describe('WazoVoicemail, the events', () => {
     vm.subscribe()
     await tick(5)
     expect(wazo.state.tokens).toBe(1)
-    await tick(60)
-    expect(wazo.state.tokens).toBeGreaterThanOrEqual(2)
-    expect(ws.sockets[0]!.sent).toContainEqual({ op: 'token', data: { token: 'tok-2' } })
+    // Several cycles (second review 11a, n°12): each renewal arms the next one, the WebSocket hears each token.
+    await tick(200)
+    expect(wazo.state.tokens).toBeGreaterThanOrEqual(4)
+    for (const token of ['tok-2', 'tok-3', 'tok-4']) expect(ws.sockets[0]!.sent).toContainEqual({ op: 'token', data: { token } })
     await vm.close()
     const after = wazo.state.tokens
     await tick(60)
@@ -559,6 +685,35 @@ describe('WazoVoicemail, the events', () => {
     const next = events.next()
     await vm.close()
     expect((await next).done).toBe(true)
+  })
+
+  it("tells a message as the extension its mailbox has now, whatever Gateway moved it, and owns says whose mailbox it is (second review 11a, n°2)", async () => {
+    const a = make()
+    await a.vm.syncMailboxes([jean])
+    const jeans = a.wazo.state.voicemails[0]!
+    const events = a.vm.subscribe()[Symbol.asyncIterator]()
+    await tick(1)
+    // Another Gateway: Jean moves from 102 to 105, Marie takes 102. This one heard nothing of it.
+    const b = new WazoVoicemail({ authUrl: 'http://wazo.test:9497/0.1', confdUrl: 'http://wazo.test:9486/1.1', calldUrl: 'http://wazo.test:9500/1.0', websocketdUrl: 'ws://wazo.test:9502/', username: 'twakephone', password: 'not-a-real-password', holderSecret: SECRET, fetch: a.wazo.fetch, logger: { info() {}, warn() {}, error() {} } })
+    await b.syncMailboxes([{ extension: '105', userId: 'jean' }, { extension: '102', userId: 'marie' }])
+    expect(jeans.number).toBe('105')
+    const message = { caller_id_name: 'Alice Martin', caller_id_num: '101', timestamp: 1792289524, folder: { type: 'new', name: 'inbox', id: 1 }, duration: 7, id: '1792289524-00000004' }
+    a.ws.sockets[0]!.event('user_voicemail_message_created', { voicemail_id: jeans.id, message_id: message.id, message })
+    const got = (await events.next()).value as { extension: string; mailbox: string }
+    expect([got.extension, got.mailbox]).toEqual(['105', String(jeans.id)])
+    expect(await a.vm.owns({ extension: '105', userId: 'jean', mailbox: got.mailbox })).toBe(true)
+    // Marie, who holds 102 now, never owns Jean's mailbox; nor someone a stale directory gives 105.
+    expect(await a.vm.owns({ extension: '102', userId: 'marie', mailbox: got.mailbox })).toBe(false)
+    expect(await a.vm.owns({ extension: '105', userId: 'marie', mailbox: got.mailbox })).toBe(false)
+    expect(await a.vm.owns({ extension: '105', userId: 'jean', mailbox: 'x' })).toBe(false)
+    // And what this Gateway knew of 102 (Jean's) gave way: Marie's own messages are hers.
+    expect(await a.vm.owns({ extension: '102', userId: 'marie' })).toBe(true)
+    expect(await a.vm.owns(jean)).toBe(false)
+    // Jean leaves: his mailbox set aside is nobody's, whatever extension is asked for.
+    await b.syncMailboxes([{ extension: '102', userId: 'marie' }])
+    expect(jeans.number).toMatch(/^0000/)
+    for (const extension of ['105', jeans.number]) expect(await a.vm.owns({ extension, userId: 'jean', mailbox: String(jeans.id) })).toBe(false)
+    await a.vm.close()
   })
 
   it('hears wazo-websocketd with its token, subscribes to the events of the messages, and tells each as the extension of its mailbox', async () => {
@@ -581,7 +736,7 @@ describe('WazoVoicemail, the events', () => {
     // As wazo-calld sent it on the Docker stack (user_voicemail_message_created).
     const message = { caller_id_name: 'Alice Martin', caller_id_num: '101', timestamp: 1792289524, empty: false, voicemail: { accesstype: 'personal', name: 'Jean', id: box.id }, transcription: null, folder: { type: 'new', name: 'inbox', id: 1 }, duration: 7, id: '1792289524-00000004' }
     ws.sockets[0]!.event('user_voicemail_message_created', { user_uuid: wazo.state.users[0]!.uuid, voicemail_id: box.id, message_id: message.id, message })
-    expect((await events.next()).value).toEqual({ extension: '102', event: { type: 'voicemail.created', timestamp: expect.any(String), payload: { voicemail: { id: message.id, from: '101', fromName: 'Alice Martin', receivedAt: '2026-10-18T02:12:04.000Z', durationSec: 7, unread: true } } } })
+    expect((await events.next()).value).toEqual({ extension: '102', mailbox: String(box.id), event: { type: 'voicemail.created', timestamp: expect.any(String), payload: { voicemail: { id: message.id, from: '101', fromName: 'Alice Martin', receivedAt: '2026-10-18T02:12:04.000Z', durationSec: 7, unread: true } } } })
     ws.sockets[0]!.event('user_voicemail_message_updated', { voicemail_id: box.id, message_id: message.id, message: { ...message, folder: { type: 'old', name: 'old', id: 2 } } })
     expect((await events.next()).value).toMatchObject({ extension: '102', event: { type: 'voicemail.updated', payload: { voicemail: { id: message.id, unread: false } } } })
     ws.sockets[0]!.event('user_voicemail_message_deleted', { voicemail_id: box.id, message_id: message.id, message })

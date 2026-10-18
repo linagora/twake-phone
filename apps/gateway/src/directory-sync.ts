@@ -72,7 +72,7 @@ export class DirectorySync {
   private last: SyncReport | undefined
   private timer: NodeJS.Timeout | undefined
   private intervalMs: number | undefined
-  private readonly listeners: ((tenantId: string) => void)[] = []
+  private readonly listeners: ((tenantId: string, extensions: string[]) => void)[] = []
 
   constructor(private readonly opts: DirectorySyncOptions) {}
 
@@ -81,8 +81,11 @@ export class DirectorySync {
     this.opts.log = log
   }
 
-  /** Called after a run that created, changed or removed a mapping (who holds which extension changed). */
-  onChange(listener: (tenantId: string) => void) {
+  /**
+   * Called after a run that created, changed or removed a mapping (who holds which extension changed), with the
+   * extensions that passed to someone else or to nobody (their mailbox is withdrawn at once: second review 11a, n°3).
+   */
+  onChange(listener: (tenantId: string, extensions: string[]) => void) {
     this.listeners.push(listener)
   }
 
@@ -280,12 +283,15 @@ export class DirectorySync {
       await store.deleteMapping(tenantId, userId, { left: !listed.has(userId) })
       if (!wanted.has(userId)) report.removed++
     }
+    // The extensions whose holder changed: those let go, and those given to someone who did not hold them.
+    const changed = new Set([...released].map(userId => previous.get(userId)!.extension))
     for (const next of wanted.values()) {
       const before = previous.get(next.userId)
       if (before && before.source === 'ldap' && same(before, next)) {
         report.unchanged++
         continue
       }
+      if (byExtension.get(next.extension)?.userId !== next.userId) changed.add(next.extension)
       try {
         await store.upsertMapping(next)
         if (before) report.updated++
@@ -300,7 +306,7 @@ export class DirectorySync {
     if (report.created || report.updated || report.removed || released.size) {
       for (const listener of this.listeners) {
         try {
-          listener(tenantId)
+          listener(tenantId, [...changed].sort())
         } catch (err) {
           this.opts.log?.error({ err }, 'directory synchronisation: a listener failed')
         }

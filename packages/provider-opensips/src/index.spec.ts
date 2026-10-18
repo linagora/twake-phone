@@ -448,6 +448,12 @@ describe('OpensipsProvider call rules', () => {
     expect(await p.getVoicemailAccess()).toBe(true)
     sips.state.shv = [{ name: 'wazo_on', type: 1, value: 0 }]
     expect(await p.getVoicemailAccess()).toBe(false)
+    // The shape of other versions of OpenSIPS, read as well.
+    sips.state.shvAs = 'VARs'
+    expect(await p.getVoicemailAccess()).toBe(false)
+    sips.state.shv = [{ name: 'wazo_on', type: 1, value: 1 }]
+    expect(await p.getVoicemailAccess()).toBe(true)
+    sips.state.shvAs = 'lists'
     // An OpenSIPS of before step 11a: it cannot say.
     sips.state.shv = [{ name: 'meet_on', type: 1, value: 1 }]
     expect(await p.getVoicemailAccess()).toBeUndefined()

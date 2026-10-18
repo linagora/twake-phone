@@ -74,4 +74,10 @@ export class VoicemailBoxes {
       )
     return { skipped }
   }
+
+  /** These extensions of the tenant lose their mailbox, the others keep theirs (second review 11a, n°3). */
+  async withdraw(extensions: string[]): Promise<void> {
+    const list = extensions.filter(e => EXTENSION.test(e))
+    if (list.length) await this.query('DELETE FROM voicemail_boxes v WHERE v.tenant_id = $1 AND v.extension = ANY($2::text[])', [this.tenantId, list])
+  }
 }

@@ -57,6 +57,15 @@ describe('VoicemailBoxes', () => {
     expect(none.queries).toHaveLength(1)
     expect(none.queries[0]!.values).toEqual(['default', []])
   })
+
+  it('withdraws the mailboxes of some extensions of its tenant only, never one that is no extension (second review 11a, n°3)', async () => {
+    const db = recorder()
+    await new VoicemailBoxes({ pool: db.pool, tenantId: 'A' }).withdraw(['102', "1' OR '1'='1"])
+    expect(db.queries).toEqual([{ text: 'DELETE FROM voicemail_boxes v WHERE v.tenant_id = $1 AND v.extension = ANY($2::text[])', values: ['A', ['102']] }])
+    const none = recorder()
+    await new VoicemailBoxes({ pool: none.pool, tenantId: 'A' }).withdraw([])
+    expect(none.queries).toEqual([])
+  })
 })
 
 // Against a real PostgreSQL (TEST_DATABASE_URL): the SQL itself, and the query of opensips.cfg.tpl on what it writes.
@@ -91,6 +100,16 @@ if (process.env.TEST_DATABASE_URL) {
       // 9103's holder left: its mailbox goes; 9102's changed.
       await a.set([{ extension: '9102', mailbox: '9102@ctx-c' }])
       expect(await a.list()).toEqual([{ extension: '9102', mailbox: '9102@ctx-c' }])
+      // An extension given to someone else: its mailbox withdrawn at once, never another tenant's.
+      await b.set([{ extension: '9105', mailbox: '9105@ctx-b' }])
+      await a.set([
+        { extension: '9102', mailbox: '9102@ctx-c' },
+        { extension: '9106', mailbox: '9106@ctx-c' }
+      ])
+      await a.withdraw(['9102', '9105'])
+      expect(await a.list()).toEqual([{ extension: '9106', mailbox: '9106@ctx-c' }])
+      expect(await b.list()).toEqual([{ extension: '9105', mailbox: '9105@ctx-b' }])
+      await a.set([{ extension: '9102', mailbox: '9102@ctx-c' }])
       // route[rules_next]'s column, as it reads it.
       const read = async (ext: string) => (await pool.query(`SELECT (SELECT v.mailbox FROM voicemail_boxes v WHERE v.extension = '${ext}' AND v.mailbox ~ '^[0-9]{1,40}@[A-Za-z0-9_-]{1,79}$') AS m`)).rows[0].m
       expect(await read('9102')).toBe('9102@ctx-c')

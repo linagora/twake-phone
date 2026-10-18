@@ -564,6 +564,41 @@ describe('CallTracker', () => {
     expect(calls()).toEqual(['102:call.ended:inbound:101:missed', '101:call.connected:outbound:102:connected'])
   })
 
+  it('makes the call of a direct number its fallback group did not answer, taken by the mailbox (second review 11a, n°5), missed for each member and for the extension the number rings', () => {
+    const { tracker, calls, presences, events, clear } = make()
+    for (const ext of ['102', '104', '105']) tracker.handle('E_UL_CONTACT_INSERT', contact(ext, `sip:${ext}@x.invalid`))
+    clear()
+    const ext = '+33639980008'
+    // The operator calls the direct number of 102, which rings, nobody answers; its fallback is the group 200 (104, 105).
+    tracker.handle('E_TWAKEPHONE_CALLING', { ...call('n6', ext, '102'), dialled: '102' })
+    tracker.handle('E_TWAKEPHONE_RINGING', call('n6', ext, '102'))
+    tracker.handle('E_TWAKEPHONE_FORWARDED', { callid: 'n6', caller: ext, callee: '200', from: '102', code: '408', group: '200' })
+    tracker.handle('E_TWAKEPHONE_RINGING', { ...call('n6', ext, '104'), dialled: '102', group: '200' })
+    tracker.handle('E_TWAKEPHONE_RINGING', { ...call('n6', ext, '105'), dialled: '102', group: '200' })
+    // Nobody of the group answers: the mailbox of 102 (route[voicemail], acc's callee the extension dialled, no group).
+    tracker.handle('E_TWAKEPHONE_VOICEMAIL', { callid: 'n6', caller: ext, callee: '102', dialled: '102', greeting: 'unavailable', code: '480' })
+    // Nobody took it: no colleague answered for the others, nobody has it answered; each one had it missed, once, as
+    // the mailbox answered (not when the call ends, minutes later), their phones free again.
+    expect(events.filter(e => e.event.type === 'call.taken' || e.event.type === 'call.connected')).toEqual([])
+    expect(calls()).toEqual([
+      '102:call.ringing:inbound:+33639980008:ringing',
+      '102:call.ended:inbound:+33639980008:missed',
+      '104:call.ringing:inbound:+33639980008:ringing',
+      '105:call.ringing:inbound:+33639980008:ringing',
+      '104:call.ended:inbound:+33639980008:missed',
+      '105:call.ended:inbound:+33639980008:missed'
+    ])
+    expect(presences()).toEqual(['102:busy', '102:available', '104:busy', '105:busy', '104:available', '105:available'])
+    // The call ends: nothing more for anyone; its record again (a duplicate): nothing either.
+    clear()
+    tracker.handle('E_ACC_CDR', cdr('n6', ext, '102', 20, 1792000805))
+    expect(calls()).toEqual([])
+    expect(presences()).toEqual([])
+    expect(tracker.activeCalls()).toEqual([])
+    tracker.handle('E_ACC_CDR', cdr('n6', ext, '102', 20, 1792000805))
+    expect(events).toEqual([])
+  })
+
   it('ends what the user chose at its date: told when it comes, never in force after it', () => {
     let t = Date.parse('2026-10-14T18:00:00.000Z')
     const told: string[] = []

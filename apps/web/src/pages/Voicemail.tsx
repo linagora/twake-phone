@@ -27,8 +27,11 @@ export const applyVoicemailEvent = (items: Voicemail[], event: TelephonyEvent): 
 
 const isVoicemailEvent = (event: TelephonyEvent) => event.type === 'voicemail.created' || event.type === 'voicemail.updated' || event.type === 'voicemail.deleted'
 
-/** Where the focus goes after an action took a button away: a message's « Écouter », or the page's title. */
-type FocusTarget = { listen: string } | 'title'
+/**
+ * Where the focus goes after an action took a button away: a message's « Écouter », its « Supprimer » (a deletion
+ * given up), the confirmation asked, or the page's title.
+ */
+type FocusTarget = { listen: string } | { remove: string } | { confirm: string } | 'title'
 
 /**
  * The person's mailbox (step 11a): the messages left when they could not answer, newest first, as they arrive. Each is
@@ -38,7 +41,9 @@ type FocusTarget = { listen: string } | 'title'
  * clock hidden from assistive tech); what changes without the person (a message arriving) and what an action did
  * (deleted, marked as read) is said in the status region, each time, even with the same words; an action that takes
  * its button away gives the focus to the next message, or the previous one, or the title. The recordings have no
- * transcription before step 11b (RGAA 4.1: a derogation, ADR 0022).
+ * transcription before step 11b (RGAA 4.1: a derogation, ADR 0022). Each button names its message with who left it and
+ * when (second review 11a, n°15: two messages of the same caller are two); a deletion, for good, is confirmed first;
+ * a recording asked before the one asked last is not played.
  */
 export const VoicemailPage = () => {
   const { t, lang } = useT()
@@ -65,7 +70,13 @@ export const VoicemailPage = () => {
   }, [items])
   const title = useRef<HTMLHeadingElement>(null)
   const listenButtons = useRef(new Map<string, HTMLButtonElement>())
+  const removeButtons = useRef(new Map<string, HTMLButtonElement>())
+  const confirmButtons = useRef(new Map<string, HTMLButtonElement>())
   const focusAfter = useRef<FocusTarget | null>(null)
+  /** The message whose deletion waits for its confirmation. */
+  const [confirming, setConfirming] = useState<string | null>(null)
+  /** Which listening is the last asked: an answer to one before it is dropped. */
+  const listening = useRef(0)
 
   /** Who left a message: their name and number, the number alone, or that they hid it. */
   const whoOf = useCallback((v: Voicemail) => (v.fromName ? (v.from ? `${v.fromName} (${formatNumber(v.from)})` : v.fromName) : v.from ? formatNumber(v.from) : t('call.hiddenNumber')), [t])
@@ -94,7 +105,7 @@ export const VoicemailPage = () => {
       if (event.type === 'voicemail.created') {
         const v = event.payload.voicemail
         const count = applyVoicemailEvent(current, event).filter(i => i.unread).length
-        say(t('voicemail.arrived', { who: whoOf(v), time: time.format(new Date(v.receivedAt)), count: String(count) }))
+        say(t(count === 1 ? 'voicemail.arrivedOne' : 'voicemail.arrived', { who: whoOf(v), time: time.format(new Date(v.receivedAt)), count: String(count) }))
       }
     })
     return () => {
@@ -113,28 +124,31 @@ export const VoicemailPage = () => {
     []
   )
 
-  // The focus an action asked for, once the list without its button is on the page.
+  // The focus an action asked for, once the list without its button (or with the confirmation) is on the page.
   useEffect(() => {
     const target = focusAfter.current
     if (!target) return
     focusAfter.current = null
     if (target !== 'title') {
-      const button = listenButtons.current.get(target.listen)
+      const button = 'listen' in target ? listenButtons.current.get(target.listen) : 'remove' in target ? removeButtons.current.get(target.remove) : confirmButtons.current.get(target.confirm)
       if (button) return button.focus()
     }
     title.current?.focus()
-  }, [items])
+  }, [items, confirming])
 
   const listen = async (v: Voicemail) => {
     setNotice(null)
+    const ticket = ++listening.current
     try {
       const blob = await client.getVoicemailAudio(v.id)
+      // Another message was asked meanwhile: this one is not played.
+      if (ticket !== listening.current) return
       const next = URL.createObjectURL(blob)
       if (url.current) URL.revokeObjectURL(url.current)
       url.current = next
       setPlaying({ id: v.id, url: next })
     } catch {
-      setNotice(t('voicemail.audioFailed'))
+      if (ticket === listening.current) setNotice(t('voicemail.audioFailed'))
     }
   }
   const act = async (run: () => Promise<void>, failed: string) => {
@@ -153,8 +167,19 @@ export const VoicemailPage = () => {
       setItems(current => current?.map(i => (i.id === v.id ? { ...i, unread: false } : i)) ?? current)
       say(t('voicemail.markedRead', { who: whoOf(v) }))
     }, t('voicemail.actionFailed'))
+  // A deletion is for good: asked first, then confirmed (the focus on the confirmation), or given up (back on its
+  // « Supprimer »).
+  const askRemove = (v: Voicemail) => {
+    focusAfter.current = { confirm: v.id }
+    setConfirming(v.id)
+  }
+  const keep = (v: Voicemail) => {
+    focusAfter.current = { remove: v.id }
+    setConfirming(null)
+  }
   const remove = (v: Voicemail) =>
     act(async () => {
+      setConfirming(null)
       await client.deleteVoicemail(v.id)
       const list = shown.current ?? []
       const at = list.findIndex(i => i.id === v.id)
@@ -215,6 +240,8 @@ export const VoicemailPage = () => {
           <ul className="list voicemails">
             {items.map(v => {
               const who = whoOf(v)
+              const at = when.format(new Date(v.receivedAt))
+              const named = { who, when: at }
               return (
                 <li key={v.id} data-testid="voicemail" data-id={v.id} data-unread={v.unread ? '1' : '0'}>
                   <div>
@@ -222,12 +249,12 @@ export const VoicemailPage = () => {
                     {v.unread ? <span className="badge missed"> · {t('voicemail.new')}</span> : null}
                     <br />
                     <span className="badge">
-                      <time dateTime={v.receivedAt}>{when.format(new Date(v.receivedAt))}</time> · <span className="sr-only">{t('voicemail.durationLabel', { duration: clock(v.durationSec) })}</span>
+                      <time dateTime={v.receivedAt}>{at}</time> · <span className="sr-only">{t('voicemail.durationLabel', { duration: clock(v.durationSec) })}</span>
                       <span aria-hidden="true">{clock(v.durationSec)}</span>
                     </span>
                     {playing?.id === v.id ? (
                       <div>
-                        <audio controls autoPlay src={playing.url} aria-label={t('voicemail.player', { who })} data-testid="voicemail-audio" />
+                        <audio controls autoPlay src={playing.url} aria-label={t('voicemail.player', named)} data-testid="voicemail-audio" />
                       </div>
                     ) : null}
                   </div>
@@ -240,23 +267,52 @@ export const VoicemailPage = () => {
                         else listenButtons.current.delete(v.id)
                       }}
                       onClick={() => void listen(v)}
-                      aria-label={t('voicemail.listenTo', { who })}
+                      aria-label={t('voicemail.listenTo', named)}
                     >
                       {t('voicemail.listen')}
                     </button>
                     {v.from && toDialTarget(v.from) ? (
-                      <button type="button" className="btn btn-primary" onClick={() => void callBack(v)} aria-label={t('voicemail.callBackWho', { who })}>
+                      <button type="button" className="btn btn-primary" onClick={() => void callBack(v)} aria-label={t('voicemail.callBackWho', named)}>
                         {t('voicemail.callBack')}
                       </button>
                     ) : null}
                     {v.unread ? (
-                      <button type="button" className="btn" onClick={() => void markRead(v)} aria-label={t('voicemail.markReadWho', { who })}>
+                      <button type="button" className="btn" onClick={() => void markRead(v)} aria-label={t('voicemail.markReadWho', named)}>
                         {t('voicemail.markRead')}
                       </button>
                     ) : null}
-                    <button type="button" className="btn" onClick={() => void remove(v)} aria-label={t('voicemail.deleteWho', { who })}>
-                      {t('voicemail.delete')}
-                    </button>
+                    {confirming === v.id ? (
+                      <span role="group" aria-label={t('voicemail.confirmDeleteWho', named)} className="actions">
+                        <button
+                          type="button"
+                          className="btn btn-danger"
+                          ref={el => {
+                            if (el) confirmButtons.current.set(v.id, el)
+                            else confirmButtons.current.delete(v.id)
+                          }}
+                          onClick={() => void remove(v)}
+                          aria-label={t('voicemail.confirmDelete', named)}
+                        >
+                          {t('voicemail.confirmDeleteShort')}
+                        </button>
+                        <button type="button" className="btn" onClick={() => keep(v)} aria-label={t('voicemail.keepWho', named)}>
+                          {t('voicemail.keep')}
+                        </button>
+                      </span>
+                    ) : (
+                      <button
+                        type="button"
+                        className="btn"
+                        ref={el => {
+                          if (el) removeButtons.current.set(v.id, el)
+                          else removeButtons.current.delete(v.id)
+                        }}
+                        onClick={() => askRemove(v)}
+                        aria-label={t('voicemail.deleteWho', named)}
+                      >
+                        {t('voicemail.delete')}
+                      </button>
+                    )}
                   </div>
                 </li>
               )

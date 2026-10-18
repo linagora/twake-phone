@@ -29,6 +29,11 @@ import type {
 export interface RoutedEvent {
   extension: string
   event: TelephonyEvent
+  /**
+   * A voicemail server's event (step 11a): the mailbox it is of, as the server names it (opaque to the Gateway), which
+   * the Gateway hands back to `owns` with the holder of `extension` (review 11a, second, n°2).
+   */
+  mailbox?: string
 }
 
 export interface TelephonyProvider {
@@ -100,6 +105,11 @@ export interface TelephonyProvider {
    * refuses, busy or that reaches nobody goes to `mailbox`; an extension not in it has none.
    */
   setVoicemailBoxes?(boxes: VoicemailBox[]): Promise<void>
+  /**
+   * These extensions lose their mailbox at once, the others keep theirs (second review 11a, n°3): what a Gateway does
+   * as soon as it gave an extension to someone else, before the voicemail server has moved anything.
+   */
+  withdrawVoicemailBoxes?(extensions: string[]): Promise<void>
   /** Where the calls of the user's extension go (capability `forwarding`). */
   getForwarding?(user: User): Promise<ForwardingRules>
   /** Replaces those rules; targets are extensions the Gateway checked. */
@@ -156,6 +166,34 @@ export interface VoicemailBox {
 export interface VoicemailOwner {
   extension: string
   userId: string
+  /**
+   * The mailbox an event was of (RoutedEvent's `mailbox`): `owns` then says whether that very mailbox is at the
+   * extension and the person's, read again from the voicemail server (another Gateway may have moved it).
+   */
+  mailbox?: string
+}
+
+/** What a synchronisation of the mailboxes did (VoicemailProvider's syncMailboxes). */
+export interface VoicemailSync {
+  /** The mailboxes, for the SIP server (TelephonyProvider's setVoicemailBoxes). */
+  boxes: VoicemailBox[]
+  /** The mailboxes the voicemail server refused to make, move or set aside (each one said in the log): tried again later. */
+  failed: number
+  /**
+   * What was held back, too many at once (second review 11a, n°9): `park`, mailboxes of people who no longer hold an
+   * extension, left where they are; `remove`, mailboxes aside past their grace period, kept. Until `release`.
+   */
+  heldBack?: { park?: number; remove?: number; of: number }
+}
+
+export interface VoicemailSyncOptions {
+  /**
+   * Called once the voicemail server was read and before it is changed, with the mailboxes already at their holder's
+   * extension: the SIP server keeps only those meanwhile (second review 11a, n°3).
+   */
+  beforeChanges?(boxes: VoicemailBox[]): Promise<void>
+  /** What was held back (heldBack) goes this time: an administrator said it was meant. */
+  release?: boolean
 }
 
 /**
@@ -172,10 +210,14 @@ export interface VoicemailProvider {
    * Who holds each extension of the tenant now: each gets a mailbox (kept, moved with its messages from the extension
    * its holder had, or made). The others are set aside with their messages, out of reach of any call, and removed only
    * after a grace period if their holder has not come back. Returns the mailboxes, for the SIP server
-   * (TelephonyProvider's setVoicemailBoxes).
+   * (TelephonyProvider's setVoicemailBoxes), and what failed or was held back. One mailbox the server refuses is left
+   * out, the others done.
    */
-  syncMailboxes(holders: { extension: string; userId: string; displayName?: string }[]): Promise<VoicemailBox[]>
-  /** Whether the mailbox of `owner.extension` is `owner.userId`'s (the events of a mailbox go to its holder only). */
+  syncMailboxes(holders: { extension: string; userId: string; displayName?: string }[], options?: VoicemailSyncOptions): Promise<VoicemailSync>
+  /**
+   * Whether the mailbox of `owner.extension` is `owner.userId`'s (the events of a mailbox go to its holder only); with
+   * `owner.mailbox`, whether that mailbox is (read again from the voicemail server).
+   */
   owns(owner: VoicemailOwner): Promise<boolean>
   /** The messages of the owner's mailbox, newest first; none when they have no mailbox. */
   listMessages(owner: VoicemailOwner): Promise<Voicemail[]>

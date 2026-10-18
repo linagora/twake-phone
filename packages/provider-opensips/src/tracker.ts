@@ -44,6 +44,8 @@ interface TrackedCall {
    * the caller it is answered, for the callee a missed call, told then, whatever rang; the callee is not busy with it.
    */
   voicemail?: boolean
+  /** The extensions told the call ended for them while it went on elsewhere (a forward, a group): told once. */
+  over?: Set<string>
 }
 
 /** What the SIP server knows of an extension: registered or not, in a call or not. */
@@ -404,7 +406,11 @@ export class CallTracker {
         // call missed (or declined); the callee too, at once (their phone is free: the mailbox has the call); the caller
         // is in a call, with the mailbox.
         const call = this.find(p, now)
-        if (!call || call.connectedAt || call.group || call.conference) return
+        if (!call || call.connectedAt || call.conference) return
+        // The fallback group of a direct number nobody of which answered, then the mailbox of the extension the number
+        // rings (second review 11a, n°5): each member whose phone rang has the call missed, never taken by a colleague;
+        // the call is no group's any more.
+        if (call.group) this.leaveGroup(call, now)
         const code = Number(p.code) || 0
         this.moveTo(call, userOf(str(p.callee)), code, now)
         if (call.rang) this.count(call.callee, -1)
@@ -412,7 +418,8 @@ export class CallTracker {
         call.woken?.delete(call.callee)
         call.voicemail = true
         call.connectedAt = now
-        if (call.callee !== call.caller) this.emit(call.callee, { type: 'call.ended', timestamp: now, payload: { call: { ...this.toCall(call, call.callee, DECLINED.has(code) ? 'rejected' : 'missed', now), connectedAt: undefined } } })
+        // Told once: the extension dialled whose phone rang before a forward (or a group) has its missed call already.
+        if (call.callee !== call.caller && !call.over?.has(call.callee)) this.emit(call.callee, { type: 'call.ended', timestamp: now, payload: { call: { ...this.toCall(call, call.callee, DECLINED.has(code) ? 'rejected' : 'missed', now), connectedAt: undefined } } })
         this.tell(call, call.caller, 'call.connected', 'connected')
         break
       }
@@ -600,7 +607,10 @@ export class CallTracker {
   private leaveGroup(call: TrackedCall, now: string) {
     for (const m of call.group?.ringing ?? []) {
       this.count(m, -1)
-      if (m !== call.caller) this.emit(m, { type: 'call.ended', timestamp: this.now(), payload: { call: this.toCall(call, m, 'missed', now) } })
+      if (m !== call.caller) {
+        this.emit(m, { type: 'call.ended', timestamp: this.now(), payload: { call: this.toCall(call, m, 'missed', now) } })
+        ;(call.over ??= new Set()).add(m)
+      }
     }
     delete call.group
     call.rang = false
@@ -612,7 +622,10 @@ export class CallTracker {
     // Woken for it (its browser was, nothing of its rang): missed all the same.
     const woken = call.woken?.delete(call.callee) ?? false
     if (call.rang) this.count(call.callee, -1)
-    if ((call.rang || woken) && call.callee !== call.caller) this.emit(call.callee, { type: 'call.ended', timestamp: this.now(), payload: { call: this.toCall(call, call.callee, DECLINED.has(code) ? 'rejected' : 'missed', now) } })
+    if ((call.rang || woken) && call.callee !== call.caller) {
+      this.emit(call.callee, { type: 'call.ended', timestamp: this.now(), payload: { call: this.toCall(call, call.callee, DECLINED.has(code) ? 'rejected' : 'missed', now) } })
+      ;(call.over ??= new Set()).add(call.callee)
+    }
     call.callee = to
     call.rang = false
   }

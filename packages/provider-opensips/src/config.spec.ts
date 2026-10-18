@@ -173,6 +173,33 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(vm.indexOf('$avp(vm_used) = 1;')).toBeLessThan(vm.indexOf('t_relay()'))
     expect(vm).toContain('append_hf("X-Twake-Mailbox: $avp(vm_box)\\r\\n");')
     expect(vm).toContain('append_hf("X-Twake-Voicemail: $param(1)\\r\\n");')
+    // Whatever a caller sent of them goes before they are written (second review 11a, n°18).
+    for (const name of ['X-Twake-Mailbox', 'X-Twake-Voicemail']) {
+      expect(vm.indexOf(`remove_hf("${name}");`), name).toBeGreaterThan(0)
+      expect(vm.indexOf(`remove_hf("${name}");`), name).toBeLessThan(vm.indexOf(`append_hf("${name}: `))
+    }
+    // The headers appended are not undone by remove_hf (n°17): the undo does not pretend to.
+    expect(section('route[voicemail_undo]', 'failure_route[voicemail_failed]')).not.toContain('remove_hf(')
+    // Bounded as Meet is (n°10): the calls of a caller and of all at the same time, under a lock, counted only if there
+    // is room; those of a caller to one mailbox in an hour.
+    expect(cfg).toContain('modparam("dialog", "profiles_with_value", "trunk_caller;meet_caller;vm_caller")')
+    expect(cfg).toContain('modparam("dialog", "profiles_no_value", "trunk_out;trunk_emergency;meet_all;vm_all")')
+    expect(vm).toContain('if ($var(vm_mine) < $var(vm_cap) && $var(vm_all) < 30) {\n\t\tset_dlg_profile("vm_caller", "$var(vm_who)");\n\t\tset_dlg_profile("vm_all");')
+    expect(vm.indexOf('get_static_lock("vm_count");')).toBeLessThan(vm.indexOf('get_profile_size("vm_caller"'))
+    expect(vm.indexOf('release_static_lock("vm_count");')).toBeGreaterThan(vm.indexOf('set_dlg_profile("vm_all");'))
+    expect(vm).toContain('$var(vm_cap) = 2;')
+    expect(vm).toContain('cache_add("local", "vm:h:$var(vm_who):$avp(dialled)", 1, 3600, $var(vm_n));\n\t\tif ($var(vm_n) > 10) {')
+    expect(vm.indexOf('if ($var(vm_room) == 0) {')).toBeLessThan(vm.indexOf('t_relay()'))
+    const capped = render({ WAZO_SIP: '192.0.2.30:5100', VOICEMAIL_CALLS_PER_CALLER: '1', VOICEMAIL_CALLS_ALL: '5', VOICEMAIL_CALLS_PER_HOUR: '3' }).cfg
+    expect(capped).toContain('$var(vm_cap) = 1;')
+    expect(capped).toContain('$var(vm_all) < 5) {')
+    expect(capped).toContain('if ($var(vm_n) > 3) {')
+    for (const [env, message] of [
+      [{ VOICEMAIL_CALLS_PER_CALLER: '0' }, /VOICEMAIL_CALLS_PER_CALLER must be 1 to 20/],
+      [{ VOICEMAIL_CALLS_PER_CALLER: '4', VOICEMAIL_CALLS_ALL: '3' }, /VOICEMAIL_CALLS_ALL must be VOICEMAIL_CALLS_PER_CALLER to 10000/],
+      [{ VOICEMAIL_CALLS_PER_HOUR: 'x' }, /VOICEMAIL_CALLS_PER_HOUR must be a number/]
+    ] as const)
+      expect(render({ WAZO_SIP: '192.0.2.30:5100', ...env }).stderr).toMatch(message)
     // A caller from outside is said as such: the greeting never spells the extension to them (review 11a, n°12).
     expect(vm).toContain('if ($dlg_val(trunk) == "caller")\n\t\tappend_hf("X-Twake-Voicemail: $param(1);caller=external\\r\\n");')
     // Bounded (n°3): VOICEMAIL_MAX_CALL_SEC (300 s by default); a mailbox that does not answer at once is left (n°14).
@@ -211,6 +238,14 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(rtpReply.indexOf('remove_hf("Twake-Voicemail");')).toBeGreaterThan(0)
     expect(rtpReply.indexOf('remove_hf("Twake-Voicemail");')).toBeLessThan(rtpReply.indexOf('append_hf("Twake-Voicemail: 1'))
     expect(rtpReply).toContain('if ($rs >= 200 && $rs < 300 && $dlg_val(trunk) != "caller")\n\t\t\tappend_hf("Twake-Voicemail: 1\\r\\n");')
+    // Never anywhere else (second review 11a, n°18): the operator never hears it.
+    expect(cfg.match(/append_hf\("Twake-Voicemail/g)).toHaveLength(1)
+    expect(cfg.match(/append_to_reply\("Twake-Voicemail/g)).toBeNull()
+    // Nor what answered (n°19): the software of the mailbox, or that it is one.
+    const mailboxReply = rtpReply.slice(rtpReply.indexOf('if ($avp(voicemail) != NULL) {'))
+    expect(mailboxReply.indexOf('remove_hf("Server");')).toBeGreaterThan(0)
+    expect(mailboxReply.indexOf('remove_hf("User-Agent");')).toBeGreaterThan(0)
+    expect(mailboxReply.indexOf('remove_hf("Server");')).toBeLessThan(mailboxReply.indexOf('exit;'))
     // Asterisk heard nothing from (review 11a, n°14): the mailboxes left out 30 s, before the refusal is given back.
     expect(cfg).toContain('modparam("cfgutils", "shvset", "wazo_mute_until=i:0")')
     expect(failed).toContain('if (t_check_status("408") && t_local_replied("all")) {\n\t\t$shv(wazo_mute_until) = $Ts + 30;')
@@ -391,7 +426,7 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(cfg).toContain('modparam("cfgutils", "shvset", "meet_max_sec=i:1800")')
     expect(call).toContain('if ($dlg_val(trunk) == NULL)\n\t\tcreate_dialog("B");\n\tif ($DLG_timeout > $shv(meet_max_sec))\n\t\t$DLG_timeout = $shv(meet_max_sec);')
     expect(cfg).toContain('if ($dlg_val(meet) == "caller" && $DLG_timeout > $shv(meet_max_sec))\n\t\t$DLG_timeout = $shv(meet_max_sec);')
-    expect(cfg).toContain('modparam("dialog", "profiles_with_value", "trunk_caller;meet_caller")')
+    expect(cfg).toContain('modparam("dialog", "profiles_with_value", "trunk_caller;meet_caller;vm_caller")')
     // The defaults.
     const defaults = render({ MEET_SIP: '192.0.2.20:5080', MEET_SIP_PASSWORD: 'not-a-real-secret-0' }).cfg
     expect(defaults).toContain('$var(pin_cap) = 10;\n\t$var(m_cap) = 2;')
@@ -1440,7 +1475,7 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(section('route[default_trunk]', 'timer_route[default_trunk, 15]')).toContain('$(var(dn){s.select,1,|}{s.int}) >= $shv(dn_gen)')
     expect(cfg).toContain('modparam("cfgutils", "shvset", "dn_gen=i:0")')
     // n°10: the emergency calls known as such in the database (their profile), a day at most, 2 h once restored.
-    expect(cfg).toContain('modparam("dialog", "profiles_no_value", "trunk_out;trunk_emergency;meet_all")')
+    expect(cfg).toContain('modparam("dialog", "profiles_no_value", "trunk_out;trunk_emergency;meet_all;vm_all")')
     const entry = readFileSync(join(dir, 'entrypoint.sh'), 'utf8')
     expect(entry).toContain(`-c "SELECT twake_outbound_restart(${EMERGENCY_RESTORED_SEC})"`)
     // n°4: before OpenSIPS starts, after the tables are there.

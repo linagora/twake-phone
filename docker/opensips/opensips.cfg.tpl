@@ -176,8 +176,8 @@ modparam("dialog", "options_ping_interval", ${CALL_PING_SEC})
 # The calls to the public network in progress (step 6b, route[outbound_count]): per caller's extension, and all of them
 # (one organisation per OpenSIPS). An emergency call is in neither, but in trunk_emergency: how a restart knows it.
 # The calls to the access number of Meet's rooms in progress (step 8, route[meet_call]): per caller, and all of them.
-modparam("dialog", "profiles_with_value", "trunk_caller;meet_caller")
-modparam("dialog", "profiles_no_value", "trunk_out;trunk_emergency;meet_all")
+modparam("dialog", "profiles_with_value", "trunk_caller;meet_caller;vm_caller")
+modparam("dialog", "profiles_no_value", "trunk_out;trunk_emergency;meet_all;vm_all")
 loadmodule "rtpengine.so"
 modparam("rtpengine", "rtpengine_sock", "${RTPENGINE_SOCK}")
 
@@ -3479,8 +3479,12 @@ route[relay_failed] {
 # A call to a mailbox lasts VOICEMAIL_MAX_CALL_SEC at most ($DLG_timeout; a call from the operator then ends with a BYE
 # both ways, B; Asterisk hangs up its side at that bound too, and records VOICEMAIL_MAX_SEC at most: review 11a, n°3).
 # A mailbox that does not answer within 2 s (Wazo down, a row of voicemail_boxes out of date) is left for the refusal,
-# and when nothing at all came back from Asterisk, every mailbox is left out the next 30 s (n°14). The greeting says whether the caller is outside (`;caller=external`): the extension is never spelled out to
-# them (n°12).
+# and when nothing at all came back from Asterisk, every mailbox is left out the next 30 s (n°14). The greeting says
+# whether the caller is outside (`;caller=external`): the extension is never spelled out to them (n°12). Bounded as
+# Meet's access number is (second review 11a, n°10): VOICEMAIL_CALLS_PER_CALLER calls of one caller to the mailboxes
+# at the same time (those who hide their number together, under VOICEMAIL_CALLS_ALL), VOICEMAIL_CALLS_ALL of all
+# callers, and VOICEMAIL_CALLS_PER_HOUR calls of one caller to the same mailbox in an hour (one caller filling a
+# mailbox fills it for everyone); past one, the refusal the call would have had without the mailbox.
 # $param(1): the greeting; $avp(vm_then), $avp(vm_code), $avp(vm_reason): that refusal. Ends the script when the
 # mailbox is called; -1 otherwise.
 route[voicemail] {
@@ -3491,6 +3495,36 @@ route[voicemail] {
 	if ($avp(rtp_on) == NULL && !has_body_part("application/sdp"))
 		return(-1);
 	$avp(vm_used) = 1;
+	$var(vm_who) = "other";
+	if ($avp(caller) =~ "^[A-Za-z0-9._+-]{1,64}$")
+		$var(vm_who) = $avp(caller);
+	$var(vm_cap) = ${VOICEMAIL_CALLS_PER_CALLER};
+	if ($var(vm_who) == "anonymous" || $var(vm_who) == "other") {
+		$var(vm_cap) = ${VOICEMAIL_CALLS_ALL};
+	} else {
+		$var(vm_n) = 0;
+		cache_add("local", "vm:h:$var(vm_who):$avp(dialled)", 1, 3600, $var(vm_n));
+		if ($var(vm_n) > ${VOICEMAIL_CALLS_PER_HOUR}) {
+			xlog("L_NOTICE", "call $ci: the mailbox of $avp(dialled) left out, $var(vm_n) calls of this caller to it in an hour\n");
+			return(-1);
+		}
+	}
+	# The calls to the mailboxes at the same time, this one counted in only if there is room, under a lock: of two calls
+	# at once, one counts the other. Its dialog leaves the profiles when it ends.
+	$var(vm_room) = 0;
+	get_static_lock("vm_count");
+	get_profile_size("vm_caller", "$var(vm_who)", $var(vm_mine));
+	get_profile_size("vm_all", , $var(vm_all));
+	if ($var(vm_mine) < $var(vm_cap) && $var(vm_all) < ${VOICEMAIL_CALLS_ALL}) {
+		set_dlg_profile("vm_caller", "$var(vm_who)");
+		set_dlg_profile("vm_all");
+		$var(vm_room) = 1;
+	}
+	release_static_lock("vm_count");
+	if ($var(vm_room) == 0) {
+		xlog("L_WARN", "call $ci: the mailbox of $avp(dialled) left out, $var(vm_mine) calls of this caller and $var(vm_all) of all callers to the mailboxes at the same time\n");
+		return(-1);
+	}
 	# The offer the windows would have had (a refusal before any of them rang has none yet: only in the request route,
 	# the initial INVITE, from the caller to a browser-like callee). Not route[rtp_offer]: it asks the dialog for the
 	# direction (route[sides]), which a failure route cannot, and answers 503 itself; here the caller gets the original
@@ -3550,7 +3584,10 @@ route[voicemail] {
 	return(-1);
 }
 
-# The mailbox did not take the call: it is back where it was, for its refusal (its `via` and its lifetime too).
+# The mailbox did not take the call: it is back where it was, for its refusal (its `via` and its lifetime too). The
+# headers appended for Asterisk stay on the request (second review 11a, n°17): remove_hf sees the headers received
+# only, never those append_hf added, and what route[voicemail] appended is not undone. No path relays the request after
+# this route (each one replies, or ends): none reaches anyone else.
 route[voicemail_undo] {
 	$(avp(voicemail)[*]) = NULL;
 	$dlg_val(voicemail) = "0";
@@ -3563,8 +3600,6 @@ route[voicemail_undo] {
 	if ($avp(vm_timeout) != NULL && $avp(vm_timeout) > 0)
 		$DLG_timeout = $avp(vm_timeout);
 	$dlg_val(callee) = $avp(vm_from);
-	remove_hf("X-Twake-Mailbox");
-	remove_hf("X-Twake-Voicemail");
 }
 
 failure_route[voicemail_failed] {
@@ -3659,6 +3694,10 @@ onreply_route[rtp] {
 	# The mailbox answered (step 11a, route[voicemail]): told once, as itself, never as a ringing or an answer of the
 	# callee; nobody's identity is asserted to the caller.
 	if ($avp(voicemail) != NULL) {
+		# Nothing says to the caller what answered (second review 11a, n°19): neither Asterisk's software nor that it is a
+		# mailbox.
+		remove_hf("Server");
+		remove_hf("User-Agent");
 		# The caller's window says whose mailbox it hears (review 11a, n°26): Twake-Voicemail, never to the operator.
 		if ($rs >= 200 && $rs < 300 && $dlg_val(trunk) != "caller")
 			append_hf("Twake-Voicemail: 1\r\n");

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef } from 'react'
 import { NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom'
 import { adminSectionOf } from '../admin/sections.js'
 import { useAuth } from '../auth/AuthProvider.js'
@@ -8,6 +8,7 @@ import type { Key } from '../i18n/index.js'
 import { useT } from '../i18n/useT.js'
 import { answerRingQueries, browserPush, calledFor, forgetPushAtSignOut, resyncPush, ringsHere, tellRinging } from '../push.js'
 import { usePhone } from '../softphone.js'
+import { useVoicemailTab } from '../voicemailTab.js'
 import { CallPanel } from './CallPanel.js'
 
 const LINKS: [string, Key][] = [
@@ -22,26 +23,16 @@ const LINKS: [string, Key][] = [
 export const Layout = () => {
   const { t } = useT()
   const { state, signOut } = useAuth()
-  const { me, client } = useGateway()
+  const { me, client, onConnected, onEvent } = useGateway()
   const phone = usePhone()
   const push = useMemo(() => browserPush(), [])
   const navigate = useNavigate()
   const name = displayNameFor(me, state.status === 'signed-in' ? state.user : null)
-  // The mailbox (step 11a) shows only where the platform has one for this person (capability `voicemail`).
-  const [voicemail, setVoicemail] = useState(false)
-  useEffect(() => {
-    let cancelled = false
-    if (!me?.extension) return
-    client
-      .getCapabilities()
-      .then(caps => !cancelled && setVoicemail(!!caps.voicemail))
-      .catch(() => undefined)
-    return () => {
-      cancelled = true
-    }
-  }, [client, me?.id, me?.extension])
+  // The mailbox (step 11a) shows only where the platform has one for this person (capability `voicemail`), with the
+  // number of messages not listened to (second review 11a, n°14), said in the link's name.
+  const voicemail = useVoicemailTab(client, me?.extension, onConnected, onEvent)
   // The administration link shows only to administrators; the Gateway refuses the others anyway.
-  const links = LINKS.filter(([to]) => (to !== '/admin' || me?.features?.admin) && (to !== '/voicemail' || (voicemail && me?.extension)))
+  const links = LINKS.filter(([to]) => (to !== '/admin' || me?.features?.admin) && (to !== '/voicemail' || (voicemail.on && me?.extension)))
   const { pathname, search } = useLocation()
   // Opened by the notification of a call: signed in, the softphone registers and the call rings here. The address
   // keeps no trace of it (a reload is no reason to do anything about that call).
@@ -126,8 +117,13 @@ export const Layout = () => {
           <ul>
             {links.map(([to, key]) => (
               <li key={to}>
-                <NavLink to={to} end={to === '/'}>
+                <NavLink to={to} end={to === '/'} {...(to === '/voicemail' && voicemail.unread ? { 'aria-label': t(voicemail.unread === 1 ? 'nav.voicemailUnreadOne' : 'nav.voicemailUnread', { count: voicemail.unread }) } : {})}>
                   {t(key)}
+                  {to === '/voicemail' && voicemail.unread ? (
+                    <span className="nav-count" aria-hidden="true" data-testid="voicemail-unread">
+                      {voicemail.unread}
+                    </span>
+                  ) : null}
                 </NavLink>
               </li>
             ))}

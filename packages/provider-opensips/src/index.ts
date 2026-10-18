@@ -371,14 +371,18 @@ export class OpensipsProvider implements TelephonyProvider, MediaProvider {
     if (skipped.length) (this.config.logger ?? console).warn(`OpenSIPS: ${skipped.length} mailbox(es) left out, not an extension of digits and a mailbox OpenSIPS reads: ${skipped.map(b => b.extension.slice(0, 20)).join(', ')}`)
   }
 
+  /** These extensions lose their mailbox at once (`voicemail_boxes`), the others keep theirs. */
+  async withdrawVoicemailBoxes(extensions: string[]) {
+    await this.config.voicemailBoxes?.withdraw(extensions)
+  }
+
   /**
    * The access number of Meet's rooms as OpenSIPS has it (its shared variables meet_on and meet_number, MI shv_get):
    * `number` undefined when Meet is off there. Undefined when it cannot be asked (no MI) or did not say.
    */
   async getMeetAccess(): Promise<{ number?: string } | undefined> {
-    if (!this.events) return undefined
-    const vars = (await this.events.call<{ VARs?: { name?: string; value?: unknown }[] } | undefined>('shv_get'))?.VARs
-    if (!Array.isArray(vars)) return undefined
+    const vars = await this.sharedVariables()
+    if (!vars) return undefined
     const on = vars.find(v => v.name === 'meet_on')?.value
     const number = vars.find(v => v.name === 'meet_number')?.value
     if (on === undefined) return undefined
@@ -390,11 +394,21 @@ export class OpensipsProvider implements TelephonyProvider, MediaProvider {
    * be asked (no MI) or did not say.
    */
   async getVoicemailAccess(): Promise<boolean | undefined> {
-    if (!this.events) return undefined
-    const vars = (await this.events.call<{ VARs?: { name?: string; value?: unknown }[] } | undefined>('shv_get'))?.VARs
-    if (!Array.isArray(vars)) return undefined
-    const on = vars.find(v => v.name === 'wazo_on')?.value
+    const vars = await this.sharedVariables()
+    const on = vars?.find(v => v.name === 'wazo_on')?.value
     return on === undefined ? undefined : Number(on) === 1
+  }
+
+  /**
+   * OpenSIPS's shared variables (MI shv_get), undefined when it cannot be asked. OpenSIPS 3.6 answers a list of lists
+   * of them (found by the SIP e2e: read as `{ VARs }` only, nothing was ever found); `{ VARs }` is read as well.
+   */
+  private async sharedVariables(): Promise<{ name?: string; value?: unknown }[] | undefined> {
+    if (!this.events) return undefined
+    const result = await this.events.call<unknown>('shv_get')
+    const listed = result && typeof result === 'object' && !Array.isArray(result) ? (result as { VARs?: unknown }).VARs : result
+    if (!Array.isArray(listed)) return undefined
+    return (listed.flat(2) as unknown[]).filter((v): v is { name?: string; value?: unknown } => !!v && typeof v === 'object')
   }
 
   /**
