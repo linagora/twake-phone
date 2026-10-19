@@ -36,7 +36,7 @@ reload of a module while a first one runs, and one more for all those that came 
 sends the commands of one HTTP request together (a set) and nothing across two requests: only this queue merges
 requests. wazo-sysconfd's `request_handlers.synchronous` (false by default) is SYSCONFD_SYNCHRONOUS=1: the answer waits
 for the request to have run, and, which wazo-sysconfd never does, says 500 when a command failed (the tests of this
-stand-in use it).
+stand-in use it). SYSCONFD_RELOAD_MS makes each command last as long as a real one does.
 
 Standard library only: it runs with the Python of a Wazo image, on the loopback.
 """
@@ -48,6 +48,7 @@ import shutil
 import socket
 import sys
 import threading
+import time
 import uuid
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -59,6 +60,8 @@ AMI_USER = os.environ.get('SYSCONFD_AMI_USER', 'twake_sysconfd')
 AMI_PASSWORD = os.environ['SYSCONFD_AMI_PASSWORD']
 CONFGEND = os.environ.get('SYSCONFD_CONFGEND', '127.0.0.1:8669')
 SYNCHRONOUS = os.environ.get('SYSCONFD_SYNCHRONOUS') == '1'
+# What a reload costs before it runs: a real Wazo's (wazo-confgen, then asterisk -rx) is far above this stack's Asterisk.
+RELOAD_MS = int(os.environ.get('SYSCONFD_RELOAD_MS', '0'))
 SPOOL = os.environ.get('SYSCONFD_SPOOL', '/var/spool/asterisk/voicemail')
 # The commands wazo-confd sends after a change to voicemails, users and lines, each the module the AMI reloads for it.
 RELOADS = {
@@ -233,18 +236,22 @@ class Request:
         self.done = threading.Event()
 
     def run(self):
-        for command in self.commands:
-            if command.optimized:
-                log(f'{command.value!r} merged into the one waiting')
-                continue
-            try:
-                ami_command(command.value)
-                log(f'ran {command.value!r}')
-            except (OSError, PermissionError, AmiError) as err:
-                log(f'{command.value!r} failed: {err}')
-                self.error = err
-                break  # the next ones are not run
-        self.done.set()
+        # As wazo-sysconfd's Command.execute: whatever fails is logged, and the next command runs all the same.
+        try:
+            for command in self.commands:
+                if command.optimized:
+                    log(f'{command.value!r} merged into the one waiting')
+                    continue
+                try:
+                    if RELOAD_MS:
+                        time.sleep(RELOAD_MS / 1000)
+                    ami_command(command.value)
+                    log(f'ran {command.value!r}')
+                except Exception as err:
+                    log(f'{command.value!r} failed: {err}')
+                    self.error = self.error or err
+        finally:
+            self.done.set()
 
 
 class RequestQueue:
@@ -281,8 +288,12 @@ QUEUE = RequestQueue()
 
 
 def work():
+    # As wazo-sysconfd's RequestProcessor.run: whatever happens, the thread goes on.
     while True:
-        QUEUE.get().run()
+        try:
+            QUEUE.get().run()
+        except Exception as err:
+            log(f'unexpected error: {err}')
 
 
 threading.Thread(target=work, daemon=True).start()

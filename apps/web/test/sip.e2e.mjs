@@ -3016,6 +3016,19 @@ try {
       .split('\n')
       .map(l => /sysconfd: ran '([^']+)'/.exec(l)?.[1])
       .filter(Boolean)
+  /**
+   * Waits until the queue of wazo-sysconfd's stand-in is empty: its log has said nothing for longer than a reload lasts
+   * (SYSCONFD_RELOAD_MS, 500 ms, between two commands of a request), so that a read of it sees every command asked.
+   */
+  const sysconfdSettled = async () => {
+    const size = () => execFileSync('docker', ['compose', '-f', COMPOSE_FILE, 'logs', '--no-log-prefix', 'wazo-sysconfd'], { encoding: 'utf8', timeout: 30_000 }).length
+    for (let last = -1, quiet = 0; quiet < 3; ) {
+      await sleep(1_000)
+      const now = size()
+      quiet = now === last ? quiet + 1 : 0
+      last = now
+    }
+  }
   // Asterisk of the stack, in its container: its CLI, a command of its own.
   const COMPOSE_FILE = fileURLToPath(new URL('../../../docker/docker-compose.sip.yml', import.meta.url))
   const inAsterisk = (...args) => execFileSync('docker', ['compose', '-f', COMPOSE_FILE, 'exec', '-T', 'wazo-asterisk', ...args], { encoding: 'utf8', timeout: 30_000 })
@@ -3856,7 +3869,7 @@ try {
       await rowsAre({ 108: `${alices}@${context}`, 109: `${claires}@${context}` }, 'the mailboxes once they swapped')
       await theirs('amartin', '108', '+33639980041')
       await theirs('cpetit', '109', '+33639980042')
-      await sleep(2_000)
+      await sysconfdSettled()
       expectEqual(reloadsSince(moving), [], 'what wazo-sysconfd reloaded of Asterisk for the moves and the swap')
       expectEqual([(await wazoOf('amartin')).name, (await wazoOf('cpetit')).name], ['TwakePhone', 'TwakePhone'], 'the names of the mailboxes once they swapped')
       // Nothing moved in the spool: each one's folder where it was, those under 108 and 109 untouched.
@@ -3869,7 +3882,7 @@ try {
       await rowsAre({ 109: undefined }, 'no mailbox at 109 once Claire left')
       await nameIs('cpetit', 'TwakePhone aside ', "Claire's mailbox, set aside in Wazo")
       await theirs('cpetit', '109', '+33639980042')
-      await sleep(2_000)
+      await sysconfdSettled()
       // A change of the mailbox only: its module reloaded (what else wazo-confd asks for with it is said here).
       const aside = reloadsSince(leaving)
       console.log(`     wazo-sysconfd, for a mailbox set aside: ${aside.join(', ') || 'nothing'}`)
@@ -3903,7 +3916,7 @@ try {
       }, { timeout: 30_000 })
     }
   })
-  await step('step 11c, prerequisite: twelve people who join the directory at once get their mailboxes in one synchronisation, written together: wazo-sysconfd merges the reloads that wait while one runs, so fewer than their 24 writes ask for', async () => {
+  await step('step 11c, prerequisite: twelve people who join the directory at once get their mailboxes in one synchronisation: wazo-sysconfd merges the reloads that wait while one runs, a few for their 24 writes that ask for PJSIP', async () => {
     const newcomers = Array.from({ length: 12 }, (_, i) => ({ uid: `lot${i}`, cn: `Lot Numero${i}`, sn: `Numero${i}`, givenName: 'Lot', mail: `lot${i}@example.test`, ipPhone: String(420 + i), ou: 'Support' }))
     const since = new Date().toISOString()
     people.push(...newcomers)
@@ -3914,15 +3927,15 @@ try {
         return newcomers.every(n => rows.includes(n.ipPhone)) ? rows : null
       }, { timeout: 60_000 })
       // The queue of wazo-sysconfd drained, whatever came last.
-      await sleep(3_000)
+      await sysconfdSettled()
       const ran = reloadsSince(since)
       const count = command => ran.filter(c => c === command).length
       console.log(`     wazo-sysconfd, for twelve mailboxes made in one synchronisation (24 writes that ask for PJSIP): ${JSON.stringify(Object.fromEntries([...new Set(ran)].map(c => [c, count(c)])))}`)
-      // Fewer than the writes that ask for them (24 for PJSIP, 12 for the voicemails): the commands that came while one
-      // ran were merged. How few depends on how long a reload takes against the writes of the batch: Asterisk of this
-      // stack reloads fast, a real Wazo (wazo-confgen, then asterisk -rx) slower, so there it merges more.
-      if (count('module reload res_pjsip.so') >= 24) throw new Error(`reloads of PJSIP for twelve mailboxes made at once: ${count('module reload res_pjsip.so')}, none merged (${JSON.stringify(ran)})`)
-      if (count('voicemail reload') >= 12) throw new Error(`reloads of the voicemails for twelve mailboxes made at once: ${count('voicemail reload')}, none merged`)
+      // A real Wazo reloads PJSIP slowly (wazo-confgen, then asterisk -rx: here 500 ms a command), so the commands that
+      // wait while one runs are merged: twelve arrivals, 24 writes that ask for PJSIP, cost a few reloads. Run one by one
+      // as the synchronous stand-in did before, they cost 24.
+      if (count('module reload res_pjsip.so') > 4) throw new Error(`reloads of PJSIP for twelve mailboxes made at once: ${count('module reload res_pjsip.so')}, 4 at most (${JSON.stringify(ran)})`)
+      if (count('voicemail reload') > 4) throw new Error(`reloads of the voicemails for twelve mailboxes made at once: ${count('voicemail reload')}, 4 at most`)
       // No reload failed meanwhile (wazo-sysconfd answers wazo-confd at once, as the real one: a failure is in its log).
       const log = execFileSync('docker', ['compose', '-f', COMPOSE_FILE, 'logs', '--no-log-prefix', '--since', since, 'wazo-sysconfd'], { encoding: 'utf8', timeout: 30_000 })
       expectEqual(log.split('\n').filter(l => / failed: /.test(l)), [], 'the commands wazo-sysconfd failed')
@@ -3983,6 +3996,18 @@ try {
     execFileSync('docker', ['compose', '-f', fileURLToPath(new URL('../../../docker/docker-compose.sip.yml', import.meta.url)), 'exec', '-T', 'wazo-asterisk', 'asterisk', '-rx', 'logger remove channel twake-e2e-trace'], { stdio: 'ignore', timeout: 30_000 })
   } catch {
     // Not there.
+  }
+  // No command of wazo-sysconfd failed in the whole run: it answers wazo-confd at once, as the real one, so a failure is only in its log.
+  try {
+    const log = execFileSync('docker', ['compose', '-f', fileURLToPath(new URL('../../../docker/docker-compose.sip.yml', import.meta.url)), 'logs', '--no-log-prefix', 'wazo-sysconfd'], { encoding: 'utf8', timeout: 30_000 })
+    const bad = log.split('\n').filter(l => / failed: /.test(l))
+    if (bad.length) {
+      failed = true
+      console.error(`wazo-sysconfd failed ${bad.length} command(s):\n${bad.slice(0, 10).join('\n')}`)
+    }
+  } catch (err) {
+    failed = true
+    console.error('the log of wazo-sysconfd not read:', err)
   }
   await db.end()
 }

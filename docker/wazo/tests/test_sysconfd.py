@@ -10,6 +10,7 @@ import shutil
 import socket
 import tempfile
 import threading
+import time
 import unittest
 from http.server import ThreadingHTTPServer
 from socketserver import StreamRequestHandler, ThreadingTCPServer
@@ -252,8 +253,8 @@ class Sysconfd(unittest.TestCase):
         status, body = self.request('POST', '/exec_request_handlers', '{"ipbx": ["dialplan reload", "module reload res_pjsip.so"]}')
         self.assertEqual(status, 500, body)
         self.assertIn('refused Reload pbx_config.so', body)
-        # The next ones are not run.
-        self.assertEqual(self.ami.commands(), ['Reload pbx_config.so'])
+        # The next one runs all the same, as wazo-sysconfd's Command.execute catches each failure.
+        self.assertEqual(self.ami.commands(), ['Reload pbx_config.so', 'Reload res_pjsip.so'])
         # Events, and never the answer: an error, not a wait.
         self.ami.answers['pbx_config.so'] = ('Success', 'Module Reloaded', 1000)
         self.assertEqual(self.request('POST', '/exec_request_handlers', '{"ipbx": ["dialplan reload"]}')[0], 500)
@@ -320,6 +321,39 @@ class Sysconfd(unittest.TestCase):
         self.addCleanup(setattr, sysconfd, 'SYNCHRONOUS', True)
         self.ami.answers['pbx_config.so'] = ('Error', 'An unknown error occurred', 0)
         self.assertEqual(self.request('POST', '/exec_request_handlers', '{"ipbx": ["dialplan reload"]}')[0], 200)
+
+    def test_the_worker_goes_on_whatever_happens_and_a_request_always_ends(self):
+        class Broken:
+            commands = []
+            done = threading.Event()
+
+            def run(self):
+                raise RuntimeError('boom')
+
+        sysconfd.QUEUE.put(Broken())
+        self.assertEqual(self.request('POST', '/exec_request_handlers', '{"ipbx": ["dialplan reload"]}')[0], 200)
+        self.assertEqual(self.ami.commands(), ['Reload pbx_config.so'])
+        # A log that fails while a command failed: the request ends all the same (done is set in a finally), and the worker lives.
+        self.ami.answers['pbx_config.so'] = ('Error', 'An unknown error occurred', 0)
+        real_log = sysconfd.log
+        def failing_log(message):
+            if 'failed' in message:
+                raise RuntimeError('log broken')
+        sysconfd.log = failing_log
+        try:
+            self.request('POST', '/exec_request_handlers', '{"ipbx": ["dialplan reload"]}')
+        finally:
+            sysconfd.log = real_log
+        self.ami.answers.clear()
+        self.assertEqual(self.request('POST', '/exec_request_handlers', '{"ipbx": ["module reload features"]}')[0], 200)
+        self.assertEqual(self.ami.commands()[-1], 'Reload features')
+
+    def test_a_reload_lasts_what_it_is_told_to(self):
+        sysconfd.RELOAD_MS = 300
+        self.addCleanup(setattr, sysconfd, 'RELOAD_MS', 0)
+        start = time.monotonic()
+        self.assertEqual(self.request('POST', '/exec_request_handlers', '{"ipbx": ["dialplan reload"]}')[0], 200)
+        self.assertGreaterEqual(time.monotonic() - start, 0.3)
 
     def test_the_mailboxes_of_a_voicemail_conf_and_of_the_amis_list(self):
         self.assertEqual(sysconfd.mailboxes_of(VOICEMAIL_CONF), {(CONTEXT, '101'), (CONTEXT, '102')})
