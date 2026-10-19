@@ -183,7 +183,8 @@ export class DirectorySync {
     const tick = () => {
       this.timer = setTimeout(tick, intervalMs)
       this.timer.unref()
-      void this.run()
+      // execute() reports its failures; this catches what would escape it, which would stop Node otherwise.
+      this.run().catch((err: unknown) => this.opts.log?.error({ err }, 'directory synchronisation failed'))
     }
     this.timer = setTimeout(tick, firstDelayMs)
     this.timer.unref()
@@ -280,7 +281,14 @@ export class DirectorySync {
       return finish()
     }
     const syncedAt = started.toISOString()
-    const previous = new Map((await store.listMappings(tenantId)).map(m => [m.userId, m]))
+    let previous: Map<string, UserMapping>
+    try {
+      previous = new Map((await store.listMappings(tenantId)).map(m => [m.userId, m]))
+    } catch (err) {
+      this.opts.log?.error({ err }, 'directory synchronisation: the mappings could not be read')
+      report.error = 'the mappings could not be read: nothing was changed (see the Gateway log)'
+      return finish()
+    }
     const synced = [...previous.values()].filter(m => m.source === 'ldap')
 
     // An empty listing is far more often a wrong filter or a reader without rights than an organisation with
@@ -369,15 +377,9 @@ export class DirectorySync {
       report.error = 'who left the directory could not be recorded: nothing was changed (see the Gateway log)'
       return finish()
     }
-    // Rows that go, first: that frees the extensions before they are given to someone else (two people swapping).
-    for (const userId of released) {
-      // Their erasure goes only when they left the directory (fourth review 10b, n°2): given another extension, or
-      // none, it stays (until purged).
-      await store.deleteMapping(tenantId, userId, { left: !listed.has(userId) })
-      if (!wanted.has(userId)) report.removed++
-    }
     // The extensions whose holder changed: those let go, and those given to someone who did not hold them.
     const changed = new Set([...released].map(userId => previous.get(userId)!.extension))
+    const writes: UserMapping[] = []
     for (const next of wanted.values()) {
       const before = previous.get(next.userId)
       if (before && before.source === 'ldap' && same(before, next)) {
@@ -385,15 +387,33 @@ export class DirectorySync {
         continue
       }
       if (byExtension.get(next.extension)?.userId !== next.userId) changed.add(next.extension)
-      try {
-        await store.upsertMapping(next)
-        if (before) report.updated++
+      writes.push(next)
+    }
+    // All in one transaction: the rows that go first, which frees the extensions before they are given to someone
+    // else (two people swapping), then the rows written. The synchronisation of the mailboxes, reading the mappings
+    // meanwhile, sees all of it or none: never someone given another extension as gone (their mailbox set aside, the
+    // voicemail server reloaded, then given back at its next round). Their erasure goes only when they left the
+    // directory: given another extension, or none, it stays (until purged).
+    // Rejected (a deadlock twice in a row, the database lost), it changed nothing: the next run tries again.
+    let failed: { userId: string; err: unknown }[]
+    try {
+      failed = (await store.applyMappings(tenantId, { remove: [...released].map(userId => ({ userId, left: !listed.has(userId) })), write: writes })).failed
+    } catch (err) {
+      this.opts.log?.error({ err }, 'directory synchronisation: the mappings could not be written, nothing changed')
+      report.error = 'the mappings could not be written: nothing was changed (see the Gateway log)'
+      return finish()
+    }
+    for (const userId of released) if (!wanted.has(userId)) report.removed++
+    for (const next of writes) {
+      const refused = failed.find(f => f.userId === next.userId)
+      if (!refused) {
+        if (previous.has(next.userId)) report.updated++
         else report.created++
-      } catch (err) {
-        // Another process wrote meanwhile (two Gateways synchronising at once): reported, repaired by the next run.
-        this.opts.log?.error({ err, userId: next.userId }, 'directory synchronisation: mapping not written')
-        report.conflicts.push({ userId: next.userId, extension: next.extension, heldBy: '?' })
+        continue
       }
+      // Another process wrote meanwhile (two Gateways synchronising at once): reported, repaired by the next run.
+      this.opts.log?.error({ err: refused.err, userId: next.userId }, 'directory synchronisation: mapping not written')
+      report.conflicts.push({ userId: next.userId, extension: next.extension, heldBy: '?' })
     }
     this.opts.log?.info({ ...report }, 'directory synchronisation done')
     if (report.created || report.updated || report.removed || released.size) {

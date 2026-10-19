@@ -3,7 +3,7 @@ import { readdir, readFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import pg from 'pg'
 import { EMPTY_OUTBOUND, outboundVersion, staleOutbound } from '../outbound.js'
-import { ALERT_DEDUP_MS, alertKey, clampLimit, type AlertQuery, type AlertRecord, type StoredAlert, type ConferenceRecord, type DidRecord, type OutboundHand, type OutboundRecord, type OutboundRules, type HistoryEntry, type HistoryNearQuery, type HistoryPage, type HistoryQuery, type OperatorCdrOutcome, type OperatorCdrRecord, type OperatorCdrStats, type MappingSource, type ErasedCallsKept, type ProviderRecord, type PushSaveResult, type PushSubscriptionRecord, type Store, type TrunkRecord, type UserMapping, type UserPresenceRecord, type VapidKeysRecord, type ClaimedDelivery, type WebhookAttemptResult, type WebhookClaimCaps, type WebhookClaimTime, allocateClaims, claimOrder, type WebhookDeliveryQuery, type WebhookLease, type WebhookSendQuota, type WebhookDeliveryRecord, type WebhookHealth, type WebhookQueueOptions, type WebhookStateChange, type WebhookStateEvent, type WebhookSubscriptionRecord, WEBHOOK_STATE_ROLE , type FencedLease, type NewTranscript, type TranscriptChange, type TranscriptLane, holderIn, holderOut, type TranscriptMatch, type TranscriptNotice, type TranscriptRecord } from './types.js'
+import { ALERT_DEDUP_MS, alertKey, clampLimit, type AlertQuery, type AlertRecord, type StoredAlert, type ConferenceRecord, type DidRecord, type OutboundHand, type OutboundRecord, type OutboundRules, type HistoryEntry, type HistoryNearQuery, type HistoryPage, type HistoryQuery, type OperatorCdrOutcome, type OperatorCdrRecord, type OperatorCdrStats, type MappingSource, type ErasedCallsKept, type ProviderRecord, type PushSaveResult, type PushSubscriptionRecord, type Store, type TrunkRecord, type MappingChange, type UserMapping, type UserPresenceRecord, type VapidKeysRecord, type ClaimedDelivery, type WebhookAttemptResult, type WebhookClaimCaps, type WebhookClaimTime, allocateClaims, claimOrder, type WebhookDeliveryQuery, type WebhookLease, type WebhookSendQuota, type WebhookDeliveryRecord, type WebhookHealth, type WebhookQueueOptions, type WebhookStateChange, type WebhookStateEvent, type WebhookSubscriptionRecord, WEBHOOK_STATE_ROLE , type FencedLease, type NewTranscript, type TranscriptChange, type TranscriptLane, holderIn, holderOut, type TranscriptMatch, type TranscriptNotice, type TranscriptRecord } from './types.js'
 import type { OperatorCdr, WebhookEventType } from '@twake/telephony-types'
 
 const MIGRATIONS = fileURLToPath(new URL('../../migrations/', import.meta.url))
@@ -313,22 +313,60 @@ export class PgStore implements Store {
 
   async upsertMapping(m: UserMapping) {
     await this.inTransaction(async client => {
-      const { rows } = await client.query<{ extension: string }>('SELECT extension FROM user_mappings WHERE tenant_id = $1 AND user_id = $2 FOR UPDATE', [m.tenantId, m.userId])
-      await client.query(
-        `INSERT INTO user_mappings (tenant_id, user_id, extension, display_name, department, source, synced_at) VALUES ($1, $2, $3, $4, $5, $6, $7)
-         ON CONFLICT (tenant_id, user_id) DO UPDATE SET extension = EXCLUDED.extension, display_name = EXCLUDED.display_name,
-           department = EXCLUDED.department, source = EXCLUDED.source, synced_at = EXCLUDED.synced_at`,
-        [m.tenantId, m.userId, m.extension, m.displayName ?? null, m.department ?? null, m.source ?? 'manual', m.syncedAt ?? null]
-      )
-      const before = rows[0]?.extension
-      if (before === m.extension) return
-      // The extension it had changes hands (second review 10b, n°3); the one it takes too, when someone held it lately.
-      if (before !== undefined) await client.query("INSERT INTO number_changes (tenant_id, kind, first_number, last_number) VALUES ($1, 'extension', $2, $2)", [m.tenantId, before])
-      await client.query(
-        `INSERT INTO number_changes (tenant_id, kind, first_number, last_number)
-         SELECT $1, 'extension', $2, $2 WHERE EXISTS (SELECT 1 FROM number_changes WHERE tenant_id = $1 AND kind = 'extension' AND first_number = $2)`,
-        [m.tenantId, m.extension]
-      )
+      await this.upsertMappingIn(client, m)
+      await this.stampNumberChanges(client, m.tenantId)
+    })
+  }
+
+  /**
+   * The rows of `number_changes` a change of mappings writes are dated 'infinity' until this, just before its COMMIT:
+   * now() would be the time of its BEGIN, and a call of the operator that started while it ran (waiting on locks
+   * perhaps) would pass for one after the change, in the history of whom the extension rings now. Rows of other
+   * transactions not committed yet are not seen; committed, they carry their own time.
+   */
+  private async stampNumberChanges(client: pg.PoolClient, tenantId: string) {
+    await client.query("UPDATE number_changes SET changed_at = clock_timestamp() WHERE tenant_id = $1 AND kind = 'extension' AND changed_at = 'infinity'", [tenantId])
+  }
+
+  private async upsertMappingIn(client: pg.PoolClient, m: UserMapping) {
+    const { rows } = await client.query<{ extension: string }>('SELECT extension FROM user_mappings WHERE tenant_id = $1 AND user_id = $2 FOR UPDATE', [m.tenantId, m.userId])
+    await client.query(
+      `INSERT INTO user_mappings (tenant_id, user_id, extension, display_name, department, source, synced_at) VALUES ($1, $2, $3, $4, $5, $6, $7)
+       ON CONFLICT (tenant_id, user_id) DO UPDATE SET extension = EXCLUDED.extension, display_name = EXCLUDED.display_name,
+         department = EXCLUDED.department, source = EXCLUDED.source, synced_at = EXCLUDED.synced_at`,
+      [m.tenantId, m.userId, m.extension, m.displayName ?? null, m.department ?? null, m.source ?? 'manual', m.syncedAt ?? null]
+    )
+    const before = rows[0]?.extension
+    if (before === m.extension) return
+    // The extension it had changes hands (second review 10b, n°3); the one it takes too, when someone held it lately.
+    // Dated at the COMMIT (stampNumberChanges).
+    if (before !== undefined) await client.query("INSERT INTO number_changes (tenant_id, kind, first_number, last_number, changed_at) VALUES ($1, 'extension', $2, $2, 'infinity')", [m.tenantId, before])
+    await client.query(
+      `INSERT INTO number_changes (tenant_id, kind, first_number, last_number, changed_at)
+       SELECT $1, 'extension', $2, $2, 'infinity' WHERE EXISTS (SELECT 1 FROM number_changes WHERE tenant_id = $1 AND kind = 'extension' AND first_number = $2)`,
+      [m.tenantId, m.extension]
+    )
+  }
+
+  async applyMappings(tenantId: string, change: MappingChange) {
+    if (change.write.some(m => m.tenantId !== tenantId)) throw new Error('applyMappings: a mapping of another tenant')
+    return this.inTransaction(async client => {
+      const failed: { userId: string; err: unknown }[] = []
+      for (const r of change.remove) await this.deleteMappingIn(client, tenantId, r.userId, r.left ? { left: true } : {})
+      for (const m of change.write) {
+        // Each write on its own: one refused leaves the others, and the removals, as they are.
+        await client.query('SAVEPOINT mapping_write')
+        try {
+          await this.upsertMappingIn(client, m)
+          await client.query('RELEASE SAVEPOINT mapping_write')
+        } catch (err) {
+          if (retryable(err)) throw err
+          await client.query('ROLLBACK TO SAVEPOINT mapping_write')
+          failed.push({ userId: m.userId, err })
+        }
+      }
+      await this.stampNumberChanges(client, tenantId)
+      return { failed }
     })
   }
 
@@ -338,19 +376,25 @@ export class PgStore implements Store {
   }
 
   async deleteMapping(tenantId: string, userId: string, opts: { left?: boolean } = {}) {
-    // What was told of their presence goes with them (it is kept otherwise, whatever its age).
     await this.inTransaction(async client => {
-      // Its extension changes hands (second review 10b, n°3).
-      await client.query(
-        "INSERT INTO number_changes (tenant_id, kind, first_number, last_number) SELECT tenant_id, 'extension', extension, extension FROM user_mappings WHERE tenant_id = $1 AND user_id = $2",
-        [tenantId, userId]
-      )
-      await client.query('DELETE FROM user_mappings WHERE tenant_id = $1 AND user_id = $2', [tenantId, userId])
-      // Their erasure goes with them once they left (third review 10b, n°3): neither who nor their numbers are kept.
-      // Given another extension, it stays (fourth review n°2).
-      if (opts.left) await client.query('DELETE FROM history_erasures WHERE tenant_id = $1 AND user_id = $2', [tenantId, userId])
-      await client.query('DELETE FROM webhook_state WHERE tenant_id = $1 AND subject = $2', [tenantId, `presence:${userId}`])
+      await this.deleteMappingIn(client, tenantId, userId, opts)
+      await this.stampNumberChanges(client, tenantId)
     })
+  }
+
+  private async deleteMappingIn(client: pg.PoolClient, tenantId: string, userId: string, opts: { left?: boolean }) {
+    // What was told of their presence goes with them (it is kept otherwise, whatever its age).
+    // Its extension changes hands (second review 10b, n°3).
+    // Dated at the COMMIT (stampNumberChanges).
+    await client.query(
+      "INSERT INTO number_changes (tenant_id, kind, first_number, last_number, changed_at) SELECT tenant_id, 'extension', extension, extension, 'infinity' FROM user_mappings WHERE tenant_id = $1 AND user_id = $2",
+      [tenantId, userId]
+    )
+    await client.query('DELETE FROM user_mappings WHERE tenant_id = $1 AND user_id = $2', [tenantId, userId])
+    // Their erasure goes with them once they left (third review 10b, n°3): neither who nor their numbers are kept.
+    // Given another extension, it stays (fourth review n°2).
+    if (opts.left) await client.query('DELETE FROM history_erasures WHERE tenant_id = $1 AND user_id = $2', [tenantId, userId])
+    await client.query('DELETE FROM webhook_state WHERE tenant_id = $1 AND subject = $2', [tenantId, `presence:${userId}`])
   }
 
   async addHistory(e: HistoryEntry, client: pg.Pool | pg.PoolClient = this.pool) {

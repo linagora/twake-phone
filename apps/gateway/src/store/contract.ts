@@ -52,6 +52,35 @@ export const storeContract = (name: string, make: () => Promise<Store>) =>
       await s.close()
     })
 
+    it('changes the mappings of a tenant at once: the removals first, then the writes, a write refused left out alone', async () => {
+      const s = await make()
+      await s.upsertMapping({ tenantId: 'A', userId: 'alice', extension: '101' })
+      await s.upsertMapping({ tenantId: 'A', userId: 'bob', extension: '102' })
+      await s.upsertMapping({ tenantId: 'A', userId: 'carol', extension: '103' })
+      await s.upsertMapping({ tenantId: 'B', userId: 'alice', extension: '201' })
+      await s.deleteHistory('A', 'bob', ['+33199000102'])
+      await s.deleteHistory('A', 'carol', ['+33199000103'])
+      // Alice and Bob swap (their rows let go first, which frees the extensions), Carol leaves; Dave and Erin both
+      // want Carol's 103: the first written takes it, the other is refused, and nothing else is undone.
+      const { failed } = await s.applyMappings('A', {
+        remove: [{ userId: 'alice' }, { userId: 'bob' }, { userId: 'carol', left: true }],
+        write: [
+          { tenantId: 'A', userId: 'alice', extension: '102' },
+          { tenantId: 'A', userId: 'bob', extension: '101' },
+          { tenantId: 'A', userId: 'dave', extension: '103' },
+          { tenantId: 'A', userId: 'erin', extension: '103' }
+        ]
+      })
+      expect(failed.map(f => f.userId)).toEqual(['erin'])
+      expect((await s.listMappings('A')).map(m => `${m.userId}:${m.extension}`)).toEqual(['alice:102', 'bob:101', 'dave:103'])
+      expect((await s.listMappings('B')).map(m => `${m.userId}:${m.extension}`)).toEqual(['alice:201'])
+      // As deleteMapping: the erasure of who was given another extension kept, of who left gone.
+      expect(await s.historyErasedAt('A', 'bob')).toBeDefined()
+      expect(await s.historyErasedAt('A', 'carol')).toBeUndefined()
+      await expect(s.applyMappings('A', { remove: [], write: [{ tenantId: 'B', userId: 'x', extension: '209' }] })).rejects.toThrow(/another tenant/)
+      await s.close()
+    })
+
     it('keeps favourites per tenant and user, in the order they were added, without duplicates', async () => {
       const s = await make()
       await s.addFavorite('A', 'alice', 'jdupont')

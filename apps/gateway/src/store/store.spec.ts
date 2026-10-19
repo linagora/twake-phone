@@ -7,6 +7,21 @@ import { PgStore } from './pg.js'
 
 storeContract('memory', async () => new MemoryStore())
 
+describe('MemoryStore, the mappings changed together', () => {
+  it('shows a read made during applyMappings all of it, never the removals without the writes (review of PR 27, n°5)', async () => {
+    const store = new MemoryStore()
+    await store.upsertMapping({ tenantId: 'acme', userId: 'alice', extension: '101', source: 'ldap' })
+    await store.upsertMapping({ tenantId: 'acme', userId: 'bob', extension: '102', source: 'ldap' })
+    // Alice moves to 103: her row goes, then is written again. The reads start while the call has not settled.
+    const applying = store.applyMappings('acme', { remove: [{ userId: 'alice' }], write: [{ tenantId: 'acme', userId: 'alice', extension: '103', source: 'ldap' }] })
+    const listed = store.listMappings('acme')
+    const alice = store.getMappingByUser('acme', 'alice')
+    expect(await applying).toEqual({ failed: [] })
+    expect((await listed).map(m => `${m.userId}:${m.extension}`)).toEqual(['alice:103', 'bob:102'])
+    expect(await alice).toMatchObject({ extension: '103' })
+  })
+})
+
 // PostgreSQL contract: runs when TEST_DATABASE_URL points to a disposable database.
 if (process.env.TEST_DATABASE_URL) {
   storeContract('postgres', async () => {
@@ -459,6 +474,42 @@ if (process.env.TEST_DATABASE_URL) {
         expect(seen).toEqual(Array.from({ length: 25 }, (_, i) => `u${String(i + 1).padStart(2, '0')}`))
       } finally {
         await pool.query("DELETE FROM call_history WHERE tenant_id = 'micro'")
+        await store.close()
+      }
+    })
+  })
+
+  describe('PgStore, the mappings changed together', () => {
+    it('runs the whole change again after a deadlock in a write, never counts that write as refused (review of PR 27, n°5)', async () => {
+      const store = new PgStore(process.env.TEST_DATABASE_URL!)
+      await store.migrate()
+      const pool = (store as unknown as { pool: pg.Pool }).pool
+      const internals = store as unknown as { retried: number; upsertMappingIn: (...args: unknown[]) => Promise<void> }
+      try {
+        await store.upsertMapping({ tenantId: 'retry', userId: 'alice', extension: '101', source: 'ldap' })
+        await store.upsertMapping({ tenantId: 'retry', userId: 'carol', extension: '103', source: 'ldap' })
+        // The first write of the first attempt is the victim of a deadlock: rolled back whole by PostgreSQL, not one
+        // write refused within the transaction.
+        const upsert = internals.upsertMappingIn.bind(store)
+        let deadlocks = 1
+        internals.upsertMappingIn = async (...args: unknown[]) => {
+          if (deadlocks-- > 0) throw Object.assign(new Error('deadlock detected'), { code: '40P01' })
+          return upsert(...args)
+        }
+        const retried = internals.retried
+        const { failed } = await store.applyMappings('retry', {
+          remove: [{ userId: 'alice' }, { userId: 'carol', left: true }],
+          write: [{ tenantId: 'retry', userId: 'alice', extension: '102', source: 'ldap' }]
+        })
+        expect(failed).toEqual([])
+        expect(internals.retried).toBe(retried + 1)
+        expect((await store.listMappings('retry')).map(m => `${m.userId}:${m.extension}`)).toEqual(['alice:102'])
+        // The removals of the first attempt went with it: each extension changed hands once.
+        const { rows } = await pool.query("SELECT first_number FROM number_changes WHERE tenant_id = 'retry' ORDER BY first_number")
+        expect(rows.map(r => r.first_number)).toEqual(['101', '103'])
+      } finally {
+        await pool.query("DELETE FROM user_mappings WHERE tenant_id = 'retry'")
+        await pool.query("DELETE FROM number_changes WHERE tenant_id = 'retry'")
         await store.close()
       }
     })

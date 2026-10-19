@@ -1906,7 +1906,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         if (!sync) throw Object.assign(new Error('This directory cannot be synchronised'), { statusCode: 501 })
         if (sync.status().running) return reply.code(409).send({ error: 'a synchronisation is already running' })
         // A large directory takes a while: the run goes on in the background, GET /admin/directory follows it.
-        void sync.run()
+        sync.run().catch((err: unknown) => req.log.error({ err }, 'directory synchronisation failed'))
         return reply.code(202).send(sync.status())
       })
 

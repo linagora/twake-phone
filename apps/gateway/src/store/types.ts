@@ -665,6 +665,12 @@ export type NewTranscript = Pick<TranscriptRecord, 'tenantId' | 'holder' | 'mess
 /** A change of a transcription (updateTranscript). */
 export type TranscriptChange = Partial<Pick<TranscriptRecord, 'status' | 'reason' | 'text' | 'attempts' | 'nextAt' | 'notice' | 'noticeAttempts' | 'noticeNextAt' | 'noticeRoom' | 'noticeEvent' | 'noticeEdit'>>
 
+/** What a directory synchronisation changes in the mappings of a tenant (applyMappings). */
+export interface MappingChange {
+  remove: { userId: string; left?: boolean }[]
+  write: UserMapping[]
+}
+
 export interface Store {
   listProviders(): Promise<ProviderRecord[]>
   upsertProvider(record: ProviderRecord): Promise<void>
@@ -680,6 +686,13 @@ export interface Store {
    * n°2: given another extension, a record read later of a call from before is still told erased).
    */
   deleteMapping(tenantId: string, userId: string, opts?: { left?: boolean }): Promise<void>
+  /**
+   * The mappings of a tenant a directory synchronisation changes, at once: those of `remove` let go first (as
+   * deleteMapping; their extensions freed for someone else), then those of `write` written (as upsertMapping), in one
+   * transaction. A reader (the synchronisation of the mailboxes) sees all of it or nothing of it, never someone moved
+   * as gone. A write refused (an extension another writer took meanwhile) is left out alone, named in `failed`.
+   */
+  applyMappings(tenantId: string, change: MappingChange): Promise<{ failed: { userId: string; err: unknown }[] }>
 
   /** Idempotent on (tenant, user, callId). */
   addHistory(entry: HistoryEntry): Promise<void>

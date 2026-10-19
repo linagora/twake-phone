@@ -1,5 +1,5 @@
 import type { OperatorCdr } from '@twake/telephony-types'
-import { clampLimit, isDeclined, isMissed, type HistoryEntry, type HistoryNearQuery, type HistoryPage, type HistoryQuery, type OperatorCdrOutcome, type OperatorCdrRecord, type OperatorCdrStats, type ConferenceRecord, type AlertRecord, type AlertQuery, type DidRecord, type OutboundHand, type OutboundRecord, type OutboundRules, ALERT_DEDUP_MS, alertKey, type ProviderRecord, type StoredAlert, type PushSaveResult, type PushSubscriptionRecord, type Store, type TrunkRecord, type UserMapping, type UserPresenceRecord, type VapidKeysRecord, type ClaimedDelivery, type ErasedCall, type ErasedCallsKept, type WebhookAttemptResult, type WebhookClaimCaps, type WebhookClaimTime, allocateClaims, type WebhookDeliveryQuery, type WebhookLease, type WebhookSendQuota, type WebhookDeliveryRecord, type WebhookQueueOptions, type WebhookStateChange, type WebhookStateEvent, type WebhookSubscriptionRecord, WEBHOOK_STATE_ROLE, type FencedLease, type NewTranscript, type TranscriptChange, type TranscriptLane, type TranscriptMatch, type TranscriptNotice, type TranscriptRecord } from './types.js'
+import { clampLimit, isDeclined, isMissed, type HistoryEntry, type HistoryNearQuery, type HistoryPage, type HistoryQuery, type OperatorCdrOutcome, type OperatorCdrRecord, type OperatorCdrStats, type ConferenceRecord, type AlertRecord, type AlertQuery, type DidRecord, type OutboundHand, type OutboundRecord, type OutboundRules, ALERT_DEDUP_MS, alertKey, type ProviderRecord, type StoredAlert, type PushSaveResult, type PushSubscriptionRecord, type Store, type TrunkRecord, type MappingChange, type UserMapping, type UserPresenceRecord, type VapidKeysRecord, type ClaimedDelivery, type ErasedCall, type ErasedCallsKept, type WebhookAttemptResult, type WebhookClaimCaps, type WebhookClaimTime, allocateClaims, type WebhookDeliveryQuery, type WebhookLease, type WebhookSendQuota, type WebhookDeliveryRecord, type WebhookQueueOptions, type WebhookStateChange, type WebhookStateEvent, type WebhookSubscriptionRecord, WEBHOOK_STATE_ROLE, type FencedLease, type NewTranscript, type TranscriptChange, type TranscriptLane, type TranscriptMatch, type TranscriptNotice, type TranscriptRecord } from './types.js'
 import type { WebhookEventType } from '@twake/telephony-types'
 import { randomBytes } from 'node:crypto'
 import { EMPTY_OUTBOUND, outboundVersion, staleOutbound } from '../outbound.js'
@@ -102,6 +102,25 @@ export class MemoryStore implements Store {
   }
 
   async upsertMapping(mapping: UserMapping) {
+    this.upsertMappingNow(mapping)
+  }
+
+  async applyMappings(tenantId: string, change: MappingChange) {
+    if (change.write.some(m => m.tenantId !== tenantId)) throw new Error('applyMappings: a mapping of another tenant')
+    // All at once, no await in between: no reader sees part of it.
+    const failed: { userId: string; err: unknown }[] = []
+    for (const r of change.remove) this.deleteMappingNow(tenantId, r.userId, r.left ? { left: true } : {})
+    for (const m of change.write) {
+      try {
+        this.upsertMappingNow(m)
+      } catch (err) {
+        failed.push({ userId: m.userId, err })
+      }
+    }
+    return { failed }
+  }
+
+  private upsertMappingNow(mapping: UserMapping) {
     for (const m of this.mappings.values()) {
       if (m.tenantId === mapping.tenantId && m.extension === mapping.extension && m.userId !== mapping.userId) {
         throw new Error('extension already mapped to another user of this tenant')
@@ -125,6 +144,10 @@ export class MemoryStore implements Store {
   }
 
   async deleteMapping(tenantId: string, userId: string, opts: { left?: boolean } = {}) {
+    this.deleteMappingNow(tenantId, userId, opts)
+  }
+
+  private deleteMappingNow(tenantId: string, userId: string, opts: { left?: boolean }) {
     const before = this.mappings.get(key(tenantId, userId))
     if (before) this.changed(tenantId, 'extension', before.extension, before.extension)
     this.mappings.delete(key(tenantId, userId))
