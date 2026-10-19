@@ -1,9 +1,11 @@
-import { describe, expect, it } from 'vitest'
+import pg from 'pg'
+import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import type { Contact } from '@twake/telephony-types'
 import { MemoryContactDirectory } from './contacts.js'
 import { DirectorySync, HOLDER_RECORD, MAX_INTERVAL_MS, VOICEMAIL_HELD, extensionOf, holderIdOf, parseInterval, type HolderRecord } from './directory-sync.js'
 import { accessNumberInUse, meetAccessMismatch, reservedInUse, seedUserMap } from './directory.js'
 import { MemoryStore } from './store/memory.js'
+import { PgStore } from './store/pg.js'
 
 const person = (id: string, name: string, extension?: string, department = 'Support'): Contact => ({
   id,
@@ -498,3 +500,68 @@ describe("the access number of Meet's rooms (step 8, review n°12)", () => {
     expect(meetAccessMismatch(undefined, { number: '8000' })).toEqual([expect.stringMatching(/off here .* and on in OpenSIPS/)])
   })
 })
+
+// Against a real PostgreSQL (TEST_DATABASE_URL), in a schema of its own: the synchronisation of the mailboxes reads
+// the mappings while a directory synchronisation changes them.
+if (process.env.TEST_DATABASE_URL) {
+  describe('DirectorySync on PostgreSQL, read meanwhile', () => {
+    const SCHEMA = 'spec_directory_sync'
+    const APP = 'spec-directory-sync'
+    const admin = new pg.Pool({ connectionString: process.env.TEST_DATABASE_URL, max: 4 })
+    const url = new URL(process.env.TEST_DATABASE_URL!)
+    url.searchParams.set('options', `-c search_path=${SCHEMA}`)
+    url.searchParams.set('application_name', APP)
+    const stores: PgStore[] = []
+    const open = async () => {
+      const s = new PgStore(url.toString())
+      stores.push(s)
+      await s.migrate()
+      return s
+    }
+    beforeAll(async () => {
+      await admin.query(`DROP SCHEMA IF EXISTS ${SCHEMA} CASCADE`)
+      await admin.query(`CREATE SCHEMA ${SCHEMA}`)
+    })
+    afterAll(async () => {
+      for (const s of stores) await s.close()
+      await admin.query(`DROP SCHEMA IF EXISTS ${SCHEMA} CASCADE`)
+      await admin.end()
+    })
+
+    it('never shows someone given another extension as gone to a read between its removals and its writes (the mailbox set aside, the voicemail server reloaded)', async () => {
+      const store = await open()
+      // The synchronisation of the mailboxes, on another Gateway: its own connections.
+      const mailboxes = await open()
+      let people = [person('bob', 'Bob Durand', '102'), person('alice', 'Alice Martin', '101')]
+      const directory = new MemoryContactDirectory(people)
+      directory.listAll = async () => people
+      const sync = new DirectorySync({ store, directory, tenantId: 'acme', now: () => new Date('2026-10-14T10:00:00.000Z') })
+      await sync.run()
+      // Alice moves to 103, Bob is renamed: Alice's row goes, then Bob's is written, then Alice's.
+      people = [person('bob', 'Bob Durand-Petit', '102'), person('alice', 'Alice Martin', '103')]
+      // Bob's row held by someone else a moment (another writer): the synchronisation waits on it, after Alice's row went.
+      const lock = await admin.connect()
+      try {
+        await lock.query('BEGIN')
+        await lock.query(`SELECT 1 FROM ${SCHEMA}.user_mappings WHERE tenant_id = 'acme' AND user_id = 'bob' FOR UPDATE`)
+        const running = sync.run()
+        const start = Date.now()
+        for (;;) {
+          const { rows } = await admin.query<{ n: number }>("SELECT count(*)::int AS n FROM pg_stat_activity WHERE application_name = $1 AND wait_event_type = 'Lock'", [APP])
+          if (rows[0]!.n > 0) break
+          if (Date.now() - start > 5_000) throw new Error('the synchronisation never waited on the row held')
+          await new Promise(r => setTimeout(r, 10))
+        }
+        // Read now, as the mailboxes are: Alice still there, at her extension of before.
+        const seen = await mailboxes.listMappings('acme')
+        expect(seen.map(m => `${m.userId}:${m.extension}`)).toEqual(['alice:101', 'bob:102'])
+        await lock.query('COMMIT')
+        expect(await running).toMatchObject({ updated: 2, removed: 0, conflicts: [] })
+      } finally {
+        await lock.query('ROLLBACK').catch(() => undefined)
+        lock.release()
+      }
+      expect((await mailboxes.listMappings('acme')).map(m => `${m.userId}:${m.extension}:${m.displayName}`)).toEqual(['alice:103:Alice Martin', 'bob:102:Bob Durand-Petit'])
+    })
+  })
+}

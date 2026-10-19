@@ -369,15 +369,9 @@ export class DirectorySync {
       report.error = 'who left the directory could not be recorded: nothing was changed (see the Gateway log)'
       return finish()
     }
-    // Rows that go, first: that frees the extensions before they are given to someone else (two people swapping).
-    for (const userId of released) {
-      // Their erasure goes only when they left the directory (fourth review 10b, n°2): given another extension, or
-      // none, it stays (until purged).
-      await store.deleteMapping(tenantId, userId, { left: !listed.has(userId) })
-      if (!wanted.has(userId)) report.removed++
-    }
     // The extensions whose holder changed: those let go, and those given to someone who did not hold them.
     const changed = new Set([...released].map(userId => previous.get(userId)!.extension))
+    const writes: UserMapping[] = []
     for (const next of wanted.values()) {
       const before = previous.get(next.userId)
       if (before && before.source === 'ldap' && same(before, next)) {
@@ -385,15 +379,25 @@ export class DirectorySync {
         continue
       }
       if (byExtension.get(next.extension)?.userId !== next.userId) changed.add(next.extension)
-      try {
-        await store.upsertMapping(next)
-        if (before) report.updated++
+      writes.push(next)
+    }
+    // All in one transaction: the rows that go first, which frees the extensions before they are given to someone
+    // else (two people swapping), then the rows written. The synchronisation of the mailboxes, reading the mappings
+    // meanwhile, sees all of it or none: never someone given another extension as gone (their mailbox set aside, the
+    // voicemail server reloaded, then given back at its next round). Their erasure goes only when they left the
+    // directory: given another extension, or none, it stays (until purged).
+    const { failed } = await store.applyMappings(tenantId, { remove: [...released].map(userId => ({ userId, left: !listed.has(userId) })), write: writes })
+    for (const userId of released) if (!wanted.has(userId)) report.removed++
+    for (const next of writes) {
+      const refused = failed.find(f => f.userId === next.userId)
+      if (!refused) {
+        if (previous.has(next.userId)) report.updated++
         else report.created++
-      } catch (err) {
-        // Another process wrote meanwhile (two Gateways synchronising at once): reported, repaired by the next run.
-        this.opts.log?.error({ err, userId: next.userId }, 'directory synchronisation: mapping not written')
-        report.conflicts.push({ userId: next.userId, extension: next.extension, heldBy: '?' })
+        continue
       }
+      // Another process wrote meanwhile (two Gateways synchronising at once): reported, repaired by the next run.
+      this.opts.log?.error({ err: refused.err, userId: next.userId }, 'directory synchronisation: mapping not written')
+      report.conflicts.push({ userId: next.userId, extension: next.extension, heldBy: '?' })
     }
     this.opts.log?.info({ ...report }, 'directory synchronisation done')
     if (report.created || report.updated || report.removed || released.size) {
