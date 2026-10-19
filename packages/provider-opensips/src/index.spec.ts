@@ -412,6 +412,26 @@ describe('OpensipsProvider call rules', () => {
     sips.state.down = false
   })
 
+  it("reads the dialog of a call a room placed to an extension (step 8d): who it was placed for, who answered, the tags; any other call, one not answered, a phone call is nothing", async () => {
+    const sips = await fakeOpensips()
+    cleanups.push(sips.close)
+    const p = new OpensipsProvider({ websocketUrl: 'wss://sip.example.test', domain: 'sip.example.test', sipSecretFor: async () => 's', events: { miUrl: sips.url, timeoutMs: 300 }, logger: quiet })
+    cleanups.push(() => p.close())
+    await until('the subscription', () => p.getStatus() === 'CONNECTED')
+    const dialog = (callid: string, over: Record<string, unknown> = {}, values: Record<string, unknown>[] = [{ meet: 'caller' }, { callee: '102' }, { callee_tag: 'tag-b' }]) => ({
+      callid, state: 4, from_uri: 'sip:101@sip.example.test', to_uri: 'sip:102@sip.example.test', caller_tag: 'SCL_abc', context: { values }, ...over
+    })
+    sips.state.dialogContexts.set('r1', dialog('r1'))
+    expect(await p.roomCallParties('r1')).toEqual({ callId: 'r1', caller: '101', callerTag: 'SCL_abc', callee: '102', calleeTag: 'tag-b' })
+    sips.state.dialogContexts.set('phone', dialog('phone', {}, [{ callee: '102' }, { callee_tag: 'tag-b' }]))
+    sips.state.dialogContexts.set('ringing', dialog('ringing', { state: 2 }))
+    sips.state.dialogContexts.set('trunk', dialog('trunk', {}, [{ meet: 'caller' }, { callee: '+33612345678' }, { callee_tag: 'b' }]))
+    for (const id of ['phone', 'ringing', 'trunk', 'nope']) expect(await p.roomCallParties(id), id).toBeUndefined()
+    sips.state.dialogContexts.set('broken', 'fail')
+    await expect(p.roomCallParties('broken')).rejects.toMatchObject({ statusCode: 503 })
+    expect(await make().roomCallParties('r1')).toBeUndefined()
+  })
+
   it('ends a call OpenSIPS has by its Call-ID (MI dlg_end_dlg, review 8b, n°3), saying whether it was answered or still ringing (third review 8b, n°1); one it no longer has is no error, and said (second review 8b, n°1)', async () => {
     const sips = await fakeOpensips()
     cleanups.push(sips.close)

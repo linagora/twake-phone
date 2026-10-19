@@ -171,6 +171,33 @@ export interface ConferenceRecord {
 
 export type ConferenceDecision = 'confirmed' | 'cancelled'
 
+export type VisioStatus = 'pending' | 'calling' | 'swapped' | 'called' | 'failed' | 'gone'
+/** Someone who was in the call's room when it went to Meet (step 8d): by its id there, with what became of it. */
+export interface VisioPerson {
+  /** Its id in the old room (a participant id). */
+  key: string
+  number: string
+  /** `extension`: a phone of the tenant (called again in the place of its call); `number`: the public network; `other`: a group, a short number: never called again. */
+  kind: 'extension' | 'number' | 'other'
+  status: VisioStatus
+  /** Its id in Meet's room, once called again from it: what the Gateway itself put there. */
+  newId?: string
+  reason?: string
+}
+/** The passage of a call's conference to a room of Meet (step 8d, ADR 0026), kept for every Gateway. */
+export interface VisioRecord {
+  oldRoom: string
+  meetRoom: string
+  tenantId: string
+  ownerUserId: string
+  slug: string
+  url?: string
+  /** `running`: still calling; `done`; `halted` (a call was diverted: nothing more is called); `left`: the old room is ended. */
+  state: 'running' | 'done' | 'halted' | 'left'
+  createdAt: string
+  people: VisioPerson[]
+}
+
 /** What a person chose as presence (absent, do not disturb…), kept per user: it survives a restart and stays theirs. */
 export interface UserPresenceRecord {
   tenantId: string
@@ -836,6 +863,15 @@ export interface Store {
    * that stands (the asked one, or the one made before). Null for a room that is not there (step 8c, ADR 0025).
    */
   decideConference(meetingId: string, decision: ConferenceDecision): Promise<ConferenceDecision | null>
+  /** The passage of a call's room to Meet, once: the first to claim it wins, what comes back is the one that stands (step 8d). */
+  claimVisio(record: Omit<VisioRecord, 'people'>, people: Omit<VisioPerson, 'status'>[]): Promise<VisioRecord>
+  getVisio(oldRoom: string): Promise<VisioRecord | null>
+  getVisioByMeetRoom(meetRoom: string): Promise<VisioRecord | null>
+  listVisios(tenantId: string, ownerUserId: string): Promise<VisioRecord[]>
+  /** Moves one person from a status to another only if it is still in the first (true when it did): two Gateways never call the same one. */
+  moveVisioPerson(oldRoom: string, key: string, from: VisioStatus, to: VisioStatus, patch?: { newId?: string; reason?: string }): Promise<boolean>
+  setVisioState(oldRoom: string, state: VisioRecord['state']): Promise<void>
+  deleteVisio(oldRoom: string): Promise<void>
   /** The rooms of a tenant, or of one owner in it. */
   countConferences(tenantId: string, ownerUserId?: string): Promise<number>
   /** The rooms of one owner, oldest first. */

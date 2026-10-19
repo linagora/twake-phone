@@ -567,6 +567,32 @@ export const storeContract = (name: string, make: () => Promise<Store>) =>
       expect(both[0]).toBe(both[1])
       await s.deleteConference('twake-call-0123456789abcdef')
       await s.deleteConference('twake-call-fedcba9876543210')
+      // The passage of a call's room to Meet (step 8d): once per room, what comes back is the one that stands; each person moves
+      // from a status to another only if it is still in the first.
+      const visio = { oldRoom: 'twake-call-aaaaaaaaaaaaaaaa', meetRoom: 'fe15dd04-262c-48d6-83de-d82ab167deb3', tenantId: 'A', ownerUserId: 'alice', slug: 'abc-defg-hij', url: 'https://meet.example/abc', state: 'running' as const, createdAt: base.createdAt }
+      const people = [{ key: 'p1', number: '102', kind: 'extension' as const }, { key: 'p2', number: '+33612345678', kind: 'number' as const }, { key: 'p3', number: '600', kind: 'other' as const }]
+      const made = await s.claimVisio(visio, people)
+      expect(made).toMatchObject({ ...visio, people: [{ key: 'p1', number: '102', kind: 'extension', status: 'pending' }, { key: 'p2', status: 'pending' }, { key: 'p3', kind: 'other' }] })
+      // Another claim of the same room (or of the same room of Meet): the first stands, nothing is added.
+      const again = await s.claimVisio({ ...visio, meetRoom: 'other-meet-room', slug: 'x' }, [{ key: 'p9', number: '1', kind: 'other' }])
+      expect(again.meetRoom).toBe(visio.meetRoom)
+      expect(again.people.map(p => p.key)).toEqual(['p1', 'p2', 'p3'])
+      expect((await s.claimVisio({ ...visio, oldRoom: 'twake-call-bbbbbbbbbbbbbbbb' }, [])).oldRoom).toBe('twake-call-aaaaaaaaaaaaaaaa')
+      expect(await s.getVisioByMeetRoom(visio.meetRoom)).toMatchObject({ oldRoom: visio.oldRoom })
+      expect((await s.listVisios('A', 'alice')).map(v => v.oldRoom)).toEqual([visio.oldRoom])
+      expect(await s.listVisios('B', 'alice')).toEqual([])
+      expect(await s.moveVisioPerson(visio.oldRoom, 'p1', 'pending', 'calling')).toBe(true)
+      expect(await s.moveVisioPerson(visio.oldRoom, 'p1', 'pending', 'calling')).toBe(false)
+      expect(await s.moveVisioPerson(visio.oldRoom, 'p1', 'calling', 'swapped', { newId: 'meet:phone-1' })).toBe(true)
+      expect(await s.moveVisioPerson(visio.oldRoom, 'p2', 'pending', 'failed', { reason: 'busy' })).toBe(true)
+      expect(await s.moveVisioPerson(visio.oldRoom, 'nope', 'pending', 'failed')).toBe(false)
+      const after = await s.getVisio(visio.oldRoom)
+      expect(after?.people.map(p => [p.status, p.newId, p.reason])).toEqual([['swapped', 'meet:phone-1', undefined], ['failed', undefined, 'busy'], ['pending', undefined, undefined]])
+      await s.setVisioState(visio.oldRoom, 'done')
+      expect((await s.getVisio(visio.oldRoom))?.state).toBe('done')
+      await s.deleteVisio(visio.oldRoom)
+      expect(await s.getVisio(visio.oldRoom)).toBeNull()
+      expect(await s.getVisioByMeetRoom(visio.meetRoom)).toBeNull()
       // Counted per tenant, and per owner in it.
       await s.claimConference({ meetingId: 'second', createdAt: base.createdAt, tenantId: 'A', ownerUserId: 'bob' })
       await s.claimConference({ meetingId: 'third', createdAt: base.createdAt, tenantId: 'B', ownerUserId: 'alice' })

@@ -52,14 +52,15 @@
 // (docker compose -f docker/docker-compose.sip.yml exec wazo-asterisk; COMPOSE_PROJECT_NAME as Docker Compose reads
 // it), and docker/wazo/check-loopback.py runs during a call to a mailbox (as root: sudo -n when this is not root).
 import { execFileSync } from 'node:child_process'
-import { createHmac, randomBytes } from 'node:crypto'
+import { createHmac, randomBytes, randomUUID } from 'node:crypto'
 import { createSocket } from 'node:dgram'
 import { readFileSync } from 'node:fs'
+import { createServer as createHttpServer } from 'node:http'
 import { createServer, connect } from 'node:net'
 import { fileURLToPath } from 'node:url'
 import pg from 'pg'
 import { chromium, firefox } from 'playwright-core'
-import { LiveKitConferenceBridge } from '../../../packages/conference-livekit/dist/index.js'
+import { LiveKitConferenceBridge, MeetApi } from '../../../packages/conference-livekit/dist/index.js'
 import { buildApp } from '../../gateway/dist/app.js'
 import { RateLimiter } from '../../gateway/dist/contacts.js'
 import { WebPush } from '../../gateway/dist/push.js'
@@ -492,6 +493,8 @@ const gateway = await buildApp(registry, {
   conference,
   // The calls of rooms a person may place a minute (10 by default): the conferences of steps 8b, 8c and 8d follow one another within it.
   dialOutLimiter: new RateLimiter(100, 60_000),
+  // A passage to Meet is ended for want of anyone of the organisation in its room after a second here (2 minutes by default).
+  visioGraceMs: 1_000,
   webhooks: { policy: { allowHttp: true, ports: [Number(new URL(receiver.url).port)] }, open: parseNetworks('127.0.0.1/32'), retryBaseMs: 1_000 },
   trunkWatchMs: 2_000,
   voicemail: tenantId => (tenantId === TENANT ? wazo : undefined),
@@ -587,6 +590,8 @@ const open = async (login, name, { timezoneId } = {}) => {
   return { page, context, name }
 }
 const phoneState = page => page.getByTestId('phone-state')
+/** A number as the page writes it (+33 6 39 98 00 07). */
+const formatNumberForPage = n => n.replace(/^\+33(\d)(\d\d)(\d\d)(\d\d)(\d\d)$/, '+33 $1 $2 $3 $4 $5')
 const calls = page => page.evaluate(() => window.twakephone.calls)
 const lastEnded = page => page.evaluate(() => window.twakephone.lastEnded)
 /** Dials and waits for that call to end: not for the one that ended just before (shown a few seconds longer). */
@@ -2499,7 +2504,9 @@ try {
   // This test dials numbers of Mayotte (0639), the same one twenty times or so and up to six in a minute; the overseas
   // numbers have the thresholds of international ones (review 6b, n°14): six calls in a minute, or fifteen in a row to
   // one number, are refused (fraud). Raised here for those two only: the thresholds are proven by trunk.sip.mjs.
-  const FRAUD = { international: { callsPerMinute: { warning: 30, critical: 60 }, sequentialCalls: { warning: 50, critical: 100 } } }
+  // (The 06 39 98 00 0x numbers of these steps are Mayotte's: overseas, the rule of the international ones, whose daily attempts
+  // warn at 20 by default; the steps are not about that, the whole suite makes more than that.)
+  const FRAUD = { international: { dailyAttempts: { warning: 1000, critical: 2000 }, callsPerMinute: { warning: 30, critical: 60 }, sequentialCalls: { warning: 50, critical: 100 } } }
   await step('step 6b: Alice gives Bob the rights profile "internal calls only" (PUT /admin/outbound): his call to 06 39 98 00 03 is refused before the operator (403, rights) and the app tells him why; given "France" (PUT /admin/outbound/users/bdurand), the same call reaches the operator', async () => {
     const api = await asPerson(alice)
     const put = await api('PUT', '/admin/outbound', { policy: { fraud: FRAUD }, profiles: PROFILES, assignments: [{ userId: 'bdurand', profileId: 'internal' }] })
@@ -3186,6 +3193,127 @@ try {
       expectEqual((await api('PUT', '/admin/outbound', { policy: { fraud: FRAUD } })).statusCode, 200, 'PUT /admin/outbound (no profile)')
     }
   })
+  // Step 8d (ADR 0026): « Passer en visio ». Meet is played by this process (its external API and the page of a room),
+  // attached to the Gateway for the one step: the stack has no Meet.
+  await step('step 8d: Alice takes a conference (Jean, Bob, two numbers of the operator, one of which will refuse to be called again) to video: Meet makes a restricted room and the answer is at once; each person is called again from it (Jean and Bob in the place of their call, no ringing; a number by a new call); the old calls and Alice\'s own stay; « Terminer l\'ancienne salle » names who stays; once removed, the old room ends; and when only the number is left in Meet\'s room it ends too, the number hung up', async () => {
+    const meetRoom = { id: randomUUID(), slug: 'abc-defg-hij', name: 'abc-defg-hij' }
+    const asked = []
+    const meet = createHttpServer((req, res) => {
+      let raw = ''
+      req.on('data', c => (raw += c))
+      req.on('end', () => {
+        asked.push(`${req.method} ${req.url} ${raw}`)
+        const json = (code, body) => (res.writeHead(code, { 'content-type': 'application/json' }), res.end(JSON.stringify(body)))
+        if (req.method === 'POST' && req.url?.startsWith('/external-api/v1.0/application/token/')) return json(200, { access_token: 'e2e-meet', expires_in: 3600 })
+        if (req.method === 'POST' && req.url?.startsWith('/external-api/v1.0/rooms/')) return json(201, { ...meetRoom, url: meetRoom.url, access_level: JSON.parse(raw || '{}').access_level ?? 'public' })
+        if (req.method === 'GET' && req.url?.startsWith('/external-api/v1.0/rooms/')) return json(200, { results: [{ ...meetRoom, url: meetRoom.url }], next: null })
+        res.writeHead(200, { 'content-type': 'text/html' })
+        res.end('<!doctype html><title>Meet</title><p>The room of Meet (played by the e2e).</p>')
+      })
+    })
+    await new Promise(resolve => meet.listen(0, '127.0.0.1', resolve))
+    meetRoom.url = `http://127.0.0.1:${meet.address().port}/${meetRoom.slug}`
+    conference.meet = new MeetApi({ url: `http://127.0.0.1:${meet.address().port}`, clientId: 'e2e', clientSecret: 'e2e' })
+    // Calling a number again, its old call goes on: two numbers in the conference are four external calls at a time, past the two a person has by default.
+    const policy = await asPerson(alice)
+    expectEqual((await policy('PUT', '/admin/outbound', { policy: { userCaps: { concurrent: 6 }, fraud: FRAUD } })).statusCode, 200, 'PUT /admin/outbound (more calls at a time)')
+    try {
+      // The conference: Alice, Jean, Bob, and two numbers of the operator.
+      await aliceCallsJean(alice, jean)
+      await alice.page.getByRole('button', { name: 'Ajouter un participant' }).click()
+      await alice.page.getByLabel('Participant à ajouter (poste ou numéro)').fill('103')
+      await alice.page.getByRole('button', { name: 'Appeler et ajouter' }).click()
+      const ringing = bob.page.getByTestId('incoming-call')
+      await ringing.waitFor({ timeout: 30_000 })
+      await ringing.getByRole('button', { name: 'Répondre' }).click()
+      await until('Bob in the conference', async () => ((await calls(bob.page))[0]?.state === 'connected' ? true : null), { timeout: 30_000 })
+      await alice.page.getByTestId('conference-participant').nth(2).waitFor({ timeout: 20_000 })
+      const firsts = {}
+      for (const [typed, uri] of [['06 39 98 00 07', '+33639980007'], ['06 39 98 00 08', '+33639980008']]) {
+        await alice.page.getByRole('button', { name: 'Ajouter un participant' }).click()
+        await alice.page.getByLabel('Participant à ajouter (poste ou numéro)').fill(typed)
+        await alice.page.getByRole('button', { name: 'Appeler et ajouter' }).click()
+        const { call, at } = await invitedAtOperator(invite => invite.uri === `sip:${uri}@operator.example`)
+        await at.callState(call, 'answered')
+        firsts[uri] = { call, at }
+      }
+      const room = await until('the room of the conference', async () => (await store.listConferences(TENANT, 'amartin')).find(r => /^twake-call-[0-9a-f]{16}$/.test(r.meetingId))?.meetingId ?? null)
+      await until('the numbers in the room', async () => ((await bridge.participantCalls(room)).filter(p => p.number.startsWith('+3363998000')).length === 2 ? true : null), { timeout: 30_000 })
+      expectEqual(await jean.page.getByRole('button', { name: 'Passer en visio' }).count(), 0, 'the button to go to video on Jean\'s page')
+      const api = await asPerson(alice)
+      const [aliceOwn] = await calls(alice.page)
+      const [jeans] = await calls(jean.page)
+      // The first number called again is refused (486): whichever it is, it stays in the old room.
+      operator.state.next.push({ reply: '486 Busy Here' })
+      const popup = alice.context.waitForEvent('page')
+      await alice.page.getByRole('button', { name: 'Passer en visio' }).click()
+      const tab = await popup
+      await tab.waitForURL(meetRoom.url, { timeout: 30_000 })
+      await tab.getByText('The room of Meet').waitFor()
+      // Meet was asked for one room, the most closed it gives, and the Gateway keeps the passage.
+      const made = asked.filter(a => a.startsWith('POST /external-api/v1.0/rooms/'))
+      expectEqual(made.length, 1, 'the rooms Meet was asked for')
+      expectEqual(JSON.parse(made[0].replace(/^POST \S+ /, '')).access_level, 'restricted', 'the access of the room of Meet')
+      expectEqual((await store.getConference(meetRoom.id))?.ownerUserId, 'amartin', 'the owner of the room of Meet')
+      expectEqual((await api('POST', `/conferences/${room}/visio`)).json().meetingId, meetRoom.id, 'a second ask gives the same passage')
+      const done = await until('the passage done', async () => {
+        const res = await api('GET', `/conferences/${room}/visio`)
+        return res.statusCode === 200 && res.json().state === 'done' ? res.json() : null
+      }, { timeout: 60_000 })
+      expectEqual(asked.filter(a => a.startsWith('POST /external-api/v1.0/rooms/')).length, 1, 'the rooms Meet was asked for once the second ask is made')
+      const byNumber = Object.fromEntries(done.people.map(p => [p.number, p.status]))
+      const calledNumber = Object.keys(byNumber).find(n => byNumber[n] === 'called')
+      const failedNumber = Object.keys(byNumber).find(n => byNumber[n] === 'failed')
+      expectEqual(`${byNumber['102']} ${byNumber['103']} ${!!calledNumber} ${!!failedNumber}`, 'swapped swapped true true', `how each person was called again ${JSON.stringify(byNumber)}`)
+      // Jean and Bob: their call replaced at once (no ringing), going on; the number called again, answered.
+      await until('Jean on the room of Meet', async () => {
+        const c = await calls(jean.page)
+        return c.length === 1 && c[0].state === 'connected' && c[0].replacedCallId === jeans.id ? c : null
+      }, { timeout: 30_000 })
+      const { call: second, at: at2 } = await invitedAtOperator(invite => invite.uri === `sip:${calledNumber}@operator.example` && invite.headers.get('call-id')?.[0] !== firsts[calledNumber].call.invite.headers.get('call-id')?.[0])
+      await at2.callState(second, 'answered')
+      const inMeet = await until('everyone called again in the room of Meet', async () => {
+        const now = (await bridge.participantCalls(meetRoom.id)).map(p => p.number).sort()
+        return now.join(' ') === ['102', '103', calledNumber].sort().join(' ') ? now : null
+      }, { timeout: 30_000 })
+      expectEqual(inMeet.includes(failedNumber), false, 'the number that refused is not in the room of Meet')
+      // Nothing is hung up yet; the page says who was called again and who stayed.
+      await alice.page.getByText(/ont été rappelés dans la salle Meet/).waitFor({ timeout: 20_000 })
+      await alice.page.getByText(/Pas rappelés, restés dans l'ancienne salle/).waitFor()
+      await sleep(1_500)
+      expectEqual(firsts[calledNumber].call.state, 'answered', 'the old call of the number called again before Alice says so')
+      expectEqual((await calls(alice.page)).some(c => c.id === aliceOwn.id), true, 'Alice\'s own call before she says so')
+      // Alice says: the old room is not ended, someone stays in it (the number that refused), and Alice is not left with them alone.
+      await alice.page.getByRole('button', { name: "Terminer l'ancienne salle" }).click()
+      await alice.page.getByText(/Restent dans l'ancienne salle/).waitFor({ timeout: 20_000 })
+      expectEqual((await store.getConference(room)) !== null, true, 'the old room while someone stays in it')
+      expectEqual((await calls(alice.page)).some(c => c.id === aliceOwn.id), true, 'Alice\'s own call while someone stays in the old room')
+      // Nobody is added to a room that is going to Meet.
+      expectEqual(await alice.page.getByRole('button', { name: 'Ajouter un participant' }).isDisabled(), true, 'the add button during the passage')
+      // She removes the one who stayed (the list\'s button): its old call ends; now the old room can end.
+      const shown = formatNumberForPage(failedNumber)
+      await alice.page.getByRole('button', { name: `Retirer ${shown} de la conférence` }).click()
+      await firsts[failedNumber].at.callState(firsts[failedNumber].call, 'ended', 20_000)
+      await alice.page.getByRole('button', { name: "Terminer l'ancienne salle" }).click()
+      await firsts[calledNumber].at.callState(firsts[calledNumber].call, 'ended', 20_000)
+      await until('the end of Alice\'s own call', async () => ((await calls(alice.page)).length === 0 ? true : null), { timeout: 20_000 })
+      await until('the old room gone', async () => ((await store.getConference(room)) === null ? true : null), { timeout: 20_000 })
+      // They go on, in Meet's room, and hear each other and the number.
+      expectEqual(`${(await calls(jean.page)).length} ${(await calls(bob.page)).length} ${second.state}`, '1 1 answered', 'the calls after the old room ended')
+      await bothHearEachOther(jean, bob)
+      await until('sound from the room of Meet at the number', async () => (second.media.stats.voiced > 20 ? true : null), { timeout: 30_000 })
+      await tab.close()
+      // Jean and Bob leave: only the number is left in Meet's room, nobody to answer for its call: the room ends, the number is hung up.
+      for (const who of [jean, bob]) await who.page.getByRole('button', { name: 'Quitter la conférence' }).click()
+      for (const who of [jean, bob]) await until(`the end of ${who.name}'s call`, async () => ((await calls(who.page)).length === 0 ? true : null), { timeout: 20_000 })
+      await at2.callState(second, 'ended', 40_000)
+      await until('the record of the room of Meet gone', async () => ((await store.getConference(meetRoom.id)) === null ? true : null), { timeout: 20_000 })
+    } finally {
+      delete conference.meet
+      await new Promise(resolve => meet.close(resolve))
+      expectEqual((await policy('PUT', '/admin/outbound', { policy: { fraud: FRAUD } })).statusCode, 200, 'PUT /admin/outbound (no profile)')
+    }
+  })
   await step('a registration left on a dead connection (the first one, Alice) with a no-answer forward: Bob rings at once, not after the delay', async () => {
     await setForwarding(alice, { noAnswer: '103', delay: '20' })
     relay.cutUpstream(0)
@@ -3370,9 +3498,13 @@ try {
       expectEqual(rows, holders, 'the extensions with a line')
       await sysconfdSettled()
       // Asterisk has them once its reload of PJSIP is through (read again while it is not).
-      await until('an endpoint at Asterisk for each holder', async () => {
+      // The reload is asynchronous (the AMI answers before it is done) and Asterisk loads the endpoints before the credentials: an endpoint
+      // is no proof that its credentials are there. A REGISTER that comes in between is not answered in time (408, the lines left out 30 s) or
+      // fails for the want of the auth object of the endpoint. So each holder's endpoint AND auth are waited for.
+      await until('an endpoint and its credentials at Asterisk for each holder', async () => {
         const endpoints = asteriskCli('pjsip show endpoints')
-        return holders.every(ext => new RegExp(`^\\s*Endpoint:\\s+${ext}\\b`, 'm').test(endpoints)) ? true : null
+        const auths = asteriskCli('pjsip show auths')
+        return holders.every(ext => new RegExp(`^\\s*Endpoint:\\s+${ext}\\b`, 'm').test(endpoints) && new RegExp(`^\\s*Auth:\\s+${ext}\\b`, 'm').test(auths)) ? true : null
       }, { timeout: 60_000 })
       // The password of a line is a print of its extension: the registration of the next step proves it (Asterisk takes it only with that password).
       // The same stack answers an extension OpenSIPS gave no line: registered here, never at Wazo.

@@ -531,6 +531,24 @@ export class OpensipsProvider implements TelephonyProvider, MediaProvider {
   }
 
   /**
+   * A call a room placed to an extension (`meet` = caller in its dialog), answered, as OpenSIPS holds it (MI dlg_list_ctx,
+   * step 8d): the person it was placed for (its From), the extension that answered and the tags of the dialog. Undefined
+   * for another call, one not answered or over (404); an MI that does not answer is 503.
+   */
+  async roomCallParties(callId: string): Promise<CallParties | undefined> {
+    if (!this.events || !callId) return undefined
+    const dialog = await this.events.call('dlg_list_ctx', { callid: callId }).then(parseDlgContext, (err: unknown) => {
+      if ((err as { code?: unknown }).code === 404) return undefined
+      throw Object.assign(new Error('The SIP server did not say where the call is'), { statusCode: 503, code: 'SIP_SERVER_UNAVAILABLE' })
+    })
+    if (!dialog || dialog.callid !== callId || dialog.state !== 4 || dialog.values.meet !== 'caller') return undefined
+    const callee = dialog.values.callee ?? ''
+    const calleeTag = dialog.values.callee_tag ?? ''
+    if (!EXTENSION.test(dialog.caller) || !EXTENSION.test(callee) || !TAG.test(dialog.callerTag) || !TAG.test(calleeTag)) return undefined
+    return { callId, caller: dialog.caller, callerTag: dialog.callerTag, callee, calleeTag }
+  }
+
+  /**
    * The trunks and direct numbers of the tenant (ADR 0016), written into OpenSIPS's database; then OpenSIPS reloads
    * what changed: its dispatcher (the operator's servers), its registrations (only when they changed: an operator
    * stops answering an address that registers too often, ARCHITECTURE §13), and, once per start, its numbering plan.

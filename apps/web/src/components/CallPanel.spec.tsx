@@ -3,6 +3,7 @@ import { act } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { SoftCall } from '@twake/softphone'
+import type { CallVisio } from '@twake/telephony-client'
 import type { ConferenceParticipant } from '@twake/telephony-types'
 import type { useGateway } from '../gateway.js'
 import type { usePhone } from '../softphone.js'
@@ -41,7 +42,8 @@ const reads = (...answers: (ConferenceParticipant[] | Error | Promise<Conference
     return { meetingId: ROOM, participants: await next }
   })
   const muteParticipant = vi.fn(async () => undefined)
-  const client: Partial<Gateway['client']> = { getCallConference, muteParticipant }
+  const getCapabilities = vi.fn(async () => ({ conference: { dialIn: true, dialOut: true } }))
+  const client: Partial<Gateway['client']> = { getCallConference, muteParticipant, getCapabilities: getCapabilities as unknown as Gateway['client']['getCapabilities'], getVisio: async () => null }
   gateway = { client: client as Gateway['client'], me: { extension: '101' } as Gateway['me'] }
   return { getCallConference, muteParticipant }
 }
@@ -269,6 +271,94 @@ describe('CallPanel, a conference (step 8b): who comes in or leaves is told in t
     expect(host.querySelector('[data-testid="conference-confirm"]')).toBeNull()
     expect(document.activeElement === host.querySelector('.call-title') || document.activeElement === document.body).toBe(true)
     expect(button('call.addParticipant').disabled).toBe(false)
+  })
+
+  it('offers « Passer en visio » to the one who made the conference when Meet is there, off with its reason while a call with the operator waits or a passage goes on; the click opens a tab on the room of Meet, the state is read behind (and found again on opening), numbers called again ask for the person\'s word and who stays is named (step 8d)', async () => {
+    reads([alice(true), jean()])
+    const person = (number: string, status: CallVisio['people'][number]['status'], kind: CallVisio['people'][number]['kind'] = 'number') => ({ number, kind, status })
+    const meetId = 'fe15dd04-262c-48d6-83de-d82ab167deb3'
+    let passage: CallVisio | null = null
+    const startVisio = vi.fn(async (_id: string) => (passage = { meetingId: meetId, slug: 'abc-defg-hij', url: 'https://meet.example/abc-defg-hij', state: 'running', people: [] }))
+    const getVisio = vi.fn(async (_id: string) => passage)
+    const leaveVisio = vi.fn(async (_id: string) => ({ left: false, remaining: ['104'] }))
+    const call = roomCall(true, 'room-a@192.0.2.30')
+    const renderIt = (caps: boolean, awaiting: boolean) =>
+      act(async () => {
+        Object.assign(gateway.client, { getCapabilities: async () => ({ conference: { dialIn: true, dialOut: true, ...(caps ? { visio: true } : {}) } }), startVisio, getVisio, leaveVisio })
+        phone = { calls: [call], lastEnded: null, tones: {}, rooms: { [call.conferenceOf!]: ROOM }, parties: {}, inviting: {}, awaiting: awaiting ? { [call.conferenceOf!]: '+33612345678' } : {}, confirmConference: async () => undefined, cancelAwaiting: async () => undefined }
+        root.render(<CallPanel />)
+        await vi.advanceTimersByTimeAsync(0)
+      })
+    const button = (name: string) => [...host.querySelectorAll('button')].find(b => b.textContent === name)
+    await renderIt(false, false)
+    expect(button('conference.visio')).toBeUndefined()
+    act(() => root.unmount())
+    root = createRoot(host)
+    // A call with the operator waits for the person: the button is there, off, and says why.
+    await renderIt(true, true)
+    expect(button('conference.visio')!.disabled).toBe(true)
+    expect(button('conference.visio')!.getAttribute('aria-describedby')).toBeTruthy()
+    expect(host.textContent).toContain('conference.errorVisioAwaiting')
+    act(() => root.unmount())
+    root = createRoot(host)
+    await renderIt(true, false)
+    const tab = { opener: 'us', location: { href: '' }, close: vi.fn() }
+    vi.stubGlobal('open', vi.fn(() => tab))
+    expect(button('conference.visio')!.disabled).toBe(false)
+    await act(async () => {
+      button('conference.visio')!.click()
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    expect(startVisio).toHaveBeenCalledWith(ROOM)
+    expect(tab.opener).toBeNull()
+    expect(tab.location.href).toBe('https://meet.example/abc-defg-hij')
+    // Running: said, nothing asked, the buttons off with the reason; read again every 2 s.
+    expect(host.querySelector('[role="status"].badge')?.textContent).toBe('conference.visioRunning')
+    expect(button('conference.visio')!.disabled).toBe(true)
+    expect(button('call.addParticipant')!.disabled).toBe(true)
+    expect(host.textContent).toContain('conference.visioGoing')
+    passage = { ...passage!, state: 'done', people: [person('102', 'swapped', 'extension'), person('+33612345678', 'called'), person('104', 'failed', 'extension')] }
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_100)
+    })
+    const alert = host.querySelector('[role="alert"]')?.textContent ?? ''
+    // Only who was called by a new call is asked about (no empty list), and who stays is said.
+    expect(alert).toContain('conference.visioAwaiting +33 6 12 34 56 78')
+    expect(alert).toContain('conference.visioFailed 104')
+    expect(alert).not.toContain('102')
+    await act(async () => {
+      button('conference.visioLeave')!.click()
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    expect(leaveVisio).toHaveBeenCalledWith(ROOM)
+    // Not ended: someone stays in the old room, named; the question stays.
+    expect(host.textContent).toContain('conference.visioRemaining 104')
+    expect(host.querySelector('[role="alert"]')).not.toBeNull()
+    leaveVisio.mockResolvedValueOnce({ left: true, remaining: [] })
+    await act(async () => {
+      button('conference.visioLeave')!.click()
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    expect(host.querySelector('[role="alert"]')).toBeNull()
+    // A page loaded again finds the passage (the Gateway's record): the button is off at once, nothing asked when only phones moved.
+    act(() => root.unmount())
+    root = createRoot(host)
+    passage = { meetingId: meetId, slug: 'abc-defg-hij', url: 'https://meet.example/abc-defg-hij', state: 'done', people: [person('102', 'swapped', 'extension')] }
+    await renderIt(true, false)
+    expect(button('conference.visio')!.disabled).toBe(true)
+    expect(host.querySelector('[role="alert"]')).toBeNull()
+    // Meet says no: the tab is closed and the person told.
+    act(() => root.unmount())
+    root = createRoot(host)
+    passage = null
+    startVisio.mockRejectedValueOnce(Object.assign(new Error('VISIO_UNAVAILABLE'), { code: 'VISIO_UNAVAILABLE' }))
+    await renderIt(true, false)
+    await act(async () => {
+      button('conference.visio')!.click()
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    expect(tab.close).toHaveBeenCalled()
+    expect(host.textContent).toContain('conference.errorVisioUnavailable')
   })
 
 })

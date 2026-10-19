@@ -92,6 +92,13 @@ export interface TelephonyProvider {
    */
   callBetweenExtensions?(callId: string): Promise<CallParties | CallWithOperator | 'external' | undefined>
   /**
+   * A call a room placed to one of the tenant's extensions, answered, as the SIP server holds its dialog (step 8d, ADR
+   * 0026): `caller` is the extension it was placed at the name of, `callee` the one that answered, with the tags of the
+   * dialog, which a call of another room that takes its place names (Replaces). Undefined for any other call, one not
+   * answered yet or over; an SIP server that cannot say fails (503).
+   */
+  roomCallParties?(callId: string): Promise<CallParties | undefined>
+  /**
    * The access number of Meet's rooms as the SIP server has it (step 8): `number` undefined when its rooms are off
    * there; undefined when it cannot say. The Gateway compares it with its own at its start.
    */

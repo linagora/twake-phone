@@ -584,7 +584,8 @@ export interface Capabilities {
    * (`OutboundProfile`, `OutboundPolicy`), and the provider raises alerts (`alert.raised`).
    */
   outboundPolicy?: boolean
-  conference: { dialIn: boolean; dialOut: boolean }
+  /** `visio`: a conference of a call can go to a room of Meet, in the browser (step 8d, ADR 0026). */
+  conference: { dialIn: boolean; dialOut: boolean; visio?: boolean }
   /**
    * Each person has a mailbox (step 11a, ADR 0022): a call nobody answers, refused by their "do not disturb", busy or
    * that reaches nobody goes there, and they read their messages (`Voicemail`, the `voicemail.*` events).

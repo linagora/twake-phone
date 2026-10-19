@@ -50,6 +50,12 @@ export const describeConferenceError = (err: unknown, t: T, { making = false, wh
   const failed = err as { code?: unknown; status?: unknown; conferenceMade?: unknown; callOver?: unknown } | null
   if (failed?.conferenceMade === true) making = false
   switch (failed?.code) {
+    case 'VISIO_UNAVAILABLE':
+      return t('conference.errorVisioUnavailable')
+    case 'VISIO_IN_PROGRESS':
+      return t('conference.errorVisioInProgress')
+    case 'CONFERENCE_AWAITING':
+      return t('conference.errorVisioAwaiting')
     case 'CONFERENCE_CONFIRMED':
       return t('conference.errorConfirmed')
     case 'CONFERENCE_CANCELLED':

@@ -3,7 +3,7 @@ import { readdir, readFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import pg from 'pg'
 import { EMPTY_OUTBOUND, outboundVersion, staleOutbound } from '../outbound.js'
-import { ALERT_DEDUP_MS, alertKey, clampLimit, type AlertQuery, type AlertRecord, type StoredAlert, type ConferenceDecision, type ConferenceRecord, type DidRecord, type SiteRecord, type OutboundHand, type OutboundRecord, type OutboundRules, type HistoryEntry, type HistoryNearQuery, type HistoryPage, type HistoryQuery, type OperatorCdrOutcome, type OperatorCdrRecord, type OperatorCdrStats, type MappingSource, type ErasedCallsKept, type ProviderRecord, type PushSaveResult, type PushSubscriptionRecord, type Store, type TrunkRecord, type MappingChange, type UserMapping, type UserPresenceRecord, type VapidKeysRecord, type ClaimedDelivery, type WebhookAttemptResult, type WebhookClaimCaps, type WebhookClaimTime, allocateClaims, claimOrder, type WebhookDeliveryQuery, type WebhookLease, type WebhookSendQuota, type WebhookDeliveryRecord, type WebhookHealth, type WebhookQueueOptions, type WebhookStateChange, type WebhookStateEvent, type WebhookSubscriptionRecord, WEBHOOK_STATE_ROLE , type FencedLease, type NewTranscript, type TranscriptChange, type TranscriptLane, holderIn, holderOut, type TranscriptMatch, type TranscriptNotice, type TranscriptRecord } from './types.js'
+import { ALERT_DEDUP_MS, alertKey, clampLimit, type AlertQuery, type AlertRecord, type StoredAlert, type ConferenceDecision, type VisioPerson, type VisioRecord, type VisioStatus, type ConferenceRecord, type DidRecord, type SiteRecord, type OutboundHand, type OutboundRecord, type OutboundRules, type HistoryEntry, type HistoryNearQuery, type HistoryPage, type HistoryQuery, type OperatorCdrOutcome, type OperatorCdrRecord, type OperatorCdrStats, type MappingSource, type ErasedCallsKept, type ProviderRecord, type PushSaveResult, type PushSubscriptionRecord, type Store, type TrunkRecord, type MappingChange, type UserMapping, type UserPresenceRecord, type VapidKeysRecord, type ClaimedDelivery, type WebhookAttemptResult, type WebhookClaimCaps, type WebhookClaimTime, allocateClaims, claimOrder, type WebhookDeliveryQuery, type WebhookLease, type WebhookSendQuota, type WebhookDeliveryRecord, type WebhookHealth, type WebhookQueueOptions, type WebhookStateChange, type WebhookStateEvent, type WebhookSubscriptionRecord, WEBHOOK_STATE_ROLE , type FencedLease, type NewTranscript, type TranscriptChange, type TranscriptLane, holderIn, holderOut, type TranscriptMatch, type TranscriptNotice, type TranscriptRecord } from './types.js'
 import type { OperatorCdr, WebhookEventType } from '@twake/telephony-types'
 
 const MIGRATIONS = fileURLToPath(new URL('../../migrations/', import.meta.url))
@@ -16,6 +16,8 @@ type MappingRow = { tenant_id: string; user_id: string; extension: string; displ
 type HistoryRow = { tenant_id: string; user_id: string; call_id: string; direction: HistoryEntry['direction']; remote_number: string; started_at: Timestamp; ended_at: Timestamp | null; duration_sec: number; state: HistoryEntry['state']; answered: boolean; conference: boolean; operator: string | null; operator_cdr: string | null; operator_only: boolean; operator_forwarded: boolean; voicemail: boolean }
 type OperatorCdrRow = { tenant_id: string; operator: string; id: string; line: string; direction: HistoryEntry['direction']; forwarded: boolean; calling: string | null; called: string | null; started_at: Timestamp; duration_sec: number; outcome: OperatorCdrRecord['outcome'] | null; call_id: string | null; user_id: string | null; invalid: string | null }
 type PresenceRow = { tenant_id: string; user_id: string; status: UserPresenceRecord['status']; since: Timestamp; until: Timestamp | null; message: string | null }
+type VisioRow = { old_room: string; meet_room: string; tenant_id: string; owner_user_id: string; slug: string; url: string | null; state: VisioRecord['state']; created_at: Timestamp }
+type VisioPersonRow = { old_room: string; key: string; position: number; number: string; kind: VisioPerson['kind']; status: VisioStatus; new_id: string | null; reason: string | null }
 type ConferenceRow = { tenant_id: string; meeting_id: string; owner_user_id: string; pin: string | null; origin_call: string | null; decision: ConferenceDecision | null; created_at: Timestamp }
 type PushRow = { tenant_id: string; user_id: string; endpoint: string; p256dh: string; auth: string; created_at: Timestamp }
 type TrunkRow = { tenant_id: string; id: string; config: TrunkRecord['config']; password_enc: string | null }
@@ -885,6 +887,56 @@ export class PgStore implements Store {
   async decideConference(meetingId: string, decision: ConferenceDecision) {
     const { rows } = await this.pool.query<{ decision: ConferenceDecision }>('UPDATE conferences SET decision = coalesce(decision, $2) WHERE meeting_id = $1 RETURNING decision', [meetingId, decision])
     return rows[0]?.decision ?? null
+  }
+
+  private visio(v: VisioRow, people: VisioPersonRow[]): VisioRecord {
+    return {
+      oldRoom: v.old_room, meetRoom: v.meet_room, tenantId: v.tenant_id, ownerUserId: v.owner_user_id, slug: v.slug, ...(v.url ? { url: v.url } : {}), state: v.state, createdAt: new Date(v.created_at).toISOString(),
+      people: people.map(p => ({ key: p.key, number: p.number, kind: p.kind, status: p.status, ...(p.new_id ? { newId: p.new_id } : {}), ...(p.reason ? { reason: p.reason } : {}) }))
+    }
+  }
+
+  private async visiosWhere(where: string, params: unknown[]): Promise<VisioRecord[]> {
+    const { rows } = await this.pool.query<VisioRow>(`SELECT * FROM visios WHERE ${where} ORDER BY created_at`, params)
+    if (!rows.length) return []
+    const { rows: people } = await this.pool.query<VisioPersonRow>('SELECT * FROM visio_people WHERE old_room = ANY($1) ORDER BY position', [rows.map(r => r.old_room)])
+    return rows.map(v => this.visio(v, people.filter(p => p.old_room === v.old_room)))
+  }
+
+  async claimVisio(record: Omit<VisioRecord, 'people'>, people: Omit<VisioPerson, 'status'>[]) {
+    await this.inTransaction(async client => {
+      const { rowCount } = await client.query('INSERT INTO visios (old_room, meet_room, tenant_id, owner_user_id, slug, url, state, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT DO NOTHING', [record.oldRoom, record.meetRoom, record.tenantId, record.ownerUserId, record.slug, record.url ?? null, record.state, record.createdAt])
+      if (!rowCount) return
+      let position = 0
+      for (const p of people) await client.query('INSERT INTO visio_people (old_room, key, position, number, kind) VALUES ($1, $2, $3, $4, $5)', [record.oldRoom, p.key, position++, p.number, p.kind])
+    })
+    const [v] = await this.visiosWhere('old_room = $1 OR meet_room = $2', [record.oldRoom, record.meetRoom])
+    return v!
+  }
+
+  async getVisio(oldRoom: string) {
+    return (await this.visiosWhere('old_room = $1', [oldRoom]))[0] ?? null
+  }
+
+  async getVisioByMeetRoom(meetRoom: string) {
+    return (await this.visiosWhere('meet_room = $1', [meetRoom]))[0] ?? null
+  }
+
+  async listVisios(tenantId: string, ownerUserId: string) {
+    return this.visiosWhere('tenant_id = $1 AND owner_user_id = $2', [tenantId, ownerUserId])
+  }
+
+  async moveVisioPerson(oldRoom: string, key: string, from: VisioStatus, to: VisioStatus, patch: { newId?: string; reason?: string } = {}) {
+    const { rowCount } = await this.pool.query('UPDATE visio_people SET status = $4, new_id = coalesce($5, new_id), reason = coalesce($6, reason) WHERE old_room = $1 AND key = $2 AND status = $3', [oldRoom, key, from, to, patch.newId ?? null, patch.reason ?? null])
+    return (rowCount ?? 0) > 0
+  }
+
+  async setVisioState(oldRoom: string, state: VisioRecord['state']) {
+    await this.pool.query('UPDATE visios SET state = $2 WHERE old_room = $1', [oldRoom, state])
+  }
+
+  async deleteVisio(oldRoom: string) {
+    await this.pool.query('DELETE FROM visios WHERE old_room = $1', [oldRoom])
   }
 
   async countConferences(tenantId: string, ownerUserId?: string) {

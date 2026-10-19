@@ -33,7 +33,7 @@ import { DELIVERY_CURSOR, DELIVERY_ID, MAX_WEBHOOKS, WEBHOOK_ID, WEBHOOK_SECRET_
 import { MAX_DIDS, MAX_SITES, MAX_TRUNKS, TRUNK_ID, defaultTrunk, inDids, parseDid, parseOperatorLines, parseSite, parseTrunk, providerTrunks, publicDid, publicSite, publicTrunk, trunkRecord } from './trunks.js'
 import { EMPTY_OUTBOUND, PROFILE_ID, outboundVersion, parseOutbound, staleOutbound, type Outbound } from './outbound.js'
 import { MemoryStore } from './store/memory.js'
-import { ALERT_RETENTION_DAYS, clampLimit, isMissed, type AlertRecord, type HistoryEntry, type HistoryQuery, type Store, type StoredAlert, type TrunkRecord, type UserPresenceRecord, type WebhookDeliveryStatus, type WebhookSubscriptionRecord } from './store/types.js'
+import { ALERT_RETENTION_DAYS, clampLimit, isMissed, type AlertRecord, type HistoryEntry, type HistoryQuery, type Store, type StoredAlert, type TrunkRecord, type VisioPerson, type VisioRecord, type UserPresenceRecord, type WebhookDeliveryStatus, type WebhookSubscriptionRecord } from './store/types.js'
 
 /** How long a trunk's save waits for its operator (step 10b), and a round asked from the administration. */
 const OPERATOR_APPLY_MS = 8_000
@@ -206,6 +206,8 @@ export interface BuildOptions {
    * without waiting for LiveKit's webhook. Default: 15 s.
    */
   conferenceOwnerCheckMs?: number
+  /** How long after a passage to Meet before its room may be ended for want of anyone of the organisation in it (ADR 0026). Default: 2 min. */
+  visioGraceMs?: number
   /**
    * How long someone found without an extension keeps their browsers' subscriptions: removed at the first
    * reconciliation after that (a mapping missing a moment loses nothing). Default: an hour.
@@ -1715,7 +1717,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         // A mailbox (step 11a): with a voicemail server for the tenant, and a SIP server that sends calls to it.
         // Its shared variable says so when it can: a SIP server started without Wazo has none.
         const voicemail = !!options.voicemail?.(user.tenantId) && !!provider.setVoicemailBoxes && !!user.extension && (await voicemailOn(user.tenantId, provider))
-        return { ...caps, conference: { dialIn: enabled, dialOut: enabled }, ...(voicemail ? { voicemail: true, ...(transcripts.transcribes ? { voicemailTranscription: true } : {}) } : {}) }
+        return { ...caps, conference: { dialIn: enabled, dialOut: enabled, ...(enabled && options.conference?.meet ? { visio: true } : {}) }, ...(voicemail ? { voicemail: true, ...(transcripts.transcribes ? { voicemailTranscription: true } : {}) } : {}) }
       })
 
       // What the others see, and what the person chose (`choice`: kept in the store, with its end and message).
@@ -3086,6 +3088,8 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
       const shown = ({ sipCallId: _, ...participant }: DialedParticipant) => participant
       v1.post<{ Params: { id: string }; Body: { number?: string } }>('/conferences/:id/participants', async (req, reply) => {
         const { bridge, record, user } = await owned(req, req.params.id)
+        // Nobody is added to a room that is going to Meet: they would be left behind (step 8d).
+        if (CALL_ROOM.test(record.meetingId) && (await store.getVisio(record.meetingId))?.state !== undefined && (await store.getVisio(record.meetingId))!.state !== 'left') return reply.code(409).send({ statusCode: 409, code: 'VISIO_IN_PROGRESS', error: 'Conflict', message: 'The conference is going to video: nobody is added to the old room' })
         if (!user.extension) throw Object.assign(new Error('You hold no extension: a room calls at the name of whoever asks'), { statusCode: 403, code: 'NO_EXTENSION' })
         const number = (req.body?.number ?? '').trim()
         if (!/^\+?[0-9*#]{2,20}$/.test(number)) throw bad('Invalid phone number')
@@ -3136,9 +3140,17 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
       const closeEndedCallRooms = async (bridge: LiveKitConferenceBridge, tenantId: string, userId: string) => {
         // A room just made may not be in LiveKit yet (its first call rings): a minute's grace.
         const mine = (await store.listConferences(tenantId, userId)).filter(r => CALL_ROOM.test(r.meetingId) && Date.now() - Date.parse(r.createdAt) > 60_000)
-        if (!mine.length) return
-        const open = await viaLiveKit(() => bridge.openRooms(mine.map(r => r.meetingId)))
+        // The rooms of Meet of the passages (step 8d) count among the person's rooms too: those LiveKit has no more go, with their record.
+        const passages = (await store.listVisios(tenantId, userId)).filter(v => v.state !== 'running' && Date.now() - Date.parse(v.createdAt) > 60_000)
+        if (!mine.length && !passages.length) return
+        const open = await viaLiveKit(() => bridge.openRooms([...mine.map(r => r.meetingId), ...passages.map(v => v.meetRoom)]))
         for (const r of mine) if (!open.has(r.meetingId)) await store.deleteConference(r.meetingId)
+        for (const v of passages) {
+          if (open.has(v.meetRoom)) continue
+          await store.deleteConference(v.meetRoom)
+          if (!(await store.getConference(v.oldRoom))) await store.deleteVisio(v.oldRoom)
+          else await store.setVisioState(v.oldRoom, 'left')
+        }
       }
       // One conference at a time per call (review 8b, n°6): both parties asking at once would have two rooms take the
       // same dialog. In this process (a Gateway behind another one asked at the same instant is not seen).
@@ -3276,6 +3288,227 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         return reply.code(204).send()
       })
 
+      // « Passer en visio » (step 8d, ADR 0026): the conference of a call goes to a room of Meet, opened for the person (its
+      // access the most closed Meet gives: restricted). No call moves between rooms (LiveKit's own does not): each person
+      // on the phone is called again from Meet's room, at the person's name, through the grant and the checks of any call
+      // of a room: the phone of an extension in the place of its call (Replaces, as in step 8b: no ringing, nothing is
+      // hung up until its new call is through), a number of the public network by a new call (as in step 8c). The passage
+      // is a record (`visios`) every Gateway reads, not a request that lasts: POST answers at once (202) with the link of
+      // Meet's room and the calls go on behind it, one person at a time, each read again just before its call; GET gives
+      // the state, wherever the window reads it from. A second POST for the same room gives the same passage, never a
+      // second room of Meet. Whoever cannot be called again, or is added meanwhile, stays in the old room, and the person's
+      // own call with it: the old room is ended only when no one is left in it (visio/leave).
+      const goingVisio = new Set<string>()
+      const visioRuns = new Set<string>()
+      const VISIO_NUMBER = /^\+[0-9]{6,15}$/
+      const visioView = (v: VisioRecord) => ({ meetingId: v.meetRoom, slug: v.slug, ...(v.url ? { url: v.url } : {}), state: v.state, people: v.people.map(p => ({ number: p.number, kind: p.kind, status: p.status, ...(p.reason ? { reason: p.reason } : {}) })) })
+      const meetGraceMs = options.visioGraceMs ?? 120_000
+      /**
+       * Ends Meet's room of a passage when nobody of the organisation and no browser is in it any more and someone from
+       * outside is (ADR 0026, as the owner's guard of ADR 0019 for a call's room): those calls go at the owner's name and on
+       * their caps. Not before meetGraceMs after the passage (the person's browser is joining). Whether it ended.
+       */
+      const endMeetIfAbandoned = async (bridge: LiveKitConferenceBridge, v: VisioRecord) => {
+        if (Date.now() - Date.parse(v.createdAt) < meetGraceMs) return false
+        const now = await viaLiveKit(() => bridge.participantCalls(v.meetRoom))
+        let member = false
+        let outsider = false
+        for (const p of now) {
+          if (p.number === '' || (await insider({ tenantId: v.tenantId, ownerUserId: v.ownerUserId }, p))) member = true
+          else outsider = true
+        }
+        if (!outsider || member) return false
+        app.log.info({ tenantId: v.tenantId }, 'nobody of the organisation is left in the room of Meet of a passage with someone from outside: the room ends')
+        await viaLiveKit(() => bridge.deleteRoom(v.meetRoom))
+        await store.deleteConference(v.meetRoom)
+        await store.setVisioState(v.oldRoom, 'left')
+        return true
+      }
+      const watchMeet = (bridge: LiveKitConferenceBridge, oldRoom: string) => {
+        let busy = false
+        const timer = setInterval(() => {
+          if (busy) return
+          busy = true
+          void (async () => {
+            const v = await store.getVisio(oldRoom)
+            if (closing || !v || v.state === 'left' || !(await viaLiveKit(() => bridge.openRooms([v.meetRoom]))).has(v.meetRoom)) return clearInterval(timer)
+            if (await endMeetIfAbandoned(bridge, v)) clearInterval(timer)
+          })()
+            .catch((err: unknown) => app.log.warn({ err }, "the room of Meet of a passage not looked at"))
+            .finally(() => (busy = false))
+        }, ownerCheckMs)
+        timer.unref()
+      }
+      const runVisio = (bridge: LiveKitConferenceBridge, provider: TelephonyProvider, ctx: { tenantId: string; userId: string; me: string }, oldRoom: string) => {
+        visioRuns.add(oldRoom)
+        const { tenantId, me } = ctx
+        const run = async () => {
+          const first = await store.getVisio(oldRoom)
+          if (!first) return
+          // A call a process that ended left half made: not made again (it may have gone through).
+          for (const p of first.people) if (p.status === 'calling') await store.moveVisioPerson(oldRoom, p.key, 'calling', 'failed', { reason: 'interrupted' })
+          const halt = async () => {
+            await store.setVisioState(oldRoom, 'halted')
+            const v = await store.getVisio(oldRoom)
+            for (const p of v?.people ?? []) {
+              if (p.status === 'pending') await store.moveVisioPerson(oldRoom, p.key, 'pending', 'failed', { reason: 'halted' })
+              // The ones called again by a new call go back to the old room: their Meet call ends, their old one never did.
+              if (p.status === 'called' && p.newId) {
+                await viaLiveKit(() => bridge.disconnectParticipant(p.newId!)).catch(() => undefined)
+                await store.moveVisioPerson(oldRoom, p.key, 'called', 'failed', { reason: 'returned' })
+              }
+            }
+          }
+          for (const person of first.people) {
+            const v = await store.getVisio(oldRoom)
+            if (!v || v.state !== 'running') return
+            if (!(await store.moveVisioPerson(oldRoom, person.key, 'pending', 'calling'))) continue
+            const fail = (reason: string) => store.moveVisioPerson(oldRoom, person.key, 'calling', 'failed', { reason })
+            if (person.kind === 'other') {
+              await fail('unsupported')
+              continue
+            }
+            // The old room, read again just before: gone (left, removed) is not called again.
+            let now: ParticipantCall | undefined
+            try {
+              now = (await viaLiveKit(() => bridge.participantCalls(v.oldRoom))).find(p => p.id === person.key)
+            } catch {
+              await fail('unreachable')
+              continue
+            }
+            if (!now) {
+              await store.moveVisioPerson(oldRoom, person.key, 'calling', 'gone')
+              continue
+            }
+            try {
+              let replaces: string | undefined
+              if (person.kind === 'extension') {
+                // Their call from the old room, as the SIP server holds it: placed at the name of this person, answered by this phone.
+                const parties = now.callId ? await provider.roomCallParties!(now.callId) : undefined
+                if (!parties || parties.caller !== me || parties.callee !== person.number) throw Object.assign(new Error('call not found'), { code: 'NOT_FOUND' })
+                replaces = `${parties.callId};to-tag=${parties.calleeTag};from-tag=${parties.callerTag}`
+                if (!REPLACES.test(replaces)) throw Object.assign(new Error('call cannot be replaced'), { code: 'NOT_FOUND' })
+              }
+              if (!(await trunkIntact(bridge, tenantId, me))) throw Object.assign(new Error('diverted'), { code: 'CALL_DIVERTED' })
+              const grant = await provider.grantRoomCall!({ extension: me, number: person.number, ...(replaces ? { replaces } : {}) })
+              let participant: DialedParticipant
+              try {
+                participant = await viaLiveKit(() => bridge.dialParticipant(v.meetRoom, person.number, { from: me, grant: grant.token }))
+              } catch (err) {
+                if (await settle(provider, tenantId, grant, undefined, me, person.number)) throw Object.assign(new Error('diverted'), { code: 'CALL_DIVERTED' })
+                throw err
+              }
+              if (await settle(provider, tenantId, grant, participant, me, person.number)) {
+                await viaLiveKit(() => bridge.disconnectParticipant(participant.id)).catch(() => undefined)
+                throw Object.assign(new Error('diverted'), { code: 'CALL_DIVERTED' })
+              }
+              await store.moveVisioPerson(oldRoom, person.key, 'calling', replaces ? 'swapped' : 'called', { newId: participant.id })
+            } catch (err) {
+              const failed = err as Error & { code?: string; sipStatus?: number }
+              if (failed.code === 'CALL_DIVERTED') {
+                await fail('diverted')
+                await halt()
+                return
+              }
+              app.log.warn({ err }, 'a participant was not called again from the room of Meet')
+              await fail(failed.sipStatus ? `sip ${failed.sipStatus}` : (failed.code ?? 'failed'))
+            }
+          }
+          // Everyone still there was called in the place of their call: nothing waits, the person's own call goes too (their
+          // voice passes by the video). Otherwise it waits for their word (visio/leave).
+          const done = await store.getVisio(oldRoom)
+          if (!done || done.state !== 'running') return
+          await store.setVisioState(oldRoom, 'done')
+          const fresh = (await store.getVisio(oldRoom))!
+          if (fresh.people.every(p => p.status === 'swapped' || p.status === 'gone'))
+            for (const p of await viaLiveKit(() => bridge.participantCalls(oldRoom)).catch(() => [])) if (p.number === me) await viaLiveKit(() => bridge.disconnectParticipant(p.id)).catch(() => undefined)
+          watchMeet(bridge, oldRoom)
+        }
+        void run()
+          .catch(async (err: unknown) => {
+            app.log.error({ err }, 'a passage to the room of Meet failed')
+            await store.setVisioState(oldRoom, 'halted').catch(() => undefined)
+          })
+          .finally(() => visioRuns.delete(oldRoom))
+      }
+      v1.post<{ Params: { id: string } }>('/conferences/:id/visio', async (req, reply) => {
+        const { user, bridge, record, email } = await owned(req, req.params.id)
+        const meet = options.conference?.meet
+        if (!meet) return reply.code(501).send({ statusCode: 501, code: 'VISIO_UNAVAILABLE', error: 'Not Implemented', message: 'Meet is not configured: there is no room to open' })
+        if (!CALL_ROOM.test(record.meetingId)) throw bad('Only the room of a call becomes a video conference')
+        if (record.originCall && !record.decision) return reply.code(409).send({ statusCode: 409, code: 'CONFERENCE_AWAITING', error: 'Conflict', message: 'Confirm or give up the call with the operator first' })
+        if (!email) throw bad('Your account has no email: Meet cannot identify you')
+        const me = user.extension
+        if (!me) throw Object.assign(new Error('You hold no extension: a room calls at the name of whoever asks'), { statusCode: 403, code: 'NO_EXTENSION' })
+        const provider = registry.serves(user.tenantId) ? registry.forTenant(user.tenantId) : undefined
+        if (!provider?.grantRoomCall || !provider.roomCallParties) throw Object.assign(new Error('The SIP server cannot let a room call'), { statusCode: 501 })
+        if (goingVisio.has(record.meetingId)) return reply.code(409).send({ statusCode: 409, code: 'VISIO_IN_PROGRESS', error: 'Conflict', message: 'The conference is already going to video' })
+        goingVisio.add(record.meetingId)
+        try {
+          let visio = await store.getVisio(record.meetingId)
+          if (!visio) {
+            const inside = await viaLiveKit(() => bridge.participantCalls(record.meetingId))
+            const people: Omit<VisioPerson, 'status'>[] = []
+            for (const p of inside.filter(p => p.number !== me)) {
+              const kind = p.number && (await store.getMappingByExtension(user.tenantId, p.number)) ? 'extension' : VISIO_NUMBER.test(p.number) ? 'number' : 'other'
+              people.push({ key: p.id, number: p.number, kind })
+            }
+            if (!dialOuts.allow(ownerKey(user.tenantId, user.id), Math.max(people.filter(p => p.kind !== 'other').length, 1))) return reply.code(429).send(tooManyDialOuts)
+            if (!(await mayOpen(user.tenantId, user.id))) return reply.code(429).send(tooManyRooms)
+            let room: MeetRoom
+            try {
+              room = await meet.createRoom(email, { accessLevel: 'restricted' })
+            } catch (err) {
+              app.log.error({ err }, 'Meet request failed')
+              throw Object.assign(new Error('Meet is unavailable'), { statusCode: 502 })
+            }
+            // The room of Meet is the person's, or the passage is not made (a room claimed by someone else is never used).
+            const claimed = await store.claimConference({ tenantId: user.tenantId, meetingId: room.id, ownerUserId: user.id, createdAt: new Date().toISOString() })
+            if (claimed.tenantId !== user.tenantId || claimed.ownerUserId !== user.id) throw Object.assign(new Error('The room of Meet is not yours'), { statusCode: 502 })
+            visio = await store.claimVisio({ oldRoom: record.meetingId, meetRoom: room.id, tenantId: user.tenantId, ownerUserId: user.id, slug: room.slug, ...(room.url ? { url: room.url } : {}), state: 'running', createdAt: new Date().toISOString() }, people)
+            // Another Gateway made the passage first: its room stands, the one just made is let go.
+            if (visio.meetRoom !== room.id) await store.deleteConference(room.id)
+          }
+          if (visio.state === 'running' && !visioRuns.has(record.meetingId)) runVisio(bridge, provider, { tenantId: user.tenantId, userId: user.id, me }, record.meetingId)
+          return reply.code(202).send(visioView(visio))
+        } finally {
+          goingVisio.delete(record.meetingId)
+        }
+      })
+      v1.get<{ Params: { id: string } }>('/conferences/:id/visio', async (req, reply) => {
+        const { record } = await owned(req, req.params.id)
+        const visio = await store.getVisio(record.meetingId)
+        if (!visio) return reply.code(404).send({ statusCode: 404, code: 'VISIO_NONE', error: 'Not Found', message: 'This conference is not going to video' })
+        return visioView(visio)
+      })
+      // « Terminer l'ancienne salle » (step 8d): the person hears, in Meet's room, the numbers of the public network the room
+      // called again. Only the people the Gateway itself called again (the ids it recorded, found in Meet's room) end in the
+      // old room; the person's own call and the old room end only when no one else is left in it (a person who could not be
+      // called again, or who was added meanwhile, is never left alone): otherwise it says who stays. Replayable.
+      v1.post<{ Params: { id: string } }>('/conferences/:id/visio/leave', async (req, reply) => {
+        const old = await store.getConference(req.params.id)
+        if (!old) return reply.code(204).send()
+        const { user, bridge, record } = await owned(req, req.params.id)
+        const visio = await store.getVisio(record.meetingId)
+        if (!visio) return reply.code(404).send({ statusCode: 404, code: 'VISIO_NONE', error: 'Not Found', message: 'This conference is not going to video' })
+        if (visio.state === 'running') return reply.code(409).send({ statusCode: 409, code: 'VISIO_IN_PROGRESS', error: 'Conflict', message: 'The calls are still being made' })
+        const there = new Set((await viaLiveKit(() => bridge.participantCalls(visio.meetRoom))).map(p => p.id))
+        const moved = new Map(visio.people.filter(p => (p.status === 'swapped' || p.status === 'called') && p.newId && there.has(p.newId)).map(p => [p.key, p]))
+        const here = await viaLiveKit(() => bridge.participantCalls(record.meetingId))
+        const remaining: string[] = []
+        for (const p of here) {
+          if (p.number === user.extension) continue
+          if (moved.has(p.id)) await viaLiveKit(() => bridge.disconnectParticipant(p.id))
+          else remaining.push(p.number || 'web')
+        }
+        if (remaining.length) return { left: false, remaining }
+        for (const p of here) if (p.number === user.extension) await viaLiveKit(() => bridge.disconnectParticipant(p.id))
+        await viaLiveKit(() => bridge.deleteRoom(record.meetingId))
+        await store.deleteConference(record.meetingId)
+        await store.setVisioState(record.meetingId, 'left')
+        return { left: true, remaining: [] }
+      })
+
       /**
        * Ends the room its owner is no longer in while someone from outside is (review 8b, n°7; insider, second review
        * 8b, n°4): that call goes at the owner's name and on their caps, with nobody left to end it. Read from LiveKit
@@ -3339,6 +3572,14 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         if (record && bridge && body.event === 'participant_left' && CALL_ROOM.test(record.meetingId)) {
           const owner = await store.getMappingByUser(record.tenantId, record.ownerUserId)
           if (owner?.extension && (body as { participant?: { attributes?: Record<string, string> } }).participant?.attributes?.['twake.number'] === owner.extension) await endIfOwnerGone(bridge, record)
+        }
+        // The room of Meet of a passage (step 8d): its record goes with it, and it ends when nobody of the organisation is in it.
+        if (record && !CALL_ROOM.test(record.meetingId)) {
+          const visio = await store.getVisioByMeetRoom(record.meetingId)
+          if (visio && body.event === 'room_finished') {
+            await store.deleteConference(record.meetingId)
+            await store.setVisioState(visio.oldRoom, 'left')
+          } else if (visio && bridge && body.event === 'participant_left') await endMeetIfAbandoned(bridge, visio)
         }
         const event = record && bridge ? bridge.fromWebhook(body) : undefined
         if (record && event) bus.publish(record.tenantId, record.ownerUserId, event)

@@ -34,6 +34,16 @@ describe('MeetApi', () => {
     expect(r).toMatchObject({ id: 'id-abc-defg-hij', slug: 'abc-defg-hij', telephony: { phoneNumber: '8000', pinCode: '1234567890', defaultCountry: 'FR' } })
   })
 
+  it('asks for the room access it wants and refuses a room Meet made more open than that (step 8d)', async () => {
+    const closed = setup({ ...token, 'POST /rooms/': body => ({ json: { ...room('abc-defg-hij'), access_level: body.access_level } }) })
+    const r = await closed.api.createRoom('a@x.fr', { accessLevel: 'restricted' })
+    expect(closed.calls[1]!.body).toEqual({ access_level: 'restricted' })
+    expect(r.accessLevel).toBe('restricted')
+    // A Meet that ignores the level and makes a trusted room: refused, never kept.
+    const open = setup({ ...token, 'POST /rooms/': () => ({ json: room('abc-defg-hij') }) })
+    await expect(open.api.createRoom('a@x.fr', { accessLevel: 'restricted' })).rejects.toMatchObject({ status: 502 })
+  })
+
   it('caches tokens per user until shortly before they expire', async () => {
     const { api, calls, tick } = setup({ ...token, 'POST /rooms/': () => ({ json: room('a') }) })
     await api.createRoom('a@x.fr')
