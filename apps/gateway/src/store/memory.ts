@@ -1,5 +1,5 @@
 import type { OperatorCdr } from '@twake/telephony-types'
-import { clampLimit, isDeclined, isMissed, type HistoryEntry, type HistoryNearQuery, type HistoryPage, type HistoryQuery, type OperatorCdrOutcome, type OperatorCdrRecord, type OperatorCdrStats, type ConferenceRecord, type AlertRecord, type AlertQuery, type DidRecord, type SiteRecord, type OutboundHand, type OutboundRecord, type OutboundRules, ALERT_DEDUP_MS, alertKey, type ProviderRecord, type StoredAlert, type PushSaveResult, type PushSubscriptionRecord, type Store, type TrunkRecord, type MappingChange, type UserMapping, type UserPresenceRecord, type VapidKeysRecord, type ClaimedDelivery, type ErasedCall, type ErasedCallsKept, type WebhookAttemptResult, type WebhookClaimCaps, type WebhookClaimTime, allocateClaims, type WebhookDeliveryQuery, type WebhookLease, type WebhookSendQuota, type WebhookDeliveryRecord, type WebhookQueueOptions, type WebhookStateChange, type WebhookStateEvent, type WebhookSubscriptionRecord, WEBHOOK_STATE_ROLE, type FencedLease, type NewTranscript, type TranscriptChange, type TranscriptLane, type TranscriptMatch, type TranscriptNotice, type TranscriptRecord } from './types.js'
+import { clampLimit, isDeclined, isMissed, type HistoryEntry, type HistoryNearQuery, type HistoryPage, type HistoryQuery, type OperatorCdrOutcome, type OperatorCdrRecord, type OperatorCdrStats, type ConferenceDecision, type ConferenceRecord, type AlertRecord, type AlertQuery, type DidRecord, type SiteRecord, type OutboundHand, type OutboundRecord, type OutboundRules, ALERT_DEDUP_MS, alertKey, type ProviderRecord, type StoredAlert, type PushSaveResult, type PushSubscriptionRecord, type Store, type TrunkRecord, type MappingChange, type UserMapping, type UserPresenceRecord, type VapidKeysRecord, type ClaimedDelivery, type ErasedCall, type ErasedCallsKept, type WebhookAttemptResult, type WebhookClaimCaps, type WebhookClaimTime, allocateClaims, type WebhookDeliveryQuery, type WebhookLease, type WebhookSendQuota, type WebhookDeliveryRecord, type WebhookQueueOptions, type WebhookStateChange, type WebhookStateEvent, type WebhookSubscriptionRecord, WEBHOOK_STATE_ROLE, type FencedLease, type NewTranscript, type TranscriptChange, type TranscriptLane, type TranscriptMatch, type TranscriptNotice, type TranscriptRecord } from './types.js'
 import type { WebhookEventType } from '@twake/telephony-types'
 import { randomBytes } from 'node:crypto'
 import { EMPTY_OUTBOUND, outboundVersion, staleOutbound } from '../outbound.js'
@@ -565,6 +565,13 @@ export class MemoryStore implements Store {
     if (to === null) delete c.pin
     else c.pin = to
     return true
+  }
+
+  async decideConference(meetingId: string, decision: ConferenceDecision) {
+    const c = this.conferences.get(meetingId)
+    if (!c) return null
+    c.decision ??= decision
+    return c.decision
   }
 
   async countConferences(tenantId: string, ownerUserId?: string) {

@@ -12,7 +12,7 @@ type Gateway = ReturnType<typeof useGateway>
 type Phone = ReturnType<typeof usePhone>
 // What useGateway() and usePhone() hand the panel, set by each test before it renders.
 let gateway: Pick<Gateway, 'client' | 'me'>
-let phone: Pick<Phone, 'calls' | 'lastEnded' | 'tones' | 'rooms' | 'parties' | 'inviting'>
+let phone: Pick<Phone, 'calls' | 'lastEnded' | 'tones' | 'rooms' | 'parties' | 'inviting' | 'awaiting' | 'confirmConference' | 'cancelAwaiting'>
 vi.mock('../gateway.js', () => ({ useGateway: () => gateway }))
 vi.mock('../softphone.js', () => ({ usePhone: () => phone }))
 // One translator for every render, as the app's (a new one would start the reads again).
@@ -54,7 +54,7 @@ describe('CallPanel, a conference (step 8b): who comes in or leaves is told in t
   const status = () => host.querySelector('[data-testid="call-status"]')!.textContent
   const render = (call: SoftCall, parties?: ConferenceParticipant[]) =>
     act(async () => {
-      phone = { calls: [call], lastEnded: null, tones: {}, rooms: call.conferenceOf ? { [call.conferenceOf]: ROOM } : {}, parties: parties && call.conferenceOf ? { [call.conferenceOf]: parties } : {}, inviting: {} }
+      phone = { calls: [call], lastEnded: null, tones: {}, rooms: call.conferenceOf ? { [call.conferenceOf]: ROOM } : {}, parties: parties && call.conferenceOf ? { [call.conferenceOf]: parties } : {}, inviting: {}, awaiting: {}, confirmConference: async () => undefined, cancelAwaiting: async () => undefined }
       root.render(<CallPanel />)
       await vi.advanceTimersByTimeAsync(0)
     })
@@ -226,4 +226,49 @@ describe('CallPanel, a conference (step 8b): who comes in or leaves is told in t
     await render(roomCall(false, 'room-a@192.0.2.30'))
     expect([...host.querySelectorAll('[data-testid="conference-participant"]')].filter(li => li.textContent?.includes('conference.you'))).toHaveLength(1)
   })
+  it('asks the person to confirm a call with the operator made a conference (step 8c): the number called is shown in an alert, the two buttons are off while a request is out (no double send), « Passer en conférence » confirms, « Annuler » gives up, the add button waits, and the focus comes back when the question goes', async () => {
+    reads([alice(true), jean()])
+    let release: () => void = () => undefined
+    const confirmConference = vi.fn(() => new Promise<void>(resolve => (release = resolve)))
+    const cancelAwaiting = vi.fn(async () => undefined)
+    const call = roomCall(true, 'room-a@192.0.2.30')
+    const renderWaiting = (waiting: boolean) =>
+      act(async () => {
+        phone = { calls: [call], lastEnded: null, tones: {}, rooms: { [call.conferenceOf!]: ROOM }, parties: {}, inviting: {}, awaiting: waiting ? { [call.conferenceOf!]: '+33612345678' } : {}, confirmConference, cancelAwaiting }
+        root.render(<CallPanel />)
+        await vi.advanceTimersByTimeAsync(0)
+      })
+    await renderWaiting(true)
+    expect(host.querySelector('[role="alert"]')?.textContent).toContain('conference.awaiting +33 6 12 34 56 78')
+    const button = (name: string) => [...host.querySelectorAll('button')].find(b => b.textContent === name)!
+    expect(button('call.addParticipant').disabled).toBe(true)
+    await act(async () => {
+      button('conference.confirm').click()
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    expect(confirmConference).toHaveBeenCalledWith(call.conferenceOf)
+    // A request is out: neither button answers, a second click sends nothing.
+    expect(button('conference.confirm').disabled).toBe(true)
+    expect(button('conference.giveUp').disabled).toBe(true)
+    button('conference.confirm').click()
+    button('conference.giveUp').click()
+    expect(confirmConference).toHaveBeenCalledTimes(1)
+    expect(cancelAwaiting).not.toHaveBeenCalled()
+    await act(async () => {
+      release()
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    expect(button('conference.giveUp').disabled).toBe(false)
+    await act(async () => {
+      button('conference.giveUp').click()
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    expect(cancelAwaiting).toHaveBeenCalledWith(call.conferenceOf)
+    // Confirmed: the question goes, the focus is the conference's title again, the add button works.
+    await renderWaiting(false)
+    expect(host.querySelector('[data-testid="conference-confirm"]')).toBeNull()
+    expect(document.activeElement === host.querySelector('.call-title') || document.activeElement === document.body).toBe(true)
+    expect(button('call.addParticipant').disabled).toBe(false)
+  })
+
 })

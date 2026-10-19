@@ -43,6 +43,7 @@ describe('SoftphoneProvider, the conferences this window made (third review of t
   let actEnvironment: unknown
   let phone: Phone
   let inviteByPhone: ReturnType<typeof vi.fn>
+  let makeConferenceMock: ReturnType<typeof vi.fn>
   const Probe = () => {
     phone = usePhone()
     return null
@@ -56,7 +57,7 @@ describe('SoftphoneProvider, the conferences this window made (third review of t
     inviteByPhone = vi.fn(async () => undefined)
     const client: Partial<Gateway['client']> = {
       getCapabilities: vi.fn(async () => ({}) as Awaited<ReturnType<Gateway['client']['getCapabilities']>>),
-      makeConference: vi.fn(async () => ({ meetingId: ROOM, participants: parties })),
+      makeConference: makeConferenceMock = vi.fn(async () => ({ meetingId: ROOM, participants: parties })),
       inviteByPhone
     }
     gateway = { client: client as Gateway['client'], me: { id: 'u1', displayName: 'Alice', extension: '101' } }
@@ -90,6 +91,24 @@ describe('SoftphoneProvider, the conferences this window made (third review of t
     act(() => softphoneOptions!.onCallChange({ ...theRoomsCall, state: 'ended' }))
     expect(phone.rooms).toEqual({})
     expect(phone.parties).toEqual({})
+  })
+
+  it('keeps a call with the operator until the person confirms (step 8c): the third participant is not called before, and once confirmed the Gateway ends the call and the room calls them', async () => {
+    roomCall = theRoomsCall
+    const confirmConference = vi.fn(async () => undefined)
+    Object.assign(gateway.client, { confirmConference })
+    makeConferenceMock.mockResolvedValueOnce({ meetingId: ROOM, participants: parties, awaiting: '+33612345678' })
+    await act(() => phone.addParticipant(first, '103'))
+    expect(phone.awaiting).toEqual({ 'first-call': '+33612345678' })
+    expect(inviteByPhone).not.toHaveBeenCalled()
+    expect(confirmConference).not.toHaveBeenCalled()
+    await act(() => phone.confirmConference('first-call'))
+    expect(confirmConference).toHaveBeenCalledWith(ROOM)
+    expect(phone.awaiting).toEqual({})
+    expect(inviteByPhone).toHaveBeenCalledWith(ROOM, '103')
+    // Nothing waits any more: a second confirmation asks nothing.
+    await act(() => phone.confirmConference('first-call'))
+    expect(confirmConference).toHaveBeenCalledTimes(1)
   })
 
   it("keeps nothing of a conference whose room's call ended while it began (its end already told)", async () => {

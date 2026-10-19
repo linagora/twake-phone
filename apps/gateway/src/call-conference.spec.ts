@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
 import { LiveKitConferenceBridge, signToken, type Fetch } from '@twake/conference-livekit'
-import type { CallParties, ProviderFactory, RoomCallGrant, TelephonyProvider } from '@twake/telephony-provider-sdk'
+import type { CallParties, CallWithOperator, ProviderFactory, RoomCallGrant, TelephonyProvider } from '@twake/telephony-provider-sdk'
 import type { Call, TelephonyEvent } from '@twake/telephony-types'
 import { describe, expect, it } from 'vitest'
 import { buildApp } from './app.js'
@@ -32,22 +32,29 @@ const JOIN = '0123456789abcdef'.repeat(2)
  * has the Call-ID of its call (`sip.callIDFull`); the room's call to the group 600 is answered by Carol (104), whom
  * the SIP server tells of it (second review 8b, n°4). Dave (105) holds an extension and is in none.
  */
-const setup = async ({ failFor, failTaken, divertFor, untakenFor, leaveFor, trunkAt = 'pbx:5060', trunkMovesAt, dialOutLimiter, conferenceCaps, ownerCheckMs, takenFails, miFails }: { takenFails?: boolean; miFails?: boolean; failFor?: string; failTaken?: 'own' | 'another' | 'ringing'; divertFor?: string; untakenFor?: string; leaveFor?: string; trunkAt?: string; trunkMovesAt?: string; dialOutLimiter?: RateLimiter; conferenceCaps?: { perPerson?: number }; ownerCheckMs?: number } = {}) => {
+const setup = async ({ failFor, failTaken, divertFor, untakenFor, leaveFor, trunkAt = 'pbx:5060', trunkMovesAt, dialOutLimiter, conferenceCaps, ownerCheckMs, takenFails, miFails, vanish, failStatus, slowFor, endsWhileRinging }: { endsWhileRinging?: boolean; vanish?: { id: string; after: number }; failStatus?: { code: string; status: number; reason: string }; slowFor?: string; takenFails?: boolean; miFails?: boolean; failFor?: string; failTaken?: 'own' | 'another' | 'ringing'; divertFor?: string; untakenFor?: string; leaveFor?: string; trunkAt?: string; trunkMovesAt?: string; dialOutLimiter?: RateLimiter; conferenceCaps?: { perPerson?: number }; ownerCheckMs?: number } = {}) => {
   const grants: (RoomCallGrant & { token: string; revoked: boolean; taken?: { tag: string; callId: string } })[] = []
   const ended: string[] = []
+  let reads = 0
+  let opReads = 0
+  // `endsWhileRinging`: the original call is over from the moment the callback starts to ring (its correspondent took the callback).
+  let ringing = false
   // The calls the SIP server has (in progress).
-  const alive = new Map<string, 'answered' | 'ringing'>([['diverted@192.0.2.66', 'answered']])
+  const alive = new Map<string, 'answered' | 'ringing'>([['diverted@192.0.2.66', 'answered'], ['op', 'answered']])
   let trunk = trunkAt
-  const parties: Record<string, CallParties | 'external' | 'broken'> = {
+  const parties: Record<string, CallParties | CallWithOperator | 'external' | 'broken'> = {
     c1: { callId: 'c1', caller: '101', callerTag: 'a-tag', callee: '102', calleeTag: 'b-tag' },
     c2: { callId: 'c2', caller: '102', callerTag: 'b-tag', callee: '101', calleeTag: 'a-tag' },
     odd: { callId: 'odd call', caller: '101', callerTag: 'a-tag', callee: '102', calleeTag: 'b-tag' },
     ext: 'external',
+    // With the operator (step 8c): the number a room calls again; one of Bob's call, which Alice's id names to no one.
+    op: { callId: 'op', extension: '101', number: '+33612345678' },
+    opbob: { callId: 'opbob', extension: '102', number: '+33612345678' },
     broken: 'broken',
     bob: { callId: 'bob', caller: '102', callerTag: 'x', callee: '103', calleeTag: 'y' }
   }
   const events: { extension: string; event: TelephonyEvent }[] = [
-    ...['c1', 'c2', 'ext', 'ringing', 'odd', 'broken'].map(id => ({ extension: '101', event: { type: 'call.connected' as const, timestamp: new Date().toISOString(), payload: { call: call(id) } } })),
+    ...['c1', 'c2', 'ext', 'op', 'opbob', 'ringing', 'odd', 'broken'].map(id => ({ extension: '101', event: { type: 'call.connected' as const, timestamp: new Date().toISOString(), payload: { call: call(id) } } })),
     { extension: '102', event: { type: 'call.connected', timestamp: new Date().toISOString(), payload: { call: call('bob') } } },
     { extension: '104', event: { type: 'call.connected', timestamp: new Date().toISOString(), payload: { call: call('grp@192.0.2.30') } } }
   ]
@@ -73,6 +80,10 @@ const setup = async ({ failFor, failTaken, divertFor, untakenFor, leaveFor, trun
           }
         },
         callBetweenExtensions: async (id: string) => {
+          // `vanish`: the call is over (the far end hung up) from its `after`th reading on.
+          if (vanish?.id === id && ++reads > vanish.after) return undefined
+          if (id === 'op') opReads++
+          if (id === 'op' && ringing) return undefined
           const p = parties[id]
           if (p === 'broken') throw Object.assign(new Error('The SIP server did not say where the call is'), { statusCode: 503, code: 'SIP_SERVER_UNAVAILABLE' })
           return p
@@ -100,7 +111,8 @@ const setup = async ({ failFor, failTaken, divertFor, untakenFor, leaveFor, trun
     lk.push(`${path} ${JSON.stringify(body)}`)
     if (path === 'livekit.SIP/CreateSIPParticipant') {
       // A call takes a while to be answered: another request meanwhile is served.
-      await new Promise(r => setTimeout(r, 10))
+      if (endsWhileRinging && body.sip_call_to === slowFor) ringing = true
+      await new Promise(r => setTimeout(r, body.sip_call_to === slowFor ? 400 : 10))
       if (body.sip_call_to === trunkMovesAt) trunk = '198.51.100.7:5060'
       const sipCallId = `SCL_${++calls}`
       const grant = grants.find(g => g.token === body.headers?.['X-Twake-Grant'])
@@ -110,7 +122,7 @@ const setup = async ({ failFor, failTaken, divertFor, untakenFor, leaveFor, trun
         alive.set(`${sipCallId}@192.0.2.30`, 'ringing')
         return { ok: false, status: 400, text: async () => JSON.stringify({ code: 'canceled', msg: 'sip status: 480: Temporarily Unavailable', meta: { sip_status_code: '480', sip_status: 'Temporarily Unavailable' } }) }
       }
-      if (body.sip_call_to === failFor) return { ok: false, status: 400, text: async () => JSON.stringify({ code: 'unavailable', msg: 'sip status: 486: Busy Here', meta: { sip_status_code: '486', sip_status: 'Busy Here' } }) }
+      if (body.sip_call_to === failFor) return { ok: false, status: 400, text: async () => JSON.stringify({ code: failStatus?.code ?? 'unavailable', msg: `sip status: ${failStatus?.status ?? 486}: ${failStatus?.reason ?? 'Busy Here'}`, meta: { sip_status_code: String(failStatus?.status ?? 486), sip_status: failStatus?.reason ?? 'Busy Here' } }) }
       // The SIP server takes the grant with the call that carries it: LiveKit's own, or another one.
       if (grant && body.sip_call_to !== untakenFor) grant.taken = body.sip_call_to === divertFor ? { tag: 'SCL_someone-else', callId: 'diverted@192.0.2.66' } : { tag: sipCallId, callId: `${sipCallId}@192.0.2.30` }
       if (body.sip_call_to !== divertFor && body.sip_call_to !== untakenFor) alive.set(`${sipCallId}@192.0.2.30`, 'answered')
@@ -141,13 +153,16 @@ const setup = async ({ failFor, failTaken, divertFor, untakenFor, leaveFor, trun
   await store.upsertMapping({ tenantId: 'dev', userId: 'carol', extension: '104' })
   await store.upsertMapping({ tenantId: 'dev', userId: 'dave', extension: '105' })
   const registry = new ProviderRegistry([{ tenantId: 'dev', type: 'fake', config: {} }], [factory])
-  const app = await buildApp(registry, {
+  const options = {
     store,
     ...(dialOutLimiter ? { dialOutLimiter } : {}),
     ...(conferenceCaps ? { conferenceCaps } : {}),
     ...(ownerCheckMs ? { conferenceOwnerCheckMs: ownerCheckMs } : {}),
     conference: { bridge: () => bridge, accessNumber: '8000', webhookKey: 'k', webhookSecret: 's' }
-  })
+  }
+  const app = await buildApp(registry, options)
+  // Another Gateway on the same database, the same SIP server and the same LiveKit (or this one started again): nothing in memory is shared.
+  const another = () => buildApp(registry, options)
   registry.startAll()
   await new Promise(r => setTimeout(r, 50)) // the event pump records whose calls they are
   const as = (user: string) => ({ 'x-dev-user': user, 'x-dev-tenant': 'dev' })
@@ -159,7 +174,7 @@ const setup = async ({ failFor, failTaken, divertFor, untakenFor, leaveFor, trun
     const token = signToken('k', 's', { sha256: createHash('sha256').update(body).digest('base64') })
     return app.inject({ method: 'POST', url: '/api/v1/webhooks/livekit', headers: { 'content-type': 'application/webhook+json', authorization: token }, payload: body })
   }
-  return { app, as, conference, grants, ended, lk, dialled, rooms, store, webhook, joinsLater }
+  return { app, another, parties, opReads: () => opReads, as, conference, grants, ended, lk, dialled, rooms, store, webhook, joinsLater }
 }
 
 describe('a call becomes a conference (POST /calls/:id/conference, step 8b)', () => {
@@ -208,6 +223,168 @@ describe('a call becomes a conference (POST /calls/:id/conference, step 8b)', ()
     expect(lk.filter(l => l.startsWith('livekit.RoomService/DeleteRoom'))).toEqual([`livekit.RoomService/DeleteRoom {"room":"${meetingId}"}`])
     expect(rooms.size).toBe(0)
     expect(await store.getConference(meetingId)).toBeNull()
+  })
+
+  it("makes a conference of a call with the operator (step 8c): the room calls the person's window (join), then the same number again, through a grant of its own and no Replaces; the original call is kept until the person confirms", async () => {
+    const s = await setup()
+    const { conference, grants, dialled, store, app, as } = s
+    const res = await conference('op')
+    expect(res.statusCode, res.body).toBe(201)
+    const { meetingId, participants, awaiting, hangUp } = res.json()
+    // The original call stays: the person confirms they hear their correspondent in the room first (ADR 0025).
+    expect(awaiting).toBe('+33612345678')
+    expect(hangUp).toBeUndefined()
+    expect(s.ended).toEqual([])
+    expect(participants.map((p: { number: string }) => p.number)).toEqual(['101', '+33612345678'])
+    // The number as the SIP server wrote it down, at the person's name, the room named: the grant any call to the
+    // public network of the person's rooms has (POST /conferences/:id/participants), none of a Replaces.
+    expect(grants.map(({ extension, number, join, replaces, room }) => ({ extension, number, join, replaces, room }))).toEqual([
+      { extension: '101', number: '101', join: JOIN, replaces: undefined, room: meetingId },
+      { extension: '101', number: '+33612345678', join: undefined, replaces: undefined, room: meetingId }
+    ])
+    expect(dialled().map(d => [d.sip_call_to, d.sip_number])).toEqual([['101', '101'], ['+33612345678', '101']])
+    expect((await store.getConference(meetingId))?.ownerUserId).toBe('alice')
+    // A call with two extensions waits for nobody: the Replaces ends it.
+    expect((await conference('c1')).json()).not.toHaveProperty('awaiting')
+    // Whoever the number is, the room is read as any other of the person's: numbers outside the tenant masked to the others.
+    expect((await app.inject({ method: 'GET', url: `/api/v1/conferences/${meetingId}`, headers: as('alice') })).statusCode).toBe(200)
+  })
+
+  const post = (s: Awaited<ReturnType<typeof setup>>, id: string, what: 'confirm' | 'cancel', user = 'alice', app = s.app) =>
+    app.inject({ method: 'POST', url: `/api/v1/conferences/${id}/${what}`, headers: s.as(user) })
+
+  it("keeps the call with the operator until the person confirms; confirming ends it at the SIP server (by the Call-ID the room recorded), is replayable and the owner's; a room that waits for nothing is refused", async () => {
+    const s = await setup()
+    const { meetingId } = (await s.conference('op')).json()
+    expect((await s.store.getConference(meetingId))?.originCall).toBe('op')
+    expect((await post(s, meetingId, 'confirm', 'bob')).statusCode).toBe(403)
+    expect(s.ended).toEqual([])
+    expect((await post(s, meetingId, 'confirm')).statusCode).toBe(204)
+    expect(s.ended).toEqual(['op'])
+    // Replayed: nothing more to end, still a success (the call is over, the SIP server has no such dialog).
+    const again = await post(s, meetingId, 'confirm')
+    expect(again.statusCode, again.body).toBe(204)
+    // The room of a call between two extensions (8b) waits for nothing: neither is accepted.
+    const t = await setup()
+    const plain = (await t.conference('c1')).json().meetingId as string
+    for (const what of ['confirm', 'cancel'] as const) {
+      const res = await post(t, plain, what)
+      expect(res.statusCode, what).toBe(409)
+      expect(res.json().code).toBe('CONFERENCE_NOT_AWAITING')
+    }
+    expect(t.ended).toEqual([])
+    expect(t.rooms.has(plain)).toBe(true)
+  })
+
+  it('writes nothing when a confirmation cannot be carried out (the call is not the person\'s, the SIP server does not answer): the person can still give up', async () => {
+    for (const [now, status] of [['external', 400], ['broken', 503], [{ callId: 'op', extension: '102', number: '+33612345678' }, 400]] as const) {
+      const s = await setup()
+      const { meetingId } = (await s.conference('op')).json()
+      s.parties.op = now
+      expect((await post(s, meetingId, 'confirm')).statusCode, JSON.stringify(now)).toBe(status)
+      expect((await s.store.getConference(meetingId))?.decision).toBeUndefined()
+      expect(s.ended).toEqual([])
+      // Giving up still works: the room goes, the call was never touched.
+      expect((await post(s, meetingId, 'cancel')).statusCode).toBe(204)
+      expect(s.rooms.has(meetingId)).toBe(false)
+    }
+  })
+
+  it('keeps the conference when the correspondent takes the callback while it rings (the original call over meanwhile): the call is not read during the ringing, and nothing fails', async () => {
+    // The callback rings 400 ms; the original call is over from its start: a read during the ringing would see it.
+    const s = await setup({ endsWhileRinging: true, slowFor: '+33612345678' })
+    const res = await s.conference('op')
+    expect(res.statusCode, res.body).toBe(201)
+    expect(res.json().awaiting).toBe('+33612345678')
+    // Read at the start and just before the callback, never again meanwhile.
+    expect(s.opReads()).toBe(2)
+    expect(s.rooms.has(res.json().meetingId)).toBe(true)
+    expect((await post(s, res.json().meetingId, 'confirm')).statusCode).toBe(204)
+    expect(s.ended).toEqual([])
+  })
+
+  it('is a success to confirm once the correspondent hung up the original call after the callback was answered (before the confirmation): nothing to end', async () => {
+    const s = await setup({ vanish: { id: 'op', after: 2 } })
+    const res = await s.conference('op')
+    expect(res.statusCode, res.body).toBe(201)
+    const done = await post(s, res.json().meetingId, 'confirm')
+    expect(done.statusCode, done.body).toBe(204)
+    expect(s.ended).toEqual([])
+    expect(s.rooms.has(res.json().meetingId)).toBe(true)
+  })
+
+  it('does not call the correspondent back when the original call is over just before the room would (read once more before), and calls nothing', async () => {
+    const before = await setup({ vanish: { id: 'op', after: 1 } })
+    const res = await before.conference('op')
+    expect(res.statusCode, res.body).toBe(409)
+    expect(res.json().code).toBe('CALL_NOT_ANSWERED')
+    expect(before.dialled().map(d => d.sip_call_to)).toEqual(['101'])
+    expect(before.rooms.size).toBe(0)
+    expect(await before.store.countConferences('dev')).toBe(0)
+  })
+
+  it('has confirming and giving up exclude each other, whichever comes first and from whichever Gateway, each replayable', async () => {
+    // Confirmed first, on another Gateway: giving up is refused (the original call is gone), the room stays.
+    const s = await setup()
+    const { meetingId } = (await s.conference('op')).json()
+    const elsewhere = await s.another()
+    expect((await post(s, meetingId, 'confirm', 'alice', elsewhere)).statusCode).toBe(204)
+    expect(s.ended).toEqual(['op'])
+    const refused = await post(s, meetingId, 'cancel')
+    expect(refused.statusCode).toBe(409)
+    expect(refused.json().code).toBe('CONFERENCE_CONFIRMED')
+    expect(s.rooms.has(meetingId)).toBe(true)
+    expect((await post(s, meetingId, 'confirm')).statusCode).toBe(204)
+    // Given up first: the room is gone, the call untouched, confirming finds nothing.
+    const t = await setup()
+    const room = (await t.conference('op')).json().meetingId as string
+    expect((await post(t, room, 'cancel')).statusCode).toBe(204)
+    expect(t.rooms.has(room)).toBe(false)
+    expect(await t.store.getConference(room)).toBeNull()
+    expect(t.ended).toEqual([])
+    expect((await post(t, room, 'confirm')).statusCode).toBe(404)
+    // Both decided at the same instant, on two Gateways: one wins, the other is told, never both.
+    const u = await setup()
+    const racing = (await u.conference('op')).json().meetingId as string
+    const other = await u.another()
+    const [a, b] = await Promise.all([post(u, racing, 'confirm', 'alice', other), post(u, racing, 'cancel')])
+    expect([a.statusCode, b.statusCode].filter(c => c === 204)).toHaveLength(1)
+    expect([a.statusCode, b.statusCode].filter(c => c === 409 || c === 404)).toHaveLength(1)
+    expect(u.ended.length + (u.rooms.has(racing) ? 0 : 1)).toBe(1)
+  })
+
+  it('says the SIP code of a callback the operator, the rights or the caps refuse (403 limit, 480 no answer), and leaves nothing', async () => {
+    for (const failStatus of [{ code: 'permission_denied', status: 403, reason: 'Forbidden' }, { code: 'canceled', status: 480, reason: 'Temporarily Unavailable' }]) {
+      const s = await setup({ failFor: '+33612345678', failStatus })
+      const res = await s.conference('op')
+      expect(res.statusCode, res.body).toBe(409)
+      expect(res.json()).toMatchObject({ code: 'DIAL_FAILED', sipStatus: failStatus.status })
+      expect(s.ended).toEqual([])
+      expect(s.rooms.size).toBe(0)
+      expect(await s.store.countConferences('dev')).toBe(0)
+    }
+  })
+
+  it("leaves the call with the operator as it was when the number does not answer, is refused or is another's call: the room ends, nothing stays", async () => {
+    const { conference, grants, rooms, store, lk } = await setup({ failFor: '+33612345678' })
+    const res = await conference('op')
+    expect(res.statusCode, res.body).toBe(409)
+    expect(res.json()).toMatchObject({ code: 'DIAL_FAILED', sipStatus: 486 })
+    expect(res.json()).not.toHaveProperty('awaiting')
+    expect(grants.map(g => g.revoked)).toEqual([false, true])
+    expect(lk.filter(l => l.startsWith('livekit.RoomService/DeleteRoom'))).toHaveLength(1)
+    expect(rooms.size).toBe(0)
+    expect(await store.countConferences('dev')).toBe(0)
+    // A call of Bob's with the operator is not Alice's: not found, then not answered when the extension is not hers.
+    const other = await conference('opbob')
+    expect(other.statusCode).toBe(409)
+    expect(other.json().code).toBe('CALL_NOT_ANSWERED')
+  })
+
+  it('counts the two calls of the room of a call with the operator among the person’s dial-outs, like any other', async () => {
+    const { conference, grants } = await setup({ dialOutLimiter: new RateLimiter(1, 60_000) })
+    expect((await conference('op')).statusCode).toBe(429)
+    expect(grants).toEqual([])
   })
 
   it('names the dialog as the other party has it when they placed the call', async () => {

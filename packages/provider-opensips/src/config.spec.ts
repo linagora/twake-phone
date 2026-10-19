@@ -1477,6 +1477,16 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(render().cfg).toContain('$DLG_timeout = 14400;')
   })
 
+  it('writes the number an operator call showed in its dialog (`cli`) for the conference of step 8c, and none when it was hidden', () => {
+    const { cfg } = render()
+    // Written once, after `trunk`, from the number route[trunk_in] settled (anonymous when Privacy hid it): never from the From.
+    expect(cfg).toContain('\t$dlg_val(trunk) = "caller";\n')
+    expect(cfg.match(/\$dlg_val\(cli\) = /g)).toEqual(['$dlg_val(cli) = '])
+    expect(cfg).toContain('\tif ($var(from_number) != "anonymous")\n\t\t$dlg_val(cli) = $var(from_number);')
+    const trunkIn = cfg.slice(cfg.indexOf('\nroute[trunk_in] {'), cfg.indexOf('\nroute[trunk_in_loaded]'))
+    expect(trunkIn.indexOf('$dlg_val(cli) =')).toBeGreaterThan(trunkIn.indexOf('create_dialog("Bp");'))
+  })
+
   it('ends a call with the operator when its phone stops answering the OPTIONS of the dialog, every CALL_PING_SEC', () => {
     // The phone's side only: the caller's (P) of a call out, the callee's (p) of a call in; never the operator's.
     const { cfg } = render({ CALL_PING_SEC: '12' })

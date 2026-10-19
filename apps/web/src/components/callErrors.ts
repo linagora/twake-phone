@@ -50,6 +50,10 @@ export const describeConferenceError = (err: unknown, t: T, { making = false, wh
   const failed = err as { code?: unknown; status?: unknown; conferenceMade?: unknown; callOver?: unknown } | null
   if (failed?.conferenceMade === true) making = false
   switch (failed?.code) {
+    case 'CONFERENCE_CONFIRMED':
+      return t('conference.errorConfirmed')
+    case 'CONFERENCE_CANCELLED':
+      return t('conference.errorCancelled')
     case 'CONFERENCE_EXTERNAL':
       return t('conference.errorExternal')
     case 'CALL_NOT_ANSWERED':

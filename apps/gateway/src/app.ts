@@ -3144,25 +3144,39 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
       })
       const makeConference = async (callId: string, join: string, user: User, me: string, provider: TelephonyProvider, bridge: LiveKitConferenceBridge, reply: FastifyReply) => {
         const parties = await provider.callBetweenExtensions!(callId)
-        if (parties === 'external') return reply.code(409).send({ statusCode: 409, code: 'CONFERENCE_EXTERNAL', error: 'Conflict', message: 'A call with the public network or a room cannot become a conference yet' })
-        if (!parties || (parties.caller !== me && parties.callee !== me)) return reply.code(409).send({ statusCode: 409, code: 'CALL_NOT_ANSWERED', error: 'Conflict', message: 'The call is not in progress' })
-        const placed = parties.caller === me
-        const other = placed ? parties.callee : parties.caller
-        // The dialog as the other party's phone has it (RFC 3891): its own tag (To), then the person's (From). A dialog
-        // a Replaces header cannot name as it is (a phone's Call-ID of other characters) is said before anything begins
-        // (review 8b, n°15).
-        const replaces = `${parties.callId};to-tag=${placed ? parties.calleeTag : parties.callerTag};from-tag=${placed ? parties.callerTag : parties.calleeTag}`
-        if (!REPLACES.test(replaces)) return reply.code(409).send({ statusCode: 409, code: 'CONFERENCE_UNSUPPORTED', error: 'Conflict', message: 'This call cannot be taken over by a room' })
+        if (parties === 'external') return reply.code(409).send({ statusCode: 409, code: 'CONFERENCE_EXTERNAL', error: 'Conflict', message: 'A call with a room, an emergency number or a number that is hidden cannot become a conference' })
+        // With the public network (step 8c, ADR 0025): nothing can take the operator's place in its dialog, so the room
+        // calls the same number again, through the same grant and the same checks as any call of the person's
+        // (POST /conferences/:id/participants), and the window ends the call it replaces once that one answers.
+        const notAnswered = () => reply.code(409).send({ statusCode: 409, code: 'CALL_NOT_ANSWERED', error: 'Conflict', message: 'The call is not in progress' })
+        if (!parties) return notAnswered()
+        const operator = 'number' in parties
+        let other: string
+        let leg: { replaces: string } | Record<string, never> = {}
+        if (operator) {
+          if (parties.extension !== me) return notAnswered()
+          other = parties.number
+        } else {
+          if (parties.caller !== me && parties.callee !== me) return notAnswered()
+          const placed = parties.caller === me
+          other = placed ? parties.callee : parties.caller
+          // The dialog as the other party's phone has it (RFC 3891): its own tag (To), then the person's (From). A dialog
+          // a Replaces header cannot name as it is (a phone's Call-ID of other characters) is said before anything begins
+          // (review 8b, n°15).
+          const replaces = `${parties.callId};to-tag=${placed ? parties.calleeTag : parties.callerTag};from-tag=${placed ? parties.callerTag : parties.calleeTag}`
+          if (!REPLACES.test(replaces)) return reply.code(409).send({ statusCode: 409, code: 'CONFERENCE_UNSUPPORTED', error: 'Conflict', message: 'This call cannot be taken over by a room' })
+          leg = { replaces }
+        }
         await closeEndedCallRooms(bridge, user.tenantId, user.id)
         // Two calls of a room (review 8b, n°16), counted before a room is: refused, nothing of either is used.
         if (!dialOuts.allow(ownerKey(user.tenantId, user.id), 2)) return reply.code(429).send(tooManyDialOuts)
         if (!(await mayOpen(user.tenantId, user.id))) return reply.code(429).send(tooManyRooms)
         const meetingId = `twake-call-${randomBytes(8).toString('hex')}`
-        await store.claimConference({ tenantId: user.tenantId, meetingId, ownerUserId: user.id, createdAt: new Date().toISOString() })
+        await store.claimConference({ tenantId: user.tenantId, meetingId, ownerUserId: user.id, ...(operator ? { originCall: callId } : {}), createdAt: new Date().toISOString() })
         const divertedCall = () => Object.assign(new Error('A call of the room was diverted'), { code: 'CALL_DIVERTED' })
         // LiveKit's trunk read again before each grant (second review 8b, n°1): changed between the two calls, the
         // second is not placed.
-        const place = async (number: string, conference: { join: string } | { replaces: string }) => {
+        const place = async (number: string, conference: { join: string } | { replaces: string } | Record<string, never>) => {
           if (!(await trunkIntact(bridge, user.tenantId, me))) throw divertedCall()
           const grant = await provider.grantRoomCall!({ extension: me, number, room: meetingId, ...conference })
           let participant: DialedParticipant
@@ -3175,27 +3189,72 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
           if (await settle(provider, user.tenantId, grant, participant, me, number)) throw divertedCall()
           return participant
         }
+        // The call a conference is made of is read once more just before the room calls its far end (step 8c): its far end
+        // hung up meanwhile, and the room would call them again at the person's name. Once the callback is rung, the original
+        // call ending is no failure (the correspondent answers the callback: the best case), so it is not read again.
+        const sameCall = async () => {
+          const now = await provider.callBetweenExtensions!(callId).catch(() => 'unknown' as const)
+          return now === 'unknown' || (!!now && now !== 'external' && 'number' in now && now.extension === me && now.number === other)
+        }
+        const endedMeanwhile = () => Object.assign(new Error('The call is over'), { code: 'ORIGIN_ENDED' })
         try {
           const own = await place(me, { join })
           // The person left the room before the other party comes in (hung up while it began, review 8b, n°8): nobody
           // else's call is taken over.
           if (!(await viaLiveKit(() => bridge.listParticipants(meetingId))).some(p => p.id === own.id))
             throw Object.assign(new Error('You left the room before the conference began'), { code: 'CONFERENCE_ABANDONED' })
-          const theirs = await place(other, { replaces })
+          if (operator && !(await sameCall())) throw endedMeanwhile()
+          const theirs = await place(other, leg)
           watchOwner(bridge, { tenantId: user.tenantId, meetingId, ownerUserId: user.id })
-          return reply.code(201).send({ meetingId, participants: [shown(own), shown(theirs)] })
+          if (!operator) return reply.code(201).send({ meetingId, participants: [shown(own), shown(theirs)] })
+          // The original call stays, quiet in the window, until the person confirms they hear their correspondent in the
+          // room (ADR 0025): a mailbox of the operator may have answered the callback, and it is never hung up for it.
+          return reply.code(201).send({ meetingId, participants: [shown(own), shown(theirs)], awaiting: other })
         } catch (err) {
           // Ending the room also ends a call of it still ringing: LiveKit SIP stops dialing once its participant is gone
           // from the room (CANCEL; review 8b, n°13, read in LiveKit SIP v1.17.0).
           await viaLiveKit(() => bridge.deleteRoom(meetingId)).catch((e: unknown) => app.log.warn({ err: e }, 'the room of a conference that did not begin was not ended'))
           await store.deleteConference(meetingId)
           const failed = err as Error & { code?: string; sipStatus?: number; sipReason?: string }
+          if (failed.code === 'ORIGIN_ENDED') return notAnswered()
           if (failed.code === 'CALL_DIVERTED') return reply.code(502).send(divertedReply)
           if (failed.code === 'CONFERENCE_ABANDONED') return reply.code(409).send({ statusCode: 409, code: 'CONFERENCE_ABANDONED', error: 'Conflict', message: failed.message })
           if (failed.code !== 'DIAL_FAILED') throw err
           return reply.code(409).send({ statusCode: 409, code: 'DIAL_FAILED', error: 'Conflict', message: failed.message, sipStatus: failed.sipStatus, sipReason: failed.sipReason })
         }
       }
+
+      // « Passer en conférence » et « Annuler » (step 8c, ADR 0025). The room's record keeps the call it is made of
+      // (`originCall`, written when the room is made) and what the person chose (`decision`, set once, by every Gateway):
+      // the first choice stands, the other is refused, the same one replayed succeeds. Confirming is « end the original
+      // call if it is still there »: it is over already when its correspondent hung up to take the callback (the best
+      // case), which is success. Every check comes before the choice is written: a confirmation that cannot be carried
+      // out leaves the person free to give up. Cancelling ends the room; refused once confirmed.
+      const awaitingRoom = (record: { meetingId: string; originCall?: string }) => {
+        if (!CALL_ROOM.test(record.meetingId) || !record.originCall) throw Object.assign(new Error('Nothing waits for your choice: this conference is not made of a call with the operator'), { statusCode: 409, code: 'CONFERENCE_NOT_AWAITING' })
+        return record.originCall
+      }
+      v1.post<{ Params: { id: string } }>('/conferences/:id/confirm', async (req, reply) => {
+        const { user, record } = await owned(req, req.params.id)
+        const call = awaitingRoom(record)
+        if (record.decision === 'cancelled') return reply.code(409).send({ statusCode: 409, code: 'CONFERENCE_CANCELLED', error: 'Conflict', message: 'The conference was given up' })
+        const provider = registry.serves(user.tenantId) ? registry.forTenant(user.tenantId) : undefined
+        if (!provider?.endRoomCall || !provider.callBetweenExtensions) throw Object.assign(new Error('The SIP server cannot end a call'), { statusCode: 501 })
+        // Only the person's own call with the operator is ended; one that is over already is nothing to end.
+        const parties = await provider.callBetweenExtensions(call)
+        if (parties && (parties === 'external' || !('number' in parties) || parties.extension !== user.extension)) throw bad('The call this conference is made of is not your call with the operator')
+        if ((await store.decideConference(record.meetingId, 'confirmed')) !== 'confirmed') return reply.code(409).send({ statusCode: 409, code: 'CONFERENCE_CANCELLED', error: 'Conflict', message: 'The conference was given up' })
+        if (parties) await provider.endRoomCall(call)
+        return reply.code(204).send()
+      })
+      v1.post<{ Params: { id: string } }>('/conferences/:id/cancel', async (req, reply) => {
+        const { bridge, record } = await owned(req, req.params.id, { closing: true })
+        awaitingRoom(record)
+        if ((await store.decideConference(record.meetingId, 'cancelled')) !== 'cancelled') return reply.code(409).send({ statusCode: 409, code: 'CONFERENCE_CONFIRMED', error: 'Conflict', message: 'The conference is confirmed: the original call is gone' })
+        await viaLiveKit(() => bridge.deleteRoom(record.meetingId))
+        await store.deleteConference(record.meetingId)
+        return reply.code(204).send()
+      })
 
       /**
        * Ends the room its owner is no longer in while someone from outside is (review 8b, n°7; insider, second review

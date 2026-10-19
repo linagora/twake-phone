@@ -86,10 +86,11 @@ export interface TelephonyProvider {
    * A call in progress between two of the tenant's extensions, as the SIP server holds it (step 8b, ADR 0019): its
    * parties (the extensions where it reached, a ring group's member who answered, a forward's target) and the tags
    * of its dialog, which a room's call that takes its place names (Replaces). `external` for an answered call with
-   * the public network or a room (no room's call takes its place: the platform has no B2BUA); undefined when the
-   * SIP server has no such call answered (ringing, over, never there).
+   * a room (no room's call takes its place: the platform has no B2BUA) or one with the public network whose number
+   * it cannot say (hidden, or not a number); `CallWithOperator` for one with the public network (step 8c, ADR 0025);
+   * undefined when the SIP server has no such call answered (ringing, over, never there).
    */
-  callBetweenExtensions?(callId: string): Promise<CallParties | 'external' | undefined>
+  callBetweenExtensions?(callId: string): Promise<CallParties | CallWithOperator | 'external' | undefined>
   /**
    * The access number of Meet's rooms as the SIP server has it (step 8): `number` undefined when its rooms are off
    * there; undefined when it cannot say. The Gateway compares it with its own at its start.
@@ -397,6 +398,17 @@ export interface CallParties {
   /** The extension it reached (who answered), and the To tag. */
   callee: string
   calleeTag: string
+}
+
+/**
+ * An answered call between one of the tenant's extensions and a number of the public network, through the trunk
+ * (callBetweenExtensions, step 8c): the number the room calls in its place (the one dialled, or the one that called
+ * and did not hide it), as the SIP server wrote it down.
+ */
+export interface CallWithOperator {
+  callId: string
+  extension: string
+  number: string
 }
 
 /**

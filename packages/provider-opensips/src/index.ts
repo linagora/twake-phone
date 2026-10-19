@@ -1,4 +1,4 @@
-import type { CallParties, MediaProvider, ProviderFactory, RoomCallGrant, RoomCallGrantToken, RoutedEvent, TelephonyProvider, VoicemailBox, VoicemailBoxesWrite } from '@twake/telephony-provider-sdk'
+import type { CallParties, CallWithOperator, MediaProvider, ProviderFactory, RoomCallGrant, RoomCallGrantToken, RoutedEvent, TelephonyProvider, VoicemailBox, VoicemailBoxesWrite } from '@twake/telephony-provider-sdk'
 import type { Call, Capabilities, DidRange, Endpoint, EmergencySite, ForwardingRules, MediaSession, OriginateRequest, OutboundAssignment, OutboundPolicy, OutboundProfile, Presence, ProviderStatus, RingGroup, Trunk, TrunkStatus, User } from '@twake/telephony-types'
 import type { CallGroups } from './call-groups.js'
 import type { CallRules } from './call-rules.js'
@@ -8,6 +8,7 @@ import type { OutboundTables } from './outbound.js'
 import type { VoicemailBoxes } from './voicemail-boxes.js'
 import { trunkStatusFrom, type TrunkTables } from './trunks.js'
 import { OpensipsEvents, parseDlgContext, parseDlgList, parseUlDump, type EventsLogger } from './events.js'
+import { classify } from './numbering.js'
 import { AsyncQueue } from './queue.js'
 import { CallTracker } from './tracker.js'
 
@@ -139,6 +140,7 @@ const MAX_TIMER_MS = 2 ** 31 - 1
 /** One of our extensions, as a dialog names it; a tag that a Replaces header carries as it is (REPLACES). */
 const EXTENSION = /^[0-9]{2,20}$/
 const TAG = /^[A-Za-z0-9._~!%*+-]{1,50}$/
+const NUMBER = /^\+?[0-9]{2,20}$/
 
 const noExtension = () => Object.assign(new Error('No extension is assigned to this user'), { statusCode: 404 })
 
@@ -481,7 +483,7 @@ export class OpensipsProvider implements TelephonyProvider, MediaProvider {
    * 2xx). Undefined without the MI, for a call it does not have (No such dialog, 404), or one not answered yet. An MI
    * that does not answer, or answers another error, is not "no such call" (review 8b, n°10): 503, SIP_SERVER_UNAVAILABLE.
    */
-  async callBetweenExtensions(callId: string): Promise<CallParties | 'external' | undefined> {
+  async callBetweenExtensions(callId: string): Promise<CallParties | CallWithOperator | 'external' | undefined> {
     if (!this.events || !callId) return undefined
     const dialog = await this.events.call('dlg_list_ctx', { callid: callId }).then(parseDlgContext, (err: unknown) => {
       if ((err as { code?: unknown }).code === 404) return undefined
@@ -490,7 +492,18 @@ export class OpensipsProvider implements TelephonyProvider, MediaProvider {
       throw Object.assign(new Error('The SIP server did not say where the call is'), { statusCode: 503, code: 'SIP_SERVER_UNAVAILABLE' })
     })
     if (!dialog || dialog.callid !== callId || dialog.state !== 4) return undefined
-    if (dialog.values.trunk !== undefined || dialog.values.meet !== undefined) return 'external'
+    if (dialog.values.meet !== undefined || dialog.values.voicemail === '1') return 'external'
+    if (dialog.values.trunk !== undefined) {
+      // With the operator (step 8c): the extension is the caller's (placed) or the one that answered (received), the
+      // number what was dialled (written as the call went out) or the caller's presented one (`cli`, not written when
+      // it was hidden): never the From of the dialog, which keeps a number that asked not to be shown.
+      const placed = dialog.values.trunk === 'callee'
+      const extension = placed ? dialog.caller : (dialog.values.callee ?? '')
+      const number = placed ? (dialog.values.dialled ?? '') : (dialog.values.cli ?? '')
+      // An emergency call is never put on hold for a room's call: that call would be refused anyway (ADR 0017).
+      if (!EXTENSION.test(extension) || !NUMBER.test(number) || classify(number)?.class === 'emergency') return 'external'
+      return { callId, extension, number }
+    }
     const callee = dialog.values.callee ?? ''
     const calleeTag = dialog.values.callee_tag ?? ''
     if (!EXTENSION.test(dialog.caller) || !EXTENSION.test(callee) || dialog.caller === callee || !TAG.test(dialog.callerTag) || !TAG.test(calleeTag)) return undefined

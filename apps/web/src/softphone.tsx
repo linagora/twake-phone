@@ -4,7 +4,7 @@ import type { CallConference } from '@twake/telephony-client'
 import type { ConferenceParticipant } from '@twake/telephony-types'
 import { useAuth } from './auth/AuthProvider.js'
 import { displayNameFor } from './auth/oidc.js'
-import { conferenceMade, conferenceOver, type MadeConferences } from './conferences.js'
+import { conferenceConfirmed, conferenceMade, conferenceOver, type MadeConferences } from './conferences.js'
 import { useGateway } from './gateway.js'
 
 /** 'off': this platform gives the browser no SIP session (no extension, or no SIP server yet). */
@@ -44,6 +44,12 @@ export interface Phone {
   inviteToConference(meetingId: string, number: string): Promise<void>
   /** The room of each conference this window made, by the call that became it. */
   rooms: Record<string, string>
+  /** A conference made of a call with the operator waits for the person (step 8c): the number the room called again, by call. */
+  awaiting: Record<string, string>
+  /** « Passer en conférence » (step 8c): the person hears their correspondent in the room; the original call ends, the third participant is called. */
+  confirmConference(callId: string): Promise<void>
+  /** « Annuler » (step 8c): the room ends, the original call is the person's again. */
+  cancelAwaiting(callId: string): Promise<void>
   /**
    * The participants each conference this window made began with, by the call that became it: the two parties
    * POST /calls/:id/conference answered. Whoever came in later is news to this window, and one of them gone, too.
@@ -102,6 +108,7 @@ export const SoftphoneProvider = ({ children }: { children: ReactNode }) => {
   // The conferences this window made, by the call that became each one: `rooms` and `parties` are read from them.
   const [made, setMade] = useState<MadeConferences>({})
   const rooms = useMemo(() => Object.fromEntries(Object.entries(made).map(([callId, c]) => [callId, c.meetingId])), [made])
+  const awaiting = useMemo(() => Object.fromEntries(Object.entries(made).flatMap(([callId, c]) => (c.awaiting ? [[callId, c.awaiting.number]] : []))), [made])
   const parties = useMemo(() => Object.fromEntries(Object.entries(made).map(([callId, c]) => [callId, c.parties])), [made])
   const [inviting, setInviting] = useState<Record<string, string[]>>({})
   const phone = useRef<Softphone | null>(null)
@@ -224,7 +231,10 @@ export const SoftphoneProvider = ({ children }: { children: ReactNode }) => {
       // and its conference is not kept: the end of its call, already told, would never forget it (third review of the
       // notice, n°3).
       if (!softphone.conferenceCall(call.id)) return
-      setMade(m => conferenceMade(m, call.id, answer))
+      setMade(m => conferenceMade(m, call.id, answer, number))
+      // A call with the public network is not replaced by the room's call (step 8c): the number was called again and the
+      // call stays, quiet, until the person confirms (confirmConference); the third participant is called then.
+      if (answer.awaiting) return
       // The conference is there: what fails now is the call to the third participant only (review 8b, n°4).
       try {
         await inviteToConference(meetingId, number)
@@ -233,6 +243,29 @@ export const SoftphoneProvider = ({ children }: { children: ReactNode }) => {
       }
     },
     [client, inviteToConference]
+  )
+
+  const confirmConference = useCallback(
+    async (callId: string) => {
+      const c = made[callId]
+      if (!c?.awaiting) return
+      await client.confirmConference(c.meetingId)
+      setMade(m => conferenceConfirmed(m, callId))
+      try {
+        await inviteToConference(c.meetingId, c.awaiting.third)
+      } catch (err) {
+        throw Object.assign(err instanceof Error ? err : new Error(String(err)), { conferenceMade: true })
+      }
+    },
+    [client, made, inviteToConference]
+  )
+
+  const cancelAwaiting = useCallback(
+    async (callId: string) => {
+      const c = made[callId]
+      if (c?.awaiting) await client.cancelConference(c.meetingId)
+    },
+    [client, made]
   )
 
   const call = useCallback(async (target: string) => {
@@ -261,8 +294,8 @@ export const SoftphoneProvider = ({ children }: { children: ReactNode }) => {
   const ringTest = useCallback(async () => (phone.current ? phone.current.ringTest() : false), [])
 
   const value = useMemo<Phone>(
-    () => ({ state, detail, calls, lastEnded, tones, call, shutdown, devices, setDevices, devicesVersion, soundBlocked, unblockAudio, ringTest, conferenceAvailable, addParticipant, inviteToConference, rooms, parties, inviting }),
-    [state, detail, calls, lastEnded, tones, call, shutdown, devices, setDevices, devicesVersion, soundBlocked, unblockAudio, ringTest, conferenceAvailable, addParticipant, inviteToConference, rooms, parties, inviting]
+    () => ({ state, detail, calls, lastEnded, tones, call, shutdown, devices, setDevices, devicesVersion, soundBlocked, unblockAudio, ringTest, conferenceAvailable, addParticipant, inviteToConference, rooms, awaiting, confirmConference, cancelAwaiting, parties, inviting }),
+    [state, detail, calls, lastEnded, tones, call, shutdown, devices, setDevices, devicesVersion, soundBlocked, unblockAudio, ringTest, conferenceAvailable, addParticipant, inviteToConference, rooms, awaiting, confirmConference, cancelAwaiting, parties, inviting]
   )
   // What a test can read from outside: never actions, only counters (packets, calls, tones).
   useEffect(() => {

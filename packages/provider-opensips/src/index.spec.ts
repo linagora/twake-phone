@@ -376,9 +376,26 @@ describe('OpensipsProvider call rules', () => {
     // Forwarded from 102 to 103: the extension it reached, and the tag of the phone that answered.
     expect(await p.callBetweenExtensions('c1')).toEqual({ callId: 'c1', caller: '101', callerTag: 'tag-a', callee: '103', calleeTag: 'tag-b' })
     expect(sips.requests.find(r => r.method === 'dlg_list_ctx')?.params).toEqual({ callid: 'c1' })
-    sips.state.dialogContexts.set('trunk', dialog('trunk', {}, [{ callee: '103' }, { callee_tag: 'b' }, { trunk: 'caller' }]))
     sips.state.dialogContexts.set('room', dialog('room', {}, [{ callee: '103' }, { callee_tag: 'b' }, { meet: 'caller' }]))
-    expect([await p.callBetweenExtensions('trunk'), await p.callBetweenExtensions('room')]).toEqual(['external', 'external'])
+    expect(await p.callBetweenExtensions('room')).toBe('external')
+    // With the operator (step 8c). Placed (`trunk: callee`): the caller's extension and the number dialled. Received
+    // (`trunk: caller`): the extension that answered and the number shown (`cli`), never the From of the dialog.
+    const operator = (from: string, values: Record<string, unknown>[]) => dialog('op', { from_uri: `sip:${from}@sip.example.test` }, [{ callee_tag: 'b' }, ...values])
+    sips.state.dialogContexts.set('op', operator('101', [{ trunk: 'callee' }, { callee: '+33612345678' }, { dialled: '+33612345678' }]))
+    expect(await p.callBetweenExtensions('op')).toEqual({ callId: 'op', extension: '101', number: '+33612345678' })
+    sips.state.dialogContexts.set('op', operator('+33142000000', [{ trunk: 'caller' }, { callee: '103' }, { cli: '+33142000000' }]))
+    expect(await p.callBetweenExtensions('op')).toEqual({ callId: 'op', extension: '103', number: '+33142000000' })
+    // Hidden number (no `cli`, the From still has it), a mailbox, a number that is not one, an extension that is not: external.
+    sips.state.dialogContexts.set('op', operator('+33142000000', [{ trunk: 'caller' }, { callee: '103' }]))
+    expect(await p.callBetweenExtensions('op')).toBe('external')
+    sips.state.dialogContexts.set('op', operator('+33142000000', [{ trunk: 'caller' }, { callee: '103' }, { cli: '+33142000000' }, { voicemail: '1' }]))
+    expect(await p.callBetweenExtensions('op')).toBe('external')
+    sips.state.dialogContexts.set('op', operator('101', [{ trunk: 'callee' }, { dialled: '112' }]))
+    expect(await p.callBetweenExtensions('op')).toBe('external')
+    sips.state.dialogContexts.set('op', operator('101', [{ trunk: 'callee' }, { dialled: '+33 6;12' }]))
+    expect(await p.callBetweenExtensions('op')).toBe('external')
+    sips.state.dialogContexts.set('op', operator('+33142000000', [{ trunk: 'caller' }, { callee: 'ab' }, { cli: '+33142000000' }]))
+    expect(await p.callBetweenExtensions('op')).toBe('external')
     // Ringing; answered before OpenSIPS kept the tag of the answer; to oneself; a name no extension has; unknown.
     sips.state.dialogContexts.set('early', dialog('early', { state: 2 }))
     sips.state.dialogContexts.set('untagged', dialog('untagged', {}, [{ callee: '103' }]))

@@ -162,8 +162,14 @@ export interface ConferenceRecord {
   meetingId: string
   ownerUserId: string
   pin?: string
+  /** A call with the operator made a conference (step 8c): its Call-ID, which the person's confirmation ends. */
+  originCall?: string
+  /** What the person chose for it, once: shared by every Gateway. */
+  decision?: ConferenceDecision
   createdAt: string
 }
+
+export type ConferenceDecision = 'confirmed' | 'cancelled'
 
 /** What a person chose as presence (absent, do not disturb…), kept per user: it survives a restart and stays theirs. */
 export interface UserPresenceRecord {
@@ -825,6 +831,11 @@ export interface Store {
    * new PIN for a room at once, one only wins (third review n°5).
    */
   replaceConferencePin(meetingId: string, from: string | null, to: string | null): Promise<boolean>
+  /**
+   * The person's choice for the room, set once, atomically: the first one to ask wins, and what comes back is the choice
+   * that stands (the asked one, or the one made before). Null for a room that is not there (step 8c, ADR 0025).
+   */
+  decideConference(meetingId: string, decision: ConferenceDecision): Promise<ConferenceDecision | null>
   /** The rooms of a tenant, or of one owner in it. */
   countConferences(tenantId: string, ownerUserId?: string): Promise<number>
   /** The rooms of one owner, oldest first. */

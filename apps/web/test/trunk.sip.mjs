@@ -1230,6 +1230,38 @@ try {
     await setOutbound({}, PROFILES, [])
   })
 
+  await step("step 8c: a call with the operator, as the Gateway reads its dialog to make a conference of it (placed: the caller's extension and the number dialled; received: the extension that answered and the number shown, none when hidden), then the room calls that number again at the person's name, under their caps, as for any call of theirs", async () => {
+    await setOutbound({}, PROFILES, [])
+    const read = async callId => parseDlgContext((await mi('dlg_list_ctx', { callid: callId })).result)
+    const out = await p301.dial('0199000025')
+    expect('answered', out.final.status === 200, out.final.first)
+    const placed = await read(out.callId)
+    expect('placed: the extension, the number dialled in E.164, no number shown', placed?.state === 4 && placed.caller === '301' && placed.values.trunk === 'callee' && placed.values.dialled === '+33199000025' && placed.values.cli === undefined, JSON.stringify(placed))
+    // No Replaces: nothing takes the operator's place in its dialog. The room calls the same number, through the
+    // grant any call of a room has (here a conference's room), while the first call lasts: under the person's caps (two
+    // external calls at a time), from their direct number; a third call of theirs is refused as for the phone itself.
+    const lk = await room('301')
+    const conference = 'twake-call-0123456789abcdef'
+    const grantIn = async number => `X-Twake-Grant: ${await grants.grant('301', number, 30, { room: conference })}`
+    const again = await lk.dial('+33199000025', { extra: [await grantIn('+33199000025')] })
+    expect("the room's call to the same number answered", again.final.status === 200, again.final.first)
+    const second = (await atOperator(A, again)).invite
+    expect('at the operator, from the direct number of 301', second.uri === 'sip:+33199000025@operator.example' && header(second, 'from').includes('<sip:+33199000301@operator.example>'), `${second.uri} ${header(second, 'from')}`)
+    refused('a third call of 301, by the room', await lk.dial('+33199000026', { extra: [await grantIn('+33199000026')] }), 'limit')
+    expect("the room's call named a conference's", (await read(again.callId))?.values.meet === 'caller', JSON.stringify(await read(again.callId)))
+    expect('the first call goes on', out.state === 'answered', out.state)
+    await lk.hangup(again)
+    await hangupOut(p301, out)
+    // Received: the extension that answered, the number shown (E.164, as OpenSIPS settled it): in `cli`, never read from the From.
+    for (const [headers, shown] of [[[], true], [['Privacy: id'], false]]) {
+      const received = await A.call('+33199000301', { from: '639980002', headers })
+      expect(`received ${headers.join('')}`, (await received.final).status === 200)
+      const dialog = await read(received.callId)
+      expect(`received ${headers.join('') || 'with a number'}: the extension, ${shown ? 'the number shown' : 'no number'}`, dialog?.state === 4 && dialog.values.trunk === 'caller' && dialog.values.callee === '301' && (shown ? dialog.values.cli === '+33639980002' : dialog.values.cli === undefined), JSON.stringify(dialog))
+      await received.hangup()
+    }
+  })
+
   await step(`third review 8a, n°1, n°2: a call to the access number is a try of a PIN when it comes, given back when LiveKit SIP does not answer it; ${MEET_CALLS_PER_CALLER} calls of one caller at the same time (486, meet-busy), ${MEET_CALLS_ALL} of all (503, meet-full, told); those who hide their number, refused past ${MEET_PIN_TRIES_ALL}, tell the administrators at ${MEET_PIN_TRIES_ALL} (the calls LiveKit SIP answers, and a wrong PIN typed late, are played by the SIP e2e)`, async () => {
     // LiveKit SIP answers none of these (no room's rule: it rings, or not, and drops the call); OpenSIPS gives each up
     // after 15 s (408). A call let through has no refusal of OpenSIPS's own.
