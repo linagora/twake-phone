@@ -1,6 +1,6 @@
 # ADR 0005 : Wazo Platform derrière OpenSIPS, à l'étape 11
 
-Date : 2026-10-13. État : acceptée. Décidé dans le fil de discussion du projet du 13 octobre 2026 ; remplacé par : aucun ; précisé par l'ADR 0022 (messagerie, étape 11a).
+Date : 2026-10-13. État : acceptée. Décidé dans le fil de discussion du projet du 13 octobre 2026 ; remplacé par : aucun ; précisé par l'ADR 0022 (messagerie, étape 11a) et l'ADR 0027 (`mid_registrar` et les lignes, étape 11c-1).
 
 ## Contexte
 
