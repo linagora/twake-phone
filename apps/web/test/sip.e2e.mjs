@@ -3511,9 +3511,6 @@ try {
         console.log(`[11c-1] auths: ${asteriskCli('pjsip show auths')}\n[11c-1] endpoint 103: ${asteriskCli('pjsip show endpoint 103').slice(0, 1500)}\n[11c-1] twake-pjsip-lines: ${exec('/usr/bin/twake-pjsip-lines | grep -A14 "^\\[103"')}\n[11c-1] confgen: ${exec('wazo-confgen asterisk/pjsip.conf | grep -B2 -A14 "103"').slice(0, 3000)}`)
         const log = execFileSync('docker', ['compose', '-f', COMPOSE_FILE, 'logs', '--no-color', '--timestamps', 'wazo-sysconfd', 'wazo-asterisk'], { encoding: 'utf8', timeout: 30_000, maxBuffer: 64 << 20 }).split('\n').filter(l => /pjsip|ran '|failed|Reload|reload|auth/i.test(l)).slice(-30).map(l => l.replace(/\x1b\[[0-9;]*m/g, '').slice(0, 260))
         console.log(`[11c-1] sysconfd and asterisk, with their times: ${log.join('\n')}\n[11c-1] now: ${new Date().toISOString()}`)
-        // A reload now: do the credentials come?
-        asteriskCli('module reload res_pjsip.so')
-        for (let i = 0; i < 6; i++) { execFileSync('sleep', ['5']); const a = asteriskCli('pjsip show auths'); console.log(`[11c-1] after a reload, ${5 * (i + 1)} s: ${a.split('\n').filter(l => /Auth:\s+\d/.test(l)).join(' ')}`) }
         throw err
       })
       // The password of a line is a print of its extension: the registration of the next step proves it (Asterisk takes it only with that password).
