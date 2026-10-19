@@ -61,6 +61,7 @@ import pg from 'pg'
 import { chromium, firefox } from 'playwright-core'
 import { LiveKitConferenceBridge } from '../../../packages/conference-livekit/dist/index.js'
 import { buildApp } from '../../gateway/dist/app.js'
+import { RateLimiter } from '../../gateway/dist/contacts.js'
 import { WebPush } from '../../gateway/dist/push.js'
 import { JwtAuthenticator } from '../../gateway/dist/auth.js'
 import { DirectorySync } from '../../gateway/dist/directory-sync.js'
@@ -406,6 +407,8 @@ const gateway = await buildApp(registry, {
   secretsKey: key,
   admin: { adminRole: 'twakephone-admin', adminUsers: new Set() },
   conference,
+  // The calls of rooms a person may place a minute (10 by default): the conferences of steps 8b, 8c and 8d follow one another within it.
+  dialOutLimiter: new RateLimiter(100, 60_000),
   webhooks: { policy: { allowHttp: true, ports: [Number(new URL(receiver.url).port)] }, open: parseNetworks('127.0.0.1/32'), retryBaseMs: 1_000 },
   trunkWatchMs: 2_000,
   voicemail: tenantId => (tenantId === TENANT ? wazo : undefined),
