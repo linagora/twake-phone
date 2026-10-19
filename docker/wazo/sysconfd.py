@@ -9,7 +9,7 @@ Anything else is answered 200 and written to the log, as nothing of it applies h
 wazo-confd's requests carry no credentials (as with Wazo's own wazo-sysconfd, on the loopback): a browser's are refused
 , those that say where they come from (Origin, Sec-Fetch-Site) or name another host than the one it
 listens on (a DNS name made to point to the loopback), so that no web page opened on this machine deletes a mailbox.
-An Asterisk command is answered once Asterisk answered it (its ActionID), and fails when Asterisk refused it. It logs
+An Asterisk command is done once Asterisk answered it (its ActionID), and fails (in the log; 500 when synchronous) when Asterisk refused it. It logs
 in with an AMI account of its own and no event, and runs each command as the AMI action
 that does it, never through the CLI: the module reloads (Reload, the `system` privilege) and
 the list of the mailboxes (VoicemailUsersList, `reporting`). The account (`write = system,reporting`:
@@ -29,6 +29,15 @@ its number or context changed, after its database committed) replaces whatever i
 and nothing when it had no folder. No quarantine: the Gateway never changes a mailbox's number (a person's mailbox
 keeps its number whatever extension they hold, provider-wazo), so nothing here moves on a real Wazo either.
 
+Its queue is wazo-sysconfd's own (wazo_sysconfd/plugins/request_handlers/request.py): a request is answered 200 at once
+and its commands run one after another in one worker; a command that is already waiting in the queue (not yet taken by
+the worker) is not queued twice, its request ends when the one waiting has run. So a burst of requests costs one
+reload of a module while a first one runs, and one more for all those that came meanwhile, never one each. wazo-confd
+sends the commands of one HTTP request together (a set) and nothing across two requests: only this queue merges
+requests. wazo-sysconfd's `request_handlers.synchronous` (false by default) is SYSCONFD_SYNCHRONOUS=1: the answer waits
+for the request to have run, and, which wazo-sysconfd never does, says 500 when a command failed (the tests of this
+stand-in use it). SYSCONFD_RELOAD_MS makes each command last as long as a real one does.
+
 Standard library only: it runs with the Python of a Wazo image, on the loopback.
 """
 
@@ -38,7 +47,10 @@ import re
 import shutil
 import socket
 import sys
+import threading
+import time
 import uuid
+from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -47,6 +59,9 @@ AMI = os.environ.get('SYSCONFD_AMI', '127.0.0.1:5038')
 AMI_USER = os.environ.get('SYSCONFD_AMI_USER', 'twake_sysconfd')
 AMI_PASSWORD = os.environ['SYSCONFD_AMI_PASSWORD']
 CONFGEND = os.environ.get('SYSCONFD_CONFGEND', '127.0.0.1:8669')
+SYNCHRONOUS = os.environ.get('SYSCONFD_SYNCHRONOUS') == '1'
+# What a reload costs before it runs: a real Wazo's (wazo-confgen, then asterisk -rx) is far above this stack's Asterisk.
+RELOAD_MS = int(os.environ.get('SYSCONFD_RELOAD_MS', '0'))
 SPOOL = os.environ.get('SYSCONFD_SPOOL', '/var/spool/asterisk/voicemail')
 # The commands wazo-confd sends after a change to voicemails, users and lines, each the module the AMI reloads for it.
 RELOADS = {
@@ -201,10 +216,105 @@ def ami_command(command):
     except OSError as err:
         raise AmiError(f'wazo-confgend not reached, voicemail reload not run: {err}') from err
     reloaded, listed = ami_actions([reload_action(RELOADS[command]), ['Action: VoicemailUsersList']])
+    # A mailbox deleted between the two readings of wazo-confgend says nothing: only those in both are expected.
+    try:
+        expected &= mailboxes_of(confgend('asterisk/voicemail.conf'))
+    except OSError as err:
+        raise AmiError(f'wazo-confgend not reached after the reload: {err}') from err
     missing = expected - mailboxes_listed(listed.get('entries', []))
     if missing:
         raise AmiError(f'voicemail reload: {len(missing)} mailbox(es) of wazo-confgend not in Asterisk after it, as {", ".join(sorted(f"{n}@{c}" for c, n in missing)[:5])}')
     return reloaded
+
+
+class Command:
+    def __init__(self, value):
+        self.value = value
+        self.optimized = False
+        self.merged_into = None  # the command waiting that this one is merged into
+        self.error = None
+
+
+class Request:
+    def __init__(self, commands):
+        self.id = str(uuid.uuid4())
+        self.commands = commands
+        self.error = None
+        self.done = threading.Event()
+
+    def run(self):
+        # As wazo-sysconfd's Command.execute: whatever fails is logged, and the next command runs all the same.
+        try:
+            for command in self.commands:
+                if command.optimized:
+                    log(f'{command.value!r} merged into the one waiting')
+                    # The one it was merged into ran before this request: its failure is this request's too.
+                    self.error = self.error or command.merged_into.error
+                    continue
+                try:
+                    # Only PJSIP's reload is long on a real Wazo (wazo-confgen --invalidate, then asterisk -rx).
+                    if RELOAD_MS and command.value == 'module reload res_pjsip.so':
+                        time.sleep(RELOAD_MS / 1000)
+                    ami_command(command.value)
+                    log(f'ran {command.value!r}')
+                except Exception as err:
+                    log(f'{command.value!r} failed: {err}')
+                    command.error = err
+                    self.error = self.error or err
+        finally:
+            self.done.set()
+
+
+class RequestQueue:
+    """wazo-sysconfd's RequestQueue with its DuplicateRequestOptimizer: `waiting` holds the first command of each
+    value until the worker takes its request; a command of a value in it is marked optimized and does not run."""
+
+    def __init__(self):
+        self.condition = threading.Condition()
+        self.queue = deque()
+        self.waiting = {}
+
+    def put(self, request):
+        with self.condition:
+            for command in request.commands:
+                if command.value in self.waiting:
+                    command.optimized = True
+                    command.merged_into = self.waiting[command.value]
+                else:
+                    self.waiting[command.value] = command
+            self.queue.append(request)
+            self.condition.notify()
+
+    def empty(self):
+        with self.condition:
+            return not self.queue
+
+    def get(self):
+        with self.condition:
+            while not self.queue:
+                self.condition.wait()
+            request = self.queue.popleft()
+            for command in request.commands:
+                if not command.optimized:
+                    self.waiting.pop(command.value, None)
+            return request
+
+
+QUEUE = RequestQueue()
+
+
+def work():
+    # As wazo-sysconfd's RequestProcessor.run: whatever happens, the thread goes on.
+    while True:
+        try:
+            QUEUE.get().run()
+            if QUEUE.empty():
+                log('idle')
+        except Exception as err:
+            log(f'unexpected error: {err}')
+
+
+threading.Thread(target=work, daemon=True).start()
 
 
 def mailbox_dir(context, mailbox):
@@ -274,17 +384,20 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             return self.answer(400, {'error': 'invalid JSON'})
         if self.path == '/exec_request_handlers':
+            commands = []
             for command in body.get('ipbx', []):
-                if command not in COMMANDS:
+                if command in COMMANDS:
+                    commands.append(Command(command))
+                else:
                     log(f'ipbx command not run: {command!r}')
-                    continue
-                try:
-                    ami_command(command)
-                    log(f'ran {command!r}')
-                except (OSError, PermissionError, AmiError) as err:
-                    log(f'{command!r} failed: {err}')
-                    return self.answer(500, {'error': str(err)})
-            return self.answer()
+            request = Request(commands)
+            QUEUE.put(request)
+            # As wazo-sysconfd's SyncRequestHandlers: it waits 30 s for the request to have run, then warns and answers 200.
+            if SYNCHRONOUS and not request.done.wait(30):
+                log('timeout reached on synchronous request')
+            elif SYNCHRONOUS and request.error:
+                return self.answer(500, {'error': str(request.error)})
+            return self.answer(200, {'request_uuid': request.id})
         log(f'POST {self.path}: nothing to do here')
         return self.answer()
 

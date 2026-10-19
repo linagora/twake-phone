@@ -147,6 +147,26 @@ const expectEqual = (actual, expected, what) => {
   if (!same) throw new Error(`${what}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`)
 }
 const sleep = ms => new Promise(r => setTimeout(r, ms))
+const RUN_START = new Date().toISOString()
+/** The log of wazo-sysconfd's stand-in since `since`. */
+const sysconfdLog = since =>
+  execFileSync('docker', ['compose', '-f', fileURLToPath(new URL('../../../docker/docker-compose.sip.yml', import.meta.url)), 'logs', '--no-log-prefix', ...(since ? ['--since', since] : []), 'wazo-sysconfd'], { encoding: 'utf8', timeout: 30_000 })
+/**
+ * Waits until the queue of the stand-in is empty: its log, access lines apart, ends with `idle` (it says it each time its queue empties) and
+ * has not grown for a second. At most 60 s (a reload of PJSIP lasts 500 ms here), then an error.
+ */
+const sysconfdSettled = async () => {
+  const deadline = Date.now() + 60_000
+  for (let last = null; Date.now() < deadline; ) {
+    await sleep(1_000)
+    const log = sysconfdLog().trimEnd()
+    // The access line of a request can come after the `idle` of its run: those lines are left out.
+    const said = log.split('\n').filter(l => !/ "(GET|POST|DELETE) /.test(l))
+    if (log === last && said.at(-1)?.endsWith('sysconfd: idle')) return
+    last = log
+  }
+  throw new Error('the queue of wazo-sysconfd is not empty after 60 s')
+}
 /** Polls `fn` until it returns something truthy; the message says what never came. */
 const until = async (what, fn, { timeout = 15_000, every = 250 } = {}) => {
   const deadline = Date.now() + timeout
@@ -3254,6 +3274,8 @@ try {
       const r = (await gateway.inject({ method: 'GET', url: '/ready' })).json()
       return r.ready && !(r.reasons ?? []).some(x => x.startsWith('voicemail')) ? r : null
     }, { timeout: 45_000 })
+    // The reloads wazo-confd asked for the mailboxes just made are done before a call reaches one (wazo-sysconfd answers wazo-confd at once, as the real one, and Asterisk does not know a mailbox before its reload).
+    await sysconfdSettled()
     // The messages an interrupted run left in Jean's mailbox (his, kept: he still holds 102).
     jeanMailbox = await asPerson(jean)
     const caps = (await jeanMailbox('GET', '/capabilities')).json()
@@ -3995,6 +4017,7 @@ try {
       people.push(claire)
       await directorySync.run()
       await rowsAre({ 108: `${claires}@${context}` }, 'a mailbox for Claire at 108, at her number')
+      await sysconfdSettled()
       expectEqual(await wazoOf('cpetit'), { name: 'TwakePhone', user: 'TwakePhone' }, "Claire's mailbox and its user in Wazo: nothing of her")
       // Hers shows nothing of what was under 108: never at an extension's number.
       expectEqual(await wazo.listMessages({ userId: 'cpetit', extension: '108' }), [], "Claire's messages in her new mailbox")
@@ -4017,7 +4040,7 @@ try {
       await rowsAre({ 108: `${alices}@${context}`, 109: `${claires}@${context}` }, 'the mailboxes once they swapped')
       await theirs('amartin', '108', '+33639980041')
       await theirs('cpetit', '109', '+33639980042')
-      await sleep(2_000)
+      await sysconfdSettled()
       expectEqual(reloadsSince(moving), [], 'what wazo-sysconfd reloaded of Asterisk for the moves and the swap')
       expectEqual([(await wazoOf('amartin')).name, (await wazoOf('cpetit')).name], ['TwakePhone', 'TwakePhone'], 'the names of the mailboxes once they swapped')
       // Nothing moved in the spool: each one's folder where it was, those under 108 and 109 untouched.
@@ -4030,7 +4053,7 @@ try {
       await rowsAre({ 109: undefined }, 'no mailbox at 109 once Claire left')
       await nameIs('cpetit', 'TwakePhone aside ', "Claire's mailbox, set aside in Wazo")
       await theirs('cpetit', '109', '+33639980042')
-      await sleep(2_000)
+      await sysconfdSettled()
       // A change of the mailbox only: its module reloaded (what else wazo-confd asks for with it is said here).
       const aside = reloadsSince(leaving)
       console.log(`     wazo-sysconfd, for a mailbox set aside: ${aside.join(', ') || 'nothing'}`)
@@ -4062,6 +4085,41 @@ try {
         const rows = (await mailboxRows()).map(r => r.extension)
         return rows.includes('101') && !rows.includes('108') && !rows.includes('109') ? rows : null
       }, { timeout: 30_000 })
+    }
+  })
+  await step('step 11c, prerequisite: twelve people who join the directory at once get their mailboxes in one synchronisation: wazo-sysconfd merges the reloads that wait while one runs, a few for their 24 writes that ask for PJSIP', async () => {
+    const newcomers = Array.from({ length: 12 }, (_, i) => ({ uid: `lot${i}`, cn: `Lot Numero${i}`, sn: `Numero${i}`, givenName: 'Lot', mail: `lot${i}@example.test`, ipPhone: String(420 + i), ou: 'Support' }))
+    await sysconfdSettled()
+    const since = new Date().toISOString()
+    people.push(...newcomers)
+    try {
+      await directorySync.run()
+      await until('a mailbox for each of the twelve', async () => {
+        const rows = (await mailboxRows()).map(r => r.extension)
+        return newcomers.every(n => rows.includes(n.ipPhone)) ? rows : null
+      }, { timeout: 60_000 })
+      // The queue of wazo-sysconfd drained, whatever came last.
+      await sysconfdSettled()
+      const ran = reloadsSince(since)
+      const count = command => ran.filter(c => c === command).length
+      console.log(`     wazo-sysconfd, for twelve mailboxes made in one synchronisation (24 writes that ask for PJSIP): ${JSON.stringify(Object.fromEntries([...new Set(ran)].map(c => [c, count(c)])))}`)
+      // A real Wazo reloads PJSIP slowly (wazo-confgen, then asterisk -rx: 500 ms here, the other commands are fast), so
+      // the commands that wait while it runs are merged: twelve arrivals, 24 writes that ask for PJSIP, cost far fewer
+      // reloads. Run one by one, as the synchronous stand-in did before, they cost 24 (and 12 voicemail reloads).
+      if (count('module reload res_pjsip.so') > 6) throw new Error(`reloads of PJSIP for twelve mailboxes made at once: ${count('module reload res_pjsip.so')}, 6 at most (${JSON.stringify(ran)})`)
+      if (count('voicemail reload') > 6) throw new Error(`reloads of the voicemails for twelve mailboxes made at once: ${count('voicemail reload')}, 6 at most`)
+      // No reload failed meanwhile (wazo-sysconfd answers wazo-confd at once, as the real one: a failure is in its log).
+      expectEqual(sysconfdLog(since).split('\n').filter(l => / failed: /.test(l)), [], 'the commands wazo-sysconfd failed')
+    } finally {
+      // They leave two at a time (a mass of them would be held back until an administrator says it is meant).
+      for (let i = 0; i < newcomers.length; i += 2) {
+        for (const n of newcomers.slice(i, i + 2)) people.splice(people.indexOf(n), 1)
+        await directorySync.run()
+        await until('their mailboxes no longer reached', async () => {
+          const rows = (await mailboxRows()).map(r => r.extension)
+          return newcomers.slice(i, i + 2).every(n => !rows.includes(n.ipPhone)) ? rows : null
+        }, { timeout: 60_000 })
+      }
     }
   })
   await step('the directory now shows Alice offline, and Bob available', async () => {
@@ -4109,6 +4167,18 @@ try {
     execFileSync('docker', ['compose', '-f', fileURLToPath(new URL('../../../docker/docker-compose.sip.yml', import.meta.url)), 'exec', '-T', 'wazo-asterisk', 'asterisk', '-rx', 'logger remove channel twake-e2e-trace'], { stdio: 'ignore', timeout: 30_000 })
   } catch {
     // Not there.
+  }
+  // No command of wazo-sysconfd failed in the whole run: it answers wazo-confd at once, as the real one, so a failure is only in its log.
+  try {
+    await sysconfdSettled()
+    const bad = sysconfdLog(RUN_START).split('\n').filter(l => / failed: |unexpected error:/.test(l))
+    if (bad.length) {
+      failed = true
+      console.error(`wazo-sysconfd failed ${bad.length} command(s):\n${bad.slice(0, 10).join('\n')}`)
+    }
+  } catch (err) {
+    failed = true
+    console.error('the log of wazo-sysconfd not read or not settled:', err)
   }
   await db.end()
 }

@@ -330,6 +330,8 @@ services:
       SYSCONFD_AMI_PASSWORD: twake-wazo-dev-only-sysconfd
       # Where it reads the mailboxes a voicemail reload must give Asterisk.
       SYSCONFD_CONFGEND: 127.0.0.1:8669
+      # A reload lasts what a real Wazo's does (wazo-confgen, then asterisk -rx), so that the commands that wait merge as there.
+      SYSCONFD_RELOAD_MS: '500'
     volumes:
       - ./wazo/sysconfd.py:/twake/sysconfd.py:ro
       - ./wazo/healthcheck.py:/twake/healthcheck.py:ro
