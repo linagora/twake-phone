@@ -3505,7 +3505,12 @@ try {
         const endpoints = asteriskCli('pjsip show endpoints')
         const auths = asteriskCli('pjsip show auths')
         return holders.every(ext => new RegExp(`^\\s*Endpoint:\\s+${ext}\\b`, 'm').test(endpoints) && new RegExp(`^\\s*Auth:\\s+${ext}\\b`, 'm').test(auths)) ? true : null
-      }, { timeout: 60_000 })
+      }, { timeout: 60_000 }).catch(err => {
+        // For whoever reads the failure: what Asterisk loaded of the lines, and what wazo-confgend gave it.
+        const exec = cmd => { try { return execFileSync('docker', ['compose', '-f', COMPOSE_FILE, 'exec', '-T', 'wazo-asterisk', 'bash', '-c', cmd], { encoding: 'utf8', timeout: 30_000 }) } catch (e) { return `(${e.message})` } }
+        console.log(`[11c-1] auths: ${asteriskCli('pjsip show auths')}\n[11c-1] endpoint 103: ${asteriskCli('pjsip show endpoint 103').slice(0, 1500)}\n[11c-1] twake-pjsip-lines: ${exec('/usr/bin/twake-pjsip-lines | grep -A14 "^\\[103"')}\n[11c-1] confgen: ${exec('wazo-confgen asterisk/pjsip.conf | grep -B2 -A14 "103"').slice(0, 3000)}`)
+        throw err
+      })
       // The password of a line is a print of its extension: the registration of the next step proves it (Asterisk takes it only with that password).
       // The same stack answers an extension OpenSIPS gave no line: registered here, never at Wazo.
       expectEqual(contactsOf('103'), [], 'contacts of 103 at Wazo before its window registers again')
