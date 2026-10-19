@@ -1781,7 +1781,10 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
       v1.get('/me/emergency-site', async req => {
         const { user, provider } = await who(req)
         if (!(await provider.getCapabilities()).trunks) return { enabled: false }
-        const site = (await store.listSites(user.tenantId)).find(x => x.members.includes(user.id))
+        const found = (await store.listSites(user.tenantId)).find(x => x.members.includes(user.id))
+        // Only what OpenSIPS will apply: it joins the people of a site to their accounts by the holder of the account, which an
+        // account written before the holder existed has not until its holder opens a session. Not known: the store's word.
+        const site = found && user.extension && provider.holdsAccount && !(await provider.holdsAccount(user.extension, user.id).catch(() => true)) ? undefined : found
         return { enabled: true, ...(site ? { site: { name: site.name, address: site.address, number: site.number } } : {}) }
       })
       v1.get('/me/forwarding', async req => {
@@ -1991,7 +1994,15 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
               throw err
             }
           )
-        await apply(providerTrunks(trunks, options.secretsKey), dids, (sites ?? before.sites).filter(x => trunks.some(t => t.id === x.trunkId))).catch(undo)
+        const kept = (sites ?? before.sites).filter(x => trunks.some(t => t.id === x.trunkId))
+        // The number of a site stays one of its trunk (step 6c): a change that would leave one the operator would refuse
+        // (the default number changed, a range of direct numbers removed or shortened) is refused until the site says another.
+        const stale = kept.find(x => {
+          const t = trunks.find(r => r.id === x.trunkId)!
+          return x.number !== t.config.defaultNumber && !inDids(dids.filter(d => d.trunkId === x.trunkId), x.number)
+        })
+        if (stale) throw Object.assign(new Error(`The site ${stale.id} presents ${stale.number} for its emergency calls: it is a number of the trunk ${stale.trunkId}, so change the number of the site first`), { statusCode: 409, code: 'SITE_NUMBER_IN_USE' })
+        await apply(providerTrunks(trunks, options.secretsKey), dids, kept).catch(undo)
         await keep().catch(undo)
       }
       // A number rings an extension someone holds, or a ring group of the tenant: nothing else; so does a fallback. A
@@ -2359,8 +2370,10 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
           if (!current && sites.length >= MAX_SITES) throw Object.assign(new Error(`At most ${MAX_SITES} sites`), { statusCode: 409, code: 'SITE_LIMIT' })
           const site = parseSite(req.params.id, req.body, records, dids)
           const known = new Set((await store.listMappings(user.tenantId)).map(m => m.userId))
-          const unknown = site.members.find(m => !known.has(m))
+          // Someone who left the directory and was in this site goes from it with this write; anyone else unknown is refused.
+          const unknown = site.members.find(m => !known.has(m) && !current?.members.includes(m))
           if (unknown) throw Object.assign(new Error(`members: ${unknown} is nobody of the directory`), { statusCode: 400, code: 'SITE_MEMBER' })
+          site.members = site.members.filter(m => known.has(m))
           const next = [...sites.filter(x => x.id !== site.id).map(x => ({ ...x, members: x.members.filter(m => !site.members.includes(m)) })), site]
           await changeTrunks(user.tenantId, apply, records, dids, () => store.upsertSite({ tenantId: user.tenantId, ...site }), next)
           return { site, created: !current }

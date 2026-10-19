@@ -356,6 +356,13 @@ export class TrunkTables {
     }
   }
 
+  /** Whether the account of `extension` is written for `userId` (`subscriber.holder`): how the sites reach their people. */
+  async holdsAccount(extension: string, userId: string): Promise<boolean> {
+    await this.opts.ready?.()
+    const r = (await this.opts.pool.query('SELECT 1 FROM subscriber WHERE username = $1 AND holder = $2 LIMIT 1', [extension, userId])) as { rows?: unknown[] } | undefined
+    return !!r?.rows?.length
+  }
+
   /** The tenant's trunks as OpenSIPS knows them: id, set of `dispatcher`, address of record when it registers ('' otherwise). */
   async sets(): Promise<{ id: string; setid: number; aor: string }[]> {
     await this.opts.ready?.()

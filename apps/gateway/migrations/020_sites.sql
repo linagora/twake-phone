@@ -7,7 +7,7 @@ CREATE TABLE sites (
   name       text NOT NULL,
   address    text NOT NULL,
   trunk_id   text NOT NULL,
-  number     text NOT NULL,
+  number     text NOT NULL CHECK (number ~ '^\+[1-9][0-9]{6,14}$'),
   PRIMARY KEY (tenant_id, id),
   FOREIGN KEY (tenant_id, trunk_id) REFERENCES trunk_configs (tenant_id, id) ON DELETE CASCADE
 );
@@ -19,3 +19,5 @@ CREATE TABLE site_members (
   PRIMARY KEY (tenant_id, user_id),
   FOREIGN KEY (tenant_id, site_id) REFERENCES sites (tenant_id, id) ON DELETE CASCADE
 );
+
+CREATE INDEX site_members_site_idx ON site_members (tenant_id, site_id);

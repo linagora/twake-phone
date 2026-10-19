@@ -928,7 +928,6 @@
   "admin.site.number": "Numéro présenté pour les urgences",
   "admin.site.numberHint": "Un numéro direct de ce trunk ou son numéro par défaut, par exemple +33 1 99 00 03 50.",
   "admin.site.members": "Personnes du site",
-  "admin.site.membersCount": "{count} personne(s)",
   "admin.site.membersHint": "Une personne est dans un site au plus : celle qu'on ajoute ici quitte son ancien site.",
   "admin.site.noUsers": "Aucune personne dans l'annuaire pour l'instant.",
   "admin.site.person": "{name} ({extension})",
@@ -944,5 +943,10 @@
   "settings.emergency.title": "Appels d'urgence",
   "settings.emergency.site": "Vos appels d'urgence (15, 17, 18, 112…) partent du site {name} ({address}), avec le numéro {number} : c'est l'adresse de ce site que l'opérateur transmet aux secours.",
   "settings.emergency.none": "Aucun site ne vous est attribué : vos appels d'urgence présentent votre numéro direct, sinon celui de l'organisation, et l'opérateur transmet l'adresse qu'il leur connaît. Demandez à un administrateur de vous rattacher à votre site.",
-  "settings.emergency.error": "Impossible de lire votre site d'urgence pour l'instant."
+  "settings.emergency.error": "Impossible de lire votre site d'urgence pour l'instant.",
+  "admin.site.membersOne": "{count} personne",
+  "admin.site.membersMany": "{count} personnes",
+  "admin.site.search": "Chercher une personne",
+  "admin.site.searchNone": "Personne ne correspond.",
+  "admin.site.numberRings": "Ce numéro est celui que les secours rappellent : il doit faire sonner quelqu'un du site (une réception, un poste), pas une personne seule. Le numéro direct de l'appelant n'est pas présenté pour une urgence quand il est dans un site."
 }

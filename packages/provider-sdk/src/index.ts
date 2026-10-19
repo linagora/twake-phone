@@ -143,6 +143,8 @@ export interface TelephonyProvider {
    * The trunks of the tenant with their passwords, and its direct numbers (capability `trunks`): replaces what the
    * provider had. The Gateway checked them (ids, numbers, ranges that do not overlap).
    */
+  /** Whether the SIP account of `extension` is written for the user `userId` (the sites of the emergency calls are joined to the accounts by it). */
+  holdsAccount?(extension: string, userId: string): Promise<boolean>
   setTrunks?(trunks: (Trunk & { password?: string })[], dids: DidRange[], sites?: EmergencySite[]): Promise<void>
   /**
    * How the tenant's trunks are doing now (step 7): registration and servers, as the SIP server says. Undefined when

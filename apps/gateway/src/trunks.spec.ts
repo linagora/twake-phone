@@ -259,7 +259,7 @@ describe('trunkFromEnv', () => {
 })
 
 describe('trunk routes', () => {
-  const setup = async (opts: { withTrunks?: boolean; key?: Buffer | null; store?: MemoryStore; refuse?: boolean; status?: () => Promise<unknown>; statusCacheMs?: number; logged?: unknown[][] } = {}) => {
+  const setup = async (opts: { withTrunks?: boolean; key?: Buffer | null; store?: MemoryStore; refuse?: boolean; holds?: (extension: string, userId: string) => boolean; status?: () => Promise<unknown>; statusCacheMs?: number; logged?: unknown[][] } = {}) => {
     process.env.AUTH_MODE = 'dev'
     const store = opts.store ?? new MemoryStore()
     // Who holds the extensions the direct numbers ring (tenant A), and its ring group 200.
@@ -276,6 +276,7 @@ describe('trunk routes', () => {
       close: async () => {},
       listGroups: async () => [{ number: '200', name: 'Accueil', members: ['101'] }],
       ...(opts.status ? { getTrunkStatus: opts.status } : {}),
+      ...(opts.holds ? { holdsAccount: async (extension: string, userId: string) => opts.holds!(extension, userId) } : {}),
       ...(opts.withTrunks !== false
         ? {
             setTrunks: async (trunks: (Trunk & { password?: string })[], dids: DidRange[], sites: EmergencySite[] = []) => {
@@ -389,6 +390,49 @@ describe('trunk routes', () => {
     expect(handed.at(-1)).toEqual({ trunks: [], dids: [] })
     expect(handedSites.at(-1)).toEqual([])
     expect(await store.listSites('A')).toEqual([])
+  })
+
+  it('refuses a change of the trunk or of its direct numbers that would leave a site a number its operator would refuse (step 6c, review n°1)', async () => {
+    const { app, admin, handedSites, store } = await setup()
+    await app.inject({ method: 'PUT', url: '/api/v1/admin/trunks/operator', headers: admin, payload: trunk })
+    await app.inject({ method: 'PUT', url: '/api/v1/admin/dids/reception', headers: admin, payload: { trunkId: 'operator', first: '+33199000350', last: '+33199000359', target: '101' } })
+    const site = { name: 'Paris', address: '1 rue de Rivoli', trunkId: 'operator', number: '+33199000355', members: ['alice'] }
+    expect((await app.inject({ method: 'PUT', url: '/api/v1/admin/sites/paris', headers: admin, payload: site })).statusCode).toBe(201)
+    const refused = (r: { statusCode: number; json(): unknown }) => {
+      expect(r.statusCode).toBe(409)
+      expect(r.json()).toMatchObject({ code: 'SITE_NUMBER_IN_USE' })
+    }
+    // The range removed, shortened below the number, or moved; the default number of the trunk changed (the site on it).
+    refused(await app.inject({ method: 'DELETE', url: '/api/v1/admin/dids/reception', headers: admin }))
+    refused(await app.inject({ method: 'PUT', url: '/api/v1/admin/dids/reception', headers: admin, payload: { trunkId: 'operator', first: '+33199000350', last: '+33199000354', target: '101' } }))
+    expect((await app.inject({ method: 'PUT', url: '/api/v1/admin/sites/paris', headers: admin, payload: { ...site, number: '+33199000100' } })).statusCode).toBe(200)
+    refused(await app.inject({ method: 'PUT', url: '/api/v1/admin/trunks/operator', headers: admin, payload: { ...trunk, defaultNumber: '+33199000199' } }))
+    // Nothing was written: the store and the provider hold what they held.
+    expect((await store.listDids('A')).map(d => d.last)).toEqual(['+33199000359'])
+    expect(handedSites.at(-1)!.map(x => x.number)).toEqual(['+33199000100'])
+    // The site says another number first: then the range goes, and the default number may change after its site.
+    expect((await app.inject({ method: 'PUT', url: '/api/v1/admin/sites/paris', headers: admin, payload: { ...site, number: '+33199000355' } })).statusCode).toBe(200)
+    expect((await app.inject({ method: 'PUT', url: '/api/v1/admin/trunks/operator', headers: admin, payload: { ...trunk, defaultNumber: '+33199000199' } })).statusCode).toBe(200)
+    refused(await app.inject({ method: 'DELETE', url: '/api/v1/admin/dids/reception', headers: admin }))
+  })
+
+  it('lets a site be saved again once someone of it left the directory, and tells only the site that OpenSIPS will apply (step 6c, review n°4, n°5)', async () => {
+    let holds = true
+    const { app, admin, as, store } = await setup({ holds: () => holds })
+    await app.inject({ method: 'PUT', url: '/api/v1/admin/trunks/operator', headers: admin, payload: trunk })
+    const site = { name: 'Paris', address: '1 rue de Rivoli', trunkId: 'operator', number: '+33199000100', members: ['alice', 'jean'] }
+    expect((await app.inject({ method: 'PUT', url: '/api/v1/admin/sites/paris', headers: admin, payload: site })).statusCode).toBe(201)
+    // The account of alice has no holder (written before): the app does not say the site, OpenSIPS would not apply it.
+    holds = false
+    expect((await app.inject({ url: '/api/v1/me/emergency-site', headers: as('alice') })).json()).toEqual({ enabled: true })
+    holds = true
+    expect((await app.inject({ url: '/api/v1/me/emergency-site', headers: as('alice') })).json().site).toMatchObject({ name: 'Paris' })
+    // jean left the directory: the site is saved again, without him; a stranger who was not in it is still refused.
+    await store.deleteMapping('A', 'jean')
+    const saved = await app.inject({ method: 'PUT', url: '/api/v1/admin/sites/paris', headers: admin, payload: site })
+    expect(saved.statusCode).toBe(200)
+    expect(saved.json().members).toEqual(['alice'])
+    expect((await app.inject({ method: 'PUT', url: '/api/v1/admin/sites/paris', headers: admin, payload: { ...site, members: ['alice', 'nobody'] } })).json()).toMatchObject({ code: 'SITE_MEMBER' })
   })
 
   it('says nothing of sites without trunks', async () => {

@@ -348,7 +348,7 @@ if (process.env.TEST_DATABASE_URL) {
       // `emergency`: what the script adds for an emergency call (step 6c): the number and trunk of the caller's site.
       const outbound = async (ext: string, called = '+33639980001', emergency = false) => {
         const nth = emergency ? 1 : 0
-        const vars = { ext, called, presented: scriptQuery('presented', {}, nth), site_join: scriptQuery('site_join', { ext }, nth), site_order: scriptQuery('site_order', {}, nth) }
+        const vars = { ext, called, presented: scriptQuery('presented', {}, nth), site_join: scriptQuery('site_join', { ext }, nth), site_order: scriptQuery('site_order', {}, nth), site_col: scriptQuery('site_col', {}, nth) }
         return (await pool.query(scriptQuery('trunk_query', vars))).rows[0] as Record<string, unknown> | undefined
       }
       expect(await outbound('101')).toMatchObject({ setid: 1, presented: '+33199000101', number_format: 'international-00', allowed: ',fixed,mobile,freephone,standard-rate,', internal: null })
@@ -383,6 +383,9 @@ if (process.env.TEST_DATABASE_URL) {
       ]
       await pool.query("INSERT INTO subscriber (username, domain, holder) VALUES ('101', '', 'alice'), ('102', '', 'bob'), ('103', '', 'carol'), ('104', '', 'dave')")
       try {
+        // Whether the account is written for the person (the join of the sites): not for another, not for an account without holder.
+        await pool.query("INSERT INTO subscriber (username, domain) VALUES ('105', '')")
+        expect([await tables.holdsAccount('101', 'alice'), await tables.holdsAccount('101', 'bob'), await tables.holdsAccount('105', 'alice'), await tables.holdsAccount('999', 'alice')]).toEqual([true, false, false, false])
         await tables.set(trunks, dids, sites)
         expect((await pool.query('SELECT id, trunk_id, number FROM emergency_sites ORDER BY id')).rows).toEqual([
           { id: 'lyon', trunk_id: 'backup', number: '+33199000350' },
@@ -395,13 +398,13 @@ if (process.env.TEST_DATABASE_URL) {
         ])
         const outbound = async (ext: string, emergency: boolean) => {
           const nth = emergency ? 1 : 0
-          const vars = { ext, called: '112', presented: scriptQuery('presented', {}, nth), site_join: scriptQuery('site_join', { ext }, nth), site_order: scriptQuery('site_order', {}, nth) }
+          const vars = { ext, called: '112', presented: scriptQuery('presented', {}, nth), site_join: scriptQuery('site_join', { ext }, nth), site_order: scriptQuery('site_order', {}, nth), site_col: scriptQuery('site_col', {}, nth) }
           return (await pool.query(scriptQuery('trunk_query', vars))).rows[0] as Record<string, unknown>
         }
         // 102 (bob) has no direct number: his site's trunk and number, in place of the first trunk's number.
-        expect(await outbound('102', true)).toMatchObject({ setid: 2, presented: '+33199000350' })
+        expect(await outbound('102', true)).toMatchObject({ setid: 2, presented: '+33199000350', site: '+33199000350' })
         // Any other call of his: the first trunk and its number, as without a site.
-        expect(await outbound('102', false)).toMatchObject({ setid: 1, presented: '+33199000100' })
+        expect(await outbound('102', false)).toMatchObject({ setid: 1, presented: '+33199000100', site: null })
         // 101 (alice) has a direct number: her site's number, the same here; 104 (dave) is in no site.
         expect(await outbound('101', true)).toMatchObject({ setid: 1, presented: '+33199000101' })
         expect(await outbound('104', true)).toMatchObject({ setid: 1, presented: '+33199000100' })
@@ -420,7 +423,7 @@ if (process.env.TEST_DATABASE_URL) {
         expect((await pool.query('SELECT count(*)::int AS n FROM emergency_sites')).rows[0].n).toBe(0)
         expect((await pool.query('SELECT count(*)::int AS n FROM emergency_site_users')).rows[0].n).toBe(0)
       } finally {
-        await pool.query("DELETE FROM subscriber WHERE holder IN ('alice', 'bob', 'carol', 'dave')")
+        await pool.query("DELETE FROM subscriber WHERE holder IN ('alice', 'bob', 'carol', 'dave') OR username = '105'")
         await tables.set([], [])
       }
     })

@@ -45,9 +45,9 @@ describe('the emergency site in the settings (step 6c)', () => {
     const site = { name: 'Paris', address: '1 rue de Rivoli, 75001 Paris', number: '+33199000350' }
     await show(async () => ({ enabled: true, site }))
     expect(host.querySelector('h2')?.textContent).toBe("Appels d'urgence")
-    expect(host.textContent).toContain('partent du site Paris (1 rue de Rivoli, 75001 Paris), avec le numéro +33199000350')
+    expect(host.textContent).toContain('partent du site Paris (1 rue de Rivoli, 75001 Paris), avec le numéro +33 1 99 00 03 50')
     await show(async () => ({ enabled: true, site }), 'en')
-    expect(host.textContent).toContain('leave from the site Paris (1 rue de Rivoli, 75001 Paris), with the number +33199000350')
+    expect(host.textContent).toContain('leave from the site Paris (1 rue de Rivoli, 75001 Paris), with the number +33 1 99 00 03 50')
   })
 
   it('says when no site is attributed, says nothing without trunks, and says when it cannot read', async () => {

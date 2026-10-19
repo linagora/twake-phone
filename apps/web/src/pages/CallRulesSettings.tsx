@@ -1,6 +1,7 @@
 import { useEffect, useState, type FormEvent } from 'react'
 import type { MyPresence } from '@twake/telephony-client'
 import { chosenStatus, DEFAULT_DELAY_SEC, DELAY_SEC, delayValid, formFromRules, fromLocalInput, refusalKey, rulesFromForm, statusOptions, timedStatus, toLocalInput, type ChosenStatus, type ForwardingForm } from '../callRules.js'
+import { formatNumber } from '../format.js'
 import { useGateway } from '../gateway.js'
 import { useT } from '../i18n/useT.js'
 
@@ -254,7 +255,7 @@ export const EmergencySiteSettings = () => {
           {t('settings.emergency.error')}
         </p>
       ) : (
-        <p>{state.site ? t('settings.emergency.site', state.site) : t('settings.emergency.none')}</p>
+        <p>{state.site ? t('settings.emergency.site', { ...state.site, number: formatNumber(state.site.number) }) : t('settings.emergency.none')}</p>
       )}
     </section>
   )

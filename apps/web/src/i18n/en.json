@@ -928,7 +928,6 @@
   "admin.site.number": "Number presented for emergencies",
   "admin.site.numberHint": "A direct number of this trunk or its default number, for example +33 1 99 00 03 50.",
   "admin.site.members": "People of the site",
-  "admin.site.membersCount": "{count} person(s)",
   "admin.site.membersHint": "A person is in one site at most: one added here leaves their former site.",
   "admin.site.noUsers": "Nobody in the directory yet.",
   "admin.site.person": "{name} ({extension})",
@@ -944,5 +943,10 @@
   "settings.emergency.title": "Emergency calls",
   "settings.emergency.site": "Your emergency calls (15, 17, 18, 112…) leave from the site {name} ({address}), with the number {number}: the operator passes the address of that site to the emergency services.",
   "settings.emergency.none": "No site is assigned to you: your emergency calls present your direct number, otherwise the organisation's, and the operator passes the address it knows for it. Ask an administrator to attach you to your site.",
-  "settings.emergency.error": "Your emergency site cannot be read right now."
+  "settings.emergency.error": "Your emergency site cannot be read right now.",
+  "admin.site.membersOne": "{count} person",
+  "admin.site.membersMany": "{count} people",
+  "admin.site.search": "Search for a person",
+  "admin.site.searchNone": "Nobody matches.",
+  "admin.site.numberRings": "This is the number the emergency services call back: it must ring someone at the site (a reception desk, a phone), not one person. The caller's direct number is not presented for an emergency when they are in a site."
 }

@@ -504,6 +504,11 @@ export class OpensipsProvider implements TelephonyProvider, MediaProvider {
    * A reload that fails fails the change (502, code TRUNK_RELOAD_FAILED: written, not applied; asked again at the next
    * change). Without the MI, OpenSIPS reads them at its next start (logged).
    */
+  async holdsAccount(extension: string, userId: string) {
+    if (!this.config.trunks) return true
+    return this.config.trunks.holdsAccount(extension, userId)
+  }
+
   async setTrunks(trunks: (Trunk & { password?: string })[], dids: DidRange[], sites: EmergencySite[] = []) {
     if (!this.config.trunks) throw Object.assign(new Error('Trunks are not available on this platform'), { statusCode: 501 })
     const changed = await this.config.trunks.set(trunks, dids, sites)

@@ -267,9 +267,10 @@ describe('the administration screens (step 7)', () => {
       )
     )
     await flush()
-    expect($('ul[aria-label="Sites existants"]')?.textContent).toContain('+33199000350')
+    expect($('ul[aria-label="Sites existants"]')?.textContent).toContain('+33 1 99 00 03 50')
     expect(text()).toContain('1 rue de Rivoli, 75001 Paris')
-    expect(text()).toContain('1 personne(s)')
+    expect(text()).toContain('1 personne')
+    expect(text()).not.toContain('1 personnes')
     click(button(host, 'English'))
     expect($('ul[aria-label="Existing sites"]')).not.toBeNull()
     expect(text()).toContain('Postal address')
@@ -282,6 +283,30 @@ describe('the administration screens (step 7)', () => {
     await flush()
     expect(deleteSite).toHaveBeenCalledWith('paris')
     expect(listSites.mock.calls.length).toBeGreaterThan(1)
+  })
+
+  it('searches the people of a site without losing those it hides, and drops the one who left the directory (step 6c, review n°5, n°7)', async () => {
+    const users = [
+      { userId: 'alice', extension: '101', displayName: 'Alice' },
+      { userId: 'bob', extension: '102', displayName: 'Bob' }
+    ]
+    const setSite = vi.fn(async (site: EmergencySite) => site)
+    const left: EmergencySite = { id: 'paris', name: 'Paris', address: '1 rue de Rivoli', trunkId: 'operator', number: '+33199000350', members: ['alice', 'gone'] }
+    gateway = { client: client({ setSite, listAdminUsers: vi.fn(async () => ({ items: users })), listSites: vi.fn(async () => ({ items: [left] })) }), me: { id: 'alice', displayName: 'Alice', features: { admin: true } }, meError: null }
+    await render('/admin/sites', <Sites />)
+    expect(text()).toContain('2 personnes')
+    click($('button[aria-label="Modifier le site paris"]'))
+    type($('#site-search'), 'bo')
+    expect([...host.querySelectorAll('#site-members-bob, #site-members')].length).toBe(1)
+    expect(text()).not.toContain('Alice (101)')
+    click($('#site-members'))
+    type($('#site-search'), 'zzz')
+    expect(text()).toContain('Personne ne correspond.')
+    type($('#site-search'), '')
+    await submit($('form'))
+    await flush()
+    // Alice stays though the search hid her, Bob is added, whoever is gone is not sent.
+    expect(setSite).toHaveBeenCalledWith(expect.objectContaining({ id: 'paris', members: ['alice', 'bob'] }))
   })
 
   it('lists the alerts to handle, and takes an acknowledged one off the list', async () => {

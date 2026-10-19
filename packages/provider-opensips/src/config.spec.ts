@@ -1309,7 +1309,7 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(timer).toContain('} else if ($rc == -2) {\n\t\t# No trunk any more.\n\t\t$shv(dt_setid) = 0;')
     // Taken for an emergency call when the trunk could not be read, or none of its servers is up.
     const fallback = section('route[default_trunk]', 'timer_route[default_trunk, 15]')
-    expect(fallback).toContain('if ($shv(dt_setid) == 0 || ($avp(t_setid) != NULL && $avp(t_setid) == $shv(dt_setid)))\n\t\treturn(-1);')
+    expect(fallback).toContain('if ($shv(dt_setid) == 0 || ($var(same) == 0 && $avp(t_setid) != NULL && $avp(t_setid) == $shv(dt_setid)))\n\t\treturn(-1);')
     const loaded = section('route[trunk_out_loaded]', 'route[trunk_out_send]')
     const send = section('route[trunk_out_send]', 'route[outbound_count]')
     expect(loaded).toContain('if ($avp(num_class) == "emergency" && route(default_trunk)) {')
@@ -1544,7 +1544,9 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     // An emergency call only, once; through the default trunk, unless that is the trunk that failed (route[default_trunk]).
     const fallback = section('route[emergency_fallback]', 'route[trunk_in]')
     expect(fallback).toContain('if ($avp(num_class) != "emergency" || $avp(t_fallback) != NULL)\n\t\treturn(-1);\n\t$avp(t_fallback) = 1;')
-    expect(fallback).toContain('if (!route(default_trunk) || !ds_select_dst($avp(t_setid), 8, "f"))\n\t\treturn(-1);')
+    expect(fallback).toContain('if ($var(again) == 0 || !ds_select_dst($avp(t_setid), 8, "f"))\n\t\treturn(-1);')
+    // Its trunk the default one, the number of a site refused (step 6c): once more on it with the direct or the default number.
+    expect(fallback).toContain('else if ($avp(t_site) != NULL && $avp(t_site) != "" && $shv(dt_setid) != 0 && $avp(t_setid) == $shv(dt_setid) && route(default_trunk, "same"))')
     // Written for that trunk (its number, its domain, its socket), its From and To for each branch, its failure handled here again.
     for (const step of ['route(trunk_target);', 't_on_branch("trunk_out");', 't_on_reply("rtp");', 't_on_failure("trunk_failed");', 'if (t_relay())\n\t\treturn(1);'])
       expect(fallback.indexOf(step), step).toBeGreaterThan(fallback.indexOf('route(default_trunk)'))
@@ -1675,17 +1677,23 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(out.indexOf('if ($avp(caller) =~ "^[A-Za-z0-9._+-]{1,64}$")')).toBeLessThan(out.indexOf('emergency_sites'))
     // The site's trunk first, for an emergency call only.
     expect(out).toContain('$var(site_order) = "(e.number IS NULL), ";')
+    // Which number was the site's is kept (`t_site`): what route[emergency_fallback] needs to try the trunk again without it.
+    expect(out).toContain('$var(site_col) = "e.number";')
+    expect(out).toContain('$avp(t_countries);$avp(t_internal);$avp(t_site)')
     expect(out).toContain('ORDER BY " + $var(site_order) + "(d.number IS NULL), t.position LIMIT 1')
     // Never the query of the rights, never the Gateway.
     expect(out).not.toContain('twake_outbound')
     // From memory (`es:`, with the generation of `dn:`) when the database does not answer, before the direct number.
     const timer = section('timer_route[default_trunk, 15]', 'route[emergency_failed]')
     expect(timer).toContain('cache_store("local", "$var(es_key)", "$var(es_val)", 0);')
-    expect(timer).toContain('$var(es_val) = $(avp(es_num)[$var(i)]) + "|" + $var(dn_next);')
-    expect(timer.indexOf('$shv(dn_gen) = $var(dn_next);')).toBeGreaterThan(timer.indexOf('cache_store("local", "$var(es_key)"'))
+    expect(timer).toContain('$var(es_val) = $(avp(es_num)[$var(i)]) + "|" + $var(es_next);')
+    // Its own generation, moved only by a read that succeeded (rows, or none: -2), apart from the direct numbers'.
+    expect(timer.indexOf('$shv(es_gen) = $var(es_next);')).toBeGreaterThan(timer.indexOf('cache_store("local", "$var(es_key)"'))
+    expect(timer.match(/if \(\$rc == 1 \|\| \$rc == -2\) \{/g)).toHaveLength(2)
+    expect(cfg).toContain('modparam("cfgutils", "shvset", "es_gen=i:0")')
     expect(timer).toContain('es.trunk_id = (SELECT id FROM trunks ORDER BY position LIMIT 1)')
     const fallback = section('route[default_trunk]', 'timer_route[default_trunk, 15]')
-    expect(fallback).toContain('$(var(es){s.select,1,|}{s.int}) >= $shv(dn_gen)')
+    expect(fallback).toContain('$(var(es){s.select,1,|}{s.int}) >= $shv(es_gen)')
     expect(fallback.indexOf('"es:$avp(caller)"')).toBeGreaterThan(fallback.indexOf('"dn:$avp(caller)"'))
     expect(fallback).toContain('$avp(t_presented) = $(var(es){s.select,0,|});')
   })

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState, type FormEvent } from 'react'
 import type { AdminUser, EmergencySite, Trunk } from '@twake/telephony-client'
 import { CheckGroup, ConfirmDelete, NoteLine, ProblemSummary, Section, SelectField, TextField, useFocusLater, useProblem, type Note } from '../../admin/ui.js'
 import { SITE_FIELDS, checkSite, emptySite, refusalStatus, siteForm, siteRefusal, type Problems, type SiteField, type SiteForm } from '../../admin/validate.js'
+import { formatNumber } from '../../format.js'
 import { useGateway } from '../../gateway.js'
 import { useT } from '../../i18n/useT.js'
 
@@ -13,7 +14,7 @@ const statusOf = (err: unknown) => (err as { status?: unknown } | null)?.status
  * site each).
  */
 export const Sites = () => {
-  const { t } = useT()
+  const { t, lang } = useT()
   const say = useProblem()
   const focusLater = useFocusLater()
   const { client } = useGateway()
@@ -26,6 +27,7 @@ export const Sites = () => {
   const [problems, setProblems] = useState<Problems<SiteField>>({})
   const [busy, setBusy] = useState(false)
   const [note, setNote] = useState<Note>(null)
+  const [search, setSearch] = useState('')
 
   const load = useCallback(() => {
     Promise.all([client.listSites(), client.listTrunks(), client.listAdminUsers()]).then(
@@ -48,6 +50,7 @@ export const Sites = () => {
   const reset = () => {
     setEditing(null)
     setForm(emptySite(trunks[0]?.id ?? ''))
+    setSearch('')
     setProblems({})
   }
 
@@ -85,7 +88,9 @@ export const Sites = () => {
     setNote(null)
     setProblems({})
     setEditing(site)
-    setForm(siteForm(site))
+    setSearch('')
+    // Whoever left the directory is no longer shown, and goes from the site when it is saved.
+    setForm({ ...siteForm(site), members: site.members.filter(m => users.some(u => u.userId === m)) })
     setTimeout(() => document.getElementById('site-name')?.focus(), 0)
   }
 
@@ -118,6 +123,9 @@ export const Sites = () => {
     const trunk = trunks.find(x => x.id === id)
     return trunk?.name ? `${trunk.name} (${id})` : id
   }
+  const plural = new Intl.PluralRules(lang)
+  const needle = search.trim().toLowerCase()
+  const visible = users.filter(u => !needle || `${u.displayName ?? ''} ${u.userId} ${u.extension}`.toLowerCase().includes(needle)).map(u => u.userId)
   const person = (userId: string) => {
     const u = users.find(x => x.userId === userId)
     return u ? t('admin.site.person', { name: u.displayName ?? u.userId, extension: u.extension }) : userId
@@ -147,11 +155,11 @@ export const Sites = () => {
                     </div>
                     <div>
                       <dt>{t('admin.site.number')}</dt>
-                      <dd>{site.number}</dd>
+                      <dd>{formatNumber(site.number)}</dd>
                     </div>
                     <div>
                       <dt>{t('admin.site.members')}</dt>
-                      <dd>{t('admin.site.membersCount', { count: site.members.length })}</dd>
+                      <dd>{t(plural.select(site.members.length) === 'one' ? 'admin.site.membersOne' : 'admin.site.membersMany', { count: site.members.length })}</dd>
                     </div>
                   </dl>
                 </div>
@@ -178,9 +186,29 @@ export const Sites = () => {
             <TextField id="site-name" label={t('admin.site.name')} value={form.name} onChange={set('name')} error={field('name')} required disabled={busy} maxLength={64} />
             <TextField id="site-address" label={t('admin.site.address')} hint={t('admin.site.addressHint')} autoComplete="street-address" value={form.address} onChange={set('address')} error={field('address')} required disabled={busy} maxLength={200} />
             <SelectField id="site-trunkId" label={t('admin.site.trunkId')} value={form.trunkId} onChange={set('trunkId')} options={trunks.map(x => ({ value: x.id, label: trunkName(x.id) }))} error={field('trunkId')} disabled={busy} />
-            <TextField id="site-number" label={t('admin.site.number')} hint={t('admin.site.numberHint')} type="tel" inputMode="tel" value={form.number} onChange={set('number')} error={field('number')} required disabled={busy} maxLength={24} />
+            <TextField id="site-number" label={t('admin.site.number')} hint={`${t('admin.site.numberHint')} ${t('admin.site.numberRings')}`} type="tel" inputMode="tel" value={form.number} onChange={set('number')} error={field('number')} required disabled={busy} maxLength={24} />
             {users.length ? (
-              <CheckGroup id="site-members" legend={t('admin.site.members')} hint={t('admin.site.membersHint')} values={users.map(u => u.userId)} chosen={form.members} label={person} onChange={set('members')} error={field('members')} disabled={busy} />
+              <>
+                <TextField id="site-search" label={t('admin.site.search')} value={search} onChange={setSearch} disabled={busy} maxLength={64} />
+                {visible.length ? (
+                  <CheckGroup
+                    id="site-members"
+                    legend={t('admin.site.members')}
+                    hint={t('admin.site.membersHint')}
+                    values={visible}
+                    chosen={form.members}
+                    label={person}
+                    // Those the search hides stay as they are.
+                    onChange={next => set('members')([...form.members.filter(m => !visible.includes(m)), ...next])}
+                    error={field('members')}
+                    disabled={busy}
+                  />
+                ) : (
+                  <p className="muted" role="status">
+                    {t('admin.site.searchNone')}
+                  </p>
+                )}
+              </>
             ) : (
               <p className="muted">{t('admin.site.noUsers')}</p>
             )}
