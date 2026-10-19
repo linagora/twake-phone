@@ -67,6 +67,10 @@ fieldset.field { border: 1px solid var(--divider); border-radius: var(--radius);
 .list { list-style: none; margin: 0; padding: 0; }
 .list li { display: grid; grid-template-columns: 1fr auto; gap: 8px; padding: 12px 0; border-bottom: 1px solid var(--divider); }
 .badge { font-size: 0.8rem; color: var(--muted); }
+/* A message's transcription (step 11b): its text in the body's colour, its state in the muted one. */
+.transcript { margin: 6px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.transcript-label { font-size: 0.8rem; color: var(--muted); font-weight: 600; }
+.transcript-pending, .transcript-none { color: var(--muted); }
 .missed { color: var(--danger); font-weight: 600; }
 .presence { font-size: 0.8rem; color: var(--muted); white-space: nowrap; }
 .presence-available { color: var(--ok); }

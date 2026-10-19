@@ -1,0 +1,66 @@
+# The Matrix homeserver of the development and CI stack (step 11b, ADR 0023): Synapse, where the bot of TwakePhone
+# tells each person of their messages, as Twake Chat's homeserver does in a deployment. On the loopback of the host
+# only, the client-server API alone (no federation: no other server reached nor reaching it), SQLite in its volume.
+# Its accounts (the bot's, the e2e's people) are made by the e2e through the shared-secret registration of its admin
+# API: the secrets below are this stack's own, for development and CI only (as twake:twake for PostgreSQL); a
+# deployment's homeserver is its own, and the bot's access token goes in the Gateway's environment only
+# (MATRIX_BOT_TOKEN).
+server_name: twakephone.test
+pid_file: /data/homeserver.pid
+public_baseurl: http://127.0.0.1:8008/
+listeners:
+  - port: 8008
+    bind_addresses: ["127.0.0.1"]
+    type: http
+    tls: false
+    x_forwarded: false
+    resources:
+      - names: [client]
+        compress: false
+database:
+  name: sqlite3
+  args:
+    database: /data/homeserver.db
+log_config: /config/log.config
+media_store_path: /data/media_store
+signing_key_path: /data/signing.key
+report_stats: false
+registration_shared_secret: twake-synapse-dev-only-registration
+macaroon_secret_key: twake-synapse-dev-only-macaroon
+form_secret: twake-synapse-dev-only-form
+enable_registration: false
+# Nothing federated: no key server asked, no other server allowed.
+trusted_key_servers: []
+federation_domain_whitelist: []
+suppress_key_server_warning: true
+presence:
+  enabled: false
+url_preview_enabled: false
+# A message the bot withdraws (a redaction: a message deleted, a person's right to erasure, the retention period) has
+# its content purged from the database 5 minutes after (7 days by default): a deployment sets its own, as short.
+redaction_retention_period: 5m
+# The e2e makes a few accounts and rooms in a few seconds, from one address.
+rc_message:
+  per_second: 50
+  burst_count: 100
+rc_registration:
+  per_second: 10
+  burst_count: 50
+rc_login:
+  address:
+    per_second: 10
+    burst_count: 50
+  account:
+    per_second: 10
+    burst_count: 50
+rc_joins:
+  local:
+    per_second: 10
+    burst_count: 50
+rc_invites:
+  per_room:
+    per_second: 10
+    burst_count: 50
+  per_user:
+    per_second: 10
+    burst_count: 50

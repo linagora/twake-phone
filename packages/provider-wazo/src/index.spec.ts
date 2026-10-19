@@ -16,10 +16,17 @@ afterEach(() => {
 })
 const fakeWazo = () => fakeWazoOf(numberOf)
 
-/** wazo-websocketd as it spoke on the Docker stack: init, then the subscriptions and start, then the events. */
+/**
+ * wazo-websocketd as it spoke on the Docker stack: init, then the subscriptions and start, then the events. `refusing`:
+ * each connection refused as Node's WebSocket tells it, an error and no close.
+ */
 const fakeSockets = () => {
   const sockets: (WebSocketLike & { url: string; sent: unknown[]; event(name: string, data: unknown): void; drop(code?: number): void })[] = []
+  // `refusing`: each connection refused before it opens, told by an error alone, or (`error-close`, as Node's
+  // WebSocket mostly does) by an error then a close 1006. `opened`: when each was asked for.
+  const state = { refusing: false as boolean | 'error-close', opened: [] as number[] }
   const open = (url: string) => {
+    state.opened.push(performance.now())
     const ws = {
       url,
       sent: [] as unknown[],
@@ -43,10 +50,19 @@ const fakeSockets = () => {
       }
     }
     sockets.push(ws)
+    if (state.refusing) {
+      const closeToo = state.refusing === 'error-close'
+      ws.close = () => undefined
+      queueMicrotask(() => {
+        ;(ws as WebSocketLike).onerror?.({})
+        if (closeToo) queueMicrotask(() => ws.onclose?.({ code: 1006 }))
+      })
+      return ws
+    }
     queueMicrotask(() => ws.onmessage?.({ data: JSON.stringify({ op: 'init', code: 0, data: { version: 2 } }) }))
     return ws
   }
-  return { sockets, open }
+  return { sockets, open, state }
 }
 
 const make = (over: Partial<ConstructorParameters<typeof WazoVoicemail>[0]> = {}) => {
@@ -980,6 +996,82 @@ describe('WazoVoicemail, the events', () => {
     ws.sockets[1]!.drop(4002)
     await tick(20)
     expect(new URL(ws.sockets[2]!.url).searchParams.get('token')).toBe('tok-2')
+    await vm.close()
+  })
+
+  it('says when its events are heard, at the start and again after each gap, so that the Gateway reads the mailboxes again (step 11b)', async () => {
+    const { vm, ws } = make()
+    await vm.syncMailboxes([])
+    let heard = 0
+    vm.subscribe({ onHeard: () => void heard++ })
+    await tick(1)
+    expect(heard).toBe(1)
+    ws.sockets[0]!.drop()
+    expect(heard).toBe(1)
+    await tick(20)
+    expect(vm.getStatus()).toBe('CONNECTED')
+    expect(heard).toBe(2)
+    // Refused a while (an error, no close): tried again all along, heard once it is let in.
+    ws.state.refusing = true
+    ws.sockets.at(-1)!.drop()
+    await tick(40)
+    const tried = ws.sockets.length
+    expect(tried).toBeGreaterThan(4)
+    expect(vm.getStatus()).toBe('DEGRADED')
+    ws.state.refusing = false
+    await tick(20)
+    expect(vm.getStatus()).toBe('CONNECTED')
+    expect(heard).toBe(3)
+    // A Gateway whose callback fails still hears the events.
+    const other = make()
+    await other.vm.syncMailboxes([])
+    other.vm.subscribe({
+      onHeard: () => {
+        throw new Error('nobody to tell')
+      }
+    })
+    await tick(1)
+    expect(other.vm.getStatus()).toBe('CONNECTED')
+    await vm.close()
+    await other.vm.close()
+  })
+
+  it('tries a refused connection again once per refusal, an error then a close as Node tells it, each wait longer; an error on an open one waits for its close (third review)', async () => {
+    const waits = [20, 100, 250]
+    const { vm, ws } = make({ reconnectMs: waits })
+    await vm.syncMailboxes([])
+    let heard = 0
+    vm.subscribe({ onHeard: () => void heard++ })
+    await tick(1)
+    expect([vm.getStatus(), heard]).toEqual(['CONNECTED', 1])
+    // An error on the open connection: nothing until its close, then tried again and heard again.
+    ws.sockets[0]!.onerror?.({})
+    await tick(40)
+    expect(ws.sockets).toHaveLength(1)
+    expect(vm.getStatus()).toBe('CONNECTED')
+    ws.sockets[0]!.drop()
+    await tick(40)
+    expect(ws.sockets).toHaveLength(2)
+    expect([vm.getStatus(), heard]).toEqual(['CONNECTED', 2])
+    // Refused: one new try per refusal, after each wait in turn (the attempts counted from the last connection made).
+    ws.state.refusing = 'error-close'
+    const from = ws.sockets.length
+    ws.sockets.at(-1)!.drop()
+    const dropped = performance.now()
+    const start = Date.now()
+    while (ws.sockets.length < from + 3 && Date.now() - start < 3_000) await tick(5)
+    expect(vm.getStatus()).toBe('DEGRADED')
+    const at = [dropped, ...ws.state.opened.slice(from, from + 3)]
+    const gaps = at.slice(1).map((t, i) => t - at[i]!)
+    expect(gaps[0]).toBeLessThan(waits[1]!)
+    gaps.forEach((gap, i) => expect(gap).toBeGreaterThanOrEqual(waits[i]! - 2))
+    expect(gaps[1]).toBeLessThan(waits[2]!)
+    // Then the longest wait each time, never two tries at once.
+    await tick(120)
+    expect(ws.sockets).toHaveLength(from + 3)
+    ws.state.refusing = false
+    await until(() => vm.getStatus() === 'CONNECTED', 2_000)
+    expect(heard).toBe(3)
     await vm.close()
   })
 

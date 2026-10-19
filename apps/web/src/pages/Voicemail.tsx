@@ -8,24 +8,60 @@ import { useT } from '../i18n/useT.js'
 import { Reloader } from '../reload.js'
 import { usePhone } from '../softphone.js'
 
+/** Why a message has no transcription, in the person's language. */
+const NO_TRANSCRIPT = { 'too-long': 'voicemail.transcriptTooLong', busy: 'voicemail.transcriptBusy', failed: 'voicemail.transcriptFailed', untracked: 'voicemail.transcriptUntracked' } as const
+const noTranscript = (reason: NonNullable<Voicemail['transcript']>['reason']) => NO_TRANSCRIPT[reason ?? 'failed']
+
+/**
+ * What a message says (step 11b): its text, in the language it was said in (`lang`: read out with that voice, whatever
+ * the language of the screen, RGAA 8.7), that it is on its way, or why there is none.
+ */
+const Transcript = ({ id, transcript }: { id: string; transcript: NonNullable<Voicemail['transcript']> }) => {
+  const { t } = useT()
+  const text =
+    transcript.status === 'done' ? (
+      transcript.text ? (
+        <span lang={transcript.lang ?? 'fr'}>« {transcript.text} »</span>
+      ) : (
+        t('voicemail.transcriptEmpty')
+      )
+    ) : transcript.status === 'pending' ? (
+      t('voicemail.transcriptPending')
+    ) : (
+      t(noTranscript(transcript.reason))
+    )
+  return (
+    <p className={`transcript transcript-${transcript.status}`} id={id} data-testid="voicemail-transcript" data-status={transcript.status}>
+      <span className="transcript-label">{t('voicemail.transcriptLabel')}</span> {text}
+    </p>
+  )
+}
+
 /** How long the mailbox waits for the event stream before it is read without it. */
 const WITHOUT_STREAM_MS = 3_000
 
 /** 7 → "0:07", 75 → "1:15". */
 export const clock = (sec: number) => `${Math.floor(sec / 60)}:${String(Math.max(0, Math.round(sec)) % 60).padStart(2, '0')}`
 
-/** The list after an event of the mailbox: a new message first, one read or deleted in place. Ids are unique. */
+/** A message as an event says it, its transcription kept when the event says none (the voicemail server knows none). */
+const withTranscript = (v: Voicemail, before: Voicemail | undefined): Voicemail => (v.transcript || !before?.transcript ? v : { ...v, transcript: before.transcript })
+
+/**
+ * The list after an event of the mailbox: a new message first, one read, deleted or transcribed (step 11b) in place.
+ * Ids are unique.
+ */
 export const applyVoicemailEvent = (items: Voicemail[], event: TelephonyEvent): Voicemail[] => {
   if (event.type === 'voicemail.created') {
-    const v = event.payload.voicemail
+    const v = withTranscript(event.payload.voicemail, items.find(i => i.id === event.payload.voicemail.id))
     return [v, ...items.filter(i => i.id !== v.id)].sort((a, b) => b.receivedAt.localeCompare(a.receivedAt))
   }
-  if (event.type === 'voicemail.updated') return items.map(i => (i.id === event.payload.voicemail.id ? event.payload.voicemail : i))
+  if (event.type === 'voicemail.updated') return items.map(i => (i.id === event.payload.voicemail.id ? withTranscript(event.payload.voicemail, i) : i))
   if (event.type === 'voicemail.deleted') return items.filter(i => i.id !== event.payload.id)
+  if (event.type === 'voicemail.transcribed') return items.map(i => (i.id === event.payload.id ? { ...i, transcript: event.payload.transcript } : i))
   return items
 }
 
-const isVoicemailEvent = (event: TelephonyEvent) => event.type === 'voicemail.created' || event.type === 'voicemail.updated' || event.type === 'voicemail.deleted'
+const isVoicemailEvent = (event: TelephonyEvent) => event.type === 'voicemail.created' || event.type === 'voicemail.updated' || event.type === 'voicemail.deleted' || event.type === 'voicemail.transcribed'
 
 /**
  * Where the focus goes after an action took a button away: a message's « Écouter », its « Supprimer » (a deletion
@@ -35,14 +71,16 @@ type FocusTarget = { listen: string } | { remove: string } | { confirm: string }
 
 /**
  * The person's mailbox (step 11a): the messages left when they could not answer, newest first, as they arrive. Each is
- * listened to in the page, marked as read, deleted, or its caller called back.
+ * listened to in the page, marked as read, deleted, or its caller called back; its transcription (step 11b, ADR 0023)
+ * is shown with it when the platform transcribes the messages, on its way, its text, or why there is none.
  *
  * Accessibility: a message's duration is said with its word (a visually hidden text, the
- * clock hidden from assistive tech); what changes without the person (a message arriving) and what an action did
- * (deleted, marked as read) is said in the status region, each time, even with the same words; an action that takes
- * its button away gives the focus to the next message, or the previous one, or the title. The recordings have no
- * transcription before step 11b (RGAA 4.1: a derogation, ADR 0022). Each button names its message with who left it and
- * when (two messages of the same caller are two); a deletion, for good, is confirmed first;
+ * clock hidden from assistive tech); what changes without the person (a message arriving, its transcription done) and
+ * what an action did (deleted, marked as read) is said in the status region, each time, even with the same words; an
+ * action that takes its button away gives the focus to the next message, or the previous one, or the title. The
+ * transcription is the recording's text alternative (RGAA 4.1), read before it and named by its player
+ * (aria-describedby); a message the platform did not transcribe says why. Each button names its message with who left
+ * it and when (two messages of the same caller are two); a deletion, for good, is confirmed first;
  * a recording asked before the one asked last is not played.
  */
 export const VoicemailPage = () => {
@@ -106,6 +144,15 @@ export const VoicemailPage = () => {
         const v = event.payload.voicemail
         const count = applyVoicemailEvent(current, event).filter(i => i.unread).length
         say(t(count === 1 ? 'voicemail.arrivedOne' : 'voicemail.arrived', { who: whoOf(v), time: time.format(new Date(v.receivedAt)), count: String(count) }))
+      }
+      // Its transcription done (step 11b): said once, the text itself is in the list; or that there is none, and why.
+      if (event.type === 'voicemail.transcribed') {
+        const v = current.find(i => i.id === event.payload.id)
+        const now = event.payload.transcript
+        if (v && v.transcript?.status !== now.status) {
+          if (now.status === 'done') say(t('voicemail.transcribedSaid', { who: whoOf(v) }))
+          if (now.status === 'none') say(t('voicemail.notTranscribedSaid', { who: whoOf(v), why: t(noTranscript(now.reason)) }))
+        }
       }
     })
     return () => {
@@ -252,9 +299,17 @@ export const VoicemailPage = () => {
                       <time dateTime={v.receivedAt}>{at}</time> · <span className="sr-only">{t('voicemail.durationLabel', { duration: clock(v.durationSec) })}</span>
                       <span aria-hidden="true">{clock(v.durationSec)}</span>
                     </span>
+                    {v.transcript ? <Transcript id={`transcript-${v.id}`} transcript={v.transcript} /> : null}
                     {playing?.id === v.id ? (
                       <div>
-                        <audio controls autoPlay src={playing.url} aria-label={t('voicemail.player', named)} data-testid="voicemail-audio" />
+                        <audio
+                          controls
+                          autoPlay
+                          src={playing.url}
+                          aria-label={t('voicemail.player', named)}
+                          {...(v.transcript ? { 'aria-describedby': `transcript-${v.id}` } : {})}
+                          data-testid="voicemail-audio"
+                        />
                       </div>
                     ) : null}
                   </div>

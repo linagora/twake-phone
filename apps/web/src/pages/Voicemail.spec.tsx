@@ -24,6 +24,18 @@ describe('the Messagerie vocale', () => {
     expect(applyVoicemailEvent(items, { type: 'stream.ready' } as never)).toBe(items)
   })
 
+  it('puts a transcription on its message, and keeps it when the voicemail server tells of the message again (step 11b)', () => {
+    const items = [{ ...v('b', '2026-10-18T02:00:00.000Z'), transcript: { status: 'pending' as const } }, v('a', '2026-10-18T01:00:00.000Z')]
+    const done = applyVoicemailEvent(items, { type: 'voicemail.transcribed', timestamp: at, payload: { id: 'b', transcript: { status: 'done', text: 'Rappelle-moi' } } })
+    expect(done.map(i => [i.id, i.transcript])).toEqual([['b', { status: 'done', text: 'Rappelle-moi' }], ['a', undefined]])
+    // Read on a phone: the voicemail server's event knows no transcription, the one shown stays.
+    const read = applyVoicemailEvent(done, { type: 'voicemail.updated', timestamp: at, payload: { voicemail: v('b', '2026-10-18T02:00:00.000Z', false) } })
+    expect(read[0]).toMatchObject({ unread: false, transcript: { status: 'done', text: 'Rappelle-moi' } })
+    expect(applyVoicemailEvent(read, { type: 'voicemail.created', timestamp: at, payload: { voicemail: v('b', '2026-10-18T02:00:00.000Z') } })[0]!.transcript).toEqual({ status: 'done', text: 'Rappelle-moi' })
+    // One of a message not in the list: nothing.
+    expect(applyVoicemailEvent(items, { type: 'voicemail.transcribed', timestamp: at, payload: { id: 'z', transcript: { status: 'none', reason: 'failed' } } })).toEqual(items)
+  })
+
   it('says how long a message lasts as a clock does', () => {
     expect([clock(0), clock(7), clock(75), clock(600)]).toEqual(['0:00', '0:07', '1:15', '10:00'])
   })
@@ -117,6 +129,46 @@ describe('the Messagerie vocale page', () => {
     expect(badge.querySelector('.sr-only')!.textContent).toBe('voicemail.durationLabel 0:07')
     expect(badge.querySelector('[aria-hidden="true"]')!.textContent).toBe('0:07')
     expect(badge.querySelector('[aria-label]')).toBeNull()
+  })
+
+  it("shows each message's transcription, the text alternative of its recording named by its player, and tells once it is done (step 11b)", async () => {
+    lists = [
+      [
+        { ...v('d', '2026-10-18T02:15:00.000Z'), transcript: { status: 'pending' } },
+        { ...v('c', '2026-10-18T02:14:00.000Z'), transcript: { status: 'pending' } },
+        { ...v('b', '2026-10-18T02:13:00.000Z'), transcript: { status: 'none', reason: 'too-long' } },
+        { ...v('a', at), transcript: { status: 'done', text: 'Bonjour Jean', lang: 'fr' } },
+        { ...v('y', '2026-10-18T01:30:00.000Z'), transcript: { status: 'none', reason: 'untracked' } },
+        v('z', '2026-10-18T01:00:00.000Z')
+      ]
+    ]
+    await render()
+    const transcriptOf = (id: string) => host.querySelector(`[data-id="${id}"] [data-testid="voicemail-transcript"]`)
+    expect(transcriptOf('a')!.textContent).toBe('voicemail.transcriptLabel « Bonjour Jean »')
+    // The text in its own language, read out in it whatever the language of the screen; the label in the screen's.
+    expect(transcriptOf('a')!.querySelector('[lang]')!.getAttribute('lang')).toBe('fr')
+    expect(transcriptOf('a')!.querySelector('[lang]')!.textContent).toBe('« Bonjour Jean »')
+    expect(transcriptOf('b')!.textContent).toBe('voicemail.transcriptLabel voicemail.transcriptTooLong')
+    expect(transcriptOf('b')!.querySelector('[lang]')).toBeNull()
+    expect(transcriptOf('c')!.textContent).toBe('voicemail.transcriptLabel voicemail.transcriptPending')
+    // One the platform never took in hand: said so.
+    expect(transcriptOf('y')!.textContent).toBe('voicemail.transcriptLabel voicemail.transcriptUntracked')
+    // A message left before the platform transcribed: nothing said.
+    expect(transcriptOf('z')).toBeNull()
+    await click('a', 'voicemail.listenTo')
+    const player = host.querySelector('[data-testid="voicemail-audio"]')!
+    expect(player.getAttribute('aria-describedby')).toBe(transcriptOf('a')!.id)
+    send({ type: 'voicemail.transcribed', timestamp: at, payload: { id: 'c', transcript: { status: 'done', text: '' } } })
+    expect(transcriptOf('c')!.textContent).toBe('voicemail.transcriptLabel voicemail.transcriptEmpty')
+    expect(status()).toMatch(/^voicemail\.transcribedSaid 101\s?$/)
+    const said = status()
+    // Told again (another Gateway's screen, a reload): said nothing more.
+    send({ type: 'voicemail.transcribed', timestamp: at, payload: { id: 'c', transcript: { status: 'done', text: '' } } })
+    expect(status()).toBe(said)
+    // None after all: said too, and why.
+    send({ type: 'voicemail.transcribed', timestamp: at, payload: { id: 'd', transcript: { status: 'none', reason: 'failed' } } })
+    expect(transcriptOf('d')!.textContent).toBe('voicemail.transcriptLabel voicemail.transcriptFailed')
+    expect(status()).toMatch(/^voicemail\.notTranscribedSaid 101 \| voicemail\.transcriptFailed\s?$/)
   })
 
   it('reads the list again when a message arrives during the first read, and shows it', async () => {

@@ -1,4 +1,5 @@
-"""Checks that the Wazo of the development and CI stack listens on the loopback only (step 11a, ADR 0022).
+"""Checks that the Wazo of the development and CI stack listens on the loopback only (step 11a, ADR 0022),
+and so do LinTO STT and Synapse (step 11b, ADR 0023).
 
     sudo python3 docker/wazo/check-loopback.py [compose file] [project]
 
@@ -32,7 +33,9 @@ import subprocess
 import sys
 
 SERVICES = ['wazo-db', 'rabbitmq', 'wazo-auth', 'wazo-bootstrap', 'wazo-confd', 'wazo-confgend', 'wazo-asterisk',
-            'wazo-sysconfd', 'wazo-amid', 'wazo-calld', 'wazo-websocketd']
+            'wazo-sysconfd', 'wazo-amid', 'wazo-calld', 'wazo-websocketd',
+            # Step 11b: the transcription service and the Matrix homeserver of the bot.
+            'linto-stt', 'synapse']
 # The states of /proc/net/tcp that listen (TCP_LISTEN), and of an unconnected UDP socket (TCP_CLOSE: bound, no peer).
 LISTEN = {'tcp': '0A', 'tcp6': '0A', 'udp': '07', 'udp6': '07'}
 # What the process of the DNS client is: Asterisk's binary, PJSIP's library mapped (the image's).
@@ -208,7 +211,7 @@ def main():
         print(f'allowed, the DNS client of PJSIP: {line}')
     for line in bad:
         print(f'NOT ON THE LOOPBACK: {line}')
-    print(f'{seen} listening socket(s) of the Wazo stack read, {len(bad)} not on the loopback')
+    print(f'{seen} listening socket(s) of the Wazo stack, LinTO STT and Synapse read, {len(bad)} not on the loopback')
     return 1 if bad else 0
 
 

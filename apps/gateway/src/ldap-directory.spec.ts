@@ -2,7 +2,7 @@ import { createServer } from 'node:net'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { DEFAULT_ATTRIBUTES, LdapDirectory, contactOf, digitsOf, ldapDirectoryFromEnv, searchFilter, searchWords } from './ldap-directory.js'
 // @ts-expect-error plain JavaScript test helper, shared with the browser e2e
-import { BASE_DN, READER_DN, READER_PASSWORD, startLdapMock } from '../test/ldap-mock.mjs'
+import { BASE_DN, PEOPLE, READER_DN, READER_PASSWORD, startLdapMock } from '../test/ldap-mock.mjs'
 
 const FILTER = '(objectClass=inetOrgPerson)'
 
@@ -139,6 +139,40 @@ describe('LdapDirectory against a real LDAP server', () => {
     expect(all.find(c => c.id === 'amartin')?.numbers).toContainEqual({ type: 'extension', number: '101' })
     expect(all.find(c => c.id === 'zlefevre')?.numbers.some(n => n.type === 'extension')).toBe(false)
     await expect(dir.listAll('t')).rejects.toThrow(/LDAP_ATTR_EXTENSION/)
+  })
+
+  it("gives a person's Matrix user id from its own attribute only, nothing for someone else nor for a filter typed (step 11b)", async () => {
+    const people = (PEOPLE as Record<string, unknown>[]).map(p => (p.uid === 'jdupont' ? { ...p, twakeMatrixId: '@jean.dupont:chat.example.test' } : p))
+    const mock = await startLdapMock({ people })
+    try {
+      const d = make({ url: mock.url, matrixAttribute: 'twakeMatrixId' })
+      expect(await d.matrixIdOf('t', 'jdupont')).toBe('@jean.dupont:chat.example.test')
+      expect(await d.matrixIdOf('t', 'amartin')).toBeUndefined()
+      expect(await d.matrixIdOf('t', 'nobody')).toBeUndefined()
+      expect(await d.matrixIdOf('t', 'jd*')).toBeUndefined()
+      expect(await d.matrixIdOf('t', '*)(uid=jdupont')).toBeUndefined()
+      // The directory matches an id whatever its case: the entry found is not the one asked for.
+      expect(await d.matrixIdOf('t', 'JDUPONT')).toBeUndefined()
+      // Without LDAP_ATTR_MATRIX: none, the directory not even asked.
+      expect(await make({ url: mock.url }).matrixIdOf('t', 'jdupont')).toBeUndefined()
+      // Never in a contact shown.
+      expect(JSON.stringify((await d.search('t', 'dupont', 10)).items)).not.toContain('chat.example.test')
+    } finally {
+      await mock.stop()
+    }
+  })
+
+  it('takes no Matrix id when two entries have the id asked, nor when the entry gives two (step 11b)', async () => {
+    const twin = { uid: 'twin', cn: 'Twin', sn: 'Twin', twakeMatrixId: '@twin.one:chat.example.test' }
+    const people = [...(PEOPLE as Record<string, unknown>[]), twin, { ...twin, cn: 'Twin Two', twakeMatrixId: '@twin.two:chat.example.test' }, { uid: 'multi', cn: 'Multi', sn: 'Multi', twakeMatrixId: ['@multi.a:chat.example.test', '@multi.b:chat.example.test'] }]
+    const mock = await startLdapMock({ people })
+    try {
+      const d = make({ url: mock.url, matrixAttribute: 'twakeMatrixId' })
+      await expect(d.matrixIdOf('t', 'twin')).rejects.toMatchObject({ code: 'MATRIX_ID_AMBIGUOUS' })
+      await expect(d.matrixIdOf('t', 'multi')).rejects.toMatchObject({ code: 'MATRIX_ID_AMBIGUOUS' })
+    } finally {
+      await mock.stop()
+    }
   })
 
   it('describes itself without the bind password', () => {

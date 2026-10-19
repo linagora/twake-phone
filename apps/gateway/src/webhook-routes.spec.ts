@@ -160,7 +160,7 @@ describe('the webhook routes', () => {
     expect((await create({ url: 'http://crm.example.org/in', events: ['call.missed'] })).json()).toMatchObject({ code: 'WEBHOOK_URL_SCHEME' })
     // Ports 443 and 80 only (the operator lists others): no scanner of the ports of an address of their choice.
     for (const url of ['https://crm.example.org:8080/in', 'https://crm.example.org:22/in', 'https://crm.example.org:0/in']) expect((await create({ url, events: ['call.missed'] })).json(), url).toMatchObject({ code: 'WEBHOOK_URL_PORT' })
-    expect((await create({ url: 'https://crm.example.org/in', events: ['voicemail.created'] })).json()).toMatchObject({ code: 'WEBHOOK_EVENTS' })
+    expect((await create({ url: 'https://crm.example.org/in', events: ['quality.alert'] })).json()).toMatchObject({ code: 'WEBHOOK_EVENTS' })
 
     const res = await create({ url: 'https://crm.example.org:443/in', events: ['call.missed', 'call.ringing'], description: 'CRM' })
     expect(res.statusCode).toBe(201)

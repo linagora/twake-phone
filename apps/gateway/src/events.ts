@@ -31,6 +31,11 @@ export class EventBus {
     return EventBus.add(this.listeners, this.key(tenantId, userId), listener)
   }
 
+  /** Whether a screen of the person listens in this process. */
+  listening(tenantId: TenantId, userId: UserId) {
+    return this.listeners.has(this.key(tenantId, userId))
+  }
+
   publish(tenantId: TenantId, userId: UserId, event: TelephonyEvent) {
     this.listeners.get(this.key(tenantId, userId))?.forEach(l => l(event))
   }

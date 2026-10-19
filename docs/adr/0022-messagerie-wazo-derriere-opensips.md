@@ -115,7 +115,7 @@ wazo-confd fait suivre chaque écriture d'un rechargement par wazo-sysconfd. La 
 
 - `GET /api/v1/voicemails`, `GET /api/v1/voicemails/{id}/audio` (`Cache-Control: private, no-store`), `POST /api/v1/voicemails/{id}/read`, `DELETE /api/v1/voicemails/{id}`, pour la seule boîte de la personne connectée (404 pour un autre message, 501 sans boîte, 502 `VOICEMAIL_UNAVAILABLE`) ; `voicemail.created`, `.updated` et `.deleted` sur sa WebSocket.
 - La capacité `voicemail` n'est publiée que si OpenSIPS a aussi Wazo (`wazo_on`, lu par MI, gardé 2 minutes, jamais publiée sans réponse).
-- L'onglet « Messagerie vocale » : lecteur dans la page (`media-src 'self' blob:`), « Rappeler », « Marquer comme lu », « Supprimer » après confirmation, le nombre de non lus, chaque arrivée et chaque action annoncée, le focus tenu. Dérogation au critère 4.1 du RGAA jusqu'à 11b (pas de transcription).
+- L'onglet « Messagerie vocale » : lecteur dans la page (`media-src 'self' blob:`), « Rappeler », « Marquer comme lu », « Supprimer » après confirmation, le nombre de non lus, chaque arrivée et chaque action annoncée, le focus tenu. Dérogation au critère 4.1 du RGAA jusqu'à 11b (pas de transcription), levée par l'ADR 0023 : la transcription est l'alternative textuelle du message.
 - Les alertes `voicemail` (`sync-failing`, `boxes-refused`, `sync-fenced`, `held-back`, `held-back-remove`, `hidden-calls`, `hidden-hour`, `hidden-all`, `calls-all`) paraissent dans l'administration.
 
 ### 13. Les données personnelles

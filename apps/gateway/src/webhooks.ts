@@ -49,8 +49,8 @@ export const deliveryFailure = (reason: DeliveryError['reason']): WebhookFailure
 /** What a subscription's secret is bound to (the AAD of its encryption): copied to another row, it does not decrypt. */
 export const secretContext = (tenantId: string, subscriptionId: string) => `webhook|${tenantId}|${subscriptionId}`
 
-/** The person an event is about, erased with their history (DELETE /me/history). */
-const subjectOf = (event: PublishedWebhookEvent) => ('call' in event ? event.call.user : 'presence' in event ? event.presence.user : undefined)
+/** The person an event is about, erased with their history (DELETE /me/history): of a call, a presence, a message. */
+export const subjectOf = (event: PublishedWebhookEvent) => ('call' in event ? event.call.user : 'presence' in event ? event.presence.user : 'voicemail' in event ? event.voicemail.user : undefined)
 
 /** How long what a tenant's subscriptions take is kept before it is read again (WebhookHub.wants). */
 const WANTED_MS = 5_000

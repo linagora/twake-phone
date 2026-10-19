@@ -24,6 +24,7 @@
     "@twake/provider-wazo": "*",
     "@twake/telephony-provider-sdk": "*",
     "@twake/telephony-types": "*",
+    "@twake/transcription-linto": "*",
     "fastify": "^5.0.0",
     "jose": "^6.2.12",
     "ldapts": "^9.2.0",

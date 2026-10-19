@@ -322,6 +322,8 @@ export class WazoVoicemail implements VoicemailProvider {
   private lastPeople = new Map<string, string[]>()
   /** Who holds which extension now (VoicemailSubscribeOptions' holders), and the print of each person met. */
   private holdersNow: (() => Promise<{ extension: string; userId: string }[]>) | undefined
+  /** Told when the events are heard again (VoicemailSubscribeOptions's onHeard). */
+  private onHeard: (() => void) | undefined
   private readonly keys = new Map<string, string>()
   /** The events of each mailbox, told one after the other in the order wazo-websocketd sent them. */
   private readonly eventChains = new Map<number, Promise<void>>()
@@ -1039,6 +1041,7 @@ export class WazoVoicemail implements VoicemailProvider {
     if (this.subscribed) throw new Error('Wazo provider: subscribe() takes one consumer')
     this.subscribed = true
     this.holdersNow = options.holders ? () => options.holders!() : undefined
+    this.onHeard = options.onHeard
     if (this.token) this.renewLater(this.token.renewAt - this.now())
     void this.connect()
     return this.queue
@@ -1066,7 +1069,17 @@ export class WazoVoicemail implements VoicemailProvider {
     }
     this.ws = ws
     ws.onmessage = ev => this.onMessage(ws, ev.data)
-    ws.onerror = () => undefined
+    // A connection refused before it opened: Node's WebSocket tells an error and no close (or one much later).
+    ws.onerror = () => {
+      if (this.ws !== ws || this.wsOpen) return
+      this.ws = undefined
+      try {
+        ws.close()
+      } catch {
+        // Never opened.
+      }
+      this.reconnectLater()
+    }
     ws.onclose = ev => {
       if (this.ws !== ws) return
       const was = this.wsOpen
@@ -1103,9 +1116,18 @@ export class WazoVoicemail implements VoicemailProvider {
     }
     if (msg.op === 'start') {
       if (msg.code !== undefined && msg.code !== 0) return
-      if (!this.wsOpen) this.log.info('Wazo: voicemail events heard (wazo-websocketd)')
+      const was = this.wsOpen
+      if (!was) this.log.info('Wazo: voicemail events heard (wazo-websocketd)')
       this.wsOpen = true
       this.wsAttempt = 0
+      // Heard from now on, maybe not during the gap: the Gateway reads the mailboxes again.
+      if (!was) {
+        try {
+          this.onHeard?.()
+        } catch {
+          // The Gateway's own business.
+        }
+      }
       return
     }
     if (msg.op !== 'event' || !msg.data?.name || !(msg.data.name in EVENTS)) return

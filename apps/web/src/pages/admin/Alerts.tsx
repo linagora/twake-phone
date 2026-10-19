@@ -23,7 +23,7 @@ const INITIAL = { kind: ALL, param: ALL, state: 'open' }
  * or the operator of the trunks refusing its keys or reconciling too few calls (review 10b, n°12), or a removal of a
  * forward there left as changed, let go, or late, or the mailboxes not synchronised
  * with the voicemail server for a while, some it keeps refusing, or the callers with no
- * number at the cap of a mailbox.
+ * number at the cap of a mailbox, or the transcription of the messages or the bot's notices failing (step 11b).
  */
 const paramKey = (alert: Pick<AdminAlert, 'kind' | 'param'>): Key | undefined => {
   if ((FRAUD_PARAMS as readonly string[]).includes(alert.param)) return `admin.fraud.${alert.param}` as Key
@@ -56,6 +56,17 @@ const paramKey = (alert: Pick<AdminAlert, 'kind' | 'param'>): Key | undefined =>
   // Too many mailboxes set aside or removed at once: held back until an administrator confirms.
   if (alert.param === 'held-back') return 'admin.alert.voicemailHeldBack'
   if (alert.param === 'held-back-remove') return 'admin.alert.voicemailHeldBackRemove'
+  // The transcription of the messages and the bot's notices (step 11b): too many waiting, a service that keeps failing.
+  if (alert.param === 'transcription-busy') return 'admin.alert.voicemailTranscriptionBusy'
+  if (alert.param === 'transcription-failed') return 'admin.alert.voicemailTranscriptionFailed'
+  if (alert.param === 'notice-failed') return 'admin.alert.voicemailNoticeFailed'
+  // Messages and notices that wait for too long, people the bot has no account of, notices left in Chat without a bot.
+  if (alert.param === 'transcription-backlog') return 'admin.alert.voicemailTranscriptionBacklog'
+  if (alert.param === 'notice-no-account') return 'admin.alert.voicemailNoticeNoAccount'
+  if (alert.param === 'notice-not-withdrawn') return 'admin.alert.voicemailNoticeNotWithdrawn'
+  // The reconciliation of the mailboxes: mailboxes read empty or too many messages gone at once (nothing erased), a mailbox it cannot read.
+  if (alert.param === 'transcription-held') return 'admin.alert.voicemailTranscriptionHeld'
+  if (alert.param === 'transcription-unreadable') return 'admin.alert.voicemailTranscriptionUnreadable'
   if ((TRUNK_OUTBOUND_CLASSES as readonly string[]).includes(alert.param) || alert.param === 'premium') return `admin.class.${alert.param}` as Key
   return undefined
 }

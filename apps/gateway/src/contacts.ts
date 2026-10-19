@@ -28,6 +28,8 @@ export interface ContactDirectory {
   listAll?(tenantId: TenantId): Promise<Contact[]>
   /** What an administrator may see of the source: never a credential. */
   describe?(): DirectorySource
+  /** The Matrix user id the directory gives the person, if it gives one (step 11b: the bot's notices in Twake Chat). */
+  matrixIdOf?(tenantId: TenantId, userId: string): Promise<string | undefined>
 }
 
 /** The directory as shown on the administration screen. */

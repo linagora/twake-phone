@@ -24,3 +24,6 @@ coverage
 
 # Bytecode Python (tests de docker/wazo)
 __pycache__/
+
+# Le modèle de LinTO STT de la stack de dev, en cache (docker/linto/fetch-model.py)
+docker/linto/model-cache/*.zip

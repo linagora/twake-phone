@@ -486,6 +486,26 @@ export interface Voicemail {
   durationSec: number
   /** Not yet marked as read (listened to). */
   unread: boolean
+  /**
+   * Its transcription (step 11b, ADR 0023), when the platform transcribes the messages: absent for a message left before
+   * it did, or that no Gateway heard arrive.
+   */
+  transcript?: VoicemailTranscript
+}
+
+/**
+ * What a message says (step 11b, ADR 0023): on its way (`pending`), its text (`done`; an empty text when nothing was
+ * heard in it, `lang` the language it is in), or no transcription (`none`), `reason` saying why: longer than the
+ * platform transcribes (`too-long`), too many messages waiting for theirs (`busy`), the transcription service did not
+ * answer or failed (`failed`), or the platform never took the message in hand (`untracked`: left before the
+ * transcription was on, or longer ago than it catches up with; or its message no longer looked for, its holder
+ * without an extension any more).
+ */
+export interface VoicemailTranscript {
+  status: 'pending' | 'done' | 'none'
+  text?: string
+  lang?: string
+  reason?: 'too-long' | 'busy' | 'failed' | 'untracked'
 }
 
 /**
@@ -497,6 +517,11 @@ export interface Voicemail {
 export interface HistoryErasure {
   deleted: number
   voicemailErasure?: 'asked' | 'limited'
+  /**
+   * Step 11b: `not-withdrawn` when the bot's notices of their messages in Chat cannot be withdrawn any more (the
+   * platform has no bot now): their transcriptions are erased all the same, the notices stay in Chat.
+   */
+  chatNotices?: 'not-withdrawn'
 }
 
 export interface OriginateRequest {
@@ -547,6 +572,8 @@ export interface Capabilities {
    * that reaches nobody goes there, and they read their messages (`Voicemail`, the `voicemail.*` events).
    */
   voicemail?: boolean
+  /** Each new message is transcribed (step 11b, ADR 0023): `Voicemail.transcript`, the `voicemail.transcribed` events. */
+  voicemailTranscription?: boolean
 }
 
 /** Media plane description handed to the client; opaque to the Gateway. */
@@ -622,6 +649,8 @@ export type TelephonyEvent =
    */
   | { type: 'voicemail.created' | 'voicemail.updated'; timestamp: string; payload: { voicemail: Voicemail } }
   | { type: 'voicemail.deleted'; timestamp: string; payload: { id: string } }
+  /** A message of the person's mailbox was transcribed, or will not be (step 11b): its transcription, as `Voicemail.transcript`. */
+  | { type: 'voicemail.transcribed'; timestamp: string; payload: { id: string; transcript: VoicemailTranscript } }
 
 export type ProviderStatus = 'CONNECTED' | 'DEGRADED' | 'DISCONNECTED' | 'ERROR'
 
@@ -631,13 +660,13 @@ export type ProviderStatus = 'CONNECTED' | 'DEGRADED' | 'DISCONNECTED' | 'ERROR'
  * what a provider tells the Gateway (per extension, internal): these are per person and public, written in
  * snake_case as the plan describes them, and carry a phone number only where the event needs one.
  */
-export const WEBHOOK_EVENT_TYPES = ['call.ringing', 'call.answered', 'call.ended', 'call.missed', 'presence.changed', 'trunk.degraded', 'trunk.recovered'] as const
+export const WEBHOOK_EVENT_TYPES = ['call.ringing', 'call.answered', 'call.ended', 'call.missed', 'presence.changed', 'trunk.degraded', 'trunk.recovered', 'voicemail.created', 'voicemail.transcribed'] as const
 export type WebhookEventType = (typeof WEBHOOK_EVENT_TYPES)[number]
 /**
- * Kept for later, never emitted yet and never asked for by a subscription: the voicemail with Wazo (step 11), the
- * quality of the calls with the QoS lot. The model is open to them.
+ * Kept for later, never emitted yet and never asked for by a subscription: the quality of the calls with the QoS lot.
+ * The model is open to it.
  */
-export const WEBHOOK_EVENT_TYPES_LATER = ['voicemail.created', 'voicemail.transcribed', 'quality.alert'] as const
+export const WEBHOOK_EVENT_TYPES_LATER = ['quality.alert'] as const
 
 /**
  * How a call ended, for one of its parties. `unanswered`: placed, nobody answered (given up, no reply).
@@ -741,5 +770,25 @@ export type WebhookEvent =
         fallback?: WebhookTrunkFallback
       }
     })
+  /**
+   * A message left in a person's mailbox (step 11b): who left it (`from`, absent when the caller hid their number),
+   * when, how long. Never its recording.
+   */
+  | (WebhookEventBase & { type: 'voicemail.created'; voicemail: WebhookVoicemail })
+  /**
+   * A message was transcribed, or will not be (`transcript.status`, as `VoicemailTranscript`): never its text, which
+   * only its holder reads (their Messagerie vocale, the bot's notice in Chat).
+   */
+  | (WebhookEventBase & { type: 'voicemail.transcribed'; voicemail: Pick<WebhookVoicemail, 'id' | 'user' | 'extension'>; transcript: { status: 'done' | 'none'; reason?: 'too-long' | 'busy' | 'failed' | 'untracked' } })
   /** What an administrator sends from the administration to check a subscription. */
   | (WebhookEventBase & { type: 'webhook.test'; subscription: string })
+
+/** A message of a person's mailbox as the subscribers hear of it (step 11b): the person (`user`, at `extension`). */
+export interface WebhookVoicemail {
+  id: string
+  user: UserId
+  extension: string
+  from?: string
+  received_at: string
+  duration_sec: number
+}
