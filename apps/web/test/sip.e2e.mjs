@@ -3520,11 +3520,14 @@ try {
     let bob2
     await step('step 11c-1: a second window of Bob registers: OpenSIPS keeps both windows and registers 103 once at Wazo, the contact being its lines socket; a refresh changes nothing there', async () => {
       const rows103 = await lineRows()
+      await mi('log_level', { level: 4 }).catch(() => undefined) // diagnostic: what OpenSIPS does with this REGISTER
       bob2 = await open('bdurand', 'Bob Durand')
       await phoneState(bob2.page).getByText('En ligne').waitFor({ timeout: 20_000 })
       const contacts = await until('the contact of 103 at Wazo', async () => (contactsOf('103').length ? contactsOf('103') : null), { timeout: 20_000 }).catch(err => {
         // What OpenSIPS said of the registration, and what Asterisk has, for whoever reads the failure.
         const said = execFileSync('docker', ['compose', '-f', COMPOSE_FILE, 'logs', '--no-color', '--no-log-prefix', 'opensips'], { encoding: 'utf8', timeout: 30_000, maxBuffer: 64 << 20 }).split('\n').filter(l => /wazo|mid_reg/i.test(l) && !/'from' key not found|failed to unregister contact/.test(l)).slice(-40)
+        const debug = execFileSync('docker', ['compose', '-f', COMPOSE_FILE, 'logs', '--no-color', '--no-log-prefix', 'opensips'], { encoding: 'utf8', timeout: 30_000, maxBuffer: 256 << 20 }).split('\n').filter(l => /DBG:mid_registrar|DBG:tm:.*(relay|REGISTER|branch)|wazo/.test(l)).slice(-60)
+        console.log(`[11c-1] debug: ${debug.map(l => l.slice(0, 260)).join('\n')}`)
         console.log(`[11c-1] OpenSIPS: ${said.join('\n')}\n[11c-1] Asterisk aors: ${asteriskCli('pjsip show aors')}\n[11c-1] wazo_lines: ${JSON.stringify(rows103)}`)
         throw err
       })
