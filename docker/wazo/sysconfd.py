@@ -311,7 +311,11 @@ def work():
     # As wazo-sysconfd's RequestProcessor.run: whatever happens, the thread goes on.
     while True:
         try:
-            QUEUE.get().run()
+            request = QUEUE.get()
+            # Said before it runs: a reload that lasts (PJSIP's, 10 to 25 s on a CI runner) says nothing until it is done, and
+            # whoever reads the log for `idle` would take the one before it for the state of the queue.
+            log('busy')
+            request.run()
             if QUEUE.empty():
                 log('idle')
         except Exception as err:

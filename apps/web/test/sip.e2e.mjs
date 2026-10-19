@@ -214,11 +214,11 @@ const RUN_START = new Date().toISOString()
 const sysconfdLog = since =>
   execFileSync('docker', ['compose', '-f', fileURLToPath(new URL('../../../docker/docker-compose.sip.yml', import.meta.url)), 'logs', '--no-log-prefix', ...(since ? ['--since', since] : []), 'wazo-sysconfd'], { encoding: 'utf8', timeout: 30_000 })
 /**
- * Waits until the queue of the stand-in is empty: its log, access lines apart, ends with `idle` (it says it each time its queue empties) and
- * has not grown for a second. At most 60 s (a reload of PJSIP lasts 500 ms here), then an error.
+ * Waits until the queue of the stand-in is empty: its log, access lines apart, ends with `idle` (it says it each time its queue empties, and
+ * `busy` when a request starts to run) and has not grown for a second. At most 120 s (a reload of PJSIP lasts 10 to 25 s on a CI runner), then an error.
  */
 const sysconfdSettled = async () => {
-  const deadline = Date.now() + 60_000
+  const deadline = Date.now() + 120_000
   for (let last = null; Date.now() < deadline; ) {
     await sleep(1_000)
     const log = sysconfdLog().trimEnd()
@@ -227,7 +227,7 @@ const sysconfdSettled = async () => {
     if (log === last && said.at(-1)?.endsWith('sysconfd: idle')) return
     last = log
   }
-  throw new Error('the queue of wazo-sysconfd is not empty after 60 s')
+  throw new Error('the queue of wazo-sysconfd is not empty after 120 s')
 }
 /** Polls `fn` until it returns something truthy; the message says what never came. */
 const until = async (what, fn, { timeout = 15_000, every = 250 } = {}) => {
@@ -3520,14 +3520,11 @@ try {
     let bob2
     await step('step 11c-1: a second window of Bob registers: OpenSIPS keeps both windows and registers 103 once at Wazo, the contact being its lines socket; a refresh changes nothing there', async () => {
       const rows103 = await lineRows()
-      await mi('log_level', { level: 4 }).catch(() => undefined) // diagnostic: what OpenSIPS does with this REGISTER
       bob2 = await open('bdurand', 'Bob Durand')
       await phoneState(bob2.page).getByText('En ligne').waitFor({ timeout: 20_000 })
       const contacts = await until('the contact of 103 at Wazo', async () => (contactsOf('103').length ? contactsOf('103') : null), { timeout: 20_000 }).catch(err => {
         // What OpenSIPS said of the registration, and what Asterisk has, for whoever reads the failure.
         const said = execFileSync('docker', ['compose', '-f', COMPOSE_FILE, 'logs', '--no-color', '--no-log-prefix', 'opensips'], { encoding: 'utf8', timeout: 30_000, maxBuffer: 64 << 20 }).split('\n').filter(l => /wazo|mid_reg/i.test(l) && !/'from' key not found|failed to unregister contact/.test(l)).slice(-40)
-        const debug = execFileSync('docker', ['compose', '-f', COMPOSE_FILE, 'logs', '--no-color', '--no-log-prefix', 'opensips'], { encoding: 'utf8', timeout: 30_000, maxBuffer: 256 << 20 }).split('\n').filter(l => /DBG:mid_registrar|DBG:tm:.*(relay|REGISTER|branch)|wazo/.test(l)).slice(-60)
-        console.log(`[11c-1] debug: ${debug.map(l => l.slice(0, 260)).join('\n')}`)
         console.log(`[11c-1] OpenSIPS: ${said.join('\n')}\n[11c-1] Asterisk aors: ${asteriskCli('pjsip show aors')}\n[11c-1] wazo_lines: ${JSON.stringify(rows103)}`)
         throw err
       })
