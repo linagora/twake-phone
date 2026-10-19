@@ -1,5 +1,5 @@
 import type { OperatorCdr } from '@twake/telephony-types'
-import { clampLimit, isDeclined, isMissed, type HistoryEntry, type HistoryNearQuery, type HistoryPage, type HistoryQuery, type OperatorCdrOutcome, type OperatorCdrRecord, type OperatorCdrStats, type ConferenceDecision, type ConferenceRecord, type AlertRecord, type AlertQuery, type DidRecord, type SiteRecord, type OutboundHand, type OutboundRecord, type OutboundRules, ALERT_DEDUP_MS, alertKey, type ProviderRecord, type StoredAlert, type PushSaveResult, type PushSubscriptionRecord, type Store, type TrunkRecord, type MappingChange, type UserMapping, type UserPresenceRecord, type VapidKeysRecord, type ClaimedDelivery, type ErasedCall, type ErasedCallsKept, type WebhookAttemptResult, type WebhookClaimCaps, type WebhookClaimTime, allocateClaims, type WebhookDeliveryQuery, type WebhookLease, type WebhookSendQuota, type WebhookDeliveryRecord, type WebhookQueueOptions, type WebhookStateChange, type WebhookStateEvent, type WebhookSubscriptionRecord, WEBHOOK_STATE_ROLE, type FencedLease, type NewTranscript, type TranscriptChange, type TranscriptLane, type TranscriptMatch, type TranscriptNotice, type TranscriptRecord } from './types.js'
+import { clampLimit, isDeclined, isMissed, type HistoryEntry, type HistoryNearQuery, type HistoryPage, type HistoryQuery, type OperatorCdrOutcome, type OperatorCdrRecord, type OperatorCdrStats, type ConferenceDecision, type VisioPerson, type VisioRecord, type VisioStatus, type ConferenceRecord, type AlertRecord, type AlertQuery, type DidRecord, type SiteRecord, type OutboundHand, type OutboundRecord, type OutboundRules, ALERT_DEDUP_MS, alertKey, type ProviderRecord, type StoredAlert, type PushSaveResult, type PushSubscriptionRecord, type Store, type TrunkRecord, type MappingChange, type UserMapping, type UserPresenceRecord, type VapidKeysRecord, type ClaimedDelivery, type ErasedCall, type ErasedCallsKept, type WebhookAttemptResult, type WebhookClaimCaps, type WebhookClaimTime, allocateClaims, type WebhookDeliveryQuery, type WebhookLease, type WebhookSendQuota, type WebhookDeliveryRecord, type WebhookQueueOptions, type WebhookStateChange, type WebhookStateEvent, type WebhookSubscriptionRecord, WEBHOOK_STATE_ROLE, type FencedLease, type NewTranscript, type TranscriptChange, type TranscriptLane, type TranscriptMatch, type TranscriptNotice, type TranscriptRecord } from './types.js'
 import type { WebhookEventType } from '@twake/telephony-types'
 import { randomBytes } from 'node:crypto'
 import { EMPTY_OUTBOUND, outboundVersion, staleOutbound } from '../outbound.js'
@@ -572,6 +572,48 @@ export class MemoryStore implements Store {
     if (!c) return null
     c.decision ??= decision
     return c.decision
+  }
+
+  private visios = new Map<string, VisioRecord>()
+
+  async claimVisio(record: Omit<VisioRecord, 'people'>, people: Omit<VisioPerson, 'status'>[]) {
+    const existing = this.visios.get(record.oldRoom) ?? [...this.visios.values()].find(v => v.meetRoom === record.meetRoom)
+    if (existing) return structuredClone(existing)
+    const v: VisioRecord = { ...record, people: people.map(p => ({ ...p, status: 'pending' as const })) }
+    this.visios.set(v.oldRoom, v)
+    return structuredClone(v)
+  }
+
+  async getVisio(oldRoom: string) {
+    const v = this.visios.get(oldRoom)
+    return v ? structuredClone(v) : null
+  }
+
+  async getVisioByMeetRoom(meetRoom: string) {
+    const v = [...this.visios.values()].find(x => x.meetRoom === meetRoom)
+    return v ? structuredClone(v) : null
+  }
+
+  async listVisios(tenantId: string, ownerUserId: string) {
+    return [...this.visios.values()].filter(v => v.tenantId === tenantId && v.ownerUserId === ownerUserId).map(v => structuredClone(v))
+  }
+
+  async moveVisioPerson(oldRoom: string, key: string, from: VisioStatus, to: VisioStatus, patch: { newId?: string; reason?: string } = {}) {
+    const p = this.visios.get(oldRoom)?.people.find(x => x.key === key)
+    if (!p || p.status !== from) return false
+    p.status = to
+    if (patch.newId !== undefined) p.newId = patch.newId
+    if (patch.reason !== undefined) p.reason = patch.reason
+    return true
+  }
+
+  async setVisioState(oldRoom: string, state: VisioRecord['state']) {
+    const v = this.visios.get(oldRoom)
+    if (v) v.state = state
+  }
+
+  async deleteVisio(oldRoom: string) {
+    this.visios.delete(oldRoom)
   }
 
   async countConferences(tenantId: string, ownerUserId?: string) {

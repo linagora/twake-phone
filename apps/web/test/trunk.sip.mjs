@@ -1147,6 +1147,10 @@ try {
       // How the Gateway ends a call that took a grant not its own (review 8b, n°3): its dialog by its Call-ID, a BYE to
       // both sides. Answered, its state says so (4): the Gateway reads it a divert (third review 8b, n°1).
       expect('an answered dialog', parseDlgContext((await mi('dlg_list_ctx', { callid: third.callId })).result)?.state === 4)
+      // The dialog of a call a room placed to a phone, as the Gateway reads it to call that phone again from another room
+      // (step 8d): the person it was placed for, who answered, the tags a Replaces names.
+      const roomCall = parseDlgContext((await mi('dlg_list_ctx', { callid: third.callId })).result)
+      expect('the dialog of a room\'s call to a phone', roomCall?.caller === '301' && roomCall.values.meet === 'caller' && roomCall.values.callee === '303' && /^[A-Za-z0-9._~!%*+-]{1,50}$/.test(roomCall.values.callee_tag ?? '') && roomCall.callerTag !== '', JSON.stringify(roomCall))
       const ended = await mi('dlg_end_dlg', { dialog_id: third.callId })
       expect('the dialog ended by its Call-ID', ended.result === 'OK', JSON.stringify(ended))
       await p303.callState(thirdRung, 'ended', 5_000)

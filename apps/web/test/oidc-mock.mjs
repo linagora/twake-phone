@@ -32,8 +32,8 @@ export const startOidcMock = async ({ port, appOrigin, audience, resource = 'htt
         getResourceServerInfo: () => ({ scope: 'openid profile email', audience, accessTokenFormat: 'jwt' })
       }
     },
-    // A custom claim in the JWT access token: what the Gateway reads as roles (JWT_ROLES_CLAIM=roles).
-    extraTokenClaims: async (_ctx, token) => ({ roles: ROLES[token.accountId] ?? [] }),
+    // Custom claims in the JWT access token: what the Gateway reads as roles (JWT_ROLES_CLAIM=roles), and the email Meet identifies a person by (step 8d).
+    extraTokenClaims: async (_ctx, token) => ({ roles: ROLES[token.accountId] ?? [], email: `${token.accountId}@example.test` }),
     findAccount: async (_ctx, id) => ({
       accountId: id,
       claims: async () => ({ sub: id, name: NAMES[id] ?? id, email: `${id}@example.test` })

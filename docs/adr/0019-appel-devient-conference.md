@@ -48,7 +48,7 @@ Ce qui est prouvé : la démonstration dans l'e2e SIP des trois navigateurs, con
 - le refus en attente pour les téléphones SIP autres que le softphone web (comportement à vérifier modèle par modèle) ;
 - le webhook de LiveKit configuré sur le LiveKit d'un vrai Meet (documenté seulement), et la clé que Meet attend pour les siens quand la passerelle partage sa `webhook.api_key` ;
 - une passerelle arrêtée entre l'appel de la salle à la personne et celui qui remplace l'appel : la fenêtre voit l'erreur et raccroche l'appel de la salle, l'appel d'origine reprend tel qu'il était (test du softphone) ; la passerelle, une fois relancée, ne surveille pas les salles faites avant (ni départ de la propriétaire sans webhook, ni nettoyage avant le prochain comptage) ;
-- le passage de la conférence en visio (Meet).
+- le passage de la conférence en visio (Meet) : fait à l'étape 8d, ADR 0026.
 
 ## Alternatives écartées
 

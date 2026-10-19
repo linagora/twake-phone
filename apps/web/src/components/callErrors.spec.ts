@@ -24,6 +24,9 @@ describe('describeConferenceError', () => {
     expect(describeConferenceError(gateway('CONFERENCE_ABANDONED'), t)).toBe('conference.errorAbandoned')
     expect(describeConferenceError(gateway('CONFERENCE_UNSUPPORTED'), t)).toBe('conference.errorUnsupported')
     expect(describeConferenceError(gateway('CONFERENCE_CONFIRMED'), t)).toBe('conference.errorConfirmed')
+    expect(describeConferenceError(gateway('VISIO_UNAVAILABLE'), t)).toBe('conference.errorVisioUnavailable')
+    expect(describeConferenceError(gateway('VISIO_IN_PROGRESS'), t)).toBe('conference.errorVisioInProgress')
+    expect(describeConferenceError(gateway('CONFERENCE_AWAITING'), t)).toBe('conference.errorVisioAwaiting')
     expect(describeConferenceError(gateway('CONFERENCE_CANCELLED'), t)).toBe('conference.errorCancelled')
   })
 
