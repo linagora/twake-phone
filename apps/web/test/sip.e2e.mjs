@@ -3541,7 +3541,7 @@ try {
           await who.page.getByTestId('incoming-call').getByText(/0100/).waitFor({ timeout: 20_000 }).catch(async err => {
             // For whoever reads the failure: what Wazo's Asterisk, OpenSIPS and the AMI say of the call.
             const said = execFileSync('docker', ['compose', '-f', COMPOSE_FILE, 'logs', '--no-color', '--no-log-prefix', '--tail', '400', 'opensips'], { encoding: 'utf8', timeout: 30_000, maxBuffer: 64 << 20 }).split('\n').filter(l => /wazo|0100|103|INVITE|call /i.test(l) && !/from' key|failed to unregister/.test(l)).slice(-40)
-            console.log(`[11c-1] window ${i} of Bob did not ring. OpenSIPS: ${said.join('\n')}\n[11c-1] contacts: ${asteriskCli('pjsip show contacts')}\n[11c-1] channels: ${asteriskCli('core show channels concise')}\n[11c-1] windows: ${JSON.stringify(await windowsOf('103'))}`)
+            console.log(`[11c-1] window ${i} of Bob did not ring. OpenSIPS: ${said.join('\n')}\n[11c-1] contacts: ${asteriskCli('pjsip show contacts')}\n[11c-1] channels: ${asteriskCli('core show channels concise')}\n[11c-1] windows: ${JSON.stringify(await windowsOf('103'))}\n[11c-1] the page: ${(await who.page.locator('body').innerText().catch(() => '?')).slice(0, 900)}`)
             throw err
           })
           await ringerPlaying(who.page, true)
