@@ -656,6 +656,8 @@
   "conference.errorHeld": "A call on hold does not become a conference: resume it first, or wait for the other party to resume it.",
   "conference.errorInProgress": "A conference is already being made of this call.",
   "conference.errorAbandoned": "You left the room before the other party came in: the conference was not made.",
+  "conference.errorConfirmed": "The conference is already confirmed: the original call is over and cannot be taken back.",
+  "conference.errorCancelled": "The conference was given up: the room is ended.",
   "conference.awaiting": "The room called {who} again. Your original call is kept, muted. Do you hear your correspondent in the room (not a voicemail)?",
   "conference.confirm": "Make it a conference",
   "conference.giveUp": "Cancel and take the call back",

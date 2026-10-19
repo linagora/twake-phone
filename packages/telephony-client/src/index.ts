@@ -778,9 +778,17 @@ export class TelephonyClient {
     return this.request<CallConference>(`/conferences/${encodeURIComponent(meetingId)}`, call ? { headers: { 'x-twake-call': call } } : {})
   }
 
-  /** « Passer en conférence » (step 8c): the person hears their correspondent in the room; the SIP server ends the original call. */
-  confirmConference(meetingId: string) {
-    return this.request<void>(`/conferences/${encodeURIComponent(meetingId)}/confirm`, { method: 'POST' })
+  /**
+   * « Passer en conférence » (step 8c): the person hears their correspondent in the room; the SIP server ends the
+   * original call `call` (its Call-ID) if it is still there. Replayable; refused (409 CONFERENCE_CANCELLED) once given up.
+   */
+  confirmConference(meetingId: string, call: string) {
+    return this.request<void>(`/conferences/${encodeURIComponent(meetingId)}/confirm`, { method: 'POST', body: JSON.stringify({ call }) })
+  }
+
+  /** « Annuler » (step 8c): ends the room, the original call is the person's again. Refused (409 CONFERENCE_CONFIRMED) once confirmed. */
+  cancelConference(meetingId: string) {
+    return this.request<void>(`/conferences/${encodeURIComponent(meetingId)}/cancel`, { method: 'POST' })
   }
 
   /** Ends a call's conference for everyone in it (« Terminer pour tous »). */

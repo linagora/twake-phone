@@ -656,6 +656,8 @@
   "conference.errorHeld": "Un appel en attente ne devient pas une conférence : reprenez-le d'abord, ou attendez que votre correspondant le reprenne.",
   "conference.errorInProgress": "Une conférence est déjà en train de se créer pour cet appel.",
   "conference.errorAbandoned": "Vous avez quitté la salle avant que votre correspondant n'y entre : la conférence n'a pas été créée.",
+  "conference.errorConfirmed": "La conférence est déjà confirmée : l'appel d'origine est terminé, il ne peut plus être repris.",
+  "conference.errorCancelled": "La conférence a été annulée : la salle est terminée.",
   "conference.awaiting": "La salle a rappelé {who}. Votre appel d'origine est gardé, en sourdine. Entendez-vous votre correspondant dans la salle (et non une messagerie) ?",
   "conference.confirm": "Passer en conférence",
   "conference.giveUp": "Annuler et reprendre l'appel",

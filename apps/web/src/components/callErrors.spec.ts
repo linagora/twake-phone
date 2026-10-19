@@ -23,6 +23,8 @@ describe('describeConferenceError', () => {
     expect(describeConferenceError(gateway('CONFERENCE_IN_PROGRESS'), t)).toBe('conference.errorInProgress')
     expect(describeConferenceError(gateway('CONFERENCE_ABANDONED'), t)).toBe('conference.errorAbandoned')
     expect(describeConferenceError(gateway('CONFERENCE_UNSUPPORTED'), t)).toBe('conference.errorUnsupported')
+    expect(describeConferenceError(gateway('CONFERENCE_CONFIRMED'), t)).toBe('conference.errorConfirmed')
+    expect(describeConferenceError(gateway('CONFERENCE_CANCELLED'), t)).toBe('conference.errorCancelled')
   })
 
   it('says why the window did not ask for it: a call on hold, a conference already being made (review 8b, n°1, n°6)', () => {

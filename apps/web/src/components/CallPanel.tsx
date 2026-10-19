@@ -333,12 +333,12 @@ const Participants = ({ meetingId, manage, call, parties = [], onError, onNotice
  * A question asked in place (« Terminer pour tous », leaving a conference one made: review 8b, n°7 and n°11): the focus
  * goes to it when it opens, and back to the button that opened it when it is answered "no".
  */
-const Confirm = ({ id, question, children }: { id: string; question: string; children: ReactNode }) => {
+const Confirm = ({ id, question, children, alert = false }: { id: string; question: string; children: ReactNode; alert?: boolean }) => {
   const text = useRef<HTMLParagraphElement>(null)
   useEffect(() => text.current?.focus(), [])
   return (
     <div className="confirm" role="group" aria-labelledby={id} data-testid="conference-confirm">
-      <p id={id} ref={text} tabIndex={-1}>
+      <p id={id} ref={text} tabIndex={-1} {...(alert ? { role: 'alert' } : {})}>
         {question}
       </p>
       <div className="actions">{children}</div>
@@ -368,6 +368,27 @@ const ConferenceCall = ({ call, tones, onError, onNotice }: { call: SoftCall; to
   // Who the conference this window made began with (POST /calls/:id/conference): no news to it.
   const began = call.conferenceOf ? phone.parties[call.conferenceOf] : undefined
   const waitingFor = call.conferenceOf ? phone.awaiting[call.conferenceOf] : undefined
+  // One decision at a time: the two buttons are off while a request is out (no double send, no crossing).
+  const [deciding, setDeciding] = useState(false)
+  const decide = (fn: () => Promise<void>) => () => {
+    setDeciding(true)
+    void (async () => {
+      onError(null)
+      try {
+        await fn()
+      } catch (err) {
+        onError(describeConferenceError(err, t))
+      } finally {
+        setDeciding(false)
+      }
+    })()
+  }
+  // The question goes (confirmed, or given up): the focus comes back to the conference, not to the page.
+  const wasWaiting = useRef(false)
+  useEffect(() => {
+    if (wasWaiting.current && !waitingFor) title.current?.focus()
+    wasWaiting.current = !!waitingFor
+  }, [waitingFor])
   const inviting = mine && meetingId ? (phone.inviting[meetingId] ?? []) : []
   const connected = call.state === 'connected' || call.state === 'held'
   useEffect(() => {
@@ -412,11 +433,11 @@ const ConferenceCall = ({ call, tones, onError, onNotice }: { call: SoftCall; to
       {waitingFor ? (
         // The call with the operator is kept, quiet, until the person says they hear their correspondent in the room (step
         // 8c, ADR 0025): a mailbox of the operator may have answered the number called again. The number shown is the one called.
-        <Confirm id={`wait-${call.id}`} question={t('conference.awaiting', { who: formatNumber(waitingFor) })}>
-          <button type="button" className="btn btn-primary" onClick={guard(() => phone.confirmConference(call.conferenceOf!))}>
+        <Confirm id={`wait-${call.id}`} alert question={t('conference.awaiting', { who: formatNumber(waitingFor) })}>
+          <button type="button" className="btn btn-primary" disabled={deciding} onClick={decide(() => phone.confirmConference(call.conferenceOf!))}>
             {t('conference.confirm')}
           </button>
-          <button type="button" className="btn" onClick={guard(async () => void (meetingId && (await client.endCallConference(meetingId))))}>
+          <button type="button" className="btn" disabled={deciding} onClick={decide(() => phone.cancelAwaiting(call.conferenceOf!))}>
             {t('conference.giveUp')}
           </button>
         </Confirm>
@@ -429,7 +450,7 @@ const ConferenceCall = ({ call, tones, onError, onNotice }: { call: SoftCall; to
           </button>
         ) : null}
         {mine && meetingId ? (
-          <button ref={addButton} type="button" className="btn" aria-pressed={adding} aria-controls={`add-${call.id}`} onClick={() => (adding ? closeAdd() : setAdding(true))}>
+          <button ref={addButton} type="button" className="btn" aria-pressed={adding} aria-controls={`add-${call.id}`} disabled={!!waitingFor} onClick={() => (adding ? closeAdd() : setAdding(true))}>
             {t('call.addParticipant')}
           </button>
         ) : null}

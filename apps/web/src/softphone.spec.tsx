@@ -103,7 +103,7 @@ describe('SoftphoneProvider, the conferences this window made (third review of t
     expect(inviteByPhone).not.toHaveBeenCalled()
     expect(confirmConference).not.toHaveBeenCalled()
     await act(() => phone.confirmConference('first-call'))
-    expect(confirmConference).toHaveBeenCalledWith(ROOM)
+    expect(confirmConference).toHaveBeenCalledWith(ROOM, 'a1b2@192.0.2.30')
     expect(phone.awaiting).toEqual({})
     expect(inviteByPhone).toHaveBeenCalledWith(ROOM, '103')
     // Nothing waits any more: a second confirmation asks nothing.

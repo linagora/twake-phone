@@ -2945,6 +2945,12 @@ try {
     await alice.page.getByText(/La salle a rappelé \+33 6 39 98 00 06/).waitFor({ timeout: 30_000 })
     await sleep(1_500)
     expectEqual(first.state, 'answered', 'the first call at the operator, answered by a mailbox on the second')
+    // The first call is quiet meanwhile: nothing but silence reaches the operator, and Alice's speaker for it is off.
+    const settled = first.media.stats.voiced
+    await sleep(1_500)
+    expectEqual(first.media.stats.voiced, settled, 'sound from Alice at the operator while the first call is quiet')
+    const speakers = () => alice.page.evaluate(() => [...document.querySelectorAll('audio[data-testid="remote-audio"]')].map(a => a.muted))
+    if (!(await speakers()).includes(true)) throw new Error(`no speaker of Alice is off while the first call is quiet: ${JSON.stringify(await speakers())}`)
     expectEqual((await calls(bob.page)).length, 0, 'calls on Bob\'s page')
     await alice.page.getByRole('button', { name: "Annuler et reprendre l'appel" }).click()
     await at2.callState(second, 'ended', 20_000)
@@ -2957,6 +2963,8 @@ try {
     // Her sound is back in the first call (quiet while the room's call lasted).
     const voiced = first.media.stats.voiced
     await until('sound from Alice at the operator again', async () => (first.media.stats.voiced > voiced + 20 ? true : null), { timeout: 20_000 })
+    // ...and hers: the speaker for the first call is on again.
+    expectEqual((await speakers()).includes(true), false, 'a speaker of Alice still off once she gave up')
     expectEqual(await store.countConferences(TENANT), 0, 'rooms left')
     await alice.page.getByRole('button', { name: 'Raccrocher' }).click()
     await at.callState(first, 'ended')

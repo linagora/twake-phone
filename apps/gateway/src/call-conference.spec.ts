@@ -32,7 +32,7 @@ const JOIN = '0123456789abcdef'.repeat(2)
  * has the Call-ID of its call (`sip.callIDFull`); the room's call to the group 600 is answered by Carol (104), whom
  * the SIP server tells of it (second review 8b, n°4). Dave (105) holds an extension and is in none.
  */
-const setup = async ({ failFor, failTaken, divertFor, untakenFor, leaveFor, trunkAt = 'pbx:5060', trunkMovesAt, dialOutLimiter, conferenceCaps, ownerCheckMs, takenFails, miFails, vanish, failStatus, slowFor, originWatchMs, confirmWaitMs }: { vanish?: { id: string; after: number }; failStatus?: { code: string; status: number; reason: string }; slowFor?: string; originWatchMs?: number; confirmWaitMs?: number; takenFails?: boolean; miFails?: boolean; failFor?: string; failTaken?: 'own' | 'another' | 'ringing'; divertFor?: string; untakenFor?: string; leaveFor?: string; trunkAt?: string; trunkMovesAt?: string; dialOutLimiter?: RateLimiter; conferenceCaps?: { perPerson?: number }; ownerCheckMs?: number } = {}) => {
+const setup = async ({ failFor, failTaken, divertFor, untakenFor, leaveFor, trunkAt = 'pbx:5060', trunkMovesAt, dialOutLimiter, conferenceCaps, ownerCheckMs, takenFails, miFails, vanish, failStatus, slowFor }: { vanish?: { id: string; after: number }; failStatus?: { code: string; status: number; reason: string }; slowFor?: string; takenFails?: boolean; miFails?: boolean; failFor?: string; failTaken?: 'own' | 'another' | 'ringing'; divertFor?: string; untakenFor?: string; leaveFor?: string; trunkAt?: string; trunkMovesAt?: string; dialOutLimiter?: RateLimiter; conferenceCaps?: { perPerson?: number }; ownerCheckMs?: number } = {}) => {
   const grants: (RoomCallGrant & { token: string; revoked: boolean; taken?: { tag: string; callId: string } })[] = []
   const ended: string[] = []
   let reads = 0
@@ -147,15 +147,16 @@ const setup = async ({ failFor, failTaken, divertFor, untakenFor, leaveFor, trun
   await store.upsertMapping({ tenantId: 'dev', userId: 'carol', extension: '104' })
   await store.upsertMapping({ tenantId: 'dev', userId: 'dave', extension: '105' })
   const registry = new ProviderRegistry([{ tenantId: 'dev', type: 'fake', config: {} }], [factory])
-  const app = await buildApp(registry, {
+  const options = {
     store,
     ...(dialOutLimiter ? { dialOutLimiter } : {}),
     ...(conferenceCaps ? { conferenceCaps } : {}),
     ...(ownerCheckMs ? { conferenceOwnerCheckMs: ownerCheckMs } : {}),
-    ...(originWatchMs ? { originWatchMs } : {}),
-    ...(confirmWaitMs ? { confirmWaitMs } : {}),
     conference: { bridge: () => bridge, accessNumber: '8000', webhookKey: 'k', webhookSecret: 's' }
-  })
+  }
+  const app = await buildApp(registry, options)
+  // Another Gateway on the same database, the same SIP server and the same LiveKit (or this one started again): nothing in memory is shared.
+  const another = () => buildApp(registry, options)
   registry.startAll()
   await new Promise(r => setTimeout(r, 50)) // the event pump records whose calls they are
   const as = (user: string) => ({ 'x-dev-user': user, 'x-dev-tenant': 'dev' })
@@ -167,7 +168,7 @@ const setup = async ({ failFor, failTaken, divertFor, untakenFor, leaveFor, trun
     const token = signToken('k', 's', { sha256: createHash('sha256').update(body).digest('base64') })
     return app.inject({ method: 'POST', url: '/api/v1/webhooks/livekit', headers: { 'content-type': 'application/webhook+json', authorization: token }, payload: body })
   }
-  return { app, as, conference, grants, ended, lk, dialled, rooms, store, webhook, joinsLater }
+  return { app, another, as, conference, grants, ended, lk, dialled, rooms, store, webhook, joinsLater }
 }
 
 describe('a call becomes a conference (POST /calls/:id/conference, step 8b)', () => {
@@ -218,7 +219,7 @@ describe('a call becomes a conference (POST /calls/:id/conference, step 8b)', ()
     expect(await store.getConference(meetingId)).toBeNull()
   })
 
-  it("makes a conference of a call with the operator (step 8c): the room calls the person's window (join), then the same number again, through a grant of its own and no Replaces; the window ends the call", async () => {
+  it("makes a conference of a call with the operator (step 8c): the room calls the person's window (join), then the same number again, through a grant of its own and no Replaces; the original call is kept until the person confirms", async () => {
     const s = await setup()
     const { conference, grants, dialled, store, app, as } = s
     const res = await conference('op')
@@ -243,46 +244,42 @@ describe('a call becomes a conference (POST /calls/:id/conference, step 8b)', ()
     expect((await app.inject({ method: 'GET', url: `/api/v1/conferences/${meetingId}`, headers: as('alice') })).statusCode).toBe(200)
   })
 
-  it('keeps the call with the operator until the person confirms, then has the SIP server end it (never the window alone); a correspondent gone from the room, or no one waiting, ends nothing', async () => {
+  const post = (s: Awaited<ReturnType<typeof setup>>, id: string, what: 'confirm' | 'cancel', user = 'alice', call: string | undefined = 'op', app = s.app) =>
+    app.inject({ method: 'POST', url: `/api/v1/conferences/${id}/${what}`, headers: s.as(user), payload: what === 'confirm' ? { call } : {} })
+
+  it('keeps the call with the operator until the person confirms; confirming ends it at the SIP server (by its Call-ID), is replayable, and is the owner\'s', async () => {
     const s = await setup()
-    const made = (await s.conference('op')).json()
-    // Nobody but the owner confirms.
-    expect((await s.app.inject({ method: 'POST', url: `/api/v1/conferences/${made.meetingId}/confirm`, headers: s.as('bob') })).statusCode).toBe(403)
-    expect(s.ended).toEqual([])
-    const ok = await s.app.inject({ method: 'POST', url: `/api/v1/conferences/${made.meetingId}/confirm`, headers: s.as('alice') })
-    expect(ok.statusCode, ok.body).toBe(204)
-    expect(s.ended).toEqual(['op'])
-    // Said once: nothing waits any more.
-    expect((await s.app.inject({ method: 'POST', url: `/api/v1/conferences/${made.meetingId}/confirm`, headers: s.as('alice') })).json().code).toBe('CONFERENCE_NOT_AWAITING')
-    // The correspondent left the room meanwhile (hung up, or the mailbox did): the room ends, the original call is not touched.
-    const t = await setup()
-    const second = (await t.conference('op')).json().meetingId as string
-    t.rooms.set(second, t.rooms.get(second)!.filter(p => p.attributes['twake.number'] !== '+33612345678'))
-    const gone = await t.app.inject({ method: 'POST', url: `/api/v1/conferences/${second}/confirm`, headers: t.as('alice') })
-    expect(gone.statusCode).toBe(409)
-    expect(gone.json().code).toBe('CALL_NOT_ANSWERED')
-    expect(t.ended).toEqual([])
-    expect(t.rooms.has(second)).toBe(false)
-    expect(await t.store.getConference(second)).toBeNull()
-  })
-
-  it("gives the original call back (the room ended, the call untouched) when the person gives up, or says nothing within the time (the window is gone)", async () => {
-    const s = await setup({ confirmWaitMs: 150 })
     const { meetingId } = (await s.conference('op')).json()
-    await new Promise(r => setTimeout(r, 400))
-    expect(s.rooms.has(meetingId)).toBe(false)
-    expect(await s.store.getConference(meetingId)).toBeNull()
+    expect((await post(s, meetingId, 'confirm', 'bob')).statusCode).toBe(403)
     expect(s.ended).toEqual([])
-    expect((await s.app.inject({ method: 'POST', url: `/api/v1/conferences/${meetingId}/confirm`, headers: s.as('alice') })).statusCode).toBe(404)
-    // Given up: « Annuler » is the room's end (DELETE), nothing waits after it, the call is not ended.
+    expect((await post(s, meetingId, 'confirm')).statusCode).toBe(204)
+    expect(s.ended).toEqual(['op'])
+    // Replayed: nothing more to end, still a success (the call is over, the SIP server has no such dialog).
+    const again = await post(s, meetingId, 'confirm')
+    expect(again.statusCode, again.body).toBe(204)
+    // Only the person's own call with the operator: another call is refused, nothing is ended.
     const t = await setup()
-    const made = (await t.conference('op')).json().meetingId as string
-    expect((await t.app.inject({ method: 'DELETE', url: `/api/v1/conferences/${made}`, headers: t.as('alice') })).statusCode).toBe(204)
+    const room = (await t.conference('op')).json().meetingId as string
+    expect((await post(t, room, 'confirm', 'alice', 'c1')).statusCode).toBe(400)
+    expect((await post(t, room, 'confirm', 'alice', '')).statusCode).toBe(400)
     expect(t.ended).toEqual([])
-    expect(t.rooms.has(made)).toBe(false)
   })
 
-  it("does not call the correspondent back when the original call ended before the room could (read again just before), and ends the room if it ends while the callback rings", async () => {
+  it("is a success to confirm once the correspondent hung up the original call to take the callback (answer-and-hold, the best case): during its ringing or after, the conference is kept", async () => {
+    // Over while the callback rings (read once before it, then over): the callback is answered, the conference is made.
+    const rung = await setup({ vanish: { id: 'op', after: 2 }, slowFor: '+33612345678' })
+    const res = await rung.conference('op')
+    expect(res.statusCode, res.body).toBe(201)
+    const { meetingId } = res.json()
+    expect(rung.rooms.has(meetingId)).toBe(true)
+    // Over before the person confirms: confirming ends nothing and succeeds.
+    const done = await post(rung, meetingId, 'confirm')
+    expect(done.statusCode, done.body).toBe(204)
+    expect(rung.ended).toEqual([])
+    expect(rung.rooms.has(meetingId)).toBe(true)
+  })
+
+  it('does not call the correspondent back when the original call is over just before the room would (read once more before), and calls nothing', async () => {
     const before = await setup({ vanish: { id: 'op', after: 1 } })
     const res = await before.conference('op')
     expect(res.statusCode, res.body).toBe(409)
@@ -290,14 +287,45 @@ describe('a call becomes a conference (POST /calls/:id/conference, step 8b)', ()
     expect(before.dialled().map(d => d.sip_call_to)).toEqual(['101'])
     expect(before.rooms.size).toBe(0)
     expect(await before.store.countConferences('dev')).toBe(0)
-    // While it rings (the call takes 400 ms here, read every 50): the room is ended, which cancels the ringing call.
-    const during = await setup({ vanish: { id: 'op', after: 2 }, slowFor: '+33612345678', originWatchMs: 50 })
-    const rung = await during.conference('op')
-    expect(rung.statusCode, rung.body).toBe(409)
-    expect(rung.json().code).toBe('CALL_NOT_ANSWERED')
-    expect(during.lk.filter(l => l.startsWith('livekit.RoomService/DeleteRoom')).length).toBeGreaterThanOrEqual(1)
-    expect(during.rooms.size).toBe(0)
-    expect(await during.store.countConferences('dev')).toBe(0)
+  })
+
+  it('has confirming and giving up exclude each other, whichever comes first and from whichever Gateway, each replayable', async () => {
+    // Confirmed first: giving up is refused (the original call is gone), the room stays.
+    const s = await setup()
+    const { meetingId } = (await s.conference('op')).json()
+    const elsewhere = await s.another()
+    expect((await post(s, meetingId, 'confirm', 'alice', 'op', elsewhere)).statusCode).toBe(204)
+    const refused = await post(s, meetingId, 'cancel')
+    expect(refused.statusCode).toBe(409)
+    expect(refused.json().code).toBe('CONFERENCE_CONFIRMED')
+    expect(s.rooms.has(meetingId)).toBe(true)
+    expect((await post(s, meetingId, 'confirm')).statusCode).toBe(204)
+    // Given up first: the room is gone, the call untouched, confirming finds nothing; giving up again is nothing to do.
+    const t = await setup()
+    const room = (await t.conference('op')).json().meetingId as string
+    expect((await post(t, room, 'cancel')).statusCode).toBe(204)
+    expect(t.rooms.has(room)).toBe(false)
+    expect(await t.store.getConference(room)).toBeNull()
+    expect(t.ended).toEqual([])
+    expect((await post(t, room, 'confirm')).statusCode).toBe(404)
+    // Both decided at the same instant, on two Gateways: one wins, the other is told, never both.
+    const u = await setup()
+    const racing = (await u.conference('op')).json().meetingId as string
+    const other = await u.another()
+    const [a, b] = await Promise.all([post(u, racing, 'confirm', 'alice', 'op', other), post(u, racing, 'cancel')])
+    // The loser is refused (409), or finds the room gone (404): never both succeed.
+    expect([a.statusCode, b.statusCode].filter(c => c === 204)).toHaveLength(1)
+    expect([a.statusCode, b.statusCode].filter(c => c === 409 || c === 404)).toHaveLength(1)
+    expect(u.ended.length + (u.rooms.has(racing) ? 0 : 1)).toBe(1)
+  })
+
+  it('has a confirmation made on another Gateway than the one that made the conference (or after a restart) end the call: nothing is kept in memory', async () => {
+    const s = await setup()
+    const { meetingId } = (await s.conference('op')).json()
+    const elsewhere = await s.another()
+    const res = await post(s, meetingId, 'confirm', 'alice', 'op', elsewhere)
+    expect(res.statusCode, res.body).toBe(204)
+    expect(s.ended).toEqual(['op'])
   })
 
   it('says the SIP code of a callback the operator, the rights or the caps refuse (403 limit, 480 no answer), and leaves nothing', async () => {
