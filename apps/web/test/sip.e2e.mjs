@@ -3903,6 +3903,38 @@ try {
       }, { timeout: 30_000 })
     }
   })
+  await step('step 11c, prerequisite: twelve people who join the directory at once get their mailboxes in one synchronisation, and wazo-sysconfd runs a few reloads of PJSIP for them, not one for each of their 24 writes (it merges the commands waiting while one runs)', async () => {
+    const newcomers = Array.from({ length: 12 }, (_, i) => ({ uid: `lot${i}`, cn: `Lot Numero${i}`, sn: `Numero${i}`, givenName: 'Lot', mail: `lot${i}@example.test`, ipPhone: String(420 + i), ou: 'Support' }))
+    const since = new Date().toISOString()
+    people.push(...newcomers)
+    try {
+      await directorySync.run()
+      await until('a mailbox for each of the twelve', async () => {
+        const rows = (await mailboxRows()).map(r => r.extension)
+        return newcomers.every(n => rows.includes(n.ipPhone)) ? rows : null
+      }, { timeout: 60_000 })
+      // The queue of wazo-sysconfd drained, whatever came last.
+      await sleep(3_000)
+      const ran = reloadsSince(since)
+      const count = command => ran.filter(c => c === command).length
+      console.log(`     wazo-sysconfd, for twelve mailboxes made in one synchronisation (24 writes that ask for PJSIP): ${JSON.stringify(Object.fromEntries([...new Set(ran)].map(c => [c, count(c)])))}`)
+      if (count('module reload res_pjsip.so') > 16) throw new Error(`reloads of PJSIP for twelve mailboxes made at once: ${count('module reload res_pjsip.so')} (${JSON.stringify(ran)})`)
+      if (count('voicemail reload') > 16) throw new Error(`reloads of the voicemails for twelve mailboxes made at once: ${count('voicemail reload')}`)
+      // No reload failed meanwhile (wazo-sysconfd answers wazo-confd at once, as the real one: a failure is in its log).
+      const log = execFileSync('docker', ['compose', '-f', COMPOSE_FILE, 'logs', '--no-log-prefix', '--since', since, 'wazo-sysconfd'], { encoding: 'utf8', timeout: 30_000 })
+      expectEqual(log.split('\n').filter(l => / failed: /.test(l)), [], 'the commands wazo-sysconfd failed')
+    } finally {
+      // They leave two at a time (a mass of them would be held back until an administrator says it is meant).
+      for (let i = 0; i < newcomers.length; i += 2) {
+        for (const n of newcomers.slice(i, i + 2)) people.splice(people.indexOf(n), 1)
+        await directorySync.run()
+        await until('their mailboxes no longer reached', async () => {
+          const rows = (await mailboxRows()).map(r => r.extension)
+          return newcomers.slice(i, i + 2).every(n => !rows.includes(n.ipPhone)) ? rows : null
+        }, { timeout: 60_000 })
+      }
+    }
+  })
   await step('the directory now shows Alice offline, and Bob available', async () => {
     await presenceIs(jean.page, 'Martin', '101', 'Hors ligne')
     await presenceIs(jean.page, 'Durand', '103', 'Disponible')

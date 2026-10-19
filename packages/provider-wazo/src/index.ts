@@ -145,6 +145,13 @@ const asideName = (sec: number) => `TwakePhone aside ${sec}`
 /** The extensions of a person, the shortest first (the one their events are told at). */
 const shortest = (a: string, b: string) => a.length - b.length || a.localeCompare(b)
 const PAGE = 500
+/**
+ * How many changes of mailboxes are written in Wazo at once. wazo-confd reloads Asterisk after each write (PJSIP for a
+ * user or an association, the voicemails for a mailbox) by a request to wazo-sysconfd, which runs one reload at a time
+ * and queues a command already waiting only once (its DuplicateRequestOptimizer): the closer the writes of a
+ * synchronisation come, the fewer reloads they cost. One by one, N people cost a reload for each few of them.
+ */
+const WRITES_AT_ONCE = 8
 const DAY_MS = 86_400_000
 /** How long the mailbox an event was read with stands for `owns` of that event (the same mailbox, read once). */
 const EVENT_READ_MS = 2_000
@@ -276,6 +283,26 @@ const chunksOf = (stream: ReadableStream<Uint8Array>) => ({
 const nativeFetch: Fetch = async (url, init) => {
   const res = await globalThis.fetch(url, init)
   return { status: res.status, headers: res.headers, json: () => res.json(), text: () => res.text(), body: res.body ? chunksOf(res.body) : null }
+}
+
+/**
+ * `each` on every item, `limit` at a time. A failure stops the items not begun, waits for those begun (none writes
+ * after the synchronisation ended), then is thrown: the first one.
+ */
+async function eachAtOnce<T>(items: readonly T[], limit: number, each: (item: T) => Promise<void>) {
+  let next = 0
+  let failure: { error: unknown } | undefined
+  const worker = async () => {
+    while (!failure && next < items.length) {
+      try {
+        await each(items[next++]!)
+      } catch (error) {
+        failure ??= { error }
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker))
+  if (failure) throw failure.error
 }
 
 /**
@@ -677,7 +704,7 @@ export class WazoVoicemail implements VoicemailProvider {
     for (const [key, vm] of ready) this.remember(key, vm.id)
     await options.beforeChanges?.(reachable)
     let waiting = 0
-    for (const [key, extensions] of people) {
+    await eachAtOnce([...people], WRITES_AT_ONCE, async ([key, extensions]) => {
       const number = mailboxNumber(key)
       let vm = ready.get(key)
       // A mass held back: nobody new given a mailbox meanwhile. The same people under new ids (an id attribute
@@ -685,7 +712,7 @@ export class WazoVoicemail implements VoicemailProvider {
       // and set aside without anyone saying it is meant.
       if (!vm && holdPark) {
         waiting++
-        continue
+        return
       }
       if (!vm) {
         const there = byNumber.get(number)
@@ -693,12 +720,12 @@ export class WazoVoicemail implements VoicemailProvider {
           // Someone else's at their number (a mailbox made by hand there): never shown to them.
           failed++
           this.log.error(`Wazo: the mailbox at the number of the holder of ${extensions[0]} (${there.id}) is someone else's: none for them`)
-          continue
+          return
         }
         const refused = this.refusedAt.get(key)
         if (refused && now < refused.until) {
           failed++
-          continue
+          return
         }
         let user: WazoUser | undefined
         let box: WazoMailbox | undefined = there
@@ -714,7 +741,7 @@ export class WazoVoicemail implements VoicemailProvider {
           // Refused: again after a minute, then two, four... an hour at most.
           const n = (refused?.n ?? 0) + 1
           this.refusedAt.set(key, { n, until: now + Math.min(60_000 * 2 ** (n - 1), 3_600_000) })
-          continue
+          return
         }
         this.refusedAt.delete(key)
         vm = box
@@ -724,18 +751,18 @@ export class WazoVoicemail implements VoicemailProvider {
       if (!this.bounded(vm) || vm.name !== NAME) await attempt(`the bounds of mailbox ${vm.id}`, () => this.update(vm, NAME, context.name, guard))
       this.remember(key, vm.id)
       for (const extension of extensions) boxes.push({ extension, mailbox: address(vm) })
-    }
+    })
     boxes.push(...stayBoxes)
     // The people gone: their mailbox set aside, with its messages (since when, in its name, for the grace period).
     const asideNow = new Set<WazoMailbox>()
-    for (const vm of gone) {
-      if (stay.has(vm)) continue
+    await eachAtOnce(gone, WRITES_AT_ONCE, async vm => {
+      if (stay.has(vm)) return
       this.forget(vm.id)
-      if (ASIDE.test(vm.name ?? '')) continue
-      if (!(await attempt(`setting mailbox ${vm.id} aside`, () => this.update(vm, asideName(Math.floor(now / 1000)), context.name, guard)))) continue
+      if (ASIDE.test(vm.name ?? '')) return
+      if (!(await attempt(`setting mailbox ${vm.id} aside`, () => this.update(vm, asideName(Math.floor(now / 1000)), context.name, guard)))) return
       asideNow.add(vm)
       counts.aside++
-    }
+    })
     // Aside past the grace period, or half made for nobody who holds an extension, and without a message left (the
     // messages stay their retention period, whatever the grace period), or with them when no retention period deletes
     // them: removed, unless too many at once (more than two, and more than half of the mailboxes reached now), unless
@@ -752,23 +779,23 @@ export class WazoVoicemail implements VoicemailProvider {
     const removeReleased = tooManyExpired && sameOf && release?.remove === expired.length
     const holdRemove = tooManyExpired && !removeReleased
     if (!holdRemove) {
-      for (const { vm, messages } of expired) {
+      await eachAtOnce(expired, WRITES_AT_ONCE, async ({ vm, messages }) => {
         const removed = await attempt(`removing mailbox ${vm.id}`, async () => {
           // Its messages first, through wazo-calld: none is left in the spool whatever wazo-sysconfd does next.
           for (const id of messages) if (await this.deleteFrom(vm.id, id, guard)) counts.erased++
           await this.removeMailbox(vm, users, guard)
         })
-        if (!removed) continue
+        if (!removed) return
         counts.removed++
         // Its users of ours went with it; the others (made in Wazo by hand) lost it only.
         users = users.flatMap(u => ((vm.users ?? []).some(x => x.uuid === u.uuid) ? (u.userfield?.startsWith(HOLDER) ? [] : [{ ...u, voicemail: null }]) : [u]))
-      }
+      })
     }
     // A user of ours without a mailbox, for nobody who holds an extension (one whose making stopped half-way): removed.
-    for (const u of users) {
-      if (!u.userfield?.startsWith(HOLDER) || u.voicemail || people.has(u.userfield)) continue
+    const lonely = users.filter(u => u.userfield?.startsWith(HOLDER) && !u.voicemail && !people.has(u.userfield))
+    await eachAtOnce(lonely, WRITES_AT_ONCE, async u => {
       await attempt(`removing a user without a mailbox`, () => write(`/users/${u.uuid}`, 'DELETE'))
-    }
+    })
     const heldBack =
       holdPark || holdRemove
         ? { ...(holdPark ? { park: leaving.length } : {}), ...(holdRemove ? { remove: expired.length } : {}), of: active.length, ...(holdPark && waiting ? { waiting } : {}), ...(holdPark && !boxes.length ? { noneReached: true } : {}) }

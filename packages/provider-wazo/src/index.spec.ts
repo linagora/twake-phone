@@ -383,6 +383,42 @@ describe('WazoVoicemail, the mailboxes', () => {
     expect(wazo.state.messages.get(box.id)).toHaveLength(1)
   })
 
+  it('writes the mailboxes of many people at once, a few at a time, so that wazo-sysconfd merges the reloads their writes ask for; a failure leaves no write behind', async () => {
+    const base = fakeWazo()
+    base.state.confdMs = 10
+    let inFlight = 0
+    let most = 0
+    let failAt = Infinity
+    let created = 0
+    const fetch: Fetch = async (url, init) => {
+      const write = init.method !== 'GET' && new URL(url).pathname.startsWith('/1.1')
+      if (write && new URL(url).pathname === '/1.1/users' && ++created === failAt) throw new TypeError('fetch failed')
+      if (write) most = Math.max(most, ++inFlight)
+      try {
+        return await base.fetch(url, init)
+      } finally {
+        if (write) inFlight--
+      }
+    }
+    const { vm } = make({ fetch })
+    const people = Array.from({ length: 20 }, (_, i) => ({ extension: String(200 + i), userId: `person-${i}` }))
+    const sync = await vm.syncMailboxes(people)
+    expect(sync.boxes).toHaveLength(20)
+    expect(sync.failed).toBe(0)
+    expect(people.every(p => base.boxOf(p.userId))).toBe(true)
+    // Several at once, never more than the bound: the writes of 20 people do not come one after the other.
+    expect(most).toBeGreaterThan(1)
+    expect(most).toBeLessThanOrEqual(8)
+    // Wazo down at the 25th user: the synchronisation fails, and no request of it is sent after it did.
+    created = 0
+    failAt = 5
+    const more = Array.from({ length: 20 }, (_, i) => ({ extension: String(300 + i), userId: `other-${i}` }))
+    await expect(vm.syncMailboxes([...people, ...more])).rejects.toBeInstanceOf(Error)
+    const after = base.state.requests.length
+    await tick(100)
+    expect(base.state.requests).toHaveLength(after)
+  })
+
   it('bounds a write whole, its token and its retry after a 401 included, below the margin of the lease', async () => {
     const { vm, wazo } = make({ writeTimeoutMs: 120, requestTimeoutMs: 1_000 })
     await vm.syncMailboxes([jean])
