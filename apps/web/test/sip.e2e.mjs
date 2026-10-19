@@ -3146,6 +3146,9 @@ try {
     await new Promise(resolve => meet.listen(0, '127.0.0.1', resolve))
     meetRoom.url = `http://127.0.0.1:${meet.address().port}/${meetRoom.slug}`
     conference.meet = new MeetApi({ url: `http://127.0.0.1:${meet.address().port}`, clientId: 'e2e', clientSecret: 'e2e' })
+    // Calling a number again, its old call goes on: two numbers in the conference are four external calls at a time, past the two a person has by default.
+    const policy = await asPerson(alice)
+    expectEqual((await policy('PUT', '/admin/outbound', { policy: { userCaps: { concurrent: 6 }, fraud: FRAUD } })).statusCode, 200, 'PUT /admin/outbound (more calls at a time)')
     try {
       // The conference: Alice, Jean, Bob, and two numbers of the operator.
       await aliceCallsJean(alice, jean)
@@ -3240,6 +3243,7 @@ try {
     } finally {
       delete conference.meet
       await new Promise(resolve => meet.close(resolve))
+      expectEqual((await policy('PUT', '/admin/outbound', { policy: { fraud: FRAUD } })).statusCode, 200, 'PUT /admin/outbound (no profile)')
     }
   })
   await step('a registration left on a dead connection (the first one, Alice) with a no-answer forward: Bob rings at once, not after the delay', async () => {
