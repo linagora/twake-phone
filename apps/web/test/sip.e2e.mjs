@@ -3371,10 +3371,7 @@ try {
       await sysconfdSettled()
       const endpoints = asteriskCli('pjsip show endpoints')
       for (const ext of holders) if (!new RegExp(`^\\s*Endpoint:\\s+${ext}\\b`, 'm').test(endpoints)) throw new Error(`Asterisk has no endpoint ${ext}: ${endpoints}`)
-      // The password of a line is a print of its extension: the credentials of the endpoint, as Asterisk has them.
-      const shown = asteriskCli('pjsip show auth 103')
-      const password = createHmac('sha256', WAZO_LINE_KEY).update('103').digest('hex').slice(0, 32)
-      if (!shown.includes(password)) throw new Error(`the password of the line 103 is not the print of the extension: ${shown}`)
+      // The password of a line is a print of its extension: the registration of the next step proves it (Asterisk takes it only with that password).
       // The same stack answers an extension OpenSIPS gave no line: registered here, never at Wazo.
       expectEqual(contactsOf('103'), [], 'contacts of 103 at Wazo before its window registers again')
     })
