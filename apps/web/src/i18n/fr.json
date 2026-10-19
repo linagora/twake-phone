@@ -904,5 +904,7 @@
   "voicemail.notTranscribedSaid": "Message de {who} : pas de transcription, {why}",
   "admin.alert.voicemailTranscriptionBacklog": "Des transcriptions ou des avis attendent depuis plus de 30 minutes (combien) : le service de transcription ou le serveur Matrix ne répond pas",
   "admin.alert.voicemailNoticeNoAccount": "Le bot ne connaît pas de compte Matrix à qui envoyer l'avis d'un message (combien depuis le démarrage) : voir LDAP_ATTR_MATRIX ou MATRIX_USER_TEMPLATE",
-  "admin.alert.voicemailNoticeNotWithdrawn": "Des avis de messages effacés restent dans Twake Chat : le bot n'est plus configuré pour les retirer (combien)"
+  "admin.alert.voicemailNoticeNotWithdrawn": "Des avis de messages effacés restent dans Twake Chat : le bot n'est plus configuré pour les retirer (combien)",
+  "admin.alert.voicemailTranscriptionHeld": "Des boîtes vocales se lisent vides, ou trop de messages ont disparu d'un coup (combien) : aucune transcription effacée, aucun avis retiré. Vérifier que le serveur de messagerie voit ses messages",
+  "admin.alert.voicemailTranscriptionUnreadable": "Des boîtes vocales ne se lisent plus depuis plusieurs passages (combien) : leurs messages manqués ne sont pas rattrapés"
 }

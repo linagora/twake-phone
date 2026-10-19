@@ -1446,6 +1446,31 @@ export const storeContract = (name: string, make: () => Promise<Store>) =>
       await s.close()
     })
 
+    it('takes no more pending ones than allowed however many are added at once, leaves one past them unwritten when asked to wait, and changes a notice from the state it was read in only (step 11b)', async () => {
+      const s = await make()
+      const lease = await leaseOf(s)
+      const got = await Promise.all(['m1', 'm2', 'm3', 'm4', 'm5', 'm6'].map(id => s.addTranscript(transcript(id), lease, 1)))
+      expect(got.filter(g => g === 'added')).toHaveLength(1)
+      expect(got.filter(g => g === 'busy')).toHaveLength(5)
+      // The reconciliation waits for room: nothing written, nothing said busy.
+      expect(await s.addTranscript(transcript('m7'), lease, 1, 'wait')).toBe('full')
+      expect(await s.listTranscripts('A', 'jdupont', ['m7'])).toEqual([])
+      expect(await s.addTranscript(transcript('m7', { status: 'none', reason: 'too-long' }), lease, 1, 'wait')).toBe('added')
+      const first = got.indexOf('added') + 1
+      expect(await s.addTranscript(transcript(`m${first}`), lease, 1, 'wait')).toBe('exists')
+      expect(await s.updateTranscript('A', 'jdupont', `m${first}`, { status: 'done', text: 'Bonjour' }, lease)).toBe(true)
+      expect(await s.addTranscript(transcript('m8'), lease, 1, 'wait')).toBe('added')
+      // A notice sent early, completed once: from `early` only, then from `edit` only.
+      expect(await s.updateTranscript('A', 'jdupont', 'm8', { notice: 'early', noticeRoom: '!r:example.test', noticeEvent: '$e1' }, lease)).toBe(true)
+      expect(await s.updateTranscript('A', 'jdupont', 'm8', { notice: 'edit' }, lease, 'sent')).toBe(false)
+      expect(await s.updateTranscript('A', 'jdupont', 'm8', { notice: 'edit' }, lease, 'early')).toBe(true)
+      expect((await s.dueTranscripts('A', 'notice', 10)).map(t => [t.messageId, t.notice])).toContainEqual(['m8', 'edit'])
+      expect(await s.updateTranscript('A', 'jdupont', 'm8', { notice: 'sent', noticeEdit: '$e2' }, lease, 'edit')).toBe(true)
+      expect(await s.updateTranscript('A', 'jdupont', 'm8', { notice: 'sent', noticeEdit: '$e3' }, lease, 'edit')).toBe(false)
+      expect((await s.listTranscripts('A', 'jdupont', ['m8']))[0]).toMatchObject({ notice: 'sent', noticeEvent: '$e1', noticeEdit: '$e2' })
+      await s.close()
+    })
+
     it('changes a transcription under the lease only, dated later each time, and says what is due in each queue: a try due, a notice once transcribed or waited for, a withdrawal first', async () => {
       const s = await make()
       const lease = await leaseOf(s)

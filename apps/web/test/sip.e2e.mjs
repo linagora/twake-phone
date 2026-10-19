@@ -192,6 +192,8 @@ const startRelay = (targetHost, targetPort, port, { refusing = false } = {}) =>
         port: server.address().port,
         /** A relay started refusing relays from now on. */
         open: () => void (open = true),
+        /** Refuses every new connection again (the ones relayed stay until cut). */
+        refuse: () => void (open = false),
         /** Drops the SIP server's side of the n-th connection only: the browser keeps its socket and suspects nothing. */
         cutUpstream: n => {
           const pair = pairs[n]
@@ -3390,6 +3392,20 @@ try {
     await setStatus(jean, 'Ne pas déranger')
     await jean.page.getByRole('link', { name: /^Messagerie vocale/ }).click()
     await jean.page.getByRole('heading', { level: 1, name: 'Messagerie vocale' }).waitFor()
+    // Jean's Matrix account without a name nor an avatar: Synapse says his profile is not found (404 M_NOT_FOUND), not
+    // that he has no account (404 M_UNKNOWN): his notices come all the same.
+    const jeanId = `@jdupont:${MATRIX_SERVER}`
+    await matrix(matrixTokens.jdupont, 'PUT', `/profile/${encodeURIComponent(jeanId)}/displayname`, { displayname: '' })
+    const profile = await matrix(matrixTokens['twakephone-bot'], 'GET', `/profile/${encodeURIComponent(jeanId)}`).then(
+      () => 'found',
+      err => err.message
+    )
+    if (!/: 404 M_NOT_FOUND$/.test(profile)) throw new Error(`Jean's profile without a name: ${profile}, 404 M_NOT_FOUND expected`)
+    const nobody = await matrix(matrixTokens['twakephone-bot'], 'GET', `/profile/${encodeURIComponent(`@nobody-e2e:${MATRIX_SERVER}`)}`).then(
+      () => 'found',
+      err => err.message
+    )
+    if (!/: 404 M_UNKNOWN$/.test(nobody)) throw new Error(`the profile of an account nobody has: ${nobody}, 404 M_UNKNOWN expected`)
     const started = new Date().toISOString()
     try {
       const placed = await operator.call('+33199000102', { from: '+33639980011', ruri: TRUNK_LOGIN })
@@ -3498,6 +3514,11 @@ try {
     expectEqual((await jeanApi('GET', '/voicemails')).json().items.some(i => i.id === item.id), false, "the message in Jean's mailbox after he deleted it")
     // His right to erasure: another message, its notice in the same room; he erases his history: the message gone from
     // his mailbox, its transcription with it, the notice withdrawn in Chat, the bot out of the room.
+    // That message's event missed: wazo-websocketd out of the Gateway's reach meanwhile (its relay cut and refusing),
+    // caught up once it is back (the stream reconnected, the mailboxes reconciled).
+    const events = wazoVia.websocketdUrl.relay
+    events.refuse()
+    if (events.cut() < 1) throw new Error("no connection of the Gateway to wazo-websocketd to cut")
     try {
       const placed = await operator.call('+33199000102', { from: '+33639980011', ruri: TRUNK_LOGIN })
       const answer = await placed.final
@@ -3508,10 +3529,25 @@ try {
       await sleep(1_000)
       expectEqual((await placed.hangup()).status, 200, 'answer to the operator BYE (the second message)')
     } catch (err) {
+      events.open()
       await setStatus(jean, 'Disponible')
       throw err
     }
+    // In Wazo, the Gateway not told: no row of it.
+    const left = await until('the second message in Wazo', async () => (await wazo.listMessages({ extension: '102', userId: 'jdupont' })).find(i => i.from === '+33639980011') ?? null, { timeout: 20_000 })
+    const gatewayDb = new pg.Pool({ connectionString: GATEWAY_DB_URL, max: 1 })
+    try {
+      const rowsOf = async id => Number((await gatewayDb.query('SELECT count(*) AS n FROM voicemail_transcripts WHERE tenant_id = $1 AND message_id = $2', [TENANT, id])).rows[0].n)
+      await sleep(2_000)
+      expectEqual(await rowsOf(left.id), 0, 'rows of the message whose event was missed, before the stream is back')
+      events.open()
+      await until('the message caught up', async () => ((await rowsOf(left.id)) ? true : null), { timeout: 30_000 })
+    } finally {
+      events.open()
+      await gatewayDb.end()
+    }
     const second = await until("the second message in Jean's mailbox", async () => (await jeanApi('GET', '/voicemails')).json().items.find(i => i.from === '+33639980011') ?? null, { timeout: 20_000 })
+    expectEqual(second.id, left.id, 'the message caught up')
     const again = await until("the bot's notice of the second message", async () => {
       const rooms = await noticesOf()
       return rooms.length && rooms.every(r => r.notices.every(e => e.event_id !== notice.event_id)) ? rooms : null

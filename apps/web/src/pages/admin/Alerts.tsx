@@ -64,6 +64,9 @@ const paramKey = (alert: Pick<AdminAlert, 'kind' | 'param'>): Key | undefined =>
   if (alert.param === 'transcription-backlog') return 'admin.alert.voicemailTranscriptionBacklog'
   if (alert.param === 'notice-no-account') return 'admin.alert.voicemailNoticeNoAccount'
   if (alert.param === 'notice-not-withdrawn') return 'admin.alert.voicemailNoticeNotWithdrawn'
+  // The reconciliation of the mailboxes: mailboxes read empty or too many messages gone at once (nothing erased), a mailbox it cannot read.
+  if (alert.param === 'transcription-held') return 'admin.alert.voicemailTranscriptionHeld'
+  if (alert.param === 'transcription-unreadable') return 'admin.alert.voicemailTranscriptionUnreadable'
   if ((TRUNK_OUTBOUND_CLASSES as readonly string[]).includes(alert.param) || alert.param === 'premium') return `admin.class.${alert.param}` as Key
   return undefined
 }

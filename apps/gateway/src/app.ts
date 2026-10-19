@@ -297,8 +297,9 @@ export interface BuildOptions {
   transcriptRetryMs?: number[]
   noticeRetryMs?: number[]
   transcriptEveryMs?: number
-  /** The rest of VoicemailTranscripts' bounds (tests): how often the mailboxes are reconciled, how long a notice waits for its text, the pauses of a failing transcription service, how long a declined room stays so. */
+  /** The rest of VoicemailTranscripts' bounds (tests): how often the mailboxes are reconciled, how long apart two of them must miss a message before its row is erased, how long a notice waits for its text, the pauses of a failing transcription service, how long a declined room stays so. */
   transcriptReconcileMs?: number
+  transcriptOrphanMs?: number
   noticeWaitMs?: number
   transcriptBreakerMs?: number[]
   declinedMs?: number
@@ -966,6 +967,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
       ...(options.noticeRetryMs ? { noticeRetryMs: options.noticeRetryMs } : {}),
       ...(options.transcriptEveryMs !== undefined ? { everyMs: options.transcriptEveryMs } : {}),
       ...(options.transcriptReconcileMs !== undefined ? { reconcileEveryMs: options.transcriptReconcileMs } : {}),
+      ...(options.transcriptOrphanMs !== undefined ? { orphanConfirmMs: options.transcriptOrphanMs } : {}),
       ...(options.noticeWaitMs !== undefined ? { noticeWaitMs: options.noticeWaitMs } : {}),
       ...(options.transcriptBreakerMs ? { breakerMs: options.transcriptBreakerMs } : {}),
       ...(options.declinedMs !== undefined ? { declinedMs: options.declinedMs } : {})

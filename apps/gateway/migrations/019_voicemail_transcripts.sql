@@ -16,18 +16,20 @@ CREATE TABLE IF NOT EXISTS voicemail_transcripts (
   text text,
   attempts integer NOT NULL DEFAULT 0,
   next_at timestamptz NOT NULL DEFAULT clock_timestamp(),
-  -- pending | sent | none | redact
+  -- pending | sent | early (sent before its transcription) | edit (to complete with it) | none | redact
   notice text NOT NULL,
   -- The tries of the notice (or of its withdrawal), apart from the transcription's: each queue its own.
   notice_attempts integer NOT NULL DEFAULT 0,
   notice_next_at timestamptz NOT NULL DEFAULT clock_timestamp(),
   notice_room text,
   notice_event text,
+  -- The replacement of an early notice with its transcription (m.replace), withdrawn with it.
+  notice_edit text,
   created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
   updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
   PRIMARY KEY (tenant_id, holder, message_id)
 );
 -- What is due (dueTranscripts), what changed (transcriptsChangedSince), the retention period.
-CREATE INDEX IF NOT EXISTS voicemail_transcripts_due ON voicemail_transcripts (tenant_id, created_at) WHERE status = 'pending' OR notice IN ('pending', 'redact');
+CREATE INDEX IF NOT EXISTS voicemail_transcripts_due ON voicemail_transcripts (tenant_id, created_at) WHERE status = 'pending' OR notice IN ('pending', 'edit', 'redact');
 CREATE INDEX IF NOT EXISTS voicemail_transcripts_changed ON voicemail_transcripts (tenant_id, updated_at);
 CREATE INDEX IF NOT EXISTS voicemail_transcripts_received ON voicemail_transcripts (tenant_id, received_at);

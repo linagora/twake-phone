@@ -3,7 +3,7 @@ import type { TranscriptionProvider, VoicemailProvider } from '@twake/telephony-
 import type { TelephonyEvent, Voicemail, VoicemailTranscript } from '@twake/telephony-types'
 import { LintoTranscription } from '@twake/transcription-linto'
 import { MATRIX_ID_AMBIGUOUS, MATRIX_USER_ID, MatrixBot, MatrixError } from './matrix.js'
-import { holderIn, holderOut, type FencedLease, type Store, type TranscriptLane, type TranscriptRecord } from './store/types.js'
+import { holderIn, holderOut, type FencedLease, type Store, type TranscriptLane, type TranscriptNotice, type TranscriptRecord } from './store/types.js'
 
 // The transcription of the messages of the mailboxes and the bot's notice of each in Twake Chat (step 11b, ADR 0023).
 // Each new message is written down once (Store.addTranscript) by the Gateway that writes the mailboxes, under its lease
@@ -162,12 +162,14 @@ const NO_TEXT: Record<NonNullable<TranscriptRecord['reason']>, string> = {
 }
 
 /**
- * The name the caller gave (`fromName`: theirs to choose), as a notice may show it: without the characters that change
- * how a text reads (bidirectional controls, invisible joiners, line breaks), its spaces folded, 64 characters at most.
+ * The name the caller gave (`fromName`: theirs to choose), as a notice may show it: letters, digits, spaces and a
+ * simple punctuation only (apostrophes, hyphens, commas, brackets, `&`), so that neither what changes how a text reads
+ * (bidirectional controls, invisible joiners, line breaks) nor an address a client would make a link of (`://`,
+ * `www.`, `@`) is left; its spaces folded, 64 characters at most.
  */
 export const callerName = (name: string | undefined) => {
   const clean = (name ?? '')
-    .replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, ' ')
+    .replace(/[^\p{L}\p{M}\p{N}\p{Zs}'’\-,()&]/gu, ' ')
     .replace(/\s+/g, ' ')
     .trim()
   return clean ? Array.from(clean).slice(0, 64).join('') : undefined
@@ -242,7 +244,7 @@ class NotTheWriter extends Error {}
 class Suspended extends Error {}
 
 /** What the administrators are told of (kind `voicemail`). */
-export type TranscriptAlert = 'transcription-busy' | 'transcription-failed' | 'transcription-backlog' | 'notice-failed' | 'notice-no-account' | 'notice-not-withdrawn'
+export type TranscriptAlert = 'transcription-busy' | 'transcription-failed' | 'transcription-backlog' | 'transcription-held' | 'transcription-unreadable' | 'notice-failed' | 'notice-no-account' | 'notice-not-withdrawn'
 
 export interface VoicemailTranscriptsOptions {
   store: Store
@@ -272,6 +274,11 @@ export interface VoicemailTranscriptsOptions {
   reconcileEveryMs?: number
   /** How old a message may be that the reconciliation still takes in hand: 24 h. Older ones are said `untracked`. */
   catchUpMs?: number
+  /**
+   * How long apart two reconciliations must not see a message for its row to be erased (its notice withdrawn): 10 min.
+   * One read alone never erases (a voicemail server that does not see its spool for a while answers empty mailboxes).
+   */
+  orphanConfirmMs?: number
   /** The retention period of the messages (0: none): a message past it is never taken in hand again. */
   retentionMs?: number
   /** How long a notice waits for its transcription before it goes without: 10 min. */
@@ -286,6 +293,12 @@ export interface VoicemailTranscriptsOptions {
 
 const NOTICE_RETRY_MS = [30_000, 120_000, 600_000, 3_600_000, 21_600_000]
 const BREAKER_FAILURES = 3
+/** A message its transcription does not find (not in its mailbox): looked for again this much later, its row kept. */
+const LOOK_AGAIN_MS = 300_000
+/** A round of a queue ends once this many mailboxes could not be read (the voicemail server out, not one mailbox). */
+const STALLED_MAX = 3
+/** A mailbox unreadable this many reconciliations in a row: told to the administrators. */
+const UNREADABLE_PASSES = 3
 const ROOM = 'matrix:room:'
 const LEAVE = 'matrix:leave:'
 
@@ -320,6 +333,10 @@ export class VoicemailTranscripts {
   private readonly swept = new Map<string, number>()
   private readonly quiet = new Map<string, number>()
   private readonly noAccounts = new Map<string, number>()
+  /** Rows whose message a reconciliation did not see (by tenant, then holder and message): since when. */
+  private readonly orphans = new Map<string, Map<string, number>>()
+  /** Mailboxes the reconciliation could not read (tenant and holder): how many times in a row. */
+  private readonly unreadable = new Map<string, number>()
   private timer: ReturnType<typeof setInterval> | undefined
   private closed = false
   private readonly abort = new AbortController()
@@ -431,14 +448,15 @@ export class VoicemailTranscripts {
    * A message left (`voicemail.created`) in the mailbox of `holder`, reached at `extension`: written down to transcribe
    * and to tell, once, by the Gateway that writes the mailboxes (the others: nothing; the reconciliation catches up).
    */
-  async heard(tenantId: string, extension: string, holder: string, v: Voicemail) {
+  async heard(tenantId: string, extension: string, holder: string, v: Voicemail, whenFull: 'busy' | 'wait' = 'busy') {
     if (!this.on) return undefined
     const lease = this.lease(tenantId)
     if (!lease) return undefined
     const t = this.o.transcription
     const tooLong = !!t && v.durationSec > t.maxSec
     const record = { tenantId, holder, messageId: v.id, extension, receivedAt: v.receivedAt, status: t && !tooLong ? ('pending' as const) : ('none' as const), ...(tooLong ? { reason: 'too-long' as const } : {}), notice: this.o.notices ? ('pending' as const) : ('none' as const) }
-    const added = await this.o.store.addTranscript(record, lease, t?.queueMax ?? 0)
+    // `wait` (the reconciliation): a queue full leaves the message for a later pass, never `busy` for good.
+    const added = await this.o.store.addTranscript(record, lease, t?.queueMax ?? 0, whenFull)
     if (added === 'busy') {
       this.o.log.warn({ tenantId, waiting: t?.queueMax }, 'voicemail transcription: too many messages waiting, one left without its transcription')
       await this.o.alert(tenantId, 'transcription-busy', t?.queueMax ?? 0).catch(() => undefined)
@@ -483,9 +501,11 @@ export class VoicemailTranscripts {
     const room = roomStateOf(await this.o.store.getOperatorState(tenantId, ROOM + key))
     if (this.mayWrite(tenantId, lease)) {
       // Forgotten (their Matrix id with it): a later notice makes another room. Left once its notices are withdrawn.
+      // Their refusal of the bot stays (with the id it is of): erasing their messages does not invite them again.
       if (room?.roomId && this.notifies) await this.toLeave(tenantId, holder, room)
       else if (!this.notifies) await this.o.store.deleteOperatorState(tenantId, LEAVE + key)
-      await this.o.store.deleteOperatorState(tenantId, ROOM + key)
+      if (room?.declinedAt && room.matrixId) await this.o.store.putOperatorState(tenantId, ROOM + key, { matrixId: room.matrixId, declinedAt: room.declinedAt } satisfies RoomState)
+      else await this.o.store.deleteOperatorState(tenantId, ROOM + key)
       // A round of the notices that ended before the room was set to be left leaves it at the next one.
       if (room?.roomId && this.notifies) this.kick(tenantId, 'notice')
     }
@@ -537,6 +557,15 @@ export class VoicemailTranscripts {
     return state.ended
   }
 
+  /**
+   * One reconciliation. A row whose message is not in its mailbox is erased only when a reconciliation at least
+   * `orphanConfirmMs` later still does not see it, never on one read. None of a mailbox that had two rows or more and
+   * reads empty, and none at all when every mailbox read is empty or more than half of the rows read (two at least)
+   * went at once (a spool the voicemail server no longer sees reads empty, without failing): held back, the
+   * administrators told (`transcription-held`), the rows left for their `voicemail.deleted` or the retention period. A
+   * mailbox that cannot be read is passed (the next ones read all the same), told once it stays so UNREADABLE_PASSES
+   * times in a row.
+   */
   private async reconcileOnce(tenantId: string) {
     const lease = this.lease(tenantId)
     const vm = this.o.voicemail(tenantId)
@@ -545,33 +574,75 @@ export class VoicemailTranscripts {
     const since = Date.now() - this.catchUpMs
     let added = 0
     let erased = 0
-    for (const box of await this.o.mailboxes(tenantId)) {
+    let read = 0
+    let rowsRead = 0
+    let emptied = 0
+    let goneAll = 0
+    let listed = 0
+    const missing: { holder: string; messageId: string }[] = []
+    const boxes = await this.o.mailboxes(tenantId)
+    for (const box of boxes) {
       if (!this.mayWrite(tenantId, lease)) return
       // The rows first: a row written after them is of a message the list below has (a message comes before its row).
       const rows = await this.o.store.listTranscripts(tenantId, box.holder)
+      const unreadable = `${tenantId}\u0000${box.holder}`
       let messages: Voicemail[]
       try {
         messages = await vm.listMessages({ extension: box.extension, userId: box.holder })
+        this.unreadable.delete(unreadable)
       } catch (err) {
-        this.quietly(tenantId, 'reconcile', { err: brief(err) }, 'voicemail transcriptions: the voicemail server not read, the mailboxes reconciled at the next time')
-        return
+        this.unreadable.set(unreadable, (this.unreadable.get(unreadable) ?? 0) + 1)
+        this.quietly(tenantId, 'reconcile', { err: brief(err) }, 'voicemail transcriptions: a mailbox not read, reconciled at the next time')
+        continue
       }
+      read++
+      listed += messages.length
+      rowsRead += rows.length
       const known = new Set(rows.map(r => r.messageId))
       const there = new Set(messages.map(m => m.id))
       for (const m of messages) {
         if (known.has(m.id) || !(Date.parse(m.receivedAt) >= since)) continue
-        const got = await this.heard(tenantId, box.extension, box.holder, m)
-        if (got === 'added' || got === 'busy') added++
+        const got = await this.heard(tenantId, box.extension, box.holder, m, 'wait')
+        if (got === 'added') added++
         if (got === 'fenced') return
       }
-      for (const r of rows) {
-        if (there.has(r.messageId)) continue
-        const done = await this.eraseUnder(tenantId, { holder: box.holder, messageId: r.messageId }, lease)
+      const gone = rows.filter(r => !there.has(r.messageId))
+      goneAll += gone.length
+      if (!messages.length && gone.length >= 2) emptied++
+      else missing.push(...gone.map(r => ({ holder: box.holder, messageId: r.messageId })))
+    }
+    const seen = this.orphans.get(tenantId) ?? new Map<string, number>()
+    const mass = goneAll > 0 && (listed === 0 || (goneAll >= 2 && goneAll * 2 > rowsRead))
+    if (mass || emptied) {
+      this.quietly(tenantId, 'held', { emptied, gone: goneAll, rows: rowsRead }, 'voicemail transcriptions: mailboxes read empty, or too many messages gone at once: not erased, the administrators told')
+      await this.o.alert(tenantId, 'transcription-held', goneAll).catch(() => undefined)
+    }
+    if (mass) {
+      // Not one erased this time, and those seen before are seen again from scratch.
+      this.orphans.delete(tenantId)
+    } else {
+      const next = new Map<string, number>()
+      const confirm = this.o.orphanConfirmMs ?? 600_000
+      for (const m of missing) {
+        const k = `${m.holder}\u0000${m.messageId}`
+        const first = seen.get(k)
+        if (first === undefined || Date.now() - first < confirm) {
+          next.set(k, first ?? Date.now())
+          continue
+        }
+        const done = await this.eraseUnder(tenantId, { holder: m.holder, messageId: m.messageId }, lease)
         if (!done) return
         erased += done.erased
       }
+      this.orphans.set(tenantId, next)
     }
     if (added || erased) this.o.log.info({ tenantId, added, erased }, 'voicemail transcriptions: the mailboxes reconciled, the messages missed caught up')
+    // A mailbox that stays unreadable (the voicemail server answers for the others): told. All of them: the server is out.
+    const stuck = read ? boxes.filter(b => (this.unreadable.get(`${tenantId}\u0000${b.holder}`) ?? 0) >= UNREADABLE_PASSES).length : 0
+    if (stuck) {
+      this.quietly(tenantId, 'unreadable', { mailboxes: stuck }, 'voicemail transcriptions: mailboxes the voicemail server keeps failing to read')
+      await this.o.alert(tenantId, 'transcription-unreadable', stuck).catch(() => undefined)
+    }
     const waiting = await this.o.store.staleTranscripts(tenantId, new Date(Date.now() - (this.o.backlogMs ?? 1_800_000)).toISOString())
     if (waiting > 0) {
       this.quietly(tenantId, 'backlog', { waiting }, 'voicemail transcriptions: transcriptions or notices wait for too long')
@@ -618,6 +689,9 @@ export class VoicemailTranscripts {
   }
 
   private async round(tenantId: string, lane: TranscriptLane) {
+    // The mailboxes not read this round (their rows passed): one unreadable leaves the others' going; a few, the
+    // voicemail server is out, the round ends.
+    const stalled = new Set<string>()
     for (let batch = 0; batch < 10; batch++) {
       const lease = this.lease(tenantId)
       if (!lease) return
@@ -626,15 +700,22 @@ export class VoicemailTranscripts {
       if (!due.length) break
       for (const r of due) {
         if (!this.mayWrite(tenantId, lease)) return
+        if (stalled.has(r.holder)) continue
         try {
           if (lane === 'transcribe') await this.transcribe(tenantId, r, lease)
           else if (r.notice === 'redact') await this.withdraw(tenantId, r, lease)
+          else if (r.notice === 'edit') await this.complete(tenantId, r, lease)
           else await this.notify(tenantId, r, lease)
         } catch (err) {
-          if (err instanceof NotTheWriter || err instanceof Suspended) return
+          if (err instanceof NotTheWriter) return
+          if (err instanceof Suspended) {
+            if (stalled.add(r.holder).size >= STALLED_MAX) return
+            continue
+          }
           this.o.log.error({ tenantId, err: brief(err) }, 'voicemail transcription: a step failed, again at the next round')
         }
       }
+      if (stalled.size) break
     }
     if (lane === 'notice') await this.sweep(tenantId)
   }
@@ -643,8 +724,24 @@ export class VoicemailTranscripts {
     if (!this.mayWrite(tenantId, lease)) throw new NotTheWriter()
   }
 
-  private update(tenantId: string, r: TranscriptRecord, change: Parameters<Store['updateTranscript']>[3], lease: FencedLease) {
-    return this.o.store.updateTranscript(tenantId, r.holder, r.messageId, change, lease)
+  private update(tenantId: string, r: TranscriptRecord, change: Parameters<Store['updateTranscript']>[3], lease: FencedLease, ifNotice?: TranscriptNotice) {
+    return this.o.store.updateTranscript(tenantId, r.holder, r.messageId, change, lease, ifNotice)
+  }
+
+  /** The message of a row from its mailbox; the voicemail server out: the round ends (Suspended), nothing counted, said once a while. */
+  private async messageOrSuspend(tenantId: string, r: TranscriptRecord) {
+    try {
+      return await this.messageOf(tenantId, r)
+    } catch (err) {
+      this.quietly(tenantId, 'voicemail', { err: brief(err) }, 'voicemail transcription: the voicemail server does not answer, the transcriptions and notices wait')
+      throw new Suspended()
+    }
+  }
+
+  /** A row whose message its transcription does not find: kept, looked for again later (the reconciliation erases it once its absence is confirmed). */
+  private async lookAgain(tenantId: string, r: TranscriptRecord, lease: FencedLease) {
+    this.guard(tenantId, lease)
+    await this.update(tenantId, r, { nextAt: new Date(Date.now() + LOOK_AGAIN_MS).toISOString() }, lease)
   }
 
   private async messageOf(tenantId: string, r: TranscriptRecord) {
@@ -671,32 +768,16 @@ export class VoicemailTranscripts {
       return
     }
     if (Date.now() < this.breaker.until) throw new Suspended()
-    let found: Awaited<ReturnType<VoicemailTranscripts['messageOf']>>
-    try {
-      found = await this.messageOf(tenantId, r)
-    } catch (err) {
-      // The voicemail server out: the round ends, nothing counted (each message would fail alike), said once a while.
-      this.quietly(tenantId, 'voicemail', { err: brief(err) }, 'voicemail transcription: the voicemail server does not answer, the transcriptions wait')
-      throw new Suspended()
-    }
-    const { vm, owner, message } = found
+    const { vm, owner, message } = await this.messageOrSuspend(tenantId, r)
     if (!vm || !owner) return
-    // Gone meanwhile (deleted, purged): nothing to transcribe nor to tell.
-    if (!message) {
-      this.guard(tenantId, lease)
-      await this.o.store.deleteTranscript(tenantId, r.holder, r.messageId, lease)
-      return
-    }
+    // Not seen (deleted, purged, or a mailbox read empty a while): its row kept, looked for again later.
+    if (!message) return this.lookAgain(tenantId, r, lease)
     if (message.durationSec > t.maxSec) return this.settle(tenantId, r, { status: 'none', reason: 'too-long' }, lease)
     const attempts = r.attempts + 1
     let asked = false
     try {
       const recording = await vm.getRecording(owner, r.messageId)
-      if (!recording) {
-        this.guard(tenantId, lease)
-        await this.o.store.deleteTranscript(tenantId, r.holder, r.messageId, lease)
-        return
-      }
+      if (!recording) return await this.lookAgain(tenantId, r, lease)
       if (recording.size !== undefined && recording.size > t.maxBytes) throw new TooLong(`recording of ${recording.size} bytes`)
       const audio = await readAll(recording.body, t.maxBytes)
       this.guard(tenantId, lease)
@@ -727,6 +808,8 @@ export class VoicemailTranscripts {
     if (!(await this.update(tenantId, r, { ...change, attempts: 0, nextAt: new Date().toISOString() }, lease))) return
     const settled = { ...r, ...change, attempts: 0 }
     if (publicTranscript(settled)) this.o.onSettled?.(tenantId, settled)
+    // Its notice sent without it (the wait past): completed now, unless withdrawn meanwhile.
+    if (this.o.notices && this.o.notices.withText !== false) await this.update(tenantId, r, { notice: 'edit', noticeAttempts: 0, noticeNextAt: new Date().toISOString() }, lease, 'early')
     this.kick(tenantId, 'notice')
   }
 
@@ -779,9 +862,14 @@ export class VoicemailTranscripts {
       const me = await n.bot.whoami(this.signal)
       // The bot's own server only: a notice never leaves the organisation's homeserver.
       if (matrixId.slice(matrixId.indexOf(':') + 1) !== me.serverName || matrixId === me.userId) return this.noAccount(tenantId, r, lease, "not on the bot's server", matrixId)
-      const { message } = await this.messageOf(tenantId, r)
-      // Gone before its notice (deleted, purged): nothing to tell.
-      if (!message) return none()
+      const { message } = await this.messageOrSuspend(tenantId, r)
+      // Not seen (deleted, purged, or a mailbox read empty a while): nothing sent now, looked for again later; the
+      // reconciliation erases its row once its absence is confirmed.
+      if (!message) {
+        this.guard(tenantId, lease)
+        await this.update(tenantId, r, { noticeNextAt: new Date(Date.now() + LOOK_AGAIN_MS).toISOString() }, lease)
+        return
+      }
       const room = await this.roomFor(tenantId, r.holder, matrixId, me.userId, lease)
       if (room === 'declined') return none()
       if (room === 'no-account') return this.noAccount(tenantId, r, lease, 'no such account on the homeserver', matrixId)
@@ -791,12 +879,55 @@ export class VoicemailTranscripts {
       const before = room.made ? undefined : await n.bot.findSent(room.roomId, NOTICE_FIELD, key, this.signal)
       this.guard(tenantId, lease)
       const eventId = before ?? (await n.bot.send(room.roomId, txnOf('n', tenantId, r), noticeContent(message, r, n, key), this.signal))
-      if (await this.update(tenantId, r, { notice: 'sent', noticeRoom: room.roomId, noticeEvent: eventId, noticeAttempts: 0 }, lease)) return
+      // Sent before its transcription (the wait past): `early`, completed once it is settled.
+      const early = r.status === 'pending' && n.withText !== false
+      if (await this.update(tenantId, r, { notice: early ? 'early' : 'sent', noticeRoom: room.roomId, noticeEvent: eventId, noticeAttempts: 0 }, lease)) {
+        // Settled meanwhile (its own `early` to `edit` came before this): completed all the same.
+        if (early && (await this.o.store.listTranscripts(tenantId, r.holder, [r.messageId]))[0]?.status !== 'pending') await this.update(tenantId, r, { notice: 'edit', noticeNextAt: new Date().toISOString() }, lease, 'early')
+        return
+      }
       // Erased while it was sent (its row gone): withdrawn at once. Under a lease lost, the next writer finds it again.
       if (!(await this.o.store.listTranscripts(tenantId, r.holder, [r.messageId])).length && this.mayWrite(tenantId, lease)) await n.bot.redact(room.roomId, eventId, txnOf('r', tenantId, r), 'TwakePhone', this.signal)
     } catch (err) {
-      if (err instanceof NotTheWriter) throw err
+      if (err instanceof NotTheWriter || err instanceof Suspended) throw err
       await this.noticeFailed(tenantId, r, lease, err, false)
+    }
+  }
+
+  /**
+   * A notice sent before its transcription, completed with it: a replacement (`m.replace`) of the same notice, with the
+   * text (or why there is none). Withdrawn with it. A message gone meanwhile: left as it is (withdrawn with its erasure).
+   */
+  private async complete(tenantId: string, r: TranscriptRecord, lease: FencedLease) {
+    const n = this.o.notices
+    const sent = async () => {
+      this.guard(tenantId, lease)
+      await this.update(tenantId, r, { notice: 'sent' }, lease, 'edit')
+    }
+    if (!n || !r.noticeRoom || !r.noticeEvent) return sent()
+    try {
+      const { message } = await this.messageOrSuspend(tenantId, r)
+      if (!message) return sent()
+      const content = noticeContent(message, r, n)
+      this.guard(tenantId, lease)
+      const editId = await n.bot.send(
+        r.noticeRoom,
+        txnOf('e', tenantId, r),
+        { msgtype: content.msgtype, body: `* ${content.body}`, 'm.new_content': content, 'm.relates_to': { rel_type: 'm.replace', event_id: r.noticeEvent } },
+        this.signal
+      )
+      if (await this.update(tenantId, r, { notice: 'sent', noticeEdit: editId, noticeAttempts: 0 }, lease, 'edit')) return
+      // Erased meanwhile: withdrawn with the notice (kept to withdraw), or at once when its row is gone.
+      if (!(await this.update(tenantId, r, { noticeEdit: editId }, lease)) && this.mayWrite(tenantId, lease)) await n.bot.redact(r.noticeRoom, editId, txnOf('x', tenantId, r), 'TwakePhone', this.signal)
+    } catch (err) {
+      if (err instanceof NotTheWriter || err instanceof Suspended) throw err
+      if (this.closed) throw new NotTheWriter()
+      // Past its tries: the notice stays as it was sent (the text in TwakePhone), nothing more tried.
+      const attempts = r.noticeAttempts + 1
+      this.o.log.warn({ tenantId, attempt: attempts, err: brief(err) }, 'voicemail notice not completed with its transcription')
+      this.guard(tenantId, lease)
+      if (attempts > this.noticeRetryMs.length) await this.update(tenantId, r, { notice: 'sent', noticeAttempts: 0 }, lease, 'edit')
+      else await this.update(tenantId, r, { noticeAttempts: attempts, noticeNextAt: new Date(Date.now() + this.noticeRetryMs[attempts - 1]!).toISOString() }, lease, 'edit')
     }
   }
 
@@ -893,7 +1024,7 @@ export class VoicemailTranscripts {
       const rows = await this.o.store.listTranscripts(tenantId, holder, undefined, true)
       const stay: LeaveState['rooms'] = []
       for (const room of v.rooms) {
-        if (rows.some(r => r.noticeRoom === room.roomId && (r.notice === 'sent' || r.notice === 'redact'))) {
+        if (rows.some(r => r.noticeRoom === room.roomId && r.noticeEvent && r.notice !== 'none')) {
           stay.push(room)
           continue
         }
@@ -927,17 +1058,21 @@ export class VoicemailTranscripts {
       await this.o.alert(tenantId, 'notice-not-withdrawn', 1).catch(() => undefined)
       return gone()
     }
-    try {
+    // The bot can no longer withdraw one (it left the room, the event is gone): nothing more to try for it.
+    const redact = async (eventId: string, what: 'r' | 'x') => {
       this.guard(tenantId, lease)
-      await n.bot.redact(r.noticeRoom, r.noticeEvent, txnOf('r', tenantId, r), 'TwakePhone', this.signal)
+      await n.bot.redact(r.noticeRoom!, eventId, txnOf(what, tenantId, r), 'TwakePhone', this.signal).catch((err: unknown) => {
+        if (!(err instanceof MatrixError && (err.status === 403 || err.status === 404))) throw err
+        this.o.log.warn({ tenantId, err: brief(err) }, 'voicemail notice cannot be withdrawn any more')
+      })
+    }
+    try {
+      // Its replacement first (it carries the text too), then the notice.
+      if (r.noticeEdit) await redact(r.noticeEdit, 'x')
+      await redact(r.noticeEvent, 'r')
       await gone()
     } catch (err) {
       if (err instanceof NotTheWriter) throw err
-      // The bot can no longer withdraw it (it left the room, the event is gone): nothing more to try.
-      if (err instanceof MatrixError && (err.status === 403 || err.status === 404)) {
-        this.o.log.warn({ tenantId, err: brief(err) }, 'voicemail notice cannot be withdrawn any more')
-        return gone()
-      }
       await this.noticeFailed(tenantId, r, lease, err, true)
     }
   }
@@ -945,8 +1080,11 @@ export class VoicemailTranscripts {
 
 /** The print of a message (its tenant, holder and id): the same whatever the Gateway, never the ids themselves. */
 const printOf = (tenantId: string, r: Pick<TranscriptRecord, 'holder' | 'messageId'>) => createHash('sha256').update([tenantId, r.holder, r.messageId].join('\u0000')).digest('hex').slice(0, 32)
-/** The transaction id of a notice (`n`) or of its withdrawal (`r`): the same for the same message, whatever the Gateway. */
-export const txnOf = (what: 'n' | 'r', tenantId: string, r: Pick<TranscriptRecord, 'holder' | 'messageId'>) => `twakephone-${what}-${printOf(tenantId, r)}`
+/**
+ * The transaction id of a notice (`n`), of its withdrawal (`r`), of its replacement with the transcription (`e`) and of
+ * the withdrawal of that one (`x`): the same for the same message, whatever the Gateway.
+ */
+export const txnOf = (what: 'n' | 'r' | 'e' | 'x', tenantId: string, r: Pick<TranscriptRecord, 'holder' | 'messageId'>) => `twakephone-${what}-${printOf(tenantId, r)}`
 /** What a notice carries in NOTICE_FIELD: the print of its message. */
 export const noticeKey = (tenantId: string, r: Pick<TranscriptRecord, 'holder' | 'messageId'>) => printOf(tenantId, r)
 

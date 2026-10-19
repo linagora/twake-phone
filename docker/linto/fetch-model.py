@@ -31,11 +31,15 @@ def digest(path):
 
 
 def download(name, expected, into):
-    """NAME.zip downloaded to a file of `into`, checked: its path."""
+    """NAME.zip downloaded to a file of `into`, checked: its path. Interrupted or not the model: no file left."""
     fd, path = tempfile.mkstemp(suffix='.zip', dir=into)
-    with os.fdopen(fd, 'wb') as out, urllib.request.urlopen(URL.format(name=name), timeout=300) as res:
-        shutil.copyfileobj(res, out)
-    got = digest(path)
+    try:
+        with os.fdopen(fd, 'wb') as out, urllib.request.urlopen(URL.format(name=name), timeout=300) as res:
+            shutil.copyfileobj(res, out)
+        got = digest(path)
+    except BaseException:
+        os.remove(path)
+        raise
     if got != expected:
         os.remove(path)
         sys.exit(f'{name}.zip: sha256 {got}, not the expected model ({expected})')

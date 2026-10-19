@@ -904,5 +904,7 @@
   "voicemail.notTranscribedSaid": "Message from {who}: no transcript, {why}",
   "admin.alert.voicemailTranscriptionBacklog": "Transcriptions or notices have been waiting for more than 30 minutes (how many): the transcription service or the Matrix server does not answer",
   "admin.alert.voicemailNoticeNoAccount": "The bot knows no Matrix account to send the notice of a message to (how many since the start): see LDAP_ATTR_MATRIX or MATRIX_USER_TEMPLATE",
-  "admin.alert.voicemailNoticeNotWithdrawn": "Notices of erased messages stay in Twake Chat: the bot is no longer set up to withdraw them (how many)"
+  "admin.alert.voicemailNoticeNotWithdrawn": "Notices of erased messages stay in Twake Chat: the bot is no longer set up to withdraw them (how many)",
+  "admin.alert.voicemailTranscriptionHeld": "Mailboxes read empty, or too many messages went at once (how many): no transcription erased, no notice withdrawn. Check that the voicemail server sees its messages",
+  "admin.alert.voicemailTranscriptionUnreadable": "Mailboxes have not been readable for several passes (how many): their missed messages are not caught up"
 }

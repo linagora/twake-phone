@@ -46,6 +46,13 @@ export interface MatrixMember {
 
 /** The answer of a homeserver read up to 256 kB: a room's members fit, anything larger is refused. */
 const MAX_ANSWER = 256 * 1024
+/**
+ * findSent reads the bot's last messages of a room by pages of ten, five pages back, each answer up to 1 MB: ten
+ * notices of the longest text (10 000 characters, in the plain body and escaped in the HTML one) fit it.
+ */
+const FIND_PAGE = 10
+const FIND_PAGES = 5
+const MAX_PAGE = 1024 * 1024
 
 export class MatrixBot {
   private readonly base: string
@@ -63,7 +70,7 @@ export class MatrixBot {
     this.fetch = config.fetch ?? globalThis.fetch
   }
 
-  private async request<T>(method: string, path: string, body?: unknown, signal?: AbortSignal): Promise<T> {
+  private async request<T>(method: string, path: string, body?: unknown, signal?: AbortSignal, max = MAX_ANSWER): Promise<T> {
     let res: Response
     const timeout = AbortSignal.timeout(this.timeoutMs)
     try {
@@ -87,7 +94,7 @@ export class MatrixBot {
           const { done, value } = await reader.read()
           if (done) break
           total += value.byteLength
-          if (total > MAX_ANSWER) {
+          if (total > max) {
             await reader.cancel().catch(() => undefined)
             throw new MatrixError('answer too large', res.status)
           }
@@ -131,8 +138,10 @@ export class MatrixBot {
   }
 
   /**
-   * Whether the homeserver has an account of that id (its profile): false when it says it has none (404), undefined
-   * when it does not say (a homeserver that shows profiles only to those who share a room with them: 403).
+   * Whether the homeserver has an account of that id (its profile): false when it says it has none, undefined when it
+   * does not say. A 404 `M_NOT_FOUND` says nothing: Synapse answers it for an account without a name nor an avatar
+   * ("Profile was not found"), and another 404 (Synapse's `M_UNKNOWN`, "No row found") for no account at all. A
+   * homeserver that shows profiles only to those who share a room with them: 403, undefined.
    */
   async exists(userId: string, signal?: AbortSignal): Promise<boolean | undefined> {
     if (!MATRIX_USER_ID.test(userId)) throw new MatrixError('not a Matrix user id')
@@ -140,7 +149,7 @@ export class MatrixBot {
       await this.request('GET', `/profile/${encodeURIComponent(userId)}`, undefined, signal)
       return true
     } catch (err) {
-      if (err instanceof MatrixError && err.status === 404) return false
+      if (err instanceof MatrixError && err.status === 404) return err.errcode === 'M_NOT_FOUND' ? undefined : false
       if (err instanceof MatrixError && err.status === 403) return undefined
       throw err
     }
@@ -217,17 +226,30 @@ export class MatrixBot {
   }
 
   /**
-   * The bot's own message of a room whose field `field` is `key` (among its last 50 there), or undefined: a message
-   * sent before whose answer was lost is found again, whatever token or transaction sent it.
+   * The bot's own message of a room whose field `field` is `key` (among its last 50 there, read by pages), or
+   * undefined: a message sent before whose answer was lost is found again, whatever token or transaction sent it.
    */
   async findSent(roomId: string, field: string, key: string, signal?: AbortSignal): Promise<string | undefined> {
     if (!ROOM_ID.test(roomId)) throw new MatrixError('not a room id')
     const { userId } = await this.whoami(signal)
     const filter = JSON.stringify({ types: ['m.room.message'], senders: [userId] })
-    const r = await this.request<{ chunk?: unknown }>('GET', `/rooms/${encodeURIComponent(roomId)}/messages?dir=b&limit=50&filter=${encodeURIComponent(filter)}`, undefined, signal)
-    if (!Array.isArray(r.chunk)) throw new MatrixError('messages: no chunk')
-    const found = (r.chunk as { sender?: unknown; event_id?: unknown; content?: Record<string, unknown> }[]).find(e => e?.sender === userId && e.content?.[field] === key && typeof e.event_id === 'string' && EVENT_ID.test(e.event_id))
-    return found?.event_id as string | undefined
+    // Ten at a time, back to the fiftieth: a page of long notices still fits the bound of an answer.
+    let from: string | undefined
+    for (let page = 0; page < FIND_PAGES; page++) {
+      const r = await this.request<{ chunk?: unknown; end?: unknown }>(
+        'GET',
+        `/rooms/${encodeURIComponent(roomId)}/messages?dir=b&limit=${FIND_PAGE}${from ? `&from=${encodeURIComponent(from)}` : ''}&filter=${encodeURIComponent(filter)}`,
+        undefined,
+        signal,
+        MAX_PAGE
+      )
+      if (!Array.isArray(r.chunk)) throw new MatrixError('messages: no chunk')
+      const found = (r.chunk as { sender?: unknown; event_id?: unknown; content?: Record<string, unknown> }[]).find(e => e?.sender === userId && e.content?.[field] === key && typeof e.event_id === 'string' && EVENT_ID.test(e.event_id))
+      if (found) return found.event_id as string
+      if (r.chunk.length < FIND_PAGE || typeof r.end !== 'string' || !r.end || r.end === from) return undefined
+      from = r.end
+    }
+    return undefined
   }
 
   /**

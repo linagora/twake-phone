@@ -49,10 +49,11 @@ const TOKEN = 'syt_not_a_real_token'
 
 /**
  * A Matrix homeserver in memory, as Synapse answers the client-server API the bot uses: who it is, whose account
- * exists, a room made (the bot joined, the person invited) at an address of its own (refused when taken), the
- * addresses, its members, a room left, a message sent once per transaction id, the bot's last messages of a room, a
- * message withdrawn (redacted). `fail` makes the next requests fail with these statuses; `lose` does the next request
- * of that kind and loses its answer (500).
+ * exists (a profile: Synapse's 404 `M_UNKNOWN` for no account, `M_NOT_FOUND` for an account with no name nor avatar),
+ * a room made (the bot joined, the person invited) at an address of its own (refused when taken), the addresses, its
+ * members, a room left, a message sent once per transaction id, the bot's last messages of a room (by pages, `from`
+ * and `end`), a message withdrawn (redacted). `fail` makes the next requests fail with these statuses; `lose` does the
+ * next request of that kind and loses its answer (500); `lag` hides the next addresses asked (404, as a replica late).
  */
 const homeserver = () => {
   const rooms = new Map<string, { members: Map<string, string>; created: Record<string, unknown> }>()
@@ -61,17 +62,26 @@ const homeserver = () => {
   const txns = new Map<string, string>()
   const sentTxns: string[] = []
   const noAccount = new Set<string>()
+  const noProfile = new Set<string>()
   const calls: string[] = []
+  const state = { lag: 0 }
   const failures: number[] = []
   const losing: string[] = []
   let n = 0
   const answer = (status: number, body: unknown) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } })
   const handle = (method: string, parts: string[], url: URL, body: Record<string, unknown>): Response => {
     if (parts.join('/') === 'account/whoami') return answer(200, { user_id: BOT })
-    if (parts[0] === 'profile') return noAccount.has(parts[1]!) ? answer(404, { errcode: 'M_NOT_FOUND', error: 'no profile' }) : answer(200, { displayname: 'x' })
+    if (parts[0] === 'profile') {
+      if (noAccount.has(parts[1]!)) return answer(404, { errcode: 'M_UNKNOWN', error: 'No row found (profiles)' })
+      return noProfile.has(parts[1]!) ? answer(404, { errcode: 'M_NOT_FOUND', error: 'Profile was not found' }) : answer(200, { displayname: 'x' })
+    }
     if (parts[0] === 'directory') {
       const roomId = aliases.get(parts[2]!)
       if (method === 'DELETE') return aliases.delete(parts[2]!) ? answer(200, {}) : answer(404, { errcode: 'M_NOT_FOUND', error: 'no alias' })
+      if (state.lag > 0) {
+        state.lag--
+        return answer(404, { errcode: 'M_NOT_FOUND', error: 'no alias' })
+      }
       return roomId ? answer(200, { room_id: roomId }) : answer(404, { errcode: 'M_NOT_FOUND', error: 'no alias' })
     }
     if (parts[0] === 'createRoom') {
@@ -93,8 +103,10 @@ const homeserver = () => {
       if (parts[2] === 'messages') {
         const filter = JSON.parse(url.searchParams.get('filter') ?? '{}') as { senders?: string[] }
         if (!filter.senders?.includes(BOT)) return answer(400, { errcode: 'M_INVALID_PARAM', error: 'filter expected' })
-        const chunk = [...events].filter(([, e]) => e.roomId === parts[1]).reverse().slice(0, Number(url.searchParams.get('limit') ?? 10)).map(([id, e]) => ({ event_id: id, sender: BOT, type: 'm.room.message', content: e.redacted ? {} : e.content }))
-        return answer(200, { chunk })
+        const from = Number(url.searchParams.get('from') ?? 0)
+        const limit = Number(url.searchParams.get('limit') ?? 10)
+        const chunk = [...events].filter(([, e]) => e.roomId === parts[1]).reverse().slice(from, from + limit).map(([id, e]) => ({ event_id: id, sender: BOT, type: 'm.room.message', content: e.redacted ? {} : e.content }))
+        return answer(200, { chunk, end: String(from + chunk.length) })
       }
       if (parts[2] === 'send') {
         const k = `${parts[1]}|${parts[4]}`
@@ -138,7 +150,7 @@ const homeserver = () => {
   }) as typeof globalThis.fetch
   /** The messages of the bot still readable, with their room's invited or joined people. */
   const notices = () => [...events.values()].filter(e => !e.redacted).map(e => ({ ...e, people: [...rooms.get(e.roomId)!.members].filter(([, m]) => m !== 'leave').map(([u]) => u) }))
-  return { fetch, rooms, aliases, events, calls, sentTxns, noAccount, fail: (...statuses: number[]) => void failures.push(...statuses), lose: (kind: string) => void losing.push(kind), notices }
+  return { fetch, rooms, aliases, events, calls, sentTxns, noAccount, noProfile, state, fail: (...statuses: number[]) => void failures.push(...statuses), lose: (kind: string) => void losing.push(kind), notices }
 }
 
 /**
@@ -155,7 +167,9 @@ const mailboxes = () => {
   let push: ((e: RoutedEvent) => void) | undefined
   let heard: (() => void) | undefined
   const pending: RoutedEvent[] = []
-  const state = { down: false, recordingGate: undefined as Promise<void> | undefined }
+  // `blind`: the spool out of the voicemail server's sight (unmounted), every mailbox read empty without failing
+  // (`blindTo`: those of these holders only); `failing`: the mailboxes of these holders not read (an error).
+  const state = { down: false, blind: false, blindTo: new Set<string>(), failing: new Set<string>(), lists: 0, recordingGate: undefined as Promise<void> | undefined }
   const up = () => {
     if (state.down) throw new Error('voicemail server down')
   }
@@ -177,13 +191,15 @@ const mailboxes = () => {
     owns: async o => at.get(o.extension) === o.userId,
     listMessages: async o => {
       up()
-      return [...(boxes.get(o.userId) ?? [])]
+      state.lists++
+      if (state.failing.has(o.userId)) throw new Error('mailbox not read')
+      return state.blind || state.blindTo.has(o.userId) ? [] : [...(boxes.get(o.userId) ?? [])]
     },
     getRecording: async (o, id) => {
       up()
       recordings++
       await state.recordingGate
-      if (!boxes.get(o.userId)?.some(m => m.id === id)) return undefined
+      if (state.blind || state.blindTo.has(o.userId) || !boxes.get(o.userId)?.some(m => m.id === id)) return undefined
       if (id.startsWith('big')) return { contentType: 'audio/wav', body: (async function* () { yield new Uint8Array(600_000); yield new Uint8Array(600_000) })() }
       if (id.startsWith('huge')) return { contentType: 'audio/wav', size: 2_000_000, body: (async function* () { yield new Uint8Array(1) })() }
       const bytes = new TextEncoder().encode(`RIFF-audio-of-${id}`)
@@ -285,6 +301,8 @@ const setup = async (
     logs?: string[]
     withText?: boolean
     declinedMs?: number
+    reconcileMs?: number
+    orphanMs?: number
   } = {}
 ) => {
   process.env.AUTH_MODE = 'dev'
@@ -306,6 +324,9 @@ const setup = async (
   }
   const registry = new ProviderRegistry([{ tenantId: 'A', type: 'sip', config: {} }], [sipServer().factory])
   const synced = boxes.synced()
+  // The log read by the test: written (the tests run silent otherwise).
+  const level = process.env.LOG_LEVEL
+  if (o.logs && level === 'silent') process.env.LOG_LEVEL = 'info'
   const app = await buildApp(registry, {
     store,
     bus,
@@ -335,9 +356,12 @@ const setup = async (
     transcriptEveryMs: 20,
     transcriptWatchMs: 20,
     ...(o.declinedMs !== undefined ? { declinedMs: o.declinedMs } : {}),
+    ...(o.reconcileMs !== undefined ? { transcriptReconcileMs: o.reconcileMs } : {}),
+    ...(o.orphanMs !== undefined ? { transcriptOrphanMs: o.orphanMs } : {}),
     ...(o.hub ? { secretsKey: Buffer.alloc(32, 7), webhooks: { pollMs: 3_600_000, stateLeaseMs: 300, streamSettleMs: 0 }, trunkWatchMs: 0 } : {}),
     ...(o.logs ? { logStream: { write: (line: string) => void o.logs!.push(line) } } : {})
   })
+  process.env.LOG_LEVEL = level
   await app.ready()
   registry.startAll()
   await until('the mailboxes', () => boxes.synced() > synced)
@@ -473,10 +497,14 @@ describe('the transcription of the messages and the notices in Chat (step 11b)',
     await until('the notices', () => on.hs.notices().length === 3)
     await on.app.close()
     // The pilot ends: LINTO_URL and MATRIX_* taken out, the Gateway started again.
-    const off = await setup({ store, boxes, transcribe: false, notices: false, retentionDays: 30, purgeMs: 50 })
+    const logs: string[] = []
+    const off = await setup({ store, boxes, transcribe: false, notices: false, retentionDays: 30, purgeMs: 50, logs })
     const res = await off.app.inject({ method: 'DELETE', url: '/api/v1/me/history', headers: off.as('jean') })
     expect(res.json()).toEqual({ deleted: 0, voicemailErasure: 'asked', chatNotices: 'not-withdrawn' })
     await until("Jean's row gone", async () => !(await store.listTranscripts('A', 'jean', undefined, true)).length)
+    // The erasure says how many of the bot's notices it left in Chat.
+    await until('the erasure logged', () => logs.some(l => l.includes('the messages of a person erased')))
+    expect(logs.find(l => l.includes('the messages of a person erased'))).toContain('"notWithdrawn":1')
     // A message deleted, a message past the retention period: their rows go too.
     expect((await off.app.inject({ method: 'DELETE', url: '/api/v1/voicemails/m3', headers: off.as('bob') })).statusCode).toBe(204)
     await until("Bob's row gone", async () => !(await store.listTranscripts('A', 'bob', undefined, true)).length)
@@ -487,8 +515,8 @@ describe('the transcription of the messages and the notices in Chat (step 11b)',
     await off.app.close()
   })
 
-  it('catches up the messages it did not hear while another Gateway held the lease, and erases one deleted meanwhile', async () => {
-    const { app, store, boxes, hs, transcriptOf, rowOf } = await setup()
+  it('catches up the messages it did not hear while another Gateway held the lease, and erases one deleted meanwhile once two reads apart confirm it', async () => {
+    const { app, store, boxes, hs, transcriptOf, rowOf } = await setup({ reconcileMs: 50, orphanMs: 1_000 })
     boxes.leave('102', message('m0'))
     await until("m0's notice", () => hs.notices().length === 1)
     // Another Gateway holds the lease a moment (a restart, a lease in transit): what is said meanwhile is not heard here.
@@ -503,6 +531,9 @@ describe('the transcription of the messages and the notices in Chat (step 11b)',
     expect(await rowOf('jean', 'm0')).toMatchObject({ notice: 'sent' })
     // The lease back: the mailboxes reconciled with the table.
     await until('m1 transcribed', async () => (await transcriptOf('jean', 'm1'))?.status === 'done', 5_000)
+    await until("m1's notice", () => hs.notices().length === 2, 5_000)
+    // Its absence read once: m0 kept a while, its notice too.
+    expect(await rowOf('jean', 'm0')).toBeDefined()
     await until("m1's notice, m0's withdrawn", () => hs.notices().length === 1 && String(hs.notices()[0]!.content[NOTICE_FIELD]) === noticeKey('A', { holder: 'jean', messageId: 'm1' }), 5_000)
     await until("m0's row gone", async () => !(await rowOf('jean', 'm0')))
     // Older than it catches up with: said so, never transcribed.
@@ -746,6 +777,34 @@ describe('the transcription of the messages and the notices in Chat (step 11b)',
     await second.app.close()
   })
 
+  it('sends a notice to an account with neither name nor avatar (a profile not found), and none to the bot itself (second review)', async () => {
+    const { app, store, boxes, hs, alerts } = await setup({ matrixIdOf: async (_t, userId) => (userId === 'bob' ? BOT : undefined) })
+    hs.noProfile.add(`@jean:${SERVER}`)
+    boxes.leave('102', message('m1'))
+    await until("Jean's notice", () => hs.notices().length === 1)
+    expect(hs.notices()[0]!.people).toContain(`@jean:${SERVER}`)
+    boxes.leave('103', message('b1'))
+    await until("none for Bob's", async () => (await store.listTranscripts('A', 'bob'))[0]?.notice === 'none')
+    expect(hs.calls.filter(c => c === 'POST createRoom')).toHaveLength(1)
+    expect(await alerts()).toContain('notice-no-account')
+    await app.close()
+  })
+
+  it('finds the room it made at its address, the homeserver saying it is taken while the address is not yet seen (second review)', async () => {
+    const logs: string[] = []
+    const { app, boxes, hs, rowOf } = await setup({ logs })
+    // The room made, its answer lost; then the address not yet seen (a replica late): the room in use at it is the one.
+    hs.lose('POST createRoom')
+    hs.state.lag = 2
+    boxes.leave('102', message('m1'))
+    await until('the notice', () => hs.notices().length === 1)
+    expect(hs.rooms.size).toBe(1)
+    expect(hs.calls.filter(c => c === 'POST createRoom')).toHaveLength(2)
+    expect((await rowOf('jean', 'm1'))!.noticeRoom).toBe([...hs.rooms.keys()][0])
+    expect(logs.filter(l => l.includes('voicemail notice not sent'))).toHaveLength(1)
+    await app.close()
+  })
+
   it('invites no more someone who turned the room down, leaves it once its notices are gone, and makes another room when someone else got in', async () => {
     const { app, store, boxes, hs, as } = await setup()
     boxes.leave('102', message('m1'))
@@ -763,6 +822,12 @@ describe('the transcription of the messages and the notices in Chat (step 11b)',
     expect((await app.inject({ method: 'DELETE', url: '/api/v1/voicemails/m1', headers: as('jean') })).statusCode).toBe(204)
     await until('the room left', () => hs.rooms.get(first!)!.members.get(BOT) === 'leave')
     expect(hs.aliases.size).toBe(0)
+    // His messages erased (his right): his refusal stays, still not invited again.
+    expect((await app.inject({ method: 'DELETE', url: '/api/v1/me/history', headers: as('jean') })).json()).toMatchObject({ voicemailErasure: 'asked' })
+    await until('his transcriptions gone', async () => !(await store.listTranscripts('A', 'jean', undefined, true)).length)
+    boxes.leave('102', message('m4'))
+    await until('no notice for m4', async () => (await store.listTranscripts('A', 'jean', ['m4']))[0]?.notice === 'none')
+    expect(hs.calls.filter(c => c === 'POST createRoom')).toHaveLength(1)
     // Someone else in Bob's room: another one, the first left once its notice goes.
     boxes.leave('103', message('b1'))
     await until("Bob's notice", () => hs.notices().length === 1)
@@ -808,13 +873,14 @@ describe('the transcription of the messages and the notices in Chat (step 11b)',
     expect((await app.inject({ method: 'DELETE', url: '/api/v1/voicemails/m2', headers: as('bob') })).statusCode).toBe(204)
     await until('both rows gone', async () => !(await rowOf('jean', 'm1')) && !(await rowOf('bob', 'm2')))
     expect(hs.calls.filter(c => c === 'PUT redact')).toHaveLength(2)
-    // A message transcribed, then gone before its notice (no event of it): none, at once, no alert.
+    // A message transcribed, then gone before its notice (no event of it): none sent, nothing counted, looked for
+    // again later (left to the reconciliation, which erases it once its absence is confirmed), no alert.
     boxes.leave('102', message('m5'))
     await until('m5 being transcribed', () => n === 3)
     boxes.remove('jean', 'm5')
     g.open()
-    await until('m5 settled', async () => (await rowOf('jean', 'm5'))?.notice === 'none')
-    expect((await rowOf('jean', 'm5'))!.noticeAttempts).toBe(0)
+    await until('m5 put off', async () => Date.parse((await rowOf('jean', 'm5'))?.noticeNextAt ?? '0') > Date.now() + 60_000)
+    expect(await rowOf('jean', 'm5')).toMatchObject({ status: 'done', notice: 'pending', noticeAttempts: 0 })
     expect(await alerts()).not.toContain('notice-failed')
     expect(hs.events.size).toBe(1)
     await app.close()
@@ -888,18 +954,26 @@ describe('the transcription of the messages and the notices in Chat (step 11b)',
   })
 })
 
-/** VoicemailTranscripts on its own, its lease in the test's hands. */
-const unit = async (o: Partial<VoicemailTranscriptsOptions> & { transcribe?: TranscriptionProvider['transcribe']; hs?: ReturnType<typeof homeserver> } = {}) => {
+/** The extension of each holder of the tests of VoicemailTranscripts on its own. */
+const EXTENSION: Record<string, string> = { jean: '102', bob: '103' }
+
+/** VoicemailTranscripts on its own, its lease in the test's hands: Jean's mailbox, or those of `holders`. */
+const unit = async (o: Partial<VoicemailTranscriptsOptions> & { transcribe?: TranscriptionProvider['transcribe']; hs?: ReturnType<typeof homeserver>; queueMax?: number; holders?: string[] } = {}) => {
   const store = new MemoryStore()
   const taken = await store.takeWebhookLease('voicemail:A', 'gw_1', 60_000)
   const lease: FencedLease = { role: 'voicemail:A', holder: 'gw_1', generation: taken!.generation }
   const boxes = mailboxes()
-  await boxes.vm.syncMailboxes([{ extension: '102', userId: 'jean' }], { mayWrite: () => true })
+  const held = (o.holders ?? ['jean']).map(holder => ({ extension: EXTENSION[holder]!, holder }))
+  await boxes.vm.syncMailboxes(
+    held.map(b => ({ extension: b.extension, userId: b.holder })),
+    { mayWrite: () => true }
+  )
   const state = { held: true }
   const heardAudio: string[] = []
   const signals: AbortSignal[] = []
   const warnings: string[] = []
   const settled: string[] = []
+  const alerts: string[] = []
   const t = new VoicemailTranscripts(
     {
       store,
@@ -914,15 +988,15 @@ const unit = async (o: Partial<VoicemailTranscriptsOptions> & { transcribe?: Tra
           }
         },
         maxSec: 180,
-        queueMax: 100,
+        queueMax: o.queueMax ?? 100,
         maxBytes: 1_000_000
       },
       ...(o.hs ? { notices: { bot: new MatrixBot({ homeserverUrl: `https://${SERVER}`, token: TOKEN, fetch: o.hs.fetch }), userTemplate: `@{uid}:${SERVER}`, timeZone: 'UTC', matrixIdOf: async () => undefined } } : {}),
       lease: () => (state.held ? lease : undefined),
       holderIdFor: async (_t, userId) => userId,
-      mailboxes: async () => [{ extension: '102', holder: 'jean' }],
+      mailboxes: async () => held,
       onSettled: (_t, r) => void settled.push(r.messageId),
-      alert: async () => {},
+      alert: async (_t, param) => void alerts.push(param),
       log: { info: () => {}, warn: (_obj, msg) => void warnings.push(msg), error: () => {} },
       everyMs: 0,
       retryMs: [1, 1],
@@ -931,11 +1005,17 @@ const unit = async (o: Partial<VoicemailTranscriptsOptions> & { transcribe?: Tra
     },
     () => ['A']
   )
-  const add = async (id: string) => {
-    boxes.leave('102', message(id), true)
-    await t.heard('A', '102', 'jean', message(id))
+  const add = async (id: string, holder = 'jean') => {
+    boxes.leave(EXTENSION[holder]!, message(id), true)
+    await t.heard('A', EXTENSION[holder]!, holder, message(id))
   }
-  return { t, store, boxes, state, heardAudio, signals, warnings, settled, add, lease }
+  const rows = async (holder = 'jean') => (await store.listTranscripts('A', holder, undefined, true)).map(r => r.messageId).sort()
+  /** A reconciliation, and the rounds it starts. */
+  const reconcile = async () => {
+    await t.reconcile('A')
+    await t.settled('A')
+  }
+  return { t, store, boxes, state, heardAudio, signals, warnings, settled, alerts, add, rows, reconcile, lease }
 }
 
 describe('VoicemailTranscripts', () => {
@@ -1025,6 +1105,266 @@ describe('VoicemailTranscripts', () => {
     await u.t.settled('A')
     expect((await u.store.listTranscripts('A', 'jean', ['m2']))[0]!.status).toBe('done')
   })
+
+  it('suspends the notices too while the voicemail server does not answer: no try counted, sent once it answers', async () => {
+    const hs = homeserver()
+    const u = await unit({ hs, noticeRetryMs: [50, 50] })
+    // A first try fails (the homeserver): one counted.
+    hs.fail(500)
+    await u.add('m1')
+    await u.t.settled('A')
+    expect((await u.store.listTranscripts('A', 'jean', ['m1']))[0]).toMatchObject({ status: 'done', notice: 'pending', noticeAttempts: 1 })
+    u.boxes.state.down = true
+    for (let i = 0; i < 4; i++) {
+      await sleep(20)
+      u.t.kick('A', 'notice')
+      await u.t.settled('A')
+    }
+    expect((await u.store.listTranscripts('A', 'jean', ['m1']))[0]).toMatchObject({ notice: 'pending', noticeAttempts: 1 })
+    u.boxes.state.down = false
+    await sleep(20)
+    u.t.kick('A', 'notice')
+    await u.t.settled('A')
+    expect((await u.store.listTranscripts('A', 'jean', ['m1']))[0]!.notice).toBe('sent')
+    expect(hs.notices()).toHaveLength(1)
+  })
+
+  it('erases nothing, withdraws nothing and sends nothing twice while the voicemail server reads its mailboxes empty (its spool out of its sight), and tells the administrators (second review)', async () => {
+    const hs = homeserver()
+    const u = await unit({ hs, holders: ['jean', 'bob'], orphanConfirmMs: 1 })
+    await u.add('m1')
+    await u.add('m2')
+    await u.add('b1', 'bob')
+    await u.t.settled('A')
+    expect(hs.notices()).toHaveLength(3)
+    // wazo-calld no longer sees the spool: every mailbox read empty, without an error.
+    u.boxes.state.blind = true
+    // A message heard meanwhile: neither it nor its recording found, its row kept, looked for again later.
+    await u.add('m3')
+    for (let i = 0; i < 3; i++) {
+      await sleep(5)
+      await u.reconcile()
+    }
+    expect(await u.rows()).toEqual(['m1', 'm2', 'm3'])
+    expect(await u.rows('bob')).toEqual(['b1'])
+    expect(hs.notices()).toHaveLength(3)
+    expect(hs.calls).not.toContain('PUT redact')
+    expect(u.alerts).toContain('transcription-held')
+    const m3 = (await u.store.listTranscripts('A', 'jean', ['m3']))[0]!
+    expect(m3).toMatchObject({ status: 'pending', attempts: 0, notice: 'pending' })
+    expect(Date.parse(m3.nextAt)).toBeGreaterThan(Date.now() + 60_000)
+    // The spool seen again: every message known, none written down nor told twice.
+    u.boxes.state.blind = false
+    await u.reconcile()
+    u.t.kick('A')
+    await u.t.settled('A')
+    expect(await u.rows()).toEqual(['m1', 'm2', 'm3'])
+    expect(hs.notices()).toHaveLength(3)
+    expect(hs.sentTxns).toHaveLength(3)
+    // One message in one mailbox, read empty: held all the same.
+    const one = await unit({ hs: homeserver(), orphanConfirmMs: 1 })
+    await one.add('m1')
+    await one.t.settled('A')
+    one.boxes.state.blind = true
+    for (let i = 0; i < 3; i++) {
+      await sleep(5)
+      await one.reconcile()
+    }
+    expect(await one.rows()).toEqual(['m1'])
+    expect(one.alerts).toContain('transcription-held')
+    // One mailbox of two messages read empty, the others read: held too, however few of the organisation's they are.
+    const box = await unit({ hs: homeserver(), holders: ['jean', 'bob'], orphanConfirmMs: 1 })
+    await box.add('m1')
+    await box.add('m2')
+    for (const id of ['b1', 'b2', 'b3', 'b4', 'b5']) await box.add(id, 'bob')
+    await box.t.settled('A')
+    box.boxes.state.blindTo.add('jean')
+    for (let i = 0; i < 3; i++) {
+      await sleep(5)
+      await box.reconcile()
+    }
+    expect(await box.rows()).toEqual(['m1', 'm2'])
+    expect(box.alerts).toContain('transcription-held')
+  })
+
+  it("erases the row of a message gone (its event missed) only once two reads apart do not see it, and none when too many went at once (second review)", async () => {
+    const hs = homeserver()
+    const u = await unit({ hs, orphanConfirmMs: 100 })
+    for (const id of ['m1', 'm2', 'm3', 'm4', 'm5', 'm6', 'm7']) await u.add(id)
+    await u.t.settled('A')
+    expect(hs.notices()).toHaveLength(7)
+    // Gone, read once: kept.
+    u.boxes.remove('jean', 'm1')
+    await u.reconcile()
+    expect(await u.rows()).toHaveLength(7)
+    await sleep(60)
+    await u.reconcile()
+    expect(await u.rows()).toHaveLength(7)
+    // Still not there past the wait: erased, its notice withdrawn.
+    await sleep(60)
+    await u.reconcile()
+    expect(await u.rows()).toEqual(['m2', 'm3', 'm4', 'm5', 'm6', 'm7'])
+    expect(hs.notices()).toHaveLength(6)
+    // Not seen, then seen again: counted from scratch.
+    u.boxes.remove('jean', 'm2')
+    await u.reconcile()
+    u.boxes.boxes.get('jean')!.push(message('m2'))
+    await sleep(120)
+    await u.reconcile()
+    u.boxes.remove('jean', 'm2')
+    await u.reconcile()
+    expect(await u.rows()).toContain('m2')
+    await sleep(120)
+    await u.reconcile()
+    expect(await u.rows()).toEqual(['m3', 'm4', 'm5', 'm6', 'm7'])
+    expect(u.alerts).not.toContain('transcription-held')
+    // Three of five gone at once: held, nothing erased however long, the administrators told.
+    for (const id of ['m3', 'm4', 'm5']) u.boxes.remove('jean', id)
+    for (let i = 0; i < 3; i++) {
+      await u.reconcile()
+      await sleep(120)
+    }
+    expect(await u.rows()).toEqual(['m3', 'm4', 'm5', 'm6', 'm7'])
+    expect(hs.notices()).toHaveLength(5)
+    expect(u.alerts).toContain('transcription-held')
+  })
+
+  it('reconciles the other mailboxes when one cannot be read, tells a backlog all the same, and tells the administrators of one that stays unreadable (second review)', async () => {
+    const u = await unit({ holders: ['jean', 'bob'], backlogMs: 1 })
+    await u.add('m1')
+    await u.t.settled('A')
+    u.boxes.state.failing.add('jean')
+    // Its message not read: its transcription waits.
+    await u.add('m2')
+    // Bob's, its event missed.
+    u.boxes.leave('103', message('b1'), true)
+    await sleep(5)
+    await u.reconcile()
+    expect((await u.store.listTranscripts('A', 'bob')).map(r => [r.messageId, r.status])).toEqual([['b1', 'done']])
+    expect(await u.rows()).toEqual(['m1', 'm2'])
+    expect(u.alerts).toContain('transcription-backlog')
+    expect(u.alerts).not.toContain('transcription-unreadable')
+    await u.reconcile()
+    expect(u.alerts).not.toContain('transcription-unreadable')
+    await u.reconcile()
+    expect(u.alerts.filter(a => a === 'transcription-unreadable')).toHaveLength(1)
+    // Read again: counted from scratch.
+    u.boxes.state.failing.delete('jean')
+    await u.reconcile()
+    u.boxes.state.failing.add('jean')
+    await u.reconcile()
+    await u.reconcile()
+    expect(u.alerts.filter(a => a === 'transcription-unreadable')).toHaveLength(1)
+    // Not one read (the voicemail server out): not a mailbox's trouble, no such alert.
+    const all = await unit({ holders: ['jean', 'bob'] })
+    all.boxes.state.failing.add('jean')
+    all.boxes.state.failing.add('bob')
+    for (let i = 0; i < 4; i++) await all.reconcile()
+    expect(all.alerts).not.toContain('transcription-unreadable')
+  })
+
+  it('reads no further mailbox once the lease is lost', async () => {
+    const u = await unit({ holders: ['jean', 'bob'] })
+    const list = u.boxes.vm.listMessages.bind(u.boxes.vm)
+    u.boxes.vm.listMessages = async o => {
+      u.state.held = false
+      return list(o)
+    }
+    await u.t.reconcile('A')
+    expect(u.boxes.state.lists).toBe(1)
+  })
+
+  it('leaves a message missed for a later reconciliation while too many wait, neither written down nor said busy', async () => {
+    const g = gate()
+    const u = await unit({ queueMax: 1, transcribe: async () => {
+      await g.closed
+      return { text: SAID }
+    } })
+    await u.add('m1')
+    u.boxes.leave('102', message('m2'), true)
+    await u.t.reconcile('A')
+    expect(await u.rows()).toEqual(['m1'])
+    expect(u.alerts).not.toContain('transcription-busy')
+    g.open()
+    await u.t.settled('A')
+    await u.reconcile()
+    expect((await u.store.listTranscripts('A', 'jean')).map(r => [r.messageId, r.status])).toEqual([['m1', 'done'], ['m2', 'done']])
+  })
+
+  it('completes a notice sent before its transcription with it (a replacement), and withdraws both', async () => {
+    const hs = homeserver()
+    const g = gate()
+    const u = await unit({ hs, everyMs: 20, noticeWaitMs: 50, transcribe: async () => {
+      await g.closed
+      return { text: SAID }
+    } })
+    u.t.start()
+    await u.add('m1')
+    await until('the notice without its text', () => hs.notices().length === 1, 2_000)
+    expect(String(hs.notices()[0]!.content.body)).toContain('pas encore prête')
+    expect((await u.store.listTranscripts('A', 'jean', ['m1']))[0]!.notice).toBe('early')
+    g.open()
+    await until('completed', async () => (await u.store.listTranscripts('A', 'jean', ['m1']))[0]?.notice === 'sent', 2_000)
+    const r = (await u.store.listTranscripts('A', 'jean', ['m1']))[0]!
+    const edit = hs.events.get(r.noticeEdit!)!
+    expect(edit.content).toMatchObject({ 'm.relates_to': { rel_type: 'm.replace', event_id: r.noticeEvent } })
+    expect(String((edit.content['m.new_content'] as { body: string }).body)).toContain(`« ${SAID} »`)
+    expect(String(edit.content.body)).toMatch(/^\* /)
+    expect(hs.events.size).toBe(2)
+    await u.t.erase('A', 'jean')
+    await until('both withdrawn', () => hs.notices().length === 0)
+    expect(hs.events.get(r.noticeEvent!)!.redacted && hs.events.get(r.noticeEdit!)!.redacted).toBe(true)
+    await u.t.stop()
+  })
+
+  it('withdraws at once a notice whose message was erased while it was sent, and its replacement too (second review)', async () => {
+    const hs = homeserver()
+    let erase: (() => Promise<void>) | undefined
+    const fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const now = erase
+      if (now && (input instanceof Request ? input.url : String(input)).includes('/send/')) {
+        erase = undefined
+        await now()
+      }
+      return hs.fetch(input, init)
+    }) as typeof globalThis.fetch
+    const u = await unit({ hs: { ...hs, fetch } })
+    erase = () => u.t.deleted('A', 'jean', 'm1')
+    await u.add('m1')
+    await u.t.settled('A')
+    expect(await u.rows()).toEqual([])
+    expect(hs.events.size).toBe(1)
+    expect(hs.notices()).toHaveLength(0)
+    // A replacement sent while its message was erased: withdrawn too.
+    const g = gate()
+    const w = await unit({ hs: { ...hs, fetch }, everyMs: 20, noticeWaitMs: 30, transcribe: async () => {
+      await g.closed
+      return { text: SAID }
+    } })
+    w.t.start()
+    await w.add('m2')
+    await until('the notice without its text', () => hs.notices().length === 1, 2_000)
+    erase = () => w.t.deleted('A', 'jean', 'm2')
+    g.open()
+    await until('both withdrawn', async () => hs.events.size === 3 && hs.notices().length === 0 && !(await w.rows()).length, 2_000)
+    await w.t.stop()
+    // Its row gone altogether meanwhile (nothing left to withdraw it by): the replacement withdrawn at once.
+    const h = gate()
+    const x = await unit({ hs: { ...hs, fetch }, everyMs: 20, noticeWaitMs: 30, transcribe: async () => {
+      await h.closed
+      return { text: SAID }
+    } })
+    x.t.start()
+    await x.add('m3')
+    await until('the notice without its text', () => hs.notices().length === 1, 2_000)
+    erase = async () => void (await x.store.deleteTranscript('A', 'jean', 'm3', x.lease))
+    h.open()
+    await until('the replacement sent', () => hs.events.size === 5, 2_000)
+    const replacement = [...hs.events.values()].at(-1)!
+    expect(replacement.content['m.relates_to']).toBeDefined()
+    await until('the replacement withdrawn', () => replacement.redacted, 2_000)
+    await x.t.stop()
+  })
 })
 
 describe('TranscriptWatcher', () => {
@@ -1091,6 +1431,9 @@ describe('the bot (MatrixBot)', () => {
     hs.noAccount.add(`@nobody:${SERVER}`)
     expect(await bot.exists(`@jean:${SERVER}`)).toBe(true)
     expect(await bot.exists(`@nobody:${SERVER}`)).toBe(false)
+    // An account with neither name nor avatar: Synapse says its profile is not found, not that there is no account.
+    hs.noProfile.add(`@quiet:${SERVER}`)
+    expect(await bot.exists(`@quiet:${SERVER}`)).toBeUndefined()
     const room = await bot.createDirectRoom(`@jean:${SERVER}`, 'n', 't', 'twakephone-abc')
     expect(await bot.resolveAlias('twakephone-abc')).toBe(room)
     await expect(bot.createDirectRoom(`@jean:${SERVER}`, 'n', 't', 'twakephone-abc')).rejects.toMatchObject({ errcode: 'M_ROOM_IN_USE' })
@@ -1106,6 +1449,25 @@ describe('the bot (MatrixBot)', () => {
     const stop = new AbortController()
     stop.abort()
     await expect(new MatrixBot({ homeserverUrl: `https://${SERVER}`, token: TOKEN, fetch: hs.fetch }).whoami(stop.signal)).rejects.toThrow(/stopped/)
+  })
+
+  it('finds a notice sent before among more long messages than one answer holds, page by page, back to its bound (second review)', async () => {
+    const hs = homeserver()
+    const bot = new MatrixBot({ homeserverUrl: `https://${SERVER}`, token: TOKEN, fetch: hs.fetch })
+    const room = await bot.createDirectRoom(`@jean:${SERVER}`, 'n', 't', 'twakephone-pages')
+    const long = 'x'.repeat(20_000)
+    const first = await bot.send(room, 'txn0', { body: long, [NOTICE_FIELD]: 'k0' })
+    for (let i = 1; i < 30; i++) await bot.send(room, `txn${i}`, { body: long, [NOTICE_FIELD]: `k${i}` })
+    // 30 notices of 20 kB: more than one answer of 256 kB.
+    const asked = hs.calls.filter(c => c === 'GET messages').length
+    expect(await bot.findSent(room, NOTICE_FIELD, 'k0')).toBe(first)
+    expect(hs.calls.filter(c => c === 'GET messages').length - asked).toBe(3)
+    expect(await bot.findSent(room, NOTICE_FIELD, 'k29')).toBe([...hs.events.keys()].at(-1))
+    // Past its fiftieth: not looked for any further.
+    for (let i = 30; i < 60; i++) await bot.send(room, `txn${i}`, { body: 'x', [NOTICE_FIELD]: `k${i}` })
+    const before = hs.calls.filter(c => c === 'GET messages').length
+    expect(await bot.findSent(room, NOTICE_FIELD, 'k0')).toBeUndefined()
+    expect(hs.calls.filter(c => c === 'GET messages').length - before).toBe(5)
   })
 
   it('refuses an answer too large, and one that is not JSON', async () => {
@@ -1128,14 +1490,14 @@ describe('the bot (MatrixBot)', () => {
 
 describe('the notice of a message', () => {
   it('says who called (the name they gave as theirs), when in the time zone given, how long, what they said, and links to the Messagerie vocale; escaped in HTML', () => {
-    const v = message('m1', { fromName: 'Alice <b>&</b>', from: '0612345678', receivedAt: '2026-10-18T08:05:00.000Z', durationSec: 75 })
+    const v = message('m1', { fromName: 'Alice & <b>Fils</b>', from: '0612345678', receivedAt: '2026-10-18T08:05:00.000Z', durationSec: 75 })
     const c = noticeContent(v, { status: 'done', text: 'Rappelle <moi>' }, { appUrl: 'https://phone.example.test', timeZone: 'Europe/Paris' }, 'k1')
-    expect(c.body).toBe("Nouveau message vocal du 0612345678 (nom annoncé par l'appelant : « Alice <b>&</b> »), le 18 octobre 2026 à 10:05, durée 1:15.\nTranscription : « Rappelle <moi> »\nÉcouter dans TwakePhone : https://phone.example.test/voicemail")
+    expect(c.body).toBe("Nouveau message vocal du 0612345678 (nom annoncé par l'appelant : « Alice & b Fils b »), le 18 octobre 2026 à 10:05, durée 1:15.\nTranscription : « Rappelle <moi> »\nÉcouter dans TwakePhone : https://phone.example.test/voicemail")
     expect(c[NOTICE_FIELD]).toBe('k1')
-    expect(c.formatted_body).toContain('Alice &lt;b&gt;&amp;&lt;/b&gt;')
+    expect(c.formatted_body).toContain('Alice &amp; b Fils b')
     expect(c.formatted_body).toContain('<blockquote>Rappelle &lt;moi&gt;</blockquote>')
     expect(c.formatted_body).not.toContain('<moi>')
-    expect(noticeContent(v, { status: 'done', text: '' }, { timeZone: 'UTC' }).body).toBe("Nouveau message vocal du 0612345678 (nom annoncé par l'appelant : « Alice <b>&</b> »), le 18 octobre 2026 à 08:05, durée 1:15.\nTranscription : aucune parole reconnue.")
+    expect(noticeContent(v, { status: 'done', text: '' }, { timeZone: 'UTC' }).body).toBe("Nouveau message vocal du 0612345678 (nom annoncé par l'appelant : « Alice & b Fils b »), le 18 octobre 2026 à 08:05, durée 1:15.\nTranscription : aucune parole reconnue.")
     expect(noticeContent(message('m2', { from: undefined, fromName: undefined }), { status: 'none' }, { timeZone: 'UTC' }).body).toMatch(/^Nouveau message vocal d'un numéro masqué,/)
     // Without the text: neither what was said, nor that it is on its way; why there is none still said.
     const bare = noticeContent(v, { status: 'done', text: 'Rappelle-moi' }, { appUrl: 'https://phone.example.test', timeZone: 'UTC', withText: false })
@@ -1145,8 +1507,13 @@ describe('the notice of a message', () => {
     expect(noticeContent(v, { status: 'none', reason: 'busy' }, { timeZone: 'UTC', withText: false }).body).toContain('Pas de transcription')
   })
 
-  it('takes out of the name a caller gave what changes how a text reads', () => {
+  it('takes out of the name a caller gave what changes how a text reads, and any address a client would make a link of', () => {
     expect(callerName('‮Service informatique​')).toBe('Service informatique')
+    expect(callerName('Banque https://pay.example.test/x')).toBe('Banque https pay example test x')
+    expect(callerName('www.example.test')).toBe('www example test')
+    expect(callerName('support@example.test')).toBe('support example test')
+    expect(callerName("Jean-Luc O'Brien, Dupont & Fils (SAV)")).toBe("Jean-Luc O'Brien, Dupont & Fils (SAV)")
+    expect(callerName('Élodie Müller 2')).toBe('Élodie Müller 2')
     expect(callerName('Alice⁦ ⁩Martin\nIT')).toBe('Alice Martin IT')
     expect(callerName('​‮')).toBeUndefined()
     expect(callerName(undefined)).toBeUndefined()

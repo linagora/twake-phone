@@ -1,5 +1,5 @@
 import type { OperatorCdr } from '@twake/telephony-types'
-import { clampLimit, isDeclined, isMissed, type HistoryEntry, type HistoryNearQuery, type HistoryPage, type HistoryQuery, type OperatorCdrOutcome, type OperatorCdrRecord, type OperatorCdrStats, type ConferenceRecord, type AlertRecord, type AlertQuery, type DidRecord, type OutboundHand, type OutboundRecord, type OutboundRules, ALERT_DEDUP_MS, alertKey, type ProviderRecord, type StoredAlert, type PushSaveResult, type PushSubscriptionRecord, type Store, type TrunkRecord, type UserMapping, type UserPresenceRecord, type VapidKeysRecord, type ClaimedDelivery, type ErasedCall, type ErasedCallsKept, type WebhookAttemptResult, type WebhookClaimCaps, type WebhookClaimTime, allocateClaims, type WebhookDeliveryQuery, type WebhookLease, type WebhookSendQuota, type WebhookDeliveryRecord, type WebhookQueueOptions, type WebhookStateChange, type WebhookStateEvent, type WebhookSubscriptionRecord, WEBHOOK_STATE_ROLE, type FencedLease, type NewTranscript, type TranscriptChange, type TranscriptLane, type TranscriptMatch, type TranscriptRecord } from './types.js'
+import { clampLimit, isDeclined, isMissed, type HistoryEntry, type HistoryNearQuery, type HistoryPage, type HistoryQuery, type OperatorCdrOutcome, type OperatorCdrRecord, type OperatorCdrStats, type ConferenceRecord, type AlertRecord, type AlertQuery, type DidRecord, type OutboundHand, type OutboundRecord, type OutboundRules, ALERT_DEDUP_MS, alertKey, type ProviderRecord, type StoredAlert, type PushSaveResult, type PushSubscriptionRecord, type Store, type TrunkRecord, type UserMapping, type UserPresenceRecord, type VapidKeysRecord, type ClaimedDelivery, type ErasedCall, type ErasedCallsKept, type WebhookAttemptResult, type WebhookClaimCaps, type WebhookClaimTime, allocateClaims, type WebhookDeliveryQuery, type WebhookLease, type WebhookSendQuota, type WebhookDeliveryRecord, type WebhookQueueOptions, type WebhookStateChange, type WebhookStateEvent, type WebhookSubscriptionRecord, WEBHOOK_STATE_ROLE, type FencedLease, type NewTranscript, type TranscriptChange, type TranscriptLane, type TranscriptMatch, type TranscriptNotice, type TranscriptRecord } from './types.js'
 import type { WebhookEventType } from '@twake/telephony-types'
 import { randomBytes } from 'node:crypto'
 import { EMPTY_OUTBOUND, outboundVersion, staleOutbound } from '../outbound.js'
@@ -380,12 +380,13 @@ export class MemoryStore implements Store {
     return structuredClone(out)
   }
 
-  async addTranscript(record: NewTranscript, lease: FencedLease, maxPending: number) {
+  async addTranscript(record: NewTranscript, lease: FencedLease, maxPending: number, whenFull: 'busy' | 'wait' = 'busy') {
     if (!this.holds(lease)) return 'fenced' as const
     const k = `${record.tenantId}\u0000${record.holder}\u0000${record.messageId}`
     if (this.transcripts.has(k)) return 'exists' as const
     const pending = [...this.transcripts.values()].filter(t => t.tenantId === record.tenantId && t.status === 'pending').length
     const busy = record.status === 'pending' && pending >= maxPending
+    if (busy && whenFull === 'wait') return 'full' as const
     const at = this.transcriptStamp()
     const now = new Date(this.now()).toISOString()
     this.transcripts.set(k, {
@@ -408,9 +409,9 @@ export class MemoryStore implements Store {
     return busy ? ('busy' as const) : ('added' as const)
   }
 
-  async updateTranscript(tenantId: string, holder: string, messageId: string, change: TranscriptChange, lease: FencedLease) {
+  async updateTranscript(tenantId: string, holder: string, messageId: string, change: TranscriptChange, lease: FencedLease, ifNotice?: TranscriptNotice) {
     const r = this.transcripts.get(`${tenantId}\u0000${holder}\u0000${messageId}`)
-    if (!r || !this.holds(lease)) return false
+    if (!r || !this.holds(lease) || (ifNotice !== undefined && r.notice !== ifNotice)) return false
     for (const [k, v] of Object.entries(change)) if (v !== undefined) (r as unknown as Record<string, unknown>)[k] = v
     r.updatedAt = this.transcriptStamp()
     return true
@@ -451,7 +452,7 @@ export class MemoryStore implements Store {
     const due = (r: TranscriptRecord) =>
       lane === 'transcribe'
         ? r.status === 'pending' && Date.parse(r.nextAt) <= now
-        : Date.parse(r.noticeNextAt) <= now && (r.notice === 'redact' || (r.notice === 'pending' && (r.status !== 'pending' || (noticeWaitMs !== undefined && Date.parse(r.createdAt) <= now - noticeWaitMs))))
+        : Date.parse(r.noticeNextAt) <= now && (r.notice === 'redact' || r.notice === 'edit' || (r.notice === 'pending' && (r.status !== 'pending' || (noticeWaitMs !== undefined && Date.parse(r.createdAt) <= now - noticeWaitMs))))
     return [...this.transcripts.values()]
       .filter(r => r.tenantId === tenantId && due(r))
       .sort((a, b) => (lane === 'notice' ? Number(b.notice === 'redact') - Number(a.notice === 'redact') : 0) || a.created - b.created)
@@ -460,7 +461,7 @@ export class MemoryStore implements Store {
   }
 
   async staleTranscripts(tenantId: string, before: string) {
-    return [...this.transcripts.values()].filter(r => r.tenantId === tenantId && Date.parse(r.createdAt) < Date.parse(before) && (r.status === 'pending' || r.notice === 'pending' || r.notice === 'redact')).length
+    return [...this.transcripts.values()].filter(r => r.tenantId === tenantId && Date.parse(r.createdAt) < Date.parse(before) && (r.status === 'pending' || r.notice === 'pending' || r.notice === 'edit' || r.notice === 'redact')).length
   }
 
   async transcriptsChangedSince(tenantId: string, since: string, limit: number) {

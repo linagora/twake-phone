@@ -3,7 +3,7 @@ import { readdir, readFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import pg from 'pg'
 import { EMPTY_OUTBOUND, outboundVersion, staleOutbound } from '../outbound.js'
-import { ALERT_DEDUP_MS, alertKey, clampLimit, type AlertQuery, type AlertRecord, type StoredAlert, type ConferenceRecord, type DidRecord, type OutboundHand, type OutboundRecord, type OutboundRules, type HistoryEntry, type HistoryNearQuery, type HistoryPage, type HistoryQuery, type OperatorCdrOutcome, type OperatorCdrRecord, type OperatorCdrStats, type MappingSource, type ErasedCallsKept, type ProviderRecord, type PushSaveResult, type PushSubscriptionRecord, type Store, type TrunkRecord, type UserMapping, type UserPresenceRecord, type VapidKeysRecord, type ClaimedDelivery, type WebhookAttemptResult, type WebhookClaimCaps, type WebhookClaimTime, allocateClaims, claimOrder, type WebhookDeliveryQuery, type WebhookLease, type WebhookSendQuota, type WebhookDeliveryRecord, type WebhookHealth, type WebhookQueueOptions, type WebhookStateChange, type WebhookStateEvent, type WebhookSubscriptionRecord, WEBHOOK_STATE_ROLE , type FencedLease, type NewTranscript, type TranscriptChange, type TranscriptLane, holderIn, holderOut, type TranscriptMatch, type TranscriptRecord } from './types.js'
+import { ALERT_DEDUP_MS, alertKey, clampLimit, type AlertQuery, type AlertRecord, type StoredAlert, type ConferenceRecord, type DidRecord, type OutboundHand, type OutboundRecord, type OutboundRules, type HistoryEntry, type HistoryNearQuery, type HistoryPage, type HistoryQuery, type OperatorCdrOutcome, type OperatorCdrRecord, type OperatorCdrStats, type MappingSource, type ErasedCallsKept, type ProviderRecord, type PushSaveResult, type PushSubscriptionRecord, type Store, type TrunkRecord, type UserMapping, type UserPresenceRecord, type VapidKeysRecord, type ClaimedDelivery, type WebhookAttemptResult, type WebhookClaimCaps, type WebhookClaimTime, allocateClaims, claimOrder, type WebhookDeliveryQuery, type WebhookLease, type WebhookSendQuota, type WebhookDeliveryRecord, type WebhookHealth, type WebhookQueueOptions, type WebhookStateChange, type WebhookStateEvent, type WebhookSubscriptionRecord, WEBHOOK_STATE_ROLE , type FencedLease, type NewTranscript, type TranscriptChange, type TranscriptLane, holderIn, holderOut, type TranscriptMatch, type TranscriptNotice, type TranscriptRecord } from './types.js'
 import type { OperatorCdr, WebhookEventType } from '@twake/telephony-types'
 
 const MIGRATIONS = fileURLToPath(new URL('../../migrations/', import.meta.url))
@@ -110,6 +110,7 @@ interface TranscriptRow {
   notice_next_at: Timestamp
   notice_room: string | null
   notice_event: string | null
+  notice_edit: string | null
   created_at: Timestamp
   updated_at: Timestamp
 }
@@ -129,11 +130,12 @@ const transcriptOf = (r: TranscriptRow): TranscriptRecord => ({
   noticeNextAt: iso(r.notice_next_at),
   ...(r.notice_room ? { noticeRoom: r.notice_room } : {}),
   ...(r.notice_event ? { noticeEvent: r.notice_event } : {}),
+  ...(r.notice_edit ? { noticeEdit: r.notice_edit } : {}),
   createdAt: iso(r.created_at),
   updatedAt: iso(r.updated_at)
 })
 /** The columns a change of a transcription may set (updateTranscript). */
-const TRANSCRIPT_COLUMNS: Record<keyof TranscriptChange, string> = { status: 'status', reason: 'reason', text: 'text', attempts: 'attempts', nextAt: 'next_at', notice: 'notice', noticeAttempts: 'notice_attempts', noticeNextAt: 'notice_next_at', noticeRoom: 'notice_room', noticeEvent: 'notice_event' }
+const TRANSCRIPT_COLUMNS: Record<keyof TranscriptChange, string> = { status: 'status', reason: 'reason', text: 'text', attempts: 'attempts', nextAt: 'next_at', notice: 'notice', noticeAttempts: 'notice_attempts', noticeNextAt: 'notice_next_at', noticeRoom: 'notice_room', noticeEvent: 'notice_event', noticeEdit: 'notice_edit' }
 /** Whether the lease ($1 role, $2 holder, $3 generation) is held now within its write window: in the statement that writes. */
 const LEASE_HELD = 'EXISTS (SELECT 1 FROM webhook_leases WHERE role = $1 AND holder = $2 AND generation = $3 AND write_from <= clock_timestamp() AND write_until > clock_timestamp())'
 const deliveryOf = (r: DeliveryRow): WebhookDeliveryRecord => ({
@@ -647,7 +649,7 @@ export class PgStore implements Store {
     })
   }
 
-  async addTranscript(record: NewTranscript, lease: FencedLease, maxPending: number) {
+  async addTranscript(record: NewTranscript, lease: FencedLease, maxPending: number, whenFull: 'busy' | 'wait' = 'busy') {
     return this.inTransaction(async client => {
       // One writer of the tenant's queue at a time: the pending ones counted and the new one added together. The lease
       // checked in the statement that writes, once the lock is had (a long wait for it never writes under a lease gone).
@@ -657,6 +659,7 @@ export class PgStore implements Store {
       if (there.rowCount) return 'exists' as const
       const { rows } = await client.query<{ n: string }>("SELECT count(*) AS n FROM voicemail_transcripts WHERE tenant_id = $1 AND status = 'pending'", [record.tenantId])
       const busy = record.status === 'pending' && Number(rows[0]!.n) >= maxPending
+      if (busy && whenFull === 'wait') return 'full' as const
       const added = await client.query(
         `INSERT INTO voicemail_transcripts (tenant_id, holder, message_id, extension, received_at, status, reason, notice) SELECT $4, $5, $6, $7, $8::timestamptz, $9, $10, $11 WHERE ${LEASE_HELD}`,
         [lease.role, lease.holder, lease.generation, record.tenantId, holder, record.messageId, record.extension, record.receivedAt, busy ? 'none' : record.status, busy ? 'busy' : (record.reason ?? null), record.notice]
@@ -666,7 +669,7 @@ export class PgStore implements Store {
     })
   }
 
-  async updateTranscript(tenantId: string, holder: string, messageId: string, change: TranscriptChange, lease: FencedLease) {
+  async updateTranscript(tenantId: string, holder: string, messageId: string, change: TranscriptChange, lease: FencedLease, ifNotice?: TranscriptNotice) {
     const sets: string[] = []
     const args: unknown[] = [lease.role, lease.holder, lease.generation, tenantId, holderIn(holder), messageId]
     for (const [k, column] of Object.entries(TRANSCRIPT_COLUMNS) as [keyof TranscriptChange, string][]) {
@@ -675,8 +678,9 @@ export class PgStore implements Store {
       args.push(v)
       sets.push(`${column} = $${args.length}`)
     }
+    if (ifNotice !== undefined) args.push(ifNotice)
     const { rowCount } = await this.pool.query(
-      `UPDATE voicemail_transcripts SET ${[...sets, 'updated_at = clock_timestamp()'].join(', ')} WHERE tenant_id = $4 AND holder = $5 AND message_id = $6 AND ${LEASE_HELD}`,
+      `UPDATE voicemail_transcripts SET ${[...sets, 'updated_at = clock_timestamp()'].join(', ')} WHERE tenant_id = $4 AND holder = $5 AND message_id = $6${ifNotice !== undefined ? ` AND notice = $${args.length}` : ''} AND ${LEASE_HELD}`,
       args
     )
     return !!rowCount
@@ -723,7 +727,7 @@ export class PgStore implements Store {
       lane === 'transcribe'
         ? `SELECT * FROM voicemail_transcripts WHERE tenant_id = $1 AND status = 'pending' AND next_at <= clock_timestamp() ORDER BY created_at, message_id LIMIT $2`
         : `SELECT * FROM voicemail_transcripts WHERE tenant_id = $1 AND notice_next_at <= clock_timestamp()
-             AND (notice = 'redact' OR (notice = 'pending' AND (status <> 'pending' OR ($3::float8 IS NOT NULL AND created_at <= clock_timestamp() - make_interval(secs => $3::float8 / 1000)))))
+             AND (notice IN ('redact', 'edit') OR (notice = 'pending' AND (status <> 'pending' OR ($3::float8 IS NOT NULL AND created_at <= clock_timestamp() - make_interval(secs => $3::float8 / 1000)))))
            ORDER BY (notice = 'redact') DESC, created_at, message_id LIMIT $2`,
       lane === 'transcribe' ? [tenantId, Math.max(0, limit)] : [tenantId, Math.max(0, limit), noticeWaitMs ?? null]
     )
@@ -732,7 +736,7 @@ export class PgStore implements Store {
 
   async staleTranscripts(tenantId: string, before: string) {
     const { rows } = await this.pool.query<{ n: string }>(
-      "SELECT count(*) AS n FROM voicemail_transcripts WHERE tenant_id = $1 AND created_at < $2::timestamptz AND (status = 'pending' OR notice IN ('pending', 'redact'))",
+      "SELECT count(*) AS n FROM voicemail_transcripts WHERE tenant_id = $1 AND created_at < $2::timestamptz AND (status = 'pending' OR notice IN ('pending', 'edit', 'redact'))",
       [tenantId, before]
     )
     return Number(rows[0]!.n)

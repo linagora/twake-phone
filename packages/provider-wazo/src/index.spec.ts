@@ -16,9 +16,13 @@ afterEach(() => {
 })
 const fakeWazo = () => fakeWazoOf(numberOf)
 
-/** wazo-websocketd as it spoke on the Docker stack: init, then the subscriptions and start, then the events. */
+/**
+ * wazo-websocketd as it spoke on the Docker stack: init, then the subscriptions and start, then the events. `refusing`:
+ * each connection refused as Node's WebSocket tells it, an error and no close.
+ */
 const fakeSockets = () => {
   const sockets: (WebSocketLike & { url: string; sent: unknown[]; event(name: string, data: unknown): void; drop(code?: number): void })[] = []
+  const state = { refusing: false }
   const open = (url: string) => {
     const ws = {
       url,
@@ -43,10 +47,15 @@ const fakeSockets = () => {
       }
     }
     sockets.push(ws)
+    if (state.refusing) {
+      ws.close = () => undefined
+      queueMicrotask(() => (ws as WebSocketLike).onerror?.({}))
+      return ws
+    }
     queueMicrotask(() => ws.onmessage?.({ data: JSON.stringify({ op: 'init', code: 0, data: { version: 2 } }) }))
     return ws
   }
-  return { sockets, open }
+  return { sockets, open, state }
 }
 
 const make = (over: Partial<ConstructorParameters<typeof WazoVoicemail>[0]> = {}) => {
@@ -995,6 +1004,17 @@ describe('WazoVoicemail, the events', () => {
     await tick(20)
     expect(vm.getStatus()).toBe('CONNECTED')
     expect(heard).toBe(2)
+    // Refused a while (an error, no close): tried again all along, heard once it is let in.
+    ws.state.refusing = true
+    ws.sockets.at(-1)!.drop()
+    await tick(40)
+    const tried = ws.sockets.length
+    expect(tried).toBeGreaterThan(4)
+    expect(vm.getStatus()).toBe('DEGRADED')
+    ws.state.refusing = false
+    await tick(20)
+    expect(vm.getStatus()).toBe('CONNECTED')
+    expect(heard).toBe(3)
     // A Gateway whose callback fails still hears the events.
     const other = make()
     await other.vm.syncMailboxes([])

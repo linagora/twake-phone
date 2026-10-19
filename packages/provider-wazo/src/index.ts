@@ -1069,7 +1069,17 @@ export class WazoVoicemail implements VoicemailProvider {
     }
     this.ws = ws
     ws.onmessage = ev => this.onMessage(ws, ev.data)
-    ws.onerror = () => undefined
+    // A connection refused before it opened: Node's WebSocket tells an error and no close (or one much later).
+    ws.onerror = () => {
+      if (this.ws !== ws || this.wsOpen) return
+      this.ws = undefined
+      try {
+        ws.close()
+      } catch {
+        // Never opened.
+      }
+      this.reconnectLater()
+    }
     ws.onclose = ev => {
       if (this.ws !== ws) return
       const was = this.wsOpen

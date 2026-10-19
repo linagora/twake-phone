@@ -598,9 +598,11 @@ export interface FencedLease {
 export type TranscriptStatus = 'pending' | 'done' | 'none' | 'erased'
 /**
  * The bot's notice of the message in Chat: to send (`pending`), sent (`sent`, `noticeRoom` and `noticeEvent` say
- * where), none (`none`: no bot, no Matrix account, the message gone), to withdraw (`redact`, then the row goes).
+ * where), sent before its transcription (`early`: its text to come), to complete with it once settled (`edit`: a
+ * replacement, `noticeEdit` once sent), none (`none`: no bot, no Matrix account, the message gone), to withdraw
+ * (`redact`, the replacement with it, then the row goes).
  */
-export type TranscriptNotice = 'pending' | 'sent' | 'none' | 'redact'
+export type TranscriptNotice = 'pending' | 'sent' | 'early' | 'edit' | 'none' | 'redact'
 
 /**
  * A message of a mailbox the Gateway transcribes and tells the bot of (step 11b): by tenant, holder (the id the
@@ -625,6 +627,8 @@ export interface TranscriptRecord {
   noticeNextAt: string
   noticeRoom?: string
   noticeEvent?: string
+  /** The replacement of an `early` notice, with the transcription (an `m.replace` event): withdrawn with it. */
+  noticeEdit?: string
   /** On the store's clock: when it was written down, and when it last changed (the Gateways tell the change to the holder's screens). */
   createdAt: string
   updatedAt: string
@@ -658,7 +662,7 @@ export type NewTranscript = Pick<TranscriptRecord, 'tenantId' | 'holder' | 'mess
 }
 
 /** A change of a transcription (updateTranscript). */
-export type TranscriptChange = Partial<Pick<TranscriptRecord, 'status' | 'reason' | 'text' | 'attempts' | 'nextAt' | 'notice' | 'noticeAttempts' | 'noticeNextAt' | 'noticeRoom' | 'noticeEvent'>>
+export type TranscriptChange = Partial<Pick<TranscriptRecord, 'status' | 'reason' | 'text' | 'attempts' | 'nextAt' | 'notice' | 'noticeAttempts' | 'noticeNextAt' | 'noticeRoom' | 'noticeEvent' | 'noticeEdit'>>
 
 export interface Store {
   listProviders(): Promise<ProviderRecord[]>
@@ -750,9 +754,9 @@ export interface Store {
    * generation within its write window. A message already there is left as it is (`exists`); a `pending` one past
    * `maxPending` pending ones of the tenant is kept as `none`, `busy` (the answer says `busy`).
    */
-  addTranscript(record: NewTranscript, lease: FencedLease, maxPending: number): Promise<'added' | 'exists' | 'busy' | 'fenced'>
+  addTranscript(record: NewTranscript, lease: FencedLease, maxPending: number, whenFull?: 'busy' | 'wait'): Promise<'added' | 'exists' | 'busy' | 'full' | 'fenced'>
   /** Changes one; false when it is not there, or under a lease no longer held (nothing written). Dated on the store's clock. */
-  updateTranscript(tenantId: string, holder: string, messageId: string, change: TranscriptChange, lease: FencedLease): Promise<boolean>
+  updateTranscript(tenantId: string, holder: string, messageId: string, change: TranscriptChange, lease: FencedLease, ifNotice?: TranscriptNotice): Promise<boolean>
   /** Removes one (its notice withdrawn); false when it is not there, or under a lease no longer held. */
   deleteTranscript(tenantId: string, holder: string, messageId: string, lease: FencedLease): Promise<boolean>
   /**
