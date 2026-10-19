@@ -1301,6 +1301,8 @@ try {
       { id: 'lyon', name: 'Lyon', address: '2 place Bellecour, 69002 Lyon', trunkId: 'backup', number: '+33199000310', members: ['u-303'] }
     ]
     const from = (op, call) => header(call.invite, 'from')
+    // 302's first window was dropped by an earlier step: a new one registers.
+    const q302 = await phone('302')
     try {
       await tables.set([main, backup], dids, sites)
       // 301 (direct number +33199000301, in Paris): the number of Paris, at the first trunk.
@@ -1321,16 +1323,16 @@ try {
       expect('the number of Lyon', from(C, lyonAt).includes('<sip:+33199000310@backup.example>'), from(C, lyonAt))
       if (lyon.final.status === 200) await p303.hangup(lyon)
       // 302 is in no site: its direct number, as before.
-      const none = await p302.dial('112')
+      const none = await q302.dial('112')
       const noneAt = await atOperator(A, none)
       expect('302 keeps its direct number', from(A, noneAt).includes('<sip:+33199000302@operator.example>'), from(A, noneAt))
-      if (none.final.status === 200) await p302.hangup(none)
+      if (none.final.status === 200) await q302.hangup(none)
       // One site a person, and a site's trunk before the direct number's: 302 goes to Lyon, and calls from the backup.
       await tables.set([main, backup], dids, [sites[0], { ...sites[1], members: ['u-302', 'u-303'] }])
-      const moved = await p302.dial('112')
+      const moved = await q302.dial('112')
       const movedAt = await atOperator(C, moved)
       expect('302 in Lyon: at the backup', movedAt.invite.uri === 'sip:112@backup.example' && from(C, movedAt).includes('<sip:+33199000310@backup.example>'), `${movedAt.invite.uri} ${from(C, movedAt)}`)
-      if (moved.final.status === 200) await p302.hangup(moved)
+      if (moved.final.status === 200) await q302.hangup(moved)
       await tables.set([main, backup], dids, sites)
       // The default trunk is read again every 15 s, with the sites on it: once read, the database may not answer.
       await sleep(16_000)
