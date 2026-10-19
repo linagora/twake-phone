@@ -312,7 +312,20 @@ export class PgStore implements Store {
   }
 
   async upsertMapping(m: UserMapping) {
-    await this.inTransaction(client => this.upsertMappingIn(client, m))
+    await this.inTransaction(async client => {
+      await this.upsertMappingIn(client, m)
+      await this.stampNumberChanges(client, m.tenantId)
+    })
+  }
+
+  /**
+   * The rows of `number_changes` a change of mappings writes are dated 'infinity' until this, just before its COMMIT:
+   * now() would be the time of its BEGIN, and a call of the operator that started while it ran (waiting on locks
+   * perhaps) would pass for one after the change, in the history of whom the extension rings now. Rows of other
+   * transactions not committed yet are not seen; committed, they carry their own time.
+   */
+  private async stampNumberChanges(client: pg.PoolClient, tenantId: string) {
+    await client.query("UPDATE number_changes SET changed_at = clock_timestamp() WHERE tenant_id = $1 AND kind = 'extension' AND changed_at = 'infinity'", [tenantId])
   }
 
   private async upsertMappingIn(client: pg.PoolClient, m: UserMapping) {
@@ -326,10 +339,11 @@ export class PgStore implements Store {
     const before = rows[0]?.extension
     if (before === m.extension) return
     // The extension it had changes hands (second review 10b, n°3); the one it takes too, when someone held it lately.
-    if (before !== undefined) await client.query("INSERT INTO number_changes (tenant_id, kind, first_number, last_number) VALUES ($1, 'extension', $2, $2)", [m.tenantId, before])
+    // Dated at the COMMIT (stampNumberChanges).
+    if (before !== undefined) await client.query("INSERT INTO number_changes (tenant_id, kind, first_number, last_number, changed_at) VALUES ($1, 'extension', $2, $2, 'infinity')", [m.tenantId, before])
     await client.query(
-      `INSERT INTO number_changes (tenant_id, kind, first_number, last_number)
-       SELECT $1, 'extension', $2, $2 WHERE EXISTS (SELECT 1 FROM number_changes WHERE tenant_id = $1 AND kind = 'extension' AND first_number = $2)`,
+      `INSERT INTO number_changes (tenant_id, kind, first_number, last_number, changed_at)
+       SELECT $1, 'extension', $2, $2, 'infinity' WHERE EXISTS (SELECT 1 FROM number_changes WHERE tenant_id = $1 AND kind = 'extension' AND first_number = $2)`,
       [m.tenantId, m.extension]
     )
   }
@@ -351,6 +365,7 @@ export class PgStore implements Store {
           failed.push({ userId: m.userId, err })
         }
       }
+      await this.stampNumberChanges(client, tenantId)
       return { failed }
     })
   }
@@ -361,14 +376,18 @@ export class PgStore implements Store {
   }
 
   async deleteMapping(tenantId: string, userId: string, opts: { left?: boolean } = {}) {
-    await this.inTransaction(client => this.deleteMappingIn(client, tenantId, userId, opts))
+    await this.inTransaction(async client => {
+      await this.deleteMappingIn(client, tenantId, userId, opts)
+      await this.stampNumberChanges(client, tenantId)
+    })
   }
 
   private async deleteMappingIn(client: pg.PoolClient, tenantId: string, userId: string, opts: { left?: boolean }) {
     // What was told of their presence goes with them (it is kept otherwise, whatever its age).
     // Its extension changes hands (second review 10b, n°3).
+    // Dated at the COMMIT (stampNumberChanges).
     await client.query(
-      "INSERT INTO number_changes (tenant_id, kind, first_number, last_number) SELECT tenant_id, 'extension', extension, extension FROM user_mappings WHERE tenant_id = $1 AND user_id = $2",
+      "INSERT INTO number_changes (tenant_id, kind, first_number, last_number, changed_at) SELECT tenant_id, 'extension', extension, extension, 'infinity' FROM user_mappings WHERE tenant_id = $1 AND user_id = $2",
       [tenantId, userId]
     )
     await client.query('DELETE FROM user_mappings WHERE tenant_id = $1 AND user_id = $2', [tenantId, userId])

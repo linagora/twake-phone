@@ -566,8 +566,8 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     const { cfg } = render()
     const section = (name: string, next: string) => cfg.slice(cfg.indexOf(`\n${name} {`), cfg.indexOf(`\n${next} {`))
     const code = (text: string) => text.split('\n').map(l => l.trim()).filter(l => l && !l.startsWith('#'))
-    // onreply_route[rtp] works on the transaction's AVPs, under its reply lock; a request route resumed after a read
-    // (async) works on the same list, without that lock.
+    // onreply_route[rtp] works on the transaction's AVPs, under its reply lock; a request route works on the same list
+    // once the transaction exists (t_newtran), resumed after a read (async) or not, without that lock.
     expect(cfg).toContain('modparam("tm", "onreply_avp_mode", 1)')
     const ring = code(section('route[ring_now]', 'route[cancelled]'))
     const relay = ring.indexOf('route(relay_call);')
@@ -595,6 +595,113 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     const dead = section('route[group_dead]', 'route[group_woken]')
     expect(dead).toContain('if ($avp(g_wake_list) != NULL)\n\t\t$var(placed) = $avp(g_windows) - $avp(g_woken);\n\t$var(room) = 11 - $var(placed);')
     expect(code(section('route[group_hold]', 'route[group_wait]'))).toContain('route(group_wake);')
+  })
+
+  it('touches no AVP after a relay that sent, in any request route nor in those that called it, and holds a group without windows with a 180 (review of PR 27, n°3 and n°4)', () => {
+    const { cfg } = render()
+    // The request routes (route[...] and the main route), as their lines of code; failure, branch, reply and local
+    // routes run under the reply lock, or before the transaction's first send.
+    const routes = new Map<string, string[]>()
+    let current: string[] | undefined
+    for (const line of cfg.split('\n')) {
+      const start = /^(\w*route)(?:\[(\w+)\])? \{$/.exec(line)
+      if (!current && start) {
+        current = []
+        if (start[1] === 'route') routes.set(start[2] ?? '(main)', current)
+        continue
+      }
+      if (line === '}') current = undefined
+      else if (current) {
+        const l = line.trim()
+        if (l && !l.startsWith('#')) current.push(l)
+      }
+    }
+    expect([...routes.keys()]).toEqual(expect.arrayContaining(['(main)', 'ring', 'ring_loaded', 'ring_now', 'registered_meanwhile', 'relay_call', 'group_ring']))
+    const called = (l: string) => [...l.matchAll(/route\((\w+)[,)]/g)].map(m => m[1]!)
+    // What runs once the t_relay of line i sent: the forms of the cfg, a new one is to be added here.
+    const afterSent = (name: string, lines: string[], i: number): string[] | undefined => {
+      const l = lines[i]!
+      if (l === 'if (!t_relay()) {') {
+        let depth = 1
+        let j = i + 1
+        for (; depth > 0; j++) depth += (lines[j]!.endsWith('{') ? 1 : 0) - (lines[j]!.startsWith('}') ? 1 : 0)
+        return lines.slice(j)
+      }
+      if (l === 'if (!t_relay())') {
+        const rest = lines.slice(i + 2)
+        return rest[0] === 'if ($var(relay_rc) > 0)' ? [rest[1]!] : rest
+      }
+      if (l === 'if (t_relay())') return [lines[i + 1]!]
+      // The phony branch (route[past_dead_branches]): to a port nothing listens on, over a transport not served, it
+      // sends nothing.
+      if (l === 't_relay();' && lines[i - 1] === '$du = "sip:127.0.0.1:9;transport=sctp";') return undefined
+      if (l === 't_relay();') return lines.slice(i + 1)
+      throw new Error(`route[${name}]: t_relay in a form this test does not know: ${l}`)
+    }
+    // A route whose lines read or write no AVP, nor those of the routes it calls.
+    const avpFree = (name: string, seen = new Set<string>()): boolean => {
+      if (seen.has(name)) return true
+      seen.add(name)
+      const lines = routes.get(name) ?? []
+      return lines.every(l => !l.includes('avp(') && called(l).every(c => avpFree(c, seen)))
+    }
+    // The request routes that may come back to their caller after a relay that sent: what follows the call there
+    // runs while the windows' replies are handled.
+    const returning = new Set<string>()
+    const problems: string[] = []
+    for (let changed = true; changed; ) {
+      changed = false
+      problems.length = 0
+      for (const [name, lines] of routes) {
+        lines.forEach((l, i) => {
+          let tail: string[] | undefined
+          if (l.includes('t_relay(')) tail = afterSent(name, lines, i)
+          else if (called(l).some(c => returning.has(c))) tail = lines.slice(i + 1)
+          if (!tail) return
+          const rest = tail.filter(t => t !== '}')
+          if (rest[0] === 'exit;') return
+          rest.forEach((t, k) => {
+            if (t.includes('avp(')) problems.push(`route[${name}], after "${l}": ${t}`)
+            for (const c of called(t)) {
+              // Only when route[relay_call] sent nothing (3: someone to wake, 4: a group's members to wake).
+              if (/^if \(\$var\(relayed\) == [34]\)$/.test(rest[k - 1] ?? '')) continue
+              if (!avpFree(c)) problems.push(`route[${name}], after "${l}": route[${c}], which touches AVPs`)
+            }
+          })
+          if (!returning.has(name)) {
+            returning.add(name)
+            changed = true
+          }
+        })
+      }
+    }
+    expect(problems).toEqual([])
+    // Those that come back: each of their callers stops (exit), or is one of them.
+    expect([...returning].sort()).toEqual(['emergency_fallback', 'group_ring', 'registered_meanwhile', 'relay', 'relay_call', 'ring', 'ring_now'])
+    // route[relay_call] returns 3 and 4 only once its relay failed: nothing sent.
+    const relayCall = routes.get('relay_call')!
+    expect(relayCall.indexOf('return(1);')).toBeLessThan(relayCall.indexOf('return(3);'))
+    expect(relayCall.indexOf('if ($var(relay_rc) > 0)')).toBe(relayCall.indexOf('return(1);') - 1)
+    expect(routes.get('ring_now')).toContain('$var(relayed) = $rc;')
+    // The window that registered meanwhile rings: nothing but the end of the wait, and back to route[hold], which exits.
+    const meanwhile = routes.get('registered_meanwhile')!
+    expect(meanwhile.slice(-2)).toEqual(['t_wait_no_more_branches();', 'return(1);'])
+    const hold = routes.get('hold')!
+    expect(hold[hold.indexOf('if (route(registered_meanwhile))') + 1]).toBe('exit;')
+    // route[ring_loaded], route[group_ring]...: nothing but exit after route(ring) or route(ring_now).
+    for (const name of ['ring_loaded', 'names_next', 'names_loaded', 'wake_loaded', 'rules_step', 'group_loaded', 'did_fallback', 'relay_failed']) {
+      const lines = routes.get(name)!
+      const at = lines.findIndex(l => called(l).some(c => returning.has(c)))
+      expect([name, lines[at + 1]]).toEqual([name, 'exit;'])
+    }
+    // A group none of whose members has a window, held for them (route[group_hold]): it rings, and stops there. Back in
+    // route[ring_now] it would wake them again (twice the windows awaited: 480 for 603), then relay to the group's URI.
+    const groupHold = routes.get('group_hold')!
+    const wake = groupHold.indexOf('route(group_wake);')
+    expect(groupHold.slice(wake, wake + 5)).toEqual(['route(group_wake);', 'if ($var(windows) == $avp(g_woken)) {', 't_reply(180, "Ringing");', 'exit;', '}'])
+    expect(groupHold.indexOf('route(group_wake);')).toBe(groupHold.lastIndexOf('route(group_wake);'))
+    const ringNow = routes.get('ring_now')!
+    expect(ringNow.indexOf('route(group_hold);')).toBeLessThan(ringNow.indexOf('route(group_wake);'))
   })
 
   it('takes the no-answer forward when no window of the callee can be reached, else answers 477, a missed call either way', () => {

@@ -183,7 +183,8 @@ export class DirectorySync {
     const tick = () => {
       this.timer = setTimeout(tick, intervalMs)
       this.timer.unref()
-      void this.run()
+      // execute() reports its failures; this catches what would escape it, which would stop Node otherwise.
+      this.run().catch((err: unknown) => this.opts.log?.error({ err }, 'directory synchronisation failed'))
     }
     this.timer = setTimeout(tick, firstDelayMs)
     this.timer.unref()
@@ -280,7 +281,14 @@ export class DirectorySync {
       return finish()
     }
     const syncedAt = started.toISOString()
-    const previous = new Map((await store.listMappings(tenantId)).map(m => [m.userId, m]))
+    let previous: Map<string, UserMapping>
+    try {
+      previous = new Map((await store.listMappings(tenantId)).map(m => [m.userId, m]))
+    } catch (err) {
+      this.opts.log?.error({ err }, 'directory synchronisation: the mappings could not be read')
+      report.error = 'the mappings could not be read: nothing was changed (see the Gateway log)'
+      return finish()
+    }
     const synced = [...previous.values()].filter(m => m.source === 'ldap')
 
     // An empty listing is far more often a wrong filter or a reader without rights than an organisation with
@@ -386,7 +394,15 @@ export class DirectorySync {
     // meanwhile, sees all of it or none: never someone given another extension as gone (their mailbox set aside, the
     // voicemail server reloaded, then given back at its next round). Their erasure goes only when they left the
     // directory: given another extension, or none, it stays (until purged).
-    const { failed } = await store.applyMappings(tenantId, { remove: [...released].map(userId => ({ userId, left: !listed.has(userId) })), write: writes })
+    // Rejected (a deadlock twice in a row, the database lost), it changed nothing: the next run tries again.
+    let failed: { userId: string; err: unknown }[]
+    try {
+      failed = (await store.applyMappings(tenantId, { remove: [...released].map(userId => ({ userId, left: !listed.has(userId) })), write: writes })).failed
+    } catch (err) {
+      this.opts.log?.error({ err }, 'directory synchronisation: the mappings could not be written, nothing changed')
+      report.error = 'the mappings could not be written: nothing was changed (see the Gateway log)'
+      return finish()
+    }
     for (const userId of released) if (!wanted.has(userId)) report.removed++
     for (const next of writes) {
       const refused = failed.find(f => f.userId === next.userId)

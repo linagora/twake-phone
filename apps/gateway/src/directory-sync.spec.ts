@@ -172,6 +172,66 @@ describe('DirectorySync', () => {
     ])
   })
 
+  it('reports mappings that could not be written or read, changes nothing, and does it at the next run (review of PR 27, n°2)', async () => {
+    const people = [person('alice', 'Alice', '101'), person('bob', 'Bob', '102')]
+    const { store, directory, sync } = setup(people)
+    await sync.run()
+    const apply = store.applyMappings.bind(store)
+    store.applyMappings = async () => {
+      throw new Error('connection terminated')
+    }
+    directory.listAll = async () => [person('alice', 'Alice', '103')]
+    expect(await sync.run()).toMatchObject({ removed: 0, updated: 0, error: expect.stringMatching(/mappings could not be written: nothing was changed/) })
+    expect(sync.status()).toMatchObject({ running: false, last: { error: expect.stringMatching(/could not be written/) } })
+    expect((await store.listMappings('acme')).map(m => `${m.userId}:${m.extension}`)).toEqual(['alice:101', 'bob:102'])
+    const list = store.listMappings.bind(store)
+    store.applyMappings = apply
+    store.listMappings = async () => {
+      throw new Error('connection terminated')
+    }
+    expect(await sync.run()).toMatchObject({ removed: 0, updated: 0, error: expect.stringMatching(/mappings could not be read: nothing was changed/) })
+    store.listMappings = list
+    expect(await sync.run()).toMatchObject({ removed: 1, updated: 1, conflicts: [] })
+    expect((await store.listMappings('acme')).map(m => `${m.userId}:${m.extension}`)).toEqual(['alice:103'])
+  })
+
+  it('logs a scheduled run that rejects, and runs again at the next tick (review of PR 27, n°2)', async () => {
+    const errors: string[] = []
+    const store = new MemoryStore()
+    const sync = new DirectorySync({
+      store,
+      directory: new MemoryContactDirectory([person('alice', 'Alice', '101')]),
+      tenantId: 'acme',
+      log: { info: () => undefined, error: (_o, msg) => errors.push(msg) }
+    })
+    const run = sync.run.bind(sync)
+    let runs = 0
+    sync.run = () => (runs++ === 0 ? Promise.reject(new Error('out of the blue')) : run())
+    sync.start(15, 1)
+    for (let i = 0; i < 200 && !sync.status().last; i++) await new Promise(r => setTimeout(r, 5))
+    sync.stop()
+    expect(errors).toContain('directory synchronisation failed')
+    expect(sync.status().last).toMatchObject({ created: 1 })
+  })
+
+  it('counts a write the store refused as a conflict, never as made (review of PR 27, n°5)', async () => {
+    const { store, directory, sync } = setup([person('alice', 'Alice', '101'), person('bob', 'Bob', '102')])
+    await sync.run()
+    const apply = store.applyMappings.bind(store)
+    // Another Gateway wrote Bob's new extension meanwhile: his write is refused, Alice's and Carol's go.
+    store.applyMappings = async (tenantId, change) => {
+      const out = await apply(tenantId, { ...change, write: change.write.filter(m => m.userId !== 'bob') })
+      return { failed: [...out.failed, { userId: 'bob', err: new Error('duplicate key') }] }
+    }
+    directory.listAll = async () => [person('alice', 'Alice', '201'), person('bob', 'Bob', '202'), person('carol', 'Carol', '203')]
+    expect(await sync.run()).toMatchObject({ created: 1, updated: 1, removed: 0, conflicts: [{ userId: 'bob', extension: '202', heldBy: '?' }] })
+    // His row of before went with the removals, as in the PostgreSQL store: the next run writes it.
+    expect((await store.listMappings('acme')).map(m => `${m.userId}:${m.extension}`)).toEqual(['alice:201', 'carol:203'])
+    store.applyMappings = apply
+    expect(await sync.run()).toMatchObject({ created: 1, updated: 0, unchanged: 2, conflicts: [] })
+    expect(await store.getMappingByUser('acme', 'bob')).toMatchObject({ extension: '202' })
+  })
+
   it('keeps the erasure of a history of whom it gives another extension, or none, and forgets it of whom left (fourth review 10b, n°2)', async () => {
     const people = [person('alice', 'Alice Martin', '101'), person('bob', 'Bob Durand', '102'), person('dave', 'Dave', '104')]
     const { store, directory, sync } = setup(people)
@@ -541,6 +601,7 @@ if (process.env.TEST_DATABASE_URL) {
       people = [person('bob', 'Bob Durand-Petit', '102'), person('alice', 'Alice Martin', '103')]
       // Bob's row held by someone else a moment (another writer): the synchronisation waits on it, after Alice's row went.
       const lock = await admin.connect()
+      let mid: Date | undefined
       try {
         await lock.query('BEGIN')
         await lock.query(`SELECT 1 FROM ${SCHEMA}.user_mappings WHERE tenant_id = 'acme' AND user_id = 'bob' FOR UPDATE`)
@@ -555,6 +616,8 @@ if (process.env.TEST_DATABASE_URL) {
         // Read now, as the mailboxes are: Alice still there, at her extension of before.
         const seen = await mailboxes.listMappings('acme')
         expect(seen.map(m => `${m.userId}:${m.extension}`)).toEqual(['alice:101', 'bob:102'])
+        // A call of the operator to 101 starting now still rang Alice: her extension changes hands after it.
+        mid = (await admin.query<{ t: Date }>('SELECT clock_timestamp() AS t')).rows[0]!.t
         await lock.query('COMMIT')
         expect(await running).toMatchObject({ updated: 2, removed: 0, conflicts: [] })
       } finally {
@@ -562,6 +625,8 @@ if (process.env.TEST_DATABASE_URL) {
         lock.release()
       }
       expect((await mailboxes.listMappings('acme')).map(m => `${m.userId}:${m.extension}:${m.displayName}`)).toEqual(['alice:103:Alice Martin', 'bob:102:Bob Durand-Petit'])
+      // The change of hands dated at its COMMIT, not at its BEGIN.
+      expect(Date.parse((await mailboxes.numberChangedAt('acme', '101', '101'))!)).toBeGreaterThan(mid.getTime())
     })
   })
 }
