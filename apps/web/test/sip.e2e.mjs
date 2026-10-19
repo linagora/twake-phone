@@ -3106,6 +3106,8 @@ try {
       const r = (await gateway.inject({ method: 'GET', url: '/ready' })).json()
       return r.ready && !(r.reasons ?? []).some(x => x.startsWith('voicemail')) ? r : null
     }, { timeout: 45_000 })
+    // The reloads wazo-confd asked for the mailboxes just made are done before a call reaches one (wazo-sysconfd answers wazo-confd at once, as the real one, and Asterisk does not know a mailbox before its reload).
+    await sysconfdSettled()
     // The messages an interrupted run left in Jean's mailbox (his, kept: he still holds 102).
     jeanMailbox = await asPerson(jean)
     const caps = (await jeanMailbox('GET', '/capabilities')).json()
@@ -3847,6 +3849,7 @@ try {
       people.push(claire)
       await directorySync.run()
       await rowsAre({ 108: `${claires}@${context}` }, 'a mailbox for Claire at 108, at her number')
+      await sysconfdSettled()
       expectEqual(await wazoOf('cpetit'), { name: 'TwakePhone', user: 'TwakePhone' }, "Claire's mailbox and its user in Wazo: nothing of her")
       // Hers shows nothing of what was under 108: never at an extension's number.
       expectEqual(await wazo.listMessages({ userId: 'cpetit', extension: '108' }), [], "Claire's messages in her new mailbox")
