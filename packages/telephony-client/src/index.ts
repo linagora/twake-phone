@@ -1,9 +1,10 @@
-import type { Call, Capabilities, ConferenceParticipant, Contact, DialInConfiguration, DidRange, ForwardingRules, FraudRule, MediaSession, OperatorLineForwards, OutboundAssignment, OutboundCaps, OutboundPolicy, OutboundProfile, Presence, PresenceStatus, RingGroup, TelephonyAlert, TelephonyEvent, Trunk, TrunkInput, TrunkStatus, Voicemail, WebhookEventType } from '@twake/telephony-types'
+import type { Call, Capabilities, ConferenceParticipant, Contact, DialInConfiguration, DidRange, EmergencySite, ForwardingRules, FraudRule, MediaSession, OperatorLineForwards, OutboundAssignment, OutboundCaps, OutboundPolicy, OutboundProfile, Presence, PresenceStatus, RingGroup, TelephonyAlert, TelephonyEvent, Trunk, TrunkInput, TrunkStatus, Voicemail, WebhookEventType } from '@twake/telephony-types'
 
 export type {
   Contact,
   ContactNumber,
   DidRange,
+  EmergencySite,
   ForwardingRules,
   FraudRule,
   FraudThreshold,
@@ -486,6 +487,26 @@ export class TelephonyClient {
 
   async deleteDid(id: string) {
     await this.request<void>(`/admin/dids/${encodeURIComponent(id)}`, { method: 'DELETE' })
+  }
+
+  /** The sites of the organisation for its emergency calls (step 6c, ADR 0024). */
+  listSites() {
+    return this.request<{ items: EmergencySite[] }>('/admin/sites')
+  }
+
+  /** Creates or replaces a site, with its people: each is in one site, the one named last. */
+  setSite(site: EmergencySite) {
+    const { id, ...body } = site
+    return this.request<EmergencySite>(`/admin/sites/${encodeURIComponent(id)}`, { method: 'PUT', body: JSON.stringify(body) })
+  }
+
+  async deleteSite(id: string) {
+    await this.request<void>(`/admin/sites/${encodeURIComponent(id)}`, { method: 'DELETE' })
+  }
+
+  /** Where one's emergency calls leave from: the site one is in (none: the direct number, then the organisation's); `enabled` false without trunks. */
+  getEmergencySite() {
+    return this.request<{ enabled: boolean; site?: { name: string; address: string; number: string } }>('/me/emergency-site')
   }
 
   /** The rights profiles, who has which, the caps and thresholds, and their defaults. */

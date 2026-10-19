@@ -1,5 +1,5 @@
 import type { OperatorCdr } from '@twake/telephony-types'
-import { clampLimit, isDeclined, isMissed, type HistoryEntry, type HistoryNearQuery, type HistoryPage, type HistoryQuery, type OperatorCdrOutcome, type OperatorCdrRecord, type OperatorCdrStats, type ConferenceRecord, type AlertRecord, type AlertQuery, type DidRecord, type OutboundHand, type OutboundRecord, type OutboundRules, ALERT_DEDUP_MS, alertKey, type ProviderRecord, type StoredAlert, type PushSaveResult, type PushSubscriptionRecord, type Store, type TrunkRecord, type MappingChange, type UserMapping, type UserPresenceRecord, type VapidKeysRecord, type ClaimedDelivery, type ErasedCall, type ErasedCallsKept, type WebhookAttemptResult, type WebhookClaimCaps, type WebhookClaimTime, allocateClaims, type WebhookDeliveryQuery, type WebhookLease, type WebhookSendQuota, type WebhookDeliveryRecord, type WebhookQueueOptions, type WebhookStateChange, type WebhookStateEvent, type WebhookSubscriptionRecord, WEBHOOK_STATE_ROLE, type FencedLease, type NewTranscript, type TranscriptChange, type TranscriptLane, type TranscriptMatch, type TranscriptNotice, type TranscriptRecord } from './types.js'
+import { clampLimit, isDeclined, isMissed, type HistoryEntry, type HistoryNearQuery, type HistoryPage, type HistoryQuery, type OperatorCdrOutcome, type OperatorCdrRecord, type OperatorCdrStats, type ConferenceRecord, type AlertRecord, type AlertQuery, type DidRecord, type SiteRecord, type OutboundHand, type OutboundRecord, type OutboundRules, ALERT_DEDUP_MS, alertKey, type ProviderRecord, type StoredAlert, type PushSaveResult, type PushSubscriptionRecord, type Store, type TrunkRecord, type MappingChange, type UserMapping, type UserPresenceRecord, type VapidKeysRecord, type ClaimedDelivery, type ErasedCall, type ErasedCallsKept, type WebhookAttemptResult, type WebhookClaimCaps, type WebhookClaimTime, allocateClaims, type WebhookDeliveryQuery, type WebhookLease, type WebhookSendQuota, type WebhookDeliveryRecord, type WebhookQueueOptions, type WebhookStateChange, type WebhookStateEvent, type WebhookSubscriptionRecord, WEBHOOK_STATE_ROLE, type FencedLease, type NewTranscript, type TranscriptChange, type TranscriptLane, type TranscriptMatch, type TranscriptNotice, type TranscriptRecord } from './types.js'
 import type { WebhookEventType } from '@twake/telephony-types'
 import { randomBytes } from 'node:crypto'
 import { EMPTY_OUTBOUND, outboundVersion, staleOutbound } from '../outbound.js'
@@ -53,6 +53,7 @@ export class MemoryStore implements Store {
   private vapid: VapidKeysRecord | null = null
   private trunks: TrunkRecord[] = []
   private dids = new Map<string, DidRecord>()
+  private sites = new Map<string, SiteRecord>()
   private outbound = new Map<string, OutboundRecord>()
   private alerts: StoredAlert[] = []
   private alertId = 0
@@ -643,6 +644,7 @@ export class MemoryStore implements Store {
         this.changed(tenantId, 'did', d.first, d.last)
         this.dids.delete(k)
       }
+    for (const [k, x] of this.sites) if (x.tenantId === tenantId && x.trunkId === id) this.sites.delete(k)
     return this.trunks.length < before
   }
 
@@ -666,6 +668,20 @@ export class MemoryStore implements Store {
     const before = this.dids.get(key(tenantId, id))
     if (before) this.changed(tenantId, 'did', before.first, before.last)
     return this.dids.delete(key(tenantId, id))
+  }
+
+  async listSites(tenantId: string) {
+    return [...this.sites.values()].filter(x => x.tenantId === tenantId).sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)).map(x => structuredClone(x))
+  }
+
+  async upsertSite(record: SiteRecord) {
+    if (!this.trunks.some(t => t.tenantId === record.tenantId && t.id === record.trunkId)) throw new Error(`no trunk ${record.trunkId} in this tenant`)
+    for (const [k, x] of this.sites) if (x.tenantId === record.tenantId && x.id !== record.id) this.sites.set(k, { ...x, members: x.members.filter(m => !record.members.includes(m)) })
+    this.sites.set(key(record.tenantId, record.id), { ...structuredClone(record), members: [...new Set(record.members)].sort() })
+  }
+
+  async deleteSite(tenantId: string, id: string) {
+    return this.sites.delete(key(tenantId, id))
   }
 
   async getOutbound(tenantId: string) {

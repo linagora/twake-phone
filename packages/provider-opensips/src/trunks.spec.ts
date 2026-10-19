@@ -4,7 +4,7 @@ import pg from 'pg'
 import type { DidRange, Trunk } from '@twake/telephony-types'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { SUBSCRIBER_SCHEMA, SUBSCRIBER_SQL, type Queryable } from './subscriber.js'
-import { DEFAULT_TRUNK_SOCKET, SOURCES_SET, TRUNK_SCHEMA, TRUNK_SQL, TrunkTables, codecFlags, projectTrunks, trunkSecret, trunkStatusFrom } from './trunks.js'
+import { DEFAULT_TRUNK_SOCKET, SOURCES_SET, TRUNK_SCHEMA, TRUNK_SQL, TrunkTables, codecFlags, projectSites, projectTrunks, trunkSecret, trunkStatusFrom } from './trunks.js'
 
 // Fictional numbers only (ARCEP's ranges for fiction); the operator's names are reserved for documentation (RFC 2606).
 const OPERATOR: Trunk & { password: string } = {
@@ -31,6 +31,21 @@ describe('TRUNK_SQL', () => {
     expect(SUBSCRIBER_SCHEMA).toContain(TRUNK_SCHEMA.trim())
     expect(SUBSCRIBER_SQL).toContain('CREATE TABLE IF NOT EXISTS dids')
     expect(TRUNK_SQL).toContain("('dispatcher', 9), ('dialplan', 5), ('registrant', 3)")
+  })
+})
+
+describe('projectSites', () => {
+  const site = { id: 'paris', name: 'Paris', address: '1 rue de Rivoli', trunkId: 'operator', number: '+33199000101', members: ['u2', 'u1'] }
+  it('writes each site on a trunk that exists, its people by code-unit order, one site each (step 6c)', () => {
+    expect(projectSites([site, { ...site, id: 'lyon', number: '+33199000350', members: ['u3'] }], [OPERATOR])).toEqual({
+      sites: [['lyon', 'operator', '+33199000350'], ['paris', 'operator', '+33199000101']],
+      users: [['u1', 'paris'], ['u2', 'paris'], ['u3', 'lyon']]
+    })
+    expect(() => projectSites([{ ...site, trunkId: 'nope' }], [OPERATOR])).toThrow(/no trunk nope/)
+    expect(() => projectSites([{ ...site, number: '0199000101' }], [OPERATOR])).toThrow(/not E.164/)
+    expect(() => projectSites([{ ...site, id: 'Paris!' }], [OPERATOR])).toThrow(/not valid/)
+    expect(() => projectSites([site, { ...site, id: 'lyon' }], [OPERATOR])).toThrow(/in two sites/)
+    expect(() => projectSites([{ ...site, members: [''] }], [OPERATOR])).toThrow(/empty user/)
   })
 })
 
@@ -142,8 +157,8 @@ describe('projectTrunks', () => {
 
 const SCRIPT = readFileSync(new URL('../../../docker/opensips/opensips.cfg.tpl', import.meta.url), 'utf8')
 /** A query of opensips.cfg.tpl (`$var(name) = "..." + $var(x) + "...";`) with the script's variables given. */
-const scriptQuery = (name: string, vars: Record<string, string>) => {
-  const line = new RegExp(`\\$var\\(${name}\\) = (".*");$`, 'm').exec(SCRIPT)?.[1]
+const scriptQuery = (name: string, vars: Record<string, string>, nth = 0) => {
+  const line = [...SCRIPT.matchAll(new RegExp(`\\$var\\(${name}\\) = (".*");$`, 'gm'))][nth]?.[1]
   if (!line) throw new Error(`no $var(${name}) in opensips.cfg.tpl`)
   return line.slice(1, -1).replace(/" \+ \$var\((\w+)\) \+ "/g, (_, v: string) => {
     if (!(v in vars)) throw new Error(`$var(${v}) not given`)
@@ -330,7 +345,12 @@ if (process.env.TEST_DATABASE_URL) {
       expect(await inbound('+331990001011', '')).toBeUndefined()
       // route[trunk_out], as the script builds it: the trunk of the caller's direct number and that number, else the
       // first trunk and its own; what it may call; and, for a number called that is one of ours, what it rings.
-      const outbound = async (ext: string, called = '+33639980001') => (await pool.query(scriptQuery('trunk_query', { ext, called }))).rows[0] as Record<string, unknown> | undefined
+      // `emergency`: what the script adds for an emergency call (step 6c): the number and trunk of the caller's site.
+      const outbound = async (ext: string, called = '+33639980001', emergency = false) => {
+        const nth = emergency ? 1 : 0
+        const vars = { ext, called, presented: scriptQuery('presented', {}, nth), site_join: scriptQuery('site_join', { ext }, nth), site_order: scriptQuery('site_order', {}, nth) }
+        return (await pool.query(scriptQuery('trunk_query', vars))).rows[0] as Record<string, unknown> | undefined
+      }
       expect(await outbound('101')).toMatchObject({ setid: 1, presented: '+33199000101', number_format: 'international-00', allowed: ',fixed,mobile,freephone,standard-rate,', internal: null })
       // Nothing of step 6b in it (review 6b, n°2): the rights and caps are a query of their own, never an emergency call's.
       expect(Object.keys((await outbound('101'))!)).not.toContain('rights')
@@ -343,10 +363,66 @@ if (process.env.TEST_DATABASE_URL) {
       expect(await outbound('102', '+331990001131')).toMatchObject({ internal: null })
       expect(await outbound('102', '112')).toMatchObject({ internal: null, presented: '+33199000100' })
       expect(await outbound('102', '')).toMatchObject({ internal: null })
+      // An emergency call (step 6c) is the same, for a caller who is in no site, and for a call that is not one, whatever
+      // sites there are (they are written below).
+      expect(await outbound('102', '112', true)).toMatchObject({ setid: 1, presented: '+33199000100' })
+      expect(await outbound('101', '112', true)).toMatchObject({ setid: 1, presented: '+33199000101' })
       // The countries of the trunk, for its international numbers.
       await tables.set([{ ...OPERATOR, allowed: ['international'], countries: ['44'] }], DIDS)
       expect(await outbound('101', '+442079460123')).toMatchObject({ allowed: ',international,', countries: ',44,' })
       await tables.set([], [])
+    })
+
+    it('writes the sites once, and the script reads the number and the trunk of the caller\'s site for an emergency call only (step 6c)', async () => {
+      const tables = new TrunkTables({ pool, ready, tenantId: 'spec-A' })
+      const trunks = [OPERATOR, { ...OPERATOR, id: 'backup', auth: 'ip' as const, defaultNumber: '+33199000200' }]
+      const dids = [...DIDS, { id: 'lyon', trunkId: 'backup', first: '+33199000350', last: '+33199000359', target: '105' }]
+      const sites = [
+        { id: 'paris', name: 'Paris', address: '1 rue de Rivoli', trunkId: 'operator', number: '+33199000101', members: ['alice'] },
+        { id: 'lyon', name: 'Lyon', address: '2 place Bellecour', trunkId: 'backup', number: '+33199000350', members: ['bob', 'carol'] }
+      ]
+      await pool.query("INSERT INTO subscriber (username, domain, holder) VALUES ('101', '', 'alice'), ('102', '', 'bob'), ('103', '', 'carol'), ('104', '', 'dave')")
+      try {
+        await tables.set(trunks, dids, sites)
+        expect((await pool.query('SELECT id, trunk_id, number FROM emergency_sites ORDER BY id')).rows).toEqual([
+          { id: 'lyon', trunk_id: 'backup', number: '+33199000350' },
+          { id: 'paris', trunk_id: 'operator', number: '+33199000101' }
+        ])
+        expect((await pool.query('SELECT user_id, site_id FROM emergency_site_users ORDER BY user_id')).rows).toEqual([
+          { user_id: 'alice', site_id: 'paris' },
+          { user_id: 'bob', site_id: 'lyon' },
+          { user_id: 'carol', site_id: 'lyon' }
+        ])
+        const outbound = async (ext: string, emergency: boolean) => {
+          const nth = emergency ? 1 : 0
+          const vars = { ext, called: '112', presented: scriptQuery('presented', {}, nth), site_join: scriptQuery('site_join', { ext }, nth), site_order: scriptQuery('site_order', {}, nth) }
+          return (await pool.query(scriptQuery('trunk_query', vars))).rows[0] as Record<string, unknown>
+        }
+        // 102 (bob) has no direct number: his site's trunk and number, in place of the first trunk's number.
+        expect(await outbound('102', true)).toMatchObject({ setid: 2, presented: '+33199000350' })
+        // Any other call of his: the first trunk and its number, as without a site.
+        expect(await outbound('102', false)).toMatchObject({ setid: 1, presented: '+33199000100' })
+        // 101 (alice) has a direct number: her site's number, the same here; 104 (dave) is in no site.
+        expect(await outbound('101', true)).toMatchObject({ setid: 1, presented: '+33199000101' })
+        expect(await outbound('104', true)).toMatchObject({ setid: 1, presented: '+33199000100' })
+        // The site's number comes before the direct number, and the site's trunk before the direct number's trunk.
+        await tables.set(trunks, dids, [{ ...sites[0]!, number: '+33199000100', members: ['alice', 'bob'] }, { ...sites[1]!, members: ['carol'] }])
+        expect(await outbound('101', true)).toMatchObject({ setid: 1, presented: '+33199000100' })
+        expect(await outbound('102', true)).toMatchObject({ setid: 1, presented: '+33199000100' })
+        expect(await outbound('101', false)).toMatchObject({ presented: '+33199000101' })
+        // Written once, and nothing when it holds already; a person moved is a change; a trunk removed takes no site along (the Gateway drops them).
+        const again = [{ ...sites[0]!, number: '+33199000100', members: ['bob', 'alice'] }, { ...sites[1]!, members: ['carol'] }]
+        const versions = async () => (await pool.query('SELECT xmin::text AS x FROM emergency_sites ORDER BY id')).rows
+        const before = await versions()
+        await tables.set(trunks, dids, again)
+        expect(await versions()).toEqual(before)
+        await tables.set(trunks, dids, [])
+        expect((await pool.query('SELECT count(*)::int AS n FROM emergency_sites')).rows[0].n).toBe(0)
+        expect((await pool.query('SELECT count(*)::int AS n FROM emergency_site_users')).rows[0].n).toBe(0)
+      } finally {
+        await pool.query("DELETE FROM subscriber WHERE holder IN ('alice', 'bob', 'carol', 'dave')")
+        await tables.set([], [])
+      }
     })
 
     it('reads with a direct number called its fallback inside: the number\'s own, else its trunk\'s, what it is, and whether the number is anyone\'s (review 6b, n°1, n°9)', async () => {

@@ -18,6 +18,7 @@ import type {
   ProviderStatus,
   RingGroup,
   DidRange,
+  EmergencySite,
   TelephonyEvent,
   Trunk,
   TrunkStatus,
@@ -142,7 +143,7 @@ export interface TelephonyProvider {
    * The trunks of the tenant with their passwords, and its direct numbers (capability `trunks`): replaces what the
    * provider had. The Gateway checked them (ids, numbers, ranges that do not overlap).
    */
-  setTrunks?(trunks: (Trunk & { password?: string })[], dids: DidRange[]): Promise<void>
+  setTrunks?(trunks: (Trunk & { password?: string })[], dids: DidRange[], sites?: EmergencySite[]): Promise<void>
   /**
    * How the tenant's trunks are doing now (step 7): registration and servers, as the SIP server says. Undefined when
    * the provider cannot ask it (no control channel); throws when it asked and got no answer.

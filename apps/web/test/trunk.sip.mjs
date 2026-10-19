@@ -1292,6 +1292,75 @@ try {
     }
   })
 
+  // Step 6c (ADR 0024): the sites. An emergency call presents the number of the site of its caller (a number of the
+  // site's trunk: here the default number of each trunk), through that trunk, before the direct number: for an
+  // emergency call only. Self-cleaning: the sites go at the end, whatever happens.
+  await step('6c: an emergency call presents the number of the caller\'s site, through its trunk, before the direct number; any other call, and a caller in no site, as before; the site known when the database does not answer', async () => {
+    const sites = [
+      { id: 'paris', name: 'Paris', address: '1 rue de Rivoli, 75001 Paris', trunkId: 'main', number: '+33199000300', members: ['u-301'] },
+      { id: 'lyon', name: 'Lyon', address: '2 place Bellecour, 69002 Lyon', trunkId: 'backup', number: '+33199000310', members: ['u-303'] }
+    ]
+    const from = (op, call) => header(call.invite, 'from')
+    try {
+      await tables.set([main, backup], dids, sites)
+      // 301 (direct number +33199000301, in Paris): the number of Paris, at the first trunk.
+      const sos = await p301.dial('112')
+      const at = await atOperator(A, sos)
+      expect('112 at the first trunk', at.invite.uri === 'sip:112@operator.example', at.invite.uri)
+      expect('the number of the site, not the direct number', from(A, at).includes('<sip:+33199000300@operator.example>'), from(A, at))
+      if (sos.final.status === 200) await p301.hangup(sos)
+      // Any other call of 301: its direct number, as without a site.
+      const other = await p301.dial('0199000022')
+      const otherAt = await atOperator(A, other)
+      expect('another call keeps the direct number', from(A, otherAt).includes('<sip:+33199000301@operator.example>'), from(A, otherAt))
+      if (other.final.status === 200) await p301.hangup(other)
+      // 303 (direct number +33199000303 at the backup, in Lyon): the number of Lyon, at the backup.
+      const lyon = await p303.dial('112')
+      const lyonAt = await atOperator(C, lyon)
+      expect('112 at the backup', lyonAt.invite.uri === 'sip:112@backup.example', lyonAt.invite.uri)
+      expect('the number of Lyon', from(C, lyonAt).includes('<sip:+33199000310@backup.example>'), from(C, lyonAt))
+      if (lyon.final.status === 200) await p303.hangup(lyon)
+      // 302 is in no site: its direct number, as before.
+      const none = await p302.dial('112')
+      const noneAt = await atOperator(A, none)
+      expect('302 keeps its direct number', from(A, noneAt).includes('<sip:+33199000302@operator.example>'), from(A, noneAt))
+      if (none.final.status === 200) await p302.hangup(none)
+      // One site a person, and a site's trunk before the direct number's: 302 goes to Lyon, and calls from the backup.
+      await tables.set([main, backup], dids, [sites[0], { ...sites[1], members: ['u-302', 'u-303'] }])
+      const moved = await p302.dial('112')
+      const movedAt = await atOperator(C, moved)
+      expect('302 in Lyon: at the backup', movedAt.invite.uri === 'sip:112@backup.example' && from(C, movedAt).includes('<sip:+33199000310@backup.example>'), `${movedAt.invite.uri} ${from(C, movedAt)}`)
+      if (moved.final.status === 200) await p302.hangup(moved)
+      await tables.set([main, backup], dids, sites)
+      // The default trunk is read again every 15 s, with the sites on it: once read, the database may not answer.
+      await sleep(16_000)
+      const locker = new pg.Client({ connectionString: DB_URL })
+      await locker.connect()
+      try {
+        await locker.query('BEGIN')
+        await locker.query('LOCK TABLE trunks IN ACCESS EXCLUSIVE MODE')
+        const cut = await p301.dial('112')
+        const cutAt = await atOperator(A, cut)
+        expect('112 with the database out of reach, at the operator', cutAt.invite.uri === 'sip:112@operator.example', cutAt.invite.uri)
+        expect('the site of 301, as last read', from(A, cutAt).includes('<sip:+33199000300@operator.example>'), from(A, cutAt))
+        if (cut.final.status === 200) await p301.hangup(cut)
+      } finally {
+        await locker.query('ROLLBACK').catch(() => undefined)
+        await locker.end()
+      }
+      // Taken out of its site, 301 presents its direct number again; and once the default trunk is read again, from memory too.
+      await tables.set([main, backup], dids, [{ ...sites[0], members: [] }, sites[1]])
+      const back = await p301.dial('112')
+      const backAt = await atOperator(A, back)
+      expect('301 out of its site: its direct number again', from(A, backAt).includes('<sip:+33199000301@operator.example>'), from(A, backAt))
+      if (back.final.status === 200) await p301.hangup(back)
+    } finally {
+      await tables.set([main, backup], dids)
+    }
+    // What the 15 s timer kept of the sites goes with the next read: the steps after are as before.
+    await sleep(16_000)
+  })
+
   await step(`review 6b, n°5, second review n°4, n°10: OpenSIPS killed and started again (OPENSIPS_RESTART) with calls to the public network in progress: they are still counted, a BYE ends them on both sides with their CDR, and the minutes allotted still end the one they bound; the minutes reserved for a call that was ringing (lost) are released, an emergency call restored ends within ${EMERGENCY_RESTORED_SEC} s`, async () => {
     if (!RESTART) {
       console.log('     (skipped: OPENSIPS_RESTART is not set)')

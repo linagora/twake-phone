@@ -5,6 +5,7 @@ export const ADMIN_SECTIONS: readonly (readonly [string, Key])[] = [
   ['', 'admin.nav.accounts'],
   ['trunks', 'admin.nav.trunks'],
   ['numbers', 'admin.nav.numbers'],
+  ['sites', 'admin.nav.sites'],
   ['groups', 'admin.nav.groups'],
   ['rights', 'admin.nav.rights'],
   ['limits', 'admin.nav.limits'],

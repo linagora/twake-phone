@@ -1,5 +1,5 @@
 import type { CallParties, MediaProvider, ProviderFactory, RoomCallGrant, RoomCallGrantToken, RoutedEvent, TelephonyProvider, VoicemailBox, VoicemailBoxesWrite } from '@twake/telephony-provider-sdk'
-import type { Call, Capabilities, DidRange, Endpoint, ForwardingRules, MediaSession, OriginateRequest, OutboundAssignment, OutboundPolicy, OutboundProfile, Presence, ProviderStatus, RingGroup, Trunk, TrunkStatus, User } from '@twake/telephony-types'
+import type { Call, Capabilities, DidRange, Endpoint, EmergencySite, ForwardingRules, MediaSession, OriginateRequest, OutboundAssignment, OutboundPolicy, OutboundProfile, Presence, ProviderStatus, RingGroup, Trunk, TrunkStatus, User } from '@twake/telephony-types'
 import type { CallGroups } from './call-groups.js'
 import type { CallRules } from './call-rules.js'
 import type { PushTargets } from './push-targets.js'
@@ -504,9 +504,9 @@ export class OpensipsProvider implements TelephonyProvider, MediaProvider {
    * A reload that fails fails the change (502, code TRUNK_RELOAD_FAILED: written, not applied; asked again at the next
    * change). Without the MI, OpenSIPS reads them at its next start (logged).
    */
-  async setTrunks(trunks: (Trunk & { password?: string })[], dids: DidRange[]) {
+  async setTrunks(trunks: (Trunk & { password?: string })[], dids: DidRange[], sites: EmergencySite[] = []) {
     if (!this.config.trunks) throw Object.assign(new Error('Trunks are not available on this platform'), { statusCode: 501 })
-    const changed = await this.config.trunks.set(trunks, dids)
+    const changed = await this.config.trunks.set(trunks, dids, sites)
     const log = this.config.logger ?? console
     const wanted = new Set([...this.pendingReloads, ...(changed.dispatcher ? ['ds_reload'] : []), ...(changed.registrant ? ['reg_reload'] : []), ...(this.dialplanLoaded ? [] : ['dp_reload'])])
     const reloads = ['ds_reload', 'reg_reload', 'dp_reload'].filter(m => wanted.has(m))

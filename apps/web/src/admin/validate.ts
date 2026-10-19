@@ -11,6 +11,7 @@ import {
   TRUNK_OUTBOUND_DEFAULT,
   WEBHOOK_EVENT_TYPES,
   type DidRange,
+  type EmergencySite,
   type FraudRule,
   type FraudThreshold,
   type OutboundCaps,
@@ -500,6 +501,7 @@ const GENERAL: Record<string, Key> = {
   OUTBOUND_RELOAD_FAILED: 'admin.err.reloadFailed',
   TRUNK_LIMIT: 'admin.err.trunkLimit',
   DID_LIMIT: 'admin.err.didLimit',
+  SITE_LIMIT: 'admin.err.siteLimit',
   PROFILE_LIMIT: 'admin.err.profileLimit',
   OUTBOUND_STALE: 'admin.err.stale',
   ALERT_CHANGED: 'admin.alert.changed',
@@ -607,6 +609,49 @@ export const didRefusal = (err: unknown) =>
     if (code === 'DID_RESERVED') return field === 'suffixDigits' ? { field: 'suffixDigits', problem: p('admin.did.err.suffixReservedServer') } : { field: 'target', problem: p('admin.did.err.targetReserved', { target: /^target: ([0-9]+) /.exec(detail)?.[1] ?? '' }) }
     if (field === 'first' || field === 'last') return { field, problem: p(field === 'last' ? 'admin.did.err.lastOrder' : 'admin.did.err.number') }
     if ((DID_FIELDS as string[]).includes(field)) return { field: field as DidField, problem: p(`admin.did.err.${field}` as Key) }
+    return undefined
+  })
+
+// ---------------------------------------------------------------------------------------------------------------
+// Sites (step 6c, ADR 0024)
+
+export interface SiteForm {
+  id: string
+  name: string
+  address: string
+  trunkId: string
+  number: string
+  members: string[]
+}
+export type SiteField = keyof Omit<SiteForm, 'members'> | 'members' | 'form'
+export const SITE_FIELDS: SiteField[] = ['id', 'name', 'address', 'trunkId', 'number', 'members']
+
+export const emptySite = (trunkId = ''): SiteForm => ({ id: '', name: '', address: '', trunkId, number: '', members: [] })
+export const siteForm = (s: EmergencySite): SiteForm => ({ ...s })
+
+/** The site as the Gateway takes it (PUT /admin/sites/:id), or what is wrong; the Gateway checks the number against the trunk. */
+export const checkSite = (f: SiteForm, ctx: { isNew: boolean; trunks: readonly Pick<Trunk, 'id'>[]; others: readonly Pick<EmergencySite, 'id'>[] }): { site?: EmergencySite; problems: Problems<SiteField> } => {
+  const problems: Problems<SiteField> = {}
+  const id = f.id.trim()
+  if (!SLUG.test(id)) problems.id = p('admin.site.err.id')
+  else if (ctx.isNew && ctx.others.some(o => o.id === id)) problems.id = p('admin.site.err.idTaken')
+  const name = f.name.trim()
+  if (!name || name.length > 64 || CONTROL.test(name)) problems.name = p('admin.site.err.name')
+  const address = f.address.trim()
+  if (!address || address.length > 200 || CONTROL.test(address)) problems.address = p('admin.site.err.address')
+  if (!ctx.trunks.some(t => t.id === f.trunkId)) problems.trunkId = p('admin.site.err.trunkId')
+  const number = f.number.replace(/\s/g, '')
+  if (!E164.test(number)) problems.number = p('admin.site.err.number')
+  if (Object.keys(problems).length) return { problems }
+  return { problems, site: { id, name, address, trunkId: f.trunkId, number, members: f.members } }
+}
+
+/** The refusals of PUT /admin/sites/:id, on the site form. */
+export const siteRefusal = (err: unknown) =>
+  refusalOf<SiteField>(err, (field, code) => {
+    if (code === 'SITE_NUMBER') return { field: 'number', problem: p('admin.site.err.numberTrunk') }
+    if (code === 'SITE_MEMBER') return { field: 'members', problem: p('admin.site.err.member') }
+    if ((SITE_FIELDS as string[]).includes(field)) return { field: field as SiteField, problem: p(`admin.site.err.${field}` as Key) }
     return undefined
   })
 

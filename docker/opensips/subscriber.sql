@@ -170,6 +170,19 @@ CREATE TABLE IF NOT EXISTS dids (
 CREATE INDEX IF NOT EXISTS dids_first_number_idx ON dids (first_number);
 ALTER TABLE trunks ADD COLUMN IF NOT EXISTS fallback VARCHAR(16) DEFAULT '' NOT NULL;
 ALTER TABLE dids ADD COLUMN IF NOT EXISTS fallback VARCHAR(16) DEFAULT '' NOT NULL;
+CREATE TABLE IF NOT EXISTS emergency_sites (
+    tenant_id TEXT NOT NULL,
+    id VARCHAR(32) NOT NULL,
+    trunk_id VARCHAR(32) NOT NULL,
+    number VARCHAR(16) NOT NULL,
+    PRIMARY KEY (tenant_id, id)
+);
+CREATE TABLE IF NOT EXISTS emergency_site_users (
+    tenant_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    site_id VARCHAR(32) NOT NULL,
+    PRIMARY KEY (tenant_id, user_id)
+);
 
 CREATE TABLE IF NOT EXISTS outbound_settings (
     tenant_id TEXT PRIMARY KEY NOT NULL,

@@ -226,3 +226,36 @@ export const ForwardingSettings = () => {
     </section>
   )
 }
+
+/**
+ * Where the person's emergency calls leave from (step 6c, ADR 0024): the site they are in, with its address and the
+ * number it presents, or that none is attributed to them. Nothing without trunks (no public network, no emergency calls).
+ */
+export const EmergencySiteSettings = () => {
+  const { t } = useT()
+  const { client } = useGateway()
+  const [state, setState] = useState<{ enabled: boolean; site?: { name: string; address: string; number: string } } | 'error' | null>(null)
+  useEffect(() => {
+    let cancelled = false
+    client
+      .getEmergencySite()
+      .then(r => !cancelled && setState(r))
+      .catch(err => !cancelled && setState(absent(err) ? { enabled: false } : 'error'))
+    return () => {
+      cancelled = true
+    }
+  }, [client])
+  if (state === null || (state !== 'error' && !state.enabled)) return null
+  return (
+    <section className="card" aria-labelledby="emergency">
+      <h2 id="emergency">{t('settings.emergency.title')}</h2>
+      {state === 'error' ? (
+        <p className="alert alert-error" role="alert">
+          {t('settings.emergency.error')}
+        </p>
+      ) : (
+        <p>{state.site ? t('settings.emergency.site', state.site) : t('settings.emergency.none')}</p>
+      )}
+    </section>
+  )
+}

@@ -438,6 +438,24 @@ export interface DidRange {
   fallbackTarget?: string
 }
 
+/**
+ * A site of the organisation (step 6c, ADR 0024): where its people are, for the emergency services. An emergency call
+ * of one of its `members` goes through its trunk and presents its `number`, which the operator ties to the address of
+ * the site (declared by the organisation, at the operator): a direct number of that trunk, or its default number.
+ * A person is in one site at most.
+ */
+export interface EmergencySite {
+  id: string
+  name: string
+  /** The postal address, as the organisation declared it to the operator: shown to administrators and to the members. */
+  address: string
+  trunkId: string
+  /** E.164. */
+  number: string
+  /** The ids of the people (users of the directory). */
+  members: string[]
+}
+
 export type CallState =
   | 'new'
   | 'ringing'
