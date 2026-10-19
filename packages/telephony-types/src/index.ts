@@ -495,13 +495,16 @@ export interface Voicemail {
 
 /**
  * What a message says (step 11b, ADR 0023): on its way (`pending`), its text (`done`; an empty text when nothing was
- * heard in it), or no transcription (`none`), `reason` saying why: longer than the platform transcribes (`too-long`),
- * too many messages waiting for theirs (`busy`), the transcription service did not answer or failed (`failed`).
+ * heard in it, `lang` the language it is in), or no transcription (`none`), `reason` saying why: longer than the
+ * platform transcribes (`too-long`), too many messages waiting for theirs (`busy`), the transcription service did not
+ * answer or failed (`failed`), or the platform never took the message in hand (`untracked`: left before the
+ * transcription was on, or longer ago than it catches up with).
  */
 export interface VoicemailTranscript {
   status: 'pending' | 'done' | 'none'
   text?: string
-  reason?: 'too-long' | 'busy' | 'failed'
+  lang?: string
+  reason?: 'too-long' | 'busy' | 'failed' | 'untracked'
 }
 
 /**
@@ -513,6 +516,11 @@ export interface VoicemailTranscript {
 export interface HistoryErasure {
   deleted: number
   voicemailErasure?: 'asked' | 'limited'
+  /**
+   * Step 11b: `not-withdrawn` when the bot's notices of their messages in Chat cannot be withdrawn any more (the
+   * platform has no bot now): their transcriptions are erased all the same, the notices stay in Chat.
+   */
+  chatNotices?: 'not-withdrawn'
 }
 
 export interface OriginateRequest {

@@ -17,6 +17,8 @@
 //   SIP_DOMAIN           SIP domain and digest realm (default: the host of SIP_WSS_URL)
 //   SIP_UDP, SIP_WS      UDP and WS sockets of OpenSIPS for the user agents of this process (default 127.0.0.1:5060, ws://127.0.0.1:8088)
 //   OPENSIPS_DB_URL      the database auth_db reads (default postgres://twake:twake@127.0.0.1:54320/twake)
+//   GATEWAY_DB_URL       the Gateway's own database (default: twakephone_e2e on the server of OPENSIPS_DB_URL, made
+//                        afresh at each run); its leases, fences and queues as a deployment has them (PgStore)
 //   OPENSIPS_MI_URL      the MI socket of OpenSIPS, where the Gateway subscribes to its events (default udp:127.0.0.1:8880)
 //   SIP_TRUNK            the trunk socket of OpenSIPS, where the simulated operator talks to it (default 127.0.0.1:5070)
 //   TRUNK_ADVERTISE      the address OpenSIPS announces on that socket (its own TRUNK_ADVERTISE, host:port), as behind a
@@ -70,7 +72,7 @@ import { MatrixBot } from '../../gateway/dist/matrix.js'
 import { LintoTranscription } from '../../../packages/transcription-linto/dist/index.js'
 import { ProviderRegistry } from '../../gateway/dist/registry.js'
 import { SubscriberProvisioner } from '../../../packages/provider-opensips/dist/subscriber.js'
-import { MemoryStore } from '../../gateway/dist/store/memory.js'
+import { PgStore } from '../../gateway/dist/store/pg.js'
 import { parseNetworks } from '../../gateway/dist/webhook-delivery.js'
 import { BASE_DN, PEOPLE, READER_DN, READER_PASSWORD, startLdapMock } from '../../gateway/test/ldap-mock.mjs'
 import { startPushService } from '../../gateway/test/push-service.mjs'
@@ -268,7 +270,25 @@ process.env.DEFAULT_TENANT = TENANT
 
 const oidc = await startOidcMock({ port: OIDC_PORT, appOrigin, audience: AUDIENCE, resource: RESOURCE })
 const auth = new JwtAuthenticator({ jwksUrl: oidc.jwksUrl, issuer: oidc.issuer, audience: AUDIENCE, defaultTenant: TENANT, rolesClaim: 'roles' })
-const store = new MemoryStore()
+// The Gateway's own database, a fresh one by default: what PostgreSQL fences (the leases of the mailboxes and of the
+// transcriptions, their queues) end to end, as a deployment runs it.
+const GATEWAY_DB_URL =
+  process.env.GATEWAY_DB_URL ??
+  (await (async () => {
+    const admin = new pg.Client({ connectionString: OPENSIPS_DB_URL })
+    await admin.connect()
+    try {
+      await admin.query('DROP DATABASE IF EXISTS twakephone_e2e WITH (FORCE)')
+      await admin.query('CREATE DATABASE twakephone_e2e')
+    } finally {
+      await admin.end()
+    }
+    const url = new URL(OPENSIPS_DB_URL)
+    url.pathname = '/twakephone_e2e'
+    return url.toString()
+  })())
+const store = new PgStore(GATEWAY_DB_URL)
+await store.migrate()
 // What an administrator (or the LDAP synchronisation) would have set: who has which extension.
 await store.upsertMapping({ tenantId: TENANT, userId: 'amartin', extension: '101', displayName: 'Alice Martin' })
 await store.upsertMapping({ tenantId: TENANT, userId: 'jdupont', extension: '102', displayName: 'Jean Dupont' })
@@ -390,7 +410,7 @@ const gateway = await buildApp(registry, {
   // A synchronisation of the mailboxes that failed (Wazo out of reach) is tried again every 2 s here (the steps wait for it, not for the 30 s of the Gateway's default).
   voicemailRetryMs: [1_000, 2_000],
   // Step 11b: LinTO STT of the stack, the bot on its homeserver, each person's Matrix id from their uid.
-  transcription: { provider: new LintoTranscription({ url: LINTO_URL, timeoutMs: 60_000 }), maxSec: 180, queueMax: 100, maxBytes: 180 * 24_000 + 65_536 },
+  transcription: { provider: new LintoTranscription({ url: LINTO_URL, timeoutMs: 60_000 }), maxSec: 180, queueMax: 100, maxBytes: 180 * 48_000 + 65_536, lang: 'fr' },
   notices: { bot: new MatrixBot({ homeserverUrl: SYNAPSE_URL, token: matrixTokens['twakephone-bot'] }), userTemplate: `@{uid}:${MATRIX_SERVER}`, appUrl: appOrigin, timeZone: 'Europe/Paris' }
 })
 // LiveKit's webhooks as the Gateway answered them: signed with its key, each one 204.
@@ -3362,7 +3382,7 @@ try {
     expectEqual((await store.listAlerts(TENANT, { limit: 100 })).filter(a => a.lastAt > started).map(a => `${a.alert.kind} ${a.alert.param}`), [], 'alerts since the call')
     expectEqual((await jeanApi('DELETE', `/voicemails/${message.id}`)).statusCode, 204, 'DELETE of the message')
   })
-  await step('step 11b, the demo: Jean does not want to be disturbed and looks at his Messagerie vocale; the operator calls his direct number from +33 6 39 98 00 11 and the caller leaves a message in French; it arrives in Jean\'s Messagerie vocale, transcribed by LinTO STT, the text under it; the bot tells Jean in Twake Chat (his Matrix account on the stack\'s homeserver), in a room of his own with it: caller, time, duration, the text and the link to listen to it in TwakePhone; nothing for Bob nor Alice; Jean deletes the message: the notice is withdrawn in Chat', async () => {
+  await step('step 11b, the demo: Jean does not want to be disturbed and looks at his Messagerie vocale; the operator calls his direct number from +33 6 39 98 00 11 and the caller leaves a message in French; it arrives in Jean\'s Messagerie vocale, transcribed by LinTO STT, the text under it; the bot tells Jean in Twake Chat (his Matrix account on the stack\'s homeserver), in a room of his own with it: caller, time, duration, the text and the link to listen to it in TwakePhone; nothing for Bob nor Alice; Jean deletes the message: the notice is withdrawn in Chat; another message, then he erases his history: the message, its transcription and its notice gone, the bot out of the room', async () => {
     const jeanApi = await asPerson(jean)
     const bobApi = await asPerson(bob)
     const aliceApi = await asPerson(alice)
@@ -3398,8 +3418,9 @@ try {
       return v?.transcript?.status === 'done' ? v.transcript : null
     })
     console.log(`     transcription: « ${served.text} »`)
-    // Not a word-for-word check (a small model, a synthetic voice through a telephone line): words of the phrase heard.
-    const heard = ['bonjour', 'jean', 'paul', 'merci', 'rappeler', 'demain', 'matin'].filter(w => served.text.toLowerCase().includes(w))
+    // Not a word-for-word check (a small model, a synthetic voice through a telephone line): words of the phrase heard
+    // (not « jean », the very name of the person called).
+    const heard = ['bonjour', 'paul', 'merci', 'rappeler', 'demain', 'matin'].filter(w => served.text.toLowerCase().includes(w))
     if (heard.length < 2) {
       // What LinTO hears of the phrase itself, not through the line: tells the line from the voice.
       const direct = await new LintoTranscription({ url: LINTO_URL, timeoutMs: 60_000 }).transcribe(new Uint8Array(CALLER_WAV)).then(r => r.text, err => `(${err.message})`)
@@ -3407,22 +3428,35 @@ try {
     }
     expectEqual((await transcript.textContent()).trim(), `Transcription : « ${served.text} »`, 'the transcription in the Messagerie vocale')
     await jean.page.locator('[aria-live=polite]').filter({ hasText: /transcrit\.\s?$/ }).waitFor({ timeout: 10_000 })
-    // The bot's notice: in one room only, the bot's with Jean (invited), nobody else in it.
+    // The bot's notice: in one room only, the bot's with Jean (invited), nobody else in it; one room of the bot with him.
     const bot = matrixTokens['twakephone-bot']
-    const found = await until("the bot's notice of the message", async () => {
+    const noticesOf = async () => {
+      const rooms = []
       for (const roomId of (await matrix(bot, 'GET', '/joined_rooms')).joined_rooms) {
         const { chunk } = await matrix(bot, 'GET', `/rooms/${encodeURIComponent(roomId)}/messages?dir=b&limit=50`)
         const notices = chunk.filter(e => e.type === 'm.room.message' && String(e.content?.body ?? '').includes('+33639980011'))
-        if (notices.length) return { roomId, notices }
+        if (notices.length) rooms.push({ roomId, notices })
       }
-      return null
-    }, { timeout: 30_000 })
+      return rooms
+    }
+    const roomsWithJean = async () => {
+      const rooms = []
+      for (const roomId of (await matrix(bot, 'GET', '/joined_rooms')).joined_rooms) {
+        const { chunk } = await matrix(bot, 'GET', `/rooms/${encodeURIComponent(roomId)}/members`)
+        if (chunk.some(e => e.state_key === `@jdupont:${MATRIX_SERVER}` && ['join', 'invite'].includes(e.content.membership))) rooms.push(roomId)
+      }
+      return rooms
+    }
+    const withNotices = await until("the bot's notice of the message", async () => ((await noticesOf()).length ? noticesOf() : null), { timeout: 30_000 })
+    expectEqual(withNotices.length, 1, "the bot's rooms with a notice of the message")
+    const [found] = withNotices
     expectEqual(found.notices.length, 1, "the bot's notices of the message")
+    expectEqual(await roomsWithJean(), [found.roomId], "the bot's rooms with Jean")
     const [notice] = found.notices
     const body = notice.content.body
     console.log(`     notice: ${body.replace(/\n/g, ' | ')}`)
     expectEqual(notice.content.msgtype, 'm.notice', 'the kind of message the bot sends')
-    for (const part of ['Nouveau message vocal de +33639980011', `durée 0:0`, `Transcription : « ${served.text} »`, `Écouter dans TwakePhone : ${appOrigin}/voicemail`]) {
+    for (const part of ['Nouveau message vocal du +33639980011', `durée 0:0`, `Transcription : « ${served.text} »`, `Écouter dans TwakePhone : ${appOrigin}/voicemail`]) {
       if (!body.includes(part)) throw new Error(`the notice « ${body} » does not say « ${part} »`)
     }
     const members = (await matrix(bot, 'GET', `/rooms/${encodeURIComponent(found.roomId)}/members`)).chunk.filter(e => ['join', 'invite'].includes(e.content.membership)).map(e => e.state_key).sort()
@@ -3462,6 +3496,38 @@ try {
       return e.unsigned?.redacted_because && !e.content?.body ? e : null
     }, { timeout: 20_000 })
     expectEqual((await jeanApi('GET', '/voicemails')).json().items.some(i => i.id === item.id), false, "the message in Jean's mailbox after he deleted it")
+    // His right to erasure: another message, its notice in the same room; he erases his history: the message gone from
+    // his mailbox, its transcription with it, the notice withdrawn in Chat, the bot out of the room.
+    try {
+      const placed = await operator.call('+33199000102', { from: '+33639980011', ruri: TRUNK_LOGIN })
+      const answer = await placed.final
+      const answeredAt = Date.now()
+      expectEqual(answer.status, 200, "the mailbox's answer to the operator (the second message)")
+      await sleep(Math.max(0, answeredAt + greetingMs() + 500 - Date.now()))
+      await placed.media.say(CALLER_MESSAGE)
+      await sleep(1_000)
+      expectEqual((await placed.hangup()).status, 200, 'answer to the operator BYE (the second message)')
+    } catch (err) {
+      await setStatus(jean, 'Disponible')
+      throw err
+    }
+    const second = await until("the second message in Jean's mailbox", async () => (await jeanApi('GET', '/voicemails')).json().items.find(i => i.from === '+33639980011') ?? null, { timeout: 20_000 })
+    const again = await until("the bot's notice of the second message", async () => {
+      const rooms = await noticesOf()
+      return rooms.length && rooms.every(r => r.notices.every(e => e.event_id !== notice.event_id)) ? rooms : null
+    }, { timeout: 90_000 })
+    expectEqual(again.map(r => [r.roomId, r.notices.length]), [[room, 1]], "the bot's rooms with a notice of the second message")
+    const [secondNotice] = again[0].notices
+    const erased = await jeanApi('DELETE', '/me/history')
+    expectEqual(erased.statusCode, 200, 'DELETE /me/history')
+    expectEqual([erased.json().voicemailErasure, erased.json().chatNotices], ['asked', undefined], 'the erasure, as the Gateway answers it')
+    await until("Jean's mailbox erased", async () => ((await jeanApi('GET', '/voicemails')).json().items.some(i => i.id === second.id) ? null : true), { timeout: 30_000 })
+    await until('the notice of the second message withdrawn in Chat', async () => {
+      const e = await matrix(jeanMx, 'GET', `/rooms/${encodeURIComponent(room)}/event/${encodeURIComponent(secondNotice.event_id)}`)
+      return e.unsigned?.redacted_because && !e.content?.body ? e : null
+    }, { timeout: 30_000 })
+    await until('the bot out of the room with Jean', async () => ((await roomsWithJean()).length ? null : true), { timeout: 30_000 })
+    expectEqual((await matrix(bot, 'GET', '/joined_rooms')).joined_rooms.includes(room), false, 'the room with Jean among those of the bot')
     await setStatus(jean, 'Disponible')
   })
   await step('step 11a: the operator calls the desk\'s direct number +33 1 99 00 01 04 (the desk signed out: nobody to reach), whose fallback is the ring group 210 of Bob, in a call with Jean (his window answers busy at once): the mailbox of 104 takes the call; for the desk it is a missed call, nobody of the group took it, the message is the desk\'s', async () => {

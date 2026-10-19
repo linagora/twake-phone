@@ -1,5 +1,5 @@
 import type { OperatorCdr } from '@twake/telephony-types'
-import { clampLimit, isDeclined, isMissed, type HistoryEntry, type HistoryNearQuery, type HistoryPage, type HistoryQuery, type OperatorCdrOutcome, type OperatorCdrRecord, type OperatorCdrStats, type ConferenceRecord, type AlertRecord, type AlertQuery, type DidRecord, type OutboundHand, type OutboundRecord, type OutboundRules, ALERT_DEDUP_MS, alertKey, type ProviderRecord, type StoredAlert, type PushSaveResult, type PushSubscriptionRecord, type Store, type TrunkRecord, type UserMapping, type UserPresenceRecord, type VapidKeysRecord, type ClaimedDelivery, type ErasedCall, type ErasedCallsKept, type WebhookAttemptResult, type WebhookClaimCaps, type WebhookClaimTime, allocateClaims, type WebhookDeliveryQuery, type WebhookLease, type WebhookSendQuota, type WebhookDeliveryRecord, type WebhookQueueOptions, type WebhookStateChange, type WebhookStateEvent, type WebhookSubscriptionRecord, WEBHOOK_STATE_ROLE, type FencedLease, type NewTranscript, type TranscriptChange, type TranscriptRecord } from './types.js'
+import { clampLimit, isDeclined, isMissed, type HistoryEntry, type HistoryNearQuery, type HistoryPage, type HistoryQuery, type OperatorCdrOutcome, type OperatorCdrRecord, type OperatorCdrStats, type ConferenceRecord, type AlertRecord, type AlertQuery, type DidRecord, type OutboundHand, type OutboundRecord, type OutboundRules, ALERT_DEDUP_MS, alertKey, type ProviderRecord, type StoredAlert, type PushSaveResult, type PushSubscriptionRecord, type Store, type TrunkRecord, type UserMapping, type UserPresenceRecord, type VapidKeysRecord, type ClaimedDelivery, type ErasedCall, type ErasedCallsKept, type WebhookAttemptResult, type WebhookClaimCaps, type WebhookClaimTime, allocateClaims, type WebhookDeliveryQuery, type WebhookLease, type WebhookSendQuota, type WebhookDeliveryRecord, type WebhookQueueOptions, type WebhookStateChange, type WebhookStateEvent, type WebhookSubscriptionRecord, WEBHOOK_STATE_ROLE, type FencedLease, type NewTranscript, type TranscriptChange, type TranscriptLane, type TranscriptMatch, type TranscriptRecord } from './types.js'
 import type { WebhookEventType } from '@twake/telephony-types'
 import { randomBytes } from 'node:crypto'
 import { EMPTY_OUTBOUND, outboundVersion, staleOutbound } from '../outbound.js'
@@ -387,6 +387,7 @@ export class MemoryStore implements Store {
     const pending = [...this.transcripts.values()].filter(t => t.tenantId === record.tenantId && t.status === 'pending').length
     const busy = record.status === 'pending' && pending >= maxPending
     const at = this.transcriptStamp()
+    const now = new Date(this.now()).toISOString()
     this.transcripts.set(k, {
       tenantId: record.tenantId,
       holder: record.holder,
@@ -396,8 +397,11 @@ export class MemoryStore implements Store {
       status: busy ? 'none' : record.status,
       ...(busy ? { reason: 'busy' as const } : record.reason ? { reason: record.reason } : {}),
       attempts: 0,
-      nextAt: new Date(this.now()).toISOString(),
+      nextAt: now,
       notice: record.notice,
+      noticeAttempts: 0,
+      noticeNextAt: now,
+      createdAt: at,
       updatedAt: at,
       created: this.transcriptSeq++
     })
@@ -417,37 +421,46 @@ export class MemoryStore implements Store {
     return this.transcripts.delete(`${tenantId}\u0000${holder}\u0000${messageId}`)
   }
 
-  async eraseTranscripts(tenantId: string, match: { holder?: string; messageId?: string; before?: string }, lease: FencedLease) {
+  async eraseTranscripts(tenantId: string, match: TranscriptMatch, lease: FencedLease, withdraw: boolean) {
     if (!this.holds(lease)) return null
-    let n = 0
+    const done = { erased: 0, notices: 0 }
     for (const [k, r] of [...this.transcripts]) {
-      if (r.tenantId !== tenantId || (match.holder !== undefined && r.holder !== match.holder) || (match.messageId !== undefined && r.messageId !== match.messageId)) continue
-      if (match.before !== undefined && !(Date.parse(r.receivedAt) < Date.parse(match.before))) continue
-      if (r.status === 'erased') continue
-      n++
-      if (r.noticeEvent) {
+      if (r.tenantId !== tenantId || r.status === 'erased') continue
+      if ('before' in match ? !(Date.parse(r.receivedAt) < Date.parse(match.before)) : r.holder !== match.holder || (match.messageId !== undefined && r.messageId !== match.messageId)) continue
+      done.erased++
+      if (r.noticeEvent) done.notices++
+      if (r.noticeEvent && withdraw) {
         delete r.text
         delete r.reason
-        Object.assign(r, { status: 'erased', notice: 'redact', attempts: 0, nextAt: new Date(this.now()).toISOString(), updatedAt: this.transcriptStamp() })
+        const now = new Date(this.now()).toISOString()
+        Object.assign(r, { status: 'erased', notice: 'redact', noticeAttempts: 0, noticeNextAt: now, updatedAt: this.transcriptStamp() })
       } else this.transcripts.delete(k)
     }
-    return n
+    return done
   }
 
-  async listTranscripts(tenantId: string, holder: string, messageIds?: string[]) {
+  async listTranscripts(tenantId: string, holder: string, messageIds?: string[], withErased = false) {
     return [...this.transcripts.values()]
-      .filter(r => r.tenantId === tenantId && r.holder === holder && r.status !== 'erased' && (!messageIds || messageIds.includes(r.messageId)))
+      .filter(r => r.tenantId === tenantId && r.holder === holder && (withErased || r.status !== 'erased') && (!messageIds || messageIds.includes(r.messageId)))
       .sort((a, b) => a.created - b.created)
       .map(r => MemoryStore.transcriptOut(r))
   }
 
-  async dueTranscripts(tenantId: string, limit: number) {
+  async dueTranscripts(tenantId: string, lane: TranscriptLane, limit: number, noticeWaitMs?: number) {
     const now = this.now()
+    const due = (r: TranscriptRecord) =>
+      lane === 'transcribe'
+        ? r.status === 'pending' && Date.parse(r.nextAt) <= now
+        : Date.parse(r.noticeNextAt) <= now && (r.notice === 'redact' || (r.notice === 'pending' && (r.status !== 'pending' || (noticeWaitMs !== undefined && Date.parse(r.createdAt) <= now - noticeWaitMs))))
     return [...this.transcripts.values()]
-      .filter(r => r.tenantId === tenantId && Date.parse(r.nextAt) <= now && (r.status === 'pending' || r.notice === 'pending' || r.notice === 'redact'))
-      .sort((a, b) => a.created - b.created)
+      .filter(r => r.tenantId === tenantId && due(r))
+      .sort((a, b) => (lane === 'notice' ? Number(b.notice === 'redact') - Number(a.notice === 'redact') : 0) || a.created - b.created)
       .slice(0, Math.max(0, limit))
       .map(r => MemoryStore.transcriptOut(r))
+  }
+
+  async staleTranscripts(tenantId: string, before: string) {
+    return [...this.transcripts.values()].filter(r => r.tenantId === tenantId && Date.parse(r.createdAt) < Date.parse(before) && (r.status === 'pending' || r.notice === 'pending' || r.notice === 'redact')).length
   }
 
   async transcriptsChangedSince(tenantId: string, since: string, limit: number) {

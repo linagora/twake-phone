@@ -132,12 +132,27 @@ describe('the Messagerie vocale page', () => {
   })
 
   it("shows each message's transcription, the text alternative of its recording named by its player, and tells once it is done (step 11b)", async () => {
-    lists = [[{ ...v('c', '2026-10-18T02:14:00.000Z'), transcript: { status: 'pending' } }, { ...v('b', '2026-10-18T02:13:00.000Z'), transcript: { status: 'none', reason: 'too-long' } }, { ...v('a', at), transcript: { status: 'done', text: 'Bonjour Jean' } }, v('z', '2026-10-18T01:00:00.000Z')]]
+    lists = [
+      [
+        { ...v('d', '2026-10-18T02:15:00.000Z'), transcript: { status: 'pending' } },
+        { ...v('c', '2026-10-18T02:14:00.000Z'), transcript: { status: 'pending' } },
+        { ...v('b', '2026-10-18T02:13:00.000Z'), transcript: { status: 'none', reason: 'too-long' } },
+        { ...v('a', at), transcript: { status: 'done', text: 'Bonjour Jean', lang: 'fr' } },
+        { ...v('y', '2026-10-18T01:30:00.000Z'), transcript: { status: 'none', reason: 'untracked' } },
+        v('z', '2026-10-18T01:00:00.000Z')
+      ]
+    ]
     await render()
     const transcriptOf = (id: string) => host.querySelector(`[data-id="${id}"] [data-testid="voicemail-transcript"]`)
     expect(transcriptOf('a')!.textContent).toBe('voicemail.transcriptLabel « Bonjour Jean »')
+    // The text in its own language, read out in it whatever the language of the screen; the label in the screen's.
+    expect(transcriptOf('a')!.querySelector('[lang]')!.getAttribute('lang')).toBe('fr')
+    expect(transcriptOf('a')!.querySelector('[lang]')!.textContent).toBe('« Bonjour Jean »')
     expect(transcriptOf('b')!.textContent).toBe('voicemail.transcriptLabel voicemail.transcriptTooLong')
+    expect(transcriptOf('b')!.querySelector('[lang]')).toBeNull()
     expect(transcriptOf('c')!.textContent).toBe('voicemail.transcriptLabel voicemail.transcriptPending')
+    // One the platform never took in hand: said so.
+    expect(transcriptOf('y')!.textContent).toBe('voicemail.transcriptLabel voicemail.transcriptUntracked')
     // A message left before the platform transcribed: nothing said.
     expect(transcriptOf('z')).toBeNull()
     await click('a', 'voicemail.listenTo')
@@ -150,6 +165,10 @@ describe('the Messagerie vocale page', () => {
     // Told again (another Gateway's screen, a reload): said nothing more.
     send({ type: 'voicemail.transcribed', timestamp: at, payload: { id: 'c', transcript: { status: 'done', text: '' } } })
     expect(status()).toBe(said)
+    // None after all: said too, and why.
+    send({ type: 'voicemail.transcribed', timestamp: at, payload: { id: 'd', transcript: { status: 'none', reason: 'failed' } } })
+    expect(transcriptOf('d')!.textContent).toBe('voicemail.transcriptLabel voicemail.transcriptFailed')
+    expect(status()).toMatch(/^voicemail\.notTranscribedSaid 101 \| voicemail\.transcriptFailed\s?$/)
   })
 
   it('reads the list again when a message arrives during the first read, and shows it', async () => {

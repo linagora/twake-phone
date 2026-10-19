@@ -1446,7 +1446,7 @@ export const storeContract = (name: string, make: () => Promise<Store>) =>
       await s.close()
     })
 
-    it('changes a transcription under the lease only, dated later each time, and says what is due: a try due, a notice once transcribed, a notice to withdraw', async () => {
+    it('changes a transcription under the lease only, dated later each time, and says what is due in each queue: a try due, a notice once transcribed or waited for, a withdrawal first', async () => {
       const s = await make()
       const lease = await leaseOf(s)
       await s.addTranscript(transcript('m1'), lease, 9)
@@ -1454,32 +1454,49 @@ export const storeContract = (name: string, make: () => Promise<Store>) =>
       await s.addTranscript(transcript('m3', { notice: 'none' }), lease, 9)
       // m1: pending, its try due; m2: tried, the next one later; m3: no notice, pending, due.
       expect(await s.updateTranscript('A', 'jdupont', 'm2', { attempts: 1, nextAt: new Date(Date.now() + 3_600_000).toISOString() }, lease)).toBe(true)
-      expect((await s.dueTranscripts('A', 10)).map(t => t.messageId)).toEqual(['m1', 'm3'])
+      expect((await s.dueTranscripts('A', 'transcribe', 10)).map(t => t.messageId)).toEqual(['m1', 'm3'])
+      // No notice before its transcription, unless it waited longer than allowed (sent without its text then).
+      expect((await s.dueTranscripts('A', 'notice', 10)).map(t => t.messageId)).toEqual([])
+      expect((await s.dueTranscripts('A', 'notice', 10, 3_600_000)).map(t => t.messageId)).toEqual([])
+      await new Promise(r => setTimeout(r, 30))
+      expect((await s.dueTranscripts('A', 'notice', 10, 10)).map(t => t.messageId)).toEqual(['m1', 'm2'])
       const [before] = await s.listTranscripts('A', 'jdupont', ['m1'])
       expect(await s.updateTranscript('A', 'jdupont', 'm1', { status: 'done', text: 'Bonjour Jean', attempts: 1 }, lease)).toBe(true)
       const [after] = await s.listTranscripts('A', 'jdupont', ['m1'])
-      expect([after!.status, after!.text, after!.attempts, after!.notice]).toEqual(['done', 'Bonjour Jean', 1, 'pending'])
+      expect([after!.status, after!.text, after!.attempts, after!.notice, after!.noticeAttempts]).toEqual(['done', 'Bonjour Jean', 1, 'pending', 0])
       expect(Date.parse(after!.updatedAt)).toBeGreaterThan(Date.parse(before!.updatedAt))
-      // Transcribed, its notice due; m3's notice is none, its try due.
-      expect((await s.dueTranscripts('A', 10)).map(t => t.messageId)).toEqual(['m1', 'm3'])
-      expect((await s.dueTranscripts('A', 1)).map(t => t.messageId)).toEqual(['m1'])
-      expect(await s.updateTranscript('A', 'jdupont', 'm1', { notice: 'sent', noticeRoom: '!room:example.test', noticeEvent: '$event1' }, lease)).toBe(true)
+      expect(after!.createdAt).toBe(before!.createdAt)
+      // Transcribed: off the queue of the transcriptions, its notice due; m3's notice is none, its try due.
+      expect((await s.dueTranscripts('A', 'transcribe', 10)).map(t => t.messageId)).toEqual(['m3'])
+      expect((await s.dueTranscripts('A', 'notice', 10)).map(t => t.messageId)).toEqual(['m1'])
+      // A notice tried: its next try its own, the transcription's left as it was.
+      expect(await s.updateTranscript('A', 'jdupont', 'm1', { noticeAttempts: 1, noticeNextAt: new Date(Date.now() + 3_600_000).toISOString() }, lease)).toBe(true)
+      expect((await s.dueTranscripts('A', 'notice', 10)).map(t => t.messageId)).toEqual([])
+      expect((await s.listTranscripts('A', 'jdupont', ['m1']))[0]).toMatchObject({ attempts: 1, noticeAttempts: 1 })
+      expect(await s.updateTranscript('A', 'jdupont', 'm1', { notice: 'sent', noticeRoom: '!room:example.test', noticeEvent: '$event1', noticeAttempts: 0 }, lease)).toBe(true)
       expect(await s.updateTranscript('A', 'jdupont', 'm3', { status: 'none', reason: 'failed' }, lease)).toBe(true)
-      expect((await s.dueTranscripts('A', 10)).map(t => t.messageId)).toEqual([])
+      expect((await s.dueTranscripts('A', 'transcribe', 10)).map(t => t.messageId)).toEqual([])
+      expect((await s.dueTranscripts('A', 'notice', 10)).map(t => t.messageId)).toEqual([])
       expect((await s.listTranscripts('A', 'jdupont', ['m1']))[0]).toMatchObject({ notice: 'sent', noticeRoom: '!room:example.test', noticeEvent: '$event1' })
+      // A withdrawal comes before any notice to send.
+      await s.addTranscript(transcript('m4', { status: 'none', reason: 'too-long' }), lease, 9)
+      await s.eraseTranscripts('A', { holder: 'jdupont', messageId: 'm1' }, lease, true)
+      expect((await s.dueTranscripts('A', 'notice', 10)).map(t => [t.messageId, t.notice])).toEqual([['m1', 'redact'], ['m4', 'pending']])
+      expect((await s.dueTranscripts('A', 'notice', 1)).map(t => t.messageId)).toEqual(['m1'])
       // Not there, or under a lease no longer held: nothing written.
       expect(await s.updateTranscript('A', 'jdupont', 'm9', { attempts: 2 }, lease)).toBe(false)
-      expect(await s.updateTranscript('B', 'jdupont', 'm1', { attempts: 2 }, lease)).toBe(false)
-      expect(await s.updateTranscript('A', 'jdupont', 'm1', { attempts: 2 }, { ...lease, generation: lease.generation + 1 })).toBe(false)
-      expect(await s.deleteTranscript('A', 'jdupont', 'm1', { ...lease, holder: 'gw_2' })).toBe(false)
-      expect((await s.listTranscripts('A', 'jdupont', ['m1']))[0]!.attempts).toBe(1)
-      expect(await s.deleteTranscript('A', 'jdupont', 'm1', lease)).toBe(true)
-      expect(await s.deleteTranscript('A', 'jdupont', 'm1', lease)).toBe(false)
-      expect((await s.listTranscripts('A', 'jdupont')).map(t => t.messageId)).toEqual(['m2', 'm3'])
+      expect(await s.updateTranscript('B', 'jdupont', 'm3', { attempts: 2 }, lease)).toBe(false)
+      expect(await s.updateTranscript('A', 'jdupont', 'm3', { attempts: 2 }, { ...lease, generation: lease.generation + 1 })).toBe(false)
+      expect(await s.deleteTranscript('A', 'jdupont', 'm3', { ...lease, holder: 'gw_2' })).toBe(false)
+      expect((await s.listTranscripts('A', 'jdupont', ['m3']))[0]!.attempts).toBe(0)
+      expect(await s.deleteTranscript('A', 'jdupont', 'm3', lease)).toBe(true)
+      expect(await s.deleteTranscript('A', 'jdupont', 'm3', lease)).toBe(false)
+      expect((await s.listTranscripts('A', 'jdupont')).map(t => t.messageId)).toEqual(['m2', 'm4'])
+      expect((await s.listTranscripts('A', 'jdupont', undefined, true)).map(t => t.messageId)).toEqual(['m1', 'm2', 'm4'])
       await s.close()
     })
 
-    it("erases a holder's transcriptions, one message's or those received before a date: the text at once, the row kept while the bot's notice is to withdraw", async () => {
+    it("erases a holder's transcriptions, one message's or those received before a date: the text at once, the row kept while the bot's notice is to withdraw, or gone with it without a bot", async () => {
       const s = await make()
       const lease = await leaseOf(s)
       await s.addTranscript(transcript('m1', { receivedAt: '2026-09-01T10:00:00.000Z' }), lease, 9)
@@ -1489,22 +1506,62 @@ export const storeContract = (name: string, make: () => Promise<Store>) =>
       await s.updateTranscript('A', 'jdupont', 'm1', { status: 'done', text: 'Bonjour', notice: 'sent', noticeRoom: '!r:example.test', noticeEvent: '$e1' }, lease)
       await s.updateTranscript('A', 'bdurand', 'm3', { status: 'done', text: 'Salut' }, lease)
       // Under a lease no longer held: nothing.
-      expect(await s.eraseTranscripts('A', { before: '2026-10-01T00:00:00.000Z' }, { ...lease, holder: 'gw_2' })).toBeNull()
+      expect(await s.eraseTranscripts('A', { before: '2026-10-01T00:00:00.000Z' }, { ...lease, holder: 'gw_2' }, true)).toBeNull()
+      expect(await s.listTranscripts('A', 'bdurand', ['m3'])).toHaveLength(1)
       // The retention period: m1 (its notice sent: kept to withdraw it, without its text) and m3 (gone).
-      expect(await s.eraseTranscripts('A', { before: '2026-10-01T00:00:00.000Z' }, lease)).toBe(2)
+      expect(await s.eraseTranscripts('A', { before: '2026-10-01T00:00:00.000Z' }, lease, true)).toEqual({ erased: 2, notices: 1 })
       expect((await s.listTranscripts('A', 'jdupont')).map(t => t.messageId)).toEqual(['m2'])
       expect((await s.listTranscripts('A', 'bdurand')).map(t => t.messageId)).toEqual(['m4'])
-      const due = await s.dueTranscripts('A', 10)
+      const due = await s.dueTranscripts('A', 'notice', 10)
       const m1 = due.find(t => t.messageId === 'm1')!
       expect([m1.status, m1.text, m1.notice, m1.noticeRoom, m1.noticeEvent]).toEqual(['erased', undefined, 'redact', '!r:example.test', '$e1'])
       // Erased once: not counted again.
-      expect(await s.eraseTranscripts('A', { before: '2026-10-01T00:00:00.000Z' }, lease)).toBe(0)
-      // One message, then a holder's all.
-      expect(await s.eraseTranscripts('A', { holder: 'bdurand', messageId: 'm4' }, lease)).toBe(1)
-      expect(await s.eraseTranscripts('A', { holder: 'jdupont' }, lease)).toBe(1)
+      expect(await s.eraseTranscripts('A', { before: '2026-10-01T00:00:00.000Z' }, lease, true)).toEqual({ erased: 0, notices: 0 })
+      // One message of one holder only (another's of the same id left), then a holder's all.
+      await s.addTranscript(transcript('m4', { holder: 'amartin', receivedAt: '2026-10-18T10:00:00.000Z' }), lease, 9)
+      expect(await s.eraseTranscripts('A', { holder: 'bdurand', messageId: 'm4' }, lease, true)).toEqual({ erased: 1, notices: 0 })
+      expect((await s.listTranscripts('A', 'amartin')).map(t => t.messageId)).toEqual(['m4'])
+      expect(await s.eraseTranscripts('A', { holder: 'jdupont' }, lease, true)).toEqual({ erased: 1, notices: 0 })
       expect(await s.listTranscripts('A', 'jdupont')).toEqual([])
       expect(await s.listTranscripts('A', 'bdurand')).toEqual([])
-      expect((await s.dueTranscripts('A', 10)).map(t => t.messageId)).toEqual(['m1'])
+      expect((await s.dueTranscripts('A', 'notice', 10)).map(t => t.messageId)).toEqual(['m1'])
+      // Without a bot to withdraw them: every row goes, its notice counted as left in Chat.
+      await s.updateTranscript('A', 'amartin', 'm4', { status: 'done', text: 'Coucou', notice: 'sent', noticeRoom: '!r:example.test', noticeEvent: '$e4' }, lease)
+      await s.addTranscript(transcript('m5', { holder: 'amartin' }), lease, 9)
+      expect(await s.eraseTranscripts('A', { holder: 'amartin' }, lease, false)).toEqual({ erased: 2, notices: 1 })
+      expect(await s.listTranscripts('A', 'amartin', undefined, true)).toEqual([])
+      await s.close()
+    })
+
+    it('keeps the holder of a person given an id someone had before them (its rank after a NUL) as it is, apart from the first one (step 11b)', async () => {
+      const s = await make()
+      const lease = await leaseOf(s)
+      const second = 'jdupont\u00001'
+      expect(await s.addTranscript(transcript('m1', { holder: second }), lease, 9)).toBe('added')
+      expect(await s.addTranscript(transcript('m1'), lease, 9)).toBe('added')
+      expect(await s.addTranscript(transcript('m1', { holder: 'jd%00' }), lease, 9)).toBe('added')
+      expect(await s.updateTranscript('A', second, 'm1', { status: 'done', text: 'Bonjour' }, lease)).toBe(true)
+      expect((await s.listTranscripts('A', second)).map(t => [t.holder, t.status])).toEqual([[second, 'done']])
+      expect((await s.listTranscripts('A', 'jdupont')).map(t => [t.holder, t.status])).toEqual([['jdupont', 'pending']])
+      expect((await s.listTranscripts('A', 'jd%00')).map(t => t.holder)).toEqual(['jd%00'])
+      expect((await s.transcriptsChangedSince('A', '2026-01-01T00:00:00.000Z', 10)).map(t => t.holder)).toEqual([second])
+      expect((await s.dueTranscripts('A', 'transcribe', 10)).map(t => t.holder).sort()).toEqual(['jd%00', 'jdupont'])
+      expect(await s.eraseTranscripts('A', { holder: second }, lease, true)).toEqual({ erased: 1, notices: 0 })
+      expect(await s.deleteTranscript('A', 'jd%00', 'm1', lease)).toBe(true)
+      expect((await s.listTranscripts('A', 'jdupont')).map(t => t.holder)).toEqual(['jdupont'])
+      await s.close()
+    })
+
+    it('counts the transcriptions that still wait, written down before a date', async () => {
+      const s = await make()
+      const lease = await leaseOf(s)
+      await s.addTranscript(transcript('m1'), lease, 9)
+      await s.addTranscript(transcript('m2', { status: 'none', reason: 'too-long', notice: 'none' }), lease, 9)
+      await s.addTranscript(transcript('m3', { status: 'none', reason: 'too-long' }), lease, 9)
+      const later = new Date(Date.now() + 60_000).toISOString()
+      expect(await s.staleTranscripts('A', later)).toBe(2)
+      expect(await s.staleTranscripts('A', '2026-01-01T00:00:00.000Z')).toBe(0)
+      expect(await s.staleTranscripts('B', later)).toBe(0)
       await s.close()
     })
 

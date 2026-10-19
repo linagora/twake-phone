@@ -899,5 +899,10 @@
   "admin.webhooks.event.voicemail.transcribed": "Voicemail transcribed",
   "admin.alert.voicemailTranscriptionBusy": "Too many messages were waiting for their transcription: the next ones are not transcribed (how many at most)",
   "admin.alert.voicemailTranscriptionFailed": "The transcription service (LinTO) could not transcribe a message after several tries",
-  "admin.alert.voicemailNoticeFailed": "The bot could not send the notice of a message to Twake Chat after several tries"
+  "admin.alert.voicemailNoticeFailed": "The bot could not send the notice of a message to Twake Chat after several tries",
+  "voicemail.transcriptUntracked": "none, this message was not taken in hand by the transcription.",
+  "voicemail.notTranscribedSaid": "Message from {who}: no transcript, {why}",
+  "admin.alert.voicemailTranscriptionBacklog": "Transcriptions or notices have been waiting for more than 30 minutes (how many): the transcription service or the Matrix server does not answer",
+  "admin.alert.voicemailNoticeNoAccount": "The bot knows no Matrix account to send the notice of a message to (how many since the start): see LDAP_ATTR_MATRIX or MATRIX_USER_TEMPLATE",
+  "admin.alert.voicemailNoticeNotWithdrawn": "Notices of erased messages stay in Twake Chat: the bot is no longer set up to withdraw them (how many)"
 }

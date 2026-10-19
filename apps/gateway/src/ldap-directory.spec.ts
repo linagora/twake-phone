@@ -151,10 +151,25 @@ describe('LdapDirectory against a real LDAP server', () => {
       expect(await d.matrixIdOf('t', 'nobody')).toBeUndefined()
       expect(await d.matrixIdOf('t', 'jd*')).toBeUndefined()
       expect(await d.matrixIdOf('t', '*)(uid=jdupont')).toBeUndefined()
+      // The directory matches an id whatever its case: the entry found is not the one asked for.
+      expect(await d.matrixIdOf('t', 'JDUPONT')).toBeUndefined()
       // Without LDAP_ATTR_MATRIX: none, the directory not even asked.
       expect(await make({ url: mock.url }).matrixIdOf('t', 'jdupont')).toBeUndefined()
       // Never in a contact shown.
       expect(JSON.stringify((await d.search('t', 'dupont', 10)).items)).not.toContain('chat.example.test')
+    } finally {
+      await mock.stop()
+    }
+  })
+
+  it('takes no Matrix id when two entries have the id asked, nor when the entry gives two (step 11b)', async () => {
+    const twin = { uid: 'twin', cn: 'Twin', sn: 'Twin', twakeMatrixId: '@twin.one:chat.example.test' }
+    const people = [...(PEOPLE as Record<string, unknown>[]), twin, { ...twin, cn: 'Twin Two', twakeMatrixId: '@twin.two:chat.example.test' }, { uid: 'multi', cn: 'Multi', sn: 'Multi', twakeMatrixId: ['@multi.a:chat.example.test', '@multi.b:chat.example.test'] }]
+    const mock = await startLdapMock({ people })
+    try {
+      const d = make({ url: mock.url, matrixAttribute: 'twakeMatrixId' })
+      await expect(d.matrixIdOf('t', 'twin')).rejects.toMatchObject({ code: 'MATRIX_ID_AMBIGUOUS' })
+      await expect(d.matrixIdOf('t', 'multi')).rejects.toMatchObject({ code: 'MATRIX_ID_AMBIGUOUS' })
     } finally {
       await mock.stop()
     }

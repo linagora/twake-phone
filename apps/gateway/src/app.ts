@@ -28,7 +28,7 @@ import { newWebhookSecret, parseWebhookDomains } from './webhook-delivery.js'
 import { eventId, presenceEvent, webhookEventsFor } from './webhook-events.js'
 import { VOICEMAIL_ID } from './voicemail.js'
 import { VoicemailLeases, voicemailRole, type VoicemailWeight } from './voicemail-lease.js'
-import { TranscriptWatcher, VoicemailTranscripts, publicTranscript, userOfHolder, type NoticeSettings, type TranscriptionSettings } from './voicemail-transcripts.js'
+import { TranscriptWatcher, VoicemailTranscripts, publicTranscript, userOfHolder, type NoticeSettings, type TranscriptAlert, type TranscriptionSettings } from './voicemail-transcripts.js'
 import { DELIVERY_CURSOR, DELIVERY_ID, MAX_WEBHOOKS, WEBHOOK_ID, WEBHOOK_SECRET_GRACE_MS, WEBHOOK_SENDS_PER_MINUTE, WEBHOOK_TENANT_SENDS_PER_MINUTE, WebhookHub, parseSubscription, publicDelivery, publicSubscription, secretContext, type WebhookHubOptions } from './webhooks.js'
 import { MAX_DIDS, MAX_TRUNKS, TRUNK_ID, defaultTrunk, inDids, parseDid, parseOperatorLines, parseTrunk, providerTrunks, publicDid, publicTrunk, trunkRecord } from './trunks.js'
 import { EMPTY_OUTBOUND, PROFILE_ID, outboundVersion, parseOutbound, staleOutbound, type Outbound } from './outbound.js'
@@ -297,6 +297,11 @@ export interface BuildOptions {
   transcriptRetryMs?: number[]
   noticeRetryMs?: number[]
   transcriptEveryMs?: number
+  /** The rest of VoicemailTranscripts' bounds (tests): how often the mailboxes are reconciled, how long a notice waits for its text, the pauses of a failing transcription service, how long a declined room stays so. */
+  transcriptReconcileMs?: number
+  noticeWaitMs?: number
+  transcriptBreakerMs?: number[]
+  declinedMs?: number
   /** How often each Gateway looks for transcriptions done, for its screens (TranscriptWatcher): 2 s by default. */
   transcriptWatchMs?: number
   /**
@@ -676,9 +681,6 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
       await within(store.addAlert({ tenantId, at: event.timestamp, alert }), historyWriteMs, 'alert write').catch(err => app.log.error({ err, tenantId }, 'could not record the alert'))
       return
     }
-    // A message gone (step 11b), whoever's it was: its transcription goes and the bot's notice is withdrawn, by the
-    // Gateway that writes the mailboxes (the others: nothing).
-    if (event.type === 'voicemail.deleted') void transcripts.deleted(tenantId, event.payload.id).catch((err: unknown) => app.log.error({ err, tenantId }, 'voicemail transcription not erased'))
     const userId = await dir.userIdForExtension(tenantId, extension)
     if (!userId) return
     // A mailbox's news (step 11a): for its holder only, never for someone the extension was just given to (the
@@ -688,6 +690,9 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
       const vm = options.voicemail?.(tenantId)
       const holder = await holderIdFor(tenantId, userId)
       if (!vm || !(await vm.owns({ extension, userId: holder, ...(mailbox !== undefined ? { mailbox } : {}) }))) return
+      // A message of this holder gone (step 11b): its transcription goes and the bot's notice is withdrawn, by the
+      // Gateway that writes the mailboxes (the others: nothing; a mailbox moved meanwhile: the reconciliation).
+      if (event.type === 'voicemail.deleted') void transcripts.deleted(tenantId, holder, event.payload.id).catch((err: unknown) => app.log.error({ err, tenantId }, 'voicemail transcription not erased'))
       if (event.type !== 'voicemail.created') {
         bus.publish(tenantId, userId, event)
         return
@@ -892,8 +897,10 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
           )
           .then(() => syncVoicemail(tenantId, provider))
       if (purgeTimer) void purgeVoicemail(tenantId)
-      // The transcriptions and notices left by the one that wrote before (step 11b): this one goes on with them.
+      // The transcriptions and notices left by the one that wrote before (step 11b): this one goes on with them, and
+      // catches up with the messages none heard while it did not write (their events missed).
       transcripts.kick(tenantId)
+      void transcripts.reconcile(tenantId)
     },
     logger: app.log
   })
@@ -912,7 +919,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
    * most for each, a queue full or a service down stays one alert, not one per message.
    */
   const transcriptAlerted = new Map<string, number>()
-  const transcriptAlert = async (tenantId: string, param: 'transcription-busy' | 'transcription-failed' | 'notice-failed', value: number) => {
+  const transcriptAlert = async (tenantId: string, param: TranscriptAlert, value: number) => {
     const k = `${tenantId}\u0000${param}`
     const last = transcriptAlerted.get(k)
     if (last !== undefined && Date.now() - last < 3_600_000) return
@@ -933,6 +940,12 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         return generation === undefined ? undefined : { role: voicemailRole(tenantId), holder: voicemailHolder, generation }
       },
       holderIdFor,
+      // The mailboxes as the synchronisation hands them: where each is reached, its holder.
+      mailboxes: async tenantId => {
+        const ids = await holderIdsOf(tenantId)
+        return (await store.listMappings(tenantId)).map(m => ({ extension: m.extension, holder: ids(m.userId) }))
+      },
+      retentionMs: (options.voicemailRetentionDays ?? 30) * 86_400_000,
       // Settled (done, or none and why): the subscribers told, once, never with the text.
       onSettled: (tenantId, r) => {
         const transcript = publicTranscript(r)
@@ -943,7 +956,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
           occurred_at: new Date().toISOString(),
           tenant: tenantId,
           voicemail: { id: r.messageId, user: userOfHolder(r.holder), extension: r.extension },
-          transcript: { status: transcript.status, ...(transcript.reason ? { reason: transcript.reason } : {}) }
+          transcript: { status: transcript.status, ...(transcript.status === 'none' && r.reason ? { reason: r.reason } : {}) }
         })
       },
       alert: transcriptAlert,
@@ -951,7 +964,11 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
       log: app.log,
       ...(options.transcriptRetryMs ? { retryMs: options.transcriptRetryMs } : {}),
       ...(options.noticeRetryMs ? { noticeRetryMs: options.noticeRetryMs } : {}),
-      ...(options.transcriptEveryMs !== undefined ? { everyMs: options.transcriptEveryMs } : {})
+      ...(options.transcriptEveryMs !== undefined ? { everyMs: options.transcriptEveryMs } : {}),
+      ...(options.transcriptReconcileMs !== undefined ? { reconcileEveryMs: options.transcriptReconcileMs } : {}),
+      ...(options.noticeWaitMs !== undefined ? { noticeWaitMs: options.noticeWaitMs } : {}),
+      ...(options.transcriptBreakerMs ? { breakerMs: options.transcriptBreakerMs } : {}),
+      ...(options.declinedMs !== undefined ? { declinedMs: options.declinedMs } : {})
     },
     () => started.keys()
   )
@@ -966,6 +983,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
           holderIdFor,
           publish: (tenantId, userId, event) => bus.publish(tenantId, userId, event),
           log: app.log,
+          ...(options.transcription.lang ? { lang: options.transcription.lang } : {}),
           ...(options.transcriptWatchMs !== undefined ? { everyMs: options.transcriptWatchMs } : {})
         })
       : undefined
@@ -1157,11 +1175,11 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
       const epoch = (value as { epoch?: unknown } | undefined)?.epoch
       const holder = typeof epoch === 'number' ? holderIdOf(userId, { epoch }) : await holderIdFor(tenantId, userId)
       const erased = await vm.eraseMessages({ userId: holder }, { mayWrite: () => mayWriteVoicemail(tenantId) })
-      // Their transcriptions too (step 11b), the bot's notices withdrawn at once: rejected under a lease lost, the
-      // erasure stays asked for the next round.
+      // Their transcriptions too (step 11b), the bot's notices withdrawn at once (whether the transcription and the bot
+      // are still on or not): rejected under a lease lost, the erasure stays asked for the next round.
       const transcribed = await transcripts.erase(tenantId, holder)
       await store.deleteOperatorState(tenantId, key, value)
-      app.log.info({ tenantId, erased, transcribed }, 'mailboxes: the messages of a person erased, as asked')
+      app.log.info({ tenantId, erased, transcribed: transcribed.erased, notWithdrawn: transcribed.notWithdrawn }, 'mailboxes: the messages of a person erased, as asked')
     }
   }
   /** An erasure of the messages of `userId` asked, for the Gateway that writes the mailboxes (at its next look). */
@@ -1274,6 +1292,8 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
     void (async () => {
       // At an extension its holder holds now, as the store says at each event.
       for await (const { extension, event, mailbox } of vm.subscribe({
+        // Heard (again) after a gap: what came meanwhile is caught up by the Gateway that writes the mailboxes.
+        onHeard: () => void transcripts.reconcile(tenantId),
         holders: async () => {
           const mappings = await store.listMappings(tenantId)
           const ids = await holderIdsOf(tenantId)
@@ -2237,9 +2257,11 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
           return reply.code(409).send({ statusCode: 409, code: 'VOICEMAIL_ERASE_LISTED', error: 'Conflict', message: 'The directory still lists this person: their messages are theirs to erase' })
         // Counted once asked only: a refusal above costs no place.
         if (!erasures.allow(`admin:${user.tenantId}`)) return erasureRate(reply)
+        // Without a bot any more, the notices of their messages in Chat cannot be withdrawn (step 11b): said.
+        const left = await transcripts.noticesLeft(user.tenantId, await holderIdFor(user.tenantId, userId)).catch(() => false)
         await askErasure(user.tenantId, userId)
         req.log.warn({ tenantId: user.tenantId, by: user.id }, 'mailboxes: the messages of someone who left to be erased, as an administrator asked')
-        return reply.code(202).send({ erasure: 'asked', applied: 'at the next synchronisation of the mailboxes' })
+        return reply.code(202).send({ erasure: 'asked', applied: 'at the next synchronisation of the mailboxes', ...(left ? { chatNotices: 'not-withdrawn' } : {}) })
       })
       v1.get('/admin/dids', async req => {
         const user = await administrator(req)
@@ -2560,8 +2582,11 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         // one that writes the voicemail server), done at its next round, Wazo down or not.
         if (!vm) return reply.send({ deleted } satisfies HistoryErasure)
         if (!erasures.allow(`user:${user.tenantId}\u0000${user.id}`)) return reply.send({ deleted, voicemailErasure: 'limited' } satisfies HistoryErasure)
+        // Their transcriptions are erased whether the transcription and the bot are on or not (step 11b); without a bot
+        // any more, the notices of their messages in Chat cannot be withdrawn: said.
+        const left = await transcripts.noticesLeft(user.tenantId, await holderIdFor(user.tenantId, user.id)).catch(() => false)
         await askErasure(user.tenantId, user.id)
-        return reply.send({ deleted, voicemailErasure: 'asked' } satisfies HistoryErasure)
+        return reply.send({ deleted, voicemailErasure: 'asked', ...(left ? { chatNotices: 'not-withdrawn' as const } : {}) } satisfies HistoryErasure)
       })
 
       // The person's mailbox (step 11a, ADR 0022): their messages, newest first, each one's audio, marked as read
@@ -2584,16 +2609,21 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         const { vm, tenantId, owner } = await mailboxOf(req)
         if (!owner) return { items: [] }
         const items = await vm.listMessages(owner).catch(unreachable)
-        if (!transcripts.on || !items.length) return { items }
-        // Each one's transcription (step 11b): this holder's only, as the store keeps it (none for one never heard).
-        const kept = await store.listTranscripts(tenantId, owner.userId, items.map(v => v.id)).catch((err: unknown) => {
+        if (!items.length) return { items }
+        // Each one's transcription (step 11b): this holder's only, as the store keeps it; one the table has no row of
+        // is on its way (the reconciliation catches it up) or too old for it (`untracked`).
+        let kept: Awaited<ReturnType<Store['listTranscripts']>> | undefined
+        try {
+          kept = await store.listTranscripts(tenantId, owner.userId, items.map(v => v.id))
+        } catch (err) {
           req.log.warn({ err }, 'transcriptions not read')
-          return []
-        })
-        const byId = new Map(kept.map(r => [r.messageId, publicTranscript(r)] as const))
+        }
+        if (!kept) return { items }
+        const byId = new Map(kept.map(r => [r.messageId, r] as const))
         return {
           items: items.map(v => {
-            const transcript = byId.get(v.id)
+            const row = byId.get(v.id)
+            const transcript = row ? publicTranscript(row, transcripts.lang) : transcripts.missing(tenantId, v)
             return transcript ? { ...v, transcript } : v
           })
         }
@@ -2619,7 +2649,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         const { vm, tenantId, owner } = await mailboxOf(req)
         if (!owner || !VOICEMAIL_ID.test(req.params.id) || !(await vm.deleteMessage(owner, req.params.id).catch(unreachable))) throw noMessage()
         // Its transcription and the bot's notice too, at once when this Gateway writes the mailboxes (else at the event).
-        void transcripts.deleted(tenantId, req.params.id).catch((err: unknown) => req.log.error({ err }, 'voicemail transcription not erased'))
+        void transcripts.deleted(tenantId, owner.userId, req.params.id).catch((err: unknown) => req.log.error({ err }, 'voicemail transcription not erased'))
         return reply.code(204).send()
       })
 

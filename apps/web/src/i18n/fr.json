@@ -899,5 +899,10 @@
   "admin.webhooks.event.voicemail.transcribed": "Message vocal transcrit",
   "admin.alert.voicemailTranscriptionBusy": "Trop de messages attendaient leur transcription : les suivants ne sont pas transcrits (combien au plus)",
   "admin.alert.voicemailTranscriptionFailed": "Le service de transcription (LinTO) n'a pas pu transcrire un message après plusieurs essais",
-  "admin.alert.voicemailNoticeFailed": "Le bot n'a pas pu envoyer l'avis d'un message dans Twake Chat après plusieurs essais"
+  "admin.alert.voicemailNoticeFailed": "Le bot n'a pas pu envoyer l'avis d'un message dans Twake Chat après plusieurs essais",
+  "voicemail.transcriptUntracked": "aucune, ce message n'a pas été pris en charge par la transcription.",
+  "voicemail.notTranscribedSaid": "Message de {who} : pas de transcription, {why}",
+  "admin.alert.voicemailTranscriptionBacklog": "Des transcriptions ou des avis attendent depuis plus de 30 minutes (combien) : le service de transcription ou le serveur Matrix ne répond pas",
+  "admin.alert.voicemailNoticeNoAccount": "Le bot ne connaît pas de compte Matrix à qui envoyer l'avis d'un message (combien depuis le démarrage) : voir LDAP_ATTR_MATRIX ou MATRIX_USER_TEMPLATE",
+  "admin.alert.voicemailNoticeNotWithdrawn": "Des avis de messages effacés restent dans Twake Chat : le bot n'est plus configuré pour les retirer (combien)"
 }

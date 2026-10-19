@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs'
 import { Client, FilterParser, escapeFilter, type Entry } from 'ldapts'
 import type { Contact, ContactNumber, TenantId } from '@twake/telephony-types'
 import type { ContactDirectory, DirectorySource, SearchResult } from './contacts.js'
+import { MATRIX_ID_AMBIGUOUS } from './matrix.js'
 
 /** Which LDAP attributes carry what. Defaults fit inetOrgPerson; a beneficiary's schema is mapped from the environment. */
 export interface LdapAttributes {
@@ -39,7 +40,9 @@ export interface LdapDirectoryConfig {
   rejectUnauthorized?: boolean
   /**
    * The attribute that holds a person's Matrix user id (step 11b, LDAP_ATTR_MATRIX): where the bot of TwakePhone writes
-   * to them in Twake Chat. Read for that only, never shown in the directory.
+   * to them in Twake Chat. Read for that only, never shown in the directory. Only the administrators of the directory
+   * may write it (its access rules): someone who could set their own would have the bot invite any account of the
+   * homeserver, with a text the caller dictates.
    */
   matrixAttribute?: string
 }
@@ -205,16 +208,19 @@ export class LdapDirectory implements ContactDirectory {
 
   /**
    * The Matrix user id the directory gives the person (`matrixAttribute`), undefined when it gives none, or when the
-   * attribute is not set; its first value only.
+   * attribute is not set. Their own entry only, its id the very one asked (the directory matches ids whatever their
+   * case). Two entries of that id, or two values of the attribute (whose order LDAP does not keep): an error
+   * (`MATRIX_ID_AMBIGUOUS`), no notice rather than one to someone else's account.
    */
   async matrixIdOf(_tenantId: TenantId, userId: string): Promise<string | undefined> {
     const attr = this.config.matrixAttribute
     if (!attr) return undefined
-    const [entry] = await this.entries(`(&${this.userFilter}${escapeFilter`(${this.config.attributes.id}=${userId})`})`, 2, false, [this.config.attributes.id, attr])
-    if (!entry) return undefined
-    const e = lowered(entry)
-    if (e[this.config.attributes.id.toLowerCase()]?.[0] !== userId) return undefined
-    return e[attr.toLowerCase()]?.[0]
+    const id = this.config.attributes.id.toLowerCase()
+    const found = (await this.entries(`(&${this.userFilter}${escapeFilter`(${this.config.attributes.id}=${userId})`})`, 2, false, [this.config.attributes.id, attr])).map(lowered).filter(e => e[id]?.includes(userId))
+    if (found.length > 1) throw Object.assign(new Error('LDAP: two entries have this id, no Matrix id taken'), { code: MATRIX_ID_AMBIGUOUS })
+    const values = found[0]?.[attr.toLowerCase()] ?? []
+    if (values.length > 1) throw Object.assign(new Error('LDAP: the entry has two Matrix ids, none taken'), { code: MATRIX_ID_AMBIGUOUS })
+    return values[0]
   }
 }
 

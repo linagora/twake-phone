@@ -620,10 +620,34 @@ export interface TranscriptRecord {
   attempts: number
   nextAt: string
   notice: TranscriptNotice
+  /** The tries of the notice (or of its withdrawal) so far, and when the next one is due: their own, apart from the transcription's. */
+  noticeAttempts: number
+  noticeNextAt: string
   noticeRoom?: string
   noticeEvent?: string
-  /** On the store's clock: when it last changed (the Gateways tell the change to the holder's screens). */
+  /** On the store's clock: when it was written down, and when it last changed (the Gateways tell the change to the holder's screens). */
+  createdAt: string
   updatedAt: string
+}
+
+/**
+ * A holder as a text of PostgreSQL keeps it (a column, a JSON value): the id the mailboxes know a person by carries a
+ * NUL before its rank (`<id>\0<rank>`, HolderRecord), which such a text cannot hold. Written `%00` (and `%` as `%25`, so
+ * that it reads back as it was).
+ */
+export const holderIn = (holder: string) => holder.replace(/%/g, '%25').split('\u0000').join('%00')
+export const holderOut = (kept: string) => kept.replace(/%(25|00)/g, (_, c: string) => (c === '25' ? '%' : '\u0000'))
+
+/** The two queues of the transcriptions (dueTranscripts), each its own: the transcriptions, and the notices with their withdrawals. */
+export type TranscriptLane = 'transcribe' | 'notice'
+
+/** Which transcriptions an erasure takes (eraseTranscripts): a holder's (one message of theirs), or those received before a date. */
+export type TranscriptMatch = { holder: string; messageId?: string } | { before: string }
+
+/** What an erasure did: how many it erased, and how many of them had a notice in Chat (to withdraw, or left there). */
+export interface TranscriptErasure {
+  erased: number
+  notices: number
 }
 
 /** A message to transcribe (addTranscript): `pending`, or `none` with why. */
@@ -634,7 +658,7 @@ export type NewTranscript = Pick<TranscriptRecord, 'tenantId' | 'holder' | 'mess
 }
 
 /** A change of a transcription (updateTranscript). */
-export type TranscriptChange = Partial<Pick<TranscriptRecord, 'status' | 'reason' | 'text' | 'attempts' | 'nextAt' | 'notice' | 'noticeRoom' | 'noticeEvent'>>
+export type TranscriptChange = Partial<Pick<TranscriptRecord, 'status' | 'reason' | 'text' | 'attempts' | 'nextAt' | 'notice' | 'noticeAttempts' | 'noticeNextAt' | 'noticeRoom' | 'noticeEvent'>>
 
 export interface Store {
   listProviders(): Promise<ProviderRecord[]>
@@ -732,19 +756,23 @@ export interface Store {
   /** Removes one (its notice withdrawn); false when it is not there, or under a lease no longer held. */
   deleteTranscript(tenantId: string, holder: string, messageId: string, lease: FencedLease): Promise<boolean>
   /**
-   * Erases the transcriptions of the tenant that match: of one holder (`holder`), one message (`messageId`, of that
-   * holder or of whoever: the ids of a voicemail server are its own), or received before `before` (the retention period). Each one's text goes at once; one whose
-   * notice was sent stays as `erased`, its notice to withdraw (`redact`), the others go. How many; null when the
-   * lease is no longer held (nothing written).
+   * Erases the transcriptions of the tenant that match (TranscriptMatch): of one holder, one message of one holder, or
+   * received before `before` (the retention period). Each one's text goes at once. With `withdraw` (a bot to withdraw
+   * the notices), one whose notice was sent stays as `erased`, its notice to withdraw (`redact`), the others go;
+   * without, they all go, the notices left in Chat counted. Checked against the lease in the very statement that
+   * erases: null when it is no longer held (nothing written).
    */
-  eraseTranscripts(tenantId: string, match: { holder?: string; messageId?: string; before?: string }, lease: FencedLease): Promise<number | null>
-  /** A holder's transcriptions (of `messageIds` when given), erased ones left out. */
-  listTranscripts(tenantId: string, holder: string, messageIds?: string[]): Promise<TranscriptRecord[]>
+  eraseTranscripts(tenantId: string, match: TranscriptMatch, lease: FencedLease, withdraw: boolean): Promise<TranscriptErasure | null>
+  /** A holder's transcriptions (of `messageIds` when given), erased ones left out unless `withErased`. */
+  listTranscripts(tenantId: string, holder: string, messageIds?: string[], withErased?: boolean): Promise<TranscriptRecord[]>
   /**
-   * What is due (its next try, `nextAt`, come), oldest first, `limit` at most: a transcription pending, a notice to send
-   * once the transcription is no longer pending, a notice to withdraw (due at once when erased).
+   * What is due in one queue, `limit` at most. `transcribe`: a transcription pending whose next try (`nextAt`) came,
+   * oldest first. `notice` (its next try, `noticeNextAt`, come): a notice to withdraw first, then a notice to send once
+   * the transcription is no longer pending, or written down more than `noticeWaitMs` ago (sent without its text).
    */
-  dueTranscripts(tenantId: string, limit: number): Promise<TranscriptRecord[]>
+  dueTranscripts(tenantId: string, lane: TranscriptLane, limit: number, noticeWaitMs?: number): Promise<TranscriptRecord[]>
+  /** How many of the tenant's transcriptions written down before `before` still wait (a transcription, a notice, a withdrawal). */
+  staleTranscripts(tenantId: string, before: string): Promise<number>
   /** The transcriptions of the tenant that changed after `since` (store's clock) and are `done` or `none`, oldest change first. */
   transcriptsChangedSince(tenantId: string, since: string, limit: number): Promise<TranscriptRecord[]>
 

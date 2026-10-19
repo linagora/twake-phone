@@ -111,6 +111,15 @@ jobs:
       # les messageries (étape 11a, ADR 0022 : images officielles épinglées par empreinte). Étape 11b (ADR 0023) : le
       # vrai LinTO STT (moteur Kaldi, le plus petit modèle français, construit avec l'image) et un Synapse pour le bot
       # Matrix. Réseau hôte.
+      # Le modèle de LinTO STT gardé d'un run à l'autre : une panne du site de son éditeur n'arrête aucun build. Vérifié
+      # par son SHA-256 à chaque fois, en cache ou téléchargé (docker/linto/fetch-model.py).
+      - name: Cache du modèle de LinTO STT
+        uses: actions/cache@v4
+        with:
+          path: docker/linto/model-cache
+          key: linto-model-vosk-model-small-fr-0.22-cabf6180e177eb9b3a9a9d43a437bd5e549f3a7d09525e5d69a3fed787be12ad
+      - name: Modèle de LinTO STT (téléchargé s'il n'est pas en cache)
+        run: python3 -I docker/linto/fetch-model.py --into docker/linto/model-cache vosk-model-small-fr-0.22 cabf6180e177eb9b3a9a9d43a437bd5e549f3a7d09525e5d69a3fed787be12ad
       - name: Stack SIP (Docker Compose)
         run: docker compose -f docker/docker-compose.sip.yml up --build --wait --wait-timeout 420
       # Chaque socket des services Wazo (bus et base compris), de LinTO STT et de Synapse (étape 11b), lu dans /proc :

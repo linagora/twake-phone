@@ -264,6 +264,11 @@ export interface VoicemailSubscribeOptions {
    * holds now, read at each event. Without it, the extensions of the last synchronisation.
    */
   holders?(): Promise<{ extension: string; userId: string }[]>
+  /**
+   * The events are heard (again): at the start of the stream and after each gap (a connection to the voicemail server
+   * lost and made again), when events of the gap may have been lost. The Gateway then reads the mailboxes again.
+   */
+  onHeard?: () => void
 }
 
 /**

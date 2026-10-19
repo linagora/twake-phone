@@ -983,6 +983,32 @@ describe('WazoVoicemail, the events', () => {
     await vm.close()
   })
 
+  it('says when its events are heard, at the start and again after each gap, so that the Gateway reads the mailboxes again (step 11b)', async () => {
+    const { vm, ws } = make()
+    await vm.syncMailboxes([])
+    let heard = 0
+    vm.subscribe({ onHeard: () => void heard++ })
+    await tick(1)
+    expect(heard).toBe(1)
+    ws.sockets[0]!.drop()
+    expect(heard).toBe(1)
+    await tick(20)
+    expect(vm.getStatus()).toBe('CONNECTED')
+    expect(heard).toBe(2)
+    // A Gateway whose callback fails still hears the events.
+    const other = make()
+    await other.vm.syncMailboxes([])
+    other.vm.subscribe({
+      onHeard: () => {
+        throw new Error('nobody to tell')
+      }
+    })
+    await tick(1)
+    expect(other.vm.getStatus()).toBe('CONNECTED')
+    await vm.close()
+    await other.vm.close()
+  })
+
   it('reads a message as Wazo gives it: no number that is none, no name that is a number or Asterisk saying it has none', () => {
     expect(voicemailOf({ id: '1-1', caller_id_num: '<unknown>', caller_id_name: '101', timestamp: 0, duration: -1 }, { type: 'old' })).toEqual({ id: '1-1', fromName: '101', receivedAt: '1970-01-01T00:00:00.000Z', durationSec: 0, unread: false })
     expect(voicemailOf({ id: '1-1', caller_id_num: '101', caller_id_name: '101' }, undefined)).toEqual({ id: '1-1', from: '101', receivedAt: '1970-01-01T00:00:00.000Z', durationSec: 0, unread: false })

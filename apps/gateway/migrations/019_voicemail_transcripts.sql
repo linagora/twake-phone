@@ -1,5 +1,5 @@
 -- Step 11b (ADR 0023): the transcriptions of the messages of the mailboxes, and the bot's notice of each in Chat. By
--- tenant, holder (the id the mailboxes know the person by, HolderRecord of step 11a) and message. Written by the Gateway
+-- tenant, holder (the id the mailboxes know the person by, HolderRecord of step 11a, its NUL written %00) and message. Written by the Gateway
 -- that holds the lease of the mailboxes (`voicemail:<tenant>`), under its generation: a write checks it in the same
 -- statement. The text goes with the message: deleted, past the retention period, or erased (the person's right).
 CREATE TABLE IF NOT EXISTS voicemail_transcripts (
@@ -18,6 +18,9 @@ CREATE TABLE IF NOT EXISTS voicemail_transcripts (
   next_at timestamptz NOT NULL DEFAULT clock_timestamp(),
   -- pending | sent | none | redact
   notice text NOT NULL,
+  -- The tries of the notice (or of its withdrawal), apart from the transcription's: each queue its own.
+  notice_attempts integer NOT NULL DEFAULT 0,
+  notice_next_at timestamptz NOT NULL DEFAULT clock_timestamp(),
   notice_room text,
   notice_event text,
   created_at timestamptz NOT NULL DEFAULT clock_timestamp(),

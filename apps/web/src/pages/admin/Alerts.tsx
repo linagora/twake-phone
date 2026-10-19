@@ -60,6 +60,10 @@ const paramKey = (alert: Pick<AdminAlert, 'kind' | 'param'>): Key | undefined =>
   if (alert.param === 'transcription-busy') return 'admin.alert.voicemailTranscriptionBusy'
   if (alert.param === 'transcription-failed') return 'admin.alert.voicemailTranscriptionFailed'
   if (alert.param === 'notice-failed') return 'admin.alert.voicemailNoticeFailed'
+  // Messages and notices that wait for too long, people the bot has no account of, notices left in Chat without a bot.
+  if (alert.param === 'transcription-backlog') return 'admin.alert.voicemailTranscriptionBacklog'
+  if (alert.param === 'notice-no-account') return 'admin.alert.voicemailNoticeNoAccount'
+  if (alert.param === 'notice-not-withdrawn') return 'admin.alert.voicemailNoticeNotWithdrawn'
   if ((TRUNK_OUTBOUND_CLASSES as readonly string[]).includes(alert.param) || alert.param === 'premium') return `admin.class.${alert.param}` as Key
   return undefined
 }

@@ -1,16 +1,30 @@
 import { describe, expect, it } from 'vitest'
-import type { ProviderFactory, RoutedEvent, TelephonyProvider, TranscriptionProvider, VoicemailBox, VoicemailProvider } from '@twake/telephony-provider-sdk'
+import type { ProviderFactory, RoutedEvent, TelephonyProvider, TranscriptionProvider, VoicemailBox, VoicemailProvider, VoicemailSubscribeOptions } from '@twake/telephony-provider-sdk'
 import type { TelephonyEvent, Voicemail } from '@twake/telephony-types'
 import { buildApp } from './app.js'
 import { TicketStore } from './auth.js'
 import { StoreDirectory } from './directory.js'
 import { EventBus } from './events.js'
-import { MatrixBot, MatrixError } from './matrix.js'
+import { MATRIX_ID_AMBIGUOUS, MatrixBot, MatrixError } from './matrix.js'
 import { ProviderRegistry } from './registry.js'
 import { MemoryStore } from './store/memory.js'
 import type { FencedLease, Store } from './store/types.js'
 import { voicemailRole } from './voicemail-lease.js'
-import { TranscriptWatcher, matrixFromEnv, matrixIdFromTemplate, noticeContent, publicTranscript, transcriptionFromEnv } from './voicemail-transcripts.js'
+import {
+  NOTICE_FIELD,
+  TRANSCRIPT_TEXT_MAX,
+  TranscriptWatcher,
+  VoicemailTranscripts,
+  callerName,
+  matrixFromEnv,
+  matrixIdFromTemplate,
+  noticeContent,
+  noticeKey,
+  publicTranscript,
+  transcriptionFromEnv,
+  txnOf,
+  type VoicemailTranscriptsOptions
+} from './voicemail-transcripts.js'
 
 // Step 11b (ADR 0023): the transcription of the messages, shown in the Messagerie vocale, and the bot's notice of each
 // in Twake Chat, by the Gateway that writes the mailboxes.
@@ -23,46 +37,68 @@ const until = async (what: string, fn: () => boolean | Promise<boolean>, timeout
   }
 }
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
+const gate = () => {
+  let open!: () => void
+  const closed = new Promise<void>(resolve => (open = resolve))
+  return { closed, open }
+}
 
 const SERVER = 'chat.example.test'
 const BOT = `@twakephone:${SERVER}`
 const TOKEN = 'syt_not_a_real_token'
 
 /**
- * A Matrix homeserver in memory, as Synapse answers the client-server API the bot uses: who it is, a room made (the bot
- * joined, the person invited), its members, a message sent once per transaction id, a message withdrawn (redacted).
- * `fail` makes the next requests fail with these statuses.
+ * A Matrix homeserver in memory, as Synapse answers the client-server API the bot uses: who it is, whose account
+ * exists, a room made (the bot joined, the person invited) at an address of its own (refused when taken), the
+ * addresses, its members, a room left, a message sent once per transaction id, the bot's last messages of a room, a
+ * message withdrawn (redacted). `fail` makes the next requests fail with these statuses; `lose` does the next request
+ * of that kind and loses its answer (500).
  */
 const homeserver = () => {
   const rooms = new Map<string, { members: Map<string, string>; created: Record<string, unknown> }>()
+  const aliases = new Map<string, string>()
   const events = new Map<string, { roomId: string; content: Record<string, unknown>; redacted: boolean }>()
   const txns = new Map<string, string>()
+  const sentTxns: string[] = []
+  const noAccount = new Set<string>()
   const calls: string[] = []
   const failures: number[] = []
+  const losing: string[] = []
   let n = 0
   const answer = (status: number, body: unknown) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } })
-  const fetch = (async (input: string | URL | Request, init: RequestInit = {}) => {
-    const url = new URL(input instanceof Request ? input.url : String(input))
-    const method = init.method ?? 'GET'
-    const headers = (init.headers ?? {}) as Record<string, string>
-    if (headers.authorization !== `Bearer ${TOKEN}`) return answer(401, { errcode: 'M_UNKNOWN_TOKEN', error: 'Unknown token' })
-    const parts = url.pathname.replace(/^\/_matrix\/client\/v3\//, '').split('/').map(decodeURIComponent)
-    calls.push(`${method} ${parts[0] === 'rooms' ? parts[2] : parts.join('/')}`)
-    const failure = failures.shift()
-    if (failure) return answer(failure, failure === 429 ? { errcode: 'M_LIMIT_EXCEEDED', error: 'Too many requests', retry_after_ms: 30 } : { errcode: 'M_UNKNOWN', error: 'an internal detail' })
-    const body = typeof init.body === 'string' ? (JSON.parse(init.body) as Record<string, unknown>) : {}
+  const handle = (method: string, parts: string[], url: URL, body: Record<string, unknown>): Response => {
     if (parts.join('/') === 'account/whoami') return answer(200, { user_id: BOT })
+    if (parts[0] === 'profile') return noAccount.has(parts[1]!) ? answer(404, { errcode: 'M_NOT_FOUND', error: 'no profile' }) : answer(200, { displayname: 'x' })
+    if (parts[0] === 'directory') {
+      const roomId = aliases.get(parts[2]!)
+      if (method === 'DELETE') return aliases.delete(parts[2]!) ? answer(200, {}) : answer(404, { errcode: 'M_NOT_FOUND', error: 'no alias' })
+      return roomId ? answer(200, { room_id: roomId }) : answer(404, { errcode: 'M_NOT_FOUND', error: 'no alias' })
+    }
     if (parts[0] === 'createRoom') {
+      const alias = typeof body.room_alias_name === 'string' ? `#${body.room_alias_name}:${SERVER}` : undefined
+      if (alias && aliases.has(alias)) return answer(400, { errcode: 'M_ROOM_IN_USE', error: 'alias taken' })
       const roomId = `!room${++n}:${SERVER}`
       rooms.set(roomId, { members: new Map([[BOT, 'join'], ...(body.invite as string[]).map(u => [u, 'invite'] as [string, string])]), created: body })
+      if (alias) aliases.set(alias, roomId)
       return answer(200, { room_id: roomId })
     }
     if (parts[0] === 'rooms') {
       const room = rooms.get(parts[1]!)
       if (!room || room.members.get(BOT) !== 'join') return answer(403, { errcode: 'M_FORBIDDEN', error: 'not in the room' })
       if (parts[2] === 'members') return answer(200, { chunk: [...room.members].map(([u, m]) => ({ type: 'm.room.member', state_key: u, content: { membership: m } })) })
+      if (parts[2] === 'leave') {
+        room.members.set(BOT, 'leave')
+        return answer(200, {})
+      }
+      if (parts[2] === 'messages') {
+        const filter = JSON.parse(url.searchParams.get('filter') ?? '{}') as { senders?: string[] }
+        if (!filter.senders?.includes(BOT)) return answer(400, { errcode: 'M_INVALID_PARAM', error: 'filter expected' })
+        const chunk = [...events].filter(([, e]) => e.roomId === parts[1]).reverse().slice(0, Number(url.searchParams.get('limit') ?? 10)).map(([id, e]) => ({ event_id: id, sender: BOT, type: 'm.room.message', content: e.redacted ? {} : e.content }))
+        return answer(200, { chunk })
+      }
       if (parts[2] === 'send') {
         const k = `${parts[1]}|${parts[4]}`
+        sentTxns.push(parts[4]!)
         let id = txns.get(k)
         if (!id) {
           id = `$event${++n}`
@@ -79,20 +115,50 @@ const homeserver = () => {
       }
     }
     return answer(404, { errcode: 'M_UNRECOGNIZED', error: 'unknown endpoint' })
+  }
+  const fetch = (async (input: string | URL | Request, init: RequestInit = {}) => {
+    const url = new URL(input instanceof Request ? input.url : String(input))
+    const method = init.method ?? 'GET'
+    const headers = (init.headers ?? {}) as Record<string, string>
+    if (init.signal?.aborted) throw new DOMException('This operation was aborted', 'AbortError')
+    if (headers.authorization !== `Bearer ${TOKEN}`) return answer(401, { errcode: 'M_UNKNOWN_TOKEN', error: 'Unknown token' })
+    const parts = url.pathname.replace(/^\/_matrix\/client\/v3\//, '').split('/').map(decodeURIComponent)
+    const kind = `${method} ${parts[0] === 'rooms' ? parts[2] : parts[0] === 'profile' || parts[0] === 'directory' ? parts[0] : parts.join('/')}`
+    calls.push(kind)
+    const failure = failures.shift()
+    if (failure) return answer(failure, failure === 429 ? { errcode: 'M_LIMIT_EXCEEDED', error: 'Too many requests', retry_after_ms: 30 } : { errcode: 'M_UNKNOWN', error: 'an internal detail' })
+    const body = typeof init.body === 'string' ? (JSON.parse(init.body) as Record<string, unknown>) : {}
+    const res = handle(method, parts, url, body)
+    const lost = losing.indexOf(kind)
+    if (lost >= 0 && res.status < 300) {
+      losing.splice(lost, 1)
+      return answer(500, { errcode: 'M_UNKNOWN', error: 'the answer was lost' })
+    }
+    return res
   }) as typeof globalThis.fetch
   /** The messages of the bot still readable, with their room's invited or joined people. */
   const notices = () => [...events.values()].filter(e => !e.redacted).map(e => ({ ...e, people: [...rooms.get(e.roomId)!.members].filter(([, m]) => m !== 'leave').map(([u]) => u) }))
-  return { fetch, rooms, events, calls, fail: (...statuses: number[]) => void failures.push(...statuses), notices }
+  return { fetch, rooms, aliases, events, calls, sentTxns, noAccount, fail: (...statuses: number[]) => void failures.push(...statuses), lose: (kind: string) => void losing.push(kind), notices }
 }
 
-/** A voicemail server in memory: a mailbox per holder of an extension, its messages, their recordings, its events. */
+/**
+ * A voicemail server in memory, as step 11a has it: a mailbox per holder (kept whatever extension reaches it, a set-aside
+ * one listed by any), the extension that reaches each, the messages, their recordings, its events. A message `big…` has
+ * a recording larger than 1 MB of unknown length, `huge…` one that says so. `down` makes it fail; `recordingGate` holds
+ * each recording read back.
+ */
 const mailboxes = () => {
-  const holders = new Map<string, string>()
-  const messages = new Map<string, Voicemail[]>()
+  const at = new Map<string, string>()
+  const boxes = new Map<string, Voicemail[]>()
   let synced = 0
+  let recordings = 0
   let push: ((e: RoutedEvent) => void) | undefined
+  let heard: (() => void) | undefined
   const pending: RoutedEvent[] = []
-  const mine = (o: { extension: string; userId: string }) => holders.get(o.extension) === o.userId
+  const state = { down: false, recordingGate: undefined as Promise<void> | undefined }
+  const up = () => {
+    if (state.down) throw new Error('voicemail server down')
+  }
   const vm: VoicemailProvider = {
     id: 'fake-voicemail',
     getStatus: () => 'CONNECTED',
@@ -101,48 +167,53 @@ const mailboxes = () => {
       await options.beforeChanges?.([])
       if (!options.mayWrite?.()) throw new Error('stopped')
       for (const h of list) {
-        if (holders.get(h.extension) !== h.userId) messages.set(h.extension, [])
-        holders.set(h.extension, h.userId)
+        if (!boxes.has(h.userId)) boxes.set(h.userId, [])
+        at.set(h.extension, h.userId)
       }
       synced++
       return { boxes: list.map(h => ({ extension: h.extension, mailbox: `${h.userId}@ctx` })), failed: 0 }
     },
     mailboxIsOf: (mailbox, userId) => mailbox === `${userId}@ctx`,
-    owns: async o => mine(o),
-    listMessages: async o => (mine(o) ? [...(messages.get(o.extension) ?? [])] : []),
+    owns: async o => at.get(o.extension) === o.userId,
+    listMessages: async o => {
+      up()
+      return [...(boxes.get(o.userId) ?? [])]
+    },
     getRecording: async (o, id) => {
-      if (!mine(o) || !messages.get(o.extension)?.some(m => m.id === id)) return undefined
+      up()
+      recordings++
+      await state.recordingGate
+      if (!boxes.get(o.userId)?.some(m => m.id === id)) return undefined
+      if (id.startsWith('big')) return { contentType: 'audio/wav', body: (async function* () { yield new Uint8Array(600_000); yield new Uint8Array(600_000) })() }
+      if (id.startsWith('huge')) return { contentType: 'audio/wav', size: 2_000_000, body: (async function* () { yield new Uint8Array(1) })() }
       const bytes = new TextEncoder().encode(`RIFF-audio-of-${id}`)
       return { contentType: 'audio/wav', size: bytes.length, body: (async function* () { yield bytes })() }
     },
     markRead: async () => true,
     async deleteMessage(o, id) {
-      const list = mine(o) ? messages.get(o.extension) : undefined
+      const list = boxes.get(o.userId)
       if (!list?.some(m => m.id === id)) return false
-      messages.set(o.extension, list.filter(m => m.id !== id))
+      boxes.set(o.userId, list.filter(m => m.id !== id))
       return true
     },
     async eraseMessages(o, options = {}) {
       if (!options.mayWrite?.()) throw new Error('stopped')
-      let n = 0
-      for (const [ext, user] of holders) {
-        if (user !== o.userId) continue
-        n += messages.get(ext)?.length ?? 0
-        messages.set(ext, [])
-      }
+      const n = boxes.get(o.userId)?.length ?? 0
+      if (boxes.has(o.userId)) boxes.set(o.userId, [])
       return n
     },
     async purgeMessages(before, options = {}) {
       if (!options.mayWrite?.()) throw new Error('stopped')
       let n = 0
-      for (const [ext, list] of messages) {
+      for (const [holder, list] of boxes) {
         const kept = list.filter(m => Date.parse(m.receivedAt) >= before.getTime())
         n += list.length - kept.length
-        messages.set(ext, kept)
+        boxes.set(holder, kept)
       }
       return n
     },
-    subscribe() {
+    subscribe(options?: VoicemailSubscribeOptions) {
+      heard = options?.onHeard
       return {
         [Symbol.asyncIterator]: () => ({
           next: () => {
@@ -162,13 +233,16 @@ const mailboxes = () => {
       p(e)
     } else pending.push(e)
   }
-  /** A caller leaves a message at `extension`: in its mailbox, then told (voicemail.created). */
-  const leave = (extension: string, v: Voicemail) => {
-    messages.get(extension)!.unshift(v)
-    emit({ extension, event: { type: 'voicemail.created', timestamp: v.receivedAt, payload: { voicemail: v } } })
+  /** A caller leaves a message at `extension`: in the mailbox of its holder, then told (voicemail.created) unless `silently`. */
+  const leave = (extension: string, v: Voicemail, silently = false) => {
+    boxes.get(at.get(extension)!)!.unshift(v)
+    if (!silently) emit({ extension, event: { type: 'voicemail.created', timestamp: v.receivedAt, payload: { voicemail: v } } })
   }
-  return { vm, holders, messages, emit, leave, synced: () => synced }
+  /** A message deleted on the voicemail server, nothing told. */
+  const remove = (holder: string, id: string) => void boxes.set(holder, (boxes.get(holder) ?? []).filter(m => m.id !== id))
+  return { vm, at, boxes, state, emit, leave, remove, synced: () => synced, recordings: () => recordings, heard: () => heard?.() }
 }
+type Mailboxes = ReturnType<typeof mailboxes>
 
 /** A SIP server that keeps the mailboxes it is given (as provider-opensips). */
 const sipServer = () => {
@@ -194,11 +268,12 @@ const sipServer = () => {
 }
 
 const message = (id: string, over: Partial<Voicemail> = {}): Voicemail => ({ id, from: '0612345678', fromName: 'Alice Martin', receivedAt: new Date().toISOString(), durationSec: 12, unread: true, ...over })
-const SAID = 'Bonjour Jean, ici Alice, rappelez-moi demain matin.'
+const SAID = 'Bonjour Paul, ici Alice, rappelez-moi demain matin.'
 
 const setup = async (
   o: {
     store?: MemoryStore
+    boxes?: Mailboxes
     transcribe?: TranscriptionProvider['transcribe'] | false
     notices?: false
     maxSec?: number
@@ -208,6 +283,8 @@ const setup = async (
     purgeMs?: number
     hub?: boolean
     logs?: string[]
+    withText?: boolean
+    declinedMs?: number
   } = {}
 ) => {
   process.env.AUTH_MODE = 'dev'
@@ -215,7 +292,7 @@ const setup = async (
   await store.upsertMapping({ tenantId: 'A', userId: 'alice', extension: '101', displayName: 'Alice Martin' })
   await store.upsertMapping({ tenantId: 'A', userId: 'jean', extension: '102', displayName: 'Jean Dupont' })
   await store.upsertMapping({ tenantId: 'A', userId: 'bob', extension: '103', displayName: 'Bob Durand' })
-  const boxes = mailboxes()
+  const boxes = o.boxes ?? mailboxes()
   const hs = homeserver()
   const bus = new EventBus()
   const heardAudio: string[] = []
@@ -228,6 +305,7 @@ const setup = async (
     }
   }
   const registry = new ProviderRegistry([{ tenantId: 'A', type: 'sip', config: {} }], [sipServer().factory])
+  const synced = boxes.synced()
   const app = await buildApp(registry, {
     store,
     bus,
@@ -239,20 +317,30 @@ const setup = async (
     voicemailRetryMs: [20],
     ...(o.retentionDays !== undefined ? { voicemailRetentionDays: o.retentionDays } : {}),
     ...(o.purgeMs !== undefined ? { voicemailPurgeMs: o.purgeMs } : {}),
-    ...(provider ? { transcription: { provider, maxSec: o.maxSec ?? 180, queueMax: o.queueMax ?? 100, maxBytes: 1_000_000 } } : {}),
+    ...(provider ? { transcription: { provider, maxSec: o.maxSec ?? 180, queueMax: o.queueMax ?? 100, maxBytes: 1_000_000, lang: 'fr' } } : {}),
     ...(o.notices === false
       ? {}
-      : { notices: { bot: new MatrixBot({ homeserverUrl: `https://${SERVER}`, token: TOKEN, fetch: hs.fetch }), userTemplate: `@{uid}:${SERVER}`, appUrl: 'https://phone.example.test', timeZone: 'Europe/Paris', ...(o.matrixIdOf ? { matrixIdOf: o.matrixIdOf } : {}) } }),
+      : {
+          notices: {
+            bot: new MatrixBot({ homeserverUrl: `https://${SERVER}`, token: TOKEN, fetch: hs.fetch }),
+            userTemplate: `@{uid}:${SERVER}`,
+            appUrl: 'https://phone.example.test',
+            timeZone: 'Europe/Paris',
+            ...(o.withText === false ? { withText: false } : {}),
+            ...(o.matrixIdOf ? { matrixIdOf: o.matrixIdOf } : {})
+          }
+        }),
     transcriptRetryMs: [20, 20],
     noticeRetryMs: [20, 20],
     transcriptEveryMs: 20,
     transcriptWatchMs: 20,
+    ...(o.declinedMs !== undefined ? { declinedMs: o.declinedMs } : {}),
     ...(o.hub ? { secretsKey: Buffer.alloc(32, 7), webhooks: { pollMs: 3_600_000, stateLeaseMs: 300, streamSettleMs: 0 }, trunkWatchMs: 0 } : {}),
     ...(o.logs ? { logStream: { write: (line: string) => void o.logs!.push(line) } } : {})
   })
   await app.ready()
   registry.startAll()
-  await until('the mailboxes', () => boxes.synced() > 0)
+  await until('the mailboxes', () => boxes.synced() > synced)
   const as = (user: string) => ({ 'x-dev-user': user, 'x-dev-tenant': 'A' })
   const heard = (user: string) => {
     const got: TelephonyEvent[] = []
@@ -260,11 +348,13 @@ const setup = async (
     return got
   }
   const transcriptOf = async (user: string, id: string) => (await app.inject({ url: '/api/v1/voicemails', headers: as(user) })).json<{ items: Voicemail[] }>().items.find(v => v.id === id)?.transcript
-  return { app, store, boxes, hs, as, heard, heardAudio, transcriptOf }
+  const rowOf = async (holder: string, id: string) => (await store.listTranscripts('A', holder, [id], true))[0]
+  const alerts = async () => (await store.listAlerts('A', {})).map(a => a.alert.param)
+  return { app, store, boxes, hs, as, heard, heardAudio, transcriptOf, rowOf, alerts }
 }
 
 describe('the transcription of the messages and the notices in Chat (step 11b)', () => {
-  it("transcribes a new message once, shows it to its holder only, and the bot tells them in a room of their own, nobody else", async () => {
+  it('transcribes a new message once, shows it to its holder only, and the bot tells them in a room of their own, nobody else', async () => {
     const { app, boxes, hs, as, heard, heardAudio, transcriptOf } = await setup()
     const jean = heard('jean')
     const bob = heard('bob')
@@ -274,24 +364,27 @@ describe('the transcription of the messages and the notices in Chat (step 11b)',
     await until('the message', () => jean.length >= 1)
     expect(jean[0]).toMatchObject({ type: 'voicemail.created', payload: { voicemail: { id: 'm1', transcript: { status: 'pending' } } } })
     await until('the transcription', () => jean.some(e => e.type === 'voicemail.transcribed'))
-    expect(jean.find(e => e.type === 'voicemail.transcribed')).toMatchObject({ payload: { id: 'm1', transcript: { status: 'done', text: SAID } } })
+    expect(jean.find(e => e.type === 'voicemail.transcribed')).toMatchObject({ payload: { id: 'm1', transcript: { status: 'done', text: SAID, lang: 'fr' } } })
     expect(heardAudio).toEqual(['RIFF-audio-of-m1'])
-    expect(await transcriptOf('jean', 'm1')).toEqual({ status: 'done', text: SAID })
+    expect(await transcriptOf('jean', 'm1')).toEqual({ status: 'done', text: SAID, lang: 'fr' })
     await until('the notice', () => hs.notices().length === 1)
     const [notice] = hs.notices()
     expect(notice!.people.sort()).toEqual([BOT, `@jean:${SERVER}`].sort())
-    expect(notice!.content).toMatchObject({ msgtype: 'm.notice', format: 'org.matrix.custom.html' })
+    expect(notice!.content).toMatchObject({ msgtype: 'm.notice', format: 'org.matrix.custom.html', [NOTICE_FIELD]: noticeKey('A', { holder: 'jean', messageId: 'm1' }) })
     const body = String(notice!.content.body)
-    expect(body).toContain('Alice Martin (0612345678)')
+    expect(body).toContain("du 0612345678 (nom annoncé par l'appelant : « Alice Martin »)")
     expect(body).toContain('durée 0:12')
     expect(body).toContain(`« ${SAID} »`)
     expect(body).toContain('https://phone.example.test/voicemail')
-    // A private room the bot alone may invite to, history from the invitation on, never encrypted.
+    // A private room the bot alone may invite to, history from the invitation on, never encrypted, at an address of its own.
     const room = [...hs.rooms.values()][0]!.created
     expect(room).toMatchObject({ preset: 'private_chat', is_direct: true, invite: [`@jean:${SERVER}`], power_level_content_override: { invite: 100 } })
+    expect(String(room.room_alias_name)).toMatch(/^twakephone-[0-9a-f]{32}$/)
     // The creator is never named in the power levels: a homeserver refuses it for a room of version 12.
     expect((room as { power_level_content_override: Record<string, unknown> }).power_level_content_override).not.toHaveProperty('users')
     expect(JSON.stringify(room)).not.toContain('m.room.encryption')
+    // Their account asked for before the room was made.
+    expect(hs.calls.indexOf('GET profile')).toBeLessThan(hs.calls.indexOf('POST createRoom'))
     // Nobody else: neither their screens, nor the bot.
     expect(bob).toEqual([])
     expect(alice).toEqual([])
@@ -304,42 +397,57 @@ describe('the transcription of the messages and the notices in Chat (step 11b)',
     boxes.leave('102', message('m2', { from: undefined, fromName: undefined }))
     await until('the second notice', () => hs.notices().length === 2)
     expect(hs.rooms.size).toBe(1)
-    expect(String(hs.notices()[1]!.content.body)).toContain('un numéro masqué')
+    expect(String(hs.notices()[1]!.content.body)).toContain("d'un numéro masqué")
     expect((await app.inject({ url: '/api/v1/capabilities', headers: as('jean') })).json()).toMatchObject({ voicemail: true, voicemailTranscription: true })
     await app.close()
   })
 
-  it('erases the transcription of a message deleted and withdraws its notice, whoever deleted it', async () => {
-    const { app, store, boxes, hs, as } = await setup()
+  it('erases the transcription of a message deleted and withdraws its notice, whoever deleted it, for its holder only', async () => {
+    const { app, store, boxes, hs, as, rowOf } = await setup()
     boxes.leave('102', message('m1'))
     boxes.leave('102', message('m2'))
-    await until('the notices', () => hs.notices().length === 2)
+    // Bob's mailbox has a message of the same id: its own.
+    boxes.leave('103', message('m2'))
+    await until('the notices', () => hs.notices().length === 3)
     // From the app.
     expect((await app.inject({ method: 'DELETE', url: '/api/v1/voicemails/m1', headers: as('jean') })).statusCode).toBe(204)
-    await until('m1 withdrawn', () => hs.notices().length === 1)
+    await until('m1 withdrawn', () => hs.notices().length === 2)
     expect((await store.listTranscripts('A', 'jean')).map(t => t.messageId)).toEqual(['m2'])
     // From a phone (the voicemail server tells it).
-    boxes.messages.set('102', [])
+    boxes.remove('jean', 'm2')
     boxes.emit({ extension: '102', event: { type: 'voicemail.deleted', timestamp: new Date().toISOString(), payload: { id: 'm2' } } })
-    await until('m2 withdrawn', () => hs.notices().length === 0)
-    await until('no transcription left', async () => !(await store.dueTranscripts('A', 10)).length && !(await store.listTranscripts('A', 'jean')).length)
+    await until('m2 withdrawn', () => hs.notices().length === 1)
+    await until('no transcription left', async () => !(await store.dueTranscripts('A', 'notice', 10)).length && !(await store.listTranscripts('A', 'jean', undefined, true)).length)
     expect(hs.calls.filter(c => c === 'PUT redact')).toHaveLength(2)
+    // Bob's is his: still there, its notice too.
+    expect(await rowOf('bob', 'm2')).toMatchObject({ status: 'done', notice: 'sent' })
+    expect(hs.notices()[0]!.people).toContain(`@bob:${SERVER}`)
     await app.close()
   })
 
-  it("erases a person's transcriptions with their messages (their right to erasure), withdraws the bot's notices and forgets their room", async () => {
+  it("erases a person's transcriptions with their messages (their right to erasure), withdraws the bot's notices, forgets their room and leaves it", async () => {
     const { app, store, boxes, hs, as } = await setup()
     boxes.leave('102', message('m1'))
     boxes.leave('103', message('m3'))
     await until('the notices', () => hs.notices().length === 2)
-    expect(await store.getOperatorState('A', 'matrix:room:jean')).toMatchObject({ matrixId: `@jean:${SERVER}` })
+    const rooms = await store.listOperatorState('A', 'matrix:room:')
+    expect(rooms).toHaveLength(2)
+    const jeanRoom = rooms.map(r => r.value as { matrixId: string; roomId: string }).find(v => v.matrixId === `@jean:${SERVER}`)!
     const res = await app.inject({ method: 'DELETE', url: '/api/v1/me/history', headers: as('jean') })
-    expect(res.json()).toMatchObject({ voicemailErasure: 'asked' })
+    expect(res.json()).toEqual({ deleted: 0, voicemailErasure: 'asked' })
     await until("Jean's notice withdrawn", () => hs.notices().length === 1)
     expect(hs.notices()[0]!.people).toContain(`@bob:${SERVER}`)
-    await until('his transcriptions gone', async () => !(await store.listTranscripts('A', 'jean')).length && !(await store.dueTranscripts('A', 10)).length)
-    expect(await store.getOperatorState('A', 'matrix:room:jean')).toBeUndefined()
+    await until('his transcriptions gone', async () => !(await store.listTranscripts('A', 'jean', undefined, true)).length)
+    expect((await store.listOperatorState('A', 'matrix:room:')).map(r => (r.value as { matrixId: string }).matrixId)).toEqual([`@bob:${SERVER}`])
+    // The bot leaves his room once its notice is withdrawn, and gives its address back.
+    await until('his room left', () => hs.rooms.get(jeanRoom.roomId)!.members.get(BOT) === 'leave')
+    expect([...hs.aliases.values()]).not.toContain(jeanRoom.roomId)
+    await until('nothing left to leave', async () => !(await store.listOperatorState('A', 'matrix:leave:')).length)
     expect(await store.listTranscripts('A', 'bob')).toHaveLength(1)
+    // A later message: another room, invited once more.
+    boxes.leave('102', message('m4'))
+    await until('the new notice', () => hs.notices().length === 2)
+    expect(hs.rooms.size).toBe(3)
     await app.close()
   })
 
@@ -351,17 +459,77 @@ describe('the transcription of the messages and the notices in Chat (step 11b)',
     boxes.leave('102', message('m-new'))
     await until('the notices', () => hs.notices().length === 2)
     await until('the old one withdrawn', () => hs.notices().length === 1, 5_000)
-    expect(String(hs.notices()[0]!.content.body)).not.toContain('2026-09')
-    await until('its transcription gone', async () => (await store.listTranscripts('A', 'jean')).map(t => t.messageId).join() === 'm-new')
+    await until('its transcription gone', async () => (await store.listTranscripts('A', 'jean', undefined, true)).map(t => t.messageId).join() === 'm-new')
+    await app.close()
+  })
+
+  it('erases, deletes and expires the transcriptions with the transcription and the bot off, and says the notices left in Chat', async () => {
+    const store = new MemoryStore()
+    const boxes = mailboxes()
+    const on = await setup({ store, boxes, retentionDays: 0 })
+    on.boxes.leave('102', message('m1'))
+    on.boxes.leave('103', message('m3'))
+    on.boxes.leave('101', message('m-old', { receivedAt: new Date(Date.now() - 31 * 86_400_000).toISOString() }))
+    await until('the notices', () => on.hs.notices().length === 3)
+    await on.app.close()
+    // The pilot ends: LINTO_URL and MATRIX_* taken out, the Gateway started again.
+    const off = await setup({ store, boxes, transcribe: false, notices: false, retentionDays: 30, purgeMs: 50 })
+    const res = await off.app.inject({ method: 'DELETE', url: '/api/v1/me/history', headers: off.as('jean') })
+    expect(res.json()).toEqual({ deleted: 0, voicemailErasure: 'asked', chatNotices: 'not-withdrawn' })
+    await until("Jean's row gone", async () => !(await store.listTranscripts('A', 'jean', undefined, true)).length)
+    // A message deleted, a message past the retention period: their rows go too.
+    expect((await off.app.inject({ method: 'DELETE', url: '/api/v1/voicemails/m3', headers: off.as('bob') })).statusCode).toBe(204)
+    await until("Bob's row gone", async () => !(await store.listTranscripts('A', 'bob', undefined, true)).length)
+    await until("Alice's old row gone", async () => !(await store.listTranscripts('A', 'alice', undefined, true)).length)
+    expect(await off.alerts()).toContain('notice-not-withdrawn')
+    // Their room is forgotten with them: no Matrix id of theirs kept.
+    expect(JSON.stringify(await store.listOperatorState('A', 'matrix:'))).not.toContain('@jean')
+    await off.app.close()
+  })
+
+  it('catches up the messages it did not hear while another Gateway held the lease, and erases one deleted meanwhile', async () => {
+    const { app, store, boxes, hs, transcriptOf, rowOf } = await setup()
+    boxes.leave('102', message('m0'))
+    await until("m0's notice", () => hs.notices().length === 1)
+    // Another Gateway holds the lease a moment (a restart, a lease in transit): what is said meanwhile is not heard here.
+    await store.takeWebhookLease(voicemailRole('A'), 'gw_other', 600, 99)
+    await sleep(100)
+    boxes.leave('102', message('m1'))
+    boxes.leave('102', message('m-old', { receivedAt: new Date(Date.now() - 2 * 86_400_000).toISOString() }))
+    boxes.remove('jean', 'm0')
+    boxes.emit({ extension: '102', event: { type: 'voicemail.deleted', timestamp: new Date().toISOString(), payload: { id: 'm0' } } })
+    await sleep(100)
+    expect(await rowOf('jean', 'm1')).toBeUndefined()
+    expect(await rowOf('jean', 'm0')).toMatchObject({ notice: 'sent' })
+    // The lease back: the mailboxes reconciled with the table.
+    await until('m1 transcribed', async () => (await transcriptOf('jean', 'm1'))?.status === 'done', 5_000)
+    await until("m1's notice, m0's withdrawn", () => hs.notices().length === 1 && String(hs.notices()[0]!.content[NOTICE_FIELD]) === noticeKey('A', { holder: 'jean', messageId: 'm1' }), 5_000)
+    await until("m0's row gone", async () => !(await rowOf('jean', 'm0')))
+    // Older than it catches up with: said so, never transcribed.
+    expect(await transcriptOf('jean', 'm-old')).toEqual({ status: 'none', reason: 'untracked' })
+    expect(await rowOf('jean', 'm-old')).toBeUndefined()
+    await app.close()
+  })
+
+  it('catches up after a gap in the stream of the voicemail server', async () => {
+    const { app, boxes, hs, transcriptOf } = await setup()
+    boxes.leave('102', message('m1'), true)
+    await sleep(100)
+    expect(hs.events.size).toBe(0)
+    // On the screen meanwhile: on its way.
+    expect(await transcriptOf('jean', 'm1')).toEqual({ status: 'pending' })
+    boxes.leave('102', message('m2'), true)
+    boxes.heard()
+    await until('both caught up', () => hs.notices().length === 2)
+    expect(await transcriptOf('jean', 'm2')).toMatchObject({ status: 'done' })
     await app.close()
   })
 
   it('writes nothing from a Gateway that lost the lease of the mailboxes, not even a transcription it finished', async () => {
-    let open!: () => void
-    const gate = new Promise<void>(resolve => (open = resolve))
+    const g = gate()
     const { app, store, boxes, hs, transcriptOf } = await setup({
       transcribe: async () => {
-        await gate
+        await g.closed
         return { text: SAID }
       }
     })
@@ -370,7 +538,7 @@ describe('the transcription of the messages and the notices in Chat (step 11b)',
     // Another Gateway takes the lease meanwhile.
     await store.takeWebhookLease(voicemailRole('A'), 'gw_other', 60_000, 99)
     await sleep(400)
-    open()
+    g.open()
     await sleep(200)
     const [row] = await store.listTranscripts('A', 'jean')
     expect([row!.status, row!.text, row!.notice]).toEqual(['pending', undefined, 'pending'])
@@ -383,14 +551,67 @@ describe('the transcription of the messages and the notices in Chat (step 11b)',
     await app.close()
   })
 
+  it("never tells a newcomer given an id another person had of that person's message, nor shows them its text", async () => {
+    const g = gate()
+    let n = 0
+    const { app, store, boxes, hs, transcriptOf, rowOf } = await setup({
+      transcribe: async () => {
+        if (n++ === 0) await g.closed
+        return { text: n === 1 ? 'le message de l’ancien Jean' : SAID }
+      }
+    })
+    boxes.leave('102', message('m1'))
+    await until('the transcription asked', async () => (await rowOf('jean', 'm1'))?.status === 'pending' && n === 1)
+    // Jean leaves, someone else is given his id (HolderRecord: the second holder of it), his mailbox their own.
+    await store.putOperatorState('A', 'voicemail:holder:jean', { epoch: 1 })
+    const newcomer = 'jean\u00001'
+    boxes.boxes.set(newcomer, [message('m1')])
+    boxes.at.set('102', newcomer)
+    g.open()
+    await until("the old Jean's transcription", async () => (await rowOf('jean', 'm1'))?.status === 'done')
+    // No notice of it: whoever has the id now is not him.
+    await until('no notice', async () => (await rowOf('jean', 'm1'))?.notice === 'none')
+    expect(hs.events.size).toBe(0)
+    // The newcomer's own m1: never the old one's text.
+    expect((await transcriptOf('jean', 'm1'))?.text).not.toBe('le message de l’ancien Jean')
+    // The stream heard again: the newcomer's mailbox read, their m1 theirs.
+    boxes.heard()
+    await until("the newcomer's own", async () => (await transcriptOf('jean', 'm1'))?.text === SAID)
+    await until("the newcomer's notice", () => hs.notices().length === 1)
+    expect(hs.notices()[0]!.people).toContain(`@jean:${SERVER}`)
+    expect(await rowOf(newcomer, 'm1')).toMatchObject({ notice: 'sent' })
+    // Their rooms are each holder's: the old one's erasure leaves the newcomer's alone.
+    expect((await store.listOperatorState('A', 'matrix:room:')).length).toBe(1)
+    await app.close()
+  })
+
+  it('reads a message through the mailbox of its holder, whatever extension reaches it now', async () => {
+    const { app, store, boxes, hs, transcriptOf } = await setup()
+    const g = gate()
+    boxes.state.recordingGate = g.closed
+    boxes.leave('102', message('m0'))
+    await until('m0 read', () => boxes.recordings() === 1)
+    boxes.leave('102', message('m1'))
+    await until('m1 written down', async () => (await store.listTranscripts('A', 'jean')).length === 2)
+    // Jean moves to 104 before m1 is transcribed: his mailbox with him.
+    await store.deleteMapping('A', 'jean')
+    await store.upsertMapping({ tenantId: 'A', userId: 'jean', extension: '104', displayName: 'Jean Dupont' })
+    boxes.at.delete('102')
+    boxes.at.set('104', 'jean')
+    boxes.state.recordingGate = undefined
+    g.open()
+    await until('both told', () => hs.notices().length === 2)
+    expect(await transcriptOf('jean', 'm1')).toMatchObject({ status: 'done' })
+    await app.close()
+  })
+
   it('transcribes no message longer than the bound, nor past the messages waiting allowed, says why, and tells the administrators once', async () => {
-    let open!: () => void
-    const gate = new Promise<void>(resolve => (open = resolve))
+    const g = gate()
     const { app, store, boxes, hs, heard, heardAudio, transcriptOf } = await setup({
       maxSec: 60,
       queueMax: 1,
       transcribe: async () => {
-        await gate
+        await g.closed
         return { text: SAID }
       }
     })
@@ -409,81 +630,193 @@ describe('the transcription of the messages and the notices in Chat (step 11b)',
     await until('m2 and m3 left without', async () => (await transcriptOf('jean', 'm3'))?.reason === 'busy' && (await transcriptOf('jean', 'm2'))?.reason === 'busy')
     const alerts = (await store.listAlerts('A', {})).filter(a => a.alert.param === 'transcription-busy')
     expect(alerts.map(a => [a.alert.kind, a.alert.value])).toEqual([['voicemail', 1]])
-    open()
+    // The notices of those not transcribed do not wait behind the one being transcribed.
+    await until('their notices', () => hs.notices().length === 3)
+    g.open()
     await until('m1 done', async () => (await transcriptOf('jean', 'm1'))?.status === 'done')
     expect(heardAudio).toEqual(['RIFF-audio-of-m1'])
     await until('every notice', () => hs.notices().length === 4)
     await app.close()
   })
 
+  it('keeps a text without control characters and 10 000 characters long at most, and a recording too large is a message too long', async () => {
+    const { app, boxes, heardAudio, transcriptOf } = await setup({ transcribe: async () => ({ text: `a\u0000b\u0007c\nd\te${'x'.repeat(TRANSCRIPT_TEXT_MAX + 50)}` }) })
+    boxes.leave('102', message('m1'))
+    boxes.leave('102', message('big1'))
+    boxes.leave('102', message('huge1'))
+    await until('m1 done', async () => (await transcriptOf('jean', 'm1'))?.status === 'done')
+    const text = (await transcriptOf('jean', 'm1'))!.text!
+    expect(text.startsWith('abc\nd\texxx')).toBe(true)
+    expect(text).toHaveLength(TRANSCRIPT_TEXT_MAX)
+    await until('big1 and huge1 too long', async () => (await transcriptOf('jean', 'big1'))?.reason === 'too-long' && (await transcriptOf('jean', 'huge1'))?.reason === 'too-long')
+    expect(heardAudio).toEqual(['RIFF-audio-of-m1'])
+    await app.close()
+  })
+
   it('tries a transcription that fails twice more, then says it failed, tells the administrators, and still sends the notice', async () => {
     let tries = 0
-    const { app, store, boxes, hs, transcriptOf } = await (async () => {
-      const lines: string[] = []
-      const s = await setup({
-        logs: lines,
-        transcribe: async () => {
-          tries++
-          throw new Error('LinTO answered 500')
-        }
-      })
-      return { ...s, logs: lines }
-    })()
+    const { app, boxes, hs, transcriptOf, alerts } = await setup({
+      transcribe: async () => {
+        tries++
+        throw new Error('LinTO answered 500')
+      }
+    })
     boxes.leave('102', message('m1'))
     await until('given up', async () => (await transcriptOf('jean', 'm1'))?.status === 'none')
     expect(tries).toBe(3)
     expect(await transcriptOf('jean', 'm1')).toEqual({ status: 'none', reason: 'failed' })
-    expect((await store.listAlerts('A', {})).map(a => a.alert.param)).toContain('transcription-failed')
+    expect(await alerts()).toContain('transcription-failed')
     await until('the notice', () => hs.notices().length === 1)
     expect(String(hs.notices()[0]!.content.body)).toContain("n'a pas pu le transcrire")
     await app.close()
   })
 
-  it('sends a notice again after a failure of the homeserver, once (its transaction id), and gives up past its tries with an alert', async () => {
-    const { app, store, boxes, hs } = await setup()
+  it('sends a notice again after a failure of the homeserver, once, even when its answer was lost, and gives up past its tries with an alert', async () => {
+    const { app, store, boxes, hs, alerts } = await setup()
     hs.fail(500, 429)
     boxes.leave('102', message('m1'))
-    await until('the notice', () => hs.notices().length === 1)
+    await until('the notice', async () => (await store.listTranscripts('A', 'jean', ['m1']))[0]?.notice === 'sent')
     expect(hs.events.size).toBe(1)
-    // A homeserver that keeps refusing: given up after its tries (three here), told to the administrators.
-    hs.fail(500, 500, 500, 500, 500, 500, 500, 500)
+    // The notice sent, its answer lost: the next try sends nothing more.
+    hs.lose('PUT send')
     boxes.leave('102', message('m2'))
-    await until('given up', async () => (await store.listTranscripts('A', 'jean', ['m2']))[0]?.notice === 'none')
-    expect((await store.listAlerts('A', {})).map(a => a.alert.param)).toContain('notice-failed')
-    expect(hs.events.size).toBe(1)
+    await until('the second notice', async () => (await store.listTranscripts('A', 'jean', ['m2']))[0]?.notice === 'sent')
+    expect(hs.events.size).toBe(2)
+    expect(new Set(hs.sentTxns).size).toBe(2)
+    // The room made, its answer lost: the next try takes it, no second room, no second invitation.
+    hs.lose('POST createRoom')
+    boxes.leave('103', message('b1'))
+    await until("Bob's notice", async () => (await store.listTranscripts('A', 'bob', ['b1']))[0]?.notice === 'sent')
+    expect(hs.rooms.size).toBe(2)
+    expect(hs.calls.filter(c => c === 'POST createRoom')).toHaveLength(2)
+    // A homeserver that keeps refusing: given up after its tries (three here), told to the administrators.
+    hs.fail(500, 500, 500)
+    boxes.leave('102', message('m3'))
+    await until('given up', async () => (await store.listTranscripts('A', 'jean', ['m3']))[0]?.notice === 'none')
+    expect(await alerts()).toContain('notice-failed')
+    expect(hs.events.size).toBe(3)
     await app.close()
   })
 
-  it("sends no notice to an account on another server than the bot's, nor to someone the directory and the template give none", async () => {
-    const ids: Record<string, string> = { jean: '@jean:elsewhere.example.net' }
-    const { app, store, boxes, hs, transcriptOf } = await setup({ matrixIdOf: async (_t, userId) => ids[userId] })
+  it('finds again a notice sent before whose answer was lost, whatever transaction sent it', async () => {
+    const { app, store, boxes, hs } = await setup()
     boxes.leave('102', message('m1'))
-    await until('transcribed', async () => (await transcriptOf('jean', 'm1'))?.status === 'done')
-    await until('no notice', async () => (await store.listTranscripts('A', 'jean', ['m1']))[0]?.notice === 'none')
-    expect(hs.calls.filter(c => c !== 'GET account/whoami')).toEqual([])
+    await until('the first notice', () => hs.notices().length === 1)
+    const [roomId] = [...hs.rooms.keys()]
+    // Sent by a token since rotated (its transaction id unknown now): there, with its print.
+    hs.events.set('$sent-before', { roomId: roomId!, content: { msgtype: 'm.notice', body: 'x', [NOTICE_FIELD]: noticeKey('A', { holder: 'jean', messageId: 'm2' }) }, redacted: false })
+    boxes.leave('102', message('m2'))
+    await until('m2 told', async () => (await store.listTranscripts('A', 'jean', ['m2']))[0]?.notice === 'sent')
+    expect((await store.listTranscripts('A', 'jean', ['m2']))[0]!.noticeEvent).toBe('$sent-before')
+    expect(hs.events.size).toBe(2)
     await app.close()
-    // The directory's word first: Bob's own account, not the template's.
-    const second = await setup({ matrixIdOf: async (_t, userId) => (userId === 'bob' ? `@bob.durand:${SERVER}` : undefined) })
+  })
+
+  it("sends no notice to an account on another server than the bot's, nor to one the directory and the template give none or a wrong one, nor to one the homeserver does not have; says so and tells the administrators", async () => {
+    const ids: Record<string, string> = { jean: '@jean:elsewhere.example.net', bob: 'Bob.Durand@chat.example.test' }
+    const logs: string[] = []
+    const level = process.env.LOG_LEVEL
+    process.env.LOG_LEVEL = 'info'
+    const { app, store, boxes, hs, transcriptOf, alerts } = await setup({ logs, matrixIdOf: async (_t, userId) => ids[userId] }).finally(() => (process.env.LOG_LEVEL = level))
+    hs.noAccount.add(`@alice:${SERVER}`)
+    boxes.leave('102', message('m1'))
+    boxes.leave('103', message('m3'))
+    boxes.leave('101', message('m4'))
+    await until('transcribed', async () => (await transcriptOf('jean', 'm1'))?.status === 'done')
+    await until('no notice', async () => (await Promise.all(['jean', 'bob', 'alice'].map(async h => (await store.listTranscripts('A', h))[0]?.notice))).every(n => n === 'none'))
+    expect(hs.calls.filter(c => !['GET account/whoami', 'GET profile'].includes(c))).toEqual([])
+    expect(await alerts()).toContain('notice-no-account')
+    const all = logs.join('\n')
+    expect(all).toContain("not on the bot's server")
+    expect(all).toContain('not a Matrix user id')
+    expect(all).toContain('no such account on the homeserver')
+    await app.close()
+    // The directory's word first: Bob's own account, not the template's; two of them: none.
+    const second = await setup({
+      matrixIdOf: async (_t, userId) => {
+        if (userId === 'jean') throw Object.assign(new Error('two'), { code: MATRIX_ID_AMBIGUOUS })
+        return userId === 'bob' ? `@bob.durand:${SERVER}` : undefined
+      }
+    })
     second.boxes.leave('103', message('m3'))
+    second.boxes.leave('102', message('m1'))
     await until('the notice', () => second.hs.notices().length === 1)
     expect(second.hs.notices()[0]!.people).toContain(`@bob.durand:${SERVER}`)
+    await until("none for Jean's", async () => (await second.store.listTranscripts('A', 'jean'))[0]?.notice === 'none')
     await second.app.close()
   })
 
-  it('writes in a new room once the person left the one the bot kept, or someone else got in it', async () => {
-    const { app, boxes, hs } = await setup()
+  it('invites no more someone who turned the room down, leaves it once its notices are gone, and makes another room when someone else got in', async () => {
+    const { app, store, boxes, hs, as } = await setup()
     boxes.leave('102', message('m1'))
     await until('the notice', () => hs.notices().length === 1)
     const [first] = [...hs.rooms.keys()]
+    // Jean declines (or leaves): no new room, no new invitation, message after message.
     hs.rooms.get(first!)!.members.set(`@jean:${SERVER}`, 'leave')
     boxes.leave('102', message('m2'))
-    await until('the second notice', () => hs.notices().length === 2)
-    expect(hs.rooms.size).toBe(2)
-    const [, second] = [...hs.rooms.keys()]
-    hs.rooms.get(second!)!.members.set(`@eve:${SERVER}`, 'join')
     boxes.leave('102', message('m3'))
-    await until('the third notice', () => hs.notices().length === 3)
+    await until('no notice', async () => (await store.listTranscripts('A', 'jean', ['m2', 'm3'])).every(r => r.notice === 'none'))
+    expect(hs.rooms.size).toBe(1)
+    expect(hs.calls.filter(c => c === 'POST createRoom')).toHaveLength(1)
+    // The bot stays while its notice is there (to withdraw it), and leaves once it is withdrawn.
+    expect(hs.rooms.get(first!)!.members.get(BOT)).toBe('join')
+    expect((await app.inject({ method: 'DELETE', url: '/api/v1/voicemails/m1', headers: as('jean') })).statusCode).toBe(204)
+    await until('the room left', () => hs.rooms.get(first!)!.members.get(BOT) === 'leave')
+    expect(hs.aliases.size).toBe(0)
+    // Someone else in Bob's room: another one, the first left once its notice goes.
+    boxes.leave('103', message('b1'))
+    await until("Bob's notice", () => hs.notices().length === 1)
+    const bobs = [...hs.rooms.keys()][1]!
+    hs.rooms.get(bobs)!.members.set(`@eve:${SERVER}`, 'join')
+    boxes.leave('103', message('b2'))
+    await until("Bob's second notice", () => hs.notices().length === 2)
     expect(hs.rooms.size).toBe(3)
+    expect(hs.rooms.get(bobs)!.members.get(BOT)).toBe('join')
+    await app.close()
+  })
+
+  it('invites again once in a while someone who declined', async () => {
+    const { app, store, boxes, hs } = await setup({ declinedMs: 100 })
+    boxes.leave('102', message('m1'))
+    await until('the notice', () => hs.notices().length === 1)
+    hs.rooms.get([...hs.rooms.keys()][0]!)!.members.set(`@jean:${SERVER}`, 'leave')
+    boxes.leave('102', message('m2'))
+    await until('none for m2', async () => (await store.listTranscripts('A', 'jean', ['m2']))[0]?.notice === 'none')
+    await sleep(150)
+    boxes.leave('102', message('m3'))
+    await until('invited again', () => hs.rooms.size === 2 && hs.notices().length === 2)
+    await app.close()
+  })
+
+  it('gives a withdrawal up when the bot can no longer make it (left the room, the event gone), and sends no notice of a message gone before it', async () => {
+    const g = gate()
+    let n = 0
+    const { app, boxes, hs, as, rowOf, alerts } = await setup({
+      transcribe: async () => {
+        if (n++ === 2) await g.closed
+        return { text: SAID }
+      }
+    })
+    boxes.leave('102', message('m1'))
+    boxes.leave('103', message('m2'))
+    await until('the notices', () => hs.notices().length === 2)
+    // The event gone (404), the bot out of the room (403).
+    const m1 = (await rowOf('jean', 'm1'))!.noticeEvent!
+    hs.events.delete(m1)
+    hs.rooms.get((await rowOf('bob', 'm2'))!.noticeRoom!)!.members.set(BOT, 'leave')
+    expect((await app.inject({ method: 'DELETE', url: '/api/v1/voicemails/m1', headers: as('jean') })).statusCode).toBe(204)
+    expect((await app.inject({ method: 'DELETE', url: '/api/v1/voicemails/m2', headers: as('bob') })).statusCode).toBe(204)
+    await until('both rows gone', async () => !(await rowOf('jean', 'm1')) && !(await rowOf('bob', 'm2')))
+    expect(hs.calls.filter(c => c === 'PUT redact')).toHaveLength(2)
+    // A message transcribed, then gone before its notice (no event of it): none, at once, no alert.
+    boxes.leave('102', message('m5'))
+    await until('m5 being transcribed', () => n === 3)
+    boxes.remove('jean', 'm5')
+    g.open()
+    await until('m5 settled', async () => (await rowOf('jean', 'm5'))?.notice === 'none')
+    expect((await rowOf('jean', 'm5'))!.noticeAttempts).toBe(0)
+    expect(await alerts()).not.toContain('notice-failed')
+    expect(hs.events.size).toBe(1)
     await app.close()
   })
 
@@ -513,7 +846,7 @@ describe('the transcription of the messages and the notices in Chat (step 11b)',
     try {
       const { app, boxes, hs, as } = await setup({ logs, matrixIdOf: async () => `@jean:elsewhere.example.net` })
       boxes.leave('102', message('m1'))
-      await until('transcribed', () => logs.some(l => l.includes('elsewhere') || l.includes("not on the bot's server")))
+      await until('transcribed', () => logs.some(l => l.includes("not on the bot's server")))
       await app.inject({ url: '/api/v1/voicemails', headers: as('jean') })
       expect(hs.events.size).toBe(0)
       await app.close()
@@ -523,6 +856,17 @@ describe('the transcription of the messages and the notices in Chat (step 11b)',
     const all = logs.join('\n')
     expect(all).toContain("not on the bot's server")
     expect(all).not.toMatch(/Bonjour|RIFF|elsewhere\.example|@jean|syt_/)
+  })
+
+  it('sends no text in the notices when asked not to: who called, when, and the link only', async () => {
+    const { app, boxes, hs } = await setup({ withText: false })
+    boxes.leave('102', message('m1'))
+    await until('the notice', () => hs.notices().length === 1)
+    const c = hs.notices()[0]!.content
+    expect(String(c.body)).not.toContain('Bonjour')
+    expect(String(c.formatted_body)).not.toContain('Bonjour')
+    expect(String(c.body)).toContain('https://phone.example.test/voicemail')
+    await app.close()
   })
 
   it('sends nothing to Chat without a bot, and transcribes nothing without a transcription service', async () => {
@@ -544,6 +888,145 @@ describe('the transcription of the messages and the notices in Chat (step 11b)',
   })
 })
 
+/** VoicemailTranscripts on its own, its lease in the test's hands. */
+const unit = async (o: Partial<VoicemailTranscriptsOptions> & { transcribe?: TranscriptionProvider['transcribe']; hs?: ReturnType<typeof homeserver> } = {}) => {
+  const store = new MemoryStore()
+  const taken = await store.takeWebhookLease('voicemail:A', 'gw_1', 60_000)
+  const lease: FencedLease = { role: 'voicemail:A', holder: 'gw_1', generation: taken!.generation }
+  const boxes = mailboxes()
+  await boxes.vm.syncMailboxes([{ extension: '102', userId: 'jean' }], { mayWrite: () => true })
+  const state = { held: true }
+  const heardAudio: string[] = []
+  const signals: AbortSignal[] = []
+  const warnings: string[] = []
+  const settled: string[] = []
+  const t = new VoicemailTranscripts(
+    {
+      store,
+      voicemail: () => boxes.vm,
+      transcription: {
+        provider: {
+          id: 'fake-transcription',
+          transcribe: async (audio, options) => {
+            heardAudio.push(new TextDecoder().decode(audio))
+            if (options?.signal) signals.push(options.signal)
+            return (o.transcribe ?? (async () => ({ text: SAID })))(audio, options)
+          }
+        },
+        maxSec: 180,
+        queueMax: 100,
+        maxBytes: 1_000_000
+      },
+      ...(o.hs ? { notices: { bot: new MatrixBot({ homeserverUrl: `https://${SERVER}`, token: TOKEN, fetch: o.hs.fetch }), userTemplate: `@{uid}:${SERVER}`, timeZone: 'UTC', matrixIdOf: async () => undefined } } : {}),
+      lease: () => (state.held ? lease : undefined),
+      holderIdFor: async (_t, userId) => userId,
+      mailboxes: async () => [{ extension: '102', holder: 'jean' }],
+      onSettled: (_t, r) => void settled.push(r.messageId),
+      alert: async () => {},
+      log: { info: () => {}, warn: (_obj, msg) => void warnings.push(msg), error: () => {} },
+      everyMs: 0,
+      retryMs: [1, 1],
+      noticeRetryMs: [1, 1],
+      ...o
+    },
+    () => ['A']
+  )
+  const add = async (id: string) => {
+    boxes.leave('102', message(id), true)
+    await t.heard('A', '102', 'jean', message(id))
+  }
+  return { t, store, boxes, state, heardAudio, signals, warnings, settled, add, lease }
+}
+
+describe('VoicemailTranscripts', () => {
+  it('asks the lease before the transcription service and before each message, and reads nothing more once it is lost', async () => {
+    const u = await unit()
+    const g = gate()
+    u.boxes.state.recordingGate = g.closed
+    await u.add('m1')
+    await until('m1 read', () => u.boxes.recordings() === 1)
+    u.state.held = false
+    g.open()
+    await u.t.settled('A')
+    expect(u.heardAudio).toEqual([])
+    // Lost right after a transcription written: the next message is not even read.
+    const w = await unit({ onSettled: () => void (w.state.held = false) })
+    await w.store.addTranscript({ tenantId: 'A', holder: 'jean', messageId: 'm2', extension: '102', receivedAt: new Date().toISOString(), status: 'pending', notice: 'none' }, w.lease, 9)
+    w.boxes.leave('102', message('m2'), true)
+    await w.add('m1')
+    await w.t.settled('A')
+    expect(w.boxes.recordings()).toBe(1)
+    expect(w.heardAudio).toHaveLength(1)
+  })
+
+  it('stops at once, the call to the transcription service aborted, the message left due for the next writer', async () => {
+    const u = await unit({ transcribe: (_a, options) => new Promise((_, reject) => options?.signal?.addEventListener('abort', () => reject(new Error('aborted')))) })
+    await u.add('m1')
+    await until('asked', () => u.signals.length === 1)
+    const start = Date.now()
+    await u.t.stop()
+    expect(Date.now() - start).toBeLessThan(500)
+    expect(u.signals[0]!.aborted).toBe(true)
+    expect((await u.store.listTranscripts('A', 'jean'))[0]).toMatchObject({ status: 'pending', attempts: 0 })
+  })
+
+  it('withdraws notices and sends them without their text while the transcription service hangs', async () => {
+    const hs = homeserver()
+    const u = await unit({ hs, everyMs: 20, noticeWaitMs: 50, transcribe: (_a, options) => new Promise((_, reject) => options?.signal?.addEventListener('abort', () => reject(new Error('aborted')))) })
+    u.t.start()
+    await u.add('m1')
+    await until('the notice without its text', () => hs.notices().length === 1, 2_000)
+    expect(String(hs.notices()[0]!.content.body)).toContain('pas encore prête')
+    // Erased meanwhile (the person's right): withdrawn, the transcription still hanging.
+    await u.t.erase('A', 'jean')
+    await until('withdrawn', () => hs.notices().length === 0)
+    expect(u.heardAudio).toHaveLength(1)
+    await u.t.stop()
+  })
+
+  it('leaves a failing transcription service alone a while after three failures in a row', async () => {
+    let calls = 0
+    const u = await unit({
+      breakerMs: [60_000],
+      retryMs: [1, 1, 1, 1, 1],
+      transcribe: async () => {
+        calls++
+        throw new Error('LinTO answered 503')
+      }
+    })
+    await u.add('m1')
+    await u.add('m2')
+    await u.add('m3')
+    await u.add('m4')
+    for (let i = 0; i < 5; i++) {
+      u.t.kick('A')
+      await u.t.settled('A')
+      await sleep(5)
+    }
+    expect(calls).toBe(3)
+    expect(u.warnings.some(w => w.includes('left alone a while'))).toBe(true)
+    expect((await u.store.listTranscripts('A', 'jean')).map(r => r.status)).toEqual(['pending', 'pending', 'pending', 'pending'])
+  })
+
+  it('counts nothing while the voicemail server does not answer, and says so once', async () => {
+    const u = await unit()
+    await u.add('m1')
+    await u.t.settled('A')
+    u.boxes.state.down = true
+    await u.add('m2')
+    for (let i = 0; i < 3; i++) {
+      u.t.kick('A')
+      await u.t.settled('A')
+    }
+    expect((await u.store.listTranscripts('A', 'jean', ['m2']))[0]).toMatchObject({ status: 'pending', attempts: 0 })
+    expect(u.warnings.filter(w => w.includes('does not answer'))).toHaveLength(1)
+    u.boxes.state.down = false
+    u.t.kick('A')
+    await u.t.settled('A')
+    expect((await u.store.listTranscripts('A', 'jean', ['m2']))[0]!.status).toBe('done')
+  })
+})
+
 describe('TranscriptWatcher', () => {
   it("tells this Gateway's screens of the transcriptions any Gateway settled, once each, to their holder only", async () => {
     const store = new MemoryStore()
@@ -558,6 +1041,7 @@ describe('TranscriptWatcher', () => {
       holderIdFor: async (_t, userId) => holders[userId] ?? userId,
       publish: (_t, userId, e) => void told.push(`${userId} ${e.type} ${JSON.stringify(e.payload)}`),
       log: { error: () => {} },
+      lang: 'fr',
       everyMs: 3_600_000
     })
     await watcher.start()
@@ -574,7 +1058,7 @@ describe('TranscriptWatcher', () => {
     await store.updateTranscript('A', 'jean', 'm4', { status: 'none', reason: 'failed' }, lease)
     await watcher.tick()
     await watcher.tick()
-    expect(told).toEqual(['jean voicemail.transcribed {"id":"m1","transcript":{"status":"done","text":"texte m1"}}', 'jean voicemail.transcribed {"id":"m4","transcript":{"status":"none","reason":"failed"}}'])
+    expect(told).toEqual(['jean voicemail.transcribed {"id":"m1","transcript":{"status":"done","text":"texte m1","lang":"fr"}}', 'jean voicemail.transcribed {"id":"m4","transcript":{"status":"none","reason":"failed"}}'])
     watcher.stop()
   })
 })
@@ -598,6 +1082,30 @@ describe('the bot (MatrixBot)', () => {
     expect(() => new MatrixBot({ homeserverUrl: 'ftp://chat.example.test', token: TOKEN })).toThrow(/http/)
     expect(() => new MatrixBot({ homeserverUrl: 'https://chat.example.test', token: 'two words' })).toThrow(/not an access token/)
     await expect(bot.createDirectRoom('jean', 'n', 't')).rejects.toThrow(/not a Matrix user id/)
+    await expect(bot.createDirectRoom(`@jean:${SERVER}`, 'n', 't', 'Not An Alias')).rejects.toThrow(/not an alias/)
+  })
+
+  it('knows whose account exists, makes a room once at its address, finds it again, leaves it, and gives its address back', async () => {
+    const hs = homeserver()
+    const bot = new MatrixBot({ homeserverUrl: `https://${SERVER}`, token: TOKEN, fetch: hs.fetch })
+    hs.noAccount.add(`@nobody:${SERVER}`)
+    expect(await bot.exists(`@jean:${SERVER}`)).toBe(true)
+    expect(await bot.exists(`@nobody:${SERVER}`)).toBe(false)
+    const room = await bot.createDirectRoom(`@jean:${SERVER}`, 'n', 't', 'twakephone-abc')
+    expect(await bot.resolveAlias('twakephone-abc')).toBe(room)
+    await expect(bot.createDirectRoom(`@jean:${SERVER}`, 'n', 't', 'twakephone-abc')).rejects.toMatchObject({ errcode: 'M_ROOM_IN_USE' })
+    const sent = await bot.send(room, 'txn1', { body: 'x', [NOTICE_FIELD]: 'k1' })
+    expect(await bot.findSent(room, NOTICE_FIELD, 'k1')).toBe(sent)
+    expect(await bot.findSent(room, NOTICE_FIELD, 'k2')).toBeUndefined()
+    await bot.leave(room)
+    await bot.leave(room)
+    await bot.deleteAlias('twakephone-abc')
+    await bot.deleteAlias('twakephone-abc')
+    expect(await bot.resolveAlias('twakephone-abc')).toBeUndefined()
+    // Stopped: said so, nothing sent.
+    const stop = new AbortController()
+    stop.abort()
+    await expect(new MatrixBot({ homeserverUrl: `https://${SERVER}`, token: TOKEN, fetch: hs.fetch }).whoami(stop.signal)).rejects.toThrow(/stopped/)
   })
 
   it('refuses an answer too large, and one that is not JSON', async () => {
@@ -606,22 +1114,51 @@ describe('the bot (MatrixBot)', () => {
     const html = (async () => new Response('<html>oops</html>', { status: 502 })) as unknown as typeof globalThis.fetch
     await expect(new MatrixBot({ homeserverUrl: `https://${SERVER}`, token: TOKEN, fetch: html }).whoami()).rejects.toThrow(/unreadable answer \(502\)/)
   })
+
+  it('sends a notice and its withdrawal under transaction ids of their own, the same whatever the Gateway and the try', () => {
+    const r = { holder: 'jean', messageId: 'm1' }
+    expect(txnOf('n', 'A', r)).toBe(txnOf('n', 'A', { ...r }))
+    expect(txnOf('n', 'A', r)).toMatch(/^twakephone-n-[0-9a-f]{32}$/)
+    expect(txnOf('r', 'A', r).slice(13)).toBe(txnOf('n', 'A', r).slice(13))
+    expect(txnOf('n', 'A', { holder: 'jean\u00001', messageId: 'm1' })).not.toBe(txnOf('n', 'A', r))
+    expect(txnOf('n', 'B', r)).not.toBe(txnOf('n', 'A', r))
+    expect(txnOf('n', 'A', { holder: 'jean', messageId: 'm2' })).not.toBe(txnOf('n', 'A', r))
+  })
 })
 
 describe('the notice of a message', () => {
-  it('says who called, when in the time zone given, how long, what they said, and links to the Messagerie vocale; escaped in HTML', () => {
+  it('says who called (the name they gave as theirs), when in the time zone given, how long, what they said, and links to the Messagerie vocale; escaped in HTML', () => {
     const v = message('m1', { fromName: 'Alice <b>&</b>', from: '0612345678', receivedAt: '2026-10-18T08:05:00.000Z', durationSec: 75 })
-    const c = noticeContent(v, { status: 'done', text: 'Rappelle <moi>' }, { appUrl: 'https://phone.example.test', timeZone: 'Europe/Paris' })
-    expect(c.body).toBe('Nouveau message vocal de Alice <b>&</b> (0612345678), le 18 octobre 2026 à 10:05, durée 1:15.\nTranscription : « Rappelle <moi> »\nÉcouter dans TwakePhone : https://phone.example.test/voicemail')
+    const c = noticeContent(v, { status: 'done', text: 'Rappelle <moi>' }, { appUrl: 'https://phone.example.test', timeZone: 'Europe/Paris' }, 'k1')
+    expect(c.body).toBe("Nouveau message vocal du 0612345678 (nom annoncé par l'appelant : « Alice <b>&</b> »), le 18 octobre 2026 à 10:05, durée 1:15.\nTranscription : « Rappelle <moi> »\nÉcouter dans TwakePhone : https://phone.example.test/voicemail")
+    expect(c[NOTICE_FIELD]).toBe('k1')
     expect(c.formatted_body).toContain('Alice &lt;b&gt;&amp;&lt;/b&gt;')
     expect(c.formatted_body).toContain('<blockquote>Rappelle &lt;moi&gt;</blockquote>')
     expect(c.formatted_body).not.toContain('<moi>')
-    expect(noticeContent(v, { status: 'done', text: '' }, { timeZone: 'UTC' }).body).toBe('Nouveau message vocal de Alice <b>&</b> (0612345678), le 18 octobre 2026 à 08:05, durée 1:15.\nTranscription : aucune parole reconnue.')
-    expect(noticeContent(message('m2', { from: undefined, fromName: undefined }), { status: 'none' }, { timeZone: 'UTC' }).body).toMatch(/^Nouveau message vocal de un numéro masqué,/)
+    expect(noticeContent(v, { status: 'done', text: '' }, { timeZone: 'UTC' }).body).toBe("Nouveau message vocal du 0612345678 (nom annoncé par l'appelant : « Alice <b>&</b> »), le 18 octobre 2026 à 08:05, durée 1:15.\nTranscription : aucune parole reconnue.")
+    expect(noticeContent(message('m2', { from: undefined, fromName: undefined }), { status: 'none' }, { timeZone: 'UTC' }).body).toMatch(/^Nouveau message vocal d'un numéro masqué,/)
+    // Without the text: neither what was said, nor that it is on its way; why there is none still said.
+    const bare = noticeContent(v, { status: 'done', text: 'Rappelle-moi' }, { appUrl: 'https://phone.example.test', timeZone: 'UTC', withText: false })
+    expect(`${bare.body}${bare.formatted_body}`).not.toContain('Rappelle')
+    expect(noticeContent(v, { status: 'pending' }, { timeZone: 'UTC', withText: false }).body).not.toContain('Transcription')
+    expect(noticeContent(v, { status: 'pending' }, { timeZone: 'UTC' }).body).toContain('Transcription : pas encore prête')
+    expect(noticeContent(v, { status: 'none', reason: 'busy' }, { timeZone: 'UTC', withText: false }).body).toContain('Pas de transcription')
   })
 
-  it('shows the screens a transcription as it is, nothing of one erased or never made', () => {
-    expect(publicTranscript({ status: 'pending' })).toEqual({ status: 'pending' })
+  it('takes out of the name a caller gave what changes how a text reads', () => {
+    expect(callerName('‮Service informatique​')).toBe('Service informatique')
+    expect(callerName('Alice⁦ ⁩Martin\nIT')).toBe('Alice Martin IT')
+    expect(callerName('​‮')).toBeUndefined()
+    expect(callerName(undefined)).toBeUndefined()
+    expect(Array.from(callerName('é'.repeat(100))!)).toHaveLength(64)
+    const c = noticeContent(message('m1', { fromName: '\u202eService informatique' }), { status: 'none' }, { timeZone: 'UTC' })
+    expect(c.body).toContain("(nom annoncé par l'appelant : « Service informatique »)")
+    expect(c.body).not.toMatch(/[\u202a-\u202e\u2066-\u2069\u200b]/)
+  })
+
+  it('shows the screens a transcription as it is, its text in its language, nothing of one erased or never made', () => {
+    expect(publicTranscript({ status: 'pending' }, 'fr')).toEqual({ status: 'pending' })
+    expect(publicTranscript({ status: 'done', text: 'x' }, 'fr')).toEqual({ status: 'done', text: 'x', lang: 'fr' })
     expect(publicTranscript({ status: 'done', text: 'x' })).toEqual({ status: 'done', text: 'x' })
     expect(publicTranscript({ status: 'none', reason: 'busy' })).toEqual({ status: 'none', reason: 'busy' })
     expect(publicTranscript({ status: 'none' })).toBeUndefined()
@@ -630,26 +1167,30 @@ describe('the notice of a message', () => {
 })
 
 describe('transcriptionFromEnv and matrixFromEnv', () => {
-  it('is off without LINTO_URL, and reads the bounds of the messages transcribed', () => {
+  it('is off without LINTO_URL, and reads the bounds of the messages transcribed and their language', () => {
     expect(transcriptionFromEnv({}, true)).toBeUndefined()
     const t = transcriptionFromEnv({ LINTO_URL: 'http://127.0.0.1:8090', VOICEMAIL_MAX_SEC: '120' }, true)!
-    expect([t.maxSec, t.queueMax, t.provider.id]).toEqual([120, 100, 'linto'])
-    expect(transcriptionFromEnv({ LINTO_URL: 'http://127.0.0.1:8090', VOICEMAIL_TRANSCRIBE_MAX_SEC: '60', VOICEMAIL_TRANSCRIBE_QUEUE_MAX: '5' }, true)).toMatchObject({ maxSec: 60, queueMax: 5, maxBytes: 60 * 24_000 + 65_536 })
+    expect([t.maxSec, t.queueMax, t.provider.id, t.lang]).toEqual([120, 100, 'linto', 'fr'])
+    // A recording of 16 kHz is read whole; a bound under 10 s is not one.
+    expect(transcriptionFromEnv({ LINTO_URL: 'http://127.0.0.1:8090', VOICEMAIL_TRANSCRIBE_MAX_SEC: '60', VOICEMAIL_TRANSCRIBE_QUEUE_MAX: '5', LINTO_LANGUAGE: 'fr-FR' }, true)).toMatchObject({ maxSec: 60, queueMax: 5, maxBytes: 60 * 48_000 + 65_536, lang: 'fr-FR' })
+    expect(transcriptionFromEnv({ LINTO_URL: 'http://127.0.0.1:8090', VOICEMAIL_MAX_SEC: '5' }, true)!.maxSec).toBe(10)
     expect(() => transcriptionFromEnv({ LINTO_URL: 'http://127.0.0.1:8090' }, false)).toThrow(/voicemail server/)
     expect(() => transcriptionFromEnv({ LINTO_URL: 'http://u:p@127.0.0.1:8090' }, true)).toThrow(/LINTO_URL/)
     expect(() => transcriptionFromEnv({ LINTO_URL: 'http://127.0.0.1:8090', VOICEMAIL_TRANSCRIBE_QUEUE_MAX: '0' }, true)).toThrow(/VOICEMAIL_TRANSCRIBE_QUEUE_MAX/)
     expect(() => transcriptionFromEnv({ LINTO_URL: 'http://127.0.0.1:8090', LINTO_LANGUAGE: 'fr FR' }, true)).toThrow(/LINTO_LANGUAGE/)
   })
 
-  it('takes the bot from its homeserver and its token only together, a template with {uid}, and the link of the app', () => {
+  it('takes the bot from its homeserver and its token only together, a template with {uid}, the link of the app, and whether the notices carry the text', () => {
     expect(matrixFromEnv({}, true)).toBeUndefined()
     expect(() => matrixFromEnv({ MATRIX_HOMESERVER_URL: 'https://chat.example.test' }, true)).toThrow(/go together/)
     expect(() => matrixFromEnv({ MATRIX_BOT_TOKEN: TOKEN }, true)).toThrow(/go together/)
     expect(() => matrixFromEnv({ MATRIX_HOMESERVER_URL: 'https://chat.example.test', MATRIX_BOT_TOKEN: TOKEN }, false)).toThrow(/voicemail server/)
     expect(() => matrixFromEnv({ MATRIX_HOMESERVER_URL: 'https://chat.example.test', MATRIX_BOT_TOKEN: TOKEN, MATRIX_USER_TEMPLATE: '@jean:chat.example.test' }, true)).toThrow(/\{uid\}/)
     expect(() => matrixFromEnv({ MATRIX_HOMESERVER_URL: 'https://chat.example.test', MATRIX_BOT_TOKEN: TOKEN, NOTICE_TIME_ZONE: 'Mars/Olympus' }, true)).toThrow(/NOTICE_TIME_ZONE/)
+    expect(() => matrixFromEnv({ MATRIX_HOMESERVER_URL: 'https://chat.example.test', MATRIX_BOT_TOKEN: TOKEN, MATRIX_NOTICE_TEXT: 'no' }, true)).toThrow(/MATRIX_NOTICE_TEXT/)
     const n = matrixFromEnv({ MATRIX_HOMESERVER_URL: 'https://chat.example.test', MATRIX_BOT_TOKEN: TOKEN, MATRIX_USER_TEMPLATE: '@{uid}:chat.example.test', CORS_ORIGINS: 'http://localhost:3000, https://phone.example.test/' }, true)!
-    expect([n.userTemplate, n.appUrl, n.timeZone]).toEqual(['@{uid}:chat.example.test', 'https://phone.example.test', 'Europe/Paris'])
+    expect([n.userTemplate, n.appUrl, n.timeZone, n.withText]).toEqual(['@{uid}:chat.example.test', 'https://phone.example.test', 'Europe/Paris', true])
+    expect(matrixFromEnv({ MATRIX_HOMESERVER_URL: 'https://chat.example.test', MATRIX_BOT_TOKEN: TOKEN, MATRIX_NOTICE_TEXT: 'off' }, true)!.withText).toBe(false)
     expect(matrixFromEnv({ MATRIX_HOMESERVER_URL: 'https://chat.example.test', MATRIX_BOT_TOKEN: TOKEN, APP_URL: 'https://app.example.test/phone/' }, true)!.appUrl).toBe('https://app.example.test/phone')
     expect(matrixIdFromTemplate('@{uid}:chat.example.test', 'JDupont')).toBe('@jdupont:chat.example.test')
     expect(matrixIdFromTemplate('@{uid}:chat.example.test', 'jean dupont')).toBeUndefined()

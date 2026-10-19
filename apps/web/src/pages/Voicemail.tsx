@@ -8,17 +8,28 @@ import { useT } from '../i18n/useT.js'
 import { Reloader } from '../reload.js'
 import { usePhone } from '../softphone.js'
 
-/** What a message says (step 11b): its text, that it is on its way, or why there is none. */
+/** Why a message has no transcription, in the person's language. */
+const NO_TRANSCRIPT = { 'too-long': 'voicemail.transcriptTooLong', busy: 'voicemail.transcriptBusy', failed: 'voicemail.transcriptFailed', untracked: 'voicemail.transcriptUntracked' } as const
+const noTranscript = (reason: NonNullable<Voicemail['transcript']>['reason']) => NO_TRANSCRIPT[reason ?? 'failed']
+
+/**
+ * What a message says (step 11b): its text, in the language it was said in (`lang`: read out with that voice, whatever
+ * the language of the screen, RGAA 8.7), that it is on its way, or why there is none.
+ */
 const Transcript = ({ id, transcript }: { id: string; transcript: NonNullable<Voicemail['transcript']> }) => {
   const { t } = useT()
   const text =
-    transcript.status === 'done'
-      ? transcript.text
-        ? `« ${transcript.text} »`
-        : t('voicemail.transcriptEmpty')
-      : transcript.status === 'pending'
-        ? t('voicemail.transcriptPending')
-        : t(transcript.reason === 'too-long' ? 'voicemail.transcriptTooLong' : transcript.reason === 'busy' ? 'voicemail.transcriptBusy' : 'voicemail.transcriptFailed')
+    transcript.status === 'done' ? (
+      transcript.text ? (
+        <span lang={transcript.lang ?? 'fr'}>« {transcript.text} »</span>
+      ) : (
+        t('voicemail.transcriptEmpty')
+      )
+    ) : transcript.status === 'pending' ? (
+      t('voicemail.transcriptPending')
+    ) : (
+      t(noTranscript(transcript.reason))
+    )
   return (
     <p className={`transcript transcript-${transcript.status}`} id={id} data-testid="voicemail-transcript" data-status={transcript.status}>
       <span className="transcript-label">{t('voicemail.transcriptLabel')}</span> {text}
@@ -134,10 +145,14 @@ export const VoicemailPage = () => {
         const count = applyVoicemailEvent(current, event).filter(i => i.unread).length
         say(t(count === 1 ? 'voicemail.arrivedOne' : 'voicemail.arrived', { who: whoOf(v), time: time.format(new Date(v.receivedAt)), count: String(count) }))
       }
-      // Its transcription done (step 11b): said once, the text itself is in the list.
-      if (event.type === 'voicemail.transcribed' && event.payload.transcript.status === 'done') {
+      // Its transcription done (step 11b): said once, the text itself is in the list; or that there is none, and why.
+      if (event.type === 'voicemail.transcribed') {
         const v = current.find(i => i.id === event.payload.id)
-        if (v && v.transcript?.status !== 'done') say(t('voicemail.transcribedSaid', { who: whoOf(v) }))
+        const now = event.payload.transcript
+        if (v && v.transcript?.status !== now.status) {
+          if (now.status === 'done') say(t('voicemail.transcribedSaid', { who: whoOf(v) }))
+          if (now.status === 'none') say(t('voicemail.notTranscribedSaid', { who: whoOf(v), why: t(noTranscript(now.reason)) }))
+        }
       }
     })
     return () => {
