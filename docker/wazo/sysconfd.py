@@ -216,6 +216,11 @@ def ami_command(command):
     except OSError as err:
         raise AmiError(f'wazo-confgend not reached, voicemail reload not run: {err}') from err
     reloaded, listed = ami_actions([reload_action(RELOADS[command]), ['Action: VoicemailUsersList']])
+    # A mailbox deleted between the two readings of wazo-confgend says nothing: only those in both are expected.
+    try:
+        expected &= mailboxes_of(confgend('asterisk/voicemail.conf'))
+    except OSError as err:
+        raise AmiError(f'wazo-confgend not reached after the reload: {err}') from err
     missing = expected - mailboxes_listed(listed.get('entries', []))
     if missing:
         raise AmiError(f'voicemail reload: {len(missing)} mailbox(es) of wazo-confgend not in Asterisk after it, as {", ".join(sorted(f"{n}@{c}" for c, n in missing)[:5])}')
@@ -226,6 +231,8 @@ class Command:
     def __init__(self, value):
         self.value = value
         self.optimized = False
+        self.merged_into = None  # the command waiting that this one is merged into
+        self.error = None
 
 
 class Request:
@@ -241,14 +248,18 @@ class Request:
             for command in self.commands:
                 if command.optimized:
                     log(f'{command.value!r} merged into the one waiting')
+                    # The one it was merged into ran before this request: its failure is this request's too.
+                    self.error = self.error or command.merged_into.error
                     continue
                 try:
-                    if RELOAD_MS:
+                    # Only PJSIP's reload is long on a real Wazo (wazo-confgen --invalidate, then asterisk -rx).
+                    if RELOAD_MS and command.value == 'module reload res_pjsip.so':
                         time.sleep(RELOAD_MS / 1000)
                     ami_command(command.value)
                     log(f'ran {command.value!r}')
                 except Exception as err:
                     log(f'{command.value!r} failed: {err}')
+                    command.error = err
                     self.error = self.error or err
         finally:
             self.done.set()
@@ -261,17 +272,22 @@ class RequestQueue:
     def __init__(self):
         self.condition = threading.Condition()
         self.queue = deque()
-        self.waiting = set()
+        self.waiting = {}
 
     def put(self, request):
         with self.condition:
             for command in request.commands:
                 if command.value in self.waiting:
                     command.optimized = True
+                    command.merged_into = self.waiting[command.value]
                 else:
-                    self.waiting.add(command.value)
+                    self.waiting[command.value] = command
             self.queue.append(request)
             self.condition.notify()
+
+    def empty(self):
+        with self.condition:
+            return not self.queue
 
     def get(self):
         with self.condition:
@@ -280,7 +296,7 @@ class RequestQueue:
             request = self.queue.popleft()
             for command in request.commands:
                 if not command.optimized:
-                    self.waiting.discard(command.value)
+                    self.waiting.pop(command.value, None)
             return request
 
 
@@ -292,6 +308,8 @@ def work():
     while True:
         try:
             QUEUE.get().run()
+            if QUEUE.empty():
+                log('idle')
         except Exception as err:
             log(f'unexpected error: {err}')
 
@@ -374,10 +392,10 @@ class Handler(BaseHTTPRequestHandler):
                     log(f'ipbx command not run: {command!r}')
             request = Request(commands)
             QUEUE.put(request)
-            # As wazo-sysconfd's SyncRequestHandlers: it waits 30 s for the request to have run.
+            # As wazo-sysconfd's SyncRequestHandlers: it waits 30 s for the request to have run, then warns and answers 200.
             if SYNCHRONOUS and not request.done.wait(30):
-                return self.answer(500, {'error': 'timeout reached on synchronous request'})
-            if SYNCHRONOUS and request.error:
+                log('timeout reached on synchronous request')
+            elif SYNCHRONOUS and request.error:
                 return self.answer(500, {'error': str(request.error)})
             return self.answer(200, {'request_uuid': request.id})
         log(f'POST {self.path}: nothing to do here')
