@@ -2438,8 +2438,9 @@ try {
   // This test dials numbers of Mayotte (0639), the same one twenty times or so and up to six in a minute; the overseas
   // numbers have the thresholds of international ones (review 6b, n°14): six calls in a minute, or fifteen in a row to
   // one number, are refused (fraud). Raised here for those two only: the thresholds are proven by trunk.sip.mjs.
-  // (The daily attempts of national numbers are not what these steps look at: the whole suite makes more than 150 a day by now.)
-  const FRAUD = { national: { dailyAttempts: { warning: 5000, critical: 10000 } }, international: { callsPerMinute: { warning: 30, critical: 60 }, sequentialCalls: { warning: 50, critical: 100 } } }
+  // (The 06 39 98 00 0x numbers of these steps are Mayotte's: overseas, the rule of the international ones, whose daily attempts
+  // warn at 20 by default; the steps are not about that, the whole suite makes more than that.)
+  const FRAUD = { international: { dailyAttempts: { warning: 1000, critical: 2000 }, callsPerMinute: { warning: 30, critical: 60 }, sequentialCalls: { warning: 50, critical: 100 } } }
   await step('step 6b: Alice gives Bob the rights profile "internal calls only" (PUT /admin/outbound): his call to 06 39 98 00 03 is refused before the operator (403, rights) and the app tells him why; given "France" (PUT /admin/outbound/users/bdurand), the same call reaches the operator', async () => {
     const api = await asPerson(alice)
     const put = await api('PUT', '/admin/outbound', { policy: { fraud: FRAUD }, profiles: PROFILES, assignments: [{ userId: 'bdurand', profileId: 'internal' }] })
