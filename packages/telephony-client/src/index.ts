@@ -227,17 +227,16 @@ export interface CallConference {
   awaiting?: string
 }
 
-/** The room of Meet a conference went to (startVisio): its link, and who the room called again from it. */
+/** What became of each person of the old room in a passage to Meet (step 8d). */
+export type VisioPersonStatus = 'pending' | 'calling' | 'swapped' | 'called' | 'failed' | 'gone'
+/** The passage of a conference to a room of Meet: its link, and each person (`swapped`: a phone that took Meet's call in the place of its own; `called`: a number called again by a new call). */
 export interface CallVisio {
   meetingId: string
   slug: string
   url?: string
-  /** The phones of extensions that took the place of their call (nothing to wait for). */
-  swapped: string[]
-  /** The numbers of the public network called again: their old calls stay until the person says they hear them (leaveVisio). */
-  called: string[]
-  /** Who could not be called again from Meet's room: they stay in the old room. */
-  failed: string[]
+  /** `running`: the calls are being made; `done`; `halted`: a call was diverted, nothing more is called; `left`: the old room ended. */
+  state: 'running' | 'done' | 'halted' | 'left'
+  people: { number: string; kind: 'extension' | 'number' | 'other'; status: VisioPersonStatus; reason?: string }[]
 }
 
 export interface SyncReport {
@@ -801,16 +800,30 @@ export class TelephonyClient {
 
   /**
    * « Passer en visio » (step 8d): a room of Meet (restricted access) is opened for the person, `url` to open in the
-   * browser, and each person on the phone is called again from it. 501 `VISIO_UNAVAILABLE` without Meet; 409
-   * `CONFERENCE_AWAITING` while a call with the operator waits for the person's word.
+   * browser, and each person on the phone is called again from it, behind the answer (202): read the state with
+   * getVisio. A second ask gives the same passage. 501 `VISIO_UNAVAILABLE` without Meet; 409 `CONFERENCE_AWAITING` while a
+   * call with the operator waits for the person's word.
    */
   startVisio(meetingId: string) {
     return this.request<CallVisio>(`/conferences/${encodeURIComponent(meetingId)}/visio`, { method: 'POST' })
   }
 
-  /** « Terminer l'ancienne salle » (step 8d): the person hears the numbers in Meet's room `room`; the old room ends. Replayable. */
-  leaveVisio(meetingId: string, room: string) {
-    return this.request<void>(`/conferences/${encodeURIComponent(meetingId)}/visio/leave`, { method: 'POST', body: JSON.stringify({ room }) })
+  /** The passage of the conference to Meet, or null when there is none (read again after a reload of the page). */
+  async getVisio(meetingId: string): Promise<CallVisio | null> {
+    try {
+      return await this.request<CallVisio>(`/conferences/${encodeURIComponent(meetingId)}/visio`)
+    } catch (err) {
+      if ((err as { code?: string }).code === 'VISIO_NONE') return null
+      throw err
+    }
+  }
+
+  /**
+   * « Terminer l'ancienne salle » (step 8d): the old room ends once no one is left in it. `left: false` and who stays
+   * (a person that could not be called again, or added meanwhile) otherwise. Replayable.
+   */
+  leaveVisio(meetingId: string) {
+    return this.request<{ left: boolean; remaining: string[] } | undefined>(`/conferences/${encodeURIComponent(meetingId)}/visio/leave`, { method: 'POST' })
   }
 
   /** « Annuler » (step 8c): ends the room, the original call is the person's again. Refused (409 CONFERENCE_CONFIRMED) once confirmed. */

@@ -430,6 +430,8 @@ const gateway = await buildApp(registry, {
   conference,
   // The calls of rooms a person may place a minute (10 by default): the conferences of steps 8b, 8c and 8d follow one another within it.
   dialOutLimiter: new RateLimiter(100, 60_000),
+  // A passage to Meet is ended for want of anyone of the organisation in its room after a second here (2 minutes by default).
+  visioGraceMs: 1_000,
   webhooks: { policy: { allowHttp: true, ports: [Number(new URL(receiver.url).port)] }, open: parseNetworks('127.0.0.1/32'), retryBaseMs: 1_000 },
   trunkWatchMs: 2_000,
   voicemail: tenantId => (tenantId === TENANT ? wazo : undefined),
@@ -522,6 +524,8 @@ const open = async (login, name, { timezoneId } = {}) => {
   return { page, context, name }
 }
 const phoneState = page => page.getByTestId('phone-state')
+/** A number as the page writes it (+33 6 39 98 00 07). */
+const formatNumberForPage = n => n.replace(/^\+33(\d)(\d\d)(\d\d)(\d\d)(\d\d)$/, '+33 $1 $2 $3 $4 $5')
 const calls = page => page.evaluate(() => window.twakephone.calls)
 const lastEnded = page => page.evaluate(() => window.twakephone.lastEnded)
 /** Dials and waits for that call to end: not for the one that ended just before (shown a few seconds longer). */
@@ -3123,7 +3127,7 @@ try {
   })
   // Step 8d (ADR 0026): « Passer en visio ». Meet is played by this process (its external API and the page of a room),
   // attached to the Gateway for the one step: the stack has no Meet.
-  await step('step 8d: Alice takes a conference (Jean, Bob, a number of the operator) to video: Meet makes a restricted room, each person is called again from it (Jean and Bob in the place of their call, no ringing; the number by a new call), Alice\'s tab opens on the room; the old calls stay until Alice says she hears the number, then the old room ends', async () => {
+  await step('step 8d: Alice takes a conference (Jean, Bob, two numbers of the operator, one of which will refuse to be called again) to video: Meet makes a restricted room and the answer is at once; each person is called again from it (Jean and Bob in the place of their call, no ringing; a number by a new call); the old calls and Alice\'s own stay; « Terminer l\'ancienne salle » names who stays; once removed, the old room ends; and when only the number is left in Meet\'s room it ends too, the number hung up', async () => {
     const meetRoom = { id: randomUUID(), slug: 'abc-defg-hij', name: 'abc-defg-hij' }
     const asked = []
     const meet = createHttpServer((req, res) => {
@@ -3143,7 +3147,7 @@ try {
     meetRoom.url = `http://127.0.0.1:${meet.address().port}/${meetRoom.slug}`
     conference.meet = new MeetApi({ url: `http://127.0.0.1:${meet.address().port}`, clientId: 'e2e', clientSecret: 'e2e' })
     try {
-      // The conference: Alice, Jean, Bob, and a number of the operator.
+      // The conference: Alice, Jean, Bob, and two numbers of the operator.
       await aliceCallsJean(alice, jean)
       await alice.page.getByRole('button', { name: 'Ajouter un participant' }).click()
       await alice.page.getByLabel('Participant à ajouter (poste ou numéro)').fill('103')
@@ -3153,58 +3157,86 @@ try {
       await ringing.getByRole('button', { name: 'Répondre' }).click()
       await until('Bob in the conference', async () => ((await calls(bob.page))[0]?.state === 'connected' ? true : null), { timeout: 30_000 })
       await alice.page.getByTestId('conference-participant').nth(2).waitFor({ timeout: 20_000 })
-      await alice.page.getByRole('button', { name: 'Ajouter un participant' }).click()
-      await alice.page.getByLabel('Participant à ajouter (poste ou numéro)').fill('06 39 98 00 07')
-      await alice.page.getByRole('button', { name: 'Appeler et ajouter' }).click()
-      const { call: first, at } = await invitedAtOperator(invite => invite.uri === 'sip:+33639980007@operator.example')
-      await at.callState(first, 'answered')
+      const firsts = {}
+      for (const [typed, uri] of [['06 39 98 00 07', '+33639980007'], ['06 39 98 00 08', '+33639980008']]) {
+        await alice.page.getByRole('button', { name: 'Ajouter un participant' }).click()
+        await alice.page.getByLabel('Participant à ajouter (poste ou numéro)').fill(typed)
+        await alice.page.getByRole('button', { name: 'Appeler et ajouter' }).click()
+        const { call, at } = await invitedAtOperator(invite => invite.uri === `sip:${uri}@operator.example`)
+        await at.callState(call, 'answered')
+        firsts[uri] = { call, at }
+      }
       const room = await until('the room of the conference', async () => (await store.listConferences(TENANT, 'amartin')).find(r => /^twake-call-[0-9a-f]{16}$/.test(r.meetingId))?.meetingId ?? null)
-      await until('the number in the room', async () => ((await bridge.participantCalls(room)).some(p => p.number === '+33639980007') ? true : null), { timeout: 30_000 })
+      await until('the numbers in the room', async () => ((await bridge.participantCalls(room)).filter(p => p.number.startsWith('+3363998000')).length === 2 ? true : null), { timeout: 30_000 })
       expectEqual(await jean.page.getByRole('button', { name: 'Passer en visio' }).count(), 0, 'the button to go to video on Jean\'s page')
+      const api = await asPerson(alice)
       const [aliceOwn] = await calls(alice.page)
       const [jeans] = await calls(jean.page)
+      // The first number called again is refused (486): whichever it is, it stays in the old room.
+      operator.state.next.push({ reply: '486 Busy Here' })
       const popup = alice.context.waitForEvent('page')
       await alice.page.getByRole('button', { name: 'Passer en visio' }).click()
       const tab = await popup
       await tab.waitForURL(meetRoom.url, { timeout: 30_000 })
       await tab.getByText('The room of Meet').waitFor()
-      // Meet was asked for one room, the most closed it gives.
+      // Meet was asked for one room, the most closed it gives, and the Gateway keeps the passage.
       const made = asked.filter(a => a.startsWith('POST /external-api/v1.0/rooms/'))
       expectEqual(made.length, 1, 'the rooms Meet was asked for')
       expectEqual(JSON.parse(made[0].replace(/^POST \S+ /, '')).access_level, 'restricted', 'the access of the room of Meet')
       expectEqual((await store.getConference(meetRoom.id))?.ownerUserId, 'amartin', 'the owner of the room of Meet')
-      // Jean and Bob: their call replaced by the one of Meet's room, at once (no ringing), going on; the number called again.
-      const [hisNew] = await until('Jean on the room of Meet', async () => {
+      expectEqual((await api('POST', `/conferences/${room}/visio`)).json().meetingId, meetRoom.id, 'a second ask gives the same passage')
+      const done = await until('the passage done', async () => {
+        const res = await api('GET', `/conferences/${room}/visio`)
+        return res.statusCode === 200 && res.json().state === 'done' ? res.json() : null
+      }, { timeout: 60_000 })
+      expectEqual(asked.filter(a => a.startsWith('POST /external-api/v1.0/rooms/')).length, 1, 'the rooms Meet was asked for once the second ask is made')
+      const byNumber = Object.fromEntries(done.people.map(p => [p.number, p.status]))
+      const calledNumber = Object.keys(byNumber).find(n => byNumber[n] === 'called')
+      const failedNumber = Object.keys(byNumber).find(n => byNumber[n] === 'failed')
+      expectEqual(`${byNumber['102']} ${byNumber['103']} ${!!calledNumber} ${!!failedNumber}`, 'swapped swapped true true', `how each person was called again ${JSON.stringify(byNumber)}`)
+      // Jean and Bob: their call replaced at once (no ringing), going on; the number called again, answered.
+      await until('Jean on the room of Meet', async () => {
         const c = await calls(jean.page)
         return c.length === 1 && c[0].state === 'connected' && c[0].replacedCallId === jeans.id ? c : null
       }, { timeout: 30_000 })
-      expectEqual(hisNew.room, 'conference', 'Jean\'s call from the room of Meet')
-      await until('Bob on the room of Meet', async () => ((await calls(bob.page)).length === 1 && (await calls(bob.page))[0].replacedCallId ? true : null), { timeout: 30_000 })
-      const { call: second, at: at2 } = await invitedAtOperator(invite => invite.uri === 'sip:+33639980007@operator.example')
+      const { call: second, at: at2 } = await invitedAtOperator(invite => invite.uri === `sip:${calledNumber}@operator.example` && invite.headers.get('call-id')?.[0] !== firsts[calledNumber].call.invite.headers.get('call-id')?.[0])
       await at2.callState(second, 'answered')
-      const inMeet = await until('everyone in the room of Meet', async () => {
+      const inMeet = await until('everyone called again in the room of Meet', async () => {
         const now = (await bridge.participantCalls(meetRoom.id)).map(p => p.number).sort()
-        return now.join(' ') === '+33639980007 102 103' ? now : null
+        return now.join(' ') === ['102', '103', calledNumber].sort().join(' ') ? now : null
       }, { timeout: 30_000 })
-      expectEqual(inMeet.join(' '), '+33639980007 102 103', 'who is in the room of Meet')
-      // The number is called again: its old call and Alice's own stay until she says she hears it.
+      expectEqual(inMeet.includes(failedNumber), false, 'the number that refused is not in the room of Meet')
+      // Nothing is hung up yet; the page says who was called again and who stayed.
       await alice.page.getByText(/ont été rappelés dans la salle Meet/).waitFor({ timeout: 20_000 })
+      await alice.page.getByText(/Pas rappelés, restés dans l'ancienne salle/).waitFor()
       await sleep(1_500)
-      expectEqual(first.state, 'answered', 'the old call at the operator before Alice says so')
+      expectEqual(firsts[calledNumber].call.state, 'answered', 'the old call of the number called again before Alice says so')
       expectEqual((await calls(alice.page)).some(c => c.id === aliceOwn.id), true, 'Alice\'s own call before she says so')
+      // Alice says: the old room is not ended, someone stays in it (the number that refused), and Alice is not left with them alone.
       await alice.page.getByRole('button', { name: "Terminer l'ancienne salle" }).click()
-      await at.callState(first, 'ended', 20_000)
+      await alice.page.getByText(/Restent dans l'ancienne salle/).waitFor({ timeout: 20_000 })
+      expectEqual((await store.getConference(room)) !== null, true, 'the old room while someone stays in it')
+      expectEqual((await calls(alice.page)).some(c => c.id === aliceOwn.id), true, 'Alice\'s own call while someone stays in the old room')
+      // Nobody is added to a room that is going to Meet.
+      expectEqual(await alice.page.getByRole('button', { name: 'Ajouter un participant' }).isDisabled(), true, 'the add button during the passage')
+      // She removes the one who stayed (the list\'s button): its old call ends; now the old room can end.
+      const shown = formatNumberForPage(failedNumber)
+      await alice.page.getByRole('button', { name: `Retirer ${shown} de la conférence` }).click()
+      await firsts[failedNumber].at.callState(firsts[failedNumber].call, 'ended', 20_000)
+      await alice.page.getByRole('button', { name: "Terminer l'ancienne salle" }).click()
+      await firsts[calledNumber].at.callState(firsts[calledNumber].call, 'ended', 20_000)
       await until('the end of Alice\'s own call', async () => ((await calls(alice.page)).length === 0 ? true : null), { timeout: 20_000 })
       await until('the old room gone', async () => ((await store.getConference(room)) === null ? true : null), { timeout: 20_000 })
-      // They go on, in Meet's room, and hear each other and the operator's number.
+      // They go on, in Meet's room, and hear each other and the number.
       expectEqual(`${(await calls(jean.page)).length} ${(await calls(bob.page)).length} ${second.state}`, '1 1 answered', 'the calls after the old room ended')
       await bothHearEachOther(jean, bob)
-      await until('sound from the room of Meet at the operator', async () => (second.media.stats.voiced > 20 ? true : null), { timeout: 30_000 })
+      await until('sound from the room of Meet at the number', async () => (second.media.stats.voiced > 20 ? true : null), { timeout: 30_000 })
       await tab.close()
+      // Jean and Bob leave: only the number is left in Meet's room, nobody to answer for its call: the room ends, the number is hung up.
       for (const who of [jean, bob]) await who.page.getByRole('button', { name: 'Quitter la conférence' }).click()
       for (const who of [jean, bob]) await until(`the end of ${who.name}'s call`, async () => ((await calls(who.page)).length === 0 ? true : null), { timeout: 20_000 })
-      await at2.hangupReceived(second).catch(() => undefined)
-      await store.deleteConference(meetRoom.id)
+      await at2.callState(second, 'ended', 40_000)
+      await until('the record of the room of Meet gone', async () => ((await store.getConference(meetRoom.id)) === null ? true : null), { timeout: 20_000 })
     } finally {
       delete conference.meet
       await new Promise(resolve => meet.close(resolve))

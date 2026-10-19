@@ -32,7 +32,7 @@ const JOIN = '0123456789abcdef'.repeat(2)
  * has the Call-ID of its call (`sip.callIDFull`); the room's call to the group 600 is answered by Carol (104), whom
  * the SIP server tells of it (second review 8b, n°4). Dave (105) holds an extension and is in none.
  */
-const setup = async ({ failFor, failTaken, divertFor, untakenFor, leaveFor, trunkAt = 'pbx:5060', trunkMovesAt, dialOutLimiter, conferenceCaps, ownerCheckMs, takenFails, miFails, vanish, failStatus, slowFor, endsWhileRinging, meet, noDialogFor, divertInMeet }: { divertInMeet?: string; meet?: { createRoom(email: string, options?: { accessLevel?: string }): Promise<unknown>; findRoom(email: string, by: unknown): Promise<unknown> }; noDialogFor?: string; endsWhileRinging?: boolean; vanish?: { id: string; after: number }; failStatus?: { code: string; status: number; reason: string }; slowFor?: string; takenFails?: boolean; miFails?: boolean; failFor?: string; failTaken?: 'own' | 'another' | 'ringing'; divertFor?: string; untakenFor?: string; leaveFor?: string; trunkAt?: string; trunkMovesAt?: string; dialOutLimiter?: RateLimiter; conferenceCaps?: { perPerson?: number }; ownerCheckMs?: number } = {}) => {
+const setup = async ({ failFor, failTaken, divertFor, untakenFor, leaveFor, trunkAt = 'pbx:5060', trunkMovesAt, dialOutLimiter, conferenceCaps, ownerCheckMs, takenFails, miFails, vanish, failStatus, slowFor, endsWhileRinging, meet, noDialogFor, divertInMeet, callerOf, visioGraceMs, preset }: { preset?: (store: MemoryStore) => Promise<void>; visioGraceMs?: number; callerOf?: string; divertInMeet?: string; meet?: { createRoom(email: string, options?: { accessLevel?: string }): Promise<unknown>; findRoom(email: string, by: unknown): Promise<unknown> }; noDialogFor?: string; endsWhileRinging?: boolean; vanish?: { id: string; after: number }; failStatus?: { code: string; status: number; reason: string }; slowFor?: string; takenFails?: boolean; miFails?: boolean; failFor?: string; failTaken?: 'own' | 'another' | 'ringing'; divertFor?: string; untakenFor?: string; leaveFor?: string; trunkAt?: string; trunkMovesAt?: string; dialOutLimiter?: RateLimiter; conferenceCaps?: { perPerson?: number }; ownerCheckMs?: number } = {}) => {
   const grants: (RoomCallGrant & { token: string; revoked: boolean; taken?: { tag: string; callId: string } })[] = []
   const ended: string[] = []
   let reads = 0
@@ -72,7 +72,7 @@ const setup = async ({ failFor, failTaken, divertFor, untakenFor, leaveFor, trun
         // The dialog of a call a room placed to an extension, as the SIP server holds it (step 8d).
         roomCallParties: async (id: string) => {
           const callee = dialogOf.get(id)
-          return callee && callee !== noDialogFor && /^[0-9]{2,6}$/.test(callee) ? { callId: id, caller: '101', callerTag: id.split('@')[0]!, callee, calleeTag: `t-${callee}` } : undefined
+          return callee && callee !== noDialogFor && /^[0-9]{2,6}$/.test(callee) ? { callId: id, caller: callerOf ?? '101', callerTag: id.split('@')[0]!, callee, calleeTag: `t-${callee}` } : undefined
         },
         grantRoomCall: async (g: RoomCallGrant) => {
           const kept: (typeof grants)[number] = { ...g, token: String(grants.length).padStart(32, 'c'), revoked: false }
@@ -161,12 +161,14 @@ const setup = async ({ failFor, failTaken, divertFor, untakenFor, leaveFor, trun
   await store.upsertMapping({ tenantId: 'dev', userId: 'bob', extension: '102' })
   await store.upsertMapping({ tenantId: 'dev', userId: 'carol', extension: '104' })
   await store.upsertMapping({ tenantId: 'dev', userId: 'dave', extension: '105' })
+  await preset?.(store)
   const registry = new ProviderRegistry([{ tenantId: 'dev', type: 'fake', config: {} }], [factory])
   const options = {
     store,
     ...(dialOutLimiter ? { dialOutLimiter } : {}),
     ...(conferenceCaps ? { conferenceCaps } : {}),
     ...(ownerCheckMs ? { conferenceOwnerCheckMs: ownerCheckMs } : {}),
+    ...(visioGraceMs !== undefined ? { visioGraceMs } : {}),
     conference: { bridge: () => bridge, accessNumber: '8000', webhookKey: 'k', webhookSecret: 's', ...(meet ? { meet: meet as never } : {}) }
   }
   const app = await buildApp(registry, options)
@@ -709,65 +711,131 @@ describe("a conference goes to Meet's room (POST /conferences/:id/visio, step 8d
     return made
   }
   const visio = (s: S, id: string, user = 'alice') => s.app.inject({ method: 'POST', url: `/api/v1/conferences/${id}/visio`, headers: s.as(user) })
-  const leave = (s: S, id: string, room = MEET.id) => s.app.inject({ method: 'POST', url: `/api/v1/conferences/${id}/visio/leave`, headers: s.as('alice'), payload: { room } })
+  const state = (s: S, id: string, user = 'alice') => s.app.inject({ method: 'GET', url: `/api/v1/conferences/${id}/visio`, headers: s.as(user) })
+  const leave = (s: S, id: string) => s.app.inject({ method: 'POST', url: `/api/v1/conferences/${id}/visio/leave`, headers: s.as('alice') })
+  /** The passage once its calls are made (the POST answers before). */
+  const settled = async (s: S, id: string) => {
+    for (let i = 0; i < 100; i++) {
+      const res = await state(s, id)
+      if (res.statusCode === 200 && res.json().state !== 'running') return res.json()
+      await new Promise(r => setTimeout(r, 20))
+    }
+    throw new Error('the passage never ended')
+  }
   const removed = (s: S) => s.lk.filter(l => l.startsWith('livekit.RoomService/RemoveParticipant'))
+  const statuses = (v: { people: { number: string; status: string }[] }) => Object.fromEntries(v.people.map(p => [p.number, p.status]))
 
-  it("opens a restricted room of Meet and calls everyone again from it: Replaces for the phones of extensions, a new call for a number; nothing is hung up until the person says they hear the number, then the old room ends", async () => {
+  it("answers at once with Meet's restricted room, then calls everyone again from it (Replaces for phones, a new call for a number); the old calls and the person's own stay until they say so; a second ask is the same passage, never a second room", async () => {
     const { meet, asked } = withMeet()
     const s = await setup({ meet })
     const made = await crowd(s)
     expect((await s.app.inject({ method: 'GET', url: '/api/v1/capabilities', headers: s.as('alice') })).json().conference).toEqual({ dialIn: true, dialOut: true, visio: true })
     const before = s.grants.length
     const res = await visio(s, made)
-    expect(res.statusCode, res.body).toBe(201)
-    expect(res.json()).toMatchObject({ meetingId: MEET.id, slug: MEET.slug, url: MEET.url, swapped: ['102', '104'], called: ['+33612345678'], failed: [] })
+    expect(res.statusCode, res.body).toBe(202)
+    expect(res.json()).toMatchObject({ meetingId: MEET.id, slug: MEET.slug, url: MEET.url, state: 'running' })
+    // No PIN, no number to dial in: the room of the passage shows nothing of Meet's telephony.
+    expect(res.json()).not.toHaveProperty('dialIn')
     expect(asked).toEqual([{ email: 'alice@twake.local', accessLevel: 'restricted' }])
-    // Each call from Meet's room, at Alice's name, through a grant: the dialog of the call it replaces for a phone, none for a number.
+    // A second ask while it runs, and after: the same passage, one room of Meet only.
+    expect((await visio(s, made)).json().meetingId).toBe(MEET.id)
+    const done = await settled(s, made)
+    expect((await visio(s, made)).json().meetingId).toBe(MEET.id)
+    expect(asked).toHaveLength(1)
+    expect(done.state).toBe('done')
+    expect(statuses(done)).toEqual({ '102': 'swapped', '104': 'swapped', '+33612345678': 'called' })
     const g = s.grants.slice(before).map(({ extension, number, replaces, room, join }) => ({ extension, number, replaces, room, join }))
-    expect(g).toHaveLength(3)
     expect(g.map(x => x.number)).toEqual(['102', '104', '+33612345678'])
     for (const x of g) expect([x.extension, x.room, x.join]).toEqual(['101', undefined, undefined])
     expect(g[0]!.replaces).toMatch(/^SCL_\d+@192\.0\.2\.30;to-tag=t-102;from-tag=SCL_\d+$/)
-    expect(g[1]!.replaces).toMatch(/;to-tag=t-104;/)
     expect(g[2]!.replaces).toBeUndefined()
     expect(s.rooms.get(MEET.id)?.map(p => p.attributes['twake.number']).sort()).toEqual(['+33612345678', '102', '104'])
-    // The number is called again: the old calls and the person's own stay until they say so.
+    // The number is called again: its old call and the person's own stay.
     expect(removed(s)).toHaveLength(0)
     expect(s.rooms.get(made)).toHaveLength(4)
     expect((await s.store.getConference(MEET.id))?.ownerUserId).toBe('alice')
-    expect(await s.store.getConference(made)).not.toBeNull()
-    expect((await leave(s, made, MEET.id)).statusCode).toBe(204)
-    expect(s.lk.some(l => l.startsWith(`livekit.RoomService/DeleteRoom {"room":"${made}"}`))).toBe(true)
+    // Only the owner reads it.
+    expect((await state(s, made, 'bob')).statusCode).toBe(403)
+    const left = await leave(s, made)
+    expect(left.json()).toEqual({ left: true, remaining: [] })
     expect(await s.store.getConference(made)).toBeNull()
-    // Replayed: nothing left, done.
-    expect((await leave(s, made, MEET.id)).statusCode).toBe(204)
+    expect((await leave(s, made)).statusCode).toBe(204)
   })
 
-  it("ends the person's own call at once when nobody on the public network is called again (the phones replace theirs by themselves)", async () => {
+  it("ends the person's own call at once when everyone is called again in the place of their call", async () => {
     const { meet } = withMeet()
     const s = await setup({ meet })
     const made = await crowd(s, { withNumber: false })
-    const res = await visio(s, made)
-    expect(res.statusCode, res.body).toBe(201)
-    expect(res.json()).toMatchObject({ swapped: ['102', '104'], called: [], failed: [] })
+    expect((await visio(s, made)).statusCode).toBe(202)
+    expect(statuses(await settled(s, made))).toEqual({ '102': 'swapped', '104': 'swapped' })
     expect(removed(s)).toHaveLength(1)
     expect(s.lk.some(l => l.includes('MoveParticipant'))).toBe(false)
   })
 
-  it("leaves whoever cannot be called again where they are: nothing of theirs is hung up, the old room stays", async () => {
+  it("never leaves anyone alone: whoever cannot be called again stays in the old room with the person's own call, which « leave » keeps and names; the number that could be called ends", async () => {
     const { meet } = withMeet()
     const s = await setup({ meet, noDialogFor: '102' })
     const made = await crowd(s)
-    const res = await visio(s, made)
-    expect(res.statusCode, res.body).toBe(201)
-    expect(res.json()).toMatchObject({ swapped: ['104'], called: ['+33612345678'], failed: ['102'] })
-    expect((await leave(s, made, MEET.id)).statusCode).toBe(204)
-    // The ones Meet's room has go from the old one; the one it has not (102) stays, so the room stays.
-    expect(s.rooms.get(made)?.map(p => p.attributes['twake.number'])).toEqual(['102'])
+    expect((await visio(s, made)).statusCode).toBe(202)
+    const done = await settled(s, made)
+    expect(statuses(done)).toEqual({ '102': 'failed', '104': 'swapped', '+33612345678': 'called' })
+    const left = await leave(s, made)
+    expect(left.statusCode).toBe(200)
+    expect(left.json()).toEqual({ left: false, remaining: ['102'] })
+    // Alice's own call is still there, with Bob's: the old room is not ended, nobody is left alone in it.
+    expect(s.rooms.get(made)?.map(p => p.attributes['twake.number']).sort()).toEqual(['101', '102'])
     expect(await s.store.getConference(made)).not.toBeNull()
+    // Nobody is added to a room that is going to Meet.
+    const add = await s.app.inject({ method: 'POST', url: `/api/v1/conferences/${made}/participants`, headers: s.as('alice'), payload: { number: '105' } })
+    expect(add.statusCode).toBe(409)
+    expect(add.json().code).toBe('VISIO_IN_PROGRESS')
+    // The person removes the one left (the list's button), and then it ends.
+    const bob = s.rooms.get(made)!.find(p => p.attributes['twake.number'] === '102')!
+    s.rooms.set(made, s.rooms.get(made)!.filter(p => p !== bob))
+    expect((await leave(s, made)).json()).toEqual({ left: true, remaining: [] })
   })
 
-  it('is the owner\'s, for the room of a call only, needs Meet, and waits for a call with the operator to be settled', async () => {
+  it("does not call again someone who left or was removed meanwhile (the old room is read again just before each call), nor a group or a short number (a failure said, they stay), nor a call placed for someone else", async () => {
+    const { meet } = withMeet()
+    // 102 is called slowly (400 ms): meanwhile 104 is removed from the old room.
+    const s = await setup({ meet })
+    const made = (await s.conference('c1')).json().meetingId as string
+    for (const number of ['104', '600']) expect((await s.app.inject({ method: 'POST', url: `/api/v1/conferences/${made}/participants`, headers: s.as('alice'), payload: { number } })).statusCode).toBe(201)
+    const room = s.rooms.get(made)!
+    const carol = room.find(p => p.attributes['twake.number'] === '104')!
+    const before = s.grants.length
+    expect((await visio(s, made)).statusCode).toBe(202)
+    // 104 goes right away, before its turn comes.
+    s.rooms.set(made, s.rooms.get(made)!.filter(p => p !== carol))
+    const done = await settled(s, made)
+    expect(statuses(done)).toEqual({ '102': 'swapped', '104': 'gone', '600': 'failed' })
+    expect(done.people.find((p: { number: string }) => p.number === '600').reason).toBe('unsupported')
+    expect(s.grants.slice(before).map(g => g.number)).toEqual(['102'])
+    // A call that is not placed at this person's name is never replaced.
+    const t = await setup({ meet, callerOf: '104' })
+    const other = await crowd(t, { withNumber: false })
+    const mark = t.grants.length
+    expect((await visio(t, other)).statusCode).toBe(202)
+    expect(statuses(await settled(t, other))).toEqual({ '102': 'failed', '104': 'failed' })
+    expect(t.grants.slice(mark)).toHaveLength(0)
+  })
+
+  it("stops at a diverted call: the rest is not called, who was called again by a new call is let go (their old call never ended), the record of Meet's room stays so the person can end it", async () => {
+    const { meet } = withMeet()
+    const s = await setup({ meet, divertInMeet: '104' })
+    const made = await crowd(s)
+    expect((await visio(s, made)).statusCode).toBe(202)
+    const done = await settled(s, made)
+    expect(done.state).toBe('halted')
+    expect(statuses(done)).toEqual({ '102': 'swapped', '104': 'failed', '+33612345678': 'failed' })
+    expect(done.people.map((p: { reason?: string }) => p.reason)).toEqual([undefined, 'diverted', 'halted'])
+    expect(await s.store.getConference(MEET.id)).not.toBeNull()
+    expect(await s.store.getConference(made)).not.toBeNull()
+    // The old room is as it was, the person can leave it or end it: what stays is named.
+    expect((await leave(s, made)).json().remaining).toEqual(expect.arrayContaining(['104']))
+  })
+
+  it('is the owner\'s, for the room of a call only, needs Meet, waits for a call with the operator to be settled, and never uses a room of Meet that is another\'s', async () => {
     const none = await setup()
     const unavailable = await visio(none, await crowd(none))
     expect(unavailable.statusCode).toBe(501)
@@ -777,35 +845,75 @@ describe("a conference goes to Meet's room (POST /conferences/:id/visio, step 8d
     const made = await crowd(s)
     expect((await visio(s, made, 'bob')).statusCode).toBe(403)
     expect((await visio(s, made, 'carol')).statusCode).toBe(403)
+    expect((await state(s, made)).statusCode).toBe(404)
     await s.store.claimConference({ tenantId: 'dev', meetingId: MEET.id, ownerUserId: 'alice', createdAt: new Date().toISOString() })
     expect((await visio(s, MEET.id)).statusCode).toBe(400)
-    // A call with the operator not confirmed yet (8c): not now.
     const t = await setup({ meet })
     const op = (await t.conference('op')).json().meetingId as string
     const waiting = await visio(t, op)
     expect(waiting.statusCode).toBe(409)
     expect(waiting.json().code).toBe('CONFERENCE_AWAITING')
-    expect(t.grants.filter(g => g.replaces || !g.join).length).toBeLessThanOrEqual(1)
-    // Leaving needs the owner's own room of Meet.
-    expect((await leave(s, made, 'fe15dd04-0000-4000-8000-000000000000')).statusCode).toBe(404)
-    expect((await leave(s, made, MEET.id)).statusCode).toBe(204)
+    // The room of Meet was claimed by someone else already: refused, nothing is called, no passage kept.
+    const u = await setup({ meet, preset: async store => void (await store.claimConference({ tenantId: 'dev', meetingId: MEET.id, ownerUserId: 'bob', createdAt: new Date().toISOString() })) })
+    const room = await crowd(u)
+    const before = u.grants.length
+    expect((await visio(u, room)).statusCode).toBe(502)
+    expect(u.grants).toHaveLength(before)
+    expect(await u.store.getVisio(room)).toBeNull()
   })
 
-  it('opens nothing when Meet gives no room (or one more open than asked): the old room is as it was; a call diverted ends it all, the room of Meet is not kept', async () => {
+  it('opens nothing when Meet gives no room: the old room is as it was', async () => {
     const down = await setup({ meet: withMeet({ fail: true }).meet })
     const made = await crowd(down)
     const before = down.grants.length
     expect((await visio(down, made)).statusCode).toBe(502)
     expect(down.grants).toHaveLength(before)
     expect(removed(down)).toHaveLength(0)
-    expect(await down.store.getConference(made)).not.toBeNull()
+    expect(await down.store.getVisio(made)).toBeNull()
+  })
+
+  it('goes on after the Gateway that began it (the record, not a process, holds the passage): a second Gateway asked for the same passage finishes it; a call it left half made is not made again', async () => {
     const { meet } = withMeet()
-    const s = await setup({ meet, divertInMeet: '102' })
-    const room = await crowd(s)
-    const res = await visio(s, room)
-    expect(res.statusCode, res.body).toBe(502)
-    expect(res.json().code).toBe('CALL_DIVERTED')
+    const s = await setup({ meet })
+    const made = await crowd(s, { withNumber: false })
+    // A passage begun elsewhere and left: one person being called (no process of ours runs it), one still to call.
+    const people = s.rooms.get(made)!.filter(p => p.attributes['twake.number'] !== '101').map(p => ({ key: `${made}:${p.identity}`, number: p.attributes['twake.number']!, kind: 'extension' as const }))
+    await s.store.claimConference({ tenantId: 'dev', meetingId: MEET.id, ownerUserId: 'alice', createdAt: new Date().toISOString() })
+    await s.store.claimVisio({ oldRoom: made, meetRoom: MEET.id, tenantId: 'dev', ownerUserId: 'alice', slug: MEET.slug, url: MEET.url, state: 'running', createdAt: new Date().toISOString() }, people)
+    expect(await s.store.moveVisioPerson(made, people[0]!.key, 'pending', 'calling')).toBe(true)
+    const before = s.grants.length
+    expect((await visio(s, made)).statusCode).toBe(202)
+    const done = await settled(s, made)
+    expect(Object.values(statuses(done)).sort()).toEqual(['failed', 'swapped'])
+    expect(done.people.find((p: { key?: string; reason?: string }) => p.reason)?.reason).toBe('interrupted')
+    expect(s.grants.length - before).toBe(1)
+  })
+
+  it("ends Meet's room when nobody of the organisation nor a browser is left in it and a number from outside is (after the grace), and forgets its record when LiveKit has no more of it", async () => {
+    const { meet } = withMeet()
+    const s = await setup({ meet, visioGraceMs: 0 })
+    const made = await crowd(s)
+    expect((await visio(s, made)).statusCode).toBe(202)
+    await settled(s, made)
+    const hook = (event: string, number: string) => s.webhook({ event, room: { name: MEET.id }, participant: { identity: `phone-${number}`, attributes: { 'twake.number': number } } })
+    // The phones left, the number from outside stays: nobody to answer for its call, the room ends.
+    s.rooms.set(MEET.id, s.rooms.get(MEET.id)!.filter(p => p.attributes['twake.number'] === '+33612345678'))
+    expect((await hook('participant_left', '102')).statusCode).toBe(204)
+    expect(s.lk.some(l => l.startsWith(`livekit.RoomService/DeleteRoom {"room":"${MEET.id}"}`))).toBe(true)
     expect(await s.store.getConference(MEET.id)).toBeNull()
-    expect(await s.store.getConference(room)).not.toBeNull()
+    // A room of Meet LiveKit no longer has (more than a minute after): its record no longer counts among the person's rooms.
+    const t = await setup({ meet, conferenceCaps: { perPerson: 3 } })
+    const room = await crowd(t, { withNumber: false })
+    expect((await visio(t, room)).statusCode).toBe(202)
+    await settled(t, room)
+    await t.store.claimConference({ tenantId: 'dev', meetingId: 'twake-call-00000000000000aa', ownerUserId: 'alice', createdAt: new Date(Date.now() - 3_600_000).toISOString() })
+    t.rooms.delete(MEET.id)
+    const visios = await t.store.listVisios('dev', 'alice')
+    // The passage is old: made again, an hour ago, as it was.
+    await t.store.deleteVisio(room)
+    await t.store.claimVisio({ ...visios[0]!, createdAt: new Date(Date.now() - 3_600_000).toISOString(), state: 'done' }, [])
+    const again = await t.conference('c2')
+    expect(again.statusCode, again.body).toBe(201)
+    expect(await t.store.getConference(MEET.id)).toBeNull()
   })
 })
