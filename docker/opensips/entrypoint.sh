@@ -258,6 +258,49 @@ else
   # Never reached (WAZO_ON 0), still a valid URI.
   WAZO_SIP=wazo.invalid
 fi
+# The lines of Wazo (step 11c-1, ADR 0027): with WAZO_LINES=1 (and Wazo on), the extensions that have a line at Wazo
+# register there through mid_registrar, and Wazo's calls to them ring their windows. A UDP socket of OpenSIPS of its own
+# (WAZO_LINES_LISTEN_IP:WAZO_LINES_PORT, 127.0.0.2:5096 by default), on another address than WAZO_LISTEN_IP: Wazo's
+# Asterisk takes the requests of that one as OpenSIPS's own and those of this one as a line's. The password of a line is
+# a keyed print of its extension (WAZO_LINE_KEY: 32 to 128 letters, digits, dots, dashes and underscores, the Gateway's
+# too). WAZO_LINES empty (the default): nothing of it, the extensions register as before.
+: "${WAZO_LINES:=}"
+: "${WAZO_LINES_LISTEN_IP:=127.0.0.2}"
+: "${WAZO_LINES_PORT:=5096}"
+: "${WAZO_LINE_KEY:=}"
+WAZO_LINES_ON=0
+WAZO_LINES_SOCKET='# None: the lines of Wazo are off (WAZO_LINES not 1).'
+case "$WAZO_LINES" in
+  '' | 0) ;;
+  1)
+    if [ "$WAZO_ON" != 1 ]; then
+      echo "WAZO_LINES=1 needs Wazo (WAZO_SIP): its lines are Wazo's" >&2; exit 1
+    fi
+    case "$WAZO_LINES_PORT" in
+      '' | *[!0-9]*) echo "WAZO_LINES_PORT must be a port number" >&2; exit 1 ;;
+    esac
+    if [ "$WAZO_LINES_PORT" -lt 1 ] || [ "$WAZO_LINES_PORT" -gt 65535 ]; then
+      echo "WAZO_LINES_PORT must be 1 to 65535" >&2; exit 1
+    fi
+    if [ "$WAZO_LINES_LISTEN_IP" = "$WAZO_LISTEN_IP" ]; then
+      echo "WAZO_LINES_LISTEN_IP must differ from WAZO_LISTEN_IP: Wazo's Asterisk tells the lines' requests from OpenSIPS's own by the address" >&2; exit 1
+    fi
+    if { [ "$WAZO_LINES_LISTEN_IP" = "$LISTEN_IP" ] && [ "$WAZO_LINES_PORT" = "$SIP_PORT" ]; } || { [ "$WAZO_LINES_LISTEN_IP" = "$TRUNK_LISTEN_IP" ] && [ "$WAZO_LINES_PORT" = "$TRUNK_PORT" ]; } || { [ "$WAZO_LINES_LISTEN_IP" = "$MEET_LISTEN_IP" ] && [ "$WAZO_LINES_PORT" = "$MEET_PORT" ]; }; then
+      echo "WAZO_LINES_PORT must differ from SIP_PORT, TRUNK_PORT and MEET_PORT on the same address: the lines of Wazo have a socket of their own" >&2; exit 1
+    fi
+    case "$WAZO_LINE_KEY" in
+      *[!A-Za-z0-9._-]*) echo "WAZO_LINE_KEY must be letters, digits, dots, dashes and underscores" >&2; exit 1 ;;
+    esac
+    if [ "${#WAZO_LINE_KEY}" -lt 32 ] || [ "${#WAZO_LINE_KEY}" -gt 128 ]; then
+      echo "WAZO_LINE_KEY (32 to 128 characters, the same as the Gateway's) is needed with WAZO_LINES=1: the password of a line is a print of its extension" >&2; exit 1
+    fi
+    WAZO_LINES_ON=1
+    WAZO_LINES_SOCKET="socket=udp:$WAZO_LINES_LISTEN_IP:$WAZO_LINES_PORT"
+    ;;
+  *) echo "WAZO_LINES must be 1, or empty (or 0) to leave the lines of Wazo off" >&2; exit 1 ;;
+esac
+# Never used with the lines off (WAZO_LINES_ON 0): a literal the script still reads.
+[ "$WAZO_LINES_ON" = 1 ] || WAZO_LINE_KEY=unused
 # The longest a call to a mailbox lasts: the greeting, VOICEMAIL_MAX_SEC of message, the goodbye.
 : "${VOICEMAIL_MAX_CALL_SEC:=300}"
 case "$VOICEMAIL_MAX_CALL_SEC" in
@@ -307,7 +350,7 @@ fi
 # script rendered here only. A call restored from the database after a restart still counts among all, under the
 # print of before.
 VOICEMAIL_CALLER_KEY=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
-export SIP_DOMAIN LISTEN_IP SIP_PORT WS_PORT WSS_PORT OPENSIPS_DB_URL OPENSIPS_RULES_DB_URL RULES_QUERY_TIMEOUT_MS DB_MAX_ASYNC_CONNECTIONS PUSH_WAIT_SEC RTPENGINE_SOCK OPENSIPS_LOG_LEVEL OPENSIPS_MPATH MI_FIFO MI_LISTEN_IP MI_PORT TLS_CERT TLS_KEY TRUNK_LISTEN_IP TRUNK_PORT TRUNK_SOCKET_AS TRUNK_MAX_CALL_SEC TRUNK_MIN_CALL_SEC CALL_PING_SEC CALL_PING_TIMEOUT_SEC TZ MEET_ON MEET_SIP MEET_SIP_IP MEET_LISTEN_IP MEET_PORT MEET_NUMBER MEET_SIP_USER MEET_SIP_HA1 MEET_SOCKET MEET_PIN_TRIES MEET_PIN_TRIES_ALL MEET_CALLS_PER_CALLER MEET_CALLS_ALL MEET_MAX_CALL_SEC WAZO_ON WAZO_SIP WAZO_SIP_IP WAZO_LISTEN_IP WAZO_PORT WAZO_SOCKET VOICEMAIL_MAX_CALL_SEC VOICEMAIL_CALLS_PER_CALLER VOICEMAIL_CALLS_HIDDEN VOICEMAIL_CALLS_HIDDEN_ALL VOICEMAIL_CALLS_ALL VOICEMAIL_CALLS_PER_HOUR VOICEMAIL_CALLER_KEY
+export SIP_DOMAIN LISTEN_IP SIP_PORT WS_PORT WSS_PORT OPENSIPS_DB_URL OPENSIPS_RULES_DB_URL RULES_QUERY_TIMEOUT_MS DB_MAX_ASYNC_CONNECTIONS PUSH_WAIT_SEC RTPENGINE_SOCK OPENSIPS_LOG_LEVEL OPENSIPS_MPATH MI_FIFO MI_LISTEN_IP MI_PORT TLS_CERT TLS_KEY TRUNK_LISTEN_IP TRUNK_PORT TRUNK_SOCKET_AS TRUNK_MAX_CALL_SEC TRUNK_MIN_CALL_SEC CALL_PING_SEC CALL_PING_TIMEOUT_SEC TZ MEET_ON MEET_SIP MEET_SIP_IP MEET_LISTEN_IP MEET_PORT MEET_NUMBER MEET_SIP_USER MEET_SIP_HA1 MEET_SOCKET MEET_PIN_TRIES MEET_PIN_TRIES_ALL MEET_CALLS_PER_CALLER MEET_CALLS_ALL MEET_MAX_CALL_SEC WAZO_ON WAZO_SIP WAZO_SIP_IP WAZO_LISTEN_IP WAZO_PORT WAZO_SOCKET WAZO_LINES_ON WAZO_LINES_LISTEN_IP WAZO_LINES_PORT WAZO_LINES_SOCKET WAZO_LINE_KEY VOICEMAIL_MAX_CALL_SEC VOICEMAIL_CALLS_PER_CALLER VOICEMAIL_CALLS_HIDDEN VOICEMAIL_CALLS_HIDDEN_ALL VOICEMAIL_CALLS_ALL VOICEMAIL_CALLS_PER_HOUR VOICEMAIL_CALLER_KEY
 
 # The MI socket (mi_datagram) has no authentication: whoever reaches it can stop OpenSIPS, drop registrations, end
 # calls, read who is registered and subscribe to the events (who calls whom). It listens on its own address, the
@@ -350,6 +393,9 @@ fi
 if [ "$MEET_ON" = 1 ] && { ! is_ipv4 "$MEET_SIP_IP" || [ "$MEET_SIP_IP" = "0.0.0.0" ]; }; then
   echo "MEET_SIP must be LiveKit SIP's IPv4 address and port (192.0.2.20:5080)" >&2; exit 1
 fi
+if [ "$WAZO_LINES_ON" = 1 ] && { ! is_ipv4 "$WAZO_LINES_LISTEN_IP" || [ "$WAZO_LINES_LISTEN_IP" = "0.0.0.0" ]; }; then
+  echo "WAZO_LINES_LISTEN_IP=$WAZO_LINES_LISTEN_IP must be an IPv4 address of this machine (not 0.0.0.0)" >&2; exit 1
+fi
 if ! is_ipv4 "$WAZO_LISTEN_IP" || [ "$WAZO_LISTEN_IP" = "0.0.0.0" ]; then
   echo "WAZO_LISTEN_IP=$WAZO_LISTEN_IP must be an IPv4 address of this machine (not 0.0.0.0)" >&2; exit 1
 fi
@@ -371,7 +417,7 @@ if [ ! -f "$TLS_CERT" ] || [ ! -f "$TLS_KEY" ]; then
 fi
 
 # Only the listed variables are substituted: a "$avp(...)" of the script must stay as it is.
-envsubst '$SIP_DOMAIN $LISTEN_IP $SIP_PORT $WS_PORT $WSS_PORT $OPENSIPS_DB_URL $OPENSIPS_RULES_DB_URL $RULES_QUERY_TIMEOUT_MS $DB_MAX_ASYNC_CONNECTIONS $PUSH_WAIT_SEC $RTPENGINE_SOCK $OPENSIPS_LOG_LEVEL $OPENSIPS_MPATH $MI_FIFO $MI_LISTEN_IP $MI_PORT $TLS_CERT $TLS_KEY $TRUNK_LISTEN_IP $TRUNK_PORT $TRUNK_SOCKET_AS $TRUNK_MAX_CALL_SEC $TRUNK_MIN_CALL_SEC $CALL_PING_SEC $CALL_PING_TIMEOUT_SEC $MEET_ON $MEET_SIP $MEET_SIP_IP $MEET_LISTEN_IP $MEET_PORT $MEET_NUMBER $MEET_SIP_USER $MEET_SIP_HA1 $MEET_SOCKET $MEET_PIN_TRIES $MEET_PIN_TRIES_ALL $MEET_CALLS_PER_CALLER $MEET_CALLS_ALL $MEET_MAX_CALL_SEC $WAZO_ON $WAZO_SIP $WAZO_SIP_IP $WAZO_LISTEN_IP $WAZO_PORT $WAZO_SOCKET $VOICEMAIL_MAX_CALL_SEC $VOICEMAIL_CALLS_PER_CALLER $VOICEMAIL_CALLS_HIDDEN $VOICEMAIL_CALLS_HIDDEN_ALL $VOICEMAIL_CALLS_ALL $VOICEMAIL_CALLS_PER_HOUR $VOICEMAIL_CALLER_KEY' \
+envsubst '$SIP_DOMAIN $LISTEN_IP $SIP_PORT $WS_PORT $WSS_PORT $OPENSIPS_DB_URL $OPENSIPS_RULES_DB_URL $RULES_QUERY_TIMEOUT_MS $DB_MAX_ASYNC_CONNECTIONS $PUSH_WAIT_SEC $RTPENGINE_SOCK $OPENSIPS_LOG_LEVEL $OPENSIPS_MPATH $MI_FIFO $MI_LISTEN_IP $MI_PORT $TLS_CERT $TLS_KEY $TRUNK_LISTEN_IP $TRUNK_PORT $TRUNK_SOCKET_AS $TRUNK_MAX_CALL_SEC $TRUNK_MIN_CALL_SEC $CALL_PING_SEC $CALL_PING_TIMEOUT_SEC $MEET_ON $MEET_SIP $MEET_SIP_IP $MEET_LISTEN_IP $MEET_PORT $MEET_NUMBER $MEET_SIP_USER $MEET_SIP_HA1 $MEET_SOCKET $MEET_PIN_TRIES $MEET_PIN_TRIES_ALL $MEET_CALLS_PER_CALLER $MEET_CALLS_ALL $MEET_MAX_CALL_SEC $WAZO_ON $WAZO_SIP $WAZO_SIP_IP $WAZO_LISTEN_IP $WAZO_PORT $WAZO_SOCKET $WAZO_LINES_ON $WAZO_LINES_LISTEN_IP $WAZO_LINES_PORT $WAZO_LINES_SOCKET $WAZO_LINE_KEY $VOICEMAIL_MAX_CALL_SEC $VOICEMAIL_CALLS_PER_CALLER $VOICEMAIL_CALLS_HIDDEN $VOICEMAIL_CALLS_HIDDEN_ALL $VOICEMAIL_CALLS_ALL $VOICEMAIL_CALLS_PER_HOUR $VOICEMAIL_CALLER_KEY' \
   < "$CFG_TEMPLATE" > "$CFG_OUT"
 
 # The tables of the trunks (step 6): dispatcher, dialplan and uac_registrant read theirs at start and OpenSIPS stops
@@ -397,7 +443,7 @@ if [ -f "$TRUNK_SQL" ]; then
   # processes, the Gateway's pool). Said when the database takes fewer (max_connections): past it, reads fail at the
   # busiest moments. OpenSIPS starts.
   max_connections=$(psql "$OPENSIPS_DB_URL" -qAt -c "SHOW max_connections" 2>/dev/null) || max_connections=""
-  sip_processes=$((10 + 2 * WAZO_ON))
+  sip_processes=$((10 + 2 * WAZO_ON + 2 * WAZO_LINES_ON))
   needed=$((sip_processes * (DB_MAX_ASYNC_CONNECTIONS + 1) + 20))
   case "$max_connections" in
     '' | *[!0-9]*) ;;

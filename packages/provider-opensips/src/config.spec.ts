@@ -20,7 +20,7 @@ writeFileSync(join(tmp, 'key.pem'), 'test')
 writeFileSync(join(tmp, 'opensips'), '#!/bin/sh\nexit 0\n')
 chmodSync(join(tmp, 'opensips'), 0o755)
 
-const render = (env: Record<string, string> = {}) => {
+const renderWhole = (env: Record<string, string> = {}) => {
   const out = join(tmp, `opensips-${Math.random().toString(36).slice(2)}.cfg`)
   const run = spawnSync('sh', [join(dir, 'entrypoint.sh')], {
     env: { PATH: process.env.PATH ?? '/usr/bin:/bin', CFG_TEMPLATE: join(dir, 'opensips.cfg.tpl'), CFG_OUT: out, OPENSIPS_BIN: join(tmp, 'opensips'), TLS_CERT: join(tmp, 'cert.pem'), TLS_KEY: join(tmp, 'key.pem'), ...env },
@@ -29,7 +29,97 @@ const render = (env: Record<string, string> = {}) => {
   return { status: run.status, stderr: run.stderr, cfg: run.status === 0 ? readFileSync(out, 'utf8') : '' }
 }
 
+/**
+ * The configuration as the tests of the steps before read it: without the lines of Wazo (step 11c-1), the blocks of the
+ * template between `# wazo-lines: begin` and `# wazo-lines: end`, which a deployment without them never runs (the shared
+ * variable wazo_lines_on is 0) and which the counts and the order those tests keep must not see. The last tests of the
+ * file read the whole (`renderWhole`).
+ */
+const render = (env: Record<string, string> = {}) => {
+  const out = renderWhole(env)
+  return { ...out, cfg: out.cfg.replace(/^[ \t]*# wazo-lines: begin\n[^]*?^[ \t]*# wazo-lines: end\n/gm, '') }
+}
+
 describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
+  it("gives Wazo's lines a socket of their own, on another address than the mailboxes', and nothing at all when they are off (step 11c-1, ADR 0027)", () => {
+    const key = 'twake-wazo-line-test-key-0123456789abcdef'
+    const off = renderWhole()
+    expect(off.status).toBe(0)
+    expect(off.cfg).toContain('# None: the lines of Wazo are off (WAZO_LINES not 1).')
+    expect(off.cfg).toContain('modparam("cfgutils", "shvset", "wazo_lines_on=i:0")')
+    expect(off.cfg).not.toMatch(/^socket=udp:[^\n]*:5096/m)
+    // Wazo on for the mailboxes only: the same, the lines stay off.
+    const mailboxesOnly = renderWhole({ WAZO_SIP: '127.0.0.1:5100' })
+    expect(mailboxesOnly.cfg).toContain('modparam("cfgutils", "shvset", "wazo_lines_on=i:0")')
+    expect(mailboxesOnly.cfg).not.toMatch(/^socket=udp:[^\n]*:5096/m)
+    for (const cfg of [off.cfg, mailboxesOnly.cfg]) expect(cfg).not.toContain(key)
+    const on = renderWhole({ WAZO_SIP: '127.0.0.1:5100', WAZO_LINES: '1', WAZO_LINE_KEY: key })
+    expect(on.status, on.stderr).toBe(0)
+    expect(on.cfg).toContain('modparam("cfgutils", "shvset", "wazo_lines_on=i:1")')
+    expect(on.cfg).toMatch(/^socket=udp:127\.0\.0\.2:5096$/m)
+    expect(on.cfg).toMatch(/^socket=udp:127\.0\.0\.1:5095$/m)
+    expect(on.cfg).toContain('if ($socket_in(ip) == "127.0.0.2" && $socket_in(port) == 5096) {')
+    expect(on.cfg).toContain(`$avp(wl_pass) = $(tU{s.sha256_hmac,${key}}{s.substr,0,32});`)
+    expect(on.cfg).toContain('$socket_out = "udp:127.0.0.2:5096";')
+    // Moved: another address and port.
+    const moved = renderWhole({ WAZO_SIP: '192.0.2.30:5100', WAZO_LINES: '1', WAZO_LINE_KEY: key, WAZO_LINES_LISTEN_IP: '127.0.0.9', WAZO_LINES_PORT: '5111' })
+    expect(moved.status, moved.stderr).toBe(0)
+    expect(moved.cfg).toMatch(/^socket=udp:127\.0\.0\.9:5111$/m)
+    for (const [env, message] of [
+      [{ WAZO_LINES: '1', WAZO_LINE_KEY: key }, /needs Wazo/],
+      [{ WAZO_SIP: '127.0.0.1:5100', WAZO_LINES: '1' }, /WAZO_LINE_KEY/],
+      [{ WAZO_SIP: '127.0.0.1:5100', WAZO_LINES: '1', WAZO_LINE_KEY: 'short' }, /WAZO_LINE_KEY/],
+      [{ WAZO_SIP: '127.0.0.1:5100', WAZO_LINES: '1', WAZO_LINE_KEY: `${key}"` }, /letters, digits/],
+      [{ WAZO_SIP: '127.0.0.1:5100', WAZO_LINES: '1', WAZO_LINE_KEY: key, WAZO_LINES_LISTEN_IP: '127.0.0.1' }, /must differ from WAZO_LISTEN_IP/],
+      [{ WAZO_SIP: '127.0.0.1:5100', WAZO_LINES: '1', WAZO_LINE_KEY: key, WAZO_LINES_LISTEN_IP: '0.0.0.0' }, /WAZO_LINES_LISTEN_IP/],
+      [{ WAZO_SIP: '127.0.0.1:5100', WAZO_LINES: '1', WAZO_LINE_KEY: key, WAZO_LINES_PORT: '70000' }, /WAZO_LINES_PORT/],
+      [{ WAZO_SIP: '127.0.0.1:5100', WAZO_LINES: '1', WAZO_LINE_KEY: key, WAZO_LINES_LISTEN_IP: '127.0.0.1', WAZO_LINES_PORT: '5060', WAZO_LISTEN_IP: '127.0.0.3' }, /socket of their own/],
+      [{ WAZO_SIP: '127.0.0.1:5100', WAZO_LINES: 'yes' }, /WAZO_LINES must be/]
+    ] as [Record<string, string>, RegExp][]) {
+      const bad = renderWhole(env)
+      expect(bad.status, JSON.stringify(env)).toBe(1)
+      expect(bad.stderr).toMatch(message)
+    }
+  })
+
+  it("registers an extension at Wazo only with the lines on, a line for it, and Wazo answering, and never lets Wazo's requests anywhere else than a call to a window (step 11c-1)", () => {
+    const { cfg } = renderWhole({ WAZO_SIP: '127.0.0.1:5100', WAZO_LINES: '1', WAZO_LINE_KEY: 'twake-wazo-line-test-key-0123456789abcdef' })
+    const register = cfg.slice(cfg.indexOf('if (is_method("REGISTER")) {'), cfg.indexOf('if (!is_myself("$rd")) {'))
+    // The order: the windows' credentials checked first; Wazo's only when the lines are on and not left out; the
+    // credentials of the windows not passed on; the plain save, as before, for every other registration.
+    const order = ['www_authorize', 'fix_nated_register', 'wazo_lines_on) == 1 && $shv(wazo_lines_mute_until) <= $Ts', 'FROM wazo_lines WHERE extension', 'consume_credentials', 'mid_registrar_save("location")', 't_on_failure("wazo_register_failed")', 't_relay()', 'if (!save("location"))']
+    let at = -1
+    for (const part of order) {
+      const i = register.indexOf(part, at + 1)
+      expect(i, part).toBeGreaterThan(at)
+      at = i
+    }
+    // Only an extension of digits, read in the table: nothing a window sends is in the query but those digits.
+    expect(register).toContain('$tU =~ "^[0-9]{1,40}$"')
+    // mid_registrar is called nowhere else, and never with the lines off (the shared variable guards its only call).
+    expect(cfg.match(/mid_registrar_save\(/g)).toHaveLength(1)
+    expect(cfg).not.toContain('mid_registrar_lookup')
+    // The failure: a challenge answered once with the line's password, a server that does not answer left out 30 s, a
+    // line that is refused 5 minutes, the window told 503 and nothing saved.
+    const failure = cfg.slice(cfg.indexOf('failure_route[wazo_register_failed] {'))
+    for (const part of ['uac_auth()', '$shv(wazo_lines_mute_until) = $Ts + 30;', 'cache_store("local", "wazo:line:$tU", "0", 300);', 't_reply(503, "Service Unavailable");'])
+      expect(failure.slice(0, failure.indexOf('\n}\n')), part).toContain(part)
+    // Wazo's socket: its address only, nothing in a call it did not place, nothing but its INVITE out of a call.
+    expect(cfg).toContain('if ($shv(wazo_lines_on) != 1 || $si != "127.0.0.1") {')
+    expect(cfg).toContain('if ($dlg_val(wline) == "1" && is_direction("downstream"))')
+    expect(cfg).toContain('if ($var(from_wline) != $var(wline)) {')
+    const call = cfg.slice(cfg.indexOf('if ($var(wline) == 1) {\n\t\tif (is_method("ACK"))'))
+    expect(call.slice(0, call.indexOf('route(rules_step);'))).toContain('if (is_present_hf("Replaces") || !($rU =~ "^[A-Za-z0-9._+-]{1,64}$")) {')
+    expect(call.slice(0, 2500)).not.toContain('route(voicemail')
+    // A transfer of such a call is refused as one with the operator (REFER).
+    expect(cfg).toContain('$dlg_val(meet) != NULL || $dlg_val(wline) == "1")) {')
+  })
+
+  it('stays under the 99 named routes OpenSIPS 3.6 has room for (one more fails the start: "no slot left")', () => {
+    const { cfg } = renderWhole({ WAZO_SIP: '127.0.0.1:5100', WAZO_LINES: '1', WAZO_LINE_KEY: 'twake-wazo-line-test-key-0123456789abcdef' })
+    expect(cfg.match(/^route\[/gm)!.length).toBeLessThanOrEqual(99)
+  })
+
   it('keeps the MI on the loopback when SIP listens on a network', () => {
     const { status, cfg } = render({ LISTEN_IP: '192.0.2.10' })
     expect(status).toBe(0)
@@ -145,7 +235,7 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(on.cfg).toContain('if ($shv(wazo_on) == 1 && $shv(no11_until) <= $Ts) {')
     expect(on.cfg).toContain('if ($avp(q11) == 1 && route(table_11_missing)) {\n\t\t$shv(no11_until) = $Ts + 30;')
     // Twelve SIP processes with Wazo's socket for the connections the database must take.
-    expect(readFileSync(join(dir, 'entrypoint.sh'), 'utf8')).toContain('sip_processes=$((10 + 2 * WAZO_ON))')
+    expect(readFileSync(join(dir, 'entrypoint.sh'), 'utf8')).toContain('sip_processes=$((10 + 2 * WAZO_ON + 2 * WAZO_LINES_ON))')
     for (const [env, message] of [
       [{ WAZO_SIP: 'wazo.example.test:5100' }, /WAZO_SIP must be the IPv4 address and port/],
       [{ WAZO_SIP: '192.0.2.30' }, /WAZO_SIP must be the IPv4 address and port/],
@@ -1367,7 +1457,7 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     const { cfg } = render()
     const main = cfg.slice(cfg.indexOf('\nroute {'), cfg.indexOf('\nroute[outbound_policy] {'))
     const inDialog = main.slice(main.indexOf('if (has_totag()) {'), main.indexOf('if (is_method("CANCEL")) {'))
-    const refer = inDialog.indexOf('if (is_method("REFER") && ($dlg_val(trunk) != NULL || $dlg_val(meet) != NULL)) {')
+    const refer = inDialog.indexOf('if (is_method("REFER") && ($dlg_val(trunk) != NULL || $dlg_val(meet) != NULL || $dlg_val(wline) == "1")) {')
     expect(refer).toBeGreaterThan(inDialog.indexOf('if (!match_dialog()) {'))
     expect(refer).toBeLessThan(inDialog.indexOf('route(relay);'))
     expect(inDialog.slice(refer)).toMatch(/^[^]*?send_reply\(403, "Transfer Not Allowed"\);\n\t\t\texit;/)

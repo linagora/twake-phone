@@ -79,6 +79,16 @@ TWAKE_ACL = [
     'confd.voicemails.*.read',
     'confd.voicemails.*.update',
     'confd.voicemails.*.delete',
+    # The lines (step 11c-1, ADR 0027): an endpoint and a line for each extension someone holds, none of them changed once
+    # made (the password is a print of the extension), their tenant's only.
+    'confd.endpoints.sip.create',
+    'confd.endpoints.sip.read',
+    'confd.endpoints.sip.*.delete',
+    'confd.lines.create',
+    'confd.lines.read',
+    'confd.lines.*.delete',
+    'confd.lines.*.endpoints.sip.*.update',
+    'confd.lines.*.endpoints.sip.*.delete',
     'calld.voicemails.*.read',
     'calld.voicemails.*.messages.*.read',
     'calld.voicemails.*.messages.*.update',

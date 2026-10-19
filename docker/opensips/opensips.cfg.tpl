@@ -68,6 +68,11 @@ ${MEET_SOCKET}
 # The socket of Wazo's Asterisk (step 11a, ADR 0022): it hears that Asterisk only (WAZO_SIP), and only within the calls
 # this OpenSIPS sent to a mailbox. None at all when Wazo is off (WAZO_ON 0, entrypoint.sh).
 ${WAZO_SOCKET}
+# The socket of the lines of Wazo (step 11c-1, ADR 0027): the registrations of the people's lines go to Wazo's Asterisk
+# from it (mid_registrar), and Wazo's calls to a person's phones come back to it. On another address than the one
+# above: Wazo's Asterisk takes the requests of the first as OpenSIPS's own (a trunk), those of this one as a line's.
+# None at all when the lines are off (WAZO_LINES_ON 0, entrypoint.sh).
+${WAZO_LINES_SOCKET}
 
 mpath="${OPENSIPS_MPATH}"
 
@@ -145,6 +150,17 @@ modparam("registrar", "default_expires", 300)
 modparam("registrar", "max_expires", 3600)
 loadmodule "nathelper.so"
 modparam("nathelper", "received_avp", "$avp(received)")
+# The people whose line Wazo has (step 11c-1, ADR 0027) register through mid_registrar, in AOR throttling mode: Wazo's
+# Asterisk is told of one contact for the extension (this OpenSIPS's lines socket, which it calls back), and OpenSIPS
+# keeps the windows behind it, as registrar does for the others. The same settings as registrar's.
+loadmodule "mid_registrar.so"
+modparam("mid_registrar", "mode", 2)
+modparam("mid_registrar", "received_avp", "$avp(received)")
+modparam("mid_registrar", "tcp_persistent_flag", "TCP_PERSISTENT")
+modparam("mid_registrar", "max_contacts", 10)
+modparam("mid_registrar", "default_expires", 300)
+modparam("mid_registrar", "max_expires", 3600)
+modparam("mid_registrar", "outgoing_expires", 600)
 
 #### Calls: dialogs followed (only ours pass in-dialog; REFER and NOTIFY of the transfers ride them), media through rtpengine
 loadmodule "dialog.so"
@@ -222,6 +238,15 @@ modparam("cfgutils", "shvset", "no11_until=i:0")
 # Wazo's Asterisk heard nothing from (a mailbox called, no answer at all within 2 s): the mailboxes are left out 30 s
 # ($shv(wazo_mute_until), failure_route[voicemail_failed]), the calls get their refusal at once.
 modparam("cfgutils", "shvset", "wazo_mute_until=i:0")
+# Whether Wazo's lines are on (step 11c-1, ADR 0027): WAZO_LINES set and Wazo on (entrypoint.sh). Off, nothing of
+# mid_registrar is ever called and a REGISTER is saved as before. Wazo's Asterisk heard nothing from (a REGISTER of a
+# line with no answer within the timeout, or a server error): the lines are left out 30 s ($shv(wazo_lines_mute_until),
+# failure_route[wazo_register_failed]), the REGISTERs are saved here only, as before.
+modparam("cfgutils", "shvset", "wazo_lines_on=i:${WAZO_LINES_ON}")
+modparam("cfgutils", "shvset", "wazo_lines_mute_until=i:0")
+# `wazo_lines` (the extensions that have a line) unreadable (the Gateway has not made it, the database cannot say): no
+# line for 30 s, as for the tables of the steps before.
+modparam("cfgutils", "shvset", "wazo_lines_nodb_until=i:0")
 # The bounds of the calls to the mailboxes (route[voicemail]), for the calls to come once changed (MI shv_set; the e2e
 # lowers the caps a moment): VOICEMAIL_MAX_CALL_SEC, which the Gateway reads (shv_get) and compares with the longest
 # message of its voicemail server at its start; VOICEMAIL_CALLS_PER_CALLER,
@@ -490,6 +515,22 @@ route {
 		$var(wazo) = 1;
 	}
 
+	# wazo-lines: begin
+	# The socket of the lines of Wazo (step 11c-1, ADR 0027) hears Wazo's Asterisk only (WAZO_SIP), any port, and nothing
+	# when the lines are off. Its INVITE to a person's windows (route[wazo_line_call]) and, in that call, its side's
+	# requests are what comes from there; nothing registers there.
+	$var(wline) = 0;
+	if ($socket_in(ip) == "${WAZO_LINES_LISTEN_IP}" && $socket_in(port) == ${WAZO_LINES_PORT}) {
+		if ($shv(wazo_lines_on) != 1 || $si != "${WAZO_SIP_IP}") {
+			xlog("L_NOTICE", "wazo: $rm from $si:$sp refused on the lines socket, not Wazo's Asterisk\n");
+			if (!is_method("ACK"))
+				send_reply(403, "Forbidden");
+			exit;
+		}
+		$var(wline) = 1;
+	}
+	# wazo-lines: end
+
 	# In-dialog requests (ACK, BYE, re-INVITE for hold, INFO, REFER...) follow the Record-Route.
 	if (has_totag()) {
 		if (is_method("ACK") && $var(stranger) == 0 && t_check_trans()) {
@@ -555,6 +596,19 @@ route {
 				send_reply(403, "Forbidden");
 			exit;
 		}
+		# wazo-lines: begin
+		# Wazo's side of a call it places to a person's windows (step 11c-1: the caller, so downstream) speaks from the
+		# lines socket, and nothing else does.
+		$var(from_wline) = 0;
+		if ($dlg_val(wline) == "1" && is_direction("downstream"))
+			$var(from_wline) = 1;
+		if ($var(from_wline) != $var(wline)) {
+			xlog("L_NOTICE", "wazo: $rm of call $ci from $si:$sp refused, not Wazo's side of a call it placed\n");
+			if (!is_method("ACK"))
+				send_reply(403, "Forbidden");
+			exit;
+		}
+		# wazo-lines: end
 		# From the operator's side of a call to the phone's: to the phone of this dialog, at the Contact it gave
 		# (fix_route_dialog), whatever the Request-URI says: the operator never had the phone's own (route[trunk_contact])
 		# and nothing it sends can go anywhere else. Its answers go back to the operator (onreply_route[rtp]).
@@ -576,9 +630,9 @@ route {
 		# have it call whatever the Refer-To says, on our account and past route[outbound_policy]. Refused whichever
 		# side sends it: a transfer with an external party waits for one the platform makes itself. Likewise in a call
 		# with LiveKit SIP (step 8): a room calls through the Gateway only, at the name of whoever asked.
-		if (is_method("REFER") && ($dlg_val(trunk) != NULL || $dlg_val(meet) != NULL)) {
-			xlog("L_NOTICE", "call $ci: REFER in a call with the operator or LiveKit SIP refused\n");
-			if (route(to_trunk) || route(to_meet))
+		if (is_method("REFER") && ($dlg_val(trunk) != NULL || $dlg_val(meet) != NULL || $dlg_val(wline) == "1")) {
+			xlog("L_NOTICE", "call $ci: REFER in a call with the operator, LiveKit SIP or Wazo's lines refused\n");
+			if (route(to_trunk) || route(to_meet) || $dlg_val(wline) == "1")
 				append_to_reply("Twake-Call-Refused: transfer-external\r\n");
 			send_reply(403, "Transfer Not Allowed");
 			exit;
@@ -663,6 +717,71 @@ route {
 		exit;
 	}
 
+	# wazo-lines: begin
+	# The socket of the lines of Wazo (step 11c-1): its keepalives, and its INVITE to a person's windows.
+	if ($var(wline) == 1) {
+		if (is_method("ACK"))
+			exit;
+		if (is_method("OPTIONS")) {
+			send_reply(200, "OK");
+			exit;
+		}
+		if (!is_method("INVITE")) {
+			xlog("L_NOTICE", "wazo: $rm from $si:$sp refused on the lines socket\n");
+			send_reply(405, "Method Not Allowed");
+			exit;
+		}
+		# Wazo's call to the windows of an extension ($rU): the INVITE it sends to the contact it holds for it. Wazo's
+		# decision, taken (see "Wazo's lines" below): no rule of the extension, no mailbox, no group; the call goes where
+		# the windows are (route[rules_step], with no rule read), a browser is woken when there are none. Never a call that
+		# replaces another (Replaces), nor without an offer (a media session through rtpengine needs one), nor to an
+		# extension that is not one the SIP server could have.
+		if (is_present_hf("Replaces") || !($rU =~ "^[A-Za-z0-9._+-]{1,64}$")) {
+			xlog("L_NOTICE", "wazo: call $ci to $rU refused on the lines socket\n");
+			send_reply(403, "Forbidden");
+			exit;
+		}
+		if (!has_body_part("application/sdp")) {
+			xlog("L_NOTICE", "wazo: call $ci to $rU refused on the lines socket, no offer\n");
+			send_reply(488, "Not Acceptable Here");
+			exit;
+		}
+		# Who calls is told by this script (and by Wazo for what it asserts: the From): nothing a header asserts passes on.
+		remove_hf("P-Asserted-Identity");
+		remove_hf("P-Preferred-Identity");
+		remove_hf("Remote-Party-ID");
+		remove_hf_glob("Twake-*");
+		remove_hf_glob("X-Twake-*");
+		$var(pstn) = 0;
+		$var(meet) = 0;
+		record_route();
+		fix_nated_contact();
+		create_dialog();
+		$dlg_val(wline) = "1";
+		$acc_extra(via) = "wazo";
+		# Who calls: the number Wazo gives, when it is one of an extension's characters; else nobody the Gateway names.
+		$avp(caller) = "anonymous";
+		if ($fU =~ "^[A-Za-z0-9._+-]{1,64}$")
+			$avp(caller) = $fU;
+		$avp(callee) = $rU;
+		$avp(dialled) = $rU;
+		$avp(domain) = "${SIP_DOMAIN}";
+		$ru = "sip:" + $rU + "@" + $avp(domain);
+		$acc_extra(caller) = $avp(caller);
+		$acc_extra(callee) = $rU;
+		$acc_extra(dialled) = $rU;
+		do_accounting("db|evi", "cdr");
+		$avp(fwd_hops) = 0;
+		$avp(fwd_seen) = "," + $rU + ",";
+		if (!t_newtran()) {
+			sl_reply_error();
+			exit;
+		}
+		route(rules_step);
+		exit;
+	}
+	# wazo-lines: end
+
 	# The socket of LiveKit SIP (step 8): the calls its rooms place (dial-out), and its keepalives. Nothing registers there.
 	if ($var(meet) == 1) {
 		if (is_method("ACK"))
@@ -699,6 +818,51 @@ route {
 		fix_nated_register();
 		setbflag("NAT");
 		setflag("TCP_PERSISTENT");
+		# wazo-lines: begin
+		# The extension has a line at Wazo (step 11c-1, ADR 0027): `wazo_lines`, which the Gateway writes once Wazo has the
+		# line, read through the cache (60 s: a REGISTER is made to be read often). A database that cannot say (the table
+		# missing, a failed read) says no line for 30 s ($shv(wazo_lines_nodb_until)). Its registration goes to Wazo too:
+		# saved by mid_registrar (the windows are kept here, in `location`) and relayed to Wazo's Asterisk, which has one
+		# contact for the extension, this OpenSIPS's lines socket; a refresh Wazo has already is absorbed here (200 at
+		# once). The credentials of the windows are for this OpenSIPS: Wazo's are the line's (failure_route).
+		$var(wl_line) = 0;
+		if ($shv(wazo_lines_on) == 1 && $shv(wazo_lines_mute_until) <= $Ts && $tU =~ "^[0-9]{1,40}$") {
+			$var(wl_key) = "wazo:line:" + $tU;
+			$var(wl_has) = 0;
+			if (cache_fetch("local", "$var(wl_key)", $var(wl_has))) {
+				$var(wl_line) = $(var(wl_has){s.int});
+			} else if ($shv(wazo_lines_nodb_until) <= $Ts) {
+				if (sql_query_one("SELECT (count(*) > 0)::integer FROM wazo_lines WHERE extension = '$tU'", "$var(wl_has)")) {
+					$var(wl_line) = $(var(wl_has){s.int});
+					cache_store("local", "$var(wl_key)", "$var(wl_line)", 60);
+				} else {
+					$shv(wazo_lines_nodb_until) = $Ts + 30;
+					xlog("L_WARN", "wazo: wazo_lines not read (the Gateway of step 11c creates it): no line for 30 s\n");
+				}
+			}
+		}
+		if ($var(wl_line) == 1) {
+			consume_credentials();
+			$(avp(wl_pass)[*]) = NULL;
+			$avp(wl_pass) = $(tU{s.sha256_hmac,${WAZO_LINE_KEY}}{s.substr,0,32});
+			$socket_out = "udp:${WAZO_LINES_LISTEN_IP}:${WAZO_LINES_PORT}";
+			$ru = "sip:${WAZO_SIP}";
+			mid_registrar_save("location");
+			$var(mid_rc) = $rc;
+			if ($var(mid_rc) == 2)
+				exit;
+			if ($var(mid_rc) == 1) {
+				t_on_failure("wazo_register_failed");
+				if (t_relay())
+					exit;
+				xlog("L_WARN", "wazo: the registration of $tU could not be relayed to Wazo\n");
+			} else {
+				xlog("L_WARN", "wazo: the registration of $tU was not taken ($var(mid_rc))\n");
+			}
+			sl_reply_error();
+			exit;
+		}
+		# wazo-lines: end
 		if (!save("location"))
 			sl_reply_error();
 		exit;
@@ -3576,6 +3740,58 @@ route[relay_failed] {
 		rtpengine_delete();
 	route(account_missed);
 	t_reply($avp(vm_code), "$avp(vm_reason)");
+	exit;
+}
+
+#### Wazo's lines (step 11c-1, ADR 0027) ###############################################################################
+# Wazo's Asterisk rings a person's windows. The person's extension has a line there (`wazo_lines`, which the Gateway
+# writes once Wazo has the line: an endpoint named after the extension, with a password that is a keyed print of it,
+# WAZO_LINE_KEY). The windows still register here, with the credentials of `subscriber`; mid_registrar (AOR throttling)
+# then makes one registration of the extension at Wazo's Asterisk, from the lines socket: its contact is that socket,
+# and the windows stay behind it (usrloc, as for any other extension). An INVITE Wazo places to that contact comes back
+# on the socket (route[wazo_line_call]) and rings the windows as any call does, with the wake of a browser, the media
+# through rtpengine and the events and CDR of a call (`via` wazo).
+# Nothing else changes for the people who have a line: a call between two of them goes as before, by the rules of the
+# extension called. Wazo is not asked to place it: no call goes through Wazo unless Wazo started it. Wazo's call is
+# Wazo's decision, taken: the rules of the extension (forwards, "do not disturb"), its mailbox and its groups do not
+# apply, and a transfer of it (REFER) is refused as in a call with the operator. Registrations never depend on Wazo:
+# a registration Wazo does not take (no answer, an error, a challenge the line's password does not answer) is told to
+# the window once (503), and the same extension, or all of them for a server that does not answer, is registered here
+# only for a while (route[wazo_line_of], failure_route[wazo_register_failed]).
+
+# Wazo's Asterisk did not take the registration of the line $tU: its challenge is answered once with the line's
+# password; anything else leaves the window a 503 (it registers again, the softphone does), and the extension
+# registered here only for 5 minutes (it has no working line); a server that does not answer, all the extensions
+# for 30 s. Nothing is saved from a refused registration: the next REGISTER is the one that is.
+failure_route[wazo_register_failed] {
+	if (t_was_cancelled())
+		exit;
+	if (t_check_status("401|407") && $avp(wl_tried) == NULL) {
+		$avp(wl_tried) = 1;
+		$var(challenge) = $(<reply>hdr(WWW-Authenticate));
+		if ($T_reply_code == 407)
+			$var(challenge) = $(<reply>hdr(Proxy-Authenticate));
+		$(avp(t_user)[*]) = NULL;
+		$(avp(t_pass)[*]) = NULL;
+		$(avp(t_realm)[*]) = NULL;
+		$avp(t_user) = $tU;
+		$avp(t_pass) = $avp(wl_pass);
+		$avp(t_realm) = $(var(challenge){re.subst,/^.*realm="([^"]*)".*$/\1/});
+		if (uac_auth()) {
+			$socket_out = "udp:${WAZO_LINES_LISTEN_IP}:${WAZO_LINES_PORT}";
+			t_on_failure("wazo_register_failed");
+			if (t_relay())
+				exit;
+		}
+	}
+	if (t_check_status("408|5[0-9][0-9]")) {
+		$shv(wazo_lines_mute_until) = $Ts + 30;
+		xlog("L_WARN", "wazo: Wazo's Asterisk does not take registrations ($T_reply_code): the lines are left out 30 s\n");
+	} else {
+		cache_store("local", "wazo:line:$tU", "0", 300);
+		xlog("L_WARN", "wazo: the registration of $tU was refused ($T_reply_code): registered here only for 5 minutes\n");
+	}
+	t_reply(503, "Service Unavailable");
 	exit;
 }
 
