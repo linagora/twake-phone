@@ -2104,9 +2104,16 @@ route[ring_now] {
 	# Nobody registered, a browser to wake (route[wake_loaded]): the call waits for it.
 	if ($avp(wake) == 1)
 		route(hold);
-	# A ring group whose members with a window ring now, and whose members without one are woken (route[group_hold]).
+	# A ring group whose members with a window ring now, and whose members without one are woken: none has a window,
+	# the call waits for them (route[group_hold]); some have, they are woken before the relay (route[group_wake]) and
+	# the call waits for them once it is made (route[group_wait]).
 	if ($avp(group) != NULL && $avp(g_woken) > 0 && $avp(g_windows) == 0)
 		route(group_hold);
+	$var(group_wait) = 0;
+	if ($avp(group) != NULL && $avp(g_woken) > 0) {
+		route(group_wake);
+		$var(group_wait) = 1;
+	}
 	# Relayed from the request route: windows that cannot be reached may still have a browser to wake (3; 4 for a
 	# ring group).
 	$var(relay_request) = 1;
@@ -2116,8 +2123,8 @@ route[ring_now] {
 		route(wake_next);
 	if ($var(relayed) == 4)
 		route(group_dead);
-	if ($avp(group) != NULL && $avp(g_woken) > 0)
-		route(group_hold);
+	if ($var(group_wait) == 1)
+		route(group_wait);
 }
 
 # The caller cancelled while the rules were read (the transaction exists, so tm accepts its CANCEL, but nothing rang
@@ -2506,12 +2513,13 @@ route[woken] {
 }
 
 # A ring group whose members without a window can be woken ($avp(gw_ext), the first $avp(g_woken) of them in their
-# order): after the windows of the others are relayed (none at all: the caller hears it ringing, a 180 of ours), the
-# transaction waits PUSH_WAIT_SEC for a window of each of them (t_wait_for_new_branches, no limit: once every one of
-# them had a window answer, onreply_route[rtp] stops the wait and the call ends as the ringing does), each is woken
-# (E_TWAKEPHONE_WAKE names the member and the group) and the windows each registers ring with the others
-# (route[group_woken]). Counted per member, not per window: a member who opens two windows takes no colleague's
-# place, and counts once among those who must decline for the group to be declined (failure_route).
+# order): the transaction waits PUSH_WAIT_SEC for a window of each of them (t_wait_for_new_branches, no limit: once
+# every one of them had a window answer, onreply_route[rtp] stops the wait and the call ends as the ringing does),
+# each is woken (E_TWAKEPHONE_WAKE names the member and the group, route[group_wake]) and the windows each registers
+# ring with the others (route[group_woken]). Counted per member, not per window: a member who opens two windows takes
+# no colleague's place, and counts once among those who must decline for the group to be declined (failure_route).
+# Here when no window of the others rings (none at all: the caller hears it ringing, a 180 of ours; or none could be
+# reached, route[group_dead]); when some do, route[ring_now] wakes the members before the relay and waits after it.
 route[group_hold] {
 	$var(wait) = ${PUSH_WAIT_SEC};
 	$T_fr_inv_timeout = $var(wait);
@@ -2527,6 +2535,33 @@ route[group_hold] {
 			route(unreachable);
 		return(-1);
 	}
+	route(group_wake);
+	if ($var(windows) == $avp(g_woken)) {
+		t_reply(180, "Ringing");
+		exit;
+	}
+}
+
+# The windows of the others relayed (route[ring_now]), the call waits for the members woken before (route[group_wake]),
+# as route[group_hold]. Their replies are handled meanwhile, in other processes (onreply_route[rtp]), on the AVPs of the
+# transaction: tm guards them with its reply lock, which a request route never takes. Nothing here reads or writes an
+# AVP: written from here while a reply was handled, they were corrupted (a process looping or crashing on them).
+# The phony branch has its place (route[group_order] leaves it one): only short of memory can it fail.
+route[group_wait] {
+	$T_fr_inv_timeout = ${PUSH_WAIT_SEC};
+	if (!t_wait_for_new_branches())
+		xlog("L_ERR", "call $ci: a ring group cannot wait for its members to wake: they were woken, its windows ring\n");
+	$T_fr_inv_timeout = NULL;
+}
+
+# The members of a held ring group woken, and what the replies and the branches of the call read of them: before its
+# windows are relayed (route[ring_now]), or with no window ringing (route[group_hold]). A member woken already (before
+# a relay none of whose windows could be reached, route[group_dead]) is not woken again.
+route[group_wake] {
+	$var(wait) = ${PUSH_WAIT_SEC};
+	$var(was_woken) = ",";
+	if ($avp(g_wake_list) != NULL)
+		$var(was_woken) = $avp(g_wake_list);
 	$avp(held) = 1;
 	$var(n) = 0;
 	while ($(avp(gw_ext)[$var(n)]) != NULL)
@@ -2546,21 +2581,24 @@ route[group_hold] {
 	while ($var(j) >= 0 && $var(left) > 0) {
 		$var(member) = $(avp(gw_ext)[$var(j)]);
 		$var(list) = $var(list) + $var(member) + ",";
-		$(avp(wake_filter)[*]) = NULL;
-		$avp(wake_filter) = "aor=" + $var(member);
-		# A window that registers, or one that comes back with its Contact (route[hold]).
-		$var(followed) = 0;
-		if (notify_on_event("E_UL_CONTACT_INSERT", $avp(wake_filter), "group_woken", $var(wait)))
-			$var(followed) = $var(followed) + 1;
-		if (notify_on_event("E_UL_CONTACT_UPDATE", $avp(wake_filter), "group_woken", $var(wait)))
-			$var(followed) = $var(followed) + 1;
-		if ($var(followed) < 2)
-			xlog("L_ERR", "call $ci: a window of $var(member) may not ring in group $avp(group) (notify_on_event failed)\n");
-		$avp(ev_callee) = $var(member);
-		route(event_attrs);
-		$avp(ev_attr) = "wait";
-		$avp(ev_val) = $var(wait);
-		raise_event("E_TWAKEPHONE_WAKE", $avp(ev_attr), $avp(ev_val));
+		$var(mark) = "," + $var(member) + ",";
+		if ($(var(was_woken){s.index,$var(mark)}) == NULL) {
+			$(avp(wake_filter)[*]) = NULL;
+			$avp(wake_filter) = "aor=" + $var(member);
+			# A window that registers, or one that comes back with its Contact (route[hold]).
+			$var(followed) = 0;
+			if (notify_on_event("E_UL_CONTACT_INSERT", $avp(wake_filter), "group_woken", $var(wait)))
+				$var(followed) = $var(followed) + 1;
+			if (notify_on_event("E_UL_CONTACT_UPDATE", $avp(wake_filter), "group_woken", $var(wait)))
+				$var(followed) = $var(followed) + 1;
+			if ($var(followed) < 2)
+				xlog("L_ERR", "call $ci: a window of $var(member) may not ring in group $avp(group) (notify_on_event failed)\n");
+			$avp(ev_callee) = $var(member);
+			route(event_attrs);
+			$avp(ev_attr) = "wait";
+			$avp(ev_val) = $var(wait);
+			raise_event("E_TWAKEPHONE_WAKE", $avp(ev_attr), $avp(ev_val));
+		}
 		$var(j) = $var(j) - 1;
 		$var(left) = $var(left) - 1;
 	}
@@ -2571,10 +2609,6 @@ route[group_hold] {
 	$var(windows) = $avp(g_windows) + $avp(g_woken);
 	$(avp(g_windows)[*]) = NULL;
 	$avp(g_windows) = $var(windows);
-	if ($var(windows) == $avp(g_woken)) {
-		t_reply(180, "Ringing");
-		exit;
-	}
 }
 
 # A ring group none of whose windows could be reached (route[relay_call] 4: they are on dead WebSockets): its members
@@ -2588,8 +2622,12 @@ route[group_dead] {
 	$var(nd) = 0;
 	while ($(avp(gd_ext)[$var(nd)]) != NULL)
 		$var(nd) = $var(nd) + 1;
-	# Room: 12 branches, the failed ones ($avp(g_windows), all placed) and the phony one taken.
-	$var(room) = 11 - $avp(g_windows);
+	# Room: 12 branches, the failed ones (all placed) and the phony one taken. The members woken before the relay
+	# (route[group_wake]) are counted in $avp(g_windows) besides the windows placed.
+	$var(placed) = $avp(g_windows);
+	if ($avp(g_wake_list) != NULL)
+		$var(placed) = $avp(g_windows) - $avp(g_woken);
+	$var(room) = 11 - $var(placed);
 	# In order (the stacks hold them last first): those without a window, then those with dead ones.
 	$(avp(gx_ext)[*]) = NULL;
 	$var(taken) = 0;
@@ -3429,8 +3467,8 @@ route[relay_call] {
 		return(3);
 	}
 	# A ring group none of whose windows can be reached: its members whose browser can be woken are (4,
-	# route[group_dead]), with those who had no window.
-	if ($var(relay_rc) == -6 && $var(relay_request) == 1 && $avp(group) != NULL && $avp(held) == NULL && ($avp(gd_ext) != NULL || $avp(g_woken) > 0))
+	# route[group_dead]), with those who had no window (woken already, before the relay: route[ring_now]).
+	if ($var(relay_rc) == -6 && $var(relay_request) == 1 && $avp(group) != NULL && ($avp(gd_ext) != NULL || $avp(g_woken) > 0))
 		return(4);
 	route(relay_failed);
 }

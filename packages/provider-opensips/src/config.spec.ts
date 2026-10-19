@@ -497,12 +497,18 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     const calling = ring.indexOf('route(calling);', offer)
     expect([offer, calling].every(i => i > 0)).toBe(true)
     // Then the relay, unless the call waits for a browser to wake (step 5): the callee's (route[hold]), or members of
-    // a ring group nobody of which has a window (route[group_hold]); the others are woken once their colleagues ring.
+    // a ring group nobody of which has a window (route[group_hold]); the others are woken before their colleagues'
+    // windows are relayed (route[group_wake]), and waited for after (route[group_wait]).
     expect(ring.slice(calling + 1).filter(l => l && !l.startsWith('#'))).toEqual([
       'if ($avp(wake) == 1)',
       'route(hold);',
       'if ($avp(group) != NULL && $avp(g_woken) > 0 && $avp(g_windows) == 0)',
       'route(group_hold);',
+      '$var(group_wait) = 0;',
+      'if ($avp(group) != NULL && $avp(g_woken) > 0) {',
+      'route(group_wake);',
+      '$var(group_wait) = 1;',
+      '}',
       '$var(relay_request) = 1;',
       'route(relay_call);',
       '$var(relayed) = $rc;',
@@ -510,8 +516,8 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
       'route(wake_next);',
       'if ($var(relayed) == 4)',
       'route(group_dead);',
-      'if ($avp(group) != NULL && $avp(g_woken) > 0)',
-      'route(group_hold);',
+      'if ($var(group_wait) == 1)',
+      'route(group_wait);',
       '}'
     ])
     // One offer per call: a forward after a failure sends the same one on.
@@ -554,6 +560,41 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     const trunkIn = cfg.slice(cfg.indexOf('\nroute[trunk_in] {'), cfg.indexOf('\nroute[trunk_in_loaded] {'))
     expect(trunkIn.indexOf('if (!t_newtran()) {')).toBeGreaterThan(trunkIn.indexOf('do_accounting("db|evi", "cdr");'))
     expect(trunkIn.indexOf('if (!t_newtran()) {')).toBeLessThan(trunkIn.indexOf('async('))
+  })
+
+  it("touches no AVP of a call once its windows are relayed from the request route: their replies are handled meanwhile, in other processes, on the transaction's AVPs (a ring group's members woken before the relay)", () => {
+    const { cfg } = render()
+    const section = (name: string, next: string) => cfg.slice(cfg.indexOf(`\n${name} {`), cfg.indexOf(`\n${next} {`))
+    const code = (text: string) => text.split('\n').map(l => l.trim()).filter(l => l && !l.startsWith('#'))
+    // onreply_route[rtp] works on the transaction's AVPs, under its reply lock; a request route resumed after a read
+    // (async) works on the same list, without that lock.
+    expect(cfg).toContain('modparam("tm", "onreply_avp_mode", 1)')
+    const ring = code(section('route[ring_now]', 'route[cancelled]'))
+    const relay = ring.indexOf('route(relay_call);')
+    expect(relay).toBeGreaterThan(0)
+    expect(ring.slice(relay + 1).filter(l => l.includes('avp('))).toEqual([])
+    // Only a relay none of whose windows could be sent goes on with AVPs (route[wake_next], route[group_dead]): no
+    // window replies. One that sent returns at once.
+    const relayCall = code(section('route[relay_call]', 'route[relay_failed]'))
+    const sent = relayCall.indexOf('if (!t_relay())')
+    expect(relayCall.slice(sent, sent + 4)).toEqual(['if (!t_relay())', '$var(relay_rc) = $rc;', 'if ($var(relay_rc) > 0)', 'return(1);'])
+    // The members woken, and what the replies read of them, before the relay; after it, only the wait (a phony branch).
+    expect(ring.indexOf('route(group_wake);')).toBeLessThan(relay)
+    expect(ring.indexOf('route(group_wait);')).toBeGreaterThan(relay)
+    const wait = code(section('route[group_wait]', 'route[group_wake]'))
+    expect(wait.filter(l => l.includes('avp('))).toEqual([])
+    expect(wait).toContain('if (!t_wait_for_new_branches())')
+    expect(cfg.match(/route\(group_wait\);/g)).toHaveLength(1)
+    const wake = section('route[group_wake]', 'route[group_dead]')
+    for (const avp of ['g_wake_list', 'g_njoined', 'g_injected', 'g_awaited', 'g_windows']) expect(wake).toContain(`$avp(${avp}) = `)
+    expect(wake.match(/raise_event\("E_TWAKEPHONE_WAKE"/g)).toHaveLength(1)
+    expect(cfg.match(/raise_event\("E_TWAKEPHONE_WAKE"/g)).toHaveLength(2)
+    // None of the windows could be reached: the members with one are woken too (route[group_dead]), not those woken
+    // before the relay again; the room left counts the windows placed only.
+    expect(wake).toContain('if ($(var(was_woken){s.index,$var(mark)}) == NULL) {')
+    const dead = section('route[group_dead]', 'route[group_woken]')
+    expect(dead).toContain('if ($avp(g_wake_list) != NULL)\n\t\t$var(placed) = $avp(g_windows) - $avp(g_woken);\n\t$var(room) = 11 - $var(placed);')
+    expect(code(section('route[group_hold]', 'route[group_wait]'))).toContain('route(group_wake);')
   })
 
   it('takes the no-answer forward when no window of the callee can be reached, else answers 477, a missed call either way', () => {
@@ -989,11 +1030,12 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     for (const event of ['E_UL_CONTACT_INSERT', 'E_UL_CONTACT_UPDATE']) expect(groupHold).toContain(`notify_on_event("${event}", $avp(wake_filter), "group_woken", $var(wait))`)
     const joined = cfg.slice(cfg.indexOf('onreply_route[rtp] {'), cfg.indexOf('route[event_attrs]'))
     expect(joined).toContain('if ($var(nj) >= $avp(g_woken))\n\t\t\t\t\tt_wait_no_more_branches();')
-    // A group none of whose windows can be reached: its members are woken (those without a window first), not 477.
+    // A group none of whose windows can be reached: its members are woken (those without a window first, before the
+    // relay), not 477.
     const dead = section('route[group_dead]', 'route[group_woken]')
-    expect(dead).toContain('$var(room) = 11 - $avp(g_windows);')
+    expect(dead).toContain('$var(room) = 11 - $var(placed);')
     expect(dead.indexOf('route(past_dead_branches);')).toBeLessThan(dead.indexOf('route(group_hold);'))
-    expect(section('route[relay_call]', 'route[relay_failed]')).toContain('if ($var(relay_rc) == -6 && $var(relay_request) == 1 && $avp(group) != NULL && $avp(held) == NULL && ($avp(gd_ext) != NULL || $avp(g_woken) > 0))\n\t\treturn(4);')
+    expect(section('route[relay_call]', 'route[relay_failed]')).toContain('if ($var(relay_rc) == -6 && $var(relay_request) == 1 && $avp(group) != NULL && ($avp(gd_ext) != NULL || $avp(g_woken) > 0))\n\t\treturn(4);')
     expect(groupHold).toContain('$avp(ev_callee) = $var(member);')
     expect(section('route[group_woken]', 'route[group_next]')).toContain('$(msg.branch.attr(gext)[0]) = $avp(aor);')
     // Only the request route holds: failure_route says so before it may relay, and never reaches the hold.
