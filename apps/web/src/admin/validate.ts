@@ -502,6 +502,8 @@ const GENERAL: Record<string, Key> = {
   TRUNK_LIMIT: 'admin.err.trunkLimit',
   DID_LIMIT: 'admin.err.didLimit',
   SITE_LIMIT: 'admin.err.siteLimit',
+  TRUNK_HAS_SITES: 'admin.err.trunkHasSites',
+  SITE_NUMBER_IN_USE: 'admin.err.siteNumberInUse',
   PROFILE_LIMIT: 'admin.err.profileLimit',
   OUTBOUND_STALE: 'admin.err.stale',
   ALERT_CHANGED: 'admin.alert.changed',
@@ -650,6 +652,7 @@ export const checkSite = (f: SiteForm, ctx: { isNew: boolean; trunks: readonly P
 export const siteRefusal = (err: unknown) =>
   refusalOf<SiteField>(err, (field, code) => {
     if (code === 'SITE_NUMBER') return { field: 'number', problem: p('admin.site.err.numberTrunk') }
+    if (code === 'SITE_NUMBER_RINGS_NOBODY') return { field: 'number', problem: p('admin.site.err.numberRings') }
     if (code === 'SITE_MEMBER') return { field: 'members', problem: p('admin.site.err.member') }
     if ((SITE_FIELDS as string[]).includes(field)) return { field: field as SiteField, problem: p(`admin.site.err.${field}` as Key) }
     return undefined

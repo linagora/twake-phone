@@ -948,5 +948,8 @@
   "admin.site.membersMany": "{count} people",
   "admin.site.search": "Search for a person",
   "admin.site.searchNone": "Nobody matches.",
-  "admin.site.numberRings": "This is the number the emergency services call back: it must ring someone at the site (a reception desk, a phone), not one person. The caller's direct number is not presented for an emergency when they are in a site."
+  "admin.site.numberRings": "This is the number the emergency services call back: it must ring someone at the site (a reception desk, a phone), not one person. The caller's direct number is not presented for an emergency when they are in a site.",
+  "admin.err.trunkHasSites": "This trunk carries sites: delete them, or move them to another trunk, before deleting it.",
+  "admin.err.siteNumberInUse": "A site presents this number for its emergencies: change the number of the site first.",
+  "admin.site.err.numberRings": "This number rings nobody: choose a direct number of this trunk that leads to an extension or a group."
 }

@@ -948,5 +948,8 @@
   "admin.site.membersMany": "{count} personnes",
   "admin.site.search": "Chercher une personne",
   "admin.site.searchNone": "Personne ne correspond.",
-  "admin.site.numberRings": "Ce numéro est celui que les secours rappellent : il doit faire sonner quelqu'un du site (une réception, un poste), pas une personne seule. Le numéro direct de l'appelant n'est pas présenté pour une urgence quand il est dans un site."
+  "admin.site.numberRings": "Ce numéro est celui que les secours rappellent : il doit faire sonner quelqu'un du site (une réception, un poste), pas une personne seule. Le numéro direct de l'appelant n'est pas présenté pour une urgence quand il est dans un site.",
+  "admin.err.trunkHasSites": "Ce trunk porte des sites : supprimez-les, ou déplacez-les sur un autre trunk, avant de le supprimer.",
+  "admin.err.siteNumberInUse": "Un site présente ce numéro pour ses urgences : changez d'abord le numéro du site.",
+  "admin.site.err.numberRings": "Ce numéro ne fait sonner personne : choisissez un numéro direct de ce trunk qui mène à un poste ou à un groupe."
 }

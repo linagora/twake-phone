@@ -2116,6 +2116,8 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
           // The default trunk gives its number to everyone without a direct number: never changed without a word.
           if (records.length > 1 && defaultTrunk(records)?.id === req.params.id)
             throw Object.assign(new Error('This is the default trunk: make another one the default first'), { statusCode: 409, code: 'TRUNK_DEFAULT' })
+          // Its sites do not go with it in silence: their people would present a number declared elsewhere (step 6c).
+          if ((await store.listSites(user.tenantId)).some(x => x.trunkId === req.params.id)) throw Object.assign(new Error(`The trunk ${req.params.id} carries sites: delete them, or move them to another trunk, first`), { statusCode: 409, code: 'TRUNK_HAS_SITES' })
           // Its direct numbers go with it.
           const dids = (await store.listDids(user.tenantId)).filter(d => d.trunkId !== req.params.id).map(publicDid)
           await changeTrunks(user.tenantId, apply, records.filter(t => t.id !== req.params.id), dids, () => store.deleteTrunk(user.tenantId, req.params.id))
@@ -2369,6 +2371,17 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
           const current = sites.find(x => x.id === req.params.id)
           if (!current && sites.length >= MAX_SITES) throw Object.assign(new Error(`At most ${MAX_SITES} sites`), { statusCode: 409, code: 'SITE_LIMIT' })
           const site = parseSite(req.params.id, req.body, records, dids)
+          // The number must ring someone of the site: a direct number of the trunk that leads to an extension or a group.
+          const covering = dids.filter(d => d.trunkId === site.trunkId && inDids([d], site.number))
+          const rings = async (d: DidRange) => {
+            if (d.suffixDigits) return !!(await store.getMappingByExtension(user.tenantId, site.number.slice(-d.suffixDigits)))
+            if (!d.target) return false
+            if (await store.getMappingByExtension(user.tenantId, d.target)) return true
+            return !!(await registry.forTenant(user.tenantId).listGroups?.())?.some(g => g.number === d.target)
+          }
+          let ringing = false
+          for (const d of covering) if (await rings(d)) ringing = true
+          if (!ringing) throw Object.assign(new Error(`number: ${site.number} rings nobody: it must be a direct number of the trunk ${site.trunkId} that leads to an extension or a ring group`), { statusCode: 400, code: 'SITE_NUMBER_RINGS_NOBODY' })
           const known = new Set((await store.listMappings(user.tenantId)).map(m => m.userId))
           // Someone who left the directory and was in this site goes from it with this write; anyone else unknown is refused.
           const unknown = site.members.find(m => !known.has(m) && !current?.members.includes(m))

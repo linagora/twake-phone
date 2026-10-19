@@ -1546,7 +1546,9 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(fallback).toContain('if ($avp(num_class) != "emergency" || $avp(t_fallback) != NULL)\n\t\treturn(-1);\n\t$avp(t_fallback) = 1;')
     expect(fallback).toContain('if ($var(again) == 0 || !ds_select_dst($avp(t_setid), 8, "f"))\n\t\treturn(-1);')
     // Its trunk the default one, the number of a site refused (step 6c): once more on it with the direct or the default number.
-    expect(fallback).toContain('else if ($avp(t_site) != NULL && $avp(t_site) != "" && $shv(dt_setid) != 0 && $avp(t_setid) == $shv(dt_setid) && route(default_trunk, "same"))')
+    expect(fallback).toContain('else if ($avp(t_site) != NULL && $avp(t_site) != "" && $shv(dt_setid) != 0 && $avp(t_setid) == $shv(dt_setid) && $avp(t_rang) == NULL && $var(failed) =~ "^(403|404|484|488|603)$") {')
+    // Only a refusal before any ringing, and only when it presents another number than the one refused.
+    expect(fallback).toContain('$var(refused) = $avp(t_site);\n\t\tif (route(default_trunk, "same") && $avp(t_presented) != $var(refused))')
     // Written for that trunk (its number, its domain, its socket), its From and To for each branch, its failure handled here again.
     for (const step of ['route(trunk_target);', 't_on_branch("trunk_out");', 't_on_reply("rtp");', 't_on_failure("trunk_failed");', 'if (t_relay())\n\t\treturn(1);'])
       expect(fallback.indexOf(step), step).toBeGreaterThan(fallback.indexOf('route(default_trunk)'))
@@ -1686,7 +1688,7 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     // From memory (`es:`, with the generation of `dn:`) when the database does not answer, before the direct number.
     const timer = section('timer_route[default_trunk, 15]', 'route[emergency_failed]')
     expect(timer).toContain('cache_store("local", "$var(es_key)", "$var(es_val)", 0);')
-    expect(timer).toContain('$var(es_val) = $(avp(es_num)[$var(i)]) + "|" + $var(es_next);')
+    expect(timer).toContain('$var(es_val) = $(avp(es_num)[$var(i)]) + "|" + $var(es_next) + "|" + $var(d_setid);')
     // Its own generation, moved only by a read that succeeded (rows, or none: -2), apart from the direct numbers'.
     expect(timer.indexOf('$shv(es_gen) = $var(es_next);')).toBeGreaterThan(timer.indexOf('cache_store("local", "$var(es_key)"'))
     expect(timer.match(/if \(\$rc == 1 \|\| \$rc == -2\) \{/g)).toHaveLength(2)
@@ -1694,6 +1696,8 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(timer).toContain('es.trunk_id = (SELECT id FROM trunks ORDER BY position LIMIT 1)')
     const fallback = section('route[default_trunk]', 'timer_route[default_trunk, 15]')
     expect(fallback).toContain('$(var(es){s.select,1,|}{s.int}) >= $shv(es_gen)')
+    // The number is kept with the trunk it was read for: a default trunk that changed presents none of the old one.
+    expect(fallback).toContain('$(var(es){s.select,2,|}{s.int}) == $shv(dt_setid)')
     expect(fallback.indexOf('"es:$avp(caller)"')).toBeGreaterThan(fallback.indexOf('"dn:$avp(caller)"'))
     expect(fallback).toContain('$avp(t_presented) = $(var(es){s.select,0,|});')
   })

@@ -1265,7 +1265,7 @@ route[default_trunk] {
 	if ($avp(caller) =~ "^[A-Za-z0-9._+-]{1,64}$" && cache_fetch("local", "dn:$avp(caller)", $var(dn)) && $(var(dn){s.select,1,|}) =~ "^[0-9]+$" && $(var(dn){s.select,1,|}{s.int}) >= $shv(dn_gen) && $(var(dn){s.select,0,|}) =~ "^\+[1-9][0-9]{6,14}$")
 		$avp(t_presented) = $(var(dn){s.select,0,|});
 	# The number of the caller's site, as last read, before the direct number (step 6c, ADR 0024; a generation of its own).
-	if ($var(same) == 0 && $avp(caller) =~ "^[A-Za-z0-9._+-]{1,64}$" && cache_fetch("local", "es:$avp(caller)", $var(es)) && $(var(es){s.select,1,|}) =~ "^[0-9]+$" && $(var(es){s.select,1,|}{s.int}) >= $shv(es_gen) && $(var(es){s.select,0,|}) =~ "^\+[1-9][0-9]{6,14}$") {
+	if ($var(same) == 0 && $avp(caller) =~ "^[A-Za-z0-9._+-]{1,64}$" && cache_fetch("local", "es:$avp(caller)", $var(es)) && $(var(es){s.select,1,|}) =~ "^[0-9]+$" && $(var(es){s.select,1,|}{s.int}) >= $shv(es_gen) && $(var(es){s.select,2,|}{s.int}) == $shv(dt_setid) && $(var(es){s.select,0,|}) =~ "^\+[1-9][0-9]{6,14}$") {
 		$avp(t_presented) = $(var(es){s.select,0,|});
 		$avp(t_site) = $avp(t_presented);
 	}
@@ -1312,7 +1312,7 @@ timer_route[default_trunk, 15] {
 			$var(i) = 0;
 			while ($(avp(es_ext)[$var(i)]) != NULL) {
 				$var(es_key) = "es:" + $(avp(es_ext)[$var(i)]);
-				$var(es_val) = $(avp(es_num)[$var(i)]) + "|" + $var(es_next);
+				$var(es_val) = $(avp(es_num)[$var(i)]) + "|" + $var(es_next) + "|" + $var(d_setid);
 				cache_store("local", "$var(es_key)", "$var(es_val)", 0);
 				$var(i) = $var(i) + 1;
 			}
@@ -1844,10 +1844,14 @@ route[emergency_fallback] {
 	$var(again) = 0;
 	if (route(default_trunk))
 		$var(again) = 1;
-	else if ($avp(t_site) != NULL && $avp(t_site) != "" && $shv(dt_setid) != 0 && $avp(t_setid) == $shv(dt_setid) && route(default_trunk, "same"))
-		# Its trunk is the default one and what it refused may be the number of the site (step 6c): once more, with the
-		# caller's direct number, else the trunk's.
-		$var(again) = 1;
+	else if ($avp(t_site) != NULL && $avp(t_site) != "" && $shv(dt_setid) != 0 && $avp(t_setid) == $shv(dt_setid) && $avp(t_rang) == NULL && $var(failed) =~ "^(403|404|484|488|603)$") {
+		# Its trunk is the default one, it refused before ringing anyone, with an answer that may be about the number
+		# presented (step 6c): once more, with the caller's direct number, else the trunk's, when that is another number.
+		# Never after a ringing, a timeout or a server error: the emergency services would be called twice, or the wait doubled.
+		$var(refused) = $avp(t_site);
+		if (route(default_trunk, "same") && $avp(t_presented) != $var(refused))
+			$var(again) = 1;
+	}
 	if ($var(again) == 0 || !ds_select_dst($avp(t_setid), 8, "f"))
 		return(-1);
 	xlog("L_WARN", "call $ci: emergency call failed on its trunk ($var(failed)), through the default trunk\n");

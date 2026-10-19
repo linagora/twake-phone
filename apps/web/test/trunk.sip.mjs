@@ -1303,6 +1303,11 @@ try {
   // site's trunk: here the default number of each trunk), through that trunk, before the direct number: for an
   // emergency call only. The sites are set through the Gateway's own routes (in this process, on a memory store, handing
   // the sets to the real tables of OpenSIPS), as an administrator does.
+  // The numbers a site presents ring someone of it (the Gateway checks): one direct number each, to a ring group (a person's own number would become her direct number).
+  const SITE_DIDS = [
+    { id: 'paris-line', trunkId: 'main', first: '+33199000350', last: '+33199000350', target: '390' },
+    { id: 'lyon-line', trunkId: 'backup', first: '+33199000351', last: '+33199000351', target: '391' }
+  ]
   const gw = await (async () => {
     process.env.AUTH_MODE = 'dev'
     const store = new MemoryStore()
@@ -1312,13 +1317,13 @@ try {
       const { id, password, ...config } = t
       await store.upsertTrunk({ tenantId: TENANT, id, config, passwordEnc: encrypt(password, key) })
     }
-    for (const d of dids) await store.upsertDid({ tenantId: TENANT, ...d })
+    for (const d of [...dids, ...SITE_DIDS]) await store.upsertDid({ tenantId: TENANT, ...d })
     const provider = {
       getStatus: () => 'CONNECTED',
       getCapabilities: async () => ({ trunks: true }),
       subscribe: async function* () {},
       close: async () => {},
-      listGroups: async () => [],
+      listGroups: async () => [{ number: '390', name: 'Paris', members: ['301'] }, { number: '391', name: 'Lyon', members: ['303'] }],
       holdsAccount: (extension, userId) => tables.holdsAccount(extension, userId),
       setTrunks: async (trunks, ds, sites) => void (await tables.set(trunks, ds, sites))
     }
@@ -1330,8 +1335,8 @@ try {
     return { app, call }
   })()
   const SITES = [
-    { name: 'Paris', address: '1 rue de Rivoli, 75001 Paris', trunkId: 'main', number: '+33199000300', members: ['u-301'] },
-    { name: 'Lyon', address: '2 place Bellecour, 69002 Lyon', trunkId: 'backup', number: '+33199000310', members: ['u-303'] }
+    { name: 'Paris', address: '1 rue de Rivoli, 75001 Paris', trunkId: 'main', number: '+33199000350', members: ['u-301'] },
+    { name: 'Lyon', address: '2 place Bellecour, 69002 Lyon', trunkId: 'backup', number: '+33199000351', members: ['u-303'] }
   ]
   const putSite = async (id, site) => {
     const r = await gw.call('PUT', `/admin/sites/${id}`, 'root', site)
@@ -1349,13 +1354,13 @@ try {
       expect('a number of no trunk refused', wrong.statusCode === 400 && wrong.json().code === 'SITE_NUMBER', `${wrong.statusCode} ${wrong.body}`)
       // What the person is told is what OpenSIPS applies (the account of 301 is written for u-301).
       const told = (await gw.call('GET', '/me/emergency-site', 'u-301')).json()
-      expect('301 is told her site', told.site?.name === 'Paris' && told.site.number === '+33199000300', JSON.stringify(told))
+      expect('301 is told her site', told.site?.name === 'Paris' && told.site.number === '+33199000350', JSON.stringify(told))
       expect('302 is told none', (await gw.call('GET', '/me/emergency-site', 'u-302')).json().site === undefined)
       // 301 (direct number +33199000301, in Paris): the number of Paris, at the first trunk.
       const sos = await p301.dial('112')
       const at = await atOperator(A, sos)
       expect('112 at the first trunk', at.invite.uri === 'sip:112@operator.example', at.invite.uri)
-      expect('the number of the site, not the direct number', from(at).includes('<sip:+33199000300@operator.example>'), from(at))
+      expect('the number of the site, not the direct number', from(at).includes('<sip:+33199000350@operator.example>'), from(at))
       if (sos.final.status === 200) await p301.hangup(sos)
       // Any other call of 301: its direct number, as without a site.
       const other = await p301.dial('0199000022')
@@ -1366,7 +1371,7 @@ try {
       const lyon = await p303.dial('112')
       const lyonAt = await atOperator(C, lyon)
       expect('112 at the backup', lyonAt.invite.uri === 'sip:112@backup.example', lyonAt.invite.uri)
-      expect('the number of Lyon', from(lyonAt).includes('<sip:+33199000310@backup.example>'), from(lyonAt))
+      expect('the number of Lyon', from(lyonAt).includes('<sip:+33199000351@backup.example>'), from(lyonAt))
       if (lyon.final.status === 200) await p303.hangup(lyon)
       // 302 is in no site: its direct number, as before.
       const none = await q302.dial('112')
@@ -1377,7 +1382,7 @@ try {
       await putSite('lyon', { ...SITES[1], members: ['u-302', 'u-303'] })
       const moved = await q302.dial('112')
       const movedAt = await atOperator(C, moved)
-      expect('302 in Lyon: at the backup', movedAt.invite.uri === 'sip:112@backup.example' && from(movedAt).includes('<sip:+33199000310@backup.example>'), `${movedAt.invite.uri} ${from(movedAt)}`)
+      expect('302 in Lyon: at the backup', movedAt.invite.uri === 'sip:112@backup.example' && from(movedAt).includes('<sip:+33199000351@backup.example>'), `${movedAt.invite.uri} ${from(movedAt)}`)
       if (moved.final.status === 200) await q302.hangup(moved)
       // The default trunk is read again every 15 s, with the sites on it: once read, the database may not answer.
       await sleep(16_000)
@@ -1389,7 +1394,7 @@ try {
         const cut = await p301.dial('112')
         const cutAt = await atOperator(A, cut)
         expect('112 with the database out of reach, at the operator', cutAt.invite.uri === 'sip:112@operator.example', cutAt.invite.uri)
-        expect('the site of 301, as last read', from(cutAt).includes('<sip:+33199000300@operator.example>'), from(cutAt))
+        expect('the site of 301, as last read', from(cutAt).includes('<sip:+33199000350@operator.example>'), from(cutAt))
         if (cut.final.status === 200) await p301.hangup(cut)
       } finally {
         await locker.query('ROLLBACK').catch(() => undefined)
@@ -1415,7 +1420,7 @@ try {
       const call = await p301.dial('112')
       await A.until('both calls at the operator', () => A.state.invites.filter(c => c.callId === call.callId).length >= 2, 10_000)
       const [first, second] = A.state.invites.filter(c => c.callId === call.callId)
-      expect('the number of the site refused first', first.state === 'refused' && from(first).includes('<sip:+33199000300@operator.example>'), `${first.state} ${from(first)}`)
+      expect('the number of the site refused first', first.state === 'refused' && from(first).includes('<sip:+33199000350@operator.example>'), `${first.state} ${from(first)}`)
       expect('then the direct number, on the same trunk', second.invite.uri === 'sip:112@operator.example' && from(second).includes('<sip:+33199000301@operator.example>'), `${second.invite.uri} ${from(second)}`)
       expect('final answer', call.final.status === 200, call.final.first)
       await p301.hangup(call)
@@ -1455,6 +1460,27 @@ try {
           expect('the trunk\'s number, the old site not kept', from(at).includes('<sip:+33199000300@operator.example>'), from(at))
           if (call.final.status === 200) await p301.hangup(call)
         })
+      } finally {
+        await tables.set([main, backup], dids)
+      }
+    })
+
+    await step('second review 1, 3: an emergency call that rang then failed is never called twice; one the operator refuses for the number of the site is not tried again with the same number', async () => {
+      await putSite('paris', SITES[0])
+      // Rang, then busy: the emergency services were called, one INVITE only, whatever the site.
+      A.state.next.push({ ringThen: '486 Busy Here', afterMs: 300 })
+      const rang = await p301.dial('112')
+      await sleep(2_000)
+      expect('one INVITE only after a ringing', A.state.invites.filter(c => c.callId === rang.callId).length === 1 && B.state.invites.every(c => c.callId !== rang.callId), `${A.state.invites.filter(c => c.callId === rang.callId).length}`)
+      await putSite('paris', { ...SITES[0], members: [] })
+      // The number of the site is the trunk's own, 115 has no direct number: refused, the same number would be sent again: it is not.
+      await tables.set([main, backup], dids, [{ id: 'paris', name: 'Paris', address: '1 rue de Rivoli', trunkId: 'main', number: '+33199000300', members: ['u-115'] }])
+      try {
+        A.state.next.push({ reply: '403 Forbidden' })
+        const same = await p115.dial('112')
+        await sleep(2_000)
+        expect('one INVITE only, the number being the same', A.state.invites.filter(c => c.callId === same.callId).length === 1, `${A.state.invites.filter(c => c.callId === same.callId).length}`)
+        expect('told to call from another phone', same.final.status === 503 && header(same.final, 'twake-call-refused') === 'emergency', `${same.final.first}`)
       } finally {
         await tables.set([main, backup], dids)
       }
