@@ -3509,7 +3509,7 @@ try {
         // For whoever reads the failure: what Asterisk loaded of the lines, and what wazo-confgend gave it.
         const exec = cmd => { try { return execFileSync('docker', ['compose', '-f', COMPOSE_FILE, 'exec', '-T', 'wazo-asterisk', 'bash', '-c', cmd], { encoding: 'utf8', timeout: 30_000 }) } catch (e) { return `(${e.message})` } }
         console.log(`[11c-1] auths: ${asteriskCli('pjsip show auths')}\n[11c-1] endpoint 103: ${asteriskCli('pjsip show endpoint 103').slice(0, 1500)}\n[11c-1] twake-pjsip-lines: ${exec('/usr/bin/twake-pjsip-lines | grep -A14 "^\\[103"')}\n[11c-1] confgen: ${exec('wazo-confgen asterisk/pjsip.conf | grep -B2 -A14 "103"').slice(0, 3000)}`)
-        const log = execFileSync('docker', ['compose', '-f', COMPOSE_FILE, 'logs', '--no-color', '--timestamps', 'wazo-sysconfd', 'wazo-asterisk'], { encoding: 'utf8', timeout: 30_000, maxBuffer: 64 << 20 }).split('\n').filter(l => /pjsip|ran '|failed|Reload|reload|auth/i.test(l)).slice(-30).map(l => l.replace(/\x1b\[[0-9;]*m/g, '').slice(0, 260))
+        const log = execFileSync('docker', ['compose', '-f', COMPOSE_FILE, 'logs', '--no-color', '--timestamps', 'wazo-sysconfd', 'wazo-asterisk'], { encoding: 'utf8', timeout: 30_000, maxBuffer: 64 << 20 }).split('\n').filter(l => /pjsip|ran '|failed|Reload|reload|auth/i.test(l)).slice(-30).map(l => l.slice(0, 260))
         console.log(`[11c-1] sysconfd and asterisk, with their times: ${log.join('\n')}\n[11c-1] now: ${new Date().toISOString()}`)
         throw err
       })

@@ -61,6 +61,10 @@ AMI_PASSWORD = os.environ['SYSCONFD_AMI_PASSWORD']
 CONFGEND = os.environ.get('SYSCONFD_CONFGEND', '127.0.0.1:8669')
 SYNCHRONOUS = os.environ.get('SYSCONFD_SYNCHRONOUS') == '1'
 # What a reload costs before it runs: a real Wazo's (wazo-confgen, then asterisk -rx) is far above this stack's Asterisk.
+# How long the AMI may take to answer: a Reload answers when Asterisk is done, and a reload of PJSIP (wazo-confgen run for each
+# of its objects) takes 17 s on a CI runner. Giving up sooner leaves the reload running, and the next ones refused ("A reload
+# is in progress") and lost.
+AMI_TIMEOUT_S = int(os.environ.get('SYSCONFD_AMI_TIMEOUT_S', '90'))
 RELOAD_MS = int(os.environ.get('SYSCONFD_RELOAD_MS', '0'))
 SPOOL = os.environ.get('SYSCONFD_SPOOL', '/var/spool/asterisk/voicemail')
 # The commands wazo-confd sends after a change to voicemails, users and lines, each the module the AMI reloads for it.
@@ -142,7 +146,7 @@ def ami_actions(actions):
     (the block of its ActionID; for a list, its entries too, until its EventList completes); AmiError when Asterisk
     refused one (the next ones not run), unless it is a reload of an OPTIONAL module that is not there."""
     host, port = AMI.rsplit(':', 1)
-    with socket.create_connection((host, int(port)), timeout=10) as s:
+    with socket.create_connection((host, int(port)), timeout=AMI_TIMEOUT_S) as s:
         f = s.makefile('rwb')
         f.readline()  # the banner
         def send(lines):
