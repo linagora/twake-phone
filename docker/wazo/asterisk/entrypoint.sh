@@ -98,7 +98,27 @@ cat > /etc/asterisk/pjsip.d/01-wazo.conf <<EOF
 [global]
 type = global
 user_agent = TwakePhone
-endpoint_identifier_order = ip
+; OpenSIPS's socket for Wazo is its address (ip): a mailbox's call. The lines' socket, another address of OpenSIPS
+; (step 11c-1), is no match there: its requests are a line's, by their credentials or their From (auth_username,
+; username), see the lines below.
+endpoint_identifier_order = ip,auth_username,username
+
+; What every line shares: the media as a browser's. Its context and its credentials are the line's, from wazo-confd.
+[twake-line](!)
+type = endpoint
+transport = twake-transport
+disallow = all
+allow = opus,g722,alaw,ulaw
+dtmf_mode = rfc4733
+language = fr_FR
+webrtc = yes
+dtls_auto_generate_cert = yes
+media_address = ${WAZO_RTP_ADDRESS}
+bind_rtp_to_media_address = yes
+direct_media = no
+rtp_symmetric = yes
+send_pai = no
+trust_id_inbound = no
 
 [twake-transport]
 type = transport
@@ -132,6 +152,28 @@ rtp_symmetric = yes
 send_pai = no
 trust_id_inbound = no
 EOF
+
+# The lines (step 11c-1, ADR 0027): the endpoints, AORs and credentials wazo-confd has for the people (wazo-confgend's
+# pjsip.conf), each endpoint made on the template above, without what else it writes (its transports listen on every
+# address, its global and system sections are this stack's own).
+cat > /usr/bin/twake-pjsip-lines <<'EOF'
+#!/bin/bash
+set -o pipefail
+wazo-confgen asterisk/pjsip.conf | awk '
+  function flush() {
+    if (keep) {
+      if (kind == "endpoint") sub(/\]$/, "](twake-line)", first)
+      printf "%s\n%s", first, rest
+    }
+    first = ""; rest = ""; keep = 0; kind = ""
+  }
+  /^\[/ { flush(); first = $0; next }
+  { rest = rest $0 "\n" }
+  /^type[ \t]*=[ \t]*(endpoint|aor|auth)[ \t]*$/ { keep = 1; kind = $3 }
+  END { flush() }'
+EOF
+chmod 755 /usr/bin/twake-pjsip-lines
+printf '#exec /usr/bin/twake-pjsip-lines\n' > /etc/asterisk/pjsip.d/02-wazo-lines.conf
 
 cat > /etc/asterisk/rtp.d/01-wazo.conf <<EOF
 [general]

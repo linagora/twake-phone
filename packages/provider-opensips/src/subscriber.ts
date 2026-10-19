@@ -8,6 +8,7 @@ import { DialOutGrants, type DialOutGrantsOptions } from './dial-out-grants.js'
 import { ACC_EXTERNAL_SQL, OutboundTables, type OutboundTablesOptions } from './outbound.js'
 import { TRUNK_SCHEMA, TrunkTables, type TrunkTablesOptions } from './trunks.js'
 import { VOICEMAIL_BOXES_SCHEMA, VoicemailBoxes, type VoicemailBoxesOptions } from './voicemail-boxes.js'
+import { WAZO_LINES_SCHEMA, WazoLines, type WazoLinesOptions } from './wazo-lines.js'
 
 // Everything about OpenSIPS's `subscriber` table (module auth_db) lives here: the Gateway only sees a SecretProvisioner.
 
@@ -99,7 +100,7 @@ CREATE TABLE IF NOT EXISTS missed_calls (
 CREATE INDEX IF NOT EXISTS missed_calls_callid_idx ON missed_calls (callid);
 INSERT INTO version (table_name, table_version) VALUES ('acc', ${ACC_TABLE_VERSION}), ('missed_calls', ${MISSED_CALLS_TABLE_VERSION})
   ON CONFLICT (table_name) DO NOTHING;
-${CALL_RULES_SCHEMA}${CALL_GROUPS_SCHEMA}${DISPLAY_NAMES_SCHEMA}${PUSH_TARGETS_SCHEMA}${TRUNK_SCHEMA}${VOICEMAIL_BOXES_SCHEMA}`
+${CALL_RULES_SCHEMA}${CALL_GROUPS_SCHEMA}${DISPLAY_NAMES_SCHEMA}${PUSH_TARGETS_SCHEMA}${TRUNK_SCHEMA}${VOICEMAIL_BOXES_SCHEMA}${WAZO_LINES_SCHEMA}`
 
 const ACC_EXTRA = "VARCHAR(64) DEFAULT '' NOT NULL"
 /**
@@ -392,6 +393,11 @@ export class SubscriberProvisioner implements SecretProvisioner {
   /** The `voicemail_boxes` of the same database (step 11a), on the same connections (see VoicemailBoxesOptions). */
   voicemailBoxes(opts: Omit<VoicemailBoxesOptions, 'pool'> = {}) {
     return new VoicemailBoxes({ pool: this.pool, ...opts })
+  }
+
+  /** The `wazo_lines` of the same database (step 11c-1), on the same connections (see WazoLinesOptions). */
+  wazoLines(opts: Omit<WazoLinesOptions, 'pool'> = {}) {
+    return new WazoLines({ pool: this.pool, ...opts })
   }
 
   /** The grants of the calls Meet's rooms place (step 8), in the same database, on the same connections. */

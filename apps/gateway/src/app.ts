@@ -1091,6 +1091,26 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
           }
           await keepHeldBack(tenantId, done, asked, interrupted)
           await eraseAsked(tenantId, vm)
+          // The lines at Wazo (step 11c-1, ADR 0027), one for each extension someone holds, then told to the SIP server:
+          // it registers an extension at Wazo only once Wazo has its line, and stops before Wazo loses it.
+          if (vm.linesOn && vm.syncLines && provider.setWazoLines) {
+            const lines = await vm.syncLines(
+              (await store.listMappings(tenantId)).map(m => m.extension),
+              {
+                mayWrite: () => mayWriteVoicemail(tenantId),
+                beforeRemoval: async gone => {
+                  const told = (await provider.listWazoLines?.()) ?? []
+                  await provider.setWazoLines?.(told.filter(e => !gone.includes(e)))
+                }
+              }
+            )
+            await provider.setWazoLines(lines.ready)
+            // Lines Wazo refused: another round after a pause (never a loop on Wazo).
+            if (lines.failed > 0) {
+              state.again = true
+              state.pause = true
+            }
+          }
           attempt = 0
           forgetFailing(tenantId, 'sync-failing')
           // Done, but with mailboxes the voicemail server refused (each said in the log, tried again at each round).

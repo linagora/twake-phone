@@ -245,7 +245,12 @@ services:
     depends_on:
       wazo-bootstrap:
         condition: service_healthy
+    # The documentation of the PJSIP options wazo-confd checks an endpoint's against (asterisk-doc's pjsip.json.gz on a
+    # Wazo; the images have none): the names Asterisk 22's XML documentation gives, docker/wazo/config/pjsip.json
+    # (step 11c-1, ADR 0027), compressed as it is read.
+    entrypoint: ["sh", "-c", "mkdir -p /usr/share/doc/asterisk-doc/json && gzip -c /twake/pjsip.json > /usr/share/doc/asterisk-doc/json/pjsip.json.gz && exec wazo-confd -d"]
     volumes:
+      - ./wazo/config/pjsip.json:/twake/pjsip.json:ro
       - ./wazo/config/wazo-confd.yml:/etc/wazo-confd/conf.d/50-twakephone.yml:ro
       - ./wazo/config/xivo-dao.yml:/etc/xivo-dao/conf.d/50-twakephone.yml:ro
       - ./wazo/healthcheck.py:/twake/healthcheck.py:ro
@@ -499,6 +504,14 @@ services:
       WAZO_SIP: ${WAZO_SIP-127.0.0.1:5100}
       WAZO_LISTEN_IP: ${WAZO_LISTEN_IP:-127.0.0.1}
       WAZO_PORT: ${WAZO_PORT:-5095}
+      # The lines of Wazo (step 11c-1, ADR 0027): the extensions that have one register at Wazo's Asterisk through
+      # mid_registrar, from a socket of their own (another address than WAZO_LISTEN_IP), and Wazo's calls to them ring their
+      # windows. On here (this stack's e2e plays it); empty: the extensions register as before. The key is the Gateway's
+      # too (its WAZO_LINE_KEY): the password of a line is a print of its extension. Development and CI only.
+      WAZO_LINES: ${WAZO_LINES-1}
+      WAZO_LINES_LISTEN_IP: ${WAZO_LINES_LISTEN_IP:-127.0.0.2}
+      WAZO_LINES_PORT: ${WAZO_LINES_PORT:-5096}
+      WAZO_LINE_KEY: ${WAZO_LINE_KEY:-twake-wazo-line-dev-only-key-0123456789abcdef}
       # The longest a call to a mailbox lasts; Asterisk bounds it too.
       VOICEMAIL_MAX_CALL_SEC: ${VOICEMAIL_MAX_CALL_SEC:-300}
       # The calls to the mailboxes at once per caller, of those with no number at a mailbox and at all of them, and for

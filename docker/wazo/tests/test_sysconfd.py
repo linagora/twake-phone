@@ -398,7 +398,7 @@ class Sysconfd(unittest.TestCase):
             if 'idle' in said:
                 break
             time.sleep(0.05)
-        self.assertEqual([m for m in said if m in ('ran \'module reload features\'', 'idle')], ["ran 'module reload features'", 'idle'])
+        self.assertEqual([m for m in said if m in ('busy', 'ran \'module reload features\'', 'idle')], ['busy', "ran 'module reload features'", 'idle'])
 
     def test_the_mailboxes_of_a_voicemail_conf_and_of_the_amis_list(self):
         self.assertEqual(sysconfd.mailboxes_of(VOICEMAIL_CONF), {(CONTEXT, '101'), (CONTEXT, '102')})

@@ -133,6 +133,14 @@ export interface TelephonyProvider {
    * reached, for the voicemail server (VoicemailSyncOptions' `reached`), which then never has to keep it itself.
    */
   listVoicemailBoxes?(): Promise<VoicemailBox[]>
+  /**
+   * The extensions that have a line at the voicemail and telephony server (step 11c-1, ADR 0027; VoicemailProvider's
+   * syncLines): replaces the list. The SIP server registers such an extension there too, for the server to ring its
+   * windows. An extension not in it registers here only.
+   */
+  setWazoLines?(extensions: string[]): Promise<void>
+  /** The extensions the SIP server has a line for now: what the last writes left. */
+  listWazoLines?(): Promise<string[]>
   /** Where the calls of the user's extension go (capability `forwarding`). */
   getForwarding?(user: User): Promise<ForwardingRules>
   /** Replaces those rules; targets are extensions the Gateway checked. */
@@ -308,6 +316,14 @@ export interface VoicemailProvider {
    * back. One mailbox the server refuses is left out, the others done.
    */
   syncMailboxes(holders: { extension: string; userId: string; displayName?: string }[], options?: VoicemailSyncOptions): Promise<VoicemailSync>
+  /**
+   * A line for each of these extensions (digits) at the server, for it to ring their windows (step 11c-1, ADR 0027); those
+   * of an extension nobody holds go, once `beforeRemoval` has heard which. Returns the extensions that have their line
+   * now (`ready`: what the SIP server is told, TelephonyProvider's setWazoLines) and how many the server refused.
+   * Without its key (no lines asked), none and none.
+   */
+  readonly linesOn?: boolean
+  syncLines?(extensions: string[], options?: { mayWrite?(): boolean; beforeRemoval?(extensions: string[]): Promise<void> }): Promise<{ ready: string[]; failed: number }>
   /**
    * Whether `owner.userId` has a mailbox (the events of a mailbox go to its holder only); with `owner.mailbox`, whether
    * that mailbox is theirs (read again from the voicemail server).

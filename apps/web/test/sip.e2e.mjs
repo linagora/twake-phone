@@ -118,6 +118,10 @@ const WAZO = {
   username: process.env.WAZO_USER ?? 'twakephone',
   password: process.env.WAZO_PASSWORD ?? 'twake-wazo-dev-only-gateway'
 }
+// Step 11c-1 (ADR 0027): the lines of Wazo, the key of their passwords (OpenSIPS's WAZO_LINE_KEY) and Wazo's AMI.
+const WAZO_LINE_KEY = process.env.WAZO_LINE_KEY ?? 'twake-wazo-line-dev-only-key-0123456789abcdef'
+const WAZO_AMI = process.env.WAZO_AMI ?? '127.0.0.1:5038'
+const WAZO_AMI_PASSWORD = process.env.WAZO_AMI_PASSWORD ?? 'twake-wazo-dev-only-ami'
 const TENANT = 'e2e'
 const BROWSER = process.env.BROWSER ?? 'chromium'
 // Step 11b: LinTO STT and the Matrix homeserver of the stack.
@@ -148,16 +152,73 @@ const expectEqual = (actual, expected, what) => {
   if (!same) throw new Error(`${what}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`)
 }
 const sleep = ms => new Promise(r => setTimeout(r, ms))
+/**
+ * Wazo's AMI (Asterisk's manager, over TCP, the account of wazo-amid of the stack), as a service of Wazo's would use it:
+ * `originate` places a call from Wazo to a channel (as wazo-calld does for a user's call, a queue or an IVR would) and
+ * says how it ended; `channels` lists the channels of the call (the Newchannel events heard since the login).
+ */
+const wazoAmi = () =>
+  new Promise((resolve, reject) => {
+    const [host, port] = WAZO_AMI.split(':')
+    const socket = connect(Number(port), host)
+    const events = []
+    let buffer = ''
+    const waiters = new Set()
+    socket.on('data', chunk => {
+      buffer += chunk
+      for (let at; (at = buffer.indexOf('\r\n\r\n')) >= 0; ) {
+        events.push(buffer.slice(0, at))
+        buffer = buffer.slice(at + 4)
+        for (const w of waiters) w()
+      }
+    })
+    socket.on('error', reject)
+    const send = fields => socket.write(`${Object.entries(fields).map(([k, v]) => `${k}: ${v}`).join('\r\n')}\r\n\r\n`)
+    const waitFor = (test, what, timeout = 30_000) =>
+      new Promise((res, rej) => {
+        const timer = setTimeout(() => (waiters.delete(check), rej(new Error(`AMI: ${what} never came`))), timeout)
+        const check = () => {
+          const found = events.find(test)
+          if (!found) return
+          clearTimeout(timer)
+          waiters.delete(check)
+          res(found)
+        }
+        waiters.add(check)
+        check()
+      })
+    const field = (event, name) => new RegExp(`^${name}: (.*)$`, 'm').exec(event)?.[1]
+    socket.once('connect', async () => {
+      send({ Action: 'Login', Username: 'wazo_amid', Secret: WAZO_AMI_PASSWORD, Events: 'call' })
+      try {
+        await waitFor(e => /Authentication accepted/.test(e), 'the login')
+      } catch (err) {
+        return reject(err)
+      }
+      let n = 0
+      resolve({
+        /** Places a call to `channel` that runs `application`; resolves with how it ended (Success once answered). */
+        originate: ({ channel, application, data = '', callerId }) => {
+          const id = `e2e-${++n}`
+          send({ Action: 'Originate', Channel: channel, Application: application, ...(data ? { Data: data } : {}), CallerID: callerId, Async: 'true', ActionID: id })
+          return waitFor(e => /^Event: OriginateResponse/m.test(e) && field(e, 'ActionID') === id, 'the answer to the call', 60_000).then(e => ({ response: field(e, 'Response'), reason: field(e, 'Reason') }))
+        },
+        channelsOf: prefix => events.filter(e => /^Event: Newchannel/m.test(e) && field(e, 'Channel')?.startsWith(prefix)).map(e => field(e, 'Channel')),
+        hangup: channel => send({ Action: 'Hangup', Channel: channel, Cause: 16 }),
+        close: () => socket.end()
+      })
+    })
+  })
 const RUN_START = new Date().toISOString()
 /** The log of wazo-sysconfd's stand-in since `since`. */
 const sysconfdLog = since =>
   execFileSync('docker', ['compose', '-f', fileURLToPath(new URL('../../../docker/docker-compose.sip.yml', import.meta.url)), 'logs', '--no-log-prefix', ...(since ? ['--since', since] : []), 'wazo-sysconfd'], { encoding: 'utf8', timeout: 30_000 })
 /**
- * Waits until the queue of the stand-in is empty: its log, access lines apart, ends with `idle` (it says it each time its queue empties) and
- * has not grown for a second. At most 60 s (a reload of PJSIP lasts 500 ms here), then an error.
+ * Waits until the queue of the stand-in is empty: its log, access lines apart, ends with `idle` (it says it each time its queue empties, and
+ * `busy` when a request starts to run) and has not grown for a second. At most 120 s (a reload of PJSIP lasts 10 to 25 s on a CI runner), then an error.
  */
 const sysconfdSettled = async () => {
-  const deadline = Date.now() + 60_000
+  const deadline = Date.now() + 120_000
   for (let last = null; Date.now() < deadline; ) {
     await sleep(1_000)
     const log = sysconfdLog().trimEnd()
@@ -166,7 +227,7 @@ const sysconfdSettled = async () => {
     if (log === last && said.at(-1)?.endsWith('sysconfd: idle')) return
     last = log
   }
-  throw new Error('the queue of wazo-sysconfd is not empty after 60 s')
+  throw new Error('the queue of wazo-sysconfd is not empty after 120 s')
 }
 /** Polls `fn` until it returns something truthy; the message says what never came. */
 const until = async (what, fn, { timeout = 15_000, every = 250 } = {}) => {
@@ -390,6 +451,8 @@ const wazo = new WazoVoicemail({
   ...Object.fromEntries(WAZO_APIS.map(api => [api, wazoVia[api].relayed.toString()])),
   // The key of the holders' prints, as the Gateway derives it from SECRETS_KEY (voicemail.ts).
   holderSecret: holderSecretOf(key),
+  // Step 11c-1: the lines of Wazo, whose password is a print of the extension under this key (OpenSIPS has it too).
+  lineKey: WAZO_LINE_KEY,
   reconnectMs: [1_000, 2_000, 5_000],
   // What it says while out of reach is what the steps expect; once reachable, everything.
   logger: { info: () => {}, warn: m => wazoOpen && console.log(`[wazo] ${m}`), error: m => console.log(`[wazo] ${m}`) }
@@ -472,6 +535,9 @@ await db.query("DELETE FROM call_groups WHERE number IN ('200', '105', '106', '2
 // Nor the mailboxes an interrupted run handed to OpenSIPS (step 11a): none until Wazo is reached.
 await until('the voicemail_boxes table', async () => (await db.query("SELECT to_regclass('voicemail_boxes') AS t")).rows[0].t)
 await db.query('DELETE FROM voicemail_boxes WHERE tenant_id = $1', [TENANT])
+// Nor the lines of Wazo an interrupted run told OpenSIPS of (step 11c-1): none until Wazo is reached.
+await until('the wazo_lines table', async () => (await db.query("SELECT to_regclass('wazo_lines') AS t")).rows[0].t)
+await db.query('DELETE FROM wazo_lines WHERE tenant_id = $1', [TENANT])
 // Nor the account an older Gateway would have left (106), which this run writes by hand.
 await db.query("DELETE FROM subscriber WHERE username = '106'")
 // Nor anyone left to wake by an interrupted run (step 5): the Gateway writes the rows of this run's subscriptions.
@@ -3300,6 +3366,8 @@ try {
   // ---- Step 11a (ADR 0022): the mailboxes, on Wazo behind OpenSIPS ----------------------------------------------
   /** The tenant's rows of voicemail_boxes, as "extension mailbox". */
   const mailboxRows = async () => (await db.query('SELECT extension, mailbox FROM voicemail_boxes WHERE tenant_id = $1 ORDER BY extension', [TENANT])).rows
+  /** The extensions of the tenant that have a line at Wazo, as OpenSIPS has them (wazo_lines, step 11c-1). */
+  const lineRows = async () => (await db.query('SELECT extension FROM wazo_lines WHERE tenant_id = $1 ORDER BY extension', [TENANT])).rows.map(r => r.extension)
   /** The number of a person's mailbox in Wazo: theirs, whatever extension they hold. */
   const numberOf = userId => mailboxNumber(holderKey(holderSecretOf(key), userId))
   /** The calls of a caller to a mailbox in the hour, as OpenSIPS counts them (0: none, or the key gone). */
@@ -3410,6 +3478,143 @@ try {
     expectEqual(caps.voicemail, true, 'voicemail capability for Jean')
     for (const m of (await jeanMailbox('GET', '/voicemails')).json().items) expectEqual((await jeanMailbox('DELETE', `/voicemails/${m.id}`)).statusCode, 204, 'DELETE of a message left by an earlier run')
   })
+  // ---- Step 11c-1 (ADR 0027): the lines of Wazo, mid_registrar, Wazo rings the windows -----------------------------
+  const lineSteps = async () => {
+    const compose = (...args) => execFileSync('docker', ['compose', '-f', COMPOSE_FILE, ...args], { encoding: 'utf8', timeout: 60_000 })
+    /** What Asterisk has of the contacts of a line: "103/sip:103@127.0.0.2:5096" and the like. */
+    const contactsOf = ext => asteriskCli('pjsip show contacts').split('\n').map(l => /^\s*Contact:\s+(\S+)/.exec(l)?.[1]).filter(c => c?.startsWith(`${ext}/`))
+    /** The windows OpenSIPS keeps for `ext` (MI ul_dump), by their Contact. */
+    const windowsOf = async ext => {
+      const dump = (await mi('ul_dump', {})).result
+      const aor = (dump?.Domains ?? []).flatMap(d => d.AORs ?? []).find(a => a.AOR === ext)
+      return (aor?.Contacts ?? []).map(c => c.Contact)
+    }
+    await step('step 11c-1: each holder of an extension has a line at Wazo (an endpoint named after the extension, nothing of the person) and OpenSIPS was told once Wazo had it (wazo_lines)', async () => {
+      const holders = (await store.listMappings(TENANT)).map(m => m.extension).sort()
+      const rows = await until('a line for each holder in wazo_lines', async () => {
+        const got = await lineRows()
+        return got.length === holders.length && holders.every(h => got.includes(h)) ? got : null
+      }, { timeout: 120_000 })
+      expectEqual(rows, holders, 'the extensions with a line')
+      await sysconfdSettled()
+      // Asterisk has them once its reload of PJSIP is through (read again while it is not).
+      // The reload is asynchronous (the AMI answers before it is done) and Asterisk loads the endpoints before the credentials: an endpoint
+      // is no proof that its credentials are there. A REGISTER that comes in between is not answered in time (408, the lines left out 30 s) or
+      // fails for the want of the auth object of the endpoint. So each holder's endpoint AND auth are waited for.
+      await until('an endpoint and its credentials at Asterisk for each holder', async () => {
+        const endpoints = asteriskCli('pjsip show endpoints')
+        const auths = asteriskCli('pjsip show auths')
+        return holders.every(ext => new RegExp(`^\\s*Endpoint:\\s+${ext}\\b`, 'm').test(endpoints) && new RegExp(`^\\s*Auth:\\s+${ext}\\b`, 'm').test(auths)) ? true : null
+      }, { timeout: 60_000 }).catch(err => {
+        // For whoever reads the failure: what Asterisk loaded of the lines, and what wazo-confgend gave it.
+        const exec = cmd => { try { return execFileSync('docker', ['compose', '-f', COMPOSE_FILE, 'exec', '-T', 'wazo-asterisk', 'bash', '-c', cmd], { encoding: 'utf8', timeout: 30_000 }) } catch (e) { return `(${e.message})` } }
+        console.log(`[11c-1] auths: ${asteriskCli('pjsip show auths')}\n[11c-1] endpoint 103: ${asteriskCli('pjsip show endpoint 103').slice(0, 1500)}\n[11c-1] twake-pjsip-lines: ${exec('/usr/bin/twake-pjsip-lines | grep -A14 "^\\[103"')}\n[11c-1] confgen: ${exec('wazo-confgen asterisk/pjsip.conf | grep -B2 -A14 "103"').slice(0, 3000)}`)
+        const log = execFileSync('docker', ['compose', '-f', COMPOSE_FILE, 'logs', '--no-color', '--timestamps', 'wazo-sysconfd', 'wazo-asterisk'], { encoding: 'utf8', timeout: 30_000, maxBuffer: 64 << 20 }).split('\n').filter(l => /pjsip|ran '|failed|Reload|reload|auth/i.test(l)).slice(-30).map(l => l.slice(0, 260))
+        console.log(`[11c-1] sysconfd and asterisk, with their times: ${log.join('\n')}\n[11c-1] now: ${new Date().toISOString()}`)
+        throw err
+      })
+      // The password of a line is a print of its extension: the registration of the next step proves it (Asterisk takes it only with that password).
+      // The same stack answers an extension OpenSIPS gave no line: registered here, never at Wazo.
+      expectEqual(contactsOf('103'), [], 'contacts of 103 at Wazo before its window registers again')
+    })
+    let bob2
+    await step('step 11c-1: a second window of Bob registers: OpenSIPS keeps both windows and registers 103 once at Wazo, the contact being its lines socket; a refresh changes nothing there', async () => {
+      const rows103 = await lineRows()
+      bob2 = await open('bdurand', 'Bob Durand')
+      await phoneState(bob2.page).getByText('En ligne').waitFor({ timeout: 20_000 })
+      const contacts = await until('the contact of 103 at Wazo', async () => (contactsOf('103').length ? contactsOf('103') : null), { timeout: 20_000 }).catch(err => {
+        // What OpenSIPS said of the registration, and what Asterisk has, for whoever reads the failure.
+        const said = execFileSync('docker', ['compose', '-f', COMPOSE_FILE, 'logs', '--no-color', '--no-log-prefix', 'opensips'], { encoding: 'utf8', timeout: 30_000, maxBuffer: 64 << 20 }).split('\n').filter(l => /wazo|mid_reg/i.test(l) && !/'from' key not found|failed to unregister contact/.test(l)).slice(-40)
+        console.log(`[11c-1] OpenSIPS: ${said.join('\n')}\n[11c-1] Asterisk aors: ${asteriskCli('pjsip show aors')}\n[11c-1] wazo_lines: ${JSON.stringify(rows103)}`)
+        throw err
+      })
+      expectEqual(contacts.length, 1, 'contacts of 103 at Wazo')
+      if (!/^103\/sip:103@127\.0\.0\.2:5096/.test(contacts[0])) throw new Error(`the contact of 103 at Wazo: ${contacts[0]}`)
+      expectEqual((await windowsOf('103')).length, 2, 'the windows of 103 in OpenSIPS')
+    })
+    await step('step 11c-1, the demo: Wazo calls 103 (a call it places, as an IVR or a queue would): both windows of Bob ring, the second answers; they hear each other through rtpengine; he hangs up and Wazo ends its side; the CDR says it came from Wazo', async () => {
+      const after = await lastId('acc')
+      const wazoSide = await wazoAmi()
+      try {
+        const ended = wazoSide.originate({ channel: 'PJSIP/103', application: 'Echo', callerId: '"Standard" <0100>' })
+        for (const [i, who] of [bob, bob2].entries()) {
+          await who.page.getByTestId('incoming-call').getByText(/Standard \(01 00\)/).waitFor({ timeout: 20_000 }).catch(async err => {
+            // For whoever reads the failure: what Wazo's Asterisk, OpenSIPS and the AMI say of the call.
+            const said = execFileSync('docker', ['compose', '-f', COMPOSE_FILE, 'logs', '--no-color', '--no-log-prefix', '--tail', '400', 'opensips'], { encoding: 'utf8', timeout: 30_000, maxBuffer: 64 << 20 }).split('\n').filter(l => /wazo|0100|103|INVITE|call /i.test(l) && !/from' key|failed to unregister/.test(l)).slice(-40)
+            console.log(`[11c-1] window ${i} of Bob did not ring. OpenSIPS: ${said.join('\n')}\n[11c-1] contacts: ${asteriskCli('pjsip show contacts')}\n[11c-1] channels: ${asteriskCli('core show channels concise')}\n[11c-1] windows: ${JSON.stringify(await windowsOf('103'))}\n[11c-1] the page: ${(await who.page.locator('body').innerText().catch(() => '?')).slice(0, 900)}`)
+            throw err
+          })
+          await ringerPlaying(who.page, true)
+        }
+        await bob2.page.getByTestId('incoming-call').getByRole('button', { name: 'Répondre' }).click()
+        expectEqual((await ended).response, 'Success', 'the answer of Wazo to its call')
+        await bob.page.getByText(/pris sur un autre poste/).waitFor({ timeout: 20_000 })
+        for (const who of [bob, bob2]) await ringerPlaying(who.page, false)
+        // Asterisk's Echo gives back what the window sends: RTP flows both ways.
+        await rtpBothWays(bob2)
+        await bob2.page.getByRole('button', { name: 'Raccrocher' }).click()
+        await until('the channel of Wazo ended', async () => (asteriskCli('core show channels concise').includes('PJSIP/103-') ? null : true), { timeout: 20_000 })
+        expectEqual(await cdrsViaSince(after), ['0100>103 200 wazo'], 'the CDR of the call Wazo placed')
+        expectEqual((await calls(bob.page)).length, 0, 'calls left in Bob first window')
+      } finally {
+        wazoSide.close()
+      }
+    })
+    await step('step 11c-1: Wazo calls 103 and Bob declines: Wazo is told it was refused (no mailbox, no forward: Wazo decided); a call from Wazo to a number that has no window leaves Wazo the failure', async () => {
+      const wazoSide = await wazoAmi()
+      try {
+        const ended = wazoSide.originate({ channel: 'PJSIP/103', application: 'Wait', data: '5', callerId: '"Standard" <0100>' })
+        for (const who of [bob, bob2]) await who.page.getByTestId('incoming-call').getByText(/Standard \(01 00\)/).waitFor({ timeout: 20_000 })
+        await bob.page.getByTestId('incoming-call').getByRole('button', { name: 'Refuser' }).click()
+        expectEqual((await ended).response, 'Failure', 'the answer of Wazo to the call Bob declined')
+      } finally {
+        wazoSide.close()
+      }
+    })
+    await step('step 11c-1: nothing else of a call Wazo placed: a transfer of it (REFER) is refused as one with the operator, and its requests come from the lines socket only (a window cannot be reached through it as any other)', async () => {
+      const cfg = readFileSync(new URL('../../../docker/opensips/opensips.cfg.tpl', import.meta.url), 'utf8')
+      if (!cfg.includes('$dlg_val(wline) == "1"')) throw new Error('the configuration does not know the calls Wazo placed')
+      // A stranger on the lines socket address from another source (127.0.0.1 is Wazo's own, whatever its port): refused (403), as for the other sockets.
+      const udp = createSocket('udp4')
+      try {
+        await new Promise(resolve => udp.bind(0, '127.0.0.3', resolve))
+        const reply = new Promise(resolve => udp.once('message', buf => resolve(buf.toString())))
+        const options = ['OPTIONS sip:127.0.0.2:5096 SIP/2.0', `Via: SIP/2.0/UDP 127.0.0.3:${udp.address().port};branch=z9hG4bKe2e${randomBytes(4).toString('hex')}`, 'Max-Forwards: 70', 'From: <sip:e2e@127.0.0.1>;tag=a', 'To: <sip:127.0.0.2:5096>', `Call-ID: ${randomBytes(6).toString('hex')}`, 'CSeq: 1 OPTIONS', 'Content-Length: 0', '', ''].join('\r\n')
+        udp.send(options, 5096, '127.0.0.2')
+        expectEqual((await reply).split('\r\n')[0], 'SIP/2.0 403 Forbidden', 'the answer of the lines socket to an address that is not Wazo\'s')
+      } finally {
+        udp.close()
+      }
+    })
+    await step('step 11c-1, no regression: Wazo silent (its Asterisk paused), a window registers anyway and the people call each other as before; the registration Wazo does not answer costs that window one refusal (503), the lines are left out 30 s, then registrations are kept here only', async () => {
+      compose('pause', 'wazo-asterisk')
+      let jean3
+      try {
+        // Jean's first window registered before his line existed; this one goes to Wazo first, which says nothing.
+        jean3 = await open('jdupont', 'Jean Dupont')
+        await phoneState(jean3.page).getByText('En ligne').waitFor({ timeout: 90_000 })
+        const muted = Number(await shvOf('wazo_lines_mute_until'))
+        if (!(muted > Date.now() / 1000 - 5)) throw new Error(`the lines were not left out: wazo_lines_mute_until ${muted}`)
+        expectEqual((await windowsOf('102')).length, 2, 'the windows of 102 in OpenSIPS')
+        await dial(bob.page, '102')
+        for (const who of [jean, jean3]) await who.page.getByTestId('incoming-call').getByText('Appel entrant de Bob Durand (103)').waitFor({ timeout: 20_000 })
+        await jean3.page.getByTestId('incoming-call').getByRole('button', { name: 'Répondre' }).click()
+        await bob.page.getByText('En communication avec Jean Dupont (102)').waitFor()
+        await bothHearEachOther(bob, jean3)
+        await bob.page.getByRole('button', { name: 'Raccrocher' }).click()
+        await jean3.page.getByText('Appel avec Bob Durand (103) terminé.').waitFor()
+      } finally {
+        compose('unpause', 'wazo-asterisk')
+        if (jean3) await signOut(jean3)
+      }
+      await sysconfdSettled()
+    })
+    await step('step 11c-1: Bob\'s second window signs out: 103 is reached in the first one only', async () => {
+      await signOut(bob2)
+      expectEqual((await windowsOf('103')).length, 1, 'the windows of 103 in OpenSIPS')
+    })
+  }
+  await lineSteps()
   await step('step 11a: the dialplan Asterisk runs for OpenSIPS is docker/wazo/asterisk/extensions.conf, priority by priority (dialplan show), its refusal of a mailbox Wazo does not have included, the greeting a person recorded read at their mailbox\'s number; its trace goes to a file of its own for the steps that follow', async () => {
     const expected = {}
     let exten
@@ -4154,14 +4359,18 @@ try {
       await leave('+33199000108', '+33639980042')
       await theirs('cpetit', '108', '+33639980042')
       await spoolIs({ [alices]: 1, [claires]: 1, 108: 1, 109: 1 }, 'the messages in the spool')
-      // Alice moves to 109: the same mailbox, at the same number, now reached at 109; 101 has none. Nothing of it is
-      // written in Wazo: wazo-sysconfd reloads nothing of Asterisk for it.
-      const moving = new Date().toISOString()
+      // Alice moves to 109: the same mailbox, at the same number, now reached at 109; 101 has none. Nothing of the
+      // mailbox is written in Wazo. The lines (step 11c-1) follow the extensions: 101 loses its line, 109 gets one.
       aliceEntry.ipPhone = '109'
       await directorySync.run()
       await rowsAre({ 109: `${alices}@${context}`, 101: undefined }, "Alice's mailbox at 109, none at 101")
       await theirs('amartin', '109', '+33639980041')
-      // Alice and Claire swap 109 and 108: each keeps hers.
+      // The lines caught up (the extensions held: 108 is Claire's, 109 Alice's), and Asterisk's reloads for them over.
+      await until('the lines of the extensions held after the move', async () => ((await lineRows()).includes('109') && !(await lineRows()).includes('101') ? true : null), { timeout: 60_000 })
+      await sysconfdSettled()
+      // Alice and Claire swap 109 and 108: each keeps hers, and the extensions held are the same ones: nothing is
+      // written in Wazo for the mailboxes nor the lines, wazo-sysconfd reloads nothing of Asterisk for it.
+      const moving = new Date().toISOString()
       aliceEntry.ipPhone = '108'
       claire.ipPhone = '109'
       await directorySync.run()
@@ -4169,7 +4378,7 @@ try {
       await theirs('amartin', '108', '+33639980041')
       await theirs('cpetit', '109', '+33639980042')
       await sysconfdSettled()
-      expectEqual(reloadsSince(moving), [], 'what wazo-sysconfd reloaded of Asterisk for the moves and the swap')
+      expectEqual(reloadsSince(moving), [], 'what wazo-sysconfd reloaded of Asterisk for the swap')
       expectEqual([(await wazoOf('amartin')).name, (await wazoOf('cpetit')).name], ['TwakePhone', 'TwakePhone'], 'the names of the mailboxes once they swapped')
       // Nothing moved in the spool: each one's folder where it was, those under 108 and 109 untouched.
       await spoolIs({ [alices]: 1, [claires]: 1, 108: 1, 109: 1 }, 'the messages in the spool once they swapped')
@@ -4226,6 +4435,11 @@ try {
         const rows = (await mailboxRows()).map(r => r.extension)
         return newcomers.every(n => rows.includes(n.ipPhone)) ? rows : null
       }, { timeout: 60_000 })
+      // Their lines too (step 11c-1: an endpoint, a line and its association each, 36 more writes that ask for PJSIP).
+      await until('a line for each of the twelve', async () => {
+        const rows = await lineRows()
+        return newcomers.every(n => rows.includes(n.ipPhone)) ? rows : null
+      }, { timeout: 120_000 })
       // The queue of wazo-sysconfd drained, whatever came last.
       await sysconfdSettled()
       const ran = reloadsSince(since)
@@ -4234,7 +4448,8 @@ try {
       // A real Wazo reloads PJSIP slowly (wazo-confgen, then asterisk -rx: 500 ms here, the other commands are fast), so
       // the commands that wait while it runs are merged: twelve arrivals, 24 writes that ask for PJSIP, cost far fewer
       // reloads. Run one by one, as the synchronous stand-in did before, they cost 24 (and 12 voicemail reloads).
-      if (count('module reload res_pjsip.so') > 6) throw new Error(`reloads of PJSIP for twelve mailboxes made at once: ${count('module reload res_pjsip.so')}, 6 at most (${JSON.stringify(ran)})`)
+      // Their lines are written one at a time after the mailboxes (60 writes that ask for PJSIP in all): 12 reloads at most.
+      if (count('module reload res_pjsip.so') > 12) throw new Error(`reloads of PJSIP for twelve mailboxes and lines made at once: ${count('module reload res_pjsip.so')}, 12 at most (${JSON.stringify(ran)})`)
       if (count('voicemail reload') > 6) throw new Error(`reloads of the voicemails for twelve mailboxes made at once: ${count('voicemail reload')}, 6 at most`)
       // No reload failed meanwhile (wazo-sysconfd answers wazo-confd at once, as the real one: a failure is in its log).
       expectEqual(sysconfdLog(since).split('\n').filter(l => / failed: /.test(l)), [], 'the commands wazo-sysconfd failed')

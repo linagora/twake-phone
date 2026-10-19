@@ -263,6 +263,10 @@ const sipServer = (withMailboxes = true, access?: boolean | 'error', db?: Voicem
   const withdrawals = new Map<string, number>()
   /** Where each extension's calls go now (voicemail_boxes), in memory. */
   let rows: VoicemailBox[] = []
+  /** The extensions with a line at Wazo as the SIP server was told (wazo_lines), and each telling, in memory. */
+  let lines: string[] = []
+  const linesTold: string[][] = []
+  const linesHook: { onTold?: (extensions: string[]) => void } = {}
   const provider = {
     ...(access !== undefined
       ? {
@@ -316,7 +320,13 @@ const sipServer = (withMailboxes = true, access?: boolean | 'error', db?: Voicem
             order.push(`withdraw ${extensions.join(',')}`)
           },
           voicemailMark: async () => (db ? db.mark() : mark),
-          listVoicemailBoxes: async () => (db ? db.list() : rows)
+          listVoicemailBoxes: async () => (db ? db.list() : rows),
+          setWazoLines: async (extensions: string[]) => {
+            lines = [...extensions].sort()
+            linesTold.push(lines)
+            linesHook.onTold?.(lines)
+          },
+          listWazoLines: async () => lines
         }
       : {}),
     subscribe: async function* () {},
@@ -325,7 +335,7 @@ const sipServer = (withMailboxes = true, access?: boolean | 'error', db?: Voicem
   const factory: ProviderFactory<unknown> = { type: 'sip', create: () => provider as unknown as TelephonyProvider }
   /** A withdrawal by another Gateway (the same SIP server). */
   const withdraw = (extensions: string[]) => (provider as unknown as { withdrawVoicemailBoxes(e: string[]): Promise<void> }).withdrawVoicemailBoxes(extensions)
-  return { factory, given, withdrawn, asked, order, hooks, writes, errors, withdraw }
+  return { factory, given, withdrawn, asked, order, hooks, writes, errors, withdraw, lines: () => lines, linesTold, linesHook }
 }
 
 const setup = async (opts: { withMailboxes?: boolean; access?: boolean | 'error'; voicemail?: boolean | 'other-tenant'; directorySync?: DirectorySync; store?: MemoryStore; slow?: boolean; retentionDays?: number; purgeMs?: number; syncMs?: number; hub?: boolean; accessCacheMs?: number; changeMs?: number; alertMs?: number; mapped?: boolean; db?: VoicemailBoxes; erasureLimiter?: RateLimiter; voicemailProvider?: VoicemailProvider; retryMs?: number[] } = {}) => {
@@ -386,7 +396,7 @@ const person = (id: string, extension: string): Person => ({ id, displayName: `P
  * The Gateway's own path against provider-wazo and a Wazo in memory: the directory lists `people` (`list` changes it,
  * then synchronises it), each of them given a mailbox. `db`: `voicemail_boxes` on PostgreSQL.
  */
-const throughTheGateway = async (people: Person[], db?: VoicemailBoxes, absenceMs?: number) => {
+const throughTheGateway = async (people: Person[], db?: VoicemailBoxes, absenceMs?: number, lineKey?: string) => {
   const secret = Buffer.alloc(32, 9)
   const wazo = fakeWazo(userId => mailboxNumber(holderKey(secret, userId)))
   // wazo-websocketd as it spoke on the Docker stack: init, then start; `created` sends the news of a message.
@@ -406,7 +416,7 @@ const throughTheGateway = async (people: Person[], db?: VoicemailBoxes, absenceM
     queueMicrotask(() => ws.onmessage?.({ data: JSON.stringify({ op: 'init', code: 0, data: { version: 2 } }) }))
     return ws
   }
-  const vm = new WazoVoicemail({ authUrl: 'http://wazo.test:9497/0.1', confdUrl: 'http://wazo.test:9486/1.1', calldUrl: 'http://wazo.test:9500/1.0', websocketdUrl: 'ws://wazo.test:9502/', username: 'twakephone', password: 'not-a-real-password', holderSecret: secret, fetch: wazo.fetch, webSocket: socket, logger: { info() {}, warn() {}, error() {} } })
+  const vm = new WazoVoicemail({ authUrl: 'http://wazo.test:9497/0.1', confdUrl: 'http://wazo.test:9486/1.1', calldUrl: 'http://wazo.test:9500/1.0', websocketdUrl: 'ws://wazo.test:9502/', username: 'twakephone', password: 'not-a-real-password', holderSecret: secret, ...(lineKey ? { lineKey } : {}), fetch: wazo.fetch, webSocket: socket, logger: { info() {}, warn() {}, error() {} } })
   const store = new MemoryStore()
   let listed = people
   const directory = { listAll: async () => listed } as unknown as ContactDirectory
@@ -1933,5 +1943,43 @@ describe('wazoFromEnv', () => {
     expect(() => wazoFromEnv({ ...urls, WAZO_CALLD_URL: 'not a url', ...creds }, key)).toThrow(/calldUrl is not a URL/)
     expect(() => wazoFromEnv({ ...urls, WAZO_WEBSOCKETD_URL: 'http://127.0.0.1:9502/', ...creds }, key)).toThrow(/ws: or wss:/)
     expect(() => wazoFromEnv({ ...urls, WAZO_CONFD_URL: 'http://user:pass@127.0.0.1:9486/1.1', ...creds }, key)).toThrow(/credentials/)
+  })
+})
+
+describe('the lines of Wazo (step 11c-1, ADR 0027)', () => {
+  const lineKey = 'twake-wazo-line-test-key-0123456789abcdef'
+  const lineNames = (wazo: { state: { endpoints: { name: string; line: unknown }[] } }) => wazo.state.endpoints.filter(e => e.line).map(e => e.name).sort()
+
+  it('makes a line at Wazo for each extension someone holds and tells the SIP server once it is there; a person gone loses it there only after the SIP server stopped registering it', async () => {
+    const { wazo, sip, list } = await throughTheGateway([person('p1', '201'), person('p2', '202')], undefined, undefined, lineKey)
+    await until('the lines told', () => sip.lines().join() === '201,202')
+    expect(lineNames(wazo)).toEqual(['201', '202'])
+    // Never told before Wazo had them.
+    expect(sip.linesTold.at(0)).toEqual(['201', '202'])
+    // p2 goes: the SIP server is told first (without 202), while Wazo still has its line; then Wazo drops it.
+    const seen: [string[], string[]][] = []
+    sip.linesHook.onTold = told => void seen.push([told, lineNames(wazo)])
+    await list([person('p1', '201')])
+    await until('the line withdrawn', () => lineNames(wazo).join() === '201' && sip.lines().join() === '201', 5_000)
+    expect(seen[0]).toEqual([['201'], ['201', '202']])
+  })
+
+  it('makes no line without its key: nothing at Wazo, nothing told to the SIP server', async () => {
+    const { wazo, sip, reached } = await throughTheGateway([person('p1', '201')])
+    await until('the mailboxes', () => reached().length === 1)
+    await sleep(100)
+    expect(wazo.state.endpoints).toEqual([])
+    expect(sip.linesTold).toEqual([])
+  })
+
+  it('asks for WAZO_LINES=1 and a key of its own, the same as OpenSIPS has', () => {
+    const urls = { WAZO_AUTH_URL: 'http://127.0.0.1:9497/0.1', WAZO_CONFD_URL: 'http://127.0.0.1:9486/1.1', WAZO_CALLD_URL: 'http://127.0.0.1:9500/1.0', WAZO_WEBSOCKETD_URL: 'ws://127.0.0.1:9502/', WAZO_USER: 'twakephone', WAZO_PASSWORD: 'not-a-real-password' }
+    const secret = Buffer.alloc(32, 1)
+    expect(wazoFromEnv({ ...urls }, secret)?.linesOn).toBe(false)
+    expect(wazoFromEnv({ ...urls, WAZO_LINES: '0', WAZO_LINE_KEY: 'short' }, secret)?.linesOn).toBe(false)
+    expect(wazoFromEnv({ ...urls, WAZO_LINES: '1', WAZO_LINE_KEY: lineKey }, secret)?.linesOn).toBe(true)
+    expect(() => wazoFromEnv({ ...urls, WAZO_LINES: '1' }, secret)).toThrow(/WAZO_LINE_KEY/)
+    expect(() => wazoFromEnv({ ...urls, WAZO_LINES: '1', WAZO_LINE_KEY: 'short' }, secret)).toThrow(/WAZO_LINE_KEY/)
+    expect(() => wazoFromEnv({ ...urls, WAZO_LINES: 'yes', WAZO_LINE_KEY: lineKey }, secret)).toThrow(/WAZO_LINES must be/)
   })
 })

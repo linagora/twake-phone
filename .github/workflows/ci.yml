@@ -80,7 +80,7 @@ jobs:
   sip-e2e:
     name: SIP (OpenSIPS, rtpengine, ${{ matrix.browser }})
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:

@@ -79,8 +79,14 @@ export interface WazoConfig {
   maxRecordingBytes?: number
   /** The clock (the tests give theirs). */
   now?: () => number
-  /** The label of the context of the mailboxes. Default: TwakePhone. */
+  /** The label of the context of the mailboxes and of the lines. Default: TwakePhone. */
   contextLabel?: string
+  /**
+   * The key of the passwords of the lines (step 11c-1, ADR 0027): the password of the line of an extension is the first
+   * 32 hexadecimal digits of the HMAC-SHA256 of the extension under it, which the SIP server computes the same (its
+   * WAZO_LINE_KEY). Without it, no line is made (`syncLines` does nothing).
+   */
+  lineKey?: string
   /** How long a token of wazo-auth lasts, in seconds; renewed at four fifths of it. Default: 3600. */
   tokenTtlSec?: number
   /** How long a request to Wazo may take, in milliseconds. Default: 10 s. */
@@ -97,6 +103,26 @@ export interface WazoConfig {
   logger?: WazoLogger
   /** The provider's id (the Gateway names the tenant with it). Default: wazo. */
   id?: string
+}
+
+/** The extensions that have a line: digits, as the SIP server's REGISTER names them (`wazo_lines`). */
+const LINE_EXTENSION = /^[0-9]{1,40}$/
+
+/** A SIP endpoint of wazo-confd, with the line it belongs to. */
+interface WazoLineEndpoint {
+  uuid: string
+  name?: string
+  label?: string
+  line?: { id?: number } | null
+}
+
+/** A line of wazo-confd, with what it is associated with. */
+interface WazoLineRow {
+  id: number
+  context?: string
+  endpoint_sip?: unknown
+  users?: unknown[]
+  extensions?: unknown[]
 }
 
 /** Wazo's answer to a request it did not do (its status, and its own words, cut short). */
@@ -855,6 +881,99 @@ export class WazoVoicemail implements VoicemailProvider {
    * Whether the owner has a mailbox. With `owner.mailbox` (an event's), whether that very mailbox is theirs, as Wazo has
    * it now: at their number, its user standing for them.
    */
+  // ---- wazo-confd: the lines (step 11c-1, ADR 0027) ---------------------------------------------------------------
+
+  /** Whether lines are made (a `lineKey` was given). */
+  get linesOn() {
+    return !!this.config.lineKey
+  }
+
+  /** The password of the line of `extension`: what the SIP server answers Wazo's challenge with. */
+  linePassword(extension: string) {
+    if (!this.config.lineKey) throw new Error('Wazo provider: lineKey is not set')
+    return createHmac('sha256', this.config.lineKey).update(extension).digest('hex').slice(0, 32)
+  }
+
+  /**
+   * One line at Wazo for each of these extensions (digits): an endpoint named after it, in the context of the
+   * mailboxes, with its password (linePassword) and one contact at most. Nothing of the person is in Wazo. Those of an
+   * extension nobody holds any more go, once `beforeRemoval` has heard which (the SIP server stops registering them
+   * there first). Returns the extensions that have their line now (`ready`), and how many Wazo refused (said in the log,
+   * done again at the next round). Never more than a line at a time: each is a reload of Asterisk's PJSIP, which
+   * wazo-sysconfd melts. `mayWrite` is asked before each request.
+   */
+  async syncLines(extensions: string[], options: { mayWrite?(): boolean; beforeRemoval?(extensions: string[]): Promise<void> } = {}): Promise<{ ready: string[]; failed: number }> {
+    if (!this.config.lineKey) return { ready: [], failed: 0 }
+    const guard = () => {
+      if (options.mayWrite && !options.mayWrite()) throw new WazoStopped()
+    }
+    const label = this.config.contextLabel ?? 'TwakePhone'
+    const wanted = [...new Set(extensions.filter(e => LINE_EXTENSION.test(e)))].sort()
+    const context = await this.contextOf(guard)
+    const have = new Map<string, WazoLineEndpoint>()
+    for (const e of await this.list<WazoLineEndpoint>('/endpoints/sip')) if (e.label === label && LINE_EXTENSION.test(e.name ?? '')) have.set(e.name!, e)
+    // A line whose creation was answered by an error after it was made (wazo-sysconfd failing after wazo-confd committed)
+    // has no endpoint: used again, never made twice (the context holds nothing but ours).
+    const orphans = (await this.list<WazoLineRow>('/lines')).filter(l => l.context === context.name && !l.endpoint_sip && !(l.users?.length) && !(l.extensions?.length))
+    const ready: string[] = []
+    let failed = 0
+    const refused = (what: string, extension: string, err: unknown) => {
+      if (err instanceof WazoStopped || (err instanceof WazoError && err.status >= 500)) throw err
+      failed++
+      this.log.warn(`Wazo: the line of ${extension} not ${what}: ${err instanceof Error ? err.message : String(err)}`)
+    }
+    const confd = this.config.confdUrl
+    const gone = [...have.keys()].filter(e => !wanted.includes(e))
+    if (gone.length) await options.beforeRemoval?.(gone)
+    for (const extension of gone) {
+      const endpoint = have.get(extension)!
+      try {
+        if (endpoint.line?.id !== undefined) {
+          await this.json(`${confd}/lines/${endpoint.line.id}/endpoints/sip/${endpoint.uuid}`, 'DELETE', undefined, guard)
+          await this.json(`${confd}/lines/${endpoint.line.id}`, 'DELETE', undefined, guard)
+        }
+        await this.json(`${confd}/endpoints/sip/${endpoint.uuid}`, 'DELETE', undefined, guard)
+      } catch (err) {
+        refused('removed', extension, err)
+      }
+    }
+    for (const extension of wanted) {
+      try {
+        let endpoint = have.get(extension)
+        if (!endpoint) {
+          endpoint = await this.json<WazoLineEndpoint>(
+            `${confd}/endpoints/sip`,
+            'POST',
+            {
+              name: extension,
+              label,
+              auth_section_options: [
+                ['username', extension],
+                ['password', this.linePassword(extension)]
+              ],
+              aor_section_options: [
+                ['max_contacts', '1'],
+                ['remove_existing', 'yes']
+              ]
+            },
+            guard
+          )
+        }
+        if (endpoint.line?.id === undefined) {
+          const spare = orphans.shift()
+          const line = spare ?? (await this.json<{ id: number }>(`${confd}/lines`, 'POST', { context: context.name }, guard))
+          await this.json(`${confd}/lines/${line.id}/endpoints/sip/${endpoint.uuid}`, 'PUT', undefined, guard)
+        }
+        ready.push(extension)
+      } catch (err) {
+        refused('made', extension, err)
+      }
+    }
+    // The lines left over by an error, nothing at Wazo any more: removed.
+    for (const line of orphans) await this.json(`${confd}/lines/${line.id}`, 'DELETE', undefined, guard).catch((err: unknown) => this.log.warn(`Wazo: a line without an endpoint not removed: ${err instanceof Error ? err.message : String(err)}`))
+    return { ready, failed }
+  }
+
   /** A mailbox of the SIP server (`number@context`) is a person's when it is at their number, which is theirs only. */
   mailboxIsOf(mailbox: string, userId: string) {
     return mailbox.split('@')[0] === mailboxNumber(this.key(userId))

@@ -6,6 +6,7 @@ import type { PushTargets } from './push-targets.js'
 import type { DialOutGrants } from './dial-out-grants.js'
 import type { OutboundTables } from './outbound.js'
 import type { VoicemailBoxes } from './voicemail-boxes.js'
+import type { WazoLines } from './wazo-lines.js'
 import { trunkStatusFrom, type TrunkTables } from './trunks.js'
 import { OpensipsEvents, parseDlgContext, parseDlgList, parseUlDump, type EventsLogger } from './events.js'
 import { classify } from './numbering.js'
@@ -20,6 +21,7 @@ export { CallGroups, CALL_GROUPS_SCHEMA, DISPLAY_NAMES_SCHEMA, GROUP_MEMBERS_MAX
 export { PushTargets, PUSH_TARGETS_SCHEMA, type PushTargetsOptions } from './push-targets.js'
 export { DialOutGrants, DIAL_OUT_GRANTS_SCHEMA, GRANT_HEADER, GRANT_TTL_SEC, JOIN_HEADER, JOIN_TOKEN, REPLACES, type DialOutGrantsOptions } from './dial-out-grants.js'
 export { AsyncQueue } from './queue.js'
+export { WazoLines, WAZO_LINES_SCHEMA, type WazoLinesOptions } from './wazo-lines.js'
 export { VoicemailBoxes, VoicemailFenced, VOICEMAIL_BOXES_SCHEMA, VOICEMAIL_FENCE_RESET, MAILBOX, type VoicemailBoxesOptions } from './voicemail-boxes.js'
 export { TrunkTables, TRUNK_SCHEMA, TRUNK_SQL, DEFAULT_TRUNK_SOCKET, SOURCES_SET, DISPATCHER_TABLE_VERSION, DIALPLAN_TABLE_VERSION, REGISTRANT_TABLE_VERSION, codecFlags, projectTrunks, trunkSecret, trunkStatusFrom, type TrunkTablesOptions } from './trunks.js'
 export { OutboundTables, OUTBOUND_SCHEMA, ACC_EXTERNAL_SQL, FRAUD_PROFILE, FRAUD_RULE_INTERNATIONAL, FRAUD_RULE_NATIONAL, FRAUD_TABLE_VERSION, FRAUD_OVERSEAS_PREFIXES, DR_TABLE_VERSIONS, DIALOG_TABLE_VERSION, OUTBOUND_TIME_ZONE, CAP_MAX, PROFILE_ID, fraudRow, projectOutbound, type OutboundTablesOptions } from './outbound.js'
@@ -122,6 +124,8 @@ export interface OpensipsConfig {
    * voicemail server named them. Without it, or without a mailbox for an extension, its calls end as before.
    */
   voicemailBoxes?: VoicemailBoxes
+  /** The extensions that have a line at Wazo (step 11c-1, ADR 0027; `wazo_lines`). */
+  wazoLines?: WazoLines
   /**
    * The SIP accounts (`subscriber`) OpenSIPS authenticates and routes by: `reconcile` removes those the Gateway
    * wrote for a user who no longer holds the extension, and returns their extensions (SubscriberProvisioner's
@@ -384,6 +388,22 @@ export class OpensipsProvider implements TelephonyProvider, MediaProvider {
   /** The number of the last withdrawal (VoicemailBoxes' mark): 0 without a table of the mailboxes. */
   async voicemailMark() {
     return (await this.config.voicemailBoxes?.mark()) ?? 0
+  }
+
+  /**
+   * The extensions that have a line at Wazo (step 11c-1, ADR 0027): written in `wazo_lines`, which OpenSIPS reads at each
+   * REGISTER to register that extension at Wazo's Asterisk too (mid_registrar). Replaces the list; an extension OpenSIPS
+   * would not read (not digits) is left out, and said.
+   */
+  async setWazoLines(extensions: string[]) {
+    if (!this.config.wazoLines) return
+    const { skipped } = await this.config.wazoLines.set(extensions)
+    if (skipped.length) (this.config.logger ?? console).warn(`OpenSIPS: ${skipped.length} extension(s) left out of the lines of Wazo, not digits: ${skipped.join(', ')}`)
+  }
+
+  /** The extensions that have a line at Wazo as OpenSIPS has them (`wazo_lines`): none without the table. */
+  async listWazoLines() {
+    return (await this.config.wazoLines?.list()) ?? []
   }
 
   /** The mailboxes OpenSIPS sends calls to now (`voicemail_boxes`), by extension: none without the table. */
