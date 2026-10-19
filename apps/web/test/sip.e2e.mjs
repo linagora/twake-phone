@@ -3377,9 +3377,15 @@ try {
     })
     let bob2
     await step('step 11c-1: a second window of Bob registers: OpenSIPS keeps both windows and registers 103 once at Wazo, the contact being its lines socket; a refresh changes nothing there', async () => {
+      const rows103 = await lineRows()
       bob2 = await open('bdurand', 'Bob Durand')
       await phoneState(bob2.page).getByText('En ligne').waitFor({ timeout: 20_000 })
-      const contacts = await until('the contact of 103 at Wazo', async () => (contactsOf('103').length ? contactsOf('103') : null), { timeout: 20_000 })
+      const contacts = await until('the contact of 103 at Wazo', async () => (contactsOf('103').length ? contactsOf('103') : null), { timeout: 20_000 }).catch(err => {
+        // What OpenSIPS said of the registration, and what Asterisk has, for whoever reads the failure.
+        const said = execFileSync('docker', ['compose', '-f', COMPOSE_FILE, 'logs', '--no-color', '--no-log-prefix', 'opensips'], { encoding: 'utf8', timeout: 30_000, maxBuffer: 64 << 20 }).split('\n').filter(l => /wazo|mid_reg/i.test(l)).slice(-40)
+        console.log(`[11c-1] OpenSIPS: ${said.join('\n')}\n[11c-1] Asterisk aors: ${asteriskCli('pjsip show aors')}\n[11c-1] wazo_lines: ${JSON.stringify(rows103)}`)
+        throw err
+      })
       expectEqual(contacts.length, 1, 'contacts of 103 at Wazo')
       if (!/^103\/sip:103@127\.0\.0\.2:5096/.test(contacts[0])) throw new Error(`the contact of 103 at Wazo: ${contacts[0]}`)
       expectEqual((await windowsOf('103')).length, 2, 'the windows of 103 in OpenSIPS')
