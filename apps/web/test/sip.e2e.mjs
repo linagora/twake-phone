@@ -3574,12 +3574,12 @@ try {
     await step('step 11c-1: nothing else of a call Wazo placed: a transfer of it (REFER) is refused as one with the operator, and its requests come from the lines socket only (a window cannot be reached through it as any other)', async () => {
       const cfg = readFileSync(new URL('../../../docker/opensips/opensips.cfg.tpl', import.meta.url), 'utf8')
       if (!cfg.includes('$dlg_val(wline) == "1"')) throw new Error('the configuration does not know the calls Wazo placed')
-      // A stranger on the lines socket address from another source: refused (403), as for the other sockets.
+      // A stranger on the lines socket address from another source (127.0.0.1 is Wazo's own, whatever its port): refused (403), as for the other sockets.
       const udp = createSocket('udp4')
       try {
-        await new Promise(resolve => udp.bind(0, '127.0.0.1', resolve))
+        await new Promise(resolve => udp.bind(0, '127.0.0.3', resolve))
         const reply = new Promise(resolve => udp.once('message', buf => resolve(buf.toString())))
-        const options = ['OPTIONS sip:127.0.0.2:5096 SIP/2.0', `Via: SIP/2.0/UDP 127.0.0.1:${udp.address().port};branch=z9hG4bKe2e${randomBytes(4).toString('hex')}`, 'Max-Forwards: 70', 'From: <sip:e2e@127.0.0.1>;tag=a', 'To: <sip:127.0.0.2:5096>', `Call-ID: ${randomBytes(6).toString('hex')}`, 'CSeq: 1 OPTIONS', 'Content-Length: 0', '', ''].join('\r\n')
+        const options = ['OPTIONS sip:127.0.0.2:5096 SIP/2.0', `Via: SIP/2.0/UDP 127.0.0.3:${udp.address().port};branch=z9hG4bKe2e${randomBytes(4).toString('hex')}`, 'Max-Forwards: 70', 'From: <sip:e2e@127.0.0.1>;tag=a', 'To: <sip:127.0.0.2:5096>', `Call-ID: ${randomBytes(6).toString('hex')}`, 'CSeq: 1 OPTIONS', 'Content-Length: 0', '', ''].join('\r\n')
         udp.send(options, 5096, '127.0.0.2')
         expectEqual((await reply).split('\r\n')[0], 'SIP/2.0 403 Forbidden', 'the answer of the lines socket to an address that is not Wazo\'s')
       } finally {
