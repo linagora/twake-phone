@@ -60,11 +60,11 @@ AMI_USER = os.environ.get('SYSCONFD_AMI_USER', 'twake_sysconfd')
 AMI_PASSWORD = os.environ['SYSCONFD_AMI_PASSWORD']
 CONFGEND = os.environ.get('SYSCONFD_CONFGEND', '127.0.0.1:8669')
 SYNCHRONOUS = os.environ.get('SYSCONFD_SYNCHRONOUS') == '1'
-# What a reload costs before it runs: a real Wazo's (wazo-confgen, then asterisk -rx) is far above this stack's Asterisk.
 # How long the AMI may take to answer: a Reload answers when Asterisk is done, and a reload of PJSIP (wazo-confgen run for each
 # of its objects) takes 17 s on a CI runner. Giving up sooner leaves the reload running, and the next ones refused ("A reload
 # is in progress") and lost.
 AMI_TIMEOUT_S = int(os.environ.get('SYSCONFD_AMI_TIMEOUT_S', '90'))
+# What a reload costs before it runs: a real Wazo's (wazo-confgen, then asterisk -rx) is far above this stack's Asterisk.
 RELOAD_MS = int(os.environ.get('SYSCONFD_RELOAD_MS', '0'))
 SPOOL = os.environ.get('SYSCONFD_SPOOL', '/var/spool/asterisk/voicemail')
 # The commands wazo-confd sends after a change to voicemails, users and lines, each the module the AMI reloads for it.
@@ -210,52 +210,9 @@ def reload_action(module):
     return ['Action: Reload', f'Module: {module}']
 
 
-def auths_of(conf):
-    """The credentials of a pjsip.conf, as {name}: the sections with `type = auth` (the lines' passwords)."""
-    found = set()
-    section = None
-    for line in conf.splitlines():
-        line = line.strip()
-        if line.startswith('[') and line.endswith(']'):
-            section = line[1:-1]
-        elif section and re.fullmatch(r'type\s*=\s*auth', line):
-            found.add(section)
-    return found
-
-
-# A reload of PJSIP is not done when the AMI answers, and one that comes while another runs is dropped by Asterisk: the
-# credentials of the last lines may be left out (an endpoint without its auth, a REGISTER Asterisk cannot answer). Read
-# again for this long, then reloaded again, this many times at most.
-PJSIP_SETTLE_S = 10
-PJSIP_RELOADS = 4
-
-
-def pjsip_reload():
-    """`module reload res_pjsip.so`, checked as the voicemail one is: every credentials object wazo-confgend gives is in
-    Asterisk (PJSIPShowAuths) once it is done, the reload made again otherwise; AmiError when it is never so."""
-    missing = set()
-    for _ in range(PJSIP_RELOADS):
-        try:
-            expected = auths_of(confgend('asterisk/pjsip.conf'))
-        except OSError as err:
-            raise AmiError(f'wazo-confgend not reached, PJSIP reload not run: {err}') from err
-        reloaded = ami_actions([reload_action('res_pjsip.so')])[0]
-        if not expected:
-            return reloaded
-        for _ in range(PJSIP_SETTLE_S):
-            listed = ami_actions([['Action: PJSIPShowAuths']])[0].get('entries', [])
-            missing = expected - {e.get('ObjectName', '') for e in listed}
-            if not missing:
-                return reloaded
-            time.sleep(1)
-    raise AmiError(f'PJSIP reload: {len(missing)} credentials of wazo-confgend not in Asterisk after it, as {", ".join(sorted(missing)[:5])}')
-
-
 def ami_command(command):
     """Runs one of the COMMANDS, as the AMI reload of its module: `voicemail reload` checked by the mailboxes Asterisk
     lists after it (every mailbox wazo-confgend gave before it is there), AmiError otherwise."""
-    if command == 'module reload res_pjsip.so':
-        return pjsip_reload()
     if command != 'voicemail reload':
         return ami_actions([reload_action(RELOADS[command])])[0]
     try:

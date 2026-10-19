@@ -47,7 +47,6 @@ class FakeAmi:
         self.blocks = []
         self.answers = {}
         self.listed = list(LISTED)
-        self.auths = []  # the credentials PJSIPShowAuths lists
         self.refuse_login = False
         # While set, a Reload is not answered until it is (a reload that takes its time).
         self.gate = None
@@ -97,11 +96,6 @@ class FakeAmi:
                         self.send(['Event: Newchannel', f'Channel: PJSIP/opensips-{i:08x}'])
                     if events < 1000:
                         self.send([f'Response: {response}', f'ActionID: {action_id}', f'Message: {message}'])
-                elif action == 'PJSIPShowAuths':
-                    self.send(['Response: Success', f'ActionID: {action_id}', 'EventList: start', 'Message: A listing of Auths follows'])
-                    for name in ami.auths:
-                        self.send(['Event: AuthList', f'ActionID: {action_id}', 'ObjectType: auth', f'ObjectName: {name}'])
-                    self.send(['Event: AuthListComplete', f'ActionID: {action_id}', 'EventList: Complete', f'ListItems: {len(ami.auths)}'])
                 elif action == 'VoicemailUsersList':
                     self.send(['Response: Success', f'ActionID: {action_id}', 'EventList: start', 'Message: Voicemail user list will follow'])
                     # Another session's list in between: not this one's.
@@ -127,15 +121,13 @@ class FakeConfgend:
 
     def __init__(self):
         self.conf = VOICEMAIL_CONF
-        self.pjsip = ''  # asterisk/pjsip.conf
         self.asked = []
         confgend = self
 
         class Handler(StreamRequestHandler):
             def handle(self):
-                name = self.request.recv(1024).decode()
-                confgend.asked.append(name)
-                self.wfile.write((confgend.pjsip if name == 'asterisk/pjsip.conf' else confgend.conf).encode())
+                confgend.asked.append(self.request.recv(1024).decode())
+                self.wfile.write(confgend.conf.encode())
 
         self.server = ThreadingTCPServer(('127.0.0.1', 0), Handler)
         self.server.daemon_threads = True
@@ -296,20 +288,6 @@ class Sysconfd(unittest.TestCase):
         self.confgend.server.server_close()
         self.assertEqual(self.request('POST', '/exec_request_handlers', '{"ipbx": ["voicemail reload"]}')[0], 500)
         self.assertEqual(self.ami.commands(), [])
-
-    def test_a_pjsip_reload_is_checked_by_the_credentials_asterisk_has_after_it_and_made_again_when_one_is_missing(self):
-        sysconfd.PJSIP_SETTLE_S = 1
-        self.confgend.pjsip = '[101]\ntype = endpoint\n\n[101]\ntype=auth\n\n[103]\ntype = auth\nusername = 103\n'
-        self.ami.auths = ['101', '103']
-        self.assertEqual(self.request('POST', '/exec_request_handlers', '{"ipbx": ["module reload res_pjsip.so"]}')[0], 200)
-        self.assertEqual(self.ami.commands(), ['Reload res_pjsip.so', 'PJSIPShowAuths'])
-        # A reload dropped: 103 is not there, the reload is made again (and again), then it is an error.
-        self.ami.blocks.clear()
-        self.ami.auths = ['101']
-        status, body = self.request('POST', '/exec_request_handlers', '{"ipbx": ["module reload res_pjsip.so"]}')
-        self.assertEqual(status, 500, body)
-        self.assertIn('103', body)
-        self.assertEqual(self.ami.commands().count(f'Reload res_pjsip.so'), sysconfd.PJSIP_RELOADS)
 
     # The queue: as wazo-sysconfd's, a request is answered at once and what waits is not queued twice.
     def post_in_background(self, command):
