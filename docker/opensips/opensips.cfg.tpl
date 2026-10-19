@@ -820,7 +820,7 @@ route {
 		setflag("TCP_PERSISTENT");
 		# wazo-lines: begin
 		# The extension has a line at Wazo (step 11c-1, ADR 0027): `wazo_lines`, which the Gateway writes once Wazo has the
-		# line, read through the cache (60 s: a REGISTER is made to be read often). A database that cannot say (the table
+		# line, read through the cache (60 s for a line, never for an absence: a REGISTER is made to be read often). A database that cannot say (the table
 		# missing, a failed read) says no line for 30 s ($shv(wazo_lines_nodb_until)). Its registration goes to Wazo too:
 		# saved by mid_registrar (the windows are kept here, in `location`) and relayed to Wazo's Asterisk, which has one
 		# contact for the extension, this OpenSIPS's lines socket; a refresh Wazo has already is absorbed here (200 at
