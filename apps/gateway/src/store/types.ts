@@ -616,7 +616,8 @@ export interface TranscriptRecord {
   extension: string
   receivedAt: string
   status: TranscriptStatus
-  reason?: 'too-long' | 'busy' | 'failed'
+  /** Why there is none: as VoicemailTranscript says; `untracked` here, its holder without an extension any more. */
+  reason?: 'too-long' | 'busy' | 'failed' | 'untracked'
   text?: string
   /** The tries of the transcription so far, and when the next one is due. */
   attempts: number
@@ -773,8 +774,9 @@ export interface Store {
    * What is due in one queue, `limit` at most. `transcribe`: a transcription pending whose next try (`nextAt`) came,
    * oldest first. `notice` (its next try, `noticeNextAt`, come): a notice to withdraw first, then a notice to send once
    * the transcription is no longer pending, or written down more than `noticeWaitMs` ago (sent without its text).
+   * None of the holders in `skip` (their mailboxes not read this round).
    */
-  dueTranscripts(tenantId: string, lane: TranscriptLane, limit: number, noticeWaitMs?: number): Promise<TranscriptRecord[]>
+  dueTranscripts(tenantId: string, lane: TranscriptLane, limit: number, noticeWaitMs?: number, skip?: string[]): Promise<TranscriptRecord[]>
   /** How many of the tenant's transcriptions written down before `before` still wait (a transcription, a notice, a withdrawal). */
   staleTranscripts(tenantId: string, before: string): Promise<number>
   /** The transcriptions of the tenant that changed after `since` (store's clock) and are `done` or `none`, oldest change first. */

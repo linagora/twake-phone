@@ -478,14 +478,17 @@ describe('the transcription of the messages and the notices in Chat (step 11b)',
   it('erases the transcriptions of the messages past the retention period, and withdraws their notices', async () => {
     const store = new MemoryStore()
     const { app, boxes, hs } = await setup({ store, retentionDays: 30, purgeMs: 50 })
-    const old = new Date(Date.now() - 31 * 86_400_000).toISOString()
+    // Within it by 3 s when left (a message already past it is purged, its row with it, before its notice may go:
+    // the purge every 50 ms and the notice raced), past it once its notice is sent.
+    const old = new Date(Date.now() - 30 * 86_400_000 + 3_000).toISOString()
     boxes.leave('102', message('m-old', { receivedAt: old }))
     boxes.leave('102', message('m-new'))
     await until('the notices', () => hs.notices().length === 2)
-    await until('the old one withdrawn', () => hs.notices().length === 1, 5_000)
+    expect((await store.listTranscripts('A', 'jean', ['m-old']))[0]).toMatchObject({ status: 'done', notice: 'sent' })
+    await until('the old one withdrawn', () => hs.notices().length === 1, 8_000)
     await until('its transcription gone', async () => (await store.listTranscripts('A', 'jean', undefined, true)).map(t => t.messageId).join() === 'm-new')
     await app.close()
-  })
+  }, 15_000)
 
   it('erases, deletes and expires the transcriptions with the transcription and the bot off, and says the notices left in Chat', async () => {
     const store = new MemoryStore()
@@ -539,6 +542,35 @@ describe('the transcription of the messages and the notices in Chat (step 11b)',
     // Older than it catches up with: said so, never transcribed.
     expect(await transcriptOf('jean', 'm-old')).toEqual({ status: 'none', reason: 'untracked' })
     expect(await rowOf('jean', 'm-old')).toBeUndefined()
+    await app.close()
+  })
+
+  it('shows the administrators what the reconciliation holds back, and lets them release those very rows (third review)', async () => {
+    const { app, boxes, hs, as, rowOf, alerts } = await setup({ reconcileMs: 50, orphanMs: 200 })
+    const admin = () => app.inject({ url: '/api/v1/admin/voicemail', headers: as('root') })
+    const release = (payload: unknown, user = 'root') => app.inject({ method: 'POST', url: '/api/v1/admin/voicemail/transcripts/release', headers: as(user), payload: payload as Record<string, unknown> })
+    expect((await release({ gone: 2, of: 2 })).json()).toMatchObject({ code: 'TRANSCRIPTS_NOTHING_HELD' })
+    boxes.leave('102', message('m1'))
+    boxes.leave('102', message('m2'))
+    await until('the notices', () => hs.notices().length === 2)
+    // Deleted from the phone while no event is heard: held back, said.
+    boxes.remove('jean', 'm1')
+    boxes.remove('jean', 'm2')
+    await until('held back', async () => (await admin()).json<{ transcriptsHeld?: unknown }>().transcriptsHeld !== undefined)
+    expect((await admin()).json()).toEqual({ transcriptsHeld: { gone: 2, of: 2, since: expect.any(String), effect: expect.stringContaining('two reconciliations') } })
+    expect(await alerts()).toContain('transcription-held')
+    await sleep(300)
+    expect(await rowOf('jean', 'm1')).toBeDefined()
+    expect((await release({ gone: 2, of: 2 }, 'jean')).statusCode).toBe(403)
+    expect((await release({ gone: 2 })).json()).toMatchObject({ code: 'TRANSCRIPTS_RELEASE_COUNTS' })
+    expect((await release({ gone: -1, of: 2 })).statusCode).toBe(400)
+    expect((await release({ gone: 1, of: 2 })).json()).toMatchObject({ code: 'TRANSCRIPTS_HELD_CHANGED', transcriptsHeld: { gone: 2, of: 2 } })
+    expect(await rowOf('jean', 'm1')).toBeDefined()
+    const asked = await release({ gone: 2, of: 2 })
+    expect(asked.statusCode).toBe(202)
+    expect(asked.json()).toMatchObject({ release: 'asked', applied: expect.stringContaining('two reconciliations') })
+    await until('the rows erased, their notices withdrawn', async () => !(await rowOf('jean', 'm1')) && !(await rowOf('jean', 'm2')) && hs.notices().length === 0, 5_000)
+    await until('nothing held back', async () => JSON.stringify((await admin()).json()) === '{}', 5_000)
     await app.close()
   })
 
@@ -1187,6 +1219,72 @@ describe('VoicemailTranscripts', () => {
     expect(box.alerts).toContain('transcription-held')
   })
 
+  it('erases what it held back once an administrator says it is gone for good, those very rows only, each after two reads apart still (third review)', async () => {
+    const hs = homeserver()
+    const u = await unit({ hs, holders: ['jean', 'bob'], orphanConfirmMs: 80 })
+    expect(await u.t.release('A', { gone: 0, of: 0 }, 'root')).toBe('nothing')
+    await u.add('m1')
+    await u.add('m2')
+    for (const id of ['b1', 'b2', 'b3']) await u.add(id, 'bob')
+    await u.t.settled('A')
+    expect(hs.notices()).toHaveLength(5)
+    // Jean empties his mailbox from his phone while no event is heard: held back, as a spool out of sight would be.
+    u.boxes.remove('jean', 'm1')
+    u.boxes.remove('jean', 'm2')
+    await u.reconcile()
+    await sleep(100)
+    await u.reconcile()
+    expect(await u.rows()).toEqual(['m1', 'm2'])
+    expect(u.alerts).toContain('transcription-held')
+    const { held } = await u.t.held('A')
+    expect(held).toMatchObject({ gone: 2, of: 5 })
+    // Not what the administrator saw: refused.
+    expect(await u.t.release('A', { gone: 2, of: 4 }, 'root')).toBe('changed')
+    expect(await u.t.release('A', { gone: 1, of: 5 }, 'root')).toBe('changed')
+    expect(await u.t.release('A', { gone: 2, of: 5 }, 'root')).toMatchObject({ gone: 2, of: 5, by: 'root' })
+    // Released: read once (the reconciliation it starts), then again at once: not erased, the two reads too close.
+    await u.t.settled('A')
+    await u.reconcile()
+    expect(await u.rows()).toEqual(['m1', 'm2'])
+    expect((await u.t.held('A')).release).toMatchObject({ gone: 2, of: 5, by: 'root' })
+    const alerts = u.alerts.length
+    await sleep(100)
+    await u.reconcile()
+    expect(await u.rows()).toEqual([])
+    expect(hs.notices()).toHaveLength(3)
+    expect(await u.rows('bob')).toEqual(['b1', 'b2', 'b3'])
+    expect(u.alerts.slice(alerts)).not.toContain('transcription-held')
+    await u.reconcile()
+    expect(await u.t.held('A')).toEqual({})
+    // Another one gone meanwhile (or one back): held back again, the release done with, nothing erased however long.
+    const w = await unit({ hs: homeserver(), holders: ['jean', 'bob'], orphanConfirmMs: 80 })
+    await w.add('m1')
+    await w.add('m2')
+    for (const id of ['b1', 'b2', 'b3']) await w.add(id, 'bob')
+    await w.t.settled('A')
+    w.boxes.remove('jean', 'm1')
+    w.boxes.remove('jean', 'm2')
+    await w.reconcile()
+    expect(await w.t.release('A', { gone: 2, of: 5 }, 'root')).toMatchObject({ gone: 2 })
+    await w.t.settled('A')
+    w.boxes.remove('bob', 'b1')
+    for (let i = 0; i < 3; i++) {
+      await sleep(100)
+      await w.reconcile()
+    }
+    expect(await w.rows()).toEqual(['m1', 'm2'])
+    expect(await w.rows('bob')).toEqual(['b1', 'b2', 'b3'])
+    expect(await w.t.held('A')).toEqual({ held: expect.objectContaining({ gone: 3, of: 5 }) })
+    // Back to what was released: held back still, a release asked again for it.
+    w.boxes.leave('103', message('b1'), true)
+    for (let i = 0; i < 2; i++) {
+      await sleep(100)
+      await w.reconcile()
+    }
+    expect(await w.rows()).toEqual(['m1', 'm2'])
+    expect(await w.t.held('A')).toEqual({ held: expect.objectContaining({ gone: 2, of: 5 }) })
+  })
+
   it("erases the row of a message gone (its event missed) only once two reads apart do not see it, and none when too many went at once (second review)", async () => {
     const hs = homeserver()
     const u = await unit({ hs, orphanConfirmMs: 100 })
@@ -1315,6 +1413,63 @@ describe('VoicemailTranscripts', () => {
     await until('both withdrawn', () => hs.notices().length === 0)
     expect(hs.events.get(r.noticeEvent!)!.redacted && hs.events.get(r.noticeEdit!)!.redacted).toBe(true)
     await u.t.stop()
+  })
+
+  it('does not complete a notice whose room is no longer the person\'s alone with the bot: the notice stays as it was sent (third review)', async () => {
+    const hs = homeserver()
+    const g = gate()
+    const u = await unit({ hs, everyMs: 20, noticeWaitMs: 50, transcribe: async () => {
+      await g.closed
+      return { text: SAID }
+    } })
+    u.t.start()
+    await u.add('m1')
+    await until('the notice without its text', () => hs.notices().length === 1, 2_000)
+    // Someone else joined meanwhile (forced in by an administrator): the text not sent to the room.
+    hs.rooms.get(hs.notices()[0]!.roomId)!.members.set(`@eve:${SERVER}`, 'join')
+    g.open()
+    await until('settled', async () => (await u.store.listTranscripts('A', 'jean', ['m1']))[0]?.notice === 'sent', 2_000)
+    const r = (await u.store.listTranscripts('A', 'jean', ['m1']))[0]!
+    expect(r).toMatchObject({ status: 'done', text: SAID })
+    expect(r.noticeEdit).toBeUndefined()
+    expect(hs.events.size).toBe(1)
+    expect(String([...hs.events.values()][0]!.content.body)).not.toContain(SAID)
+    await u.t.stop()
+  })
+
+  it('stops looking for the message of someone without an extension any more: untracked, no notice, the row kept (third review)', async () => {
+    const hs = homeserver()
+    const u = await unit({ hs })
+    await u.store.addTranscript({ tenantId: 'A', holder: 'bob', messageId: 'b1', extension: '103', receivedAt: new Date().toISOString(), status: 'pending', notice: 'pending' }, u.lease, 9)
+    u.t.kick('A')
+    await u.t.settled('A')
+    expect(await u.store.listTranscripts('A', 'bob')).toMatchObject([{ messageId: 'b1', status: 'none', reason: 'untracked', notice: 'none' }])
+    expect(hs.events.size).toBe(0)
+    expect(await u.store.dueTranscripts('A', 'transcribe', 10)).toEqual([])
+    expect(await u.store.dueTranscripts('A', 'notice', 10, 0)).toEqual([])
+    // Jean's, his message not seen: looked for again later, as before.
+    await u.store.addTranscript({ tenantId: 'A', holder: 'jean', messageId: 'm2', extension: '102', receivedAt: new Date().toISOString(), status: 'pending', notice: 'pending' }, u.lease, 9)
+    u.t.kick('A')
+    await u.t.settled('A')
+    const m2 = (await u.store.listTranscripts('A', 'jean', ['m2']))[0]!
+    expect(m2).toMatchObject({ status: 'pending', notice: 'pending' })
+    expect(Date.parse(m2.nextAt)).toBeGreaterThan(Date.now() + 60_000)
+    expect(await u.store.dueTranscripts('A', 'notice', 10, 0)).toEqual([])
+  })
+
+  it('transcribes and tells the others\' messages however many rows of an unreadable mailbox are due (third review)', async () => {
+    const hs = homeserver()
+    const u = await unit({ hs, holders: ['jean', 'bob'], noticeWaitMs: 1 })
+    u.boxes.state.failing.add('jean')
+    for (let i = 1; i <= 20; i++) await u.add(`m${i}`)
+    await u.t.settled('A')
+    await sleep(5)
+    await u.add('b1', 'bob')
+    await u.t.settled('A')
+    expect((await u.store.listTranscripts('A', 'bob')).map(r => [r.messageId, r.status, r.notice])).toEqual([['b1', 'done', 'sent']])
+    expect(hs.notices()).toHaveLength(1)
+    expect((await u.store.listTranscripts('A', 'jean')).every(r => r.status === 'pending' && r.notice === 'pending')).toBe(true)
+    expect(await u.rows()).toHaveLength(20)
   })
 
   it('withdraws at once a notice whose message was erased while it was sent, and its replacement too (second review)', async () => {
@@ -1455,10 +1610,10 @@ describe('the bot (MatrixBot)', () => {
     const hs = homeserver()
     const bot = new MatrixBot({ homeserverUrl: `https://${SERVER}`, token: TOKEN, fetch: hs.fetch })
     const room = await bot.createDirectRoom(`@jean:${SERVER}`, 'n', 't', 'twakephone-pages')
-    const long = 'x'.repeat(20_000)
+    const long = 'x'.repeat(40_000)
     const first = await bot.send(room, 'txn0', { body: long, [NOTICE_FIELD]: 'k0' })
     for (let i = 1; i < 30; i++) await bot.send(room, `txn${i}`, { body: long, [NOTICE_FIELD]: `k${i}` })
-    // 30 notices of 20 kB: more than one answer of 256 kB.
+    // 30 notices of 40 kB: a page of ten (400 kB) past the bound of any other answer (256 kB), within its own (1 MB).
     const asked = hs.calls.filter(c => c === 'GET messages').length
     expect(await bot.findSent(room, NOTICE_FIELD, 'k0')).toBe(first)
     expect(hs.calls.filter(c => c === 'GET messages').length - asked).toBe(3)
@@ -1514,6 +1669,10 @@ describe('the notice of a message', () => {
     expect(callerName('support@example.test')).toBe('support example test')
     expect(callerName("Jean-Luc O'Brien, Dupont & Fils (SAV)")).toBe("Jean-Luc O'Brien, Dupont & Fils (SAV)")
     expect(callerName('Élodie Müller 2')).toBe('Élodie Müller 2')
+    // A number given as a name, and initials: kept as they are.
+    expect(callerName('+33 6 12 34 56 78')).toBe('+33 6 12 34 56 78')
+    expect(callerName('J.-P. Martin')).toBe('J.-P. Martin')
+    expect(callerName('Appel +33 6 12, x.co, Mr.Smith')).toBe('Appel 33 6 12, x co, Mr Smith')
     expect(callerName('Alice⁦ ⁩Martin\nIT')).toBe('Alice Martin IT')
     expect(callerName('​‮')).toBeUndefined()
     expect(callerName(undefined)).toBeUndefined()

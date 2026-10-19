@@ -498,7 +498,8 @@ export interface Voicemail {
  * heard in it, `lang` the language it is in), or no transcription (`none`), `reason` saying why: longer than the
  * platform transcribes (`too-long`), too many messages waiting for theirs (`busy`), the transcription service did not
  * answer or failed (`failed`), or the platform never took the message in hand (`untracked`: left before the
- * transcription was on, or longer ago than it catches up with).
+ * transcription was on, or longer ago than it catches up with; or its message no longer looked for, its holder
+ * without an extension any more).
  */
 export interface VoicemailTranscript {
   status: 'pending' | 'done' | 'none'
@@ -778,7 +779,7 @@ export type WebhookEvent =
    * A message was transcribed, or will not be (`transcript.status`, as `VoicemailTranscript`): never its text, which
    * only its holder reads (their Messagerie vocale, the bot's notice in Chat).
    */
-  | (WebhookEventBase & { type: 'voicemail.transcribed'; voicemail: Pick<WebhookVoicemail, 'id' | 'user' | 'extension'>; transcript: { status: 'done' | 'none'; reason?: 'too-long' | 'busy' | 'failed' } })
+  | (WebhookEventBase & { type: 'voicemail.transcribed'; voicemail: Pick<WebhookVoicemail, 'id' | 'user' | 'extension'>; transcript: { status: 'done' | 'none'; reason?: 'too-long' | 'busy' | 'failed' | 'untracked' } })
   /** What an administrator sends from the administration to check a subscription. */
   | (WebhookEventBase & { type: 'webhook.test'; subscription: string })
 

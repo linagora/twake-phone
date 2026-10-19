@@ -123,6 +123,9 @@ const RESTORE_RETRY_MS = [1_000, 5_000, 15_000, 30_000]
  * meant, in the store (every Gateway reads them; the one that leads honours the word).
  */
 const VOICEMAIL_RELEASE = 'voicemail:release'
+/** What releasing the transcriptions held back does (step 11b), said with them and in the answer of the release. */
+const TRANSCRIPTS_RELEASE_EFFECT =
+  'each row erased, its notice withdrawn from Chat, once two reconciliations of the mailboxes at least 10 minutes apart still miss its message; held back again if any other message goes or comes back meanwhile'
 /** The releases of the guard asked, newest first, VOICEMAIL_RELEASES_KEPT of them. */
 const VOICEMAIL_RELEASES = 'voicemail:releases'
 const VOICEMAIL_RELEASES_KEPT = 20
@@ -2215,7 +2218,14 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         const held = (await store.getOperatorState(user.tenantId, VOICEMAIL_HELD)) as HeldBack | undefined
         const release = (await store.getOperatorState(user.tenantId, VOICEMAIL_RELEASE)) as ReleaseAsked | undefined
         const releases = ((await store.getOperatorState(user.tenantId, VOICEMAIL_RELEASES)) as ReleaseRecord[] | undefined) ?? []
-        return { ...(held ? { heldBack: held, effect: releaseEffect(held) } : {}), ...(release ? { release: { ...release, state: 'asked' } } : {}), ...(releases.length ? { releases } : {}) }
+        const rows = await transcripts.held(user.tenantId)
+        return {
+          ...(held ? { heldBack: held, effect: releaseEffect(held) } : {}),
+          ...(release ? { release: { ...release, state: 'asked' } } : {}),
+          ...(releases.length ? { releases } : {}),
+          ...(rows.held ? { transcriptsHeld: { ...rows.held, effect: TRANSCRIPTS_RELEASE_EFFECT } } : {}),
+          ...(rows.release ? { transcriptsRelease: { ...rows.release, state: 'confirming' } } : {})
+        }
       })
       v1.post<{ Body: { park?: unknown; remove?: unknown; of?: unknown } }>('/admin/voicemail/release', async (req, reply) => {
         const user = await administrator(req)
@@ -2239,6 +2249,26 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         const provider = started.get(user.tenantId)
         if (provider) void syncVoicemail(user.tenantId, provider)
         return reply.code(202).send({ release: 'asked', applied: 'at the next synchronisation of the mailboxes', effect: releaseEffect(asked) })
+      })
+      // The transcriptions the reconciliation holds back (step 11b): rows whose messages it no longer sees, too many at
+      // once or a mailbox read empty (a spool the voicemail server no longer sees, or real deletions while no event was
+      // heard). An administrator who checked that the voicemail server sees its messages says these are gone for good,
+      // with the counts GET /admin/voicemail gave (`gone`, `of`; 409 TRANSCRIPTS_NOTHING_HELD, TRANSCRIPTS_HELD_CHANGED):
+      // those very rows only, each erased (its notice withdrawn) once two reconciliations apart still miss its message,
+      // held back again if any other goes or comes back meanwhile.
+      v1.post<{ Body: { gone?: unknown; of?: unknown } }>('/admin/voicemail/transcripts/release', async (req, reply) => {
+        const user = await administrator(req)
+        const body = req.body ?? {}
+        const count = (v: unknown) => (Number.isSafeInteger(v) && (v as number) >= 0 ? (v as number) : undefined)
+        const seen = { gone: count(body.gone), of: count(body.of) }
+        if (seen.gone === undefined || seen.of === undefined)
+          return reply.code(400).send({ statusCode: 400, code: 'TRANSCRIPTS_RELEASE_COUNTS', error: 'Bad Request', message: 'Give the counts held back as GET /admin/voicemail says them: gone, of' })
+        const done = await transcripts.release(user.tenantId, { gone: seen.gone, of: seen.of }, user.id)
+        if (done === 'nothing') return reply.code(409).send({ statusCode: 409, code: 'TRANSCRIPTS_NOTHING_HELD', error: 'Conflict', message: 'No transcription is held back' })
+        if (done === 'changed')
+          return reply.code(409).send({ statusCode: 409, code: 'TRANSCRIPTS_HELD_CHANGED', error: 'Conflict', message: 'What is held back changed since: read it again', transcriptsHeld: (await transcripts.held(user.tenantId)).held })
+        req.log.warn({ tenantId: user.tenantId, by: user.id, gone: done.gone, of: done.of }, 'voicemail transcriptions held back: an administrator says their messages are gone for good')
+        return reply.code(202).send({ release: 'asked', applied: TRANSCRIPTS_RELEASE_EFFECT })
       })
       // The messages of someone who left (no account any more to erase them): erased by the Gateway that writes the
       // mailboxes, at its next round (202). Not of someone who holds an extension, nor of someone the directory still

@@ -722,14 +722,14 @@ export class PgStore implements Store {
     return rows.map(transcriptOf)
   }
 
-  async dueTranscripts(tenantId: string, lane: TranscriptLane, limit: number, noticeWaitMs?: number) {
+  async dueTranscripts(tenantId: string, lane: TranscriptLane, limit: number, noticeWaitMs?: number, skip: string[] = []) {
     const { rows } = await this.pool.query<TranscriptRow>(
       lane === 'transcribe'
-        ? `SELECT * FROM voicemail_transcripts WHERE tenant_id = $1 AND status = 'pending' AND next_at <= clock_timestamp() ORDER BY created_at, message_id LIMIT $2`
-        : `SELECT * FROM voicemail_transcripts WHERE tenant_id = $1 AND notice_next_at <= clock_timestamp()
+        ? `SELECT * FROM voicemail_transcripts WHERE tenant_id = $1 AND status = 'pending' AND next_at <= clock_timestamp() AND NOT (holder = ANY($3::text[])) ORDER BY created_at, message_id LIMIT $2`
+        : `SELECT * FROM voicemail_transcripts WHERE tenant_id = $1 AND notice_next_at <= clock_timestamp() AND NOT (holder = ANY($4::text[]))
              AND (notice IN ('redact', 'edit') OR (notice = 'pending' AND (status <> 'pending' OR ($3::float8 IS NOT NULL AND created_at <= clock_timestamp() - make_interval(secs => $3::float8 / 1000)))))
            ORDER BY (notice = 'redact') DESC, created_at, message_id LIMIT $2`,
-      lane === 'transcribe' ? [tenantId, Math.max(0, limit)] : [tenantId, Math.max(0, limit), noticeWaitMs ?? null]
+      lane === 'transcribe' ? [tenantId, Math.max(0, limit), skip.map(holderIn)] : [tenantId, Math.max(0, limit), noticeWaitMs ?? null, skip.map(holderIn)]
     )
     return rows.map(transcriptOf)
   }

@@ -447,14 +447,14 @@ export class MemoryStore implements Store {
       .map(r => MemoryStore.transcriptOut(r))
   }
 
-  async dueTranscripts(tenantId: string, lane: TranscriptLane, limit: number, noticeWaitMs?: number) {
+  async dueTranscripts(tenantId: string, lane: TranscriptLane, limit: number, noticeWaitMs?: number, skip: string[] = []) {
     const now = this.now()
     const due = (r: TranscriptRecord) =>
       lane === 'transcribe'
         ? r.status === 'pending' && Date.parse(r.nextAt) <= now
         : Date.parse(r.noticeNextAt) <= now && (r.notice === 'redact' || r.notice === 'edit' || (r.notice === 'pending' && (r.status !== 'pending' || (noticeWaitMs !== undefined && Date.parse(r.createdAt) <= now - noticeWaitMs))))
     return [...this.transcripts.values()]
-      .filter(r => r.tenantId === tenantId && due(r))
+      .filter(r => r.tenantId === tenantId && due(r) && !skip.includes(r.holder))
       .sort((a, b) => (lane === 'notice' ? Number(b.notice === 'redact') - Number(a.notice === 'redact') : 0) || a.created - b.created)
       .slice(0, Math.max(0, limit))
       .map(r => MemoryStore.transcriptOut(r))

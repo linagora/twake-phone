@@ -1485,6 +1485,11 @@ export const storeContract = (name: string, make: () => Promise<Store>) =>
       expect((await s.dueTranscripts('A', 'notice', 10, 3_600_000)).map(t => t.messageId)).toEqual([])
       await new Promise(r => setTimeout(r, 30))
       expect((await s.dueTranscripts('A', 'notice', 10, 10)).map(t => t.messageId)).toEqual(['m1', 'm2'])
+      // The rows of the holders left out (their mailboxes not read this round): none of theirs, all the others'.
+      expect((await s.dueTranscripts('A', 'notice', 10, 10, ['jdupont'])).map(t => t.messageId)).toEqual([])
+      expect((await s.dueTranscripts('A', 'transcribe', 10, undefined, ['jdupont'])).map(t => t.messageId)).toEqual([])
+      expect((await s.dueTranscripts('A', 'notice', 10, 10, ['bmartin'])).map(t => t.messageId)).toEqual(['m1', 'm2'])
+      expect((await s.dueTranscripts('A', 'transcribe', 10, undefined, ['bmartin'])).map(t => t.messageId)).toEqual(['m1', 'm3'])
       const [before] = await s.listTranscripts('A', 'jdupont', ['m1'])
       expect(await s.updateTranscript('A', 'jdupont', 'm1', { status: 'done', text: 'Bonjour Jean', attempts: 1 }, lease)).toBe(true)
       const [after] = await s.listTranscripts('A', 'jdupont', ['m1'])

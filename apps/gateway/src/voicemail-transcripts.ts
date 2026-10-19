@@ -158,20 +158,30 @@ const clock = (sec: number) => `${Math.floor(sec / 60)}:${String(Math.max(0, Mat
 const NO_TEXT: Record<NonNullable<TranscriptRecord['reason']>, string> = {
   'too-long': 'le message est trop long pour être transcrit',
   busy: 'trop de messages attendaient leur transcription',
-  failed: "le service de transcription n'a pas pu le transcrire"
+  failed: "le service de transcription n'a pas pu le transcrire",
+  untracked: "sa boîte vocale n'est plus suivie"
 }
 
 /**
  * The name the caller gave (`fromName`: theirs to choose), as a notice may show it: letters, digits, spaces and a
- * simple punctuation only (apostrophes, hyphens, commas, brackets, `&`), so that neither what changes how a text reads
- * (bidirectional controls, invisible joiners, line breaks) nor an address a client would make a link of (`://`,
- * `www.`, `@`) is left; its spaces folded, 64 characters at most.
+ * simple punctuation only (apostrophes, hyphens, commas, brackets, `&`; a `+` before the digits of a number at its
+ * start; a `.` after a lone letter, an initial as in `J.-P.`, never inside a word), so that neither what changes how a
+ * text reads (bidirectional controls, invisible joiners, line breaks) nor an address a client would make a link of
+ * (`://`, `www.`, `example.test`, `@`) is left; its spaces folded, 64 characters at most.
  */
 export const callerName = (name: string | undefined) => {
-  const clean = (name ?? '')
-    .replace(/[^\p{L}\p{M}\p{N}\p{Zs}'’\-,()&]/gu, ' ')
-    .replace(/\s+/g, ' ')
-    .trim()
+  const fold = (s: string) => s.replace(/\s+/g, ' ').trim()
+  const word = /[\p{L}\p{M}\p{N}]/u
+  const chars = Array.from(fold((name ?? '').replace(/[^\p{L}\p{M}\p{N}\p{Zs}'’\-,()&+.]/gu, ' ')))
+  const clean = fold(
+    chars
+      .map((c, i) => {
+        if (c === '+') return i === 0 && /\p{N}/u.test(chars[1] ?? '') ? c : ' '
+        if (c === '.') return /\p{L}/u.test(chars[i - 1] ?? '') && !word.test(chars[i - 2] ?? '') && !word.test(chars[i + 1] ?? '') ? c : ' '
+        return c
+      })
+      .join('')
+  )
   return clean ? Array.from(clean).slice(0, 64).join('') : undefined
 }
 
@@ -242,6 +252,8 @@ const brief = (err: unknown) => (err instanceof Error ? `${err.name}: ${err.mess
 class NotTheWriter extends Error {}
 /** The round ends here, the rows left as they are (the voicemail server, or the transcription service, out a while). */
 class Suspended extends Error {}
+/** The mailbox of one holder not read (the voicemail server failed for it): its rows passed for the round only. */
+class MailboxDown extends Suspended {}
 
 /** What the administrators are told of (kind `voicemail`). */
 export type TranscriptAlert = 'transcription-busy' | 'transcription-failed' | 'transcription-backlog' | 'transcription-held' | 'transcription-unreadable' | 'notice-failed' | 'notice-no-account' | 'notice-not-withdrawn'
@@ -301,6 +313,34 @@ const STALLED_MAX = 3
 const UNREADABLE_PASSES = 3
 const ROOM = 'matrix:room:'
 const LEAVE = 'matrix:leave:'
+/**
+ * What the reconciliation holds back (operator state): `gone` rows whose messages it no longer sees, of `of` rows read,
+ * since `since`; `print`, of which rows (a hash of them: none of their ids).
+ */
+const HELD = 'voicemail:transcripts-held'
+/** An administrator's word that the rows held back are gone for good (`gone` and `of` as they saw them, their `print`). */
+const RELEASE = 'voicemail:transcripts-release'
+export interface TranscriptsHeld {
+  gone: number
+  of: number
+  since: string
+}
+export interface TranscriptsRelease {
+  gone: number
+  of: number
+  by: string
+  at: string
+}
+type HeldState = TranscriptsHeld & { print: string }
+type ReleaseState = TranscriptsRelease & { print: string }
+const heldOf = (v: unknown): HeldState | undefined => {
+  const h = v as Partial<HeldState> | undefined
+  return h && typeof h.print === 'string' && Number.isSafeInteger(h.gone) && Number.isSafeInteger(h.of) && typeof h.since === 'string' ? (h as HeldState) : undefined
+}
+const releaseOf = (v: unknown): ReleaseState | undefined => {
+  const r = v as Partial<ReleaseState> | undefined
+  return r && typeof r.print === 'string' && Number.isSafeInteger(r.gone) && Number.isSafeInteger(r.of) && typeof r.by === 'string' && typeof r.at === 'string' ? (r as ReleaseState) : undefined
+}
 
 /** The room of the bot with a holder (operator state ROOM + print of the holder): its address, whose it is, and since when declined. */
 interface RoomState {
@@ -562,7 +602,8 @@ export class VoicemailTranscripts {
    * `orphanConfirmMs` later still does not see it, never on one read. None of a mailbox that had two rows or more and
    * reads empty, and none at all when every mailbox read is empty or more than half of the rows read (two at least)
    * went at once (a spool the voicemail server no longer sees reads empty, without failing): held back, the
-   * administrators told (`transcription-held`), the rows left for their `voicemail.deleted` or the retention period. A
+   * administrators told (`transcription-held`), the rows left for their `voicemail.deleted`, the retention period or
+   * an administrator's word that these very rows are gone for good (`release`: then confirmed as any other). A
    * mailbox that cannot be read is passed (the next ones read all the same), told once it stays so UNREADABLE_PASSES
    * times in a row.
    */
@@ -580,6 +621,9 @@ export class VoicemailTranscripts {
     let goneAll = 0
     let listed = 0
     const missing: { holder: string; messageId: string }[] = []
+    // The rows of the mailboxes read empty (held back unless released), and the keys of every row gone (their print).
+    const emptiedRows: { holder: string; messageId: string }[] = []
+    const goneKeys: string[] = []
     const boxes = await this.o.mailboxes(tenantId)
     for (const box of boxes) {
       if (!this.mayWrite(tenantId, lease)) return
@@ -608,14 +652,36 @@ export class VoicemailTranscripts {
       }
       const gone = rows.filter(r => !there.has(r.messageId))
       goneAll += gone.length
-      if (!messages.length && gone.length >= 2) emptied++
-      else missing.push(...gone.map(r => ({ holder: box.holder, messageId: r.messageId })))
+      goneKeys.push(...gone.map(r => `${box.holder}\u0000${r.messageId}`))
+      const keys = gone.map(r => ({ holder: box.holder, messageId: r.messageId }))
+      if (!messages.length && gone.length >= 2) {
+        emptied++
+        emptiedRows.push(...keys)
+      } else missing.push(...keys)
     }
+    if (!this.mayWrite(tenantId, lease)) return
     const seen = this.orphans.get(tenantId) ?? new Map<string, number>()
-    const mass = goneAll > 0 && (listed === 0 || (goneAll >= 2 && goneAll * 2 > rowsRead))
+    let mass = goneAll > 0 && (listed === 0 || (goneAll >= 2 && goneAll * 2 > rowsRead))
     if (mass || emptied) {
-      this.quietly(tenantId, 'held', { emptied, gone: goneAll, rows: rowsRead }, 'voicemail transcriptions: mailboxes read empty, or too many messages gone at once: not erased, the administrators told')
-      await this.o.alert(tenantId, 'transcription-held', goneAll).catch(() => undefined)
+      // Held back, unless an administrator said these very rows are gone for good (the same print): then each erased
+      // as any other, once two reconciliations `orphanConfirmMs` apart still miss its message.
+      const print = createHash('sha256').update(goneKeys.sort().join('\n')).digest('base64url')
+      const release = releaseOf(await this.o.store.getOperatorState(tenantId, RELEASE))
+      if (release?.print === print) {
+        mass = false
+        missing.push(...emptiedRows)
+      } else {
+        const before = heldOf(await this.o.store.getOperatorState(tenantId, HELD))
+        if (before?.print !== print || before.gone !== goneAll || before.of !== rowsRead)
+          await this.o.store.putOperatorState(tenantId, HELD, { gone: goneAll, of: rowsRead, print, since: before?.since ?? new Date().toISOString() } satisfies HeldState)
+        if (release) await this.o.store.deleteOperatorState(tenantId, RELEASE, release)
+        this.quietly(tenantId, 'held', { emptied, gone: goneAll, rows: rowsRead }, 'voicemail transcriptions: mailboxes read empty, or too many messages gone at once: not erased, the administrators told')
+        await this.o.alert(tenantId, 'transcription-held', goneAll).catch(() => undefined)
+      }
+    } else if (read === boxes.length) {
+      // Nothing held back (every mailbox read): what was, and its release, done with.
+      await this.o.store.deleteOperatorState(tenantId, HELD)
+      await this.o.store.deleteOperatorState(tenantId, RELEASE)
     }
     if (mass) {
       // Not one erased this time, and those seen before are seen again from scratch.
@@ -648,6 +714,33 @@ export class VoicemailTranscripts {
       this.quietly(tenantId, 'backlog', { waiting }, 'voicemail transcriptions: transcriptions or notices wait for too long')
       await this.o.alert(tenantId, 'transcription-backlog', waiting).catch(() => undefined)
     }
+  }
+
+  /** What the reconciliation holds back now, and the release an administrator gave it, if any. */
+  async held(tenantId: string): Promise<{ held?: TranscriptsHeld; release?: TranscriptsRelease }> {
+    const held = heldOf(await this.o.store.getOperatorState(tenantId, HELD))
+    const release = releaseOf(await this.o.store.getOperatorState(tenantId, RELEASE))
+    return {
+      ...(held ? { held: { gone: held.gone, of: held.of, since: held.since } } : {}),
+      ...(release && release.print === held?.print ? { release: { gone: release.gone, of: release.of, by: release.by, at: release.at } } : {})
+    }
+  }
+
+  /**
+   * An administrator's word that the rows held back are gone for good (deleted while no event was heard: a mailbox
+   * emptied from the phone, many messages at once), given with the counts they saw (`gone`, `of`): `nothing` when
+   * nothing is held back, `changed` when what is held back is no longer that. Released, those very rows only, not one
+   * erased before two reconciliations `orphanConfirmMs` apart still miss its message; held back again at once if any
+   * other goes or comes back meanwhile.
+   */
+  async release(tenantId: string, seen: { gone: number; of: number }, by: string): Promise<'nothing' | 'changed' | TranscriptsRelease> {
+    const held = heldOf(await this.o.store.getOperatorState(tenantId, HELD))
+    if (!held) return 'nothing'
+    if (held.gone !== seen.gone || held.of !== seen.of) return 'changed'
+    const release: ReleaseState = { gone: held.gone, of: held.of, print: held.print, by, at: new Date().toISOString() }
+    await this.o.store.putOperatorState(tenantId, RELEASE, release)
+    void this.reconcile(tenantId)
+    return { gone: release.gone, of: release.of, by, at: release.at }
   }
 
   /** Looks at what is due for the tenant now, in each queue (`lane`) or one: one round at a time each, one asked meanwhile runs after it. */
@@ -689,14 +782,14 @@ export class VoicemailTranscripts {
   }
 
   private async round(tenantId: string, lane: TranscriptLane) {
-    // The mailboxes not read this round (their rows passed): one unreadable leaves the others' going; a few, the
-    // voicemail server is out, the round ends.
+    // The mailboxes not read this round (their rows left out of the next lots): one unreadable leaves the others'
+    // going, however many of its rows are due; a few, the voicemail server is out, the round ends.
     const stalled = new Set<string>()
     for (let batch = 0; batch < 10; batch++) {
       const lease = this.lease(tenantId)
       if (!lease) return
       if (lane === 'transcribe' && this.o.transcription && Date.now() < this.breaker.until) return
-      const due = await this.o.store.dueTranscripts(tenantId, lane, 20, this.o.transcription ? (this.o.noticeWaitMs ?? 600_000) : undefined)
+      const due = await this.o.store.dueTranscripts(tenantId, lane, 20, this.o.transcription ? (this.o.noticeWaitMs ?? 600_000) : undefined, [...stalled])
       if (!due.length) break
       for (const r of due) {
         if (!this.mayWrite(tenantId, lease)) return
@@ -708,14 +801,14 @@ export class VoicemailTranscripts {
           else await this.notify(tenantId, r, lease)
         } catch (err) {
           if (err instanceof NotTheWriter) return
-          if (err instanceof Suspended) {
+          if (err instanceof MailboxDown) {
             if (stalled.add(r.holder).size >= STALLED_MAX) return
             continue
           }
+          if (err instanceof Suspended) return
           this.o.log.error({ tenantId, err: brief(err) }, 'voicemail transcription: a step failed, again at the next round')
         }
       }
-      if (stalled.size) break
     }
     if (lane === 'notice') await this.sweep(tenantId)
   }
@@ -734,8 +827,16 @@ export class VoicemailTranscripts {
       return await this.messageOf(tenantId, r)
     } catch (err) {
       this.quietly(tenantId, 'voicemail', { err: brief(err) }, 'voicemail transcription: the voicemail server does not answer, the transcriptions and notices wait')
-      throw new Suspended()
+      throw new MailboxDown()
     }
+  }
+
+  /**
+   * Whether the holder of a row has a mailbox the reconciliation reads (an extension): a row of someone without one is
+   * never erased by it, and its message not found is not looked for again (`untracked`, no notice; the row kept).
+   */
+  private async tracked(tenantId: string, holder: string) {
+    return (await this.o.mailboxes(tenantId)).some(b => b.holder === holder)
   }
 
   /** A row whose message its transcription does not find: kept, looked for again later (the reconciliation erases it once its absence is confirmed). */
@@ -770,8 +871,9 @@ export class VoicemailTranscripts {
     if (Date.now() < this.breaker.until) throw new Suspended()
     const { vm, owner, message } = await this.messageOrSuspend(tenantId, r)
     if (!vm || !owner) return
-    // Not seen (deleted, purged, or a mailbox read empty a while): its row kept, looked for again later.
-    if (!message) return this.lookAgain(tenantId, r, lease)
+    // Not seen (deleted, purged, or a mailbox read empty a while): its row kept, looked for again later; its holder
+    // without an extension any more, not looked for again.
+    if (!message) return (await this.tracked(tenantId, r.holder)) ? this.lookAgain(tenantId, r, lease) : this.settle(tenantId, r, { status: 'none', reason: 'untracked' }, lease)
     if (message.durationSec > t.maxSec) return this.settle(tenantId, r, { status: 'none', reason: 'too-long' }, lease)
     const attempts = r.attempts + 1
     let asked = false
@@ -864,8 +966,9 @@ export class VoicemailTranscripts {
       if (matrixId.slice(matrixId.indexOf(':') + 1) !== me.serverName || matrixId === me.userId) return this.noAccount(tenantId, r, lease, "not on the bot's server", matrixId)
       const { message } = await this.messageOrSuspend(tenantId, r)
       // Not seen (deleted, purged, or a mailbox read empty a while): nothing sent now, looked for again later; the
-      // reconciliation erases its row once its absence is confirmed.
+      // reconciliation erases its row once its absence is confirmed. Its holder without an extension any more: none.
       if (!message) {
+        if (!(await this.tracked(tenantId, r.holder))) return none()
         this.guard(tenantId, lease)
         await this.update(tenantId, r, { noticeNextAt: new Date(Date.now() + LOOK_AGAIN_MS).toISOString() }, lease)
         return
@@ -895,8 +998,32 @@ export class VoicemailTranscripts {
   }
 
   /**
+   * Whether the room of a notice may still have its text, as when it was sent: its holder's id theirs still, their
+   * Matrix id the room's, they and the bot alone in it.
+   */
+  private async stillTheirs(tenantId: string, r: TranscriptRecord) {
+    const n = this.o.notices!
+    const userId = userOfHolder(r.holder)
+    if ((await this.o.holderIdFor(tenantId, userId)) !== r.holder) return false
+    let matrixId: string | undefined
+    try {
+      matrixId = (await n.matrixIdOf(tenantId, userId)) ?? matrixIdFromTemplate(n.userTemplate, userId)
+    } catch (err) {
+      if ((err as { code?: unknown } | null)?.code === MATRIX_ID_AMBIGUOUS) return false
+      throw err
+    }
+    if (!matrixId) return false
+    const room = roomStateOf(await this.o.store.getOperatorState(tenantId, ROOM + holderKey(tenantId, r.holder)))
+    if (!room?.roomId || room.roomId !== r.noticeRoom || room.matrixId !== matrixId) return false
+    const me = await n.bot.whoami(this.signal)
+    return (await this.usable(room.roomId, matrixId, me.userId)) === 'ok'
+  }
+
+  /**
    * A notice sent before its transcription, completed with it: a replacement (`m.replace`) of the same notice, with the
-   * text (or why there is none). Withdrawn with it. A message gone meanwhile: left as it is (withdrawn with its erasure).
+   * text (or why there is none), only while the room is still theirs alone (`stillTheirs`; else the notice stays as it
+   * was sent, the text in TwakePhone). Withdrawn with it. A message gone meanwhile: left as it is (withdrawn with its
+   * erasure).
    */
   private async complete(tenantId: string, r: TranscriptRecord, lease: FencedLease) {
     const n = this.o.notices
@@ -908,6 +1035,10 @@ export class VoicemailTranscripts {
     try {
       const { message } = await this.messageOrSuspend(tenantId, r)
       if (!message) return sent()
+      if (!(await this.stillTheirs(tenantId, r))) {
+        this.o.log.info({ tenantId }, 'voicemail notice not completed with its transcription: its room is no longer the person\'s alone with the bot')
+        return sent()
+      }
       const content = noticeContent(message, r, n)
       this.guard(tenantId, lease)
       const editId = await n.bot.send(
