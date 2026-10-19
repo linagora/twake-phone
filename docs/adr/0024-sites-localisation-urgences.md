@@ -21,6 +21,7 @@ Un appel d'urgence part vers le trunk en présentant le numéro direct de l'appe
 ## Conséquences
 
 - Un site « Télétravail » (l'adresse du domicile, un numéro déclaré chez l'opérateur pour elle) est possible, mais l'app ne sait pas où est la personne : l'affectation reste celle d'un administrateur. Une personne qui change de site change de numéro d'urgence quand un administrateur le dit, pas avant.
+- La passerelle vérifie le numéro d'un site quand on l'écrit, pas quand un trunk change après coup (son numéro par défaut, une plage de numéros directs retirée) : l'opérateur refuserait alors le numéro, et l'appel d'urgence repart une fois par le trunk par défaut avec son numéro (ADR 0016), jamais sans appel.
 - Il reste à l'exploitant : déclarer chez l'opérateur l'adresse de chaque numéro de site, et vérifier avec lui que ses urgences sont acceptées sur ce trunk. Les obligations légales de localisation (code des postes et des communications électroniques) ne sont pas validées pour un usage au-delà d'un pilote ; `docker/pilot/README.md` le dit.
 - Prouvé contre l'opérateur simulé (`apps/web/test/trunk.sip.mjs`) : le 112 d'un membre présente le numéro de son site et prend le trunk du site, celui d'un autre sans site garde son numéro direct, un autre appel du même membre garde le sien, base verrouillée le numéro du site tient. Rien n'est vérifié contre un vrai opérateur.
 
