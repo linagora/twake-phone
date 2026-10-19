@@ -101,8 +101,13 @@ export class MeetApi {
     }
   }
 
-  createRoom(email: string): Promise<MeetRoom> {
-    return this.asUser(email, async token => toRoom(await this.request<RawRoom>('/rooms/', { method: 'POST', token, body: {} })))
+  createRoom(email: string, { accessLevel }: { accessLevel?: string } = {}): Promise<MeetRoom> {
+    return this.asUser(email, async token => {
+      const room = toRoom(await this.request<RawRoom>('/rooms/', { method: 'POST', token, body: accessLevel ? { access_level: accessLevel } : {} }))
+      // Asked for a level Meet did not give (a version that ignores it): never a room more open than asked (step 8d, ADR 0026).
+      if (accessLevel && room.accessLevel !== accessLevel) throw new MeetError(`Meet made a room of access ${room.accessLevel ?? 'unknown'}, not ${accessLevel}`, 502)
+      return room
+    })
   }
 
   /** The room with this slug (or id), only if the user has access to it in Meet. */

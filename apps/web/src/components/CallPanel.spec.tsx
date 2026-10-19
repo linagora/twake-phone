@@ -41,7 +41,8 @@ const reads = (...answers: (ConferenceParticipant[] | Error | Promise<Conference
     return { meetingId: ROOM, participants: await next }
   })
   const muteParticipant = vi.fn(async () => undefined)
-  const client: Partial<Gateway['client']> = { getCallConference, muteParticipant }
+  const getCapabilities = vi.fn(async () => ({ conference: { dialIn: true, dialOut: true } }))
+  const client: Partial<Gateway['client']> = { getCallConference, muteParticipant, getCapabilities: getCapabilities as unknown as Gateway['client']['getCapabilities'] }
   gateway = { client: client as Gateway['client'], me: { extension: '101' } as Gateway['me'] }
   return { getCallConference, muteParticipant }
 }
@@ -269,6 +270,59 @@ describe('CallPanel, a conference (step 8b): who comes in or leaves is told in t
     expect(host.querySelector('[data-testid="conference-confirm"]')).toBeNull()
     expect(document.activeElement === host.querySelector('.call-title') || document.activeElement === document.body).toBe(true)
     expect(button('call.addParticipant').disabled).toBe(false)
+  })
+
+  it('offers « Passer en visio » to the one who made the conference when Meet is there, not while a call with the operator waits; the click opens a tab, pointed at the room Meet made; numbers called again ask for the person\'s word before the old room ends (step 8d)', async () => {
+    reads([alice(true), jean()])
+    const startVisio = vi.fn(async (_id: string) => ({ meetingId: 'fe15dd04-262c-48d6-83de-d82ab167deb3', slug: 'abc-defg-hij', url: 'https://meet.example/abc-defg-hij', swapped: ['102'], called: ['+33612345678'], failed: ['104'] }))
+    const leaveVisio = vi.fn(async (_id: string, _room: string) => undefined)
+    const call = roomCall(true, 'room-a@192.0.2.30')
+    const renderIt = (caps: boolean, awaiting: boolean) =>
+      act(async () => {
+        Object.assign(gateway.client, { getCapabilities: async () => ({ conference: { dialIn: true, dialOut: true, ...(caps ? { visio: true } : {}) } }), startVisio, leaveVisio })
+        phone = { calls: [call], lastEnded: null, tones: {}, rooms: { [call.conferenceOf!]: ROOM }, parties: {}, inviting: {}, awaiting: awaiting ? { [call.conferenceOf!]: '+33612345678' } : {}, confirmConference: async () => undefined, cancelAwaiting: async () => undefined }
+        root.render(<CallPanel />)
+        await vi.advanceTimersByTimeAsync(0)
+      })
+    const button = (name: string) => [...host.querySelectorAll('button')].find(b => b.textContent === name)
+    await renderIt(false, false)
+    expect(button('conference.visio')).toBeUndefined()
+    act(() => root.unmount())
+    root = createRoot(host)
+    // A call with the operator waits for the person: the button is there and off.
+    await renderIt(true, true)
+    expect(button('conference.visio')!.disabled).toBe(true)
+    act(() => root.unmount())
+    root = createRoot(host)
+    await renderIt(true, false)
+    const tab = { opener: 'us', location: { href: '' }, close: vi.fn() }
+    vi.stubGlobal('open', vi.fn(() => tab))
+    expect(button('conference.visio')!.disabled).toBe(false)
+    await act(async () => {
+      button('conference.visio')!.click()
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    expect(startVisio).toHaveBeenCalledWith(ROOM)
+    expect(tab.opener).toBeNull()
+    expect(tab.location.href).toBe('https://meet.example/abc-defg-hij')
+    // The numbers called again: asked, the old room kept; not offered again meanwhile; the ones not called again are said.
+    expect(host.querySelector('[role="alert"]')?.textContent).toContain('conference.visioAwaiting +33 6 12 34 56 78')
+    expect(host.textContent).toContain('conference.visioFailed 104')
+    expect(button('conference.visio')!.disabled).toBe(true)
+    await act(async () => {
+      button('conference.visioLeave')!.click()
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    expect(leaveVisio).toHaveBeenCalledWith(ROOM, 'fe15dd04-262c-48d6-83de-d82ab167deb3')
+    expect(host.querySelector('[role="alert"]')).toBeNull()
+    // Meet says no: the tab is closed and the person told.
+    startVisio.mockRejectedValueOnce(Object.assign(new Error('VISIO_UNAVAILABLE'), { code: 'VISIO_UNAVAILABLE' }))
+    await act(async () => {
+      button('conference.visio')!.click()
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    expect(tab.close).toHaveBeenCalled()
+    expect(host.textContent).toContain('conference.errorVisioUnavailable')
   })
 
 })

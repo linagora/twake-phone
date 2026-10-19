@@ -52,14 +52,15 @@
 // (docker compose -f docker/docker-compose.sip.yml exec wazo-asterisk; COMPOSE_PROJECT_NAME as Docker Compose reads
 // it), and docker/wazo/check-loopback.py runs during a call to a mailbox (as root: sudo -n when this is not root).
 import { execFileSync } from 'node:child_process'
-import { createHmac, randomBytes } from 'node:crypto'
+import { createHmac, randomBytes, randomUUID } from 'node:crypto'
 import { createSocket } from 'node:dgram'
 import { readFileSync } from 'node:fs'
+import { createServer as createHttpServer } from 'node:http'
 import { createServer, connect } from 'node:net'
 import { fileURLToPath } from 'node:url'
 import pg from 'pg'
 import { chromium, firefox } from 'playwright-core'
-import { LiveKitConferenceBridge } from '../../../packages/conference-livekit/dist/index.js'
+import { LiveKitConferenceBridge, MeetApi } from '../../../packages/conference-livekit/dist/index.js'
 import { buildApp } from '../../gateway/dist/app.js'
 import { RateLimiter } from '../../gateway/dist/contacts.js'
 import { WebPush } from '../../gateway/dist/push.js'
@@ -3118,6 +3119,95 @@ try {
       await at.callState(call, 'ended')
     } finally {
       expectEqual((await api('PUT', '/admin/outbound', { policy: { fraud: FRAUD } })).statusCode, 200, 'PUT /admin/outbound (no profile)')
+    }
+  })
+  // Step 8d (ADR 0026): « Passer en visio ». Meet is played by this process (its external API and the page of a room),
+  // attached to the Gateway for the one step: the stack has no Meet.
+  await step('step 8d: Alice takes a conference (Jean, Bob, a number of the operator) to video: Meet makes a restricted room, each person is called again from it (Jean and Bob in the place of their call, no ringing; the number by a new call), Alice\'s tab opens on the room; the old calls stay until Alice says she hears the number, then the old room ends', async () => {
+    const meetRoom = { id: randomUUID(), slug: 'abc-defg-hij', name: 'abc-defg-hij' }
+    const asked = []
+    const meet = createHttpServer((req, res) => {
+      let raw = ''
+      req.on('data', c => (raw += c))
+      req.on('end', () => {
+        asked.push(`${req.method} ${req.url} ${raw}`)
+        const json = (code, body) => (res.writeHead(code, { 'content-type': 'application/json' }), res.end(JSON.stringify(body)))
+        if (req.method === 'POST' && req.url?.startsWith('/external-api/v1.0/application/token/')) return json(200, { access_token: 'e2e-meet', expires_in: 3600 })
+        if (req.method === 'POST' && req.url?.startsWith('/external-api/v1.0/rooms/')) return json(201, { ...meetRoom, url: meetRoom.url, access_level: JSON.parse(raw || '{}').access_level ?? 'public' })
+        if (req.method === 'GET' && req.url?.startsWith('/external-api/v1.0/rooms/')) return json(200, { results: [{ ...meetRoom, url: meetRoom.url }], next: null })
+        res.writeHead(200, { 'content-type': 'text/html' })
+        res.end('<!doctype html><title>Meet</title><p>The room of Meet (played by the e2e).</p>')
+      })
+    })
+    await new Promise(resolve => meet.listen(0, '127.0.0.1', resolve))
+    meetRoom.url = `http://127.0.0.1:${meet.address().port}/${meetRoom.slug}`
+    conference.meet = new MeetApi({ url: `http://127.0.0.1:${meet.address().port}`, clientId: 'e2e', clientSecret: 'e2e' })
+    try {
+      // The conference: Alice, Jean, Bob, and a number of the operator.
+      await aliceCallsJean(alice, jean)
+      await alice.page.getByRole('button', { name: 'Ajouter un participant' }).click()
+      await alice.page.getByLabel('Participant à ajouter (poste ou numéro)').fill('103')
+      await alice.page.getByRole('button', { name: 'Appeler et ajouter' }).click()
+      const ringing = bob.page.getByTestId('incoming-call')
+      await ringing.waitFor({ timeout: 30_000 })
+      await ringing.getByRole('button', { name: 'Répondre' }).click()
+      await until('Bob in the conference', async () => ((await calls(bob.page))[0]?.state === 'connected' ? true : null), { timeout: 30_000 })
+      await alice.page.getByTestId('conference-participant').nth(2).waitFor({ timeout: 20_000 })
+      await alice.page.getByRole('button', { name: 'Ajouter un participant' }).click()
+      await alice.page.getByLabel('Participant à ajouter (poste ou numéro)').fill('06 39 98 00 07')
+      await alice.page.getByRole('button', { name: 'Appeler et ajouter' }).click()
+      const { call: first, at } = await invitedAtOperator(invite => invite.uri === 'sip:+33639980007@operator.example')
+      await at.callState(first, 'answered')
+      const room = await until('the room of the conference', async () => (await store.listConferences(TENANT, 'amartin')).find(r => /^twake-call-[0-9a-f]{16}$/.test(r.meetingId))?.meetingId ?? null)
+      await until('the number in the room', async () => ((await bridge.participantCalls(room)).some(p => p.number === '+33639980007') ? true : null), { timeout: 30_000 })
+      expectEqual(await jean.page.getByRole('button', { name: 'Passer en visio' }).count(), 0, 'the button to go to video on Jean\'s page')
+      const [aliceOwn] = await calls(alice.page)
+      const [jeans] = await calls(jean.page)
+      const popup = alice.context.waitForEvent('page')
+      await alice.page.getByRole('button', { name: 'Passer en visio' }).click()
+      const tab = await popup
+      await tab.waitForURL(meetRoom.url, { timeout: 30_000 })
+      await tab.getByText('The room of Meet').waitFor()
+      // Meet was asked for one room, the most closed it gives.
+      const made = asked.filter(a => a.startsWith('POST /external-api/v1.0/rooms/'))
+      expectEqual(made.length, 1, 'the rooms Meet was asked for')
+      expectEqual(JSON.parse(made[0].replace(/^POST \S+ /, '')).access_level, 'restricted', 'the access of the room of Meet')
+      expectEqual((await store.getConference(meetRoom.id))?.ownerUserId, 'amartin', 'the owner of the room of Meet')
+      // Jean and Bob: their call replaced by the one of Meet's room, at once (no ringing), going on; the number called again.
+      const [hisNew] = await until('Jean on the room of Meet', async () => {
+        const c = await calls(jean.page)
+        return c.length === 1 && c[0].state === 'connected' && c[0].replacedCallId === jeans.id ? c : null
+      }, { timeout: 30_000 })
+      expectEqual(hisNew.room, 'conference', 'Jean\'s call from the room of Meet')
+      await until('Bob on the room of Meet', async () => ((await calls(bob.page)).length === 1 && (await calls(bob.page))[0].replacedCallId ? true : null), { timeout: 30_000 })
+      const { call: second, at: at2 } = await invitedAtOperator(invite => invite.uri === 'sip:+33639980007@operator.example')
+      await at2.callState(second, 'answered')
+      const inMeet = await until('everyone in the room of Meet', async () => {
+        const now = (await bridge.participantCalls(meetRoom.id)).map(p => p.number).sort()
+        return now.join(' ') === '+33639980007 102 103' ? now : null
+      }, { timeout: 30_000 })
+      expectEqual(inMeet.join(' '), '+33639980007 102 103', 'who is in the room of Meet')
+      // The number is called again: its old call and Alice's own stay until she says she hears it.
+      await alice.page.getByText(/ont été rappelés dans la salle Meet/).waitFor({ timeout: 20_000 })
+      await sleep(1_500)
+      expectEqual(first.state, 'answered', 'the old call at the operator before Alice says so')
+      expectEqual((await calls(alice.page)).some(c => c.id === aliceOwn.id), true, 'Alice\'s own call before she says so')
+      await alice.page.getByRole('button', { name: "Terminer l'ancienne salle" }).click()
+      await at.callState(first, 'ended', 20_000)
+      await until('the end of Alice\'s own call', async () => ((await calls(alice.page)).length === 0 ? true : null), { timeout: 20_000 })
+      await until('the old room gone', async () => ((await store.getConference(room)) === null ? true : null), { timeout: 20_000 })
+      // They go on, in Meet's room, and hear each other and the operator's number.
+      expectEqual(`${(await calls(jean.page)).length} ${(await calls(bob.page)).length} ${second.state}`, '1 1 answered', 'the calls after the old room ended')
+      await bothHearEachOther(jean, bob)
+      await until('sound from the room of Meet at the operator', async () => (second.media.stats.voiced > 20 ? true : null), { timeout: 30_000 })
+      await tab.close()
+      for (const who of [jean, bob]) await who.page.getByRole('button', { name: 'Quitter la conférence' }).click()
+      for (const who of [jean, bob]) await until(`the end of ${who.name}'s call`, async () => ((await calls(who.page)).length === 0 ? true : null), { timeout: 20_000 })
+      await at2.hangupReceived(second).catch(() => undefined)
+      await store.deleteConference(meetRoom.id)
+    } finally {
+      delete conference.meet
+      await new Promise(resolve => meet.close(resolve))
     }
   })
   await step('a registration left on a dead connection (the first one, Alice) with a no-answer forward: Bob rings at once, not after the delay', async () => {

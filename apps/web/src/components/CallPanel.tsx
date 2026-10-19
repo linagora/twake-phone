@@ -368,6 +368,41 @@ const ConferenceCall = ({ call, tones, onError, onNotice }: { call: SoftCall; to
   // Who the conference this window made began with (POST /calls/:id/conference): no news to it.
   const began = call.conferenceOf ? phone.parties[call.conferenceOf] : undefined
   const waitingFor = call.conferenceOf ? phone.awaiting[call.conferenceOf] : undefined
+  // « Passer en visio » (step 8d): offered to the one who made the conference when Meet is there (read when it opens), not
+  // while a call with the operator waits for their word, nor while a visio waits for it.
+  const [visioOffered, setVisioOffered] = useState(false)
+  const [visio, setVisio] = useState<{ room: string; called: string[]; failed: string[] } | null>(null)
+  const [openingVisio, setOpeningVisio] = useState(false)
+  useEffect(() => {
+    if (!mine) return
+    let cancelled = false
+    client.getCapabilities().then(caps => !cancelled && setVisioOffered(caps.conference?.visio === true), () => undefined)
+    return () => {
+      cancelled = true
+    }
+  }, [client, mine])
+  const goVisio = () => {
+    // A tab the click itself opens (a popup blocker lets it), pointed at Meet's room once it is made; the page that opened
+    // it is out of its reach.
+    const tab = window.open('about:blank', '_blank')
+    if (tab) tab.opener = null
+    setOpeningVisio(true)
+    void (async () => {
+      onError(null)
+      try {
+        const room = await client.startVisio(meetingId!)
+        if (!room.url) throw Object.assign(new Error('no link'), { code: 'VISIO_UNAVAILABLE' })
+        if (tab) tab.location.href = room.url
+        onNotice(t('conference.visioOpened'))
+        if (room.called.length || room.failed.length) setVisio({ room: room.meetingId, called: room.called, failed: room.failed })
+      } catch (err) {
+        tab?.close()
+        onError(describeConferenceError(err, t))
+      } finally {
+        setOpeningVisio(false)
+      }
+    })()
+  }
   // One decision at a time: the two buttons are off while a request is out (no double send, no crossing).
   const [deciding, setDeciding] = useState(false)
   const decide = (fn: () => Promise<void>) => () => {
@@ -442,6 +477,14 @@ const ConferenceCall = ({ call, tones, onError, onNotice }: { call: SoftCall; to
           </button>
         </Confirm>
       ) : null}
+      {visio ? (
+        <Confirm id={`visio-${call.id}`} alert question={t('conference.visioAwaiting', { who: visio.called.map(n => formatNumber(n)).join(', ') })}>
+          {visio.failed.length ? <p className="badge">{t('conference.visioFailed', { who: visio.failed.map(n => formatNumber(n)).join(', ') })}</p> : null}
+          <button type="button" className="btn btn-primary" disabled={deciding} onClick={decide(async () => { await client.leaveVisio(meetingId!, visio.room); setVisio(null) })}>
+            {t('conference.visioLeave')}
+          </button>
+        </Confirm>
+      ) : null}
       {meetingId ? <Participants key={meetingId} meetingId={meetingId} manage={mine} {...(call.sipCallId ? { call: call.sipCallId } : {})} {...(began ? { parties: began } : {})} onError={onError} onNotice={onNotice} /> : null}
       <div className="actions">
         {connected ? (
@@ -457,6 +500,11 @@ const ConferenceCall = ({ call, tones, onError, onNotice }: { call: SoftCall; to
         <button ref={leaveButton} type="button" className="btn btn-danger" aria-expanded={mine && meetingId ? asking === 'leave' : undefined} onClick={mine && meetingId ? () => setAsking('leave') : guard(() => call.hangup())}>
           {t('conference.leave')}
         </button>
+        {mine && meetingId && visioOffered ? (
+          <button type="button" className="btn" disabled={!!waitingFor || openingVisio || !!visio} onClick={goVisio}>
+            {t('conference.visio')}
+          </button>
+        ) : null}
         {mine && meetingId ? (
           <button ref={endButton} type="button" className="btn btn-danger" aria-expanded={asking === 'end'} onClick={() => setAsking('end')}>
             {t('conference.end')}

@@ -32,10 +32,12 @@ const JOIN = '0123456789abcdef'.repeat(2)
  * has the Call-ID of its call (`sip.callIDFull`); the room's call to the group 600 is answered by Carol (104), whom
  * the SIP server tells of it (second review 8b, n°4). Dave (105) holds an extension and is in none.
  */
-const setup = async ({ failFor, failTaken, divertFor, untakenFor, leaveFor, trunkAt = 'pbx:5060', trunkMovesAt, dialOutLimiter, conferenceCaps, ownerCheckMs, takenFails, miFails, vanish, failStatus, slowFor, endsWhileRinging }: { endsWhileRinging?: boolean; vanish?: { id: string; after: number }; failStatus?: { code: string; status: number; reason: string }; slowFor?: string; takenFails?: boolean; miFails?: boolean; failFor?: string; failTaken?: 'own' | 'another' | 'ringing'; divertFor?: string; untakenFor?: string; leaveFor?: string; trunkAt?: string; trunkMovesAt?: string; dialOutLimiter?: RateLimiter; conferenceCaps?: { perPerson?: number }; ownerCheckMs?: number } = {}) => {
+const setup = async ({ failFor, failTaken, divertFor, untakenFor, leaveFor, trunkAt = 'pbx:5060', trunkMovesAt, dialOutLimiter, conferenceCaps, ownerCheckMs, takenFails, miFails, vanish, failStatus, slowFor, endsWhileRinging, meet, noDialogFor, divertInMeet }: { divertInMeet?: string; meet?: { createRoom(email: string, options?: { accessLevel?: string }): Promise<unknown>; findRoom(email: string, by: unknown): Promise<unknown> }; noDialogFor?: string; endsWhileRinging?: boolean; vanish?: { id: string; after: number }; failStatus?: { code: string; status: number; reason: string }; slowFor?: string; takenFails?: boolean; miFails?: boolean; failFor?: string; failTaken?: 'own' | 'another' | 'ringing'; divertFor?: string; untakenFor?: string; leaveFor?: string; trunkAt?: string; trunkMovesAt?: string; dialOutLimiter?: RateLimiter; conferenceCaps?: { perPerson?: number }; ownerCheckMs?: number } = {}) => {
   const grants: (RoomCallGrant & { token: string; revoked: boolean; taken?: { tag: string; callId: string } })[] = []
   const ended: string[] = []
   let reads = 0
+  const dialogOf = new Map<string, string>()
+  const isDiverted = (body: { sip_call_to?: string; room_name?: string }) => body.sip_call_to === divertFor || (body.sip_call_to === divertInMeet && !/^twake-call-/.test(body.room_name ?? ''))
   let opReads = 0
   // `endsWhileRinging`: the original call is over from the moment the callback starts to ring (its correspondent took the callback).
   let ringing = false
@@ -66,6 +68,11 @@ const setup = async ({ failFor, failTaken, divertFor, untakenFor, leaveFor, trun
         getCapabilities: async () => ({ conference: { dialIn: false, dialOut: true } }) as never,
         subscribe: async function* () {
           for (const e of events) yield e
+        },
+        // The dialog of a call a room placed to an extension, as the SIP server holds it (step 8d).
+        roomCallParties: async (id: string) => {
+          const callee = dialogOf.get(id)
+          return callee && callee !== noDialogFor && /^[0-9]{2,6}$/.test(callee) ? { callId: id, caller: '101', callerTag: id.split('@')[0]!, callee, calleeTag: `t-${callee}` } : undefined
         },
         grantRoomCall: async (g: RoomCallGrant) => {
           const kept: (typeof grants)[number] = { ...g, token: String(grants.length).padStart(32, 'c'), revoked: false }
@@ -124,15 +131,17 @@ const setup = async ({ failFor, failTaken, divertFor, untakenFor, leaveFor, trun
       }
       if (body.sip_call_to === failFor) return { ok: false, status: 400, text: async () => JSON.stringify({ code: failStatus?.code ?? 'unavailable', msg: `sip status: ${failStatus?.status ?? 486}: ${failStatus?.reason ?? 'Busy Here'}`, meta: { sip_status_code: String(failStatus?.status ?? 486), sip_status: failStatus?.reason ?? 'Busy Here' } }) }
       // The SIP server takes the grant with the call that carries it: LiveKit's own, or another one.
-      if (grant && body.sip_call_to !== untakenFor) grant.taken = body.sip_call_to === divertFor ? { tag: 'SCL_someone-else', callId: 'diverted@192.0.2.66' } : { tag: sipCallId, callId: `${sipCallId}@192.0.2.30` }
-      if (body.sip_call_to !== divertFor && body.sip_call_to !== untakenFor) alive.set(`${sipCallId}@192.0.2.30`, 'answered')
+      if (grant && body.sip_call_to !== untakenFor) grant.taken = isDiverted(body) ? { tag: 'SCL_someone-else', callId: 'diverted@192.0.2.66' } : { tag: sipCallId, callId: `${sipCallId}@192.0.2.30` }
+      if (!isDiverted(body) && body.sip_call_to !== untakenFor) alive.set(`${sipCallId}@192.0.2.30`, 'answered')
       const room = rooms.get(body.room_name) ?? []
       const callIdFull = body.sip_call_to === '600' ? 'grp@192.0.2.30' : `${sipCallId}@192.0.2.30`
+      dialogOf.set(callIdFull, body.sip_call_to)
       if (body.sip_call_to !== leaveFor) room.push({ identity: body.participant_identity, attributes: { ...body.participant_attributes, 'sip.callIDFull': callIdFull } })
       rooms.set(body.room_name, room)
       return { ok: true, status: 200, text: async () => JSON.stringify({ participant_identity: body.participant_identity, room_name: body.room_name, sip_call_id: sipCallId }) }
     }
     if (path === 'livekit.RoomService/DeleteRoom') rooms.delete(body.room)
+    if (path === 'livekit.RoomService/RemoveParticipant') rooms.set(body.room, (rooms.get(body.room) ?? []).filter(p => p.identity !== body.identity))
     // Someone who comes in just after this read (`joinsLater`), seen by the next one.
     if (path === 'livekit.RoomService/ListParticipants' && joinsLater.length) {
       const now = [...(rooms.get(body.room) ?? [])]
@@ -158,7 +167,7 @@ const setup = async ({ failFor, failTaken, divertFor, untakenFor, leaveFor, trun
     ...(dialOutLimiter ? { dialOutLimiter } : {}),
     ...(conferenceCaps ? { conferenceCaps } : {}),
     ...(ownerCheckMs ? { conferenceOwnerCheckMs: ownerCheckMs } : {}),
-    conference: { bridge: () => bridge, accessNumber: '8000', webhookKey: 'k', webhookSecret: 's' }
+    conference: { bridge: () => bridge, accessNumber: '8000', webhookKey: 'k', webhookSecret: 's', ...(meet ? { meet: meet as never } : {}) }
   }
   const app = await buildApp(registry, options)
   // Another Gateway on the same database, the same SIP server and the same LiveKit (or this one started again): nothing in memory is shared.
@@ -675,5 +684,128 @@ describe('a call becomes a conference (POST /calls/:id/conference, step 8b)', ()
     await webhook({ event: 'participant_left', room: { name: second }, participant: { identity: 'phone-101-x', attributes: { 'twake.number': '101' } } })
     expect(lk.filter(l => l.startsWith('livekit.RoomService/DeleteRoom'))).toEqual([`livekit.RoomService/DeleteRoom {"room":"${second}"}`])
     expect(await store.getConference(second)).toBeNull()
+  })
+})
+
+describe("a conference goes to Meet's room (POST /conferences/:id/visio, step 8d)", () => {
+  const MEET = { id: 'fe15dd04-262c-48d6-83de-d82ab167deb3', slug: 'abc-defg-hij', name: 'abc-defg-hij', url: 'https://meet.example/abc-defg-hij', accessLevel: 'restricted' }
+  const withMeet = (over: { fail?: boolean } = {}) => {
+    const asked: { email: string; accessLevel?: string }[] = []
+    return {
+      asked,
+      meet: {
+        createRoom: async (email: string, options: { accessLevel?: string } = {}) => (asked.push({ email, ...options }), over.fail ? Promise.reject(new Error('open')) : MEET),
+        findRoom: async () => MEET
+      }
+    }
+  }
+  type S = Awaited<ReturnType<typeof setup>>
+  /** Alice, Bob (102), Carol (104) and a number of the public network in one conference. */
+  const crowd = async (s: S, { withNumber = true } = {}) => {
+    const made = (await s.conference('c1')).json().meetingId as string
+    const add = (number: string) => s.app.inject({ method: 'POST', url: `/api/v1/conferences/${made}/participants`, headers: s.as('alice'), payload: { number } })
+    expect((await add('104')).statusCode).toBe(201)
+    if (withNumber) expect((await add('+33612345678')).statusCode).toBe(201)
+    return made
+  }
+  const visio = (s: S, id: string, user = 'alice') => s.app.inject({ method: 'POST', url: `/api/v1/conferences/${id}/visio`, headers: s.as(user) })
+  const leave = (s: S, id: string, room = MEET.id) => s.app.inject({ method: 'POST', url: `/api/v1/conferences/${id}/visio/leave`, headers: s.as('alice'), payload: { room } })
+  const removed = (s: S) => s.lk.filter(l => l.startsWith('livekit.RoomService/RemoveParticipant'))
+
+  it("opens a restricted room of Meet and calls everyone again from it: Replaces for the phones of extensions, a new call for a number; nothing is hung up until the person says they hear the number, then the old room ends", async () => {
+    const { meet, asked } = withMeet()
+    const s = await setup({ meet })
+    const made = await crowd(s)
+    expect((await s.app.inject({ method: 'GET', url: '/api/v1/capabilities', headers: s.as('alice') })).json().conference).toEqual({ dialIn: true, dialOut: true, visio: true })
+    const before = s.grants.length
+    const res = await visio(s, made)
+    expect(res.statusCode, res.body).toBe(201)
+    expect(res.json()).toMatchObject({ meetingId: MEET.id, slug: MEET.slug, url: MEET.url, swapped: ['102', '104'], called: ['+33612345678'], failed: [] })
+    expect(asked).toEqual([{ email: 'alice@twake.local', accessLevel: 'restricted' }])
+    // Each call from Meet's room, at Alice's name, through a grant: the dialog of the call it replaces for a phone, none for a number.
+    const g = s.grants.slice(before).map(({ extension, number, replaces, room, join }) => ({ extension, number, replaces, room, join }))
+    expect(g).toHaveLength(3)
+    expect(g.map(x => x.number)).toEqual(['102', '104', '+33612345678'])
+    for (const x of g) expect([x.extension, x.room, x.join]).toEqual(['101', undefined, undefined])
+    expect(g[0]!.replaces).toMatch(/^SCL_\d+@192\.0\.2\.30;to-tag=t-102;from-tag=SCL_\d+$/)
+    expect(g[1]!.replaces).toMatch(/;to-tag=t-104;/)
+    expect(g[2]!.replaces).toBeUndefined()
+    expect(s.rooms.get(MEET.id)?.map(p => p.attributes['twake.number']).sort()).toEqual(['+33612345678', '102', '104'])
+    // The number is called again: the old calls and the person's own stay until they say so.
+    expect(removed(s)).toHaveLength(0)
+    expect(s.rooms.get(made)).toHaveLength(4)
+    expect((await s.store.getConference(MEET.id))?.ownerUserId).toBe('alice')
+    expect(await s.store.getConference(made)).not.toBeNull()
+    expect((await leave(s, made, MEET.id)).statusCode).toBe(204)
+    expect(s.lk.some(l => l.startsWith(`livekit.RoomService/DeleteRoom {"room":"${made}"}`))).toBe(true)
+    expect(await s.store.getConference(made)).toBeNull()
+    // Replayed: nothing left, done.
+    expect((await leave(s, made, MEET.id)).statusCode).toBe(204)
+  })
+
+  it("ends the person's own call at once when nobody on the public network is called again (the phones replace theirs by themselves)", async () => {
+    const { meet } = withMeet()
+    const s = await setup({ meet })
+    const made = await crowd(s, { withNumber: false })
+    const res = await visio(s, made)
+    expect(res.statusCode, res.body).toBe(201)
+    expect(res.json()).toMatchObject({ swapped: ['102', '104'], called: [], failed: [] })
+    expect(removed(s)).toHaveLength(1)
+    expect(s.lk.some(l => l.includes('MoveParticipant'))).toBe(false)
+  })
+
+  it("leaves whoever cannot be called again where they are: nothing of theirs is hung up, the old room stays", async () => {
+    const { meet } = withMeet()
+    const s = await setup({ meet, noDialogFor: '102' })
+    const made = await crowd(s)
+    const res = await visio(s, made)
+    expect(res.statusCode, res.body).toBe(201)
+    expect(res.json()).toMatchObject({ swapped: ['104'], called: ['+33612345678'], failed: ['102'] })
+    expect((await leave(s, made, MEET.id)).statusCode).toBe(204)
+    // The ones Meet's room has go from the old one; the one it has not (102) stays, so the room stays.
+    expect(s.rooms.get(made)?.map(p => p.attributes['twake.number'])).toEqual(['102'])
+    expect(await s.store.getConference(made)).not.toBeNull()
+  })
+
+  it('is the owner\'s, for the room of a call only, needs Meet, and waits for a call with the operator to be settled', async () => {
+    const none = await setup()
+    const unavailable = await visio(none, await crowd(none))
+    expect(unavailable.statusCode).toBe(501)
+    expect(unavailable.json().code).toBe('VISIO_UNAVAILABLE')
+    const { meet } = withMeet()
+    const s = await setup({ meet })
+    const made = await crowd(s)
+    expect((await visio(s, made, 'bob')).statusCode).toBe(403)
+    expect((await visio(s, made, 'carol')).statusCode).toBe(403)
+    await s.store.claimConference({ tenantId: 'dev', meetingId: MEET.id, ownerUserId: 'alice', createdAt: new Date().toISOString() })
+    expect((await visio(s, MEET.id)).statusCode).toBe(400)
+    // A call with the operator not confirmed yet (8c): not now.
+    const t = await setup({ meet })
+    const op = (await t.conference('op')).json().meetingId as string
+    const waiting = await visio(t, op)
+    expect(waiting.statusCode).toBe(409)
+    expect(waiting.json().code).toBe('CONFERENCE_AWAITING')
+    expect(t.grants.filter(g => g.replaces || !g.join).length).toBeLessThanOrEqual(1)
+    // Leaving needs the owner's own room of Meet.
+    expect((await leave(s, made, 'fe15dd04-0000-4000-8000-000000000000')).statusCode).toBe(404)
+    expect((await leave(s, made, MEET.id)).statusCode).toBe(204)
+  })
+
+  it('opens nothing when Meet gives no room (or one more open than asked): the old room is as it was; a call diverted ends it all, the room of Meet is not kept', async () => {
+    const down = await setup({ meet: withMeet({ fail: true }).meet })
+    const made = await crowd(down)
+    const before = down.grants.length
+    expect((await visio(down, made)).statusCode).toBe(502)
+    expect(down.grants).toHaveLength(before)
+    expect(removed(down)).toHaveLength(0)
+    expect(await down.store.getConference(made)).not.toBeNull()
+    const { meet } = withMeet()
+    const s = await setup({ meet, divertInMeet: '102' })
+    const room = await crowd(s)
+    const res = await visio(s, room)
+    expect(res.statusCode, res.body).toBe(502)
+    expect(res.json().code).toBe('CALL_DIVERTED')
+    expect(await s.store.getConference(MEET.id)).toBeNull()
+    expect(await s.store.getConference(room)).not.toBeNull()
   })
 })

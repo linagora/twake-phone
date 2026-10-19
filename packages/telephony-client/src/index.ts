@@ -227,6 +227,19 @@ export interface CallConference {
   awaiting?: string
 }
 
+/** The room of Meet a conference went to (startVisio): its link, and who the room called again from it. */
+export interface CallVisio {
+  meetingId: string
+  slug: string
+  url?: string
+  /** The phones of extensions that took the place of their call (nothing to wait for). */
+  swapped: string[]
+  /** The numbers of the public network called again: their old calls stay until the person says they hear them (leaveVisio). */
+  called: string[]
+  /** Who could not be called again from Meet's room: they stay in the old room. */
+  failed: string[]
+}
+
 export interface SyncReport {
   startedAt: string
   finishedAt: string
@@ -784,6 +797,20 @@ export class TelephonyClient {
    */
   confirmConference(meetingId: string) {
     return this.request<void>(`/conferences/${encodeURIComponent(meetingId)}/confirm`, { method: 'POST' })
+  }
+
+  /**
+   * « Passer en visio » (step 8d): a room of Meet (restricted access) is opened for the person, `url` to open in the
+   * browser, and each person on the phone is called again from it. 501 `VISIO_UNAVAILABLE` without Meet; 409
+   * `CONFERENCE_AWAITING` while a call with the operator waits for the person's word.
+   */
+  startVisio(meetingId: string) {
+    return this.request<CallVisio>(`/conferences/${encodeURIComponent(meetingId)}/visio`, { method: 'POST' })
+  }
+
+  /** « Terminer l'ancienne salle » (step 8d): the person hears the numbers in Meet's room `room`; the old room ends. Replayable. */
+  leaveVisio(meetingId: string, room: string) {
+    return this.request<void>(`/conferences/${encodeURIComponent(meetingId)}/visio/leave`, { method: 'POST', body: JSON.stringify({ room }) })
   }
 
   /** « Annuler » (step 8c): ends the room, the original call is the person's again. Refused (409 CONFERENCE_CONFIRMED) once confirmed. */
