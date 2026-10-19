@@ -206,6 +206,9 @@ export interface BuildOptions {
    * without waiting for LiveKit's webhook. Default: 15 s.
    */
   conferenceOwnerCheckMs?: number
+  /** How often the call a conference is made of is read while the room calls its far end (step 8c), and how long the person has to confirm it. Default: 2 s, 2 min. */
+  originWatchMs?: number
+  confirmWaitMs?: number
   /**
    * How long someone found without an extension keeps their browsers' subscriptions: removed at the first
    * reconciliation after that (a mapping missing a moment loses nothing). Default: an hour.
@@ -2897,6 +2900,15 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
       // anything else is 400. A new room is CONFERENCE_LIMIT (429) past the rooms a person may open (second review n°4).
       // That limit is per process (each Gateway has its own, forgotten when it restarts); the rooms open at once are
       // bounded in the database, per person and per tenant (third review n°6): 429 CONFERENCE_LIMIT as well.
+      // A conference made of a call with the operator waits for the person (step 8c, ADR 0025): the room called the number
+      // again, and the original call stays until they say they hear their correspondent in the room (confirm), or give up
+      // (DELETE). Not said within confirmWaitMs (the window is gone), the room is ended and the original call goes on.
+      const awaiting = new Map<string, { callId: string; number: string; timer: NodeJS.Timeout }>()
+      const forgetAwaiting = (meetingId: string) => {
+        const w = awaiting.get(meetingId)
+        if (w) clearTimeout(w.timer)
+        awaiting.delete(meetingId)
+      }
       const newRooms = options.conferenceLimiter ?? new RateLimiter(20, 3_600_000)
       const tooManyRooms = { statusCode: 429, code: 'CONFERENCE_LIMIT', error: 'Too Many Requests', message: 'Too many rooms opened: wait a while' }
       const roomsPerPerson = options.conferenceCaps?.perPerson ?? 50
@@ -2977,6 +2989,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         const { bridge, record } = await owned(req, req.params.id, { closing: true })
         // A call's room (step 8b) ends for everyone in it: closing it is "Terminer pour tous". Meet owns its dial-in
         // rules: only a Gateway-managed rule is removed here.
+        forgetAwaiting(record.meetingId)
         if (CALL_ROOM.test(record.meetingId)) await viaLiveKit(() => bridge.deleteRoom(record.meetingId))
         else if (!options.conference?.meet) await viaLiveKit(() => bridge.removeDialIn(record.meetingId))
         await store.deleteConference(record.meetingId)
@@ -3189,28 +3202,88 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
           if (await settle(provider, user.tenantId, grant, participant, me, number)) throw divertedCall()
           return participant
         }
+        // The call a conference is made of still there as the room goes to its far end (step 8c): its far end hung up
+        // meanwhile, and the room would call them again at the person's name (review of the PR 31, n°2).
+        const sameCall = async () => {
+          const now = await provider.callBetweenExtensions!(callId).catch(() => 'unknown' as const)
+          return now === 'unknown' || (!!now && now !== 'external' && 'number' in now && now.extension === me && now.number === other)
+        }
+        let originEnded = false
+        const endedMeanwhile = () => Object.assign(new Error('The call is over'), { code: 'ORIGIN_ENDED' })
         try {
           const own = await place(me, { join })
           // The person left the room before the other party comes in (hung up while it began, review 8b, n°8): nobody
           // else's call is taken over.
           if (!(await viaLiveKit(() => bridge.listParticipants(meetingId))).some(p => p.id === own.id))
             throw Object.assign(new Error('You left the room before the conference began'), { code: 'CONFERENCE_ABANDONED' })
-          const theirs = await place(other, leg)
+          let watcher: NodeJS.Timeout | undefined
+          if (operator) {
+            if (!(await sameCall())) throw endedMeanwhile()
+            // While it rings, the room is ended as soon as the call is: that also cancels the ringing call.
+            const every = options.originWatchMs ?? 2_000
+            watcher = setInterval(() => {
+              void sameCall().then(async same => {
+                if (same || originEnded) return
+                originEnded = true
+                await viaLiveKit(() => bridge.deleteRoom(meetingId)).catch(() => undefined)
+              })
+            }, every)
+            watcher.unref()
+          }
+          let theirs: DialedParticipant
+          try {
+            theirs = await place(other, leg)
+          } finally {
+            clearInterval(watcher)
+          }
+          if (originEnded || (operator && !(await sameCall()))) throw endedMeanwhile()
           watchOwner(bridge, { tenantId: user.tenantId, meetingId, ownerUserId: user.id })
-          // `hangUp`: the room did not replace the call (a Replaces ends it), the window ends it.
-          return reply.code(201).send({ meetingId, participants: [shown(own), shown(theirs)], ...(operator ? { hangUp: true } : {}) })
+          if (!operator) return reply.code(201).send({ meetingId, participants: [shown(own), shown(theirs)] })
+          // The original call stays, quiet in the window, until the person confirms they hear their correspondent in the
+          // room (ADR 0025): a mailbox of the operator may have answered the call, and it is never hung up for it.
+          const wait = options.confirmWaitMs ?? 120_000
+          const timer = setTimeout(() => {
+            if (awaiting.get(meetingId)?.timer !== timer) return
+            awaiting.delete(meetingId)
+            void viaLiveKit(() => bridge.deleteRoom(meetingId)).catch(() => undefined)
+            void store.deleteConference(meetingId).catch(() => undefined)
+          }, wait)
+          timer.unref()
+          awaiting.set(meetingId, { callId, number: other, timer })
+          return reply.code(201).send({ meetingId, participants: [shown(own), shown(theirs)], awaiting: other })
         } catch (err) {
           // Ending the room also ends a call of it still ringing: LiveKit SIP stops dialing once its participant is gone
           // from the room (CANCEL; review 8b, n°13, read in LiveKit SIP v1.17.0).
           await viaLiveKit(() => bridge.deleteRoom(meetingId)).catch((e: unknown) => app.log.warn({ err: e }, 'the room of a conference that did not begin was not ended'))
           await store.deleteConference(meetingId)
           const failed = err as Error & { code?: string; sipStatus?: number; sipReason?: string }
+          if (failed.code === 'ORIGIN_ENDED' || originEnded) return notAnswered()
           if (failed.code === 'CALL_DIVERTED') return reply.code(502).send(divertedReply)
           if (failed.code === 'CONFERENCE_ABANDONED') return reply.code(409).send({ statusCode: 409, code: 'CONFERENCE_ABANDONED', error: 'Conflict', message: failed.message })
           if (failed.code !== 'DIAL_FAILED') throw err
           return reply.code(409).send({ statusCode: 409, code: 'DIAL_FAILED', error: 'Conflict', message: failed.message, sipStatus: failed.sipStatus, sipReason: failed.sipReason })
         }
       }
+
+      // « Passer en conférence » (step 8c, ADR 0025): the person hears their correspondent in the room, and says so. The
+      // original call is ended by the SIP server (its dialog, by its Call-ID), never by the window alone. Their
+      // correspondent no longer in the room, or the original call over already: the room ends, nothing is confirmed.
+      v1.post<{ Params: { id: string } }>('/conferences/:id/confirm', async (req, reply) => {
+        const { user, bridge, record } = await owned(req, req.params.id)
+        const w = awaiting.get(record.meetingId)
+        if (!w) return reply.code(409).send({ statusCode: 409, code: 'CONFERENCE_NOT_AWAITING', error: 'Conflict', message: 'Nothing waits for your confirmation: the conference is made, or ended' })
+        forgetAwaiting(record.meetingId)
+        const provider = registry.serves(user.tenantId) ? registry.forTenant(user.tenantId) : undefined
+        if (!provider?.endRoomCall) throw Object.assign(new Error('The SIP server cannot end a call'), { statusCode: 501 })
+        const inRoom = (await viaLiveKit(() => bridge.participantCalls(record.meetingId))).some(p => p.number === w.number)
+        const ended = inRoom ? await provider.endRoomCall(w.callId) : undefined
+        if (!ended) {
+          await viaLiveKit(() => bridge.deleteRoom(record.meetingId)).catch(() => undefined)
+          await store.deleteConference(record.meetingId)
+          return reply.code(409).send({ statusCode: 409, code: 'CALL_NOT_ANSWERED', error: 'Conflict', message: 'The correspondent or the call is gone: the conference is ended' })
+        }
+        return reply.code(204).send()
+      })
 
       /**
        * Ends the room its owner is no longer in while someone from outside is (review 8b, n°7; insider, second review

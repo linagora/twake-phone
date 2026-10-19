@@ -220,8 +220,11 @@ export interface Conference {
 export interface CallConference {
   meetingId: string
   participants: ConferenceParticipant[]
-  /** Step 8c: the call was with the public network, which no room's call replaces: the window ends it (the room called the number again). */
-  hangUp?: boolean
+  /**
+   * Step 8c: the call was with the public network, which no room's call replaces: the room called this number again
+   * and the call is kept until the person confirms (confirmConference) or gives up (endCallConference).
+   */
+  awaiting?: string
 }
 
 export interface SyncReport {
@@ -773,6 +776,11 @@ export class TelephonyClient {
    */
   getCallConference(meetingId: string, { call }: { call?: string } = {}) {
     return this.request<CallConference>(`/conferences/${encodeURIComponent(meetingId)}`, call ? { headers: { 'x-twake-call': call } } : {})
+  }
+
+  /** « Passer en conférence » (step 8c): the person hears their correspondent in the room; the SIP server ends the original call. */
+  confirmConference(meetingId: string) {
+    return this.request<void>(`/conferences/${encodeURIComponent(meetingId)}/confirm`, { method: 'POST' })
   }
 
   /** Ends a call's conference for everyone in it (« Terminer pour tous »). */

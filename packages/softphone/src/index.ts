@@ -1162,16 +1162,6 @@ export class Softphone {
     if (room && room.state !== 'ended' && original && original.state !== 'ended') void room.hangup().catch(() => undefined)
   }
 
-  /**
-   * The room has called the far end of our call `callId` again (step 8c: a call with the public network, which no
-   * Replaces takes over) and it answered: that call ends, the room is the conference. Nothing if the room's call is
-   * gone (the person left it): then the call stays, as `cancelConference` leaves it.
-   */
-  endForConference(callId: string) {
-    const call = this.calls.get(callId)
-    if (call && call.state !== 'ended' && this.conferenceCall(callId)) void call.hangup().catch(() => undefined)
-  }
-
   /** The call of the room of the conference made out of our call `callId`, while it is not over (step 8b). */
   conferenceCall(callId: string): SoftCall | undefined {
     return this.activeWebCalls().find(c => c.conferenceOf === callId)

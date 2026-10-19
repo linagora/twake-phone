@@ -11,7 +11,6 @@ type Gateway = ReturnType<typeof useGateway>
 // What the provider's softphone was given (its callbacks), and the call of the room it has for our call, if any.
 let softphoneOptions: { onCallChange: (call: SoftCall) => void } | undefined
 let roomCall: SoftCall | undefined
-const endedForConference: string[] = []
 vi.mock('@twake/softphone', () => ({
   Softphone: class {
     constructor(options: { onCallChange: (call: SoftCall) => void }) {
@@ -22,7 +21,6 @@ vi.mock('@twake/softphone', () => ({
     activeCalls = () => []
     expectConference = () => 'token'
     cancelConference = () => undefined
-    endForConference = (callId: string) => void endedForConference.push(callId)
     conferenceCall = (callId: string) => (roomCall?.conferenceOf === callId ? roomCall : undefined)
   }
 }))
@@ -45,6 +43,7 @@ describe('SoftphoneProvider, the conferences this window made (third review of t
   let actEnvironment: unknown
   let phone: Phone
   let inviteByPhone: ReturnType<typeof vi.fn>
+  let makeConferenceMock: ReturnType<typeof vi.fn>
   const Probe = () => {
     phone = usePhone()
     return null
@@ -55,11 +54,10 @@ describe('SoftphoneProvider, the conferences this window made (third review of t
     ;(globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
     softphoneOptions = undefined
     roomCall = undefined
-    endedForConference.length = 0
     inviteByPhone = vi.fn(async () => undefined)
     const client: Partial<Gateway['client']> = {
       getCapabilities: vi.fn(async () => ({}) as Awaited<ReturnType<Gateway['client']['getCapabilities']>>),
-      makeConference: vi.fn(async () => ({ meetingId: ROOM, participants: parties })),
+      makeConference: makeConferenceMock = vi.fn(async () => ({ meetingId: ROOM, participants: parties })),
       inviteByPhone
     }
     gateway = { client: client as Gateway['client'], me: { id: 'u1', displayName: 'Alice', extension: '101' } }
@@ -95,13 +93,22 @@ describe('SoftphoneProvider, the conferences this window made (third review of t
     expect(phone.parties).toEqual({})
   })
 
-  it('ends the call it made a conference of when the Gateway says the room did not replace it (a call with the operator, step 8c), and only then', async () => {
+  it('keeps a call with the operator until the person confirms (step 8c): the third participant is not called before, and once confirmed the Gateway ends the call and the room calls them', async () => {
     roomCall = theRoomsCall
+    const confirmConference = vi.fn(async () => undefined)
+    Object.assign(gateway.client, { confirmConference })
+    makeConferenceMock.mockResolvedValueOnce({ meetingId: ROOM, participants: parties, awaiting: '+33612345678' })
     await act(() => phone.addParticipant(first, '103'))
-    expect(endedForConference).toEqual([])
-    ;(gateway.client.makeConference as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ meetingId: ROOM, participants: parties, hangUp: true })
-    await act(() => phone.addParticipant(first, '103'))
-    expect(endedForConference).toEqual(['first-call'])
+    expect(phone.awaiting).toEqual({ 'first-call': '+33612345678' })
+    expect(inviteByPhone).not.toHaveBeenCalled()
+    expect(confirmConference).not.toHaveBeenCalled()
+    await act(() => phone.confirmConference('first-call'))
+    expect(confirmConference).toHaveBeenCalledWith(ROOM)
+    expect(phone.awaiting).toEqual({})
+    expect(inviteByPhone).toHaveBeenCalledWith(ROOM, '103')
+    // Nothing waits any more: a second confirmation asks nothing.
+    await act(() => phone.confirmConference('first-call'))
+    expect(confirmConference).toHaveBeenCalledTimes(1)
   })
 
   it("keeps nothing of a conference whose room's call ended while it began (its end already told)", async () => {

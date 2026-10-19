@@ -2934,6 +2934,33 @@ try {
     await alice.page.getByLabel('Participant à ajouter (poste ou numéro)').fill('103')
     await alice.page.getByRole('button', { name: 'Appeler et ajouter' }).click()
   }
+  await step('step 8c: a mailbox of the operator answers the number called again (here the operator answers the second call as it would a mailbox): the first call is never hung up by itself; Alice, who does not hear her correspondent, gives up (« Annuler et reprendre l\'appel »): the room ends, the callback is hung up, the first call goes on with its sound back, and Bob was never rung', async () => {
+    await dial(alice.page, '06 39 98 00 06')
+    const { call: first, at } = await invitedAtOperator(invite => invite.uri === OPERATED)
+    await alice.page.getByText('En communication avec +33 6 39 98 00 06').waitFor()
+    await at.callState(first, 'answered')
+    await operatorConference()
+    const { call: second, at: at2 } = await invitedAtOperator(invite => invite.uri === OPERATED)
+    await at2.callState(second, 'answered')
+    await alice.page.getByText(/La salle a rappelé \+33 6 39 98 00 06/).waitFor({ timeout: 30_000 })
+    await sleep(1_500)
+    expectEqual(first.state, 'answered', 'the first call at the operator, answered by a mailbox on the second')
+    expectEqual((await calls(bob.page)).length, 0, 'calls on Bob\'s page')
+    await alice.page.getByRole('button', { name: "Annuler et reprendre l'appel" }).click()
+    await at2.callState(second, 'ended', 20_000)
+    const [back] = await until('only her first call left', async () => {
+      const c = await calls(alice.page)
+      return c.length === 1 && c[0].room === undefined && c[0].state === 'connected' ? c : null
+    })
+    expectEqual(back.remoteNumber.replace(/\s/g, ''), '+33639980006', 'who Alice talks to')
+    expectEqual(first.state, 'answered', 'the first call at the operator once Alice gave up')
+    // Her sound is back in the first call (quiet while the room's call lasted).
+    const voiced = first.media.stats.voiced
+    await until('sound from Alice at the operator again', async () => (first.media.stats.voiced > voiced + 20 ? true : null), { timeout: 20_000 })
+    expectEqual(await store.countConferences(TENANT), 0, 'rooms left')
+    await alice.page.getByRole('button', { name: 'Raccrocher' }).click()
+    await at.callState(first, 'ended')
+  })
   await step('step 8c: a call with the operator becomes a conference (« Ajouter un participant », 103): the room calls Alice\'s window, then the number again from her direct number (the operator answers it as a call of its own), her first call ends as a conference, Bob rings; the room holds Alice, the number and Bob, and the operator hears the room', async () => {
     conferenceFrom = new Date().toISOString()
     conferenceAcc = await lastId('acc')
@@ -2947,8 +2974,15 @@ try {
     const { call: second, at: at2 } = await invitedAtOperator(invite => invite.uri === OPERATED)
     for (const [name, c] of [['first', first], ['second', second]]) if (!(c.invite.headers.get('from')?.[0] ?? '').includes('<sip:+33199000101@operator.example>')) throw new Error(`From of the ${name} call at the operator: ${c.invite.headers.get('from')}`)
     await at2.callState(second, 'answered')
-    // The window ends the first call (nothing takes the operator's place in it): its BYE reaches the operator.
-    await at.callState(first, 'ended')
+    // Nothing is hung up by itself: the person is asked whether they hear their correspondent in the room, and the first
+    // call is kept, quiet, meanwhile (review of the PR 31, n°1). Bob is not rung before.
+    await alice.page.getByText(/La salle a rappelé \+33 6 39 98 00 06/).waitFor({ timeout: 30_000 })
+    await sleep(1_500)
+    expectEqual(first.state, 'answered', 'the first call at the operator while the person has not confirmed')
+    expectEqual((await calls(bob.page)).length, 0, 'calls on Bob\'s page before the confirmation')
+    await alice.page.getByRole('button', { name: 'Passer en conférence' }).click()
+    // The SIP server ends it (its dialog, by its Call-ID): the BYE reaches the operator.
+    await at.callState(first, 'ended', 20_000)
     const [mine] = await until('Alice in the conference', async () => {
       const c = await calls(alice.page)
       return c.length === 1 && c[0].room === 'conference' && c[0].state === 'connected' ? c : null
@@ -2986,6 +3020,9 @@ try {
       return rows.length >= 2 ? rows.map(r => r.callee).sort() : null
     })
     expectEqual(cdrs.join(' '), '101 103', 'the CDRs of the conference\'s calls to extensions (via conference)')
+    // The calls of the room to the public network stay `meet` (the callback to the correspondent, the added number): ADR 0019 and 0025.
+    const viaRoom = await db.query("SELECT callee FROM acc WHERE via = 'meet' AND id > $1 AND callee LIKE '+336399800%' ORDER BY id", [conferenceAcc])
+    expectEqual(viaRoom.rows.map(r => r.callee).sort().join(' '), '+33639980006 +33639980007', 'the CDRs of the room\'s calls to the public network (via meet)')
   })
   await step('step 8c: a call received from the operator becomes a conference too: the room calls the number that called (shown, E.164) and the first call ends; with a hidden number nothing can be called back: Alice is told (CONFERENCE_EXTERNAL) and the call goes on', async () => {
     const shown = await operator.call('+33199000101', { from: '+33639980008' })
@@ -2995,6 +3032,8 @@ try {
     await operatorConference()
     const { call: back, at } = await invitedAtOperator(invite => invite.uri === 'sip:+33639980008@operator.example')
     await at.callState(back, 'answered')
+    expectEqual(shown.state, 'answered', 'the received call before the confirmation')
+    await alice.page.getByRole('button', { name: 'Passer en conférence' }).click()
     await operator.callState(shown, 'ended', 20_000)
     await until('Alice in the conference', async () => {
       const c = await calls(alice.page)
@@ -3012,7 +3051,7 @@ try {
     await alice.page.getByText('En communication avec Numéro masqué').waitFor()
     const attempts = operator.state.attempts.length + operator2.state.attempts.length
     await operatorConference()
-    await alice.page.getByRole('alert').filter({ hasText: "ou le numéro de votre correspondant est masqué" }).waitFor()
+    await alice.page.getByRole('alert').filter({ hasText: "un numéro masqué" }).waitFor()
     await sleep(1_000)
     expectEqual(operator.state.attempts.length + operator2.state.attempts.length, attempts, 'calls the operator was sent')
     expectEqual((await calls(bob.page)).length, 0, 'calls on Bob\'s page')
@@ -3025,6 +3064,7 @@ try {
     const api = await asPerson(alice)
     expectEqual((await api('PUT', '/admin/outbound', { policy: { caps: { concurrent: 1 }, fraud: FRAUD } })).statusCode, 200, 'PUT /admin/outbound (one external call at a time)')
     try {
+      const invitesBefore = operator.state.invites.length + operator2.state.invites.length
       await dial(alice.page, '06 39 98 00 06')
       const { call, at } = await invitedAtOperator(invite => invite.uri === OPERATED)
       await alice.page.getByText('En communication avec +33 6 39 98 00 06').waitFor()
@@ -3033,8 +3073,12 @@ try {
       // The room's call to her window, answered at once, is hung up: her call with the operator is the only one left, unquiet.
       const [still] = await until('only her call with the operator left', async () => {
         const c = await calls(alice.page)
-        return c.length === 1 && c[0].room === undefined && !c[0].muted ? c : null
+        return c.length === 1 && c[0].room === undefined ? c : null
       })
+      // Her sound is back in it (quiet while the room's call lasted), and the operator was sent nothing else.
+      const voiced = call.media.stats.voiced
+      await until('sound from Alice at the operator again', async () => (call.media.stats.voiced > voiced + 20 ? true : null), { timeout: 20_000 })
+      expectEqual(operator.state.invites.length + operator2.state.invites.length, invitesBefore + 1, 'the calls the operator received')
       expectEqual(`${still?.state} ${still?.room ?? '-'}`, 'connected -', 'Alice\'s call with the operator')
       expectEqual((await calls(bob.page)).length, 0, 'calls on Bob\'s page')
       expectEqual(call.state, 'answered', 'the operator\'s call')

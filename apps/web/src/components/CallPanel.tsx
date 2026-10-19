@@ -367,6 +367,7 @@ const ConferenceCall = ({ call, tones, onError, onNotice }: { call: SoftCall; to
   const meetingId = call.conferenceOf ? phone.rooms[call.conferenceOf] : call.conferenceRoom
   // Who the conference this window made began with (POST /calls/:id/conference): no news to it.
   const began = call.conferenceOf ? phone.parties[call.conferenceOf] : undefined
+  const waitingFor = call.conferenceOf ? phone.awaiting[call.conferenceOf] : undefined
   const inviting = mine && meetingId ? (phone.inviting[meetingId] ?? []) : []
   const connected = call.state === 'connected' || call.state === 'held'
   useEffect(() => {
@@ -408,6 +409,18 @@ const ConferenceCall = ({ call, tones, onError, onNotice }: { call: SoftCall; to
         </p>
       ))}
       {tones ? <p className="badge">{t('call.tonesReceived', { tones })}</p> : null}
+      {waitingFor ? (
+        // The call with the operator is kept, quiet, until the person says they hear their correspondent in the room (step
+        // 8c, ADR 0025): a mailbox of the operator may have answered the number called again. The number shown is the one called.
+        <Confirm id={`wait-${call.id}`} question={t('conference.awaiting', { who: formatNumber(waitingFor) })}>
+          <button type="button" className="btn btn-primary" onClick={guard(() => phone.confirmConference(call.conferenceOf!))}>
+            {t('conference.confirm')}
+          </button>
+          <button type="button" className="btn" onClick={guard(async () => void (meetingId && (await client.endCallConference(meetingId))))}>
+            {t('conference.giveUp')}
+          </button>
+        </Confirm>
+      ) : null}
       {meetingId ? <Participants key={meetingId} meetingId={meetingId} manage={mine} {...(call.sipCallId ? { call: call.sipCallId } : {})} {...(began ? { parties: began } : {})} onError={onError} onNotice={onNotice} /> : null}
       <div className="actions">
         {connected ? (

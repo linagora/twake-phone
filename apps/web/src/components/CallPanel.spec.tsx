@@ -12,7 +12,7 @@ type Gateway = ReturnType<typeof useGateway>
 type Phone = ReturnType<typeof usePhone>
 // What useGateway() and usePhone() hand the panel, set by each test before it renders.
 let gateway: Pick<Gateway, 'client' | 'me'>
-let phone: Pick<Phone, 'calls' | 'lastEnded' | 'tones' | 'rooms' | 'parties' | 'inviting'>
+let phone: Pick<Phone, 'calls' | 'lastEnded' | 'tones' | 'rooms' | 'parties' | 'inviting' | 'awaiting' | 'confirmConference'>
 vi.mock('../gateway.js', () => ({ useGateway: () => gateway }))
 vi.mock('../softphone.js', () => ({ usePhone: () => phone }))
 // One translator for every render, as the app's (a new one would start the reads again).
@@ -54,7 +54,7 @@ describe('CallPanel, a conference (step 8b): who comes in or leaves is told in t
   const status = () => host.querySelector('[data-testid="call-status"]')!.textContent
   const render = (call: SoftCall, parties?: ConferenceParticipant[]) =>
     act(async () => {
-      phone = { calls: [call], lastEnded: null, tones: {}, rooms: call.conferenceOf ? { [call.conferenceOf]: ROOM } : {}, parties: parties && call.conferenceOf ? { [call.conferenceOf]: parties } : {}, inviting: {} }
+      phone = { calls: [call], lastEnded: null, tones: {}, rooms: call.conferenceOf ? { [call.conferenceOf]: ROOM } : {}, parties: parties && call.conferenceOf ? { [call.conferenceOf]: parties } : {}, inviting: {}, awaiting: {}, confirmConference: async () => undefined }
       root.render(<CallPanel />)
       await vi.advanceTimersByTimeAsync(0)
     })
@@ -226,4 +226,30 @@ describe('CallPanel, a conference (step 8b): who comes in or leaves is told in t
     await render(roomCall(false, 'room-a@192.0.2.30'))
     expect([...host.querySelectorAll('[data-testid="conference-participant"]')].filter(li => li.textContent?.includes('conference.you'))).toHaveLength(1)
   })
+  it('asks the person to confirm a call with the operator made a conference (step 8c): the number called is shown, « Passer en conférence » confirms, « Annuler » ends the room', async () => {
+    const { getCallConference } = reads([alice(true), jean()])
+    expect(getCallConference).toBeDefined()
+    const confirmConference = vi.fn(async () => undefined)
+    const endCallConference = vi.fn(async () => undefined)
+    Object.assign(gateway.client, { endCallConference })
+    const call = roomCall(true, 'room-a@192.0.2.30')
+    await act(async () => {
+      phone = { calls: [call], lastEnded: null, tones: {}, rooms: { [call.conferenceOf!]: ROOM }, parties: {}, inviting: {}, awaiting: { [call.conferenceOf!]: '+33612345678' }, confirmConference }
+      root.render(<CallPanel />)
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    expect(host.textContent).toContain('conference.awaiting +33 6 12 34 56 78')
+    const button = (name: string) => [...host.querySelectorAll('button')].find(b => b.textContent === name)!
+    await act(async () => {
+      button('conference.confirm').click()
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    expect(confirmConference).toHaveBeenCalledWith(call.conferenceOf)
+    await act(async () => {
+      button('conference.giveUp').click()
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    expect(endCallConference).toHaveBeenCalledWith(ROOM)
+  })
+
 })

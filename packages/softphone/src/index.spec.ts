@@ -776,29 +776,6 @@ describe('Softphone', () => {
     expect(joined.state).toBe('connected')
   })
 
-  it('ends the call with the operator once the room called the number again and it answered (step 8c), and leaves it when the room is gone', async () => {
-    const { phone, ua } = await setup()
-    const call = await phone.call('0612345678')
-    const s = ua().lastCall!
-    s.emit('accepted', { originator: 'remote' })
-    // The room is not there (the person left it, or it was never answered): the call stays.
-    phone.endForConference(call.id)
-    expect(s.terminate).not.toHaveBeenCalled()
-    const room = new FakeSession('incoming')
-    const token = phone.expectConference(call.id)
-    ua().emit('newRTCSession', { originator: 'remote', session: room, request: { getHeader: (name: string) => ({ 'Twake-Join': token, 'Twake-Room': 'conference' })[name] } })
-    room.emit('accepted', { originator: 'local' })
-    // The call replaced by no Replaces: the window ends it, as a conference.
-    phone.endForConference(call.id)
-    expect(s.terminate).toHaveBeenCalled()
-    s.emit('ended', { originator: 'local', cause: 'Terminated' })
-    expect(call.endReason).toBe('conference')
-    expect(phone.activeCalls().map(c => c.room)).toEqual(['conference'])
-    // A call that is over, or one nobody asked a conference of, is left alone.
-    phone.endForConference(call.id)
-    phone.endForConference('nope')
-  })
-
   it('takes the call back as it was when the room of the conference ends before its far end moved, or forgets it when asked (step 8b)', async () => {
     const { phone, ua } = await setup()
     const its = audios.length
