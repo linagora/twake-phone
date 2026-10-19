@@ -3369,8 +3369,11 @@ try {
       }, { timeout: 120_000 })
       expectEqual(rows, holders, 'the extensions with a line')
       await sysconfdSettled()
-      const endpoints = asteriskCli('pjsip show endpoints')
-      for (const ext of holders) if (!new RegExp(`^\\s*Endpoint:\\s+${ext}\\b`, 'm').test(endpoints)) throw new Error(`Asterisk has no endpoint ${ext}: ${endpoints}`)
+      // Asterisk has them once its reload of PJSIP is through (read again while it is not).
+      await until('an endpoint at Asterisk for each holder', async () => {
+        const endpoints = asteriskCli('pjsip show endpoints')
+        return holders.every(ext => new RegExp(`^\\s*Endpoint:\\s+${ext}\\b`, 'm').test(endpoints)) ? true : null
+      }, { timeout: 60_000 })
       // The password of a line is a print of its extension: the registration of the next step proves it (Asterisk takes it only with that password).
       // The same stack answers an extension OpenSIPS gave no line: registered here, never at Wazo.
       expectEqual(contactsOf('103'), [], 'contacts of 103 at Wazo before its window registers again')
