@@ -151,7 +151,7 @@ const RUN_START = new Date().toISOString()
 const sysconfdLog = since =>
   execFileSync('docker', ['compose', '-f', fileURLToPath(new URL('../../../docker/docker-compose.sip.yml', import.meta.url)), 'logs', '--no-log-prefix', ...(since ? ['--since', since] : []), 'wazo-sysconfd'], { encoding: 'utf8', timeout: 30_000 })
 /**
- * Waits until the queue of the stand-in is empty: its log ends with `idle` (it says it each time its queue empties) and
+ * Waits until the queue of the stand-in is empty: its log, access lines apart, ends with `idle` (it says it each time its queue empties) and
  * has not grown for a second. At most 60 s (a reload of PJSIP lasts 500 ms here), then an error.
  */
 const sysconfdSettled = async () => {
@@ -159,7 +159,9 @@ const sysconfdSettled = async () => {
   for (let last = null; Date.now() < deadline; ) {
     await sleep(1_000)
     const log = sysconfdLog().trimEnd()
-    if (log === last && log.endsWith('sysconfd: idle')) return
+    // The access line of a request can come after the `idle` of its run: those lines are left out.
+    const said = log.split('\n').filter(l => !/ "(GET|POST|DELETE) /.test(l))
+    if (log === last && said.at(-1)?.endsWith('sysconfd: idle')) return
     last = log
   }
   throw new Error('the queue of wazo-sysconfd is not empty after 60 s')
@@ -3943,8 +3945,8 @@ try {
       // A real Wazo reloads PJSIP slowly (wazo-confgen, then asterisk -rx: 500 ms here, the other commands are fast), so
       // the commands that wait while it runs are merged: twelve arrivals, 24 writes that ask for PJSIP, cost far fewer
       // reloads. Run one by one, as the synchronous stand-in did before, they cost 24 (and 12 voicemail reloads).
-      if (count('module reload res_pjsip.so') > 12) throw new Error(`reloads of PJSIP for twelve mailboxes made at once: ${count('module reload res_pjsip.so')}, 12 at most (${JSON.stringify(ran)})`)
-      if (count('voicemail reload') > 11) throw new Error(`reloads of the voicemails for twelve mailboxes made at once: ${count('voicemail reload')}, 11 at most`)
+      if (count('module reload res_pjsip.so') > 6) throw new Error(`reloads of PJSIP for twelve mailboxes made at once: ${count('module reload res_pjsip.so')}, 6 at most (${JSON.stringify(ran)})`)
+      if (count('voicemail reload') > 6) throw new Error(`reloads of the voicemails for twelve mailboxes made at once: ${count('voicemail reload')}, 6 at most`)
       // No reload failed meanwhile (wazo-sysconfd answers wazo-confd at once, as the real one: a failure is in its log).
       expectEqual(sysconfdLog(since).split('\n').filter(l => / failed: /.test(l)), [], 'the commands wazo-sysconfd failed')
     } finally {
