@@ -231,7 +231,7 @@ export const SoftphoneProvider = ({ children }: { children: ReactNode }) => {
       // and its conference is not kept: the end of its call, already told, would never forget it (third review of the
       // notice, n°3).
       if (!softphone.conferenceCall(call.id)) return
-      setMade(m => conferenceMade(m, call.id, answer, number, call.sipCallId ?? ''))
+      setMade(m => conferenceMade(m, call.id, answer, number))
       // A call with the public network is not replaced by the room's call (step 8c): the number was called again and the
       // call stays, quiet, until the person confirms (confirmConference); the third participant is called then.
       if (answer.awaiting) return
@@ -249,7 +249,7 @@ export const SoftphoneProvider = ({ children }: { children: ReactNode }) => {
     async (callId: string) => {
       const c = made[callId]
       if (!c?.awaiting) return
-      await client.confirmConference(c.meetingId, c.awaiting.call)
+      await client.confirmConference(c.meetingId)
       setMade(m => conferenceConfirmed(m, callId))
       try {
         await inviteToConference(c.meetingId, c.awaiting.third)

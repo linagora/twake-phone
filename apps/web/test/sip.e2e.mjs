@@ -2945,12 +2945,15 @@ try {
     await alice.page.getByText(/La salle a rappelé \+33 6 39 98 00 06/).waitFor({ timeout: 30_000 })
     await sleep(1_500)
     expectEqual(first.state, 'answered', 'the first call at the operator, answered by a mailbox on the second')
-    // The first call is quiet meanwhile: nothing but silence reaches the operator, and Alice's speaker for it is off.
-    const settled = first.media.stats.voiced
+    // The first call is quiet meanwhile: the operator gets packets (silence, not nothing) and no sound from Alice, and it
+    // is the speaker of that very call that is off, not another.
+    const { id: firstId } = (await calls(alice.page)).find(c => c.room === undefined) ?? (await calls(alice.page))[0]
+    const settled = { voiced: first.media.stats.voiced, packets: first.media.stats.received }
     await sleep(1_500)
-    expectEqual(first.media.stats.voiced, settled, 'sound from Alice at the operator while the first call is quiet')
-    const speakers = () => alice.page.evaluate(() => [...document.querySelectorAll('audio[data-testid="remote-audio"]')].map(a => a.muted))
-    if (!(await speakers()).includes(true)) throw new Error(`no speaker of Alice is off while the first call is quiet: ${JSON.stringify(await speakers())}`)
+    if (!(first.media.stats.received > settled.packets + 20)) throw new Error(`no packets of silence at the operator while the first call is quiet: ${settled.packets} -> ${first.media.stats.received}`)
+    expectEqual(first.media.stats.voiced, settled.voiced, 'sound from Alice at the operator while the first call is quiet')
+    const speaker = id => alice.page.evaluate(callId => document.querySelector(`audio[data-callid="${callId}"]`)?.muted ?? null, id)
+    expectEqual(await speaker(firstId), true, 'the speaker of the first call while it is quiet')
     expectEqual((await calls(bob.page)).length, 0, 'calls on Bob\'s page')
     await alice.page.getByRole('button', { name: "Annuler et reprendre l'appel" }).click()
     await at2.callState(second, 'ended', 20_000)
@@ -2963,8 +2966,8 @@ try {
     // Her sound is back in the first call (quiet while the room's call lasted).
     const voiced = first.media.stats.voiced
     await until('sound from Alice at the operator again', async () => (first.media.stats.voiced > voiced + 20 ? true : null), { timeout: 20_000 })
-    // ...and hers: the speaker for the first call is on again.
-    expectEqual((await speakers()).includes(true), false, 'a speaker of Alice still off once she gave up')
+    // ...and hers: the speaker of the first call is on again.
+    expectEqual(await speaker(firstId), false, 'the speaker of the first call once she gave up')
     expectEqual(await store.countConferences(TENANT), 0, 'rooms left')
     await alice.page.getByRole('button', { name: 'Raccrocher' }).click()
     await at.callState(first, 'ended')

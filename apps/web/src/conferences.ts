@@ -6,16 +6,16 @@ export interface MadeConference {
   meetingId: string
   parties: ConferenceParticipant[]
   /** A call with the operator (step 8c): the number the room called again, and the third participant to call once the person confirms. */
-  awaiting?: { number: string; third: string; call: string }
+  awaiting?: { number: string; third: string }
 }
 
 /** The conferences this window made, by the call that became each one. */
 export type MadeConferences = Readonly<Record<string, MadeConference>>
 
 /** Our call `callId` became the conference POST /calls/:id/conference answered: its room and who it began with. */
-export const conferenceMade = (made: MadeConferences, callId: string, answer: CallConference, third = '', call = ''): MadeConferences => ({
+export const conferenceMade = (made: MadeConferences, callId: string, answer: CallConference, third = ''): MadeConferences => ({
   ...made,
-  [callId]: { meetingId: answer.meetingId, parties: answer.participants, ...(answer.awaiting ? { awaiting: { number: answer.awaiting, third, call } } : {}) }
+  [callId]: { meetingId: answer.meetingId, parties: answer.participants, ...(answer.awaiting ? { awaiting: { number: answer.awaiting, third } } : {}) }
 })
 
 /** The person confirmed (or the wait is over): the conference no longer waits for them. */

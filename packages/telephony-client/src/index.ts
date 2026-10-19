@@ -780,10 +780,10 @@ export class TelephonyClient {
 
   /**
    * « Passer en conférence » (step 8c): the person hears their correspondent in the room; the SIP server ends the
-   * original call `call` (its Call-ID) if it is still there. Replayable; refused (409 CONFERENCE_CANCELLED) once given up.
+   * original call (the one the room records) if it is still there. Replayable; refused (409 CONFERENCE_CANCELLED) once given up.
    */
-  confirmConference(meetingId: string, call: string) {
-    return this.request<void>(`/conferences/${encodeURIComponent(meetingId)}/confirm`, { method: 'POST', body: JSON.stringify({ call }) })
+  confirmConference(meetingId: string) {
+    return this.request<void>(`/conferences/${encodeURIComponent(meetingId)}/confirm`, { method: 'POST' })
   }
 
   /** « Annuler » (step 8c): ends the room, the original call is the person's again. Refused (409 CONFERENCE_CONFIRMED) once confirmed. */

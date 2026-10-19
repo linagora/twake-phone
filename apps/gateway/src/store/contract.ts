@@ -550,6 +550,23 @@ export const storeContract = (name: string, make: () => Promise<Store>) =>
       expect(await s.replaceConferencePin('abc-defg', '0123456789', '1111111111')).toBe(true)
       expect((await s.getConference('abc-defg'))?.pin).toBe('1111111111')
       expect(await s.replaceConferencePin('nope', null, '1')).toBe(false)
+      // A conference made of a call with the operator (step 8c): the call it is made of is kept, and the person's choice is
+      // set once: the first asked wins, what comes back is the one that stands, nothing for a room that is not there.
+      await s.claimConference({ meetingId: 'twake-call-0123456789abcdef', createdAt: base.createdAt, tenantId: 'A', ownerUserId: 'alice', originCall: 'op-call@192.0.2.1' })
+      expect(await s.getConference('twake-call-0123456789abcdef')).toMatchObject({ originCall: 'op-call@192.0.2.1' })
+      expect((await s.getConference('twake-call-0123456789abcdef'))?.decision).toBeUndefined()
+      expect((await s.getConference('abc-defg'))?.originCall).toBeUndefined()
+      expect(await s.decideConference('twake-call-0123456789abcdef', 'confirmed')).toBe('confirmed')
+      expect(await s.decideConference('twake-call-0123456789abcdef', 'cancelled')).toBe('confirmed')
+      expect(await s.decideConference('twake-call-0123456789abcdef', 'confirmed')).toBe('confirmed')
+      expect((await s.getConference('twake-call-0123456789abcdef'))?.decision).toBe('confirmed')
+      expect(await s.decideConference('nope', 'confirmed')).toBeNull()
+      // Two at once: one only wins.
+      await s.claimConference({ meetingId: 'twake-call-fedcba9876543210', createdAt: base.createdAt, tenantId: 'A', ownerUserId: 'alice', originCall: 'x' })
+      const both = await Promise.all([s.decideConference('twake-call-fedcba9876543210', 'confirmed'), s.decideConference('twake-call-fedcba9876543210', 'cancelled')])
+      expect(both[0]).toBe(both[1])
+      await s.deleteConference('twake-call-0123456789abcdef')
+      await s.deleteConference('twake-call-fedcba9876543210')
       // Counted per tenant, and per owner in it.
       await s.claimConference({ meetingId: 'second', createdAt: base.createdAt, tenantId: 'A', ownerUserId: 'bob' })
       await s.claimConference({ meetingId: 'third', createdAt: base.createdAt, tenantId: 'B', ownerUserId: 'alice' })

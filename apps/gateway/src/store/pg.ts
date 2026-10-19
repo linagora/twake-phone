@@ -3,7 +3,11 @@ import { readdir, readFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import pg from 'pg'
 import { EMPTY_OUTBOUND, outboundVersion, staleOutbound } from '../outbound.js'
+<<<<<<< HEAD
 import { ALERT_DEDUP_MS, alertKey, clampLimit, type AlertQuery, type AlertRecord, type StoredAlert, type ConferenceRecord, type DidRecord, type SiteRecord, type OutboundHand, type OutboundRecord, type OutboundRules, type HistoryEntry, type HistoryNearQuery, type HistoryPage, type HistoryQuery, type OperatorCdrOutcome, type OperatorCdrRecord, type OperatorCdrStats, type MappingSource, type ErasedCallsKept, type ProviderRecord, type PushSaveResult, type PushSubscriptionRecord, type Store, type TrunkRecord, type MappingChange, type UserMapping, type UserPresenceRecord, type VapidKeysRecord, type ClaimedDelivery, type WebhookAttemptResult, type WebhookClaimCaps, type WebhookClaimTime, allocateClaims, claimOrder, type WebhookDeliveryQuery, type WebhookLease, type WebhookSendQuota, type WebhookDeliveryRecord, type WebhookHealth, type WebhookQueueOptions, type WebhookStateChange, type WebhookStateEvent, type WebhookSubscriptionRecord, WEBHOOK_STATE_ROLE , type FencedLease, type NewTranscript, type TranscriptChange, type TranscriptLane, holderIn, holderOut, type TranscriptMatch, type TranscriptNotice, type TranscriptRecord } from './types.js'
+=======
+import { ALERT_DEDUP_MS, alertKey, clampLimit, type AlertQuery, type AlertRecord, type StoredAlert, type ConferenceDecision, type ConferenceRecord, type DidRecord, type OutboundHand, type OutboundRecord, type OutboundRules, type HistoryEntry, type HistoryNearQuery, type HistoryPage, type HistoryQuery, type OperatorCdrOutcome, type OperatorCdrRecord, type OperatorCdrStats, type MappingSource, type ErasedCallsKept, type ProviderRecord, type PushSaveResult, type PushSubscriptionRecord, type Store, type TrunkRecord, type MappingChange, type UserMapping, type UserPresenceRecord, type VapidKeysRecord, type ClaimedDelivery, type WebhookAttemptResult, type WebhookClaimCaps, type WebhookClaimTime, allocateClaims, claimOrder, type WebhookDeliveryQuery, type WebhookLease, type WebhookSendQuota, type WebhookDeliveryRecord, type WebhookHealth, type WebhookQueueOptions, type WebhookStateChange, type WebhookStateEvent, type WebhookSubscriptionRecord, WEBHOOK_STATE_ROLE , type FencedLease, type NewTranscript, type TranscriptChange, type TranscriptLane, holderIn, holderOut, type TranscriptMatch, type TranscriptNotice, type TranscriptRecord } from './types.js'
+>>>>>>> e960cc9 (fix(conference): vérifier avant de décider, état de la salle en colonnes dédiées)
 import type { OperatorCdr, WebhookEventType } from '@twake/telephony-types'
 
 const MIGRATIONS = fileURLToPath(new URL('../../migrations/', import.meta.url))
@@ -16,7 +20,7 @@ type MappingRow = { tenant_id: string; user_id: string; extension: string; displ
 type HistoryRow = { tenant_id: string; user_id: string; call_id: string; direction: HistoryEntry['direction']; remote_number: string; started_at: Timestamp; ended_at: Timestamp | null; duration_sec: number; state: HistoryEntry['state']; answered: boolean; conference: boolean; operator: string | null; operator_cdr: string | null; operator_only: boolean; operator_forwarded: boolean; voicemail: boolean }
 type OperatorCdrRow = { tenant_id: string; operator: string; id: string; line: string; direction: HistoryEntry['direction']; forwarded: boolean; calling: string | null; called: string | null; started_at: Timestamp; duration_sec: number; outcome: OperatorCdrRecord['outcome'] | null; call_id: string | null; user_id: string | null; invalid: string | null }
 type PresenceRow = { tenant_id: string; user_id: string; status: UserPresenceRecord['status']; since: Timestamp; until: Timestamp | null; message: string | null }
-type ConferenceRow = { tenant_id: string; meeting_id: string; owner_user_id: string; pin: string | null; created_at: Timestamp }
+type ConferenceRow = { tenant_id: string; meeting_id: string; owner_user_id: string; pin: string | null; origin_call: string | null; decision: ConferenceDecision | null; created_at: Timestamp }
 type PushRow = { tenant_id: string; user_id: string; endpoint: string; p256dh: string; auth: string; created_at: Timestamp }
 type TrunkRow = { tenant_id: string; id: string; config: TrunkRecord['config']; password_enc: string | null }
 type DidRow = { tenant_id: string; id: string; trunk_id: string; first_number: string; last_number: string; target: string | null; suffix_digits: number; fallback_target: string | null }
@@ -856,14 +860,14 @@ export class PgStore implements Store {
 
   private conference(r: ConferenceRow | undefined): ConferenceRecord | null {
     return r
-      ? { tenantId: r.tenant_id, meetingId: r.meeting_id, ownerUserId: r.owner_user_id, ...(r.pin ? { pin: r.pin } : {}), createdAt: new Date(r.created_at).toISOString() }
+      ? { tenantId: r.tenant_id, meetingId: r.meeting_id, ownerUserId: r.owner_user_id, ...(r.pin ? { pin: r.pin } : {}), ...(r.origin_call ? { originCall: r.origin_call } : {}), ...(r.decision ? { decision: r.decision } : {}), createdAt: new Date(r.created_at).toISOString() }
       : null
   }
 
   async claimConference(c: ConferenceRecord) {
     await this.pool.query(
-      'INSERT INTO conferences (meeting_id, tenant_id, owner_user_id, pin, created_at) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (meeting_id) DO NOTHING',
-      [c.meetingId, c.tenantId, c.ownerUserId, c.pin ?? null, c.createdAt]
+      'INSERT INTO conferences (meeting_id, tenant_id, owner_user_id, pin, origin_call, created_at) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (meeting_id) DO NOTHING',
+      [c.meetingId, c.tenantId, c.ownerUserId, c.pin ?? null, c.originCall ?? null, c.createdAt]
     )
     return (await this.getConference(c.meetingId))!
   }
@@ -880,6 +884,11 @@ export class PgStore implements Store {
   async replaceConferencePin(meetingId: string, from: string | null, to: string | null) {
     const { rowCount } = await this.pool.query('UPDATE conferences SET pin = $3 WHERE meeting_id = $1 AND pin IS NOT DISTINCT FROM $2', [meetingId, from, to])
     return (rowCount ?? 0) > 0
+  }
+
+  async decideConference(meetingId: string, decision: ConferenceDecision) {
+    const { rows } = await this.pool.query<{ decision: ConferenceDecision }>('UPDATE conferences SET decision = coalesce(decision, $2) WHERE meeting_id = $1 RETURNING decision', [meetingId, decision])
+    return rows[0]?.decision ?? null
   }
 
   async countConferences(tenantId: string, ownerUserId?: string) {

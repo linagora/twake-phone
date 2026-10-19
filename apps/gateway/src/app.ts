@@ -3172,7 +3172,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         if (!dialOuts.allow(ownerKey(user.tenantId, user.id), 2)) return reply.code(429).send(tooManyDialOuts)
         if (!(await mayOpen(user.tenantId, user.id))) return reply.code(429).send(tooManyRooms)
         const meetingId = `twake-call-${randomBytes(8).toString('hex')}`
-        await store.claimConference({ tenantId: user.tenantId, meetingId, ownerUserId: user.id, createdAt: new Date().toISOString() })
+        await store.claimConference({ tenantId: user.tenantId, meetingId, ownerUserId: user.id, ...(operator ? { originCall: callId } : {}), createdAt: new Date().toISOString() })
         const divertedCall = () => Object.assign(new Error('A call of the room was diverted'), { code: 'CALL_DIVERTED' })
         // LiveKit's trunk read again before each grant (second review 8b, n°1): changed between the two calls, the
         // second is not placed.
@@ -3224,33 +3224,33 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         }
       }
 
-      // « Passer en conférence » et « Annuler » (step 8c, ADR 0025). The state is the room's record, shared by every
-      // Gateway: its pin, empty for a call's room, is set once by compare-and-swap to `confirmed` or `cancelled`, so the
-      // two never both win and either is replayable. Confirming is « end the original call if it is still there »: it
-      // is over already when its correspondent hung up to take the callback (the best case), which is success. Cancelling
-      // ends the room (its window's call goes, the original call is quiet no more); refused once confirmed.
-      const decide = async (meetingId: string, to: 'confirmed' | 'cancelled') => {
-        if (await store.replaceConferencePin(meetingId, null, to)) return true
-        return (await store.getConference(meetingId))?.pin === to
+      // « Passer en conférence » et « Annuler » (step 8c, ADR 0025). The room's record keeps the call it is made of
+      // (`originCall`, written when the room is made) and what the person chose (`decision`, set once, by every Gateway):
+      // the first choice stands, the other is refused, the same one replayed succeeds. Confirming is « end the original
+      // call if it is still there »: it is over already when its correspondent hung up to take the callback (the best
+      // case), which is success. Every check comes before the choice is written: a confirmation that cannot be carried
+      // out leaves the person free to give up. Cancelling ends the room; refused once confirmed.
+      const awaitingRoom = (record: { meetingId: string; originCall?: string }) => {
+        if (!CALL_ROOM.test(record.meetingId) || !record.originCall) throw Object.assign(new Error('Nothing waits for your choice: this conference is not made of a call with the operator'), { statusCode: 409, code: 'CONFERENCE_NOT_AWAITING' })
+        return record.originCall
       }
-      v1.post<{ Params: { id: string }; Body: { call?: unknown } | undefined }>('/conferences/:id/confirm', async (req, reply) => {
+      v1.post<{ Params: { id: string } }>('/conferences/:id/confirm', async (req, reply) => {
         const { user, record } = await owned(req, req.params.id)
-        const call = req.body?.call
-        if (!CALL_ROOM.test(record.meetingId)) throw bad('Only the room of a call is confirmed')
-        if (typeof call !== 'string' || !call || call.length > 256) throw bad('call: the Call-ID of the original call')
-        if (!(await decide(record.meetingId, 'confirmed'))) return reply.code(409).send({ statusCode: 409, code: 'CONFERENCE_CANCELLED', error: 'Conflict', message: 'The conference was given up' })
+        const call = awaitingRoom(record)
+        if (record.decision === 'cancelled') return reply.code(409).send({ statusCode: 409, code: 'CONFERENCE_CANCELLED', error: 'Conflict', message: 'The conference was given up' })
         const provider = registry.serves(user.tenantId) ? registry.forTenant(user.tenantId) : undefined
         if (!provider?.endRoomCall || !provider.callBetweenExtensions) throw Object.assign(new Error('The SIP server cannot end a call'), { statusCode: 501 })
-        // Only the person's own call with the operator is ended here; one that is over already is nothing to end.
+        // Only the person's own call with the operator is ended; one that is over already is nothing to end.
         const parties = await provider.callBetweenExtensions(call)
-        if (parties && (parties === 'external' || !('number' in parties) || parties.extension !== user.extension)) throw bad('This call is not your call with the operator')
+        if (parties && (parties === 'external' || !('number' in parties) || parties.extension !== user.extension)) throw bad('The call this conference is made of is not your call with the operator')
+        if ((await store.decideConference(record.meetingId, 'confirmed')) !== 'confirmed') return reply.code(409).send({ statusCode: 409, code: 'CONFERENCE_CANCELLED', error: 'Conflict', message: 'The conference was given up' })
         if (parties) await provider.endRoomCall(call)
         return reply.code(204).send()
       })
       v1.post<{ Params: { id: string } }>('/conferences/:id/cancel', async (req, reply) => {
         const { bridge, record } = await owned(req, req.params.id, { closing: true })
-        if (!CALL_ROOM.test(record.meetingId)) throw bad('Only the room of a call is given up')
-        if (!(await decide(record.meetingId, 'cancelled'))) return reply.code(409).send({ statusCode: 409, code: 'CONFERENCE_CONFIRMED', error: 'Conflict', message: 'The conference is confirmed: the original call is gone' })
+        awaitingRoom(record)
+        if ((await store.decideConference(record.meetingId, 'cancelled')) !== 'cancelled') return reply.code(409).send({ statusCode: 409, code: 'CONFERENCE_CONFIRMED', error: 'Conflict', message: 'The conference is confirmed: the original call is gone' })
         await viaLiveKit(() => bridge.deleteRoom(record.meetingId))
         await store.deleteConference(record.meetingId)
         return reply.code(204).send()

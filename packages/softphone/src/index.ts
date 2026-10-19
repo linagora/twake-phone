@@ -1234,11 +1234,13 @@ export class Softphone {
     ua.stop()
   }
 
-  private createAudio() {
+  private createAudio(callId?: string) {
     if (this.options.createAudio) return this.options.createAudio()
     const audio = document.createElement('audio')
     audio.autoplay = true
     audio.dataset['testid'] = 'remote-audio'
+    // Which call this speaker is for (what a test, or a person's tools, can tell it by).
+    if (callId) audio.dataset['callid'] = callId
     ;(this.options.audioContainer ?? document.body).appendChild(audio)
     return audio
   }
@@ -1251,7 +1253,7 @@ export class Softphone {
       session.id,
       direction,
       session,
-      this.createAudio(),
+      this.createAudio(session.id),
       c => {
         if (c.state === 'ended') this.calls.delete(c.id)
         this.options.onCallChange?.(c)
