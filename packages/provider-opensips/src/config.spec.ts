@@ -96,6 +96,8 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     }
     // Only an extension of digits, read in the table: nothing a window sends is in the query but those digits.
     expect(register).toContain('$tU =~ "^[0-9]{1,40}$"')
+    // A "no line" read in the table is never kept: it would hide for 60 s the line the Gateway writes meanwhile.
+    expect(register).toContain('if ($var(wl_line) == 1)\n\t\t\t\t\t\tcache_store("local", "$var(wl_key)", "1", 60);')
     // mid_registrar is called nowhere else, and never with the lines off (the shared variable guards its only call).
     expect(cfg.match(/mid_registrar_save\(/g)).toHaveLength(1)
     expect(cfg).not.toContain('mid_registrar_lookup')

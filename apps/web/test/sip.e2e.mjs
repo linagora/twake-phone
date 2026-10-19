@@ -3385,7 +3385,7 @@ try {
       await phoneState(bob2.page).getByText('En ligne').waitFor({ timeout: 20_000 })
       const contacts = await until('the contact of 103 at Wazo', async () => (contactsOf('103').length ? contactsOf('103') : null), { timeout: 20_000 }).catch(err => {
         // What OpenSIPS said of the registration, and what Asterisk has, for whoever reads the failure.
-        const said = execFileSync('docker', ['compose', '-f', COMPOSE_FILE, 'logs', '--no-color', '--no-log-prefix', 'opensips'], { encoding: 'utf8', timeout: 30_000, maxBuffer: 64 << 20 }).split('\n').filter(l => /wazo|mid_reg/i.test(l)).slice(-40)
+        const said = execFileSync('docker', ['compose', '-f', COMPOSE_FILE, 'logs', '--no-color', '--no-log-prefix', 'opensips'], { encoding: 'utf8', timeout: 30_000, maxBuffer: 64 << 20 }).split('\n').filter(l => /wazo|mid_reg/i.test(l) && !/'from' key not found|failed to unregister contact/.test(l)).slice(-40)
         console.log(`[11c-1] OpenSIPS: ${said.join('\n')}\n[11c-1] Asterisk aors: ${asteriskCli('pjsip show aors')}\n[11c-1] wazo_lines: ${JSON.stringify(rows103)}`)
         throw err
       })

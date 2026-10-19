@@ -834,7 +834,9 @@ route {
 			} else if ($shv(wazo_lines_nodb_until) <= $Ts) {
 				if (sql_query_one("SELECT (count(*) > 0)::integer FROM wazo_lines WHERE extension = '$tU'", "$var(wl_has)")) {
 					$var(wl_line) = $(var(wl_has){s.int});
-					cache_store("local", "$var(wl_key)", "$var(wl_line)", 60);
+					# Only a line is kept: a "no line" kept 60 s would hide the line the Gateway writes meanwhile.
+					if ($var(wl_line) == 1)
+						cache_store("local", "$var(wl_key)", "1", 60);
 				} else {
 					$shv(wazo_lines_nodb_until) = $Ts + 30;
 					xlog("L_WARN", "wazo: wazo_lines not read (the Gateway of step 11c creates it): no line for 30 s\n");
