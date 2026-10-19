@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { TRUNK_COUNTRY, TRUNK_COUNTRY_EXCLUDED, TRUNK_OUTBOUND_CLASSES, TRUNK_OUTBOUND_DEFAULT, isValidExtension, type DidRange, type Trunk, type TrunkRegistrationState, type TrunkServerState, type TrunkStatus } from '@twake/telephony-types'
+import { TRUNK_COUNTRY, TRUNK_COUNTRY_EXCLUDED, TRUNK_OUTBOUND_CLASSES, TRUNK_OUTBOUND_DEFAULT, isValidExtension, type DidRange, type EmergencySite, type Trunk, type TrunkRegistrationState, type TrunkServerState, type TrunkStatus } from '@twake/telephony-types'
 import { DIALPLAN_SQL } from './numbering.js'
 import { DIAL_OUT_GRANTS_SCHEMA } from './dial-out-grants.js'
 import { ACC_EXTERNAL_SQL, OUTBOUND_SCHEMA } from './outbound.js'
@@ -27,7 +27,9 @@ export const REGISTRANT_TABLE_VERSION = 3
  * length, to an extension or group (`target`) or to the extension that ends with their last `suffix_digits` digits,
  * and their own fallback. `tenant_id` is whose they are: OpenSIPS does not read it, and one tenant only may have trunks
  * in a database (TrunkTables refuses a second one). Then the tables of the outbound policy (outbound.ts, step 6b) and
- * the grants of the calls Meet's rooms place (dial-out-grants.ts, step 8).
+ * the grants of the calls Meet's rooms place (dial-out-grants.ts, step 8). `emergency_sites` and `emergency_site_users` (step 6c,
+ * ADR 0024): the number each site presents for an emergency call, on its trunk, and the people of each site (joined to
+ * `subscriber.holder` at the call, as `outbound_users`).
  * Run as a whole by docker/opensips/entrypoint.sh before OpenSIPS starts (a database created before step 6 has none
  * of these tables, and OpenSIPS would not start without them) and at each start of the Gateway.
  */
@@ -104,6 +106,19 @@ CREATE TABLE IF NOT EXISTS dids (
 CREATE INDEX IF NOT EXISTS dids_first_number_idx ON dids (first_number);
 ALTER TABLE trunks ADD COLUMN IF NOT EXISTS fallback VARCHAR(16) DEFAULT '' NOT NULL;
 ALTER TABLE dids ADD COLUMN IF NOT EXISTS fallback VARCHAR(16) DEFAULT '' NOT NULL;
+CREATE TABLE IF NOT EXISTS emergency_sites (
+    tenant_id TEXT NOT NULL,
+    id VARCHAR(32) NOT NULL,
+    trunk_id VARCHAR(32) NOT NULL,
+    number VARCHAR(16) NOT NULL,
+    PRIMARY KEY (tenant_id, id)
+);
+CREATE TABLE IF NOT EXISTS emergency_site_users (
+    tenant_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    site_id VARCHAR(32) NOT NULL,
+    PRIMARY KEY (tenant_id, user_id)
+);
 ${OUTBOUND_SCHEMA}${DIAL_OUT_GRANTS_SCHEMA}${DIALPLAN_SQL}`
 
 /**
@@ -231,6 +246,27 @@ export const projectTrunks = (trunks: (Trunk & { password?: string })[], dids: D
   return out
 }
 
+/** Rows of `emergency_sites` and `emergency_site_users` for these sites (step 6c): each on a trunk that exists, a person in one site at most. */
+export const projectSites = (sites: readonly EmergencySite[], trunks: readonly Pick<Trunk, 'id'>[]) => {
+  const out = { sites: [] as unknown[][], users: [] as unknown[][] }
+  const seen = new Set<string>()
+  for (const s of sites) {
+    if (!/^[a-z0-9][a-z0-9-]{0,31}$/.test(s.id)) throw invalid(`Site id ${s.id} is not valid`)
+    if (!trunks.some(t => t.id === s.trunkId)) throw invalid(`Site ${s.id}: no trunk ${s.trunkId}`)
+    if (!E164.test(s.number)) throw invalid(`Site ${s.id}: the number is not E.164`)
+    out.sites.push([s.id, s.trunkId, s.number])
+    for (const u of s.members) {
+      if (!u || seen.has(u)) throw invalid(`Site ${s.id}: ${u || 'an empty user'} is in two sites`)
+      seen.add(u)
+      out.users.push([u, s.id])
+    }
+  }
+  // Code-unit order, as `COLLATE "C"` reads them back (currentSites).
+  out.sites.sort((a, b) => (String(a[0]) < String(b[0]) ? -1 : 1))
+  out.users.sort((a, b) => (String(a[0]) < String(b[0]) ? -1 : 1))
+  return out
+}
+
 /** What uac_registrant's states (MI reg_list) say, in the words of the contract. */
 const REGISTRATION_STATES: Record<string, TrunkRegistrationState> = {
   REGISTERED_STATE: 'registered',
@@ -311,6 +347,22 @@ export class TrunkTables {
     }
   }
 
+  /** The sites the database holds for the tenant now, in the order of projectSites. */
+  private async currentSites(q: Queryable) {
+    const rows = async (text: string) => (((await q.query(text, [this.tenantId])) as { rows?: Record<string, unknown>[] } | undefined)?.rows ?? []).map(r => Object.values(r))
+    return {
+      sites: await rows('SELECT id, trunk_id, number FROM emergency_sites WHERE tenant_id = $1 ORDER BY id COLLATE "C"'),
+      users: await rows('SELECT user_id, site_id FROM emergency_site_users WHERE tenant_id = $1 ORDER BY user_id COLLATE "C"')
+    }
+  }
+
+  /** Whether the account of `extension` is written for `userId` (`subscriber.holder`): how the sites reach their people. */
+  async holdsAccount(extension: string, userId: string): Promise<boolean> {
+    await this.opts.ready?.()
+    const r = (await this.opts.pool.query('SELECT 1 FROM subscriber WHERE username = $1 AND holder = $2 LIMIT 1', [extension, userId])) as { rows?: unknown[] } | undefined
+    return !!r?.rows?.length
+  }
+
   /** The tenant's trunks as OpenSIPS knows them: id, set of `dispatcher`, address of record when it registers ('' otherwise). */
   async sets(): Promise<{ id: string; setid: number; aor: string }[]> {
     await this.opts.ready?.()
@@ -323,8 +375,9 @@ export class TrunkTables {
    * holds them already: OpenSIPS is asked to reload nothing (a registration is not sent again for nothing). Refused
    * (409) when another tenant has trunks in this database: OpenSIPS's script reads one tenant's trunks only.
    */
-  async set(trunks: (Trunk & { password?: string })[], dids: DidRange[]): Promise<{ dispatcher: boolean; registrant: boolean }> {
+  async set(trunks: (Trunk & { password?: string })[], dids: DidRange[], sites: EmergencySite[] = []): Promise<{ dispatcher: boolean; registrant: boolean }> {
     const wanted = projectTrunks(trunks, dids, this.socket, this.advertise)
+    const wantedSites = projectSites(sites, trunks)
     wanted.dids.sort((a, b) => String(a[2]).localeCompare(String(b[2])) || String(a[0]).localeCompare(String(b[0])))
     // As current() reads them: by set (the servers of each trunk, then the sources), the highest priority first.
     wanted.dispatcher.sort((a, b) => Number(a[0]) - Number(b[0]) || Number(b[6]) - Number(a[6]))
@@ -346,12 +399,15 @@ export class TrunkTables {
         dispatcher: !sameRows(now.dispatcher, wanted.dispatcher),
         registrant: !sameRows(now.registrant, wanted.registrant)
       }
-      if (!changed.dispatcher && !changed.registrant && sameRows(now.trunks, wanted.trunks) && sameRows(now.dids, wanted.dids)) {
+      const nowSites = await this.currentSites(q)
+      if (!changed.dispatcher && !changed.registrant && sameRows(now.trunks, wanted.trunks) && sameRows(now.dids, wanted.dids) && sameRows(nowSites.sites, wantedSites.sites) && sameRows(nowSites.users, wantedSites.users)) {
         await q.query('COMMIT')
         return changed
       }
       await q.query("DELETE FROM registrant WHERE aor IN (SELECT reg_aor FROM trunks WHERE tenant_id = $1 AND reg_aor <> '')", [this.tenantId])
       await q.query(`DELETE FROM dispatcher WHERE ${OF_TENANT}`, [this.tenantId])
+      await q.query('DELETE FROM emergency_site_users WHERE tenant_id = $1', [this.tenantId])
+      await q.query('DELETE FROM emergency_sites WHERE tenant_id = $1', [this.tenantId])
       await q.query('DELETE FROM dids WHERE tenant_id = $1', [this.tenantId])
       await q.query('DELETE FROM trunks WHERE tenant_id = $1', [this.tenantId])
       for (const r of wanted.trunks)
@@ -360,6 +416,8 @@ export class TrunkTables {
           [this.tenantId, ...r]
         )
       for (const r of wanted.dids) await q.query('INSERT INTO dids (tenant_id, id, trunk_id, first_number, last_number, target, suffix_digits, fallback) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)', [this.tenantId, ...r])
+      for (const r of wantedSites.sites) await q.query('INSERT INTO emergency_sites (tenant_id, id, trunk_id, number) VALUES ($1, $2, $3, $4)', [this.tenantId, ...r])
+      for (const r of wantedSites.users) await q.query('INSERT INTO emergency_site_users (tenant_id, user_id, site_id) VALUES ($1, $2, $3)', [this.tenantId, ...r])
       for (const r of wanted.dispatcher) await q.query('INSERT INTO dispatcher (setid, destination, socket, state, probe_mode, weight, priority, attrs, description) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)', r)
       for (const r of wanted.registrant) await q.query('INSERT INTO registrant (registrar, proxy, aor, username, password, binding_URI, expiry, forced_socket) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)', r)
       await q.query('COMMIT')

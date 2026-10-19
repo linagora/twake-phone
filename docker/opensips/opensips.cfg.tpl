@@ -301,6 +301,8 @@ modparam("fraud_detection", "db_url", "${OPENSIPS_DB_URL}")
 modparam("cfgutils", "shvset", "dt_setid=i:0")
 # The generation of the direct numbers last read (timer_route[default_trunk]).
 modparam("cfgutils", "shvset", "dn_gen=i:0")
+# The generation of the sites' numbers last read (timer_route[default_trunk]), apart from the direct numbers'.
+modparam("cfgutils", "shvset", "es_gen=i:0")
 loadmodule "cachedb_local.so"
 
 #### Routing ###########################################################################################################
@@ -1210,10 +1212,21 @@ route[trunk_out] {
 	if ($avp(callee) =~ "^\+?[0-9]{2,16}$")
 		$var(called) = $avp(callee);
 	$(avp(trunk_query)[*]) = NULL;
-	$var(trunk_query) = "SELECT t.setid, t.domain, t.number_format, t.assert_identity, t.auth_username, t.auth_password, t.auth_realm, t.codec_flags, coalesce(d.number, t.default_number) AS presented, t.allowed, t.countries, (SELECT CASE WHEN i.suffix_digits > 0 THEN right('" + $var(called) + "', i.suffix_digits) ELSE i.target END FROM dids i WHERE length(i.first_number) = length('" + $var(called) + "') AND '" + $var(called) + "' BETWEEN i.first_number AND i.last_number ORDER BY i.suffix_digits LIMIT 1) AS internal FROM trunks t LEFT JOIN LATERAL (SELECT CASE WHEN x.suffix_digits > 0 THEN left(x.first_number, length(x.first_number) - x.suffix_digits) || '" + $var(ext) + "' ELSE x.first_number END AS number FROM dids x WHERE x.trunk_id = t.id AND ((x.suffix_digits = 0 AND x.target = '" + $var(ext) + "') OR (x.suffix_digits = length('" + $var(ext) + "') AND left(x.first_number, length(x.first_number) - x.suffix_digits) || '" + $var(ext) + "' BETWEEN x.first_number AND x.last_number)) ORDER BY x.suffix_digits, x.first_number LIMIT 1) d ON true ORDER BY (d.number IS NULL), t.position LIMIT 1";
+	# An emergency call (step 6c, ADR 0024) takes the trunk of its caller's site first and presents the number of that site, before the direct number and the trunk's own: one more join in this query, never a query of its own. Any other call neither reads nor takes anything of it.
+	$var(presented) = "coalesce(d.number, t.default_number)";
+	$var(site_join) = "";
+	$var(site_order) = "";
+	$var(site_col) = "NULL";
+	if ($avp(num_class) == "emergency") {
+		$var(presented) = "coalesce(e.number, d.number, t.default_number)";
+		$var(site_join) = " LEFT JOIN LATERAL (SELECT es.number FROM emergency_sites es JOIN emergency_site_users eu ON eu.tenant_id = es.tenant_id AND eu.site_id = es.id JOIN subscriber sb ON sb.holder = eu.user_id WHERE es.trunk_id = t.id AND sb.username = '" + $var(ext) + "' LIMIT 1) e ON true";
+		$var(site_order) = "(e.number IS NULL), ";
+		$var(site_col) = "e.number";
+	}
+	$var(trunk_query) = "SELECT t.setid, t.domain, t.number_format, t.assert_identity, t.auth_username, t.auth_password, t.auth_realm, t.codec_flags, " + $var(presented) + " AS presented, t.allowed, t.countries, (SELECT CASE WHEN i.suffix_digits > 0 THEN right('" + $var(called) + "', i.suffix_digits) ELSE i.target END FROM dids i WHERE length(i.first_number) = length('" + $var(called) + "') AND '" + $var(called) + "' BETWEEN i.first_number AND i.last_number ORDER BY i.suffix_digits LIMIT 1) AS internal, " + $var(site_col) + " AS site FROM trunks t LEFT JOIN LATERAL (SELECT CASE WHEN x.suffix_digits > 0 THEN left(x.first_number, length(x.first_number) - x.suffix_digits) || '" + $var(ext) + "' ELSE x.first_number END AS number FROM dids x WHERE x.trunk_id = t.id AND ((x.suffix_digits = 0 AND x.target = '" + $var(ext) + "') OR (x.suffix_digits = length('" + $var(ext) + "') AND left(x.first_number, length(x.first_number) - x.suffix_digits) || '" + $var(ext) + "' BETWEEN x.first_number AND x.last_number)) ORDER BY x.suffix_digits, x.first_number LIMIT 1) d ON true" + $var(site_join) + " ORDER BY " + $var(site_order) + "(d.number IS NULL), t.position LIMIT 1";
 	$avp(trunk_query) = $var(trunk_query);
 	route(read_sent);
-	async(sql_query_one("$var(trunk_query)", "$avp(t_setid);$avp(t_domain);$avp(t_format);$avp(t_pai);$avp(t_user);$avp(t_pass);$avp(t_realm);$avp(t_codecs);$avp(t_presented);$avp(t_allowed);$avp(t_countries);$avp(t_internal)"), trunk_out_loaded);
+	async(sql_query_one("$var(trunk_query)", "$avp(t_setid);$avp(t_domain);$avp(t_format);$avp(t_pai);$avp(t_user);$avp(t_pass);$avp(t_realm);$avp(t_codecs);$avp(t_presented);$avp(t_allowed);$avp(t_countries);$avp(t_internal);$avp(t_site)"), trunk_out_loaded);
 }
 
 # An emergency call must not depend on the database (ADR 0016): the default trunk as this process last read it
@@ -1223,8 +1236,13 @@ route[trunk_out] {
 # (however long ago: second review 6b, n°1), else the trunk's own number. Returns -1 when it has none, or it is the
 # trunk tried already.
 route[default_trunk] {
-	if ($shv(dt_setid) == 0 || ($avp(t_setid) != NULL && $avp(t_setid) == $shv(dt_setid)))
+	# "same": the default trunk once more, for an emergency call whose trunk refused the number of its site (route[emergency_fallback]).
+	$var(same) = 0;
+	if ($param(1) == "same")
+		$var(same) = 1;
+	if ($shv(dt_setid) == 0 || ($var(same) == 0 && $avp(t_setid) != NULL && $avp(t_setid) == $shv(dt_setid)))
 		return(-1);
+	$(avp(t_site)[*]) = NULL;
 	$(avp(t_setid)[*]) = NULL;
 	$(avp(t_domain)[*]) = NULL;
 	$(avp(t_format)[*]) = NULL;
@@ -1246,6 +1264,11 @@ route[default_trunk] {
 	# "<number>|<generation>": one of the last read that succeeded (an extension that lost its number then is not).
 	if ($avp(caller) =~ "^[A-Za-z0-9._+-]{1,64}$" && cache_fetch("local", "dn:$avp(caller)", $var(dn)) && $(var(dn){s.select,1,|}) =~ "^[0-9]+$" && $(var(dn){s.select,1,|}{s.int}) >= $shv(dn_gen) && $(var(dn){s.select,0,|}) =~ "^\+[1-9][0-9]{6,14}$")
 		$avp(t_presented) = $(var(dn){s.select,0,|});
+	# The number of the caller's site, as last read, before the direct number (step 6c, ADR 0024; a generation of its own).
+	if ($var(same) == 0 && $avp(caller) =~ "^[A-Za-z0-9._+-]{1,64}$" && cache_fetch("local", "es:$avp(caller)", $var(es)) && $(var(es){s.select,1,|}) =~ "^[0-9]+$" && $(var(es){s.select,1,|}{s.int}) >= $shv(es_gen) && $(var(es){s.select,2,|}{s.int}) == $shv(dt_setid) && $(var(es){s.select,0,|}) =~ "^\+[1-9][0-9]{6,14}$") {
+		$avp(t_presented) = $(var(es){s.select,0,|});
+		$avp(t_site) = $avp(t_presented);
+	}
 	return(1);
 }
 timer_route[default_trunk, 15] {
@@ -1265,7 +1288,9 @@ timer_route[default_trunk, 15] {
 		# from it keeps an older one, never read again (route[default_trunk]).
 		$(avp(dn_ext)[*]) = NULL;
 		$(avp(dn_num)[*]) = NULL;
-		if (sql_query("SELECT s.username, d.number FROM subscriber s CROSS JOIN LATERAL (SELECT CASE WHEN x.suffix_digits > 0 THEN left(x.first_number, length(x.first_number) - x.suffix_digits) || s.username ELSE x.first_number END AS number FROM dids x WHERE x.trunk_id = (SELECT id FROM trunks ORDER BY position LIMIT 1) AND ((x.suffix_digits = 0 AND x.target = s.username) OR (x.suffix_digits = length(s.username) AND left(x.first_number, length(x.first_number) - x.suffix_digits) || s.username BETWEEN x.first_number AND x.last_number)) ORDER BY x.suffix_digits, x.first_number LIMIT 1) d LIMIT 5000", "$avp(dn_ext);$avp(dn_num)")) {
+		sql_query("SELECT s.username, d.number FROM subscriber s CROSS JOIN LATERAL (SELECT CASE WHEN x.suffix_digits > 0 THEN left(x.first_number, length(x.first_number) - x.suffix_digits) || s.username ELSE x.first_number END AS number FROM dids x WHERE x.trunk_id = (SELECT id FROM trunks ORDER BY position LIMIT 1) AND ((x.suffix_digits = 0 AND x.target = s.username) OR (x.suffix_digits = length(s.username) AND left(x.first_number, length(x.first_number) - x.suffix_digits) || s.username BETWEEN x.first_number AND x.last_number)) ORDER BY x.suffix_digits, x.first_number LIMIT 1) d LIMIT 5000", "$avp(dn_ext);$avp(dn_num)");
+		# Read: some rows (1) or none (-2, every number lost); a failure (-1) leaves what is kept and its generation.
+		if ($rc == 1 || $rc == -2) {
 			$var(dn_next) = $shv(dn_gen) + 1;
 			$var(i) = 0;
 			while ($(avp(dn_ext)[$var(i)]) != NULL) {
@@ -1276,6 +1301,22 @@ timer_route[default_trunk, 15] {
 				$var(i) = $var(i) + 1;
 			}
 			$shv(dn_gen) = $var(dn_next);
+		}
+		# The number of each person's site on the default trunk (step 6c, ADR 0024), read and kept on its own, with its
+		# own generation: no direct number at all, or a failed read of either, changes nothing of the other.
+		$(avp(es_ext)[*]) = NULL;
+		$(avp(es_num)[*]) = NULL;
+		sql_query("SELECT sb.username, es.number FROM emergency_sites es JOIN emergency_site_users eu ON eu.tenant_id = es.tenant_id AND eu.site_id = es.id JOIN subscriber sb ON sb.holder = eu.user_id WHERE es.trunk_id = (SELECT id FROM trunks ORDER BY position LIMIT 1) LIMIT 5000", "$avp(es_ext);$avp(es_num)");
+		if ($rc == 1 || $rc == -2) {
+			$var(es_next) = $shv(es_gen) + 1;
+			$var(i) = 0;
+			while ($(avp(es_ext)[$var(i)]) != NULL) {
+				$var(es_key) = "es:" + $(avp(es_ext)[$var(i)]);
+				$var(es_val) = $(avp(es_num)[$var(i)]) + "|" + $var(es_next) + "|" + $var(d_setid);
+				cache_store("local", "$var(es_key)", "$var(es_val)", 0);
+				$var(i) = $var(i) + 1;
+			}
+			$shv(es_gen) = $var(es_next);
 		}
 	} else if ($rc == -2) {
 		# No trunk any more.
@@ -1298,7 +1339,7 @@ route[trunk_out_loaded] {
 		exit;
 	}
 	if ($var(trunk_rc) == -1 && route(read_again)) {
-		sql_query_one("$avp(trunk_query)", "$avp(t_setid);$avp(t_domain);$avp(t_format);$avp(t_pai);$avp(t_user);$avp(t_pass);$avp(t_realm);$avp(t_codecs);$avp(t_presented);$avp(t_allowed);$avp(t_countries);$avp(t_internal)");
+		sql_query_one("$avp(trunk_query)", "$avp(t_setid);$avp(t_domain);$avp(t_format);$avp(t_pai);$avp(t_user);$avp(t_pass);$avp(t_realm);$avp(t_codecs);$avp(t_presented);$avp(t_allowed);$avp(t_countries);$avp(t_internal);$avp(t_site)");
 		$var(trunk_rc) = $rc;
 	}
 	if ($var(trunk_rc) == -2) {
@@ -1800,7 +1841,18 @@ route[emergency_fallback] {
 		return(-1);
 	$avp(t_fallback) = 1;
 	$var(failed) = "" + $T_reply_code;
-	if (!route(default_trunk) || !ds_select_dst($avp(t_setid), 8, "f"))
+	$var(again) = 0;
+	if (route(default_trunk))
+		$var(again) = 1;
+	else if ($avp(t_site) != NULL && $avp(t_site) != "" && $shv(dt_setid) != 0 && $avp(t_setid) == $shv(dt_setid) && $avp(t_rang) == NULL && $var(failed) =~ "^(403|404|484|488|603)$") {
+		# Its trunk is the default one, it refused before ringing anyone, with an answer that may be about the number
+		# presented (step 6c): once more, with the caller's direct number, else the trunk's, when that is another number.
+		# Never after a ringing, a timeout or a server error: the emergency services would be called twice, or the wait doubled.
+		$var(refused) = $avp(t_site);
+		if (route(default_trunk, "same") && $avp(t_presented) != $var(refused))
+			$var(again) = 1;
+	}
+	if ($var(again) == 0 || !ds_select_dst($avp(t_setid), 8, "f"))
 		return(-1);
 	xlog("L_WARN", "call $ci: emergency call failed on its trunk ($var(failed)), through the default trunk\n");
 	route(trunk_target);

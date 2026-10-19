@@ -7,7 +7,7 @@ import { useGateway } from '../gateway.js'
 import { LANGS, type Lang } from '../i18n/index.js'
 import { useT } from '../i18n/useT.js'
 import { usePhone } from '../softphone.js'
-import { ForwardingSettings, PresenceSettings } from './CallRulesSettings.js'
+import { EmergencySiteSettings, ForwardingSettings, PresenceSettings } from './CallRulesSettings.js'
 import { NotificationSettings } from './NotificationSettings.js'
 
 type Device = { id: string; label: string }
@@ -160,6 +160,7 @@ export const Settings = ({ config }: { config: AppConfig }) => {
         <>
           <PresenceSettings />
           <ForwardingSettings />
+          <EmergencySiteSettings />
           <NotificationSettings userId={me.id} />
         </>
       ) : null}

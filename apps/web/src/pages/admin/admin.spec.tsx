@@ -3,7 +3,7 @@ import { act } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { MemoryRouter, Route, Routes } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { AdminAlert, DidRange, OutboundSettings, Trunk, WebhookDelivery, WebhookSubscription } from '@twake/telephony-client'
+import type { AdminAlert, DidRange, EmergencySite, OutboundSettings, Trunk, WebhookDelivery, WebhookSubscription } from '@twake/telephony-client'
 import type { useGateway } from '../../gateway.js'
 import { I18nProvider, useT } from '../../i18n/useT.js'
 import { Admin } from './Admin.js'
@@ -12,6 +12,7 @@ import { Limits } from './Limits.js'
 import { Numbers } from './Numbers.js'
 import { Rights } from './Rights.js'
 import { RingGroups } from './RingGroups.js'
+import { Sites } from './Sites.js'
 import { STATUS_POLL_MS, Trunks } from './Trunks.js'
 import { Webhooks } from './Webhooks.js'
 
@@ -91,6 +92,9 @@ const client = (over: Record<string, unknown> = {}) =>
     listDids: vi.fn(async () => ({ items: [] as DidRange[] })),
     setDid: vi.fn(),
     deleteDid: vi.fn(),
+    listSites: vi.fn(async () => ({ items: [] as EmergencySite[] })),
+    setSite: vi.fn(),
+    deleteSite: vi.fn(),
     listAlerts: vi.fn(),
     acknowledgeAlert: vi.fn(),
     getOutbound: vi.fn(async () => outbound()),
@@ -150,7 +154,7 @@ describe('the administration screens (step 7)', () => {
     gateway = { client: client(), me: { id: 'alice', displayName: 'Alice', features: { admin: true } }, meError: null }
     await render('/admin/trunks', <Trunks />)
     const links = [...host.querySelectorAll('nav a')]
-    expect(links.map(a => a.textContent)).toEqual(['Comptes', 'Trunks', 'Numéros directs', "Groupes d'appel", "Droits d'appel", 'Plafonds et seuils', 'Alertes', 'Webhooks'])
+    expect(links.map(a => a.textContent)).toEqual(['Comptes', 'Trunks', 'Numéros directs', 'Sites', "Groupes d'appel", "Droits d'appel", 'Plafonds et seuils', 'Alertes', 'Webhooks'])
     expect(links.find(a => a.getAttribute('aria-current') === 'page')?.textContent).toBe('Trunks')
     // The trunk, how it is doing, and its password never shown.
     expect(text()).toContain('Opérateur (operator)')
@@ -220,6 +224,94 @@ describe('the administration screens (step 7)', () => {
     await flush()
     expect(setDid).toHaveBeenCalledWith({ id: 'staff', trunkId: 'operator', first: '+33199000100', last: '+33199000100', target: '555' })
     expect($('#did-target-error')?.textContent).toContain("ni un poste attribué ni un groupe")
+  })
+
+  it('sets a site for the emergency calls: its address, a number of its trunk, its people; and puts the Gateway\'s refusal of the number on the form (step 6c)', async () => {
+    const setSite = vi.fn(async () => {
+      throw refused(400, 'SITE_NUMBER', 'number: +33199000999 is neither a direct number of the trunk operator nor its default number')
+    })
+    gateway = { client: client({ setSite }), me: { id: 'alice', displayName: 'Alice', features: { admin: true } }, meError: null }
+    await render('/admin/sites', <Sites />)
+    expect(text()).toContain('Aucun site pour l\'instant.')
+    expect(($('#site-trunkId') as HTMLSelectElement).value).toBe('operator')
+    // Nothing is sent while a field is wrong, each in words.
+    await submit($('form'))
+    expect(setSite).not.toHaveBeenCalled()
+    expect($('#site-id-error')?.textContent).toContain('lettres minuscules')
+    expect($('#site-address-error')).not.toBeNull()
+    expect($('#site-number-error')?.textContent).toContain('+33 1 99 00 03 50')
+    type($('#site-id'), 'paris')
+    type($('#site-name'), 'Paris')
+    type($('#site-address'), '1 rue de Rivoli, 75001 Paris')
+    type($('#site-number'), '+33 1 99 00 09 99')
+    click($('#site-members'))
+    await submit($('form'))
+    await flush()
+    expect(setSite).toHaveBeenCalledWith({ id: 'paris', name: 'Paris', address: '1 rue de Rivoli, 75001 Paris', trunkId: 'operator', number: '+33199000999', members: ['alice'] })
+    expect($('#site-number-error')?.textContent).toContain('ni un numéro direct de ce trunk ni son numéro par défaut')
+  })
+
+  it('lists the sites with their trunk, number and people, and says it all in English too (step 6c)', async () => {
+    const paris: EmergencySite = { id: 'paris', name: 'Paris', address: '1 rue de Rivoli, 75001 Paris', trunkId: 'operator', number: '+33199000350', members: ['alice'] }
+    const deleteSite = vi.fn(async () => undefined)
+    const listSites = vi.fn(async () => ({ items: [paris] }))
+    gateway = { client: client({ listSites, deleteSite }), me: { id: 'alice', displayName: 'Alice', features: { admin: true } }, meError: null }
+    await act(async () =>
+      root.render(
+        <I18nProvider>
+          <LangSwitch />
+          <MemoryRouter initialEntries={['/admin/sites']}>
+            <Sites />
+          </MemoryRouter>
+        </I18nProvider>
+      )
+    )
+    await flush()
+    expect($('ul[aria-label="Sites existants"]')?.textContent).toContain('+33 1 99 00 03 50')
+    expect(text()).toContain('1 rue de Rivoli, 75001 Paris')
+    expect(text()).toContain('1 personne')
+    expect(text()).not.toContain('1 personnes')
+    click(button(host, 'English'))
+    expect($('ul[aria-label="Existing sites"]')).not.toBeNull()
+    expect(text()).toContain('Postal address')
+    // Edited, the people are those it has; removed, the list is read again.
+    click($('button[aria-label="Edit site paris"]'))
+    expect(($('#site-members') as HTMLInputElement).checked).toBe(true)
+    expect(($('#site-id') as HTMLInputElement).disabled).toBe(true)
+    click($('button[aria-label="Delete site paris"]'))
+    click(button(host, 'Yes, delete'))
+    await flush()
+    expect(deleteSite).toHaveBeenCalledWith('paris')
+    expect(listSites.mock.calls.length).toBeGreaterThan(1)
+  })
+
+  it('searches the people of a site without losing those it hides, and drops the one who left the directory (step 6c, review n°5, n°7)', async () => {
+    const users = [
+      { userId: 'alice', extension: '101', displayName: 'Alice' },
+      { userId: 'bob', extension: '102', displayName: 'Bob' }
+    ]
+    const setSite = vi.fn(async (site: EmergencySite) => site)
+    const left: EmergencySite = { id: 'paris', name: 'Paris', address: '1 rue de Rivoli', trunkId: 'operator', number: '+33199000350', members: ['alice', 'gone'] }
+    gateway = { client: client({ setSite, listAdminUsers: vi.fn(async () => ({ items: users })), listSites: vi.fn(async () => ({ items: [left] })) }), me: { id: 'alice', displayName: 'Alice', features: { admin: true } }, meError: null }
+    await render('/admin/sites', <Sites />)
+    expect(text()).toContain('2 personnes')
+    click($('button[aria-label="Modifier le site paris"]'))
+    type($('#site-search'), 'bo')
+    // Enter in the search is no save: the key is taken (a browser submits the form on it otherwise).
+    const enter = new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true })
+    act(() => void $('#site-search')!.dispatchEvent(enter))
+    expect(enter.defaultPrevented).toBe(true)
+    expect(setSite).not.toHaveBeenCalled()
+    expect([...host.querySelectorAll('#site-members-bob, #site-members')].length).toBe(1)
+    expect(text()).not.toContain('Alice (101)')
+    click($('#site-members'))
+    type($('#site-search'), 'zzz')
+    expect(text()).toContain('Personne ne correspond.')
+    type($('#site-search'), '')
+    await submit($('form'))
+    await flush()
+    // Alice stays though the search hid her, Bob is added, whoever is gone is not sent.
+    expect(setSite).toHaveBeenCalledWith(expect.objectContaining({ id: 'paris', members: ['alice', 'bob'] }))
   })
 
   it('lists the alerts to handle, and takes an acknowledged one off the list', async () => {

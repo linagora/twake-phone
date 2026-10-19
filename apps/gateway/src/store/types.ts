@@ -1,4 +1,4 @@
-import type { CallDirection, CallState, DidRange, OperatorCdr, OutboundAssignment, OutboundPolicy, OutboundProfile, PresenceStatus, TelephonyAlert, Trunk, WebhookEventType } from '@twake/telephony-types'
+import type { CallDirection, CallState, DidRange, EmergencySite, OperatorCdr, OutboundAssignment, OutboundPolicy, OutboundProfile, PresenceStatus, TelephonyAlert, Trunk, WebhookEventType } from '@twake/telephony-types'
 
 export interface ProviderRecord {
   tenantId: string
@@ -223,6 +223,11 @@ export interface TrunkRecord {
 
 /** A range of direct numbers of a trunk (SDA), and the extension or group it rings. */
 export interface DidRecord extends DidRange {
+  tenantId: string
+}
+
+/** A site of a tenant for its emergency calls (step 6c, ADR 0024), with the people in it. */
+export interface SiteRecord extends EmergencySite {
   tenantId: string
 }
 
@@ -858,6 +863,14 @@ export interface Store {
   /** Adds or replaces a range; its trunk must exist in the tenant (else it throws). */
   upsertDid(record: DidRecord): Promise<void>
   deleteDid(tenantId: string, id: string): Promise<boolean>
+  /** The sites of a tenant, by id (step 6c). */
+  listSites(tenantId: string): Promise<SiteRecord[]>
+  /**
+   * Adds or replaces a site, and its members: the people it names leave the site they were in (one site a person).
+   * Its trunk must exist in the tenant (else it throws). Removing a trunk removes its sites.
+   */
+  upsertSite(record: SiteRecord): Promise<void>
+  deleteSite(tenantId: string, id: string): Promise<boolean>
 
   /** The outbound rules of a tenant; null when none was ever set. */
   getOutbound(tenantId: string): Promise<OutboundRecord | null>

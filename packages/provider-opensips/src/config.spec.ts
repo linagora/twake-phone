@@ -771,15 +771,15 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     // The trunk of a call to the public network, the direct number of a call from it: step 6; the caller's rights and
     // caps, a query of its own after the trunk's: step 6b; whether the From of a room's call is one of our accounts:
     // step 8). Three synchronous queries ask the catalog whether the tables
-    // of step 4c, that of step 5 or that of step 11a exist, only after a read failed, from the routes that resume a read; two more read
-    // the default trunk and the direct numbers on it every 15 s, in a timer of its own, never in a call (an emergency
-    // call's fallback when the trunk of the call cannot be read, with its caller's own number). The last two make the
+    // of step 4c, that of step 5 or that of step 11a exist, only after a read failed, from the routes that resume a read; three more read
+    // the default trunk, the direct numbers and the sites on it every 15 s, in a timer of its own, never in a call (an emergency
+    // call's fallback when the trunk of the call cannot be read, with its caller's own number or site). The last two make the
     // direct number's and the trunk's reads again, synchronously, when OpenSIPS dropped them (route[read_again]).
     // One more withdraws what twake_outbound() reserved for a call it refuses after all (review 8b, n°5).
-    expect(cfg.match(/sql_query/g)).toHaveLength(18)
+    expect(cfg.match(/sql_query/g)).toHaveLength(19)
     expect(cfg.match(/async\(sql_query/g)).toHaveLength(10)
     const timer = cfg.slice(cfg.indexOf('\ntimer_route[default_trunk, 15] {'), cfg.indexOf('\nroute[emergency_failed] {'))
-    expect(timer.match(/sql_query(_one)?\(/g)).toHaveLength(2)
+    expect(timer.match(/sql_query(_one)?\(/g)).toHaveLength(3)
     expect(section('route[tables_4c_missing]', 'route[table_11_missing]').match(/sql_query_one\(/g)).toHaveLength(1)
     expect(section('route[table_11_missing]', 'route[table_5_missing]').match(/sql_query_one\(/g)).toHaveLength(1)
     expect(cfg.match(/route\(table_11_missing\)/g)).toHaveLength(1)
@@ -1309,7 +1309,7 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(timer).toContain('} else if ($rc == -2) {\n\t\t# No trunk any more.\n\t\t$shv(dt_setid) = 0;')
     // Taken for an emergency call when the trunk could not be read, or none of its servers is up.
     const fallback = section('route[default_trunk]', 'timer_route[default_trunk, 15]')
-    expect(fallback).toContain('if ($shv(dt_setid) == 0 || ($avp(t_setid) != NULL && $avp(t_setid) == $shv(dt_setid)))\n\t\treturn(-1);')
+    expect(fallback).toContain('if ($shv(dt_setid) == 0 || ($var(same) == 0 && $avp(t_setid) != NULL && $avp(t_setid) == $shv(dt_setid)))\n\t\treturn(-1);')
     const loaded = section('route[trunk_out_loaded]', 'route[trunk_out_send]')
     const send = section('route[trunk_out_send]', 'route[outbound_count]')
     expect(loaded).toContain('if ($avp(num_class) == "emergency" && route(default_trunk)) {')
@@ -1544,7 +1544,11 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     // An emergency call only, once; through the default trunk, unless that is the trunk that failed (route[default_trunk]).
     const fallback = section('route[emergency_fallback]', 'route[trunk_in]')
     expect(fallback).toContain('if ($avp(num_class) != "emergency" || $avp(t_fallback) != NULL)\n\t\treturn(-1);\n\t$avp(t_fallback) = 1;')
-    expect(fallback).toContain('if (!route(default_trunk) || !ds_select_dst($avp(t_setid), 8, "f"))\n\t\treturn(-1);')
+    expect(fallback).toContain('if ($var(again) == 0 || !ds_select_dst($avp(t_setid), 8, "f"))\n\t\treturn(-1);')
+    // Its trunk the default one, the number of a site refused (step 6c): once more on it with the direct or the default number.
+    expect(fallback).toContain('else if ($avp(t_site) != NULL && $avp(t_site) != "" && $shv(dt_setid) != 0 && $avp(t_setid) == $shv(dt_setid) && $avp(t_rang) == NULL && $var(failed) =~ "^(403|404|484|488|603)$") {')
+    // Only a refusal before any ringing, and only when it presents another number than the one refused.
+    expect(fallback).toContain('$var(refused) = $avp(t_site);\n\t\tif (route(default_trunk, "same") && $avp(t_presented) != $var(refused))')
     // Written for that trunk (its number, its domain, its socket), its From and To for each branch, its failure handled here again.
     for (const step of ['route(trunk_target);', 't_on_branch("trunk_out");', 't_on_reply("rtp");', 't_on_failure("trunk_failed");', 'if (t_relay())\n\t\treturn(1);'])
       expect(fallback.indexOf(step), step).toBeGreaterThan(fallback.indexOf('route(default_trunk)'))
@@ -1662,6 +1666,42 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(unreachable.slice(reply - 3, reply + 3)).toEqual(['$avp(vm_code) = 480;', '$avp(vm_reason) = "Temporarily Unavailable";', 'if ($avp(fwd_hops) == 0 && $avp(dialled_unread) != 1) {', '$avp(vm_code) = 404;', '$avp(vm_reason) = "Not Found";', '}'])
     expect(unreachable).toContain('t_reply($avp(vm_code), "$avp(vm_reason)");')
   })
+  it('presents the number of the caller\'s site for an emergency call, in the query it makes already, and from memory when the database is down (step 6c, ADR 0024)', () => {
+    const { cfg } = render()
+    const section = (name: string, next: string) => cfg.slice(cfg.indexOf(`\n${name} {`), cfg.indexOf(`\n${next} {`))
+    const out = section('route[trunk_out]', 'route[default_trunk]')
+    // One query: the site is a join of it, for an emergency call only; the others present what they did.
+    expect(out.match(/async\(sql_query/g)).toHaveLength(1)
+    expect(out).toContain('$var(presented) = "coalesce(d.number, t.default_number)";')
+    expect(out).toContain('if ($avp(num_class) == "emergency") {\n\t\t$var(presented) = "coalesce(e.number, d.number, t.default_number)";')
+    // The people of a site are joined to the accounts by their holder, as the profiles of step 6b; the caller's user name is checked first.
+    expect(out).toContain('JOIN subscriber sb ON sb.holder = eu.user_id WHERE es.trunk_id = t.id AND sb.username = \'" + $var(ext) + "\'')
+    expect(out.indexOf('if ($avp(caller) =~ "^[A-Za-z0-9._+-]{1,64}$")')).toBeLessThan(out.indexOf('emergency_sites'))
+    // The site's trunk first, for an emergency call only.
+    expect(out).toContain('$var(site_order) = "(e.number IS NULL), ";')
+    // Which number was the site's is kept (`t_site`): what route[emergency_fallback] needs to try the trunk again without it.
+    expect(out).toContain('$var(site_col) = "e.number";')
+    expect(out).toContain('$avp(t_countries);$avp(t_internal);$avp(t_site)')
+    expect(out).toContain('ORDER BY " + $var(site_order) + "(d.number IS NULL), t.position LIMIT 1')
+    // Never the query of the rights, never the Gateway.
+    expect(out).not.toContain('twake_outbound')
+    // From memory (`es:`, with the generation of `dn:`) when the database does not answer, before the direct number.
+    const timer = section('timer_route[default_trunk, 15]', 'route[emergency_failed]')
+    expect(timer).toContain('cache_store("local", "$var(es_key)", "$var(es_val)", 0);')
+    expect(timer).toContain('$var(es_val) = $(avp(es_num)[$var(i)]) + "|" + $var(es_next) + "|" + $var(d_setid);')
+    // Its own generation, moved only by a read that succeeded (rows, or none: -2), apart from the direct numbers'.
+    expect(timer.indexOf('$shv(es_gen) = $var(es_next);')).toBeGreaterThan(timer.indexOf('cache_store("local", "$var(es_key)"'))
+    expect(timer.match(/if \(\$rc == 1 \|\| \$rc == -2\) \{/g)).toHaveLength(2)
+    expect(cfg).toContain('modparam("cfgutils", "shvset", "es_gen=i:0")')
+    expect(timer).toContain('es.trunk_id = (SELECT id FROM trunks ORDER BY position LIMIT 1)')
+    const fallback = section('route[default_trunk]', 'timer_route[default_trunk, 15]')
+    expect(fallback).toContain('$(var(es){s.select,1,|}{s.int}) >= $shv(es_gen)')
+    // The number is kept with the trunk it was read for: a default trunk that changed presents none of the old one.
+    expect(fallback).toContain('$(var(es){s.select,2,|}{s.int}) == $shv(dt_setid)')
+    expect(fallback.indexOf('"es:$avp(caller)"')).toBeGreaterThan(fallback.indexOf('"dn:$avp(caller)"'))
+    expect(fallback).toContain('$avp(t_presented) = $(var(es){s.select,0,|});')
+  })
+
   it('keeps what an emergency call presents however long the database is down, bounds the emergency calls a restart restores, and never rings a fallback group where the call has been (second review 6b, n°1, n°4, n°9, n°10)', () => {
     const { cfg } = render()
     const section = (name: string, next: string) => cfg.slice(cfg.indexOf(`\n${name} {`), cfg.indexOf(`\n${next} {`))

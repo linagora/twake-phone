@@ -843,6 +843,41 @@ export const storeContract = (name: string, make: () => Promise<Store>) =>
       await s.close()
     })
 
+    it('keeps the sites of each tenant with their people, one site a person, and removes them with their trunk (step 6c)', async () => {
+      const s = await make()
+      const config = { auth: 'ip' as const, domain: 'operator.example', codecs: ['PCMA' as const], numberFormat: 'e164' as const, defaultNumber: '+33199000100' }
+      await s.upsertTrunk({ tenantId: 'A', id: 'main', config })
+      await s.upsertTrunk({ tenantId: 'A', id: 'backup', config })
+      await s.upsertTrunk({ tenantId: 'B', id: 'main', config })
+      const lyon0 = { tenantId: 'A', id: 'lyon', name: 'Lyon', address: '2 place Bellecour, 69002 Lyon', trunkId: 'backup', number: '+33199000351', members: [] as string[] }
+      const paris = { tenantId: 'A', id: 'paris', name: 'Paris', address: '1 rue de Rivoli, 75001 Paris', trunkId: 'main', number: '+33199000350', members: ['u-2', 'u-1'] }
+      await s.upsertSite(paris)
+      await s.upsertSite(lyon0)
+      await s.upsertSite({ tenantId: 'B', id: 'paris', name: 'Other Paris', address: 'x', trunkId: 'main', number: '+33199000360', members: ['u-1'] })
+      // By id, the people sorted; each tenant has its own.
+      expect(await s.listSites('A')).toEqual([lyon0, { ...paris, members: ['u-1', 'u-2'] }])
+      expect((await s.listSites('B')).map(x => x.name)).toEqual(['Other Paris'])
+      expect(await s.listSites('C')).toEqual([])
+      // A person who is named by another site leaves the one she was in; a site replaced keeps no one it no longer names.
+      await s.upsertSite({ ...lyon0, members: ['u-2', 'u-3'] })
+      expect((await s.listSites('A')).map(x => `${x.id}:${x.members.join(',')}`)).toEqual(['lyon:u-2,u-3', 'paris:u-1'])
+      await s.upsertSite({ ...paris, name: 'Paris 1er', members: [] })
+      expect((await s.listSites('A')).map(x => `${x.id}:${x.name}:${x.members.join(',')}`)).toEqual(['lyon:Lyon:u-2,u-3', 'paris:Paris 1er:'])
+      // A trunk of another tenant, or none: refused.
+      await expect(s.upsertSite({ ...paris, tenantId: 'C' })).rejects.toThrow()
+      await expect(s.upsertSite({ ...paris, trunkId: 'nope' })).rejects.toThrow()
+      expect(await s.deleteSite('B', 'lyon')).toBe(false)
+      expect(await s.deleteSite('A', 'paris')).toBe(true)
+      expect(await s.deleteSite('A', 'paris')).toBe(false)
+      // A trunk goes with its sites, in its tenant only, and the people with them.
+      expect(await s.deleteTrunk('A', 'backup')).toBe(true)
+      expect(await s.listSites('A')).toEqual([])
+      expect((await s.listSites('B')).map(x => x.id)).toEqual(['paris'])
+      await s.upsertSite({ ...paris, trunkId: 'main', members: ['u-3'] })
+      expect((await s.listSites('A'))[0]!.members).toEqual(['u-3'])
+      await s.close()
+    })
+
     it('keeps the first VAPID keys it is given', async () => {
       const s = await make()
       expect(await s.getVapidKeys()).toBeNull()

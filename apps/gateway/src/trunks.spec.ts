@@ -1,7 +1,7 @@
 import { randomBytes } from 'node:crypto'
 import { describe, expect, it } from 'vitest'
 import type { ProviderFactory, TelephonyProvider } from '@twake/telephony-provider-sdk'
-import type { DidRange, Trunk } from '@twake/telephony-types'
+import type { DidRange, EmergencySite, Trunk } from '@twake/telephony-types'
 import { buildApp } from './app.js'
 import { TicketStore } from './auth.js'
 import { decrypt } from './crypto.js'
@@ -9,7 +9,7 @@ import { StoreDirectory } from './directory.js'
 import { EventBus } from './events.js'
 import { ProviderRegistry } from './registry.js'
 import { MemoryStore } from './store/memory.js'
-import { defaultTrunk, parseDid, parseTrunk, providerTrunks, publicTrunk, trunkFromEnv, trunkRecord } from './trunks.js'
+import { defaultTrunk, parseDid, parseSite, parseTrunk, providerTrunks, publicTrunk, trunkFromEnv, trunkRecord } from './trunks.js'
 
 // Fictional numbers only (ARCEP: 01 99 00 xx xx, 06 39 98 xx xx), documentation addresses (RFC 5737) and names.
 const trunk = { auth: 'register', domain: 'operator.example', proxies: ['192.0.2.20', 'sip2.operator.example:5070'], username: '0033199000100', password: 'not-a-real-one', codecs: ['PCMA', 'PCMU'], defaultNumber: '+33199000100' }
@@ -143,6 +143,32 @@ describe('parseTrunk', () => {
   })
 })
 
+describe('parseSite', () => {
+  const trunks = [{ id: 'operator', config: { defaultNumber: '+33199000100' } }] as unknown as Parameters<typeof parseSite>[2]
+  const dids: DidRange[] = [{ id: 'desk', trunkId: 'operator', first: '+33199000350', last: '+33199000359', target: '101' }, { id: 'other', trunkId: 'backup', first: '+33199000400', last: '+33199000400', target: '102' }]
+  const site = { name: ' Paris ', address: '1 rue de Rivoli', trunkId: 'operator', number: '+33199000355', members: ['u2', 'u1'] }
+  it('keeps the site checked, its people sorted, and its number only when it is one of its trunk', () => {
+    expect(parseSite('paris', site, trunks, dids)).toEqual({ id: 'paris', name: 'Paris', address: '1 rue de Rivoli', trunkId: 'operator', number: '+33199000355', members: ['u1', 'u2'] })
+    expect(parseSite('paris', { ...site, number: '+33199000100', members: undefined }, trunks, dids).members).toEqual([])
+    for (const [change, error] of [
+      [{ number: '+33199000400' }, /neither a direct number/],
+      [{ number: '+33199000999' }, /neither a direct number/],
+      [{ number: '0199000355' }, /^number/],
+      [{ number: '+330199000355' }, /^number/],
+      [{ trunkId: 'backup' }, /^trunkId/],
+      [{ name: '' }, /^name/],
+      [{ name: 'a\nb' }, /^name/],
+      [{ address: 'x'.repeat(201) }, /^address/],
+      [{ members: ['u1', 'u1'] }, /each person once/],
+      [{ members: [''] }, /^members/],
+      [{ members: 'u1' }, /^members/]
+    ] as [Record<string, unknown>, RegExp][])
+      expect(() => parseSite('paris', { ...site, ...change }, trunks, dids), JSON.stringify(change)).toThrow(error)
+    expect(() => parseSite('Paris!', site, trunks, dids)).toThrow(/^id/)
+    expect(() => parseSite('paris', [], trunks, dids)).toThrow(/JSON object/)
+  })
+})
+
 describe('parseDid', () => {
   const trunks = [{ id: 'operator' }]
   it('takes one number or a range, and an extension, a group, or the last digits of the number called', () => {
@@ -233,13 +259,14 @@ describe('trunkFromEnv', () => {
 })
 
 describe('trunk routes', () => {
-  const setup = async (opts: { withTrunks?: boolean; key?: Buffer | null; store?: MemoryStore; refuse?: boolean; status?: () => Promise<unknown>; statusCacheMs?: number; logged?: unknown[][] } = {}) => {
+  const setup = async (opts: { withTrunks?: boolean; key?: Buffer | null; store?: MemoryStore; refuse?: boolean; holds?: (extension: string, userId: string) => boolean; status?: () => Promise<unknown>; statusCacheMs?: number; logged?: unknown[][] } = {}) => {
     process.env.AUTH_MODE = 'dev'
     const store = opts.store ?? new MemoryStore()
     // Who holds the extensions the direct numbers ring (tenant A), and its ring group 200.
     await store.upsertMapping({ tenantId: 'A', userId: 'alice', extension: '101' })
     await store.upsertMapping({ tenantId: 'A', userId: 'jean', extension: '102' })
     const handed: { trunks: (Trunk & { password?: string })[]; dids: DidRange[] }[] = []
+    const handedSites: EmergencySite[][] = []
     // fail: what the provider throws at the next set it is handed (written, then not reloaded: a 502).
     const control: { fail?: Error } = {}
     const provider = {
@@ -249,11 +276,13 @@ describe('trunk routes', () => {
       close: async () => {},
       listGroups: async () => [{ number: '200', name: 'Accueil', members: ['101'] }],
       ...(opts.status ? { getTrunkStatus: opts.status } : {}),
+      ...(opts.holds ? { holdsAccount: async (extension: string, userId: string) => opts.holds!(extension, userId) } : {}),
       ...(opts.withTrunks !== false
         ? {
-            setTrunks: async (trunks: (Trunk & { password?: string })[], dids: DidRange[]) => {
+            setTrunks: async (trunks: (Trunk & { password?: string })[], dids: DidRange[], sites: EmergencySite[] = []) => {
               if (opts.refuse) throw Object.assign(new Error('refused by the SIP server'), { statusCode: 400 })
               handed.push({ trunks, dids })
+              handedSites.push(structuredClone(sites))
               const fail = control.fail
               control.fail = undefined
               if (fail) throw fail
@@ -285,7 +314,7 @@ describe('trunk routes', () => {
     }
     registry.startAll()
     const as = (user: string, roles?: string, tenant = 'A') => ({ 'x-dev-user': user, 'x-dev-tenant': tenant, ...(roles ? { 'x-dev-roles': roles } : {}) })
-    return { app, as, admin: as('root', 'twakephone-admin'), handed, store, key, control }
+    return { app, as, admin: as('root', 'twakephone-admin'), handed, handedSites, store, key, control }
   }
 
   it('lets an administrator set a trunk and its direct numbers, hands them whole to the provider, never shows the password', async () => {
@@ -320,6 +349,101 @@ describe('trunk routes', () => {
     expect(handed.at(-1)).toEqual({ trunks: [], dids: [] })
     expect(await store.listDids('A')).toEqual([])
     expect((await app.inject({ method: 'DELETE', url: '/api/v1/admin/trunks/operator', headers: admin })).statusCode).toBe(404)
+  })
+
+  it('lets an administrator set the sites of the emergency calls, hands them with the trunks to the provider, and tells each person hers (step 6c)', async () => {
+    const { app, admin, as, handed, handedSites, store, control } = await setup()
+    await app.inject({ method: 'PUT', url: '/api/v1/admin/trunks/operator', headers: admin, payload: trunk })
+    await app.inject({ method: 'PUT', url: '/api/v1/admin/dids/reception', headers: admin, payload: { trunkId: 'operator', first: '+33199000350', last: '+33199000359', target: '101' } })
+    const paris = { name: 'Paris', address: '1 rue de Rivoli, 75001 Paris', trunkId: 'operator', number: '+33199000350', members: ['alice'] }
+    const put = (id: string, payload: unknown, headers = admin) => app.inject({ method: 'PUT', url: `/api/v1/admin/sites/${id}`, headers, payload: payload as object })
+    expect((await put('paris', paris, as('bob'))).statusCode).toBe(403)
+    const created = await put('paris', paris)
+    expect(created.statusCode).toBe(201)
+    expect(created.json()).toEqual({ id: 'paris', ...paris })
+    expect(handedSites.at(-1)).toEqual([{ id: 'paris', ...paris }])
+    // A number must be of the trunk (the operator takes no other as the caller) and ring someone: its default number alone rings nobody.
+    expect((await put('lyon', { ...paris, name: 'Lyon', number: '+33199000355', members: ['jean', 'nobody'] })).json()).toMatchObject({ code: 'SITE_MEMBER' })
+    expect((await put('lyon', { ...paris, name: 'Lyon', number: '+33199000100', members: [] })).json()).toMatchObject({ code: 'SITE_NUMBER_RINGS_NOBODY' })
+    expect((await put('lyon', { ...paris, name: 'Lyon', number: '+33199000999', members: [] })).json()).toMatchObject({ code: 'SITE_NUMBER' })
+    expect((await put('lyon', { ...paris, name: 'Lyon', trunkId: 'nope', members: [] })).statusCode).toBe(400)
+    expect(handedSites.at(-1)).toEqual([{ id: 'paris', ...paris }])
+    // One site a person: alice moves to the site that names her, which the provider is handed with the other emptied.
+    const lyon = { ...paris, name: 'Lyon', number: '+33199000355', members: ['alice', 'jean'] }
+    expect((await put('lyon', lyon)).statusCode).toBe(201)
+    expect([...handedSites.at(-1)!].sort((a, b) => a.id.localeCompare(b.id))).toEqual([{ id: 'lyon', ...lyon }, { id: 'paris', ...paris, members: [] }])
+    expect((await store.listSites('A')).map(x => `${x.id}:${x.members.join(',')}`)).toEqual(['lyon:alice,jean', 'paris:'])
+    expect((await app.inject({ url: '/api/v1/admin/sites', headers: admin })).json().items.map((x: EmergencySite) => x.id)).toEqual(['lyon', 'paris'])
+    // What the person is told, in the app.
+    expect((await app.inject({ url: '/api/v1/me/emergency-site', headers: as('alice') })).json()).toEqual({ enabled: true, site: { name: 'Lyon', address: paris.address, number: '+33199000355' } })
+    expect((await app.inject({ url: '/api/v1/me/emergency-site', headers: as('carol') })).json()).toEqual({ enabled: true })
+    // The provider refuses (or fails to reload): the request fails, the store keeps nothing and the provider is handed the set it had.
+    const before = structuredClone(handedSites.at(-1)!)
+    control.fail = Object.assign(new Error('OpenSIPS did not reload'), { statusCode: 502 })
+    expect((await put('rome', { ...paris, name: 'Rome', members: [] })).statusCode).toBe(502)
+    expect((await store.listSites('A')).map(x => x.id)).toEqual(['lyon', 'paris'])
+    expect([...handedSites.at(-1)!].sort((a, b) => a.id.localeCompare(b.id))).toEqual([...before].sort((a, b) => a.id.localeCompare(b.id)))
+    // A site goes alone; its trunk goes only without sites.
+    expect((await app.inject({ method: 'DELETE', url: '/api/v1/admin/sites/paris', headers: admin })).statusCode).toBe(204)
+    expect((await app.inject({ method: 'DELETE', url: '/api/v1/admin/sites/paris', headers: admin })).statusCode).toBe(404)
+    expect(handedSites.at(-1)!.map(x => x.id)).toEqual(['lyon'])
+    const kept = await app.inject({ method: 'DELETE', url: '/api/v1/admin/trunks/operator', headers: admin })
+    expect(kept.statusCode).toBe(409)
+    expect(kept.json()).toMatchObject({ code: 'TRUNK_HAS_SITES' })
+    expect((await store.listSites('A')).map(x => x.id)).toEqual(['lyon'])
+    expect((await app.inject({ method: 'DELETE', url: '/api/v1/admin/sites/lyon', headers: admin })).statusCode).toBe(204)
+    expect((await app.inject({ method: 'DELETE', url: '/api/v1/admin/trunks/operator', headers: admin })).statusCode).toBe(204)
+    expect(handed.at(-1)).toEqual({ trunks: [], dids: [] })
+    expect(handedSites.at(-1)).toEqual([])
+  })
+
+  it('refuses a change of the trunk or of its direct numbers that would leave a site a number its operator would refuse (step 6c, review n°1)', async () => {
+    const { app, admin, handedSites, store } = await setup()
+    await app.inject({ method: 'PUT', url: '/api/v1/admin/trunks/operator', headers: admin, payload: trunk })
+    await app.inject({ method: 'PUT', url: '/api/v1/admin/dids/reception', headers: admin, payload: { trunkId: 'operator', first: '+33199000350', last: '+33199000359', target: '101' } })
+    await app.inject({ method: 'PUT', url: '/api/v1/admin/dids/second', headers: admin, payload: { trunkId: 'operator', first: '+33199000360', target: '102' } })
+    const site = { name: 'Paris', address: '1 rue de Rivoli', trunkId: 'operator', number: '+33199000355', members: ['alice'] }
+    expect((await app.inject({ method: 'PUT', url: '/api/v1/admin/sites/paris', headers: admin, payload: site })).statusCode).toBe(201)
+    const refused = (r: { statusCode: number; json(): unknown }) => {
+      expect(r.statusCode).toBe(409)
+      expect(r.json()).toMatchObject({ code: 'SITE_NUMBER_IN_USE' })
+    }
+    // The range removed, shortened below the number, or moved; the default number of the trunk changed (the site on it).
+    refused(await app.inject({ method: 'DELETE', url: '/api/v1/admin/dids/reception', headers: admin }))
+    refused(await app.inject({ method: 'PUT', url: '/api/v1/admin/dids/reception', headers: admin, payload: { trunkId: 'operator', first: '+33199000350', last: '+33199000354', target: '101' } }))
+    // Nothing was written: the store and the provider hold what they held.
+    expect((await store.listDids('A')).map(d => d.last).sort()).toEqual(['+33199000359', '+33199000360'])
+    expect(handedSites.at(-1)!.map(x => x.number)).toEqual(['+33199000355'])
+    // The site says another number first: then the range goes.
+    expect((await app.inject({ method: 'PUT', url: '/api/v1/admin/sites/paris', headers: admin, payload: { ...site, number: '+33199000360' } })).statusCode).toBe(200)
+    expect((await app.inject({ method: 'DELETE', url: '/api/v1/admin/dids/reception', headers: admin })).statusCode).toBe(204)
+    refused(await app.inject({ method: 'DELETE', url: '/api/v1/admin/dids/second', headers: admin }))
+  })
+
+  it('lets a site be saved again once someone of it left the directory, and tells only the site that OpenSIPS will apply (step 6c, review n°4, n°5)', async () => {
+    let holds = true
+    const { app, admin, as, store } = await setup({ holds: () => holds })
+    await app.inject({ method: 'PUT', url: '/api/v1/admin/trunks/operator', headers: admin, payload: trunk })
+    await app.inject({ method: 'PUT', url: '/api/v1/admin/dids/reception', headers: admin, payload: { trunkId: 'operator', first: '+33199000350', target: '101' } })
+    const site = { name: 'Paris', address: '1 rue de Rivoli', trunkId: 'operator', number: '+33199000350', members: ['alice', 'jean'] }
+    expect((await app.inject({ method: 'PUT', url: '/api/v1/admin/sites/paris', headers: admin, payload: site })).statusCode).toBe(201)
+    // The account of alice has no holder (written before): the app does not say the site, OpenSIPS would not apply it.
+    holds = false
+    expect((await app.inject({ url: '/api/v1/me/emergency-site', headers: as('alice') })).json()).toEqual({ enabled: true })
+    holds = true
+    expect((await app.inject({ url: '/api/v1/me/emergency-site', headers: as('alice') })).json().site).toMatchObject({ name: 'Paris' })
+    // jean left the directory: the site is saved again, without him; a stranger who was not in it is still refused.
+    await store.deleteMapping('A', 'jean')
+    const saved = await app.inject({ method: 'PUT', url: '/api/v1/admin/sites/paris', headers: admin, payload: site })
+    expect(saved.statusCode).toBe(200)
+    expect(saved.json().members).toEqual(['alice'])
+    expect((await app.inject({ method: 'PUT', url: '/api/v1/admin/sites/paris', headers: admin, payload: { ...site, members: ['alice', 'nobody'] } })).json()).toMatchObject({ code: 'SITE_MEMBER' })
+  })
+
+  it('says nothing of sites without trunks', async () => {
+    const { app, as, admin } = await setup({ withTrunks: false })
+    expect((await app.inject({ url: '/api/v1/me/emergency-site', headers: as('alice') })).json()).toEqual({ enabled: false })
+    expect((await app.inject({ url: '/api/v1/admin/sites', headers: admin })).statusCode).toBe(501)
   })
 
   it('says how the trunks are doing as the provider tells it, and that it does not know when it cannot tell (step 7)', async () => {

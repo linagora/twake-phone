@@ -8,7 +8,7 @@ import swaggerUi from '@fastify/swagger-ui'
 import { LiveKitError, PIN_DIGITS, maskNumber, splitParticipantId, verifyWebhook, type LiveKitConferenceBridge, type MeetApi, type MeetRoom, type ParticipantCall } from '@twake/conference-livekit'
 import { OUTBOUND_ALLOWED, REPLACES, classify, countryAllowed } from '@twake/provider-opensips'
 import type { DialedParticipant, MediaProvider, OperatorProvider, RoomCallGrantToken, TelephonyProvider, VoicemailBox, VoicemailProvider, VoicemailSync } from '@twake/telephony-provider-sdk'
-import { EXTENSION_FORMAT, FRAUD_DEFAULTS, OUTBOUND_CAP_DEFAULTS, isReservedNumber, type CallDirection, type DidRange, type Endpoint, type ForwardingRules, type HistoryErasure, type Presence, type PresenceStatus, type RingGroup, type TelephonyEvent, type TrunkStatus, type User } from '@twake/telephony-types'
+import { EXTENSION_FORMAT, FRAUD_DEFAULTS, OUTBOUND_CAP_DEFAULTS, isReservedNumber, type CallDirection, type DidRange, type EmergencySite, type Endpoint, type ForwardingRules, type HistoryErasure, type Presence, type PresenceStatus, type RingGroup, type TelephonyEvent, type TrunkStatus, type User } from '@twake/telephony-types'
 import { adminPolicyFromEnv, isAdmin, type AdminPolicy } from './admin.js'
 import { authenticatorFromEnv, TicketStore, type Authenticator, type Identity } from './auth.js'
 import { MAX_CONTACT_ID, MAX_FAVORITES, MAX_QUERY, MAX_SEARCH, RateLimiter, type ContactDirectory } from './contacts.js'
@@ -30,7 +30,7 @@ import { VOICEMAIL_ID } from './voicemail.js'
 import { VoicemailLeases, voicemailRole, type VoicemailWeight } from './voicemail-lease.js'
 import { TranscriptWatcher, VoicemailTranscripts, publicTranscript, userOfHolder, type NoticeSettings, type TranscriptAlert, type TranscriptionSettings } from './voicemail-transcripts.js'
 import { DELIVERY_CURSOR, DELIVERY_ID, MAX_WEBHOOKS, WEBHOOK_ID, WEBHOOK_SECRET_GRACE_MS, WEBHOOK_SENDS_PER_MINUTE, WEBHOOK_TENANT_SENDS_PER_MINUTE, WebhookHub, parseSubscription, publicDelivery, publicSubscription, secretContext, type WebhookHubOptions } from './webhooks.js'
-import { MAX_DIDS, MAX_TRUNKS, TRUNK_ID, defaultTrunk, inDids, parseDid, parseOperatorLines, parseTrunk, providerTrunks, publicDid, publicTrunk, trunkRecord } from './trunks.js'
+import { MAX_DIDS, MAX_SITES, MAX_TRUNKS, TRUNK_ID, defaultTrunk, inDids, parseDid, parseOperatorLines, parseSite, parseTrunk, providerTrunks, publicDid, publicSite, publicTrunk, trunkRecord } from './trunks.js'
 import { EMPTY_OUTBOUND, PROFILE_ID, outboundVersion, parseOutbound, staleOutbound, type Outbound } from './outbound.js'
 import { MemoryStore } from './store/memory.js'
 import { ALERT_RETENTION_DAYS, clampLimit, isMissed, type AlertRecord, type HistoryEntry, type HistoryQuery, type Store, type StoredAlert, type TrunkRecord, type UserPresenceRecord, type WebhookDeliveryStatus, type WebhookSubscriptionRecord } from './store/types.js'
@@ -1318,14 +1318,14 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
   if (options.voicemail) voicemailLeases.start()
   // The trunks and direct numbers the store keeps (step 6, ADR 0016): handed to the provider when it starts, in the
   // tenant's turn, retried until it holds (its database may be late). What it already has is not written again.
-  const trunksFor = async (tenantId: string) => ({ trunks: providerTrunks(await store.listTrunks(tenantId), options.secretsKey), dids: (await store.listDids(tenantId)).map(publicDid) })
+  const trunksFor = async (tenantId: string) => ({ trunks: providerTrunks(await store.listTrunks(tenantId), options.secretsKey), dids: (await store.listDids(tenantId)).map(publicDid), sites: (await store.listSites(tenantId)).map(publicSite) })
   const restoreTrunks = async (tenantId: string, provider: TelephonyProvider) => {
     if (!provider.setTrunks) return
     for (let attempt = 0; !closing; attempt++) {
       try {
         await inTurn(tenantId, async () => {
-          const { trunks, dids } = await trunksFor(tenantId)
-          await provider.setTrunks!(trunks, dids)
+          const { trunks, dids, sites } = await trunksFor(tenantId)
+          await provider.setTrunks!(trunks, dids, sites)
         })
         return
       } catch (err) {
@@ -1777,6 +1777,16 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         if (!user.extension) throw Object.assign(new Error('No extension is assigned to this user'), { statusCode: 404 })
         return user
       }
+      // Where the person's emergency calls leave from (step 6c, ADR 0024): the site they are in, if the platform has trunks.
+      v1.get('/me/emergency-site', async req => {
+        const { user, provider } = await who(req)
+        if (!(await provider.getCapabilities()).trunks) return { enabled: false }
+        const found = (await store.listSites(user.tenantId)).find(x => x.members.includes(user.id))
+        // Only what OpenSIPS will apply: it joins the people of a site to their accounts by the holder of the account, which an
+        // account written before the holder existed has not until its holder opens a session. Not known: the store's word.
+        const site = found && user.extension && provider.holdsAccount && !(await provider.holdsAccount(user.extension, user.id).catch(() => true)) ? undefined : found
+        return { enabled: true, ...(site ? { site: { name: site.name, address: site.address, number: site.number } } : {}) }
+      })
       v1.get('/me/forwarding', async req => {
         const { user, provider } = await who(req)
         return forwardingOf(provider).get(withExtension(user))
@@ -1971,10 +1981,11 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         return provider.setTrunks.bind(provider)
       }
       const notFound = (what: string) => Object.assign(new Error(`No such ${what}`), { statusCode: 404 })
-      const changeTrunks = async (tenantId: string, apply: ReturnType<typeof trunksOf>, trunks: TrunkRecord[], dids: DidRange[], keep: () => Promise<unknown>) => {
+      // `sites`: the sites after the change (those the store keeps now when not given); a trunk removed takes its sites.
+      const changeTrunks = async (tenantId: string, apply: ReturnType<typeof trunksOf>, trunks: TrunkRecord[], dids: DidRange[], keep: () => Promise<unknown>, sites?: EmergencySite[]) => {
         const before = await trunksFor(tenantId)
         const undo = (err: unknown) =>
-          apply(before.trunks, before.dids).then(
+          apply(before.trunks, before.dids, before.sites).then(
             () => {
               throw err
             },
@@ -1983,7 +1994,15 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
               throw err
             }
           )
-        await apply(providerTrunks(trunks, options.secretsKey), dids).catch(undo)
+        const kept = (sites ?? before.sites).filter(x => trunks.some(t => t.id === x.trunkId))
+        // The number of a site stays one of its trunk (step 6c): a change that would leave one the operator would refuse
+        // (the default number changed, a range of direct numbers removed or shortened) is refused until the site says another.
+        const stale = kept.find(x => {
+          const t = trunks.find(r => r.id === x.trunkId)!
+          return x.number !== t.config.defaultNumber && !inDids(dids.filter(d => d.trunkId === x.trunkId), x.number)
+        })
+        if (stale) throw Object.assign(new Error(`The site ${stale.id} presents ${stale.number} for its emergency calls: it is a number of the trunk ${stale.trunkId}, so change the number of the site first`), { statusCode: 409, code: 'SITE_NUMBER_IN_USE' })
+        await apply(providerTrunks(trunks, options.secretsKey), dids, kept).catch(undo)
         await keep().catch(undo)
       }
       // A number rings an extension someone holds, or a ring group of the tenant: nothing else; so does a fallback. A
@@ -2097,6 +2116,8 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
           // The default trunk gives its number to everyone without a direct number: never changed without a word.
           if (records.length > 1 && defaultTrunk(records)?.id === req.params.id)
             throw Object.assign(new Error('This is the default trunk: make another one the default first'), { statusCode: 409, code: 'TRUNK_DEFAULT' })
+          // Its sites do not go with it in silence: their people would present a number declared elsewhere (step 6c).
+          if ((await store.listSites(user.tenantId)).some(x => x.trunkId === req.params.id)) throw Object.assign(new Error(`The trunk ${req.params.id} carries sites: delete them, or move them to another trunk, first`), { statusCode: 409, code: 'TRUNK_HAS_SITES' })
           // Its direct numbers go with it.
           const dids = (await store.listDids(user.tenantId)).filter(d => d.trunkId !== req.params.id).map(publicDid)
           await changeTrunks(user.tenantId, apply, records.filter(t => t.id !== req.params.id), dids, () => store.deleteTrunk(user.tenantId, req.params.id))
@@ -2328,6 +2349,57 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
           const dids = (await store.listDids(user.tenantId)).map(publicDid)
           if (!dids.some(d => d.id === req.params.id)) throw notFound('direct number')
           await changeTrunks(user.tenantId, apply, await store.listTrunks(user.tenantId), dids.filter(d => d.id !== req.params.id), () => store.deleteDid(user.tenantId, req.params.id))
+        })
+        return reply.code(204).send()
+      })
+
+      // The sites of the organisation for its emergency calls (step 6c, ADR 0024): administrators only, written as the
+      // trunks and direct numbers are (the provider handed the whole set first, then the store, the previous set handed
+      // back when either fails). A person named by a site leaves the one she was in.
+      v1.get('/admin/sites', async req => {
+        const user = await administrator(req)
+        trunksOf(registry.forTenant(user.tenantId))
+        return { items: (await store.listSites(user.tenantId)).map(publicSite) }
+      })
+      v1.put<{ Params: { id: string } }>('/admin/sites/:id', async (req, reply) => {
+        const user = await administrator(req)
+        const apply = trunksOf(registry.forTenant(user.tenantId))
+        const { site, created } = await inTurn(user.tenantId, async () => {
+          const records = await store.listTrunks(user.tenantId)
+          const dids = (await store.listDids(user.tenantId)).map(publicDid)
+          const sites = (await store.listSites(user.tenantId)).map(publicSite)
+          const current = sites.find(x => x.id === req.params.id)
+          if (!current && sites.length >= MAX_SITES) throw Object.assign(new Error(`At most ${MAX_SITES} sites`), { statusCode: 409, code: 'SITE_LIMIT' })
+          const site = parseSite(req.params.id, req.body, records, dids)
+          // The number must ring someone of the site: a direct number of the trunk that leads to an extension or a group.
+          const covering = dids.filter(d => d.trunkId === site.trunkId && inDids([d], site.number))
+          const rings = async (d: DidRange) => {
+            if (d.suffixDigits) return !!(await store.getMappingByExtension(user.tenantId, site.number.slice(-d.suffixDigits)))
+            if (!d.target) return false
+            if (await store.getMappingByExtension(user.tenantId, d.target)) return true
+            return !!(await registry.forTenant(user.tenantId).listGroups?.())?.some(g => g.number === d.target)
+          }
+          let ringing = false
+          for (const d of covering) if (await rings(d)) ringing = true
+          if (!ringing) throw Object.assign(new Error(`number: ${site.number} rings nobody: it must be a direct number of the trunk ${site.trunkId} that leads to an extension or a ring group`), { statusCode: 400, code: 'SITE_NUMBER_RINGS_NOBODY' })
+          const known = new Set((await store.listMappings(user.tenantId)).map(m => m.userId))
+          // Someone who left the directory and was in this site goes from it with this write; anyone else unknown is refused.
+          const unknown = site.members.find(m => !known.has(m) && !current?.members.includes(m))
+          if (unknown) throw Object.assign(new Error(`members: ${unknown} is nobody of the directory`), { statusCode: 400, code: 'SITE_MEMBER' })
+          site.members = site.members.filter(m => known.has(m))
+          const next = [...sites.filter(x => x.id !== site.id).map(x => ({ ...x, members: x.members.filter(m => !site.members.includes(m)) })), site]
+          await changeTrunks(user.tenantId, apply, records, dids, () => store.upsertSite({ tenantId: user.tenantId, ...site }), next)
+          return { site, created: !current }
+        })
+        return reply.code(created ? 201 : 200).send(site)
+      })
+      v1.delete<{ Params: { id: string } }>('/admin/sites/:id', async (req, reply) => {
+        const user = await administrator(req)
+        const apply = trunksOf(registry.forTenant(user.tenantId))
+        await inTurn(user.tenantId, async () => {
+          const sites = (await store.listSites(user.tenantId)).map(publicSite)
+          if (!sites.some(x => x.id === req.params.id)) throw notFound('site')
+          await changeTrunks(user.tenantId, apply, await store.listTrunks(user.tenantId), (await store.listDids(user.tenantId)).map(publicDid), () => store.deleteSite(user.tenantId, req.params.id), sites.filter(x => x.id !== req.params.id))
         })
         return reply.code(204).send()
       })

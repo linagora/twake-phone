@@ -11,6 +11,7 @@ import { Alerts } from './pages/admin/Alerts.js'
 import { Accounts } from './pages/admin/Directory.js'
 import { Limits } from './pages/admin/Limits.js'
 import { Numbers } from './pages/admin/Numbers.js'
+import { Sites } from './pages/admin/Sites.js'
 import { Rights } from './pages/admin/Rights.js'
 import { RingGroups } from './pages/admin/RingGroups.js'
 import { Trunks } from './pages/admin/Trunks.js'
@@ -49,6 +50,7 @@ const Gate = ({ config }: { config: AppConfig }) => {
                   <Route index element={<Accounts />} />
                   <Route path="trunks" element={<Trunks />} />
                   <Route path="numbers" element={<Numbers />} />
+                  <Route path="sites" element={<Sites />} />
                   <Route path="groups" element={<RingGroups />} />
                   <Route path="rights" element={<Rights />} />
                   <Route path="limits" element={<Limits />} />

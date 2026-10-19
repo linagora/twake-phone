@@ -1,6 +1,6 @@
-import { EXTENSION_FORMAT, OPERATOR_NO_ANSWER_MAX_SEC, OPERATOR_NO_ANSWER_MIN_SEC, RESERVED_NUMBER, TRUNK_CODECS, TRUNK_COUNTRY, TRUNK_COUNTRY_EXCLUDED, TRUNK_OUTBOUND_CLASSES, type DidRange, type Trunk, type TrunkAuth, type TrunkCodec, type TrunkNumberFormat, type TrunkOperator, type TrunkOutboundClass } from '@twake/telephony-types'
+import { EXTENSION_FORMAT, OPERATOR_NO_ANSWER_MAX_SEC, OPERATOR_NO_ANSWER_MIN_SEC, RESERVED_NUMBER, TRUNK_CODECS, TRUNK_COUNTRY, TRUNK_COUNTRY_EXCLUDED, TRUNK_OUTBOUND_CLASSES, type DidRange, type EmergencySite, type Trunk, type TrunkAuth, type TrunkCodec, type TrunkNumberFormat, type TrunkOperator, type TrunkOutboundClass } from '@twake/telephony-types'
 import { decrypt, encrypt } from './crypto.js'
-import type { DidRecord, TrunkRecord } from './store/types.js'
+import type { DidRecord, SiteRecord, TrunkRecord } from './store/types.js'
 
 // The trunks to an operator and their direct numbers (step 6, ADR 0016), as administrators write them: checked here,
 // kept by the store (the password encrypted with SECRETS_KEY), handed whole to the provider (setTrunks), which writes
@@ -22,6 +22,9 @@ const FORMATS: TrunkNumberFormat[] = ['e164', 'e164-no-plus', 'international-00'
 
 export const MAX_TRUNKS = 8
 export const MAX_DIDS = 500
+export const MAX_SITES = 100
+/** People in a site at most (each is in one site). */
+const MAX_SITE_MEMBERS = 5000
 /** Numbers in one range at most. */
 export const MAX_RANGE = 10_000
 const MAX_PROXIES = 4
@@ -236,6 +239,38 @@ export const parseDid = (id: string, body: unknown, trunks: readonly Pick<TrunkR
   if (fallbackTarget && fallbackTarget === target) throw Object.assign(new Error(`fallbackTarget: ${fallbackTarget} is where the number rings already`), { statusCode: 409, code: 'FALLBACK_LOOP' })
   return { id, trunkId: b.trunkId, first, last, ...(target ? { target } : {}), ...(suffixDigits ? { suffixDigits } : {}), ...(fallbackTarget ? { fallbackTarget } : {}) }
 }
+
+/**
+ * A site as an administrator writes it (PUT /admin/sites/:id), checked against the trunks and direct numbers of the
+ * tenant (step 6c, ADR 0024): its number is E.164 and one of its trunk's (a direct number of it, or its default
+ * number), the only numbers the operator takes as the caller of that trunk. Whether its people exist is the route's.
+ */
+export const parseSite = (id: string, body: unknown, trunks: readonly Pick<TrunkRecord, 'id' | 'config'>[], dids: readonly DidRange[]): EmergencySite => {
+  const bad = (message: string) => Object.assign(new Error(message), { statusCode: 400, code: 'SITE_INVALID' })
+  if (!TRUNK_ID.test(id)) throw bad('id: lower case letters, digits and dashes, 32 at most')
+  if (!body || typeof body !== 'object' || Array.isArray(body)) throw bad('a site is a JSON object')
+  const b = body as Record<string, unknown>
+  const oneLine = (field: string, max: number) => {
+    const v = b[field]
+    if (typeof v !== 'string' || !v.trim() || v.trim().length > max || CONTROL.test(v)) throw bad(`${field}: 1 to ${max} characters, on one line`)
+    return v.trim()
+  }
+  const name = oneLine('name', 64)
+  const address = oneLine('address', 200)
+  const trunk = typeof b.trunkId === 'string' ? trunks.find(t => t.id === b.trunkId) : undefined
+  if (!trunk) throw bad('trunkId: one of the trunks')
+  const number = typeof b.number === 'string' ? b.number.trim() : ''
+  if (!E164.test(number)) throw bad('number: an E.164 number (+ then 7 to 15 digits, no 0 after +33)')
+  if (number !== trunk.config.defaultNumber && !inDids(dids.filter(d => d.trunkId === trunk.id), number))
+    throw Object.assign(new Error(`number: ${number} is neither a direct number of the trunk ${trunk.id} nor its default number: the operator takes no other number as the caller`), { statusCode: 400, code: 'SITE_NUMBER' })
+  const members = b.members ?? []
+  if (!Array.isArray(members) || members.length > MAX_SITE_MEMBERS || !members.every(m => typeof m === 'string' && m.length >= 1 && m.length <= 255 && !CONTROL.test(m) && !/\s/.test(m))) throw bad(`members: at most ${MAX_SITE_MEMBERS} user ids`)
+  if (new Set(members).size !== members.length) throw bad('members: each person once')
+  return { id, name, address, trunkId: trunk.id, number, members: [...(members as string[])].sort() }
+}
+
+/** A site as the API shows it. */
+export const publicSite = ({ tenantId: _tenant, ...s }: SiteRecord): EmergencySite => s
 
 /** A trunk as the API shows it: never its password, whether it has one. */
 export const publicTrunk = (r: TrunkRecord): Trunk => ({ id: r.id, ...r.config, hasPassword: !!r.passwordEnc })

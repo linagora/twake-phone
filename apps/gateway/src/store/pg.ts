@@ -3,7 +3,7 @@ import { readdir, readFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import pg from 'pg'
 import { EMPTY_OUTBOUND, outboundVersion, staleOutbound } from '../outbound.js'
-import { ALERT_DEDUP_MS, alertKey, clampLimit, type AlertQuery, type AlertRecord, type StoredAlert, type ConferenceRecord, type DidRecord, type OutboundHand, type OutboundRecord, type OutboundRules, type HistoryEntry, type HistoryNearQuery, type HistoryPage, type HistoryQuery, type OperatorCdrOutcome, type OperatorCdrRecord, type OperatorCdrStats, type MappingSource, type ErasedCallsKept, type ProviderRecord, type PushSaveResult, type PushSubscriptionRecord, type Store, type TrunkRecord, type MappingChange, type UserMapping, type UserPresenceRecord, type VapidKeysRecord, type ClaimedDelivery, type WebhookAttemptResult, type WebhookClaimCaps, type WebhookClaimTime, allocateClaims, claimOrder, type WebhookDeliveryQuery, type WebhookLease, type WebhookSendQuota, type WebhookDeliveryRecord, type WebhookHealth, type WebhookQueueOptions, type WebhookStateChange, type WebhookStateEvent, type WebhookSubscriptionRecord, WEBHOOK_STATE_ROLE , type FencedLease, type NewTranscript, type TranscriptChange, type TranscriptLane, holderIn, holderOut, type TranscriptMatch, type TranscriptNotice, type TranscriptRecord } from './types.js'
+import { ALERT_DEDUP_MS, alertKey, clampLimit, type AlertQuery, type AlertRecord, type StoredAlert, type ConferenceRecord, type DidRecord, type SiteRecord, type OutboundHand, type OutboundRecord, type OutboundRules, type HistoryEntry, type HistoryNearQuery, type HistoryPage, type HistoryQuery, type OperatorCdrOutcome, type OperatorCdrRecord, type OperatorCdrStats, type MappingSource, type ErasedCallsKept, type ProviderRecord, type PushSaveResult, type PushSubscriptionRecord, type Store, type TrunkRecord, type MappingChange, type UserMapping, type UserPresenceRecord, type VapidKeysRecord, type ClaimedDelivery, type WebhookAttemptResult, type WebhookClaimCaps, type WebhookClaimTime, allocateClaims, claimOrder, type WebhookDeliveryQuery, type WebhookLease, type WebhookSendQuota, type WebhookDeliveryRecord, type WebhookHealth, type WebhookQueueOptions, type WebhookStateChange, type WebhookStateEvent, type WebhookSubscriptionRecord, WEBHOOK_STATE_ROLE , type FencedLease, type NewTranscript, type TranscriptChange, type TranscriptLane, holderIn, holderOut, type TranscriptMatch, type TranscriptNotice, type TranscriptRecord } from './types.js'
 import type { OperatorCdr, WebhookEventType } from '@twake/telephony-types'
 
 const MIGRATIONS = fileURLToPath(new URL('../../migrations/', import.meta.url))
@@ -1041,6 +1041,34 @@ export class PgStore implements Store {
       const r = await client.query('DELETE FROM direct_numbers WHERE tenant_id = $1 AND id = $2', [tenantId, id])
       return (r.rowCount ?? 0) > 0
     })
+  }
+
+  async listSites(tenantId: string): Promise<SiteRecord[]> {
+    const { rows } = await this.pool.query<{ id: string; name: string; address: string; trunk_id: string; number: string; members: string[] }>(
+      `SELECT s.id, s.name, s.address, s.trunk_id, s.number, coalesce(array_agg(m.user_id ORDER BY m.user_id COLLATE "C") FILTER (WHERE m.user_id IS NOT NULL), '{}') AS members
+       FROM sites s LEFT JOIN site_members m ON m.tenant_id = s.tenant_id AND m.site_id = s.id WHERE s.tenant_id = $1 GROUP BY s.tenant_id, s.id ORDER BY s.id COLLATE "C"`,
+      [tenantId]
+    )
+    return rows.map(r => ({ tenantId, id: r.id, name: r.name, address: r.address, trunkId: r.trunk_id, number: r.number, members: r.members }))
+  }
+
+  async upsertSite(s: SiteRecord) {
+    await this.inTransaction(async client => {
+      await client.query(
+        `INSERT INTO sites (tenant_id, id, name, address, trunk_id, number) VALUES ($1, $2, $3, $4, $5, $6)
+         ON CONFLICT (tenant_id, id) DO UPDATE SET name = EXCLUDED.name, address = EXCLUDED.address, trunk_id = EXCLUDED.trunk_id, number = EXCLUDED.number`,
+        [s.tenantId, s.id, s.name, s.address, s.trunkId, s.number]
+      )
+      // Its members: those it names (taken from the site they were in), no others.
+      await client.query('DELETE FROM site_members WHERE tenant_id = $1 AND (site_id = $2 OR user_id = ANY($3::text[]))', [s.tenantId, s.id, s.members])
+      if (s.members.length)
+        await client.query('INSERT INTO site_members (tenant_id, user_id, site_id) SELECT $1, u, $2 FROM unnest($3::text[]) AS w(u)', [s.tenantId, s.id, [...new Set(s.members)]])
+    })
+  }
+
+  async deleteSite(tenantId: string, id: string) {
+    const r = await this.pool.query('DELETE FROM sites WHERE tenant_id = $1 AND id = $2', [tenantId, id])
+    return (r.rowCount ?? 0) > 0
   }
 
   async getOutbound(tenantId: string): Promise<OutboundRecord | null> {
