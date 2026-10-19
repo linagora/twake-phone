@@ -225,6 +225,9 @@ export const SoftphoneProvider = ({ children }: { children: ReactNode }) => {
       // notice, n°3).
       if (!softphone.conferenceCall(call.id)) return
       setMade(m => conferenceMade(m, call.id, answer))
+      // A call with the public network is not replaced by the room's call (step 8c): the number was called again, and
+      // this call ends now that it answered. Its panel says "conference" (becameConference), as for two extensions.
+      if (answer.hangUp) softphone.endForConference(call.id)
       // The conference is there: what fails now is the call to the third participant only (review 8b, n°4).
       try {
         await inviteToConference(meetingId, number)

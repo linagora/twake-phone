@@ -11,6 +11,7 @@ type Gateway = ReturnType<typeof useGateway>
 // What the provider's softphone was given (its callbacks), and the call of the room it has for our call, if any.
 let softphoneOptions: { onCallChange: (call: SoftCall) => void } | undefined
 let roomCall: SoftCall | undefined
+const endedForConference: string[] = []
 vi.mock('@twake/softphone', () => ({
   Softphone: class {
     constructor(options: { onCallChange: (call: SoftCall) => void }) {
@@ -21,6 +22,7 @@ vi.mock('@twake/softphone', () => ({
     activeCalls = () => []
     expectConference = () => 'token'
     cancelConference = () => undefined
+    endForConference = (callId: string) => void endedForConference.push(callId)
     conferenceCall = (callId: string) => (roomCall?.conferenceOf === callId ? roomCall : undefined)
   }
 }))
@@ -53,6 +55,7 @@ describe('SoftphoneProvider, the conferences this window made (third review of t
     ;(globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
     softphoneOptions = undefined
     roomCall = undefined
+    endedForConference.length = 0
     inviteByPhone = vi.fn(async () => undefined)
     const client: Partial<Gateway['client']> = {
       getCapabilities: vi.fn(async () => ({}) as Awaited<ReturnType<Gateway['client']['getCapabilities']>>),
@@ -90,6 +93,15 @@ describe('SoftphoneProvider, the conferences this window made (third review of t
     act(() => softphoneOptions!.onCallChange({ ...theRoomsCall, state: 'ended' }))
     expect(phone.rooms).toEqual({})
     expect(phone.parties).toEqual({})
+  })
+
+  it('ends the call it made a conference of when the Gateway says the room did not replace it (a call with the operator, step 8c), and only then', async () => {
+    roomCall = theRoomsCall
+    await act(() => phone.addParticipant(first, '103'))
+    expect(endedForConference).toEqual([])
+    ;(gateway.client.makeConference as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ meetingId: ROOM, participants: parties, hangUp: true })
+    await act(() => phone.addParticipant(first, '103'))
+    expect(endedForConference).toEqual(['first-call'])
   })
 
   it("keeps nothing of a conference whose room's call ended while it began (its end already told)", async () => {

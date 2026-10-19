@@ -220,6 +220,8 @@ export interface Conference {
 export interface CallConference {
   meetingId: string
   participants: ConferenceParticipant[]
+  /** Step 8c: the call was with the public network, which no room's call replaces: the window ends it (the room called the number again). */
+  hangUp?: boolean
 }
 
 export interface SyncReport {

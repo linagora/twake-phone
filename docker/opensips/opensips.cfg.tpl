@@ -1925,6 +1925,10 @@ route[trunk_in] {
 	create_dialog("Bp");
 	$DLG_timeout = ${TRUNK_MAX_CALL_SEC};
 	$dlg_val(trunk) = "caller";
+	# The number shown (E.164), for the room that calls it back when the call becomes a conference (step 8c): none when
+	# it was hidden, never the From of the dialog, which keeps a number that asked not to be shown.
+	if ($var(from_number) != "anonymous")
+		$dlg_val(cli) = $var(from_number);
 	# The phone's answers go to the operator: their Contact without the extension (onreply_route[rtp]).
 	$avp(reply_to_trunk) = 1;
 	# A call without SDP: the browser that answers makes the offer (route[late_offer]).

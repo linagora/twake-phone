@@ -2924,20 +2924,123 @@ try {
     await until('LiveKit\'s webhooks at the Gateway', async () => (livekitWebhooks.includes(204) ? true : null))
     expectEqual(livekitWebhooks.filter(s => s !== 204).join(' '), '', 'the webhooks of LiveKit the Gateway refused')
   })
-  await step('step 8b: a call with the operator cannot become a conference: Alice is told why (CONFERENCE_EXTERNAL), nobody is called, her call goes on', async () => {
-    await dial(alice.page, '06 39 98 00 06')
-    const { call, at } = await invitedAtOperator(invite => invite.uri === 'sip:+33639980006@operator.example')
-    await alice.page.getByText('En communication avec +33 6 39 98 00 06').waitFor()
+  // Step 8c (ADR 0025): a call with the operator becomes a conference by the room calling the same number again.
+  const OPERATED = 'sip:+33639980006@operator.example'
+  const operatorConference = async () => {
     await alice.page.getByRole('button', { name: 'Ajouter un participant' }).click()
     await alice.page.getByLabel('Participant à ajouter (poste ou numéro)').fill('103')
     await alice.page.getByRole('button', { name: 'Appeler et ajouter' }).click()
-    await alice.page.getByRole('alert').filter({ hasText: 'Seul un appel entre deux postes peut devenir une conférence' }).waitFor()
+  }
+  await step('step 8c: a call with the operator becomes a conference (« Ajouter un participant », 103): the room calls Alice\'s window, then the number again from her direct number (the operator answers it as a call of its own), her first call ends as a conference, Bob rings; the room holds Alice, the number and Bob, and the operator hears the room', async () => {
+    conferenceFrom = new Date().toISOString()
+    conferenceAcc = await lastId('acc')
+    await dial(alice.page, '06 39 98 00 06')
+    const { call: first, at } = await invitedAtOperator(invite => invite.uri === OPERATED)
+    await alice.page.getByText('En communication avec +33 6 39 98 00 06').waitFor()
+    await at.callState(first, 'answered')
+    const [original] = await calls(alice.page)
+    await operatorConference()
+    // The same number, again, from her direct number: through the grant and the checks of any call of hers.
+    const { call: second, at: at2 } = await invitedAtOperator(invite => invite.uri === OPERATED)
+    for (const [name, c] of [['first', first], ['second', second]]) if (!(c.invite.headers.get('from')?.[0] ?? '').includes('<sip:+33199000101@operator.example>')) throw new Error(`From of the ${name} call at the operator: ${c.invite.headers.get('from')}`)
+    await at2.callState(second, 'answered')
+    // The window ends the first call (nothing takes the operator's place in it): its BYE reaches the operator.
+    await at.callState(first, 'ended')
+    const [mine] = await until('Alice in the conference', async () => {
+      const c = await calls(alice.page)
+      return c.length === 1 && c[0].room === 'conference' && c[0].state === 'connected' ? c : null
+    }, { timeout: 30_000 })
+    expectEqual(`${mine.conferenceOf === original.id} ${mine.direction} ${mine.remoteNumber}`, 'true inbound 101', 'Alice\'s call of the conference')
+    expectEqual((await lastEnded(alice.page))?.endReason, 'conference', 'how Alice\'s first call ended')
+    const ringing = bob.page.getByTestId('incoming-call')
+    await ringing.waitFor({ timeout: 30_000 })
+    expectEqual((await calls(bob.page))[0]?.remoteNumber, '101', 'who calls Bob')
+    await ringing.getByRole('button', { name: 'Répondre' }).click()
+    await until('Bob in the conference', async () => ((await calls(bob.page))[0]?.state === 'connected' ? true : null), { timeout: 30_000 })
+    await alice.page.getByTestId('conference-participant').nth(2).waitFor({ timeout: 20_000 })
+    CONFERENCE = await until('the room of the conference, kept for Alice', async () => (await store.listConferences(TENANT, 'amartin')).find(r => /^twake-call-[0-9a-f]{16}$/.test(r.meetingId))?.meetingId ?? null)
+    expectEqual((await inConference()).map(p => `${p.kind} ${p.number}`).sort().join(', '), 'phone +33639980006, phone 101, phone 103', 'the room of the conference')
+    // The operator hears the room (Alice's microphone, Bob's), and its own tone reaches them.
+    await until('sound from the room at the operator', async () => (second.media.stats.voiced > 20 ? true : null), { timeout: 30_000 })
+    await bothHearEachOther(alice, bob)
+  })
+  await step('step 8c: the number is added to a conference too (« Ajouter un participant » with an external number, the rights and caps of Alice): the room calls it from her direct number and it joins; Alice removes it and ends the conference for everyone', async () => {
+    await alice.page.getByRole('button', { name: 'Ajouter un participant' }).click()
+    await alice.page.getByLabel('Participant à ajouter (poste ou numéro)').fill('06 39 98 00 07')
+    await alice.page.getByRole('button', { name: 'Appeler et ajouter' }).click()
+    const { call, at } = await invitedAtOperator(invite => invite.uri === 'sip:+33639980007@operator.example')
+    if (!(call.invite.headers.get('from')?.[0] ?? '').includes('<sip:+33199000101@operator.example>')) throw new Error(`From of the call to the added number: ${call.invite.headers.get('from')}`)
+    await at.callState(call, 'answered')
+    await until('the added number in the room', async () => ((await inConference()).some(p => p.number === '+33639980007') ? true : null), { timeout: 30_000 })
+    await alice.page.getByRole('button', { name: 'Retirer +33 6 39 98 00 07 de la conférence' }).click()
+    await at.callState(call, 'ended', 20_000)
+    await alice.page.getByRole('button', { name: 'Terminer pour tous' }).click()
+    await alice.page.getByRole('button', { name: 'Oui, terminer pour tous' }).click()
+    for (const who of [alice, bob]) await until(`the end of the conference on ${who.name}'s page`, async () => ((await calls(who.page)).length === 0 ? true : null), { timeout: 20_000 })
+    await until('the room ended', async () => ((await inConference()).length === 0 ? true : null))
+    const cdrs = await until('the CDRs of the conference\'s calls', async () => {
+      const { rows } = await db.query("SELECT callee FROM acc WHERE via = 'conference' AND id > $1 ORDER BY id", [conferenceAcc])
+      return rows.length >= 2 ? rows.map(r => r.callee).sort() : null
+    })
+    expectEqual(cdrs.join(' '), '101 103', 'the CDRs of the conference\'s calls to extensions (via conference)')
+  })
+  await step('step 8c: a call received from the operator becomes a conference too: the room calls the number that called (shown, E.164) and the first call ends; with a hidden number nothing can be called back: Alice is told (CONFERENCE_EXTERNAL) and the call goes on', async () => {
+    const shown = await operator.call('+33199000101', { from: '+33639980008' })
+    await alice.page.getByTestId('incoming-call').getByRole('button', { name: 'Répondre' }).click()
+    expectEqual((await shown.final).status, 200, 'answer to the operator')
+    await alice.page.getByText('En communication avec +33 6 39 98 00 08').waitFor()
+    await operatorConference()
+    const { call: back, at } = await invitedAtOperator(invite => invite.uri === 'sip:+33639980008@operator.example')
+    await at.callState(back, 'answered')
+    await operator.callState(shown, 'ended', 20_000)
+    await until('Alice in the conference', async () => {
+      const c = await calls(alice.page)
+      return c.length === 1 && c[0].room === 'conference' ? true : null
+    }, { timeout: 30_000 })
+    const ringing = bob.page.getByTestId('incoming-call')
+    await ringing.waitFor({ timeout: 30_000 })
+    await ringing.getByRole('button', { name: 'Refuser' }).click()
+    await alice.page.getByRole('button', { name: 'Terminer pour tous' }).click()
+    await alice.page.getByRole('button', { name: 'Oui, terminer pour tous' }).click()
+    await until('the end of the conference', async () => ((await calls(alice.page)).length === 0 ? true : null), { timeout: 20_000 })
+    const hidden = await operator.call('+33199000101', { from: '+33639980009', headers: ['Privacy: id'] })
+    await alice.page.getByTestId('incoming-call').getByRole('button', { name: 'Répondre' }).click()
+    expectEqual((await hidden.final).status, 200, 'answer to the operator (hidden number)')
+    await alice.page.getByText('En communication avec Numéro masqué').waitFor()
+    const attempts = operator.state.attempts.length + operator2.state.attempts.length
+    await operatorConference()
+    await alice.page.getByRole('alert').filter({ hasText: "ou le numéro de votre correspondant est masqué" }).waitFor()
     await sleep(1_000)
+    expectEqual(operator.state.attempts.length + operator2.state.attempts.length, attempts, 'calls the operator was sent')
     expectEqual((await calls(bob.page)).length, 0, 'calls on Bob\'s page')
     const [still] = await calls(alice.page)
     expectEqual(`${still?.state} ${still?.room ?? '-'}`, 'connected -', 'Alice\'s call with the operator')
     await alice.page.getByRole('button', { name: 'Raccrocher' }).click()
-    await at.callState(call, 'ended')
+    await operator.callState(hidden, 'ended', 20_000)
+  })
+  await step('step 8c: the caps hold for the room as for Alice: with one external call at a time in the organisation, her call with the operator cannot become a conference (the room\'s call is refused, 403, limit): she is told, nobody is rung and her call goes on', async () => {
+    const api = await asPerson(alice)
+    expectEqual((await api('PUT', '/admin/outbound', { policy: { caps: { concurrent: 1 }, fraud: FRAUD } })).statusCode, 200, 'PUT /admin/outbound (one external call at a time)')
+    try {
+      await dial(alice.page, '06 39 98 00 06')
+      const { call, at } = await invitedAtOperator(invite => invite.uri === OPERATED)
+      await alice.page.getByText('En communication avec +33 6 39 98 00 06').waitFor()
+      await operatorConference()
+      await alice.page.getByRole('alert').filter({ hasText: "plafond d'appels vers l'extérieur atteint" }).waitFor({ timeout: 30_000 })
+      // The room's call to her window, answered at once, is hung up: her call with the operator is the only one left, unquiet.
+      const [still] = await until('only her call with the operator left', async () => {
+        const c = await calls(alice.page)
+        return c.length === 1 && c[0].room === undefined && !c[0].muted ? c : null
+      })
+      expectEqual(`${still?.state} ${still?.room ?? '-'}`, 'connected -', 'Alice\'s call with the operator')
+      expectEqual((await calls(bob.page)).length, 0, 'calls on Bob\'s page')
+      expectEqual(call.state, 'answered', 'the operator\'s call')
+      expectEqual(await store.countConferences(TENANT), 0, 'rooms left')
+      await alice.page.getByRole('button', { name: 'Raccrocher' }).click()
+      await at.callState(call, 'ended')
+    } finally {
+      expectEqual((await api('PUT', '/admin/outbound', { policy: { fraud: FRAUD } })).statusCode, 200, 'PUT /admin/outbound (no profile)')
+    }
   })
   await step('a registration left on a dead connection (the first one, Alice) with a no-answer forward: Bob rings at once, not after the delay', async () => {
     await setForwarding(alice, { noAnswer: '103', delay: '20' })

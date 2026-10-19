@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
 import { LiveKitConferenceBridge, signToken, type Fetch } from '@twake/conference-livekit'
-import type { CallParties, ProviderFactory, RoomCallGrant, TelephonyProvider } from '@twake/telephony-provider-sdk'
+import type { CallParties, CallWithOperator, ProviderFactory, RoomCallGrant, TelephonyProvider } from '@twake/telephony-provider-sdk'
 import type { Call, TelephonyEvent } from '@twake/telephony-types'
 import { describe, expect, it } from 'vitest'
 import { buildApp } from './app.js'
@@ -38,16 +38,19 @@ const setup = async ({ failFor, failTaken, divertFor, untakenFor, leaveFor, trun
   // The calls the SIP server has (in progress).
   const alive = new Map<string, 'answered' | 'ringing'>([['diverted@192.0.2.66', 'answered']])
   let trunk = trunkAt
-  const parties: Record<string, CallParties | 'external' | 'broken'> = {
+  const parties: Record<string, CallParties | CallWithOperator | 'external' | 'broken'> = {
     c1: { callId: 'c1', caller: '101', callerTag: 'a-tag', callee: '102', calleeTag: 'b-tag' },
     c2: { callId: 'c2', caller: '102', callerTag: 'b-tag', callee: '101', calleeTag: 'a-tag' },
     odd: { callId: 'odd call', caller: '101', callerTag: 'a-tag', callee: '102', calleeTag: 'b-tag' },
     ext: 'external',
+    // With the operator (step 8c): the number a room calls again; one of Bob's call, which Alice's id names to no one.
+    op: { callId: 'op', extension: '101', number: '+33612345678' },
+    opbob: { callId: 'opbob', extension: '102', number: '+33612345678' },
     broken: 'broken',
     bob: { callId: 'bob', caller: '102', callerTag: 'x', callee: '103', calleeTag: 'y' }
   }
   const events: { extension: string; event: TelephonyEvent }[] = [
-    ...['c1', 'c2', 'ext', 'ringing', 'odd', 'broken'].map(id => ({ extension: '101', event: { type: 'call.connected' as const, timestamp: new Date().toISOString(), payload: { call: call(id) } } })),
+    ...['c1', 'c2', 'ext', 'op', 'opbob', 'ringing', 'odd', 'broken'].map(id => ({ extension: '101', event: { type: 'call.connected' as const, timestamp: new Date().toISOString(), payload: { call: call(id) } } })),
     { extension: '102', event: { type: 'call.connected', timestamp: new Date().toISOString(), payload: { call: call('bob') } } },
     { extension: '104', event: { type: 'call.connected', timestamp: new Date().toISOString(), payload: { call: call('grp@192.0.2.30') } } }
   ]
@@ -208,6 +211,49 @@ describe('a call becomes a conference (POST /calls/:id/conference, step 8b)', ()
     expect(lk.filter(l => l.startsWith('livekit.RoomService/DeleteRoom'))).toEqual([`livekit.RoomService/DeleteRoom {"room":"${meetingId}"}`])
     expect(rooms.size).toBe(0)
     expect(await store.getConference(meetingId)).toBeNull()
+  })
+
+  it("makes a conference of a call with the operator (step 8c): the room calls the person's window (join), then the same number again, through a grant of its own and no Replaces; the window ends the call", async () => {
+    const { conference, grants, dialled, store, app, as } = await setup()
+    const res = await conference('op')
+    expect(res.statusCode, res.body).toBe(201)
+    const { meetingId, participants, hangUp } = res.json()
+    expect(hangUp).toBe(true)
+    expect(participants.map((p: { number: string }) => p.number)).toEqual(['101', '+33612345678'])
+    // The number as the SIP server wrote it down, at the person's name, the room named: the grant any call to the
+    // public network of the person's rooms has (POST /conferences/:id/participants), none of a Replaces.
+    expect(grants.map(({ extension, number, join, replaces, room }) => ({ extension, number, join, replaces, room }))).toEqual([
+      { extension: '101', number: '101', join: JOIN, replaces: undefined, room: meetingId },
+      { extension: '101', number: '+33612345678', join: undefined, replaces: undefined, room: meetingId }
+    ])
+    expect(dialled().map(d => [d.sip_call_to, d.sip_number])).toEqual([['101', '101'], ['+33612345678', '101']])
+    expect((await store.getConference(meetingId))?.ownerUserId).toBe('alice')
+    // A call with two extensions says no `hangUp`: the Replaces ends it.
+    expect((await conference('c1')).json()).not.toHaveProperty('hangUp')
+    // Whoever the number is, the room is read as any other of the person's: numbers outside the tenant masked to the others.
+    expect((await app.inject({ method: 'GET', url: `/api/v1/conferences/${meetingId}`, headers: as('alice') })).statusCode).toBe(200)
+  })
+
+  it("leaves the call with the operator as it was when the number does not answer, is refused or is another's call: the room ends, nothing stays", async () => {
+    const { conference, grants, rooms, store, lk } = await setup({ failFor: '+33612345678' })
+    const res = await conference('op')
+    expect(res.statusCode, res.body).toBe(409)
+    expect(res.json()).toMatchObject({ code: 'DIAL_FAILED', sipStatus: 486 })
+    expect(res.json()).not.toHaveProperty('hangUp')
+    expect(grants.map(g => g.revoked)).toEqual([false, true])
+    expect(lk.filter(l => l.startsWith('livekit.RoomService/DeleteRoom'))).toHaveLength(1)
+    expect(rooms.size).toBe(0)
+    expect(await store.countConferences('dev')).toBe(0)
+    // A call of Bob's with the operator is not Alice's: not found, then not answered when the extension is not hers.
+    const other = await conference('opbob')
+    expect(other.statusCode).toBe(409)
+    expect(other.json().code).toBe('CALL_NOT_ANSWERED')
+  })
+
+  it('counts the two calls of the room of a call with the operator among the person’s dial-outs, like any other', async () => {
+    const { conference, grants } = await setup({ dialOutLimiter: new RateLimiter(1, 60_000) })
+    expect((await conference('op')).statusCode).toBe(429)
+    expect(grants).toEqual([])
   })
 
   it('names the dialog as the other party has it when they placed the call', async () => {

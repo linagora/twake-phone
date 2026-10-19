@@ -3144,15 +3144,29 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
       })
       const makeConference = async (callId: string, join: string, user: User, me: string, provider: TelephonyProvider, bridge: LiveKitConferenceBridge, reply: FastifyReply) => {
         const parties = await provider.callBetweenExtensions!(callId)
-        if (parties === 'external') return reply.code(409).send({ statusCode: 409, code: 'CONFERENCE_EXTERNAL', error: 'Conflict', message: 'A call with the public network or a room cannot become a conference yet' })
-        if (!parties || (parties.caller !== me && parties.callee !== me)) return reply.code(409).send({ statusCode: 409, code: 'CALL_NOT_ANSWERED', error: 'Conflict', message: 'The call is not in progress' })
-        const placed = parties.caller === me
-        const other = placed ? parties.callee : parties.caller
-        // The dialog as the other party's phone has it (RFC 3891): its own tag (To), then the person's (From). A dialog
-        // a Replaces header cannot name as it is (a phone's Call-ID of other characters) is said before anything begins
-        // (review 8b, n°15).
-        const replaces = `${parties.callId};to-tag=${placed ? parties.calleeTag : parties.callerTag};from-tag=${placed ? parties.callerTag : parties.calleeTag}`
-        if (!REPLACES.test(replaces)) return reply.code(409).send({ statusCode: 409, code: 'CONFERENCE_UNSUPPORTED', error: 'Conflict', message: 'This call cannot be taken over by a room' })
+        if (parties === 'external') return reply.code(409).send({ statusCode: 409, code: 'CONFERENCE_EXTERNAL', error: 'Conflict', message: 'A call with a room, an emergency number or a number that is hidden cannot become a conference' })
+        // With the public network (step 8c, ADR 0025): nothing can take the operator's place in its dialog, so the room
+        // calls the same number again, through the same grant and the same checks as any call of the person's
+        // (POST /conferences/:id/participants), and the window ends the call it replaces once that one answers.
+        const notAnswered = () => reply.code(409).send({ statusCode: 409, code: 'CALL_NOT_ANSWERED', error: 'Conflict', message: 'The call is not in progress' })
+        if (!parties) return notAnswered()
+        const operator = 'number' in parties
+        let other: string
+        let leg: { replaces: string } | Record<string, never> = {}
+        if (operator) {
+          if (parties.extension !== me) return notAnswered()
+          other = parties.number
+        } else {
+          if (parties.caller !== me && parties.callee !== me) return notAnswered()
+          const placed = parties.caller === me
+          other = placed ? parties.callee : parties.caller
+          // The dialog as the other party's phone has it (RFC 3891): its own tag (To), then the person's (From). A dialog
+          // a Replaces header cannot name as it is (a phone's Call-ID of other characters) is said before anything begins
+          // (review 8b, n°15).
+          const replaces = `${parties.callId};to-tag=${placed ? parties.calleeTag : parties.callerTag};from-tag=${placed ? parties.callerTag : parties.calleeTag}`
+          if (!REPLACES.test(replaces)) return reply.code(409).send({ statusCode: 409, code: 'CONFERENCE_UNSUPPORTED', error: 'Conflict', message: 'This call cannot be taken over by a room' })
+          leg = { replaces }
+        }
         await closeEndedCallRooms(bridge, user.tenantId, user.id)
         // Two calls of a room (review 8b, n°16), counted before a room is: refused, nothing of either is used.
         if (!dialOuts.allow(ownerKey(user.tenantId, user.id), 2)) return reply.code(429).send(tooManyDialOuts)
@@ -3162,7 +3176,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         const divertedCall = () => Object.assign(new Error('A call of the room was diverted'), { code: 'CALL_DIVERTED' })
         // LiveKit's trunk read again before each grant (second review 8b, n°1): changed between the two calls, the
         // second is not placed.
-        const place = async (number: string, conference: { join: string } | { replaces: string }) => {
+        const place = async (number: string, conference: { join: string } | { replaces: string } | Record<string, never>) => {
           if (!(await trunkIntact(bridge, user.tenantId, me))) throw divertedCall()
           const grant = await provider.grantRoomCall!({ extension: me, number, room: meetingId, ...conference })
           let participant: DialedParticipant
@@ -3181,9 +3195,10 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
           // else's call is taken over.
           if (!(await viaLiveKit(() => bridge.listParticipants(meetingId))).some(p => p.id === own.id))
             throw Object.assign(new Error('You left the room before the conference began'), { code: 'CONFERENCE_ABANDONED' })
-          const theirs = await place(other, { replaces })
+          const theirs = await place(other, leg)
           watchOwner(bridge, { tenantId: user.tenantId, meetingId, ownerUserId: user.id })
-          return reply.code(201).send({ meetingId, participants: [shown(own), shown(theirs)] })
+          // `hangUp`: the room did not replace the call (a Replaces ends it), the window ends it.
+          return reply.code(201).send({ meetingId, participants: [shown(own), shown(theirs)], ...(operator ? { hangUp: true } : {}) })
         } catch (err) {
           // Ending the room also ends a call of it still ringing: LiveKit SIP stops dialing once its participant is gone
           // from the room (CANCEL; review 8b, n°13, read in LiveKit SIP v1.17.0).
