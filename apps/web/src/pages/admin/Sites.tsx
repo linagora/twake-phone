@@ -189,7 +189,10 @@ export const Sites = () => {
             <TextField id="site-number" label={t('admin.site.number')} hint={`${t('admin.site.numberHint')} ${t('admin.site.numberRings')}`} type="tel" inputMode="tel" value={form.number} onChange={set('number')} error={field('number')} required disabled={busy} maxLength={24} />
             {users.length ? (
               <>
-                <TextField id="site-search" label={t('admin.site.search')} value={search} onChange={setSearch} disabled={busy} maxLength={64} />
+                {/* Enter in the search is no save of the form. */}
+                <div onKeyDown={e => e.key === 'Enter' && e.preventDefault()}>
+                  <TextField id="site-search" label={t('admin.site.search')} value={search} onChange={setSearch} disabled={busy} maxLength={64} />
+                </div>
                 {visible.length ? (
                   <CheckGroup
                     id="site-members"

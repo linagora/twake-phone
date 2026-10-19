@@ -297,6 +297,11 @@ describe('the administration screens (step 7)', () => {
     expect(text()).toContain('2 personnes')
     click($('button[aria-label="Modifier le site paris"]'))
     type($('#site-search'), 'bo')
+    // Enter in the search is no save: the key is taken (a browser submits the form on it otherwise).
+    const enter = new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true })
+    act(() => void $('#site-search')!.dispatchEvent(enter))
+    expect(enter.defaultPrevented).toBe(true)
+    expect(setSite).not.toHaveBeenCalled()
     expect([...host.querySelectorAll('#site-members-bob, #site-members')].length).toBe(1)
     expect(text()).not.toContain('Alice (101)')
     click($('#site-members'))
