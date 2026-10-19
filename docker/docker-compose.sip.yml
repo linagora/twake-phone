@@ -332,7 +332,6 @@ services:
       SYSCONFD_CONFGEND: 127.0.0.1:8669
       # A reload lasts what a real Wazo's does (wazo-confgen, then asterisk -rx), so that the commands that wait merge as there.
       SYSCONFD_RELOAD_MS: '500'
-      SYSCONFD_SYNCHRONOUS: '1'
     volumes:
       - ./wazo/sysconfd.py:/twake/sysconfd.py:ro
       - ./wazo/healthcheck.py:/twake/healthcheck.py:ro
