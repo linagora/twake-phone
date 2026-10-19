@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto'
+import { createHash, createHmac } from 'node:crypto'
 import { afterEach, describe, expect, it } from 'vitest'
 import { CONTEXT, fakeWazo as fakeWazoOf, made } from '../test/fake-wazo.js'
 import { MESSAGE_ID, WazoStopped, WazoVoicemail, holderKey as keyedWith, mailboxNumber, voicemailOf, type Fetch, type WebSocketLike } from './index.js'
@@ -1078,5 +1078,83 @@ describe('WazoVoicemail, the events', () => {
   it('reads a message as Wazo gives it: no number that is none, no name that is a number or Asterisk saying it has none', () => {
     expect(voicemailOf({ id: '1-1', caller_id_num: '<unknown>', caller_id_name: '101', timestamp: 0, duration: -1 }, { type: 'old' })).toEqual({ id: '1-1', fromName: '101', receivedAt: '1970-01-01T00:00:00.000Z', durationSec: 0, unread: false })
     expect(voicemailOf({ id: '1-1', caller_id_num: '101', caller_id_name: '101' }, undefined)).toEqual({ id: '1-1', from: '101', receivedAt: '1970-01-01T00:00:00.000Z', durationSec: 0, unread: false })
+  })
+})
+
+describe('WazoVoicemail, the lines (step 11c-1)', () => {
+  const LINE_KEY = 'twake-wazo-line-test-key-0123456789abcdef'
+
+  it('makes nothing without a line key', async () => {
+    const { vm, wazo } = make()
+    expect(vm.linesOn).toBe(false)
+    expect(await vm.syncLines(['102'])).toEqual({ ready: [], failed: 0 })
+    expect(wazo.state.requests).toEqual([])
+  })
+
+  it('makes an endpoint and a line for each extension, named after it, with the print of it for password, nothing of the person', async () => {
+    const { vm, wazo } = make({ lineKey: LINE_KEY })
+    const done = await vm.syncLines(['103', '102', 'abc', '102'])
+    expect(done).toEqual({ ready: ['102', '103'], failed: 0 })
+    expect(wazo.state.endpoints.map(e => [e.name, e.label, e.line !== null])).toEqual([
+      ['102', 'TwakePhone', true],
+      ['103', 'TwakePhone', true]
+    ])
+    // The same password the SIP server computes (HMAC-SHA256 of the extension, 32 digits), in the context of the mailboxes.
+    const password = createHmac('sha256', LINE_KEY).update('102').digest('hex').slice(0, 32)
+    expect(vm.linePassword('102')).toBe(password)
+    expect(wazo.state.endpoints[0]!.auth_section_options).toEqual([
+      ['username', '102'],
+      ['password', password]
+    ])
+    expect(wazo.state.endpoints[0]!.aor_section_options).toEqual([
+      ['max_contacts', '1'],
+      ['remove_existing', 'yes']
+    ])
+    expect(wazo.state.lines.map(l => l.context)).toEqual([CONTEXT, CONTEXT])
+    expect(wazo.state.users).toEqual([])
+    // Again: nothing is written.
+    const before = writes(wazo).length
+    expect(await vm.syncLines(['102', '103'])).toEqual({ ready: ['102', '103'], failed: 0 })
+    expect(writes(wazo).length).toBe(before)
+  })
+
+  it('finishes an endpoint whose line was not made, and removes the lines of an extension nobody holds once the SIP server has been told', async () => {
+    const { vm, wazo } = make({ lineKey: LINE_KEY })
+    await vm.syncLines(['102', '103'])
+    // An endpoint left without its line (a round that stopped there).
+    const half = wazo.state.endpoints.find(e => e.name === '103')!
+    const lineId = half.line!.id
+    half.line = null
+    wazo.state.lines = wazo.state.lines.filter(l => l.id !== lineId)
+    const told: string[][] = []
+    const done = await vm.syncLines(['103'], { beforeRemoval: async gone => void told.push(gone) })
+    expect(told).toEqual([['102']])
+    expect(done).toEqual({ ready: ['103'], failed: 0 })
+    expect(wazo.state.endpoints.map(e => e.name)).toEqual(['103'])
+    expect(wazo.state.endpoints[0]!.line).not.toBeNull()
+    expect(wazo.state.lines).toHaveLength(1)
+  })
+
+  it('leaves out what Wazo refuses (said, done again at the next round) and stops once it may no longer write', async () => {
+    const { vm, wazo, logs } = make({ lineKey: LINE_KEY })
+    wazo.state.endpoints.push({ uuid: 'x', name: '102', label: 'someone else', auth_section_options: [], aor_section_options: [], line: null })
+    const done = await vm.syncLines(['102', '103'])
+    expect(done).toEqual({ ready: ['103'], failed: 1 })
+    expect(logs.some(l => /line of 102 not made/.test(l))).toBe(true)
+    // An endpoint of another label is never ours to remove.
+    expect(wazo.state.endpoints.some(e => e.label === 'someone else')).toBe(true)
+    let may = true
+    await expect(vm.syncLines(['103', '104'], { mayWrite: () => may && ((may = false), true) })).rejects.toBeInstanceOf(WazoStopped)
+  })
+
+  it('uses again a line an error left without an endpoint, never makes two, and removes those it does not need', async () => {
+    const { vm, wazo } = make({ lineKey: LINE_KEY })
+    wazo.state.lineMadeThenFails = true
+    await expect(vm.syncLines(['102'])).rejects.toMatchObject({ status: 500 })
+    expect(wazo.state.lines).toHaveLength(1)
+    wazo.state.lines.push({ id: 999, context: CONTEXT })
+    expect(await vm.syncLines(['102'])).toEqual({ ready: ['102'], failed: 0 })
+    expect(wazo.state.lines).toHaveLength(1)
+    expect(wazo.state.endpoints[0]!.line).not.toBeNull()
   })
 })

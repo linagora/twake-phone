@@ -37,6 +37,11 @@ export const fakeWazo = (numberOf: (userId: string) => string) => {
   const state = {
     contexts: [] as { id: number; name: string; label: string; type: string }[],
     users: [] as { uuid: string; firstname: string; userfield: string | null; voicemail: { id: number } | null }[],
+    /** The SIP endpoints and lines (step 11c-1): an endpoint's `line` is the id of the line it is associated with. */
+    endpoints: [] as { uuid: string; name: string; label: string; auth_section_options: [string, string][]; aor_section_options: [string, string][]; line: { id: number } | null }[],
+    lines: [] as { id: number; context: string }[],
+    /** The next line made is made, then refused (500: wazo-sysconfd failing after wazo-confd committed). */
+    lineMadeThenFails: false,
     voicemails: [] as { id: number; number: string; context: string; name: string; max_messages: number | null; options: [string, string][]; users: { uuid: string }[] }[],
     messages: new Map<number, Message[]>(),
     tokens: 0,
@@ -115,6 +120,41 @@ export const fakeWazo = (numberOf: (userId: string) => string) => {
     }
     if ((m = /^\/1\.1\/contexts\/(\d+)$/.exec(path)) && init.method === 'DELETE') {
       state.contexts = state.contexts.filter(c => c.id !== Number(m![1]))
+      return json(204)
+    }
+    if (path === '/1.1/endpoints/sip' && init.method === 'GET') return page(state.endpoints)
+    if (path === '/1.1/endpoints/sip' && init.method === 'POST') {
+      if (state.endpoints.some(e => e.name === body.name)) return json(400, ['Resource Error - SIPEndpoint already exists'])
+      const endpoint = { uuid: `00000000-0000-4000-9000-${String(next++).padStart(12, '0')}`, name: body.name, label: body.label, auth_section_options: body.auth_section_options ?? [], aor_section_options: body.aor_section_options ?? [], line: null }
+      state.endpoints.push(endpoint)
+      return json(201, endpoint)
+    }
+    if ((m = /^\/1\.1\/endpoints\/sip\/([^/]+)$/.exec(path)) && init.method === 'DELETE') {
+      const endpoint = state.endpoints.find(e => e.uuid === m![1])
+      if (!endpoint) return json(404, ['Resource Not Found'])
+      if (endpoint.line) return json(400, ['Resource Error - SIPEndpoint is associated with a Line'])
+      state.endpoints = state.endpoints.filter(e => e !== endpoint)
+      return json(204)
+    }
+    if (path === '/1.1/lines' && init.method === 'GET') return page(state.lines.map(l => ({ ...l, endpoint_sip: state.endpoints.find(e => e.line?.id === l.id) ?? null, users: [], extensions: [] })))
+    if (path === '/1.1/lines' && init.method === 'POST') {
+      const line = { id: next++, context: body.context }
+      state.lines.push(line)
+      if (state.lineMadeThenFails) {
+        state.lineMadeThenFails = false
+        return json(500, ['sysconfd error'])
+      }
+      return json(201, line)
+    }
+    if ((m = /^\/1\.1\/lines\/(\d+)\/endpoints\/sip\/([^/]+)$/.exec(path)) && (init.method === 'PUT' || init.method === 'DELETE')) {
+      const endpoint = state.endpoints.find(e => e.uuid === m![2])
+      if (!endpoint || !state.lines.some(l => l.id === Number(m![1]))) return json(404, ['Resource Not Found'])
+      endpoint.line = init.method === 'PUT' ? { id: Number(m[1]) } : null
+      return json(204)
+    }
+    if ((m = /^\/1\.1\/lines\/(\d+)$/.exec(path)) && init.method === 'DELETE') {
+      if (state.endpoints.some(e => e.line?.id === Number(m![1]))) return json(400, ['Resource Error - Line is associated with an Endpoint'])
+      state.lines = state.lines.filter(l => l.id !== Number(m![1]))
       return json(204)
     }
     if (path === '/1.1/users' && init.method === 'GET') {

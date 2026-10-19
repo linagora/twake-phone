@@ -21,6 +21,9 @@ export const VOICEMAIL_ID = /^[0-9A-Za-z_-]{1,64}$/
  *                        the longest a call to a mailbox lasts (300), as OpenSIPS and Asterisk have it: VOICEMAIL_MAX_SEC
  *                        above it is refused (the call would cut the message first), and the
  *                        recordings handed out are bounded on it;
+ *   WAZO_LINES, WAZO_LINE_KEY
+ *                        1, and the key of the passwords of the lines, the same as OpenSIPS's: the people's extensions
+ *                        get a line at Wazo, which rings their windows (step 11c-1). Empty: no line;
  *   VOICEMAIL_GRACE_DAYS how long the mailbox of someone who holds no extension any more is kept aside, with its
  *                        messages, in case they come back (7). With VOICEMAIL_RETENTION_DAYS=0 (no retention period),
  *                        the mailbox goes with its messages once past it: 1 day at least then.
@@ -64,6 +67,10 @@ export const wazoFromEnv = (env: NodeJS.ProcessEnv, secretsKey: Buffer | undefin
   const maxCallSec = whole('VOICEMAIL_MAX_CALL_SEC', 3600) ?? 300
   if (maxCallSec < 30) throw new Error('Wazo: VOICEMAIL_MAX_CALL_SEC must be 30 to 3600 seconds')
   if ((maxMessageSec ?? 180) > maxCallSec) throw new Error(`Wazo: VOICEMAIL_MAX_SEC (${maxMessageSec ?? 180} s) is longer than a call to a mailbox lasts (VOICEMAIL_MAX_CALL_SEC, ${maxCallSec} s): the call would cut the message`)
+  // The lines of Wazo (step 11c-1, ADR 0027): WAZO_LINES=1, with the key OpenSIPS has too (WAZO_LINE_KEY).
+  if (env.WAZO_LINES !== undefined && env.WAZO_LINES !== '' && env.WAZO_LINES !== '0' && env.WAZO_LINES !== '1') throw new Error('Wazo: WAZO_LINES must be 1, or empty (or 0) to leave the lines of Wazo off')
+  const lineKey = env.WAZO_LINES === '1' ? env.WAZO_LINE_KEY : undefined
+  if (env.WAZO_LINES === '1' && !/^[A-Za-z0-9._-]{32,128}$/.test(lineKey ?? '')) throw new Error('Wazo: WAZO_LINE_KEY (32 to 128 letters, digits, dots, dashes or underscores, the same as OpenSIPS\'s) is needed with WAZO_LINES=1')
   const graceDays = env.VOICEMAIL_GRACE_DAYS === '0' ? 0 : whole('VOICEMAIL_GRACE_DAYS', 365)
   // Without a retention period, a mailbox aside goes with its messages once past its grace period: a day at least.
   if (graceDays === 0 && retentionDaysOf(env) === 0) throw new Error('Wazo: VOICEMAIL_GRACE_DAYS must be at least 1 day with VOICEMAIL_RETENTION_DAYS=0 (the mailbox of someone without an extension then goes with its messages once past it)')
@@ -75,6 +82,7 @@ export const wazoFromEnv = (env: NodeJS.ProcessEnv, secretsKey: Buffer | undefin
     username: env.WAZO_USER,
     password: env.WAZO_PASSWORD,
     holderSecret: holderSecretOf(secretsKey),
+    ...(lineKey ? { lineKey } : {}),
     ...(maxMessages !== undefined ? { maxMessages } : {}),
     ...(maxMessageSec !== undefined ? { maxMessageSec } : {}),
     maxCallSec,
