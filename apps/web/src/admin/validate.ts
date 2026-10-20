@@ -10,6 +10,8 @@ import {
   TRUNK_OUTBOUND_CLASSES,
   TRUNK_OUTBOUND_DEFAULT,
   WEBHOOK_EVENT_TYPES,
+  type CallFlow,
+  type CallFlowKind,
   type DidRange,
   type EmergencySite,
   type FraudRule,
@@ -705,6 +707,103 @@ export const groupRefusal = (err: unknown) =>
     if (code === 'GROUP_NAME') return { field: 'name', problem: p('admin.groupNameInvalid') }
     if (code === 'GROUP_MEMBERS') return { field: 'members', problem: p('admin.groupMembersInvalid') }
     if (code === 'GROUP_MEMBER_NOT_EXTENSION') return { field: 'members', problem: p('admin.groupMemberNotExtension') }
+    return undefined
+  })
+
+// ---------------------------------------------------------------------------------------------------------------
+// Call flows: sequential groups, queues and voice menus (step 11c-2, ADR 0028)
+
+export interface FlowForm {
+  kind: CallFlowKind | ''
+  number: string
+  name: string
+  members: string
+  ringSec: string
+  waitSec: string
+  choices: string
+  greeting: string
+}
+export type FlowField = keyof FlowForm | 'form'
+export const FLOW_FIELDS: FlowField[] = ['kind', 'number', 'name', 'members', 'ringSec', 'waitSec', 'choices', 'greeting']
+export const FLOW_KINDS: readonly CallFlowKind[] = ['sequential', 'queue', 'menu']
+/** Members of a sequential group or a queue at most, the seconds a member rings and a caller waits (FLOW_* of the Gateway). */
+export const FLOW_MEMBERS_MAX = 12
+export const FLOW_RING = { min: 5, max: 60 }
+export const FLOW_WAIT = { min: 15, max: 600 }
+const FLOW_SOUND = /^[A-Za-z0-9_/-]{1,64}$/
+
+export const emptyFlow = (): FlowForm => ({ kind: 'sequential', number: '', name: '', members: '', ringSec: '', waitSec: '', choices: '', greeting: '' })
+
+const wholeSeconds = (text: string, range: { min: number; max: number }): number | undefined | null => {
+  const t = text.trim()
+  if (!t) return undefined
+  const n = /^[0-9]{1,4}$/.test(t) ? Number(t) : NaN
+  return n >= range.min && n <= range.max ? n : null
+}
+
+/**
+ * The flow as the Gateway takes it (POST /admin/flows, PUT /admin/flows/:number), or what is wrong: only the fields of
+ * its kind are read. The Gateway checks the same, and whether the number is free and each member and each key's number
+ * is one of the organisation.
+ */
+export const checkFlow = (f: FlowForm): { flow?: CallFlow; problems: Problems<FlowField> } => {
+  const problems: Problems<FlowField> = {}
+  if (f.kind !== 'sequential' && f.kind !== 'queue' && f.kind !== 'menu') problems.kind = p('admin.flowKindInvalid')
+  const number = f.number.trim()
+  if (!EXTENSION_FORMAT.test(number)) problems.number = p('admin.flowNumberInvalid')
+  else if (RESERVED_NUMBER.test(number)) problems.number = p('admin.flowNumberReserved')
+  const name = f.name.trim()
+  if (!name || name.length > 64 || CONTROL.test(name)) problems.name = p('admin.flowNameInvalid')
+  if (f.kind === 'menu') {
+    const choices: Record<string, string> = {}
+    for (const item of splitList(f.choices)) {
+      const m = /^([0-9])=([^=]*)$/.exec(item)
+      const target = m?.[2]?.trim() ?? ''
+      if (!m || choices[m[1]!] !== undefined || !EXTENSION_FORMAT.test(target)) {
+        problems.choices = p('admin.flowChoicesInvalid', { choice: item.slice(0, 40) })
+        break
+      }
+      if (target === number) {
+        problems.choices = p('admin.flowChoiceTarget')
+        break
+      }
+      choices[m[1]!] = target
+    }
+    if (!problems.choices && Object.keys(choices).length === 0) problems.choices = p('admin.flowChoicesInvalid', { choice: f.choices.trim().slice(0, 40) })
+    const greeting = f.greeting.trim()
+    if (greeting && !FLOW_SOUND.test(greeting)) problems.greeting = p('admin.flowGreetingInvalid')
+    if (Object.keys(problems).length || f.kind !== 'menu') return { problems }
+    return { problems, flow: { number, name, kind: 'menu', choices, ...(greeting ? { greeting } : {}) } }
+  }
+  const members = parseMembers(f.members)
+  const wrong = members.filter(m => !EXTENSION_FORMAT.test(m))
+  if (!members.length || members.length > FLOW_MEMBERS_MAX) problems.members = p('admin.flowMembersInvalid')
+  else if (wrong.length) problems.members = p('admin.flow.err.memberFormat', { members: wrong.join(', ') })
+  const ringSec = wholeSeconds(f.ringSec, FLOW_RING)
+  if (ringSec === null) problems.ringSec = p('admin.flowRingInvalid')
+  const waitSec = f.kind === 'queue' ? wholeSeconds(f.waitSec, FLOW_WAIT) : undefined
+  if (waitSec === null) problems.waitSec = p('admin.flowWaitInvalid')
+  if (Object.keys(problems).length || (f.kind !== 'sequential' && f.kind !== 'queue')) return { problems }
+  return { problems, flow: { number, name, kind: f.kind, members, ...(ringSec !== undefined && ringSec !== null ? { ringSec } : {}), ...(waitSec !== undefined && waitSec !== null ? { waitSec } : {}) } }
+}
+
+/** The refusals of the flow routes, on the field they are about. */
+export const flowRefusal = (err: unknown) =>
+  refusalOf<FlowField>(err, (_field, code) => {
+    if (code === 'FLOW_NUMBER') return { field: 'number', problem: p('admin.flowNumberInvalid') }
+    if (code === 'FLOW_NUMBER_TAKEN') return { field: 'number', problem: p('admin.flowNumberTaken') }
+    if (code === 'FLOW_NUMBER_RESERVED') return { field: 'number', problem: p('admin.flowNumberReserved') }
+    if (code === 'FLOW_EXISTS') return { field: 'number', problem: p('admin.flowExists') }
+    if (code === 'FLOW_NAME') return { field: 'name', problem: p('admin.flowNameInvalid') }
+    if (code === 'FLOW_KIND') return { field: 'kind', problem: p('admin.flowKindInvalid') }
+    if (code === 'FLOW_MEMBERS') return { field: 'members', problem: p('admin.flowMembersInvalid') }
+    if (code === 'FLOW_MEMBER_NOT_EXTENSION') return { field: 'members', problem: p('admin.flowMemberNotExtension') }
+    if (code === 'FLOW_RING') return { field: 'ringSec', problem: p('admin.flowRingInvalid') }
+    if (code === 'FLOW_WAIT') return { field: 'waitSec', problem: p('admin.flowWaitInvalid') }
+    if (code === 'FLOW_CHOICES') return { field: 'choices', problem: p('admin.flowChoicesInvalid', { choice: '…' }) }
+    if (code === 'FLOW_CHOICE_TARGET') return { field: 'choices', problem: p('admin.flowChoiceTarget') }
+    if (code === 'FLOW_GREETING') return { field: 'greeting', problem: p('admin.flowGreetingInvalid') }
+    if (code === 'FLOW_IN_USE') return { field: 'form', problem: p('admin.flowInUse') }
     return undefined
   })
 

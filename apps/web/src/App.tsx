@@ -13,6 +13,7 @@ import { Limits } from './pages/admin/Limits.js'
 import { Numbers } from './pages/admin/Numbers.js'
 import { Sites } from './pages/admin/Sites.js'
 import { Rights } from './pages/admin/Rights.js'
+import { CallFlows } from './pages/admin/CallFlows.js'
 import { RingGroups } from './pages/admin/RingGroups.js'
 import { Trunks } from './pages/admin/Trunks.js'
 import { Webhooks } from './pages/admin/Webhooks.js'
@@ -52,6 +53,7 @@ const Gate = ({ config }: { config: AppConfig }) => {
                   <Route path="numbers" element={<Numbers />} />
                   <Route path="sites" element={<Sites />} />
                   <Route path="groups" element={<RingGroups />} />
+                  <Route path="flows" element={<CallFlows />} />
                   <Route path="rights" element={<Rights />} />
                   <Route path="limits" element={<Limits />} />
                   <Route path="alerts" element={<Alerts />} />
