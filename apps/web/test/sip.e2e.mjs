@@ -610,7 +610,19 @@ const mi = (method, params) =>
     const [, host, port] = /^udp:(.+):(\d+)$/.exec(OPENSIPS_MI_URL) ?? []
     const socket = createSocket('udp4')
     const timer = setTimeout(() => (socket.close(), reject(new Error(`MI ${method}: no answer`))), 5_000)
-    socket.on('message', msg => (clearTimeout(timer), socket.close(), resolve(JSON.parse(msg.toString()))))
+    // The reply comes from the MI socket and is JSON: a stray datagram on this ephemeral port (media, a late packet) is not it.
+    socket.on('message', (msg, from) => {
+      if (from.port !== Number(port)) return
+      let reply
+      try {
+        reply = JSON.parse(msg.toString())
+      } catch {
+        return
+      }
+      clearTimeout(timer)
+      socket.close()
+      resolve(reply)
+    })
     socket.send(JSON.stringify({ jsonrpc: '2.0', method, ...(params ? { params } : {}), id: 1 }), Number(port), host)
   })
 const soundBlocked = page => page.evaluate(() => window.twakephone.soundBlocked)

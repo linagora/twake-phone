@@ -92,7 +92,19 @@ const mi = (method, params) =>
   new Promise((resolve, reject) => {
     const s = createSocket('udp4')
     const t = setTimeout(() => (s.close(), reject(new Error(`MI ${method}: no answer`))), 3000)
-    s.on('message', m => (clearTimeout(t), s.close(), resolve(JSON.parse(m.toString()))))
+    // The reply comes from the MI socket and is JSON: a stray datagram on this ephemeral port (media, a late packet) is not it.
+    s.on('message', (m, from) => {
+      if (from.port !== Number(miPort)) return
+      let reply
+      try {
+        reply = JSON.parse(m.toString())
+      } catch {
+        return
+      }
+      clearTimeout(t)
+      s.close()
+      resolve(reply)
+    })
     s.send(JSON.stringify({ jsonrpc: '2.0', method, id: 1, ...(params ? { params } : {}) }), Number(miPort), miHost)
   })
 const reload = async () => {
