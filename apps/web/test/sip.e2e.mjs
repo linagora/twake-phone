@@ -3628,7 +3628,8 @@ try {
         await rtpBothWays(bob2)
         return side
       }
-      const callOfBob = () => until('the call of Bob in the supervision', async () => (await supApi('GET', '/supervision/calls')).json().items?.find(c => c.extension === '103') ?? null, { timeout: 20_000 })
+      // The list is shared for 2 s between readers: the call that ended may still be in it, so another one than `not` is waited for.
+      const callOfBob = (not) => until('the call of Bob in the supervision', async () => (await supApi('GET', '/supervision/calls')).json().items?.find(c => c.extension === '103' && c.id !== not) ?? null, { timeout: 20_000 })
       await step('step 11d, the demo: Wazo calls 103 (a call it holds); Alice, an administrator and so a supervisor, has her line at Wazo by a window of her own; the supervision lists the call (Bob\'s line, the number Wazo gives, his name from the directory) and keeps Bob, who is no supervisor, out of every route', async () => {
         alice2 = await open('amartin', 'Alice Martin')
         await phoneState(alice2.page).getByText('En ligne').waitFor({ timeout: 20_000 })
@@ -3735,7 +3736,7 @@ try {
         await until('the channel of Wazo ended', async () => (asteriskCli('core show channels concise').includes('PJSIP/103-') ? null : true), { timeout: 20_000 })
         wazoSide.close()
         wazoSide = await wazoCallsBob()
-        const second = await callOfBob()
+        const second = await callOfBob(callId)
         const started = await supApi('POST', `/supervision/calls/${second.id}/recording`, { action: 'start' })
         expectEqual(started.statusCode, 201, started.body)
         await rtpBothWays(bob2)
