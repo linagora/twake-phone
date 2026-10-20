@@ -610,10 +610,55 @@ const mi = (method, params) =>
     const [, host, port] = /^udp:(.+):(\d+)$/.exec(OPENSIPS_MI_URL) ?? []
     const socket = createSocket('udp4')
     const timer = setTimeout(() => (socket.close(), reject(new Error(`MI ${method}: no answer`))), 5_000)
-    socket.on('message', msg => (clearTimeout(timer), socket.close(), resolve(JSON.parse(msg.toString()))))
+    // The reply comes from the MI socket and is JSON: a stray datagram on this ephemeral port (media, a late packet) is not it.
+    socket.on('message', (msg, from) => {
+      if (from.port !== Number(port)) return
+      let reply
+      try {
+        reply = JSON.parse(msg.toString())
+      } catch {
+        return
+      }
+      clearTimeout(timer)
+      socket.close()
+      resolve(reply)
+    })
     socket.send(JSON.stringify({ jsonrpc: '2.0', method, ...(params ? { params } : {}), id: 1 }), Number(port), host)
   })
 const soundBlocked = page => page.evaluate(() => window.twakephone.soundBlocked)
+/** The windows OpenSIPS keeps for `ext` (MI ul_dump), by their Contact. */
+const windowsOf = async ext => {
+  const dump = (await mi('ul_dump', {})).result
+  const aor = (dump?.Domains ?? []).flatMap(d => d.AORs ?? []).find(a => a.AOR === ext)
+  return (aor?.Contacts ?? []).map(c => c.Contact)
+}
+/**
+ * Forgets every window OpenSIPS keeps for `ext` (MI ul_rm, as for an account that goes), to be called once no page of that
+ * person is open any more. A window closed without a clean unregister leaves its registration on a dead connection, which
+ * OpenSIPS drops only when it expires (300 s after its last REGISTER, at the next sweep of the table): left to expire, it
+ * is gone for a slow run and still there for a quick one, so that a later count of windows or a call to the extension
+ * depended on the speed of the runner.
+ */
+const forgetWindows = async ext => {
+  // Nothing to forget is not an error to us (OpenSIPS may say so): what counts is that nothing is left.
+  const res = await mi('ul_rm', ['location', ext])
+  expectEqual(await windowsOf(ext), [], `the windows of ${ext} in OpenSIPS once forgotten (MI ul_rm said ${JSON.stringify(res.error ?? 'ok')})`)
+}
+/**
+ * Opens the form « Ajouter un participant » of a conference and types the target in it. Opened only when it is not: the
+ * panel is drawn again as the room's list changes, which closes a form opened a moment before, and a button pressed
+ * twice closes it.
+ */
+const openAddForm = async (page, target) => {
+  const button = page.getByRole('button', { name: 'Ajouter un participant' })
+  const field = page.getByLabel('Participant à ajouter (poste ou numéro)')
+  await until('the form to add a participant open with its target typed', async () => {
+    if (!(await field.isVisible()) && (await button.getAttribute('aria-pressed', { timeout: 1_000 })) !== 'true' && (await button.isEnabled({ timeout: 1_000 }))) await button.click({ timeout: 2_000 }).catch(() => {})
+    if (!(await field.isVisible())) return null
+    await field.fill(target, { timeout: 2_000 }).catch(() => {})
+    return (await field.inputValue({ timeout: 1_000 }).catch(() => null)) === target ? true : null
+  }, { timeout: 30_000 })
+}
 /** Waits for the ringtone element to play (not paused, live stream) or to be quiet; says what it saw otherwise. */
 const ringerPlaying = async (page, playing) => {
   const state = () => page.evaluate(() => {
@@ -2249,6 +2294,8 @@ try {
   })
   await step('Jean opens TwakePhone again for what follows', async () => {
     await jean.context.close()
+    // Nobody of his is on line: what OpenSIPS keeps for 102 is what his closed windows left (leaveApp), which no longer serves.
+    await forgetWindows('102')
     jean = await open('jdupont', 'Jean Dupont')
     await phoneState(jean.page).getByText('En ligne').waitFor({ timeout: 20_000 })
   })
@@ -2458,6 +2505,8 @@ try {
     await operator.callState(placed, 'ended', 45_000)
   })
   await step('Jean opens TwakePhone again; the operator calls Bob\'s direct number and gives up while it rings (CANCEL): Bob stops ringing', async () => {
+    // The window closed just before (the call of the operator to it ended on its dead connection) leaves its registration as well.
+    await forgetWindows('102')
     jean = await open('jdupont', 'Jean Dupont')
     await phoneState(jean.page).getByText('En ligne').waitFor({ timeout: 20_000 })
     const placed = await operator.call('+33199000103', { from: '+33639980002' })
@@ -2920,8 +2969,7 @@ try {
         look()
       })
     const statusTexts = who => who.page.evaluate(() => window.__statusTexts ?? [])
-    await alice.page.getByRole('button', { name: 'Ajouter un participant' }).click()
-    await alice.page.getByLabel('Participant à ajouter (poste ou numéro)').fill('103')
+    await openAddForm(alice.page, '103')
     await alice.page.getByRole('button', { name: 'Appeler et ajouter' }).click()
     // Alice: the room's call to her window only, her call with Jean ended as a conference.
     const [mine] = await until('Alice in the conference', async () => {
@@ -3023,8 +3071,7 @@ try {
   // Step 8c (ADR 0025): a call with the operator becomes a conference by the room calling the same number again.
   const OPERATED = 'sip:+33639980006@operator.example'
   const operatorConference = async () => {
-    await alice.page.getByRole('button', { name: 'Ajouter un participant' }).click()
-    await alice.page.getByLabel('Participant à ajouter (poste ou numéro)').fill('103')
+    await openAddForm(alice.page, '103')
     await alice.page.getByRole('button', { name: 'Appeler et ajouter' }).click()
   }
   await step('step 8c: a mailbox of the operator answers the number called again (here the operator answers the second call as it would a mailbox): the first call is never hung up by itself; Alice, who does not hear her correspondent, gives up (« Annuler et reprendre l\'appel »): the room ends, the callback is hung up, the first call goes on with its sound back, and Bob was never rung', async () => {
@@ -3106,8 +3153,7 @@ try {
     await bothHearEachOther(alice, bob)
   })
   await step('step 8c: the number is added to a conference too (« Ajouter un participant » with an external number, the rights and caps of Alice): the room calls it from her direct number and it joins; Alice removes it and ends the conference for everyone', async () => {
-    await alice.page.getByRole('button', { name: 'Ajouter un participant' }).click()
-    await alice.page.getByLabel('Participant à ajouter (poste ou numéro)').fill('06 39 98 00 07')
+    await openAddForm(alice.page, '06 39 98 00 07')
     await alice.page.getByRole('button', { name: 'Appeler et ajouter' }).click()
     const { call, at } = await invitedAtOperator(invite => invite.uri === 'sip:+33639980007@operator.example')
     if (!(call.invite.headers.get('from')?.[0] ?? '').includes('<sip:+33199000101@operator.example>')) throw new Error(`From of the call to the added number: ${call.invite.headers.get('from')}`)
@@ -3220,18 +3266,27 @@ try {
     try {
       // The conference: Alice, Jean, Bob, and two numbers of the operator.
       await aliceCallsJean(alice, jean)
-      await alice.page.getByRole('button', { name: 'Ajouter un participant' }).click()
-      await alice.page.getByLabel('Participant à ajouter (poste ou numéro)').fill('103')
+      await openAddForm(alice.page, '103')
       await alice.page.getByRole('button', { name: 'Appeler et ajouter' }).click()
       const ringing = bob.page.getByTestId('incoming-call')
-      await ringing.waitFor({ timeout: 30_000 })
+      await ringing.waitFor({ timeout: 30_000 }).catch(async err => {
+        // For whoever reads the failure: whether Bob's window was registered, and what OpenSIPS and LiveKit SIP said of the call to 103.
+        try {
+          const logs = service => execFileSync('docker', ['compose', '-f', fileURLToPath(new URL('../../../docker/docker-compose.sip.yml', import.meta.url)), 'logs', '--no-color', '--no-log-prefix', '--tail', '400', service], { encoding: 'utf8', timeout: 30_000, maxBuffer: 64 << 20 }).split('\n')
+          const said = logs('opensips').filter(l => /103|INVITE|call /.test(l) && !/from' key|failed to unregister/.test(l)).slice(-30)
+          const sip = logs('livekit-sip').filter(l => /"toUser": "103"/.test(l) && /fail|error|status/i.test(l)).slice(-6).map(l => l.slice(0, 700))
+          console.log(`[8d] Bob did not ring. Windows of 103: ${JSON.stringify(await windowsOf('103'))}\n[8d] OpenSIPS: ${said.join('\n')}\n[8d] LiveKit SIP: ${sip.join('\n')}`)
+        } catch (diagnosis) {
+          console.log(`[8d] Bob did not ring, and the diagnosis failed: ${diagnosis}`)
+        }
+        throw err
+      })
       await ringing.getByRole('button', { name: 'Répondre' }).click()
       await until('Bob in the conference', async () => ((await calls(bob.page))[0]?.state === 'connected' ? true : null), { timeout: 30_000 })
       await alice.page.getByTestId('conference-participant').nth(2).waitFor({ timeout: 20_000 })
       const firsts = {}
       for (const [typed, uri] of [['06 39 98 00 07', '+33639980007'], ['06 39 98 00 08', '+33639980008']]) {
-        await alice.page.getByRole('button', { name: 'Ajouter un participant' }).click()
-        await alice.page.getByLabel('Participant à ajouter (poste ou numéro)').fill(typed)
+        await openAddForm(alice.page, typed)
         await alice.page.getByRole('button', { name: 'Appeler et ajouter' }).click()
         const { call, at } = await invitedAtOperator(invite => invite.uri === `sip:${uri}@operator.example`)
         await at.callState(call, 'answered')
@@ -3483,12 +3538,6 @@ try {
     const compose = (...args) => execFileSync('docker', ['compose', '-f', COMPOSE_FILE, ...args], { encoding: 'utf8', timeout: 60_000 })
     /** What Asterisk has of the contacts of a line: "103/sip:103@127.0.0.2:5096" and the like. */
     const contactsOf = ext => asteriskCli('pjsip show contacts').split('\n').map(l => /^\s*Contact:\s+(\S+)/.exec(l)?.[1]).filter(c => c?.startsWith(`${ext}/`))
-    /** The windows OpenSIPS keeps for `ext` (MI ul_dump), by their Contact. */
-    const windowsOf = async ext => {
-      const dump = (await mi('ul_dump', {})).result
-      const aor = (dump?.Domains ?? []).flatMap(d => d.AORs ?? []).find(a => a.AOR === ext)
-      return (aor?.Contacts ?? []).map(c => c.Contact)
-    }
     await step('step 11c-1: each holder of an extension has a line at Wazo (an endpoint named after the extension, nothing of the person) and OpenSIPS was told once Wazo had it (wazo_lines)', async () => {
       const holders = (await store.listMappings(TENANT)).map(m => m.extension).sort()
       const rows = await until('a line for each holder in wazo_lines', async () => {
@@ -3595,7 +3644,8 @@ try {
         await phoneState(jean3.page).getByText('En ligne').waitFor({ timeout: 90_000 })
         const muted = Number(await shvOf('wazo_lines_mute_until'))
         if (!(muted > Date.now() / 1000 - 5)) throw new Error(`the lines were not left out: wazo_lines_mute_until ${muted}`)
-        expectEqual((await windowsOf('102')).length, 2, 'the windows of 102 in OpenSIPS')
+        const windows102 = await windowsOf('102')
+        expectEqual(windows102.length, 2, `the windows of 102 in OpenSIPS (${JSON.stringify(windows102)})`)
         await dial(bob.page, '102')
         for (const who of [jean, jean3]) await who.page.getByTestId('incoming-call').getByText('Appel entrant de Bob Durand (103)').waitFor({ timeout: 20_000 })
         await jean3.page.getByTestId('incoming-call').getByRole('button', { name: 'Répondre' }).click()
@@ -4069,8 +4119,23 @@ try {
     const [row] = (await db.query("SELECT mailbox FROM voicemail_boxes WHERE extension = '104'")).rows
     const gone = `vm:h:${await whoOf('103')}:104@twake-gone`
     try {
-      await db.query("UPDATE voicemail_boxes SET mailbox = '104@twake-gone' WHERE extension = '104'")
-      const ended = await dialUntilEnded(bob.page, '104')
+      // The Gateway synchronises the mailboxes in the background (again and again while Wazo was out of reach, as just before) and writes
+      // the right one back over this row: the call then reaches the mailbox of 104, which is no proof about a mailbox Wazo does not
+      // have. A call that did not end with the row still out of date is that; only then is it hung up and tried again.
+      let ended
+      for (let attempt = 1; !ended; attempt++) {
+        await db.query("UPDATE voicemail_boxes SET mailbox = '104@twake-gone' WHERE extension = '104'")
+        try {
+          ended = await dialUntilEnded(bob.page, '104')
+        } catch (err) {
+          const [now] = (await db.query("SELECT mailbox FROM voicemail_boxes WHERE extension = '104'")).rows
+          const reached = (await calls(bob.page)).some(c => c.state === 'connected')
+          if (now.mailbox === '104@twake-gone' || !reached || attempt >= 3) throw err
+          console.log(`[11a] the row of 104 in voicemail_boxes was written back (${now.mailbox}) during the call, tried again (${attempt})`)
+          await bob.page.getByRole('button', { name: 'Raccrocher' }).click()
+          await until('the end of the call to 104', async () => ((await calls(bob.page)).length === 0 ? true : null))
+        }
+      }
       expectEqual(`${ended.endStatus} ${ended.endReason}`, '404 unavailable', 'how the call to a mailbox Wazo does not have ended')
       await bob.page.getByText('104 est injoignable.').waitFor()
       // Counted when it went to the mailbox, counted out when Asterisk refused it: nothing left (never -1).

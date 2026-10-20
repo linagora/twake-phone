@@ -92,7 +92,19 @@ const mi = (method, params) =>
   new Promise((resolve, reject) => {
     const s = createSocket('udp4')
     const t = setTimeout(() => (s.close(), reject(new Error(`MI ${method}: no answer`))), 3000)
-    s.on('message', m => (clearTimeout(t), s.close(), resolve(JSON.parse(m.toString()))))
+    // The reply comes from the MI socket and is JSON: a stray datagram on this ephemeral port (media, a late packet) is not it.
+    s.on('message', (m, from) => {
+      if (from.port !== Number(miPort)) return
+      let reply
+      try {
+        reply = JSON.parse(m.toString())
+      } catch {
+        return
+      }
+      clearTimeout(t)
+      s.close()
+      resolve(reply)
+    })
     s.send(JSON.stringify({ jsonrpc: '2.0', method, id: 1, ...(params ? { params } : {}) }), Number(miPort), miHost)
   })
 const reload = async () => {
@@ -269,6 +281,10 @@ try {
     const call = await p301.dial('115')
     const at = await atOperator(A, call)
     expect('Request-URI at the operator', at.invite.uri === 'sip:115@operator.example', at.invite.uri)
+    // OVH takes the received= of a lower Via for the caller and answers 403 "not registered": only our Via goes out.
+    expect('only our Via reaches the operator', at.invite.headers.get('via')?.length === 1, `${at.invite.headers.get('via')}`)
+    // ...and the answer reaches the phone with the Via it sent (a phone that matches answers by branch drops it otherwise).
+    expect('the answer keeps the phone\'s Via', call.final?.headers.get('via')?.length === 1, `${call.final?.headers.get('via')}`)
     expect('INVITEs to the account 115', ![...p115.calls.values()].some(c => c.invite), `${p115.calls.size}`)
   })
 
@@ -526,6 +542,26 @@ try {
     expect('BYE', (await placed.hangup()).status === 200)
     await p301.callState(got, 'ended', 5_000)
     expect('the BYE at the phone, at its own Contact', got.requests.at(-1)?.uri === p301.contactUri, got.requests.at(-1)?.uri)
+  })
+
+  // OVH (Cirpack) rebuilds its route set from the 2xx of a re-INVITE it sends 20 ms after the call is answered: the
+  // phone answers with the Record-Route of the request, so the proxy has to put its own entries back in it, or the
+  // next ACK and BYE come with no Route to us, to the phone's own Contact (404).
+  await step('review OVH: an operator that takes its route set from the 2xx of a re-INVITE still reaches the phone with its ACK and BYE', async () => {
+    const placed = await A.call('+33199000301', { from: '+33639980002' })
+    expect('final answer', (await placed.final).status === 200)
+    const got = await p301.incoming(i => header(i, 'call-id') === placed.callId)
+    const entries = msg => (msg.headers.get('record-route') ?? []).flatMap(v => v.split(/,\s*(?=<)/)).map(v => v.replace(/;did=[^;>]*/, ''))
+    const first = entries(placed.answer)
+    const answer = await A.reinvite(placed)
+    expect('re-INVITE answered', answer.status === 200, answer.first)
+    expect('the 2xx of the re-INVITE carries the route of the call', JSON.stringify(entries(answer)) === JSON.stringify(first), `${entries(answer)} / ${first}`)
+    placed.route = entries(answer).reverse()
+    placed.remoteTarget = /<([^>]+)>/.exec(header(answer, 'contact'))?.[1] ?? placed.remoteTarget
+    expect('re-INVITE by the new route set', (await A.reinvite(placed)).status === 200)
+    expect('both re-INVITEs and their ACKs at the phone', got.reinvites.length === 2, `${got.reinvites.length}`)
+    expect('BYE by the new route set', (await placed.hangup()).status === 200)
+    await p301.callState(got, 'ended', 5_000)
   })
 
   await step('n°5: a call from the operator whose phone went: ended, a BYE to the operator', async () => {

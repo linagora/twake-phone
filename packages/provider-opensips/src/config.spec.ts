@@ -1521,7 +1521,7 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(cfg).toContain('\tif ($dlg_val(trunk) != NULL || $dlg_val(meet) != NULL)\n\t\t$var(replaces_trunk) = 1;\n\tunload_dialog_ctx();')
     const replaced = main.indexOf('if ($var(replaces_trunk) == 1) {')
     expect(replaced).toBeGreaterThan(main.indexOf('route(replaces_target);'))
-    expect(replaced).toBeLessThan(main.indexOf('record_route();'))
+    expect(replaced).toBeLessThan(main.indexOf('record_route();', main.indexOf('if (is_method("CANCEL")) {')))
   })
 
   it('hears the operator only on the trunk socket: out of a dialog from its addresses, in one of its calls from any', () => {
@@ -1731,7 +1731,7 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     const main = cfg.slice(cfg.indexOf('\nroute {'), cfg.indexOf('\nroute[outbound_policy] {'))
     const initial = main.indexOf('if ($var(pstn) == 1 && !route(trunk_request)) {')
     expect(initial).toBeGreaterThan(0)
-    expect(initial).toBeLessThan(main.indexOf('record_route();'))
+    expect(initial).toBeLessThan(main.indexOf('record_route();', main.indexOf('if (is_method("CANCEL")) {')))
     expect(main.slice(initial)).toMatch(/^[^]*?if \(\$var\(num_class\) == "emergency"\)\n\t\t\tappend_to_reply\("Twake-Call-Refused: emergency\\r\\n"\);[^]*?send_reply\(\$var\(refuse_code\), "\$var\(refuse_reason\)"\);\n\t\texit;/)
     const inDialog = main.slice(main.indexOf('if (has_totag()) {'), main.indexOf('if (is_method("CANCEL")) {'))
     const sequential = inDialog.indexOf('if (route(to_trunk) && !route(trunk_request)) {')
