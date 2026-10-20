@@ -674,7 +674,6 @@ route {
 		if (route(to_trunk)) {
 			route(trunk_headers);
 			route(trunk_contact);
-			t_on_branch("trunk_via");
 		}
 		# From the operator to the phone: the phone's answers carry its Contact (onreply_route[rtp] rewrites it too).
 		if ($var(from_trunk) == 1) {
@@ -1638,6 +1637,15 @@ route[trunk_out_send] {
 	# for each branch (branch_route[trunk_out]).
 	route(trunk_headers);
 	route(trunk_contact, $avp(t_contact));
+	# The Vias of the phone are kept apart (in the dialog) before branch_route[trunk_out] takes them off the request,
+	# and put back by onreply_route in the replies, which the phone matches by branch.
+	$var(i) = 0;
+	$var(vias) = "";
+	while ($var(i) < $hdrcnt(Via)) {
+		$var(vias) = $var(vias) + "Via: " + $(hdr(Via)[$var(i)]) + "\r\n";
+		$var(i) = $var(i) + 1;
+	}
+	$dlg_val(orig_via) = $var(vias);
 	t_on_branch("trunk_out");
 	# An emergency call lasts until a party hangs up (no OPTIONS to the phone, above): never cut at TRUNK_MAX_CALL_SEC.
 	# A day bounds what the dialog module keeps of one both sides forgot (second review 6b, n°10; restored by a
@@ -1892,15 +1900,12 @@ route[trunk_target] {
 	$avp(t_ruri) = $ru;
 }
 
-# Only our own Via goes to the operator (added when the branch leaves): the phone's one carries received=<its
-# address>, and OVH (siptrunk.ovh.net) takes that address for the caller and answers 403 "not registered".
-branch_route[trunk_via] {
-	remove_hf("Via");
-}
-
 # Each INVITE to the operator, from the trunk it goes to (route[trunk_target]; another one for an emergency call that
 # failed on its own, failure_route[trunk_failed]): From and To its way, and the P-Asserted-Identity it may want.
 branch_route[trunk_out] {
+	# Only our own Via goes to the operator (tm adds it when the branch leaves): the phone's one carries received=<its
+	# address>, and OVH (siptrunk.ovh.net) takes that address for the caller and answers 403 "not registered". The
+	# phone's Vias were kept by the route above, to be put back in the replies (onreply_route).
 	remove_hf("Via");
 	uac_replace_from("", "sip:$avp(t_from_user)@$avp(t_domain)");
 	uac_replace_to("", "sip:$avp(t_to_user)@$avp(t_domain)");
@@ -4097,6 +4102,10 @@ onreply_route {
 }
 
 onreply_route[rtp] {
+	# The Vias of the phone, taken off the request to the operator (main route, branch_route[trunk_out]): put back
+	# after ours when the reply has no other one. A request in the dialog keeps the phone's Vias, so its replies do.
+	if ($hdrcnt(Via) == 1 && $dlg_val(orig_via) != NULL && $hdr(CSeq) =~ "INVITE$")
+		append_hf("$dlg_val(orig_via)", "Via");
 	# Only this script tells a "do not disturb" (route[dnd_reply]) and who answered (below): an UA's own Twake-Dnd or
 	# P-Asserted-Identity headers do not pass, or the caller would show them as the dialled extension's.
 	remove_hf_glob("Twake-Dnd*");
