@@ -1,4 +1,4 @@
-import type { CallDirection, CallState, DidRange, EmergencySite, OperatorCdr, OutboundAssignment, OutboundPolicy, OutboundProfile, PresenceStatus, TelephonyAlert, Trunk, WebhookEventType } from '@twake/telephony-types'
+import type { CallDirection, CallState, DidRange, EmergencySite, OperatorCdr, OutboundAssignment, OutboundPolicy, OutboundProfile, PresenceStatus, Recording, SupervisionLogEntry, TelephonyAlert, Trunk, WebhookEventType } from '@twake/telephony-types'
 
 export interface ProviderRecord {
   tenantId: string
@@ -262,6 +262,16 @@ export interface DidRecord extends DidRange {
 /** A site of a tenant for its emergency calls (step 6c, ADR 0024), with the people in it. */
 export interface SiteRecord extends EmergencySite {
   tenantId: string
+}
+
+/**
+ * The record of a recording of a call (step 11d, ADR 0029): `Recording` plus the tenant, who held the extension (`userId`,
+ * for their erasure) and the call it is of (`callId`, an Asterisk unique id). The audio is on the recordings server.
+ */
+export interface RecordingRecord extends Recording {
+  tenantId: string
+  callId: string
+  userId?: string
 }
 
 /** The rules of a tenant's calls to the public network (step 6b, ADR 0017), as an administrator set them. */
@@ -945,6 +955,36 @@ export interface Store {
   acknowledgeAlert(tenantId: string, id: string, by: string, at: string, seen: string, count: number): Promise<StoredAlert | null>
   /** Removes the alerts of every tenant whose last repeat is before `before` (ISO); how many. */
   purgeAlerts(before: string): Promise<number>
+
+  /**
+   * Keeps a recording (step 11d). Throws when one is already under way for the same call (`callId`, state `recording`).
+   */
+  addRecording(record: RecordingRecord): Promise<void>
+  getRecording(tenantId: string, id: string): Promise<RecordingRecord | null>
+  /** The recording under way of a call, null when none. */
+  getRecordingUnderWay(tenantId: string, callId: string): Promise<RecordingRecord | null>
+  /** The recordings under way of a tenant (of every tenant when none is named). */
+  listRecordingsUnderWay(tenantId?: string): Promise<RecordingRecord[]>
+  /** The recordings of a tenant, newest first, `limit` at most (clamped as a page). */
+  listRecordings(tenantId: string, limit?: number): Promise<RecordingRecord[]>
+  /**
+   * Changes a recording's state, end or size, only if it is still in state `from` (one of them; a closing and an erasure
+   * never overwrite each other): the recording as it is now, null when it is not (or not of this tenant).
+   */
+  updateRecording(tenantId: string, id: string, from: Recording['state'][], change: Partial<Pick<RecordingRecord, 'state' | 'endedAt' | 'sizeBytes'>>): Promise<RecordingRecord | null>
+  /**
+   * The recordings whose audio is to go: those `erasing`, and, with `before` (ISO), those ready or failed that began
+   * before it (the retention period); oldest first, `limit` at most. Of every tenant when `tenantId` is undefined.
+   */
+  listRecordingsToErase(before: string | null, limit: number, tenantId?: string): Promise<RecordingRecord[]>
+  /** Marks `erasing` the recordings of a person's calls (under way, ready or failed); how many. */
+  eraseRecordingsOf(tenantId: string, userId: string): Promise<number>
+  /** Adds a line to the journal of the supervision (step 11d). */
+  addSupervisionLog(tenantId: string, entry: SupervisionLogEntry): Promise<void>
+  /** The journal of a tenant, newest first, `limit` at most (clamped as a page). */
+  listSupervisionLog(tenantId: string, limit?: number): Promise<SupervisionLogEntry[]>
+  /** Removes the lines of the journal of every tenant before `before` (ISO); how many. */
+  purgeSupervisionLog(before: string): Promise<number>
 
   /** The subscriptions of a tenant, oldest first. */
   listWebhookSubscriptions(tenantId: string): Promise<WebhookSubscriptionRecord[]>

@@ -37,6 +37,11 @@
 // Step 11a (ADR 0022): the mailboxes, on the Wazo of the same stack, behind OpenSIPS (the Gateway with provider-wazo):
 //   WAZO_AUTH_URL, WAZO_CONFD_URL, WAZO_CALLD_URL, WAZO_WEBSOCKETD_URL  its APIs (default the stack's, on the loopback)
 //   WAZO_USER, WAZO_PASSWORD             the Gateway's account in Wazo (default the stack's development one)
+// Step 11d (ADR 0029): the recording and the supervision of the calls that have a channel at Wazo, by the Gateway
+// (provider-wazo: the AMI of Wazo's Asterisk with two accounts of its own, a recordings server):
+//   WAZO_AMI             Wazo's AMI (default 127.0.0.1:5038); WAZO_GATEWAY_AMI_PASSWORD and WAZO_GATEWAY_ORIGINATE_PASSWORD
+//                        the passwords of the Gateway's two accounts there (default the stack's development ones)
+//   WAZO_RECORDINGS_URL, WAZO_RECORDINGS_TOKEN  the recordings server (default http://127.0.0.1:8670 and the stack's token)
 // Step 11b (ADR 0023): each message transcribed by the LinTO STT of the same stack, the bot's notice of it in the
 // stack's Matrix homeserver (Synapse), where this process makes the bot's account and those of the cast (its
 // shared-secret registration): the bot's access token is the one Synapse gives at its registration, never written.
@@ -68,7 +73,7 @@ import { JwtAuthenticator } from '../../gateway/dist/auth.js'
 import { DirectorySync } from '../../gateway/dist/directory-sync.js'
 import { DEFAULT_ATTRIBUTES, LdapDirectory } from '../../gateway/dist/ldap-directory.js'
 import { storedOpensipsFactory } from '../../gateway/dist/providers.js'
-import { WazoVoicemail, holderKey, mailboxNumber } from '../../../packages/provider-wazo/dist/index.js'
+import { WazoSupervision, WazoVoicemail, amiAction, holderKey, mailboxNumber } from '../../../packages/provider-wazo/dist/index.js'
 import { holderSecretOf } from '../../gateway/dist/voicemail.js'
 import { MatrixBot } from '../../gateway/dist/matrix.js'
 import { LintoTranscription } from '../../../packages/transcription-linto/dist/index.js'
@@ -122,6 +127,11 @@ const WAZO = {
 const WAZO_LINE_KEY = process.env.WAZO_LINE_KEY ?? 'twake-wazo-line-dev-only-key-0123456789abcdef'
 const WAZO_AMI = process.env.WAZO_AMI ?? '127.0.0.1:5038'
 const WAZO_AMI_PASSWORD = process.env.WAZO_AMI_PASSWORD ?? 'twake-wazo-dev-only-ami'
+// Step 11d (ADR 0029): the Gateway's two AMI accounts (the calls and MixMonitor; Originate) and the recordings server.
+const WAZO_GATEWAY_AMI_PASSWORD = process.env.WAZO_GATEWAY_AMI_PASSWORD ?? 'twake-wazo-dev-only-gateway-ami'
+const WAZO_GATEWAY_ORIGINATE_PASSWORD = process.env.WAZO_GATEWAY_ORIGINATE_PASSWORD ?? 'twake-wazo-dev-only-gateway-originate'
+const WAZO_RECORDINGS_URL = process.env.WAZO_RECORDINGS_URL ?? 'http://127.0.0.1:8670'
+const WAZO_RECORDINGS_TOKEN = process.env.WAZO_RECORDINGS_TOKEN ?? 'twake-wazo-dev-only-recordings-token-0123456789'
 const TENANT = 'e2e'
 const BROWSER = process.env.BROWSER ?? 'chromium'
 // Step 11b: LinTO STT and the Matrix homeserver of the stack.
@@ -203,6 +213,9 @@ const wazoAmi = () =>
           send({ Action: 'Originate', Channel: channel, Application: application, ...(data ? { Data: data } : {}), CallerID: callerId, Async: 'true', ActionID: id })
           return waitFor(e => /^Event: OriginateResponse/m.test(e) && field(e, 'ActionID') === id, 'the answer to the call', 60_000).then(e => ({ response: field(e, 'Response'), reason: field(e, 'Reason') }))
         },
+        /** The events heard since the login whose text matches `pattern`. */
+        heard: pattern => events.filter(e => pattern.test(e)),
+        field,
         channelsOf: prefix => events.filter(e => /^Event: Newchannel/m.test(e) && field(e, 'Channel')?.startsWith(prefix)).map(e => field(e, 'Channel')),
         hangup: channel => send({ Action: 'Hangup', Channel: channel, Cause: 16 }),
         close: () => socket.end()
@@ -457,6 +470,11 @@ const wazo = new WazoVoicemail({
   // What it says while out of reach is what the steps expect; once reachable, everything.
   logger: { info: () => {}, warn: m => wazoOpen && console.log(`[wazo] ${m}`), error: m => console.log(`[wazo] ${m}`) }
 })
+// Step 11d (ADR 0029): the recording and the supervision, by the AMI of Wazo's Asterisk (the Gateway's two accounts) and its recordings server.
+const [AMI_HOST, AMI_PORT] = WAZO_AMI.split(':')
+const AMI_GATEWAY = { host: AMI_HOST, port: Number(AMI_PORT), username: 'twake_gateway', password: WAZO_GATEWAY_AMI_PASSWORD }
+const AMI_ORIGINATE = { host: AMI_HOST, port: Number(AMI_PORT), username: 'twake_gateway_originate', password: WAZO_GATEWAY_ORIGINATE_PASSWORD }
+const supervision = new WazoSupervision({ ami: AMI_GATEWAY, originate: AMI_ORIGINATE, recordingsUrl: WAZO_RECORDINGS_URL, recordingsToken: WAZO_RECORDINGS_TOKEN })
 // Step 11b: the client-server API of the stack's homeserver, as a person's Twake Chat (or the bot) calls it.
 const matrix = async (token, method, path, body) => {
   const res = await fetch(`${SYNAPSE_URL}/_matrix/client/v3${path}`, {
@@ -500,6 +518,11 @@ const gateway = await buildApp(registry, {
   voicemail: tenantId => (tenantId === TENANT ? wazo : undefined),
   // A synchronisation of the mailboxes that failed (Wazo out of reach) is tried again every 2 s here (the steps wait for it, not for the 30 s of the Gateway's default).
   voicemailRetryMs: [1_000, 2_000],
+  // Step 11d: the supervision of the calls Wazo has (Alice administers, so supervises; Bob does not); a recording is kept 30 days, the sweep looks every 2 s here.
+  supervision: tenantId => (tenantId === TENANT ? supervision : undefined),
+  recordingRetentionDays: 30,
+  recordingSweepMs: 2_000,
+  supervisionSpyWaitMs: 20_000,
   // Step 11b: LinTO STT of the stack, the bot on its homeserver, each person's Matrix id from their uid.
   transcription: { provider: new LintoTranscription({ url: LINTO_URL, timeoutMs: 60_000 }), maxSec: 180, queueMax: 100, maxBytes: 180 * 48_000 + 65_536, lang: 'fr' },
   notices: { bot: new MatrixBot({ homeserverUrl: SYNAPSE_URL, token: matrixTokens['twakephone-bot'] }), userTemplate: `@{uid}:${MATRIX_SERVER}`, appUrl: appOrigin, timeZone: 'Europe/Paris' }
@@ -3560,6 +3583,170 @@ try {
         wazoSide.close()
       }
     })
+    // ---- Step 11d (ADR 0029): the recording and the supervision of the calls Wazo has ----------------------------
+    const supervisionSteps = async () => {
+      const refused = async (promise, pattern, what) => {
+        const err = await promise.then(() => null, e => e)
+        if (!err || !pattern.test(err.message)) throw new Error(`${what}: expected a refusal matching ${pattern}, got ${err ? err.message : 'success'}`)
+      }
+      await step('step 11d: the Gateway\'s two accounts in the AMI of Wazo hold what they must and no more: the first lists the calls and records but may not originate, the second originates (a notice, a supervisor\'s call) but may not run a shell nor list the calls, neither has the CLI or the configuration to write', async () => {
+        const listed = await amiAction(AMI_GATEWAY, { Action: 'CoreShowChannels' }, { wait: 'list' })
+        expectEqual(listed.response.Response, 'Success', 'CoreShowChannels by the first account')
+        await refused(amiAction(AMI_GATEWAY, { Action: 'MixMonitor', Channel: '1.1', File: '/tmp/never.wav' }), /No such channel/, 'MixMonitor of a channel that is not there, by the first account (allowed, so the channel is what is missing)')
+        for (const [name, account] of [['first', AMI_GATEWAY], ['second', AMI_ORIGINATE]]) {
+          await refused(amiAction(account, { Action: 'Command', Command: 'core show version' }), /Permission denied/, `Command by the ${name} account`)
+          await refused(amiAction(account, { Action: 'UpdateConfig', SrcFilename: 'manager.conf', DstFilename: 'manager.conf' }), /Permission denied/, `UpdateConfig by the ${name} account`)
+        }
+        await refused(amiAction(AMI_GATEWAY, { Action: 'Originate', Channel: 'Local/s@twake-opensips', Application: 'Playback', Data: 'beep', Async: 'true' }), /Permission denied/, 'Originate by the first account')
+        await refused(amiAction(AMI_ORIGINATE, { Action: 'CoreShowChannels' }, { wait: 'list' }), /Permission denied/, 'CoreShowChannels by the second account')
+        await refused(amiAction(AMI_ORIGINATE, { Action: 'MixMonitor', Channel: '1.1', File: '/tmp/never.wav' }), /Permission denied/, 'MixMonitor by the second account')
+        await refused(amiAction(AMI_ORIGINATE, { Action: 'Originate', Channel: 'Local/s@twake-opensips', Application: 'System', Data: 'true', Async: 'true' }, { events: 'call', wait: 'event' }), /blacklisted/, 'an Originate that runs a shell, by the second account')
+        // The recordings server asks its token, and the Gateway's reads and erasures are by it.
+        expectEqual((await fetch(`${WAZO_RECORDINGS_URL}/e2e/3f2b8c0e-4d1a-4b7e-9c55-0a1b2c3d4e5f`)).status, 401, 'the recordings server without its token')
+        expectEqual((await fetch(`${WAZO_RECORDINGS_URL}/e2e/3f2b8c0e-4d1a-4b7e-9c55-0a1b2c3d4e5f`, { headers: { authorization: `Bearer ${WAZO_RECORDINGS_TOKEN}` } })).status, 404, 'the recordings server with its token, a file it has not')
+      })
+      let alice2
+      let wazoSide
+      let callId
+      let supApi
+      let bobApi
+      /** Wazo places an echo call to 103: both windows of Bob ring, the second answers. */
+      const wazoCallsBob = async () => {
+        const side = await wazoAmi()
+        const ended = side.originate({ channel: 'PJSIP/103', application: 'Echo', callerId: '"Standard" <0100>' })
+        ended.catch(() => undefined)
+        for (const who of [bob, bob2]) await who.page.getByTestId('incoming-call').getByText(/Standard \(01 00\)/).waitFor({ timeout: 20_000 })
+        await bob2.page.getByTestId('incoming-call').getByRole('button', { name: 'Répondre' }).click()
+        expectEqual((await ended).response, 'Success', 'the answer of Wazo to its call')
+        await rtpBothWays(bob2)
+        return side
+      }
+      const callOfBob = () => until('the call of Bob in the supervision', async () => (await supApi('GET', '/supervision/calls')).json().items?.find(c => c.extension === '103') ?? null, { timeout: 20_000 })
+      await step('step 11d, the demo: Wazo calls 103 (a call it holds); Alice, an administrator and so a supervisor, has her line at Wazo by a window of her own; the supervision lists the call (Bob\'s line, the number Wazo gives, his name from the directory) and keeps Bob, who is no supervisor, out of every route', async () => {
+        alice2 = await open('amartin', 'Alice Martin')
+        await phoneState(alice2.page).getByText('En ligne').waitFor({ timeout: 20_000 })
+        await until('the contact of 101 at Wazo', async () => (contactsOf('101').length ? true : null), { timeout: 20_000 })
+        wazoSide = await wazoCallsBob()
+        supApi = await asPerson(alice)
+        bobApi = await asPerson(bob)
+        const call = await callOfBob()
+        expectEqual([call.peer, call.peerName, call.displayName, call.state], ['0100', 'Standard', 'Bob Durand', 'up'], 'the call as the supervision lists it')
+        callId = call.id
+        for (const [method, url, payload] of [['GET', '/supervision/calls'], ['POST', `/supervision/calls/${callId}/recording`, { action: 'start' }], ['POST', `/supervision/calls/${callId}/spy`, { mode: 'listen' }], ['GET', '/supervision/recordings'], ['GET', '/supervision/log'], ['DELETE', '/supervision/recordings/3f2b8c0e-4d1a-4b7e-9c55-0a1b2c3d4e5f']]) {
+          expectEqual((await bobApi(method, url, payload)).statusCode, 403, `${method} ${url} as Bob`)
+        }
+        expectEqual((await bobApi('GET', '/me')).json().features.supervision, undefined, 'what /me says to Bob of the supervision')
+        expectEqual((await supApi('GET', '/me')).json().features.supervision, true, 'what /me says to Alice of the supervision')
+      })
+      let recording
+      await step('step 11d, recording: from the screen Alice records the call (the notice is spied onto the channel by Wazo\'s own context, then MixMonitor records both ways), the screen says it is being recorded, she stops it and listens to it in the page', async () => {
+        const page = alice2.page
+        await page.getByRole('link', { name: 'Supervision' }).click()
+        await page.getByRole('heading', { name: 'Supervision', level: 1 }).waitFor()
+        const row = page.getByTestId('supervision-call').filter({ hasText: 'Bob Durand (103)' })
+        await row.getByText(/Standard \(01 00\)/).waitFor({ timeout: 20_000 })
+        await row.getByRole('button', { name: "Enregistrer l'appel de Bob Durand (103)" }).click()
+        await row.getByText('Enregistrement en cours').waitFor({ timeout: 30_000 })
+        // The notice: Wazo's wazo-play-beep context spies the channel of Bob's line; and the recording of that channel.
+        await until('the ChanSpy of the notice on the channel of 103', async () => wazoSide.heard(/^Event: ChanSpyStart/m).find(e => /SpyerChannel: Local\/s@wazo-play-beep/.test(e) && /SpyeeChannel: PJSIP\/103-/.test(e)) ?? null, { timeout: 20_000 })
+        await until('the MixMonitor of the channel of 103', async () => wazoSide.heard(/^Event: MixMonitorStart/m).find(e => /Channel: PJSIP\/103-/.test(e)) ?? null, { timeout: 20_000 })
+        // A second recording of the same call is refused while one is under way.
+        const twice = await supApi('POST', `/supervision/calls/${callId}/recording`, { action: 'start' })
+        expectEqual([twice.statusCode, twice.json().code], [409, 'RECORDING_UNDER_WAY'], 'a second recording of the call')
+        await rtpBothWays(bob2)
+        await sleep(3_000)
+        await row.getByRole('button', { name: "Arrêter l'enregistrement de l'appel de Bob Durand (103)" }).click()
+        const ready = page.locator('[data-testid=supervision-recording][data-state=ready]').first()
+        await ready.waitFor({ timeout: 30_000 })
+        await ready.getByRole('button', { name: /^Écouter l'enregistrement de Bob Durand \(103\)/ }).click()
+        await page.waitForFunction(() => {
+          const a = document.querySelector('[data-testid=supervision-audio]')
+          return !!a && a.src.startsWith('blob:') && a.duration > 1
+        }, null, { timeout: 20_000 })
+        recording = (await supApi('GET', '/supervision/recordings')).json().items.find(r => r.state === 'ready')
+        if (!recording) throw new Error('no recording ready after the stop')
+        expectEqual([recording.extension, recording.displayName, recording.startedBy], ['103', 'Bob Durand', 'amartin'], 'the recording as the supervision lists it')
+        if (!(recording.durationSec >= 3)) throw new Error(`the recording lasts ${recording.durationSec} s`)
+      })
+      await step('step 11d, the audio is a WAV with sound in it (what Bob said and the echo gave back), journalled each time it is listened to; the recordings server has the file, Bob cannot reach it, and the journal says who did what without a number or a word', async () => {
+        const audio = await supApi('GET', `/supervision/recordings/${recording.id}/audio`)
+        expectEqual(audio.statusCode, 200, 'the audio')
+        expectEqual(audio.headers['content-type'], 'audio/wav', 'its type')
+        const wav = audio.rawPayload
+        expectEqual([wav.subarray(0, 4).toString(), wav.subarray(8, 12).toString()], ['RIFF', 'WAVE'], 'its header')
+        // The size the record says is what the recordings server has, and enough for 3 s of 8 kHz, 16 bits.
+        if (wav.length < recording.sizeBytes) throw new Error(`the audio is ${wav.length} bytes, the record says ${recording.sizeBytes}`)
+        if (wav.length < 2.5 * 16_000) throw new Error(`the recording is ${wav.length} bytes`)
+        let peak = 0
+        for (let i = 44; i + 1 < wav.length; i += 2) peak = Math.max(peak, Math.abs(wav.readInt16LE(i)))
+        if (peak < 100) throw new Error(`the recording is silent (peak ${peak})`)
+        expectEqual((await bobApi('GET', `/supervision/recordings/${recording.id}/audio`)).statusCode, 403, 'the audio as Bob')
+        const file = await fetch(`${WAZO_RECORDINGS_URL}/${TENANT}/${recording.id}`, { headers: { authorization: `Bearer ${WAZO_RECORDINGS_TOKEN}` } })
+        expectEqual(Number(file.headers.get('content-length')), wav.length, 'the file at the recordings server')
+        await file.arrayBuffer()
+        const log = (await supApi('GET', '/supervision/log')).json().items
+        const mine = log.filter(e => e.recordingId === recording.id).map(e => e.action)
+        for (const action of ['record-start', 'record-stop', 'listen-recording']) if (!mine.includes(action)) throw new Error(`the journal has no ${action}: ${JSON.stringify(mine)}`)
+        expectEqual(log.find(e => e.action === 'record-start').actorName, 'Alice Martin', 'who the journal says started it')
+        if (/0100|Standard|Bob/.test(JSON.stringify(log))) throw new Error(`the journal holds a number or a name of the call: ${JSON.stringify(log).slice(0, 300)}`)
+      })
+      await step('step 11d, supervising: Alice listens, then barges in (her own line is called, she answers, ChanSpy runs on the channel of Bob\'s line in the mode asked, the call goes on, her channel is no call of the list)', async () => {
+        for (const [mode, options] of [['listen', 'uqE'], ['barge', 'uqEB']]) {
+          const before = wazoSide.heard(/^Event: ChanSpyStart/m).filter(e => /SpyerChannel: PJSIP\/101-/.test(e)).length
+          const posted = supApi('POST', `/supervision/calls/${callId}/spy`, { mode })
+          const card = alice2.page.getByTestId('incoming-call')
+          await card.getByText(/Supervision \(01 99\)/).waitFor({ timeout: 20_000 })
+          await card.getByRole('button', { name: 'Répondre' }).click()
+          const r = await posted
+          expectEqual([r.statusCode, r.json().state], [202, 'answered'], `the supervision call (${mode})`)
+          await until(`the ChanSpy of the supervisor (${mode})`, async () => (wazoSide.heard(/^Event: ChanSpyStart/m).filter(e => /SpyerChannel: PJSIP\/101-/.test(e) && /SpyeeChannel: PJSIP\/103-/.test(e)).length > before ? true : null), { timeout: 20_000 })
+          const channels = asteriskCli('core show channels concise')
+          if (!channels.includes(`ChanSpy!${callId},${options}!`)) throw new Error(`no ChanSpy in mode ${mode} (${options}) on ${callId}:\n${channels}`)
+          // Alice hears the call through her phone; Bob's call goes on; the supervisor's channel is not one of the calls to supervise.
+          await rtpBothWays(alice2)
+          expectEqual((await calls(bob2.page)).length, 1, 'calls of Bob while he is supervised')
+          expectEqual((await supApi('GET', '/supervision/calls')).json().items.map(c => c.extension), ['103'], 'the calls listed while Alice is in one')
+          await alice2.page.getByRole('button', { name: 'Raccrocher' }).click()
+          await until('the supervisor\'s channel ended', async () => (asteriskCli('core show channels concise').includes('PJSIP/101-') ? null : true), { timeout: 20_000 })
+        }
+        const spied = (await supApi('GET', '/supervision/log')).json().items.map(e => e.action)
+        for (const action of ['spy-listen', 'spy-barge']) if (!spied.includes(action)) throw new Error(`the journal has no ${action}`)
+        // Her own call is hers to make: Bob's phone is the one called, never a call of Alice's.
+        expectEqual((await supApi('POST', '/supervision/calls/1792479546.99/spy', { mode: 'listen' })).statusCode, 404, 'a call that does not exist')
+      })
+      await step('step 11d: Bob hangs up; the recording of the call is closed ready by the Gateway when nobody stopped it (a second call of Wazo, recorded, the call ended)', async () => {
+        await bob2.page.getByRole('button', { name: 'Raccrocher' }).click()
+        await until('the channel of Wazo ended', async () => (asteriskCli('core show channels concise').includes('PJSIP/103-') ? null : true), { timeout: 20_000 })
+        wazoSide.close()
+        wazoSide = await wazoCallsBob()
+        const second = await callOfBob()
+        const started = await supApi('POST', `/supervision/calls/${second.id}/recording`, { action: 'start' })
+        expectEqual(started.statusCode, 201, started.body)
+        await rtpBothWays(bob2)
+        await sleep(2_000)
+        await bob2.page.getByRole('button', { name: 'Raccrocher' }).click()
+        // The Gateway looks every 2 s here: the recording is closed, with a file of its own.
+        const closed = await until('the recording of the call that ended closed', async () => (await supApi('GET', '/supervision/recordings')).json().items.find(r => r.id === started.json().id && r.state === 'ready') ?? null, { timeout: 30_000 })
+        if (!closed.endedAt || !(closed.sizeBytes > 44)) throw new Error(`the recording closed: ${JSON.stringify(closed)}`)
+        wazoSide.close()
+        wazoSide = undefined
+      })
+      await step('step 11d, retention: a recording older than RECORDING_RETENTION_DAYS is erased by the Gateway (its file at the recordings server and in Asterisk\'s folder, its record kept as purged, the journal says the platform did it), and is no longer listened to; the newer one stays', async () => {
+        const all = (await supApi('GET', '/supervision/recordings')).json().items
+        const young = all.find(r => r.state === 'ready' && r.id !== recording.id)
+        await store.pool.query("UPDATE recordings SET started_at = now() - interval '31 days' WHERE tenant_id = $1 AND id = $2", [TENANT, recording.id])
+        await until('the old recording purged', async () => ((await supApi('GET', '/supervision/recordings')).json().items.find(r => r.id === recording.id)?.state === 'purged' ? true : null), { timeout: 30_000 })
+        expectEqual((await supApi('GET', `/supervision/recordings/${recording.id}/audio`)).statusCode, 404, 'the audio of the purged recording')
+        const folder = inAsterisk('ls', `/var/lib/wazo/sounds/tenants/${TENANT}/monitor`)
+        if (folder.includes(recording.id)) throw new Error(`the file is still in Asterisk's folder: ${folder}`)
+        if (!folder.includes(young.id)) throw new Error(`the newer recording's file is gone: ${folder}`)
+        expectEqual((await supApi('GET', `/supervision/recordings/${young.id}/audio`)).statusCode, 200, 'the audio of the newer recording')
+        const purged = (await supApi('GET', '/supervision/log')).json().items.find(e => e.action === 'purge' && e.recordingId === recording.id)
+        expectEqual(purged?.actor, 'system', 'who the journal says erased it')
+      })
+      await signOut(alice2)
+    }
+    await supervisionSteps()
     await step('step 11c-1: Wazo calls 103 and Bob declines: Wazo is told it was refused (no mailbox, no forward: Wazo decided); a call from Wazo to a number that has no window leaves Wazo the failure', async () => {
       const wazoSide = await wazoAmi()
       try {
