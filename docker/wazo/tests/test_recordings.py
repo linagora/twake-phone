@@ -2,6 +2,7 @@
 
     python3 -I -m unittest discover -s docker/wazo/tests
 """
+import email.utils
 import http.client
 import importlib.util
 import os
@@ -63,6 +64,8 @@ class RecordingsTest(unittest.TestCase):
         self.assertEqual(res.getheader('Content-Type'), 'audio/wav')
         self.assertEqual(res.getheader('Content-Length'), str(len(AUDIO)))
         self.assertEqual(res.getheader('Cache-Control'), 'private, no-store')
+        # When it was last written is when its recording ended.
+        self.assertEqual(email.utils.parsedate_to_datetime(res.getheader('Last-Modified')).timestamp(), int(os.stat(os.path.join(ROOT, 'acme', 'monitor', NAME + '.wav')).st_mtime))
         res, body = self.request('HEAD', f'/acme/{NAME}')
         self.assertEqual((res.status, body, res.getheader('Content-Length')), (200, b'', str(len(AUDIO))))
 
@@ -99,6 +102,31 @@ class RecordingsTest(unittest.TestCase):
         finally:
             os.unlink(os.path.join(ROOT, 'acme', 'monitor', OTHER + '.wav'))
             os.unlink(outside.name)
+
+    def test_follows_no_link_in_the_folders_either(self):
+        outside = tempfile.mkdtemp()
+        try:
+            os.makedirs(os.path.join(outside, 'monitor'))
+            with open(os.path.join(outside, 'monitor', OTHER + '.wav'), 'wb') as f:
+                f.write(b'secret')
+            # A tenant folder that is a link to elsewhere, and a monitor folder that is.
+            os.symlink(outside, os.path.join(ROOT, 'linked'))
+            os.makedirs(os.path.join(ROOT, 'half'))
+            os.symlink(os.path.join(outside, 'monitor'), os.path.join(ROOT, 'half', 'monitor'))
+            for tenant in ('linked', 'half'):
+                for method in ('GET', 'HEAD', 'DELETE'):
+                    res, body = self.request(method, f'/{tenant}/{OTHER}')
+                    self.assertEqual(res.status, 404, (tenant, method))
+                    self.assertNotIn(b'secret', body)
+            self.assertTrue(os.path.exists(os.path.join(outside, 'monitor', OTHER + '.wav')))
+        finally:
+            shutil.rmtree(outside, ignore_errors=True)
+            for name in ('linked', 'half'):
+                path = os.path.join(ROOT, name)
+                if os.path.islink(path):
+                    os.unlink(path)
+                else:
+                    shutil.rmtree(path, ignore_errors=True)
 
     def test_erases_a_file_once(self):
         res, _ = self.request('DELETE', f'/acme/{NAME}')

@@ -42,6 +42,7 @@ export class SupervisionError extends Error {
 
 /** The number a supervisor's call comes from: not an extension, and never a call to supervise. */
 export const SUPERVISION_CALLER = '0199'
+const SUPERVISION_NAME = 'Supervision'
 /** An Asterisk unique id, which is what a call is for the Gateway. */
 export const CALL_ID = /^[0-9]{1,12}\.[0-9]{1,12}$/
 const LINE_CHANNEL = /^PJSIP\/([0-9]{1,40})-[0-9a-f]+$/i
@@ -53,6 +54,8 @@ const EXTENSION = /^[0-9]{1,40}$/
 const SPY_OPTIONS: Record<SupervisionMode, string> = { listen: 'uqE', whisper: 'uqEw', barge: 'uqEB' }
 
 const known = (v: string | undefined) => (v && v !== '<unknown>' ? v : undefined)
+/** The line of a supervisor while it rings with the call of the supervision (it runs ChanSpy only once answered). */
+const ringingSupervisor = (e: AmiMessage) => e.ChannelStateDesc !== 'Up' && known(e.CallerIDNum) === SUPERVISION_CALLER && known(e.CallerIDName) === SUPERVISION_NAME
 const clock = (v: string | undefined) => {
   const m = /^(\d+):(\d{2}):(\d{2})$/.exec(v ?? '')
   return m ? Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]) : 0
@@ -89,7 +92,7 @@ export class WazoSupervision implements SupervisionProvider {
       if (e.Event !== 'CoreShowChannel') continue
       const line = LINE_CHANNEL.exec(e.Channel ?? '')
       // The call of a supervisor is no call to supervise: it runs ChanSpy once answered, and before that it is the line ringing with its number.
-      if (!line || !CALL_ID.test(e.Uniqueid ?? '') || e.Application === 'ChanSpy' || known(e.CallerIDNum) === SUPERVISION_CALLER) continue
+      if (!line || !CALL_ID.test(e.Uniqueid ?? '') || e.Application === 'ChanSpy' || ringingSupervisor(e)) continue
       const extension = line[1] as string
       // The number of the other party: the caller of a call Wazo placed (its caller id), else who the line is connected to.
       const peer = [known(e.CallerIDNum), known(e.ConnectedLineNum)].find(n => n && n !== extension)
@@ -135,7 +138,7 @@ export class WazoSupervision implements SupervisionProvider {
     await this.originate(
       { Channel: 'Local/s@wazo-play-beep', Application: 'Playback', Data: this.notice, Variable: `WAZO_PLAYBACK_CHANNEL=${call.id}`, Timeout: '15000' },
       25_000,
-      e => e.Event === 'ChanSpyStart' && e.SpyeeUniqueid === call.id
+      e => e.Event === 'ChanSpyStart' && e.SpyeeUniqueid === call.id && (e.SpyerChannel ?? '').startsWith('Local/s@wazo-play-beep')
     )
     await this.ami({ Action: 'MixMonitor', Channel: call.id, File: `${this.monitorDir}/${file.tenant}/monitor/${file.name}.wav` })
   }
@@ -145,8 +148,9 @@ export class WazoSupervision implements SupervisionProvider {
     try {
       await this.ami({ Action: 'StopMixMonitor', Channel: call.id })
     } catch (err) {
-      // A call that ended already took its recording with it.
-      if (err instanceof SupervisionError && err.code === 'refused') return
+      // A call that ended already took its recording with it: that, and only that. A refusal for the want of a right is not
+      // "stopped" (the call would go on being recorded).
+      if (err instanceof SupervisionError && err.code === 'refused' && /No such channel/i.test(err.message)) return
       throw err
     }
   }
@@ -160,7 +164,7 @@ export class WazoSupervision implements SupervisionProvider {
         Application: 'ChanSpy',
         Data: `${call.id},${SPY_OPTIONS[mode]}`,
         // Not an extension (the screen would give it the name of the person who holds it): the supervisor reads who calls.
-        CallerID: `"Supervision" <${SUPERVISION_CALLER}>`,
+        CallerID: `"${SUPERVISION_NAME}" <${SUPERVISION_CALLER}>`,
         Timeout: '30000'
       },
       40_000
@@ -203,11 +207,12 @@ export class WazoSupervision implements SupervisionProvider {
     return true
   }
 
-  async statRecording(file: { tenant: string; name: string }): Promise<{ size: number } | undefined> {
+  async statRecording(file: { tenant: string; name: string }): Promise<{ size: number; modifiedAt?: string } | undefined> {
     const res = await this.server('HEAD', file)
     if (res.status === 404) return undefined
     if (!res.ok) throw new SupervisionError(`the recordings server answered ${res.status}`, 'unavailable')
-    return { size: Number(res.headers.get('content-length') ?? 0) }
+    const modified = Date.parse(res.headers.get('last-modified') ?? '')
+    return { size: Number(res.headers.get('content-length') ?? 0), ...(Number.isNaN(modified) ? {} : { modifiedAt: new Date(modified).toISOString() }) }
   }
 
   async getRecording(file: { tenant: string; name: string }) {

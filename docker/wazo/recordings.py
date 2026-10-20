@@ -5,7 +5,7 @@ On a Wazo, the recordings of a call are files that Asterisk's MixMonitor writes,
 make. This stands in for what the Gateway needs, and a deployment can run it on the machine of Wazo (or serve the same
 folder with the same contract behind its nginx):
 
-    GET    /<tenant>/<uuid>   the file (audio/wav), `Content-Length` said, 404 when there is none (the length it had when the
+    GET    /<tenant>/<uuid>   the file (audio/wav), `Content-Length` and `Last-Modified` (the end of its recording) said, 404 when there is none (the length it had when the
                               request came: a file still being written is read up to it)
     HEAD   /<tenant>/<uuid>   the same without the body
     DELETE /<tenant>/<uuid>   erases it: 204, 404 when there was none
@@ -28,13 +28,14 @@ import os
 import re
 import stat
 import sys
+from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 LISTEN = os.environ.get('RECORDINGS_LISTEN', '127.0.0.1:8670')
-ROOT = os.path.realpath(os.environ.get('RECORDINGS_DIR', '/var/lib/wazo/sounds/tenants'))
+ROOT = os.path.realpath(os.environ.get('RECORDINGS_DIR', '/var/lib/wazo/sounds/tenants'))  # its own folders only are followed, below it
 TOKEN = os.environ.get('RECORDINGS_TOKEN', '')
 SOUNDS = [d for d in os.environ.get('RECORDINGS_SOUNDS', '/usr/share/asterisk/sounds:/var/lib/asterisk/sounds').split(':') if d]
-SOUND_EXTENSIONS = ('wav', 'sln', 'sln16', 'sln48', 'gsm', 'ulaw', 'alaw', 'g722', 'g729', 'ogg', 'mp3')
+SOUND_EXTENSIONS = ('wav', 'sln', 'sln16', 'sln48', 'gsm', 'ulaw', 'alaw', 'g722', 'g729')
 SOUND = re.compile(r'^/sound/([A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)*)$')
 PATH = re.compile(r'^/([A-Za-z0-9_-]{1,64})/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$')
 CHUNK = 64 * 1024
@@ -50,19 +51,25 @@ def has_sound(path):
     return bool(m) and any(os.path.isfile(os.path.join(d, f'{m.group(1)}.{ext}')) for d in SOUNDS for ext in SOUND_EXTENSIONS)
 
 
-def locate(path):
-    """The file a path names, or None: a regular file inside ROOT, the very place MixMonitor wrote it."""
+def open_folder(path):
+    """The (descriptor of the monitor folder, file name) a path names, each folder opened by its name under the one before and
+    never through a link, or None. A link put where a folder or the file is (by whoever writes in that folder) is followed
+    by nothing, whatever it is swapped for meanwhile. The caller closes the descriptor."""
     m = PATH.match(path)
     if not m:
         return None
-    candidate = os.path.join(ROOT, m.group(1), 'monitor', m.group(2) + '.wav')
+    held = []
     try:
-        info = os.lstat(candidate)
+        held.append(os.open(ROOT, os.O_RDONLY | os.O_DIRECTORY))
+        for name in (m.group(1), 'monitor'):
+            held.append(os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=held[-1]))
     except OSError:
+        for fd in held:
+            os.close(fd)
         return None
-    if not stat.S_ISREG(info.st_mode) or os.path.commonpath([ROOT, os.path.realpath(candidate)]) != ROOT:
-        return None
-    return candidate, info.st_size
+    for fd in held[:-1]:
+        os.close(fd)
+    return held[-1], m.group(2) + '.wav'
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -106,25 +113,34 @@ class Handler(BaseHTTPRequestHandler):
             if method != 'HEAD':
                 return self._send(405)
             return self._send(200 if has_sound(route) else 404, head=True)
-        found = locate(route)
-        if not found:
+        opened = open_folder(route)
+        if not opened:
             return self._send(404)
-        path, size = found
-        if method == 'DELETE':
-            try:
-                os.unlink(path)
-            except FileNotFoundError:
-                return self._send(404)
-            log('recording erased')
-            return self._send(204)
-        headers = {'Content-Type': 'audio/wav', 'Content-Length': str(size)}
-        if method == 'HEAD':
-            return self._send(200, headers=headers, head=True)
+        folder, name = opened
         try:
-            f = open(path, 'rb')
-        except OSError:
-            return self._send(404)
-        with f:
+            if method == 'DELETE':
+                try:
+                    if not stat.S_ISREG(os.stat(name, dir_fd=folder, follow_symlinks=False).st_mode):
+                        return self._send(404)
+                    os.unlink(name, dir_fd=folder)
+                except FileNotFoundError:
+                    return self._send(404)
+                log('recording erased')
+                return self._send(204)
+            try:
+                fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=folder)
+            except OSError:
+                return self._send(404)
+        finally:
+            os.close(folder)
+        with os.fdopen(fd, 'rb') as f:
+            info = os.fstat(f.fileno())
+            if not stat.S_ISREG(info.st_mode):
+                return self._send(404)
+            size = info.st_size
+            headers = {'Content-Type': 'audio/wav', 'Content-Length': str(size), 'Last-Modified': formatdate(info.st_mtime, usegmt=True)}
+            if method == 'HEAD':
+                return self._send(200, headers=headers, head=True)
             self.send_response(200)
             for k, v in headers.items():
                 self.send_header(k, v)

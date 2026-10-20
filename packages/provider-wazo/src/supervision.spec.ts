@@ -204,9 +204,10 @@ describe('startRecording', () => {
       if (a.Action === 'CoreShowChannels') return channelsOf([channel({})])(a, reply)
       if (a.Action === 'Originate') {
         reply({ Response: 'Success', ActionID: a.ActionID!, Message: 'queued' }, { Event: 'OriginateResponse', Response: 'Success', ActionID: a.ActionID!, Reason: '4' })
-        // The spy of another call first, then this call's, a moment later.
-        reply({ Event: 'ChanSpyStart', SpyeeUniqueid: '1792479546.99' })
-        setTimeout(() => reply({ Event: 'ChanSpyStart', SpyeeUniqueid: a.Variable!.split('=')[1]! }), 200)
+        // The spy of another call first, then another spy of this call (a supervisor's, not the notice's), then the notice's, a moment later.
+        reply({ Event: 'ChanSpyStart', SpyerChannel: 'Local/s@wazo-play-beep-00000009;2', SpyeeUniqueid: '1792479546.99' })
+        reply({ Event: 'ChanSpyStart', SpyerChannel: 'PJSIP/101-0000000f', SpyeeUniqueid: a.Variable!.split('=')[1]! })
+        setTimeout(() => reply({ Event: 'ChanSpyStart', SpyerChannel: 'Local/s@wazo-play-beep-00000001;2', SpyeeUniqueid: a.Variable!.split('=')[1]! }), 200)
         return
       }
       order.push('record')
@@ -230,6 +231,9 @@ describe('startRecording', () => {
     await expect(sup.stopRecording({ id: '1792479546.12' })).resolves.toBeUndefined()
     expect(ami.state.actions[0]).toMatchObject({ Action: 'StopMixMonitor', Channel: '1792479546.12' })
     await expect(sup.stopRecording({ id: 'nope' })).resolves.toBeUndefined()
+    // A refusal that is not "the call is gone" is not "stopped": the call would go on being recorded.
+    const denied = await supervision((a, reply) => reply({ Response: 'Error', ActionID: a.ActionID!, Message: 'Permission denied' }))
+    await expect(denied.sup.stopRecording({ id: '1792479546.12' })).rejects.toMatchObject({ code: 'refused' })
     const down = await supervision(() => undefined)
     down.ami.close()
     await expect(down.sup.stopRecording({ id: '1792479546.12' })).rejects.toMatchObject({ code: 'unavailable' })
@@ -240,7 +244,7 @@ describe('the two accounts', () => {
   it('sends Originate by the account that holds originate and everything else by the one that holds system', async () => {
     const answer = (a: Frame, reply: (...b: Frame[]) => void) => {
       if (a.Action === 'CoreShowChannels') return channelsOf([channel({})])(a, reply)
-      if (a.Action === 'Originate') return reply({ Response: 'Success', ActionID: a.ActionID!, Message: 'queued' }, { Event: 'OriginateResponse', Response: 'Success', ActionID: a.ActionID!, Reason: '4' }, { Event: 'ChanSpyStart', SpyeeUniqueid: '1792479546.12' })
+      if (a.Action === 'Originate') return reply({ Response: 'Success', ActionID: a.ActionID!, Message: 'queued' }, { Event: 'OriginateResponse', Response: 'Success', ActionID: a.ActionID!, Reason: '4' }, { Event: 'ChanSpyStart', SpyerChannel: 'Local/s@wazo-play-beep-00000001;2', SpyeeUniqueid: '1792479546.12' })
       reply({ Response: 'Success', ActionID: a.ActionID! })
     }
     const system = await fakeAmi(answer)

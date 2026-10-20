@@ -283,6 +283,8 @@ export interface BuildOptions {
   supervisionSpyWaitMs?: number
   /** How long the closing of a recording waits for its file to be whole (tests). Default: 2 s. */
   supervisionSettleMs?: number
+  /** How long the calls listed are kept for the screens that ask at once (tests). Default: 2 s. */
+  supervisionCallsCacheMs?: number
   /** The waits between two tries of a synchronisation of the mailboxes that failed, the last repeated (tests). */
   voicemailRetryMs?: number[]
   /**
@@ -1687,6 +1689,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
     retentionDays: options.recordingRetentionDays ?? 30,
     ...(options.supervisionSpyWaitMs !== undefined ? { spyWaitMs: options.supervisionSpyWaitMs } : {}),
     ...(options.supervisionSettleMs !== undefined ? { settleMs: options.supervisionSettleMs } : {}),
+    ...(options.supervisionCallsCacheMs !== undefined ? { callsCacheMs: options.supervisionCallsCacheMs } : {}),
     isSupervisor: identity => isSupervisor(identity, supervisorPolicy, isAdmin(identity, admin)),
     isAdmin: identity => isAdmin(identity, admin),
     authenticate: req => auth.authenticate(req),

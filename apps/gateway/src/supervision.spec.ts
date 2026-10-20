@@ -22,6 +22,7 @@ const fakeSupervision = () => {
     stopped: [] as string[],
     spied: [] as { id: string; supervisor: string; mode: SupervisionMode }[],
     announceFails: false,
+    modifiedAt: undefined as string | undefined,
     noticeMissing: false,
     down: false,
     spy: 'answered' as 'answered' | 'refused' | 'never',
@@ -63,7 +64,7 @@ const fakeSupervision = () => {
     async statRecording(file) {
       unavailable()
       const b = state.files.get(key(file))
-      return b ? { size: state.sizeAfterStop ?? b.length } : undefined
+      return b ? { size: state.sizeAfterStop ?? b.length, ...(state.modifiedAt ? { modifiedAt: state.modifiedAt } : {}) } : undefined
     },
     async deleteRecording(file) {
       unavailable()
@@ -212,6 +213,19 @@ describe('recording', () => {
     expect(state.stopped).toEqual([CALL])
   })
 
+  it('says a recording ended when its file was last written, not when somebody looked at it', async () => {
+    const { get, post, state, store } = await setup()
+    const rec = (await post(`/supervision/calls/${CALL}/recording`, { action: 'start' })).json()
+    // Began ten minutes ago, its file last written 70 s after: looked at now, it ended then.
+    const began = new Date(Date.now() - 600_000).toISOString()
+    ;(store as unknown as { recordings: Map<string, unknown> }).recordings.set(`dev\u0000${rec.id}`, { ...(await store.getRecording('dev', rec.id)), startedAt: began })
+    state.calls = []
+    const wrote = new Date(Date.parse(began) + 70_000).toISOString()
+    state.modifiedAt = wrote
+    const closed = (await get('/supervision/recordings')).json().items[0]
+    expect([closed.state, closed.endedAt, closed.durationSec]).toEqual(['ready', wrote, 70])
+  })
+
   it('closes the recording of a call that ended without a stop, ready with its file, the next time anyone looks', async () => {
     const { get, post, state } = await setup()
     const rec = (await post(`/supervision/calls/${CALL}/recording`, { action: 'start' })).json()
@@ -261,6 +275,15 @@ describe('recording', () => {
     expect((await get(`/supervision/recordings/${rec.id}/audio`)).statusCode).toBe(502)
   })
 
+  it('is no listening to ask the audio with HEAD', async () => {
+    const { app, post } = await setup()
+    const rec = (await post(`/supervision/calls/${CALL}/recording`, { action: 'start' })).json()
+    await post(`/supervision/calls/${CALL}/recording`, { action: 'stop' })
+    const head = await app.inject({ method: 'HEAD', url: `/api/v1/supervision/recordings/${rec.id}/audio`, headers: as('amartin', SUP) })
+    expect(head.statusCode).toBe(405)
+    expect((await app.inject({ url: '/api/v1/supervision/log', headers: as('amartin', SUP) })).json().items.map((e: { action: string }) => e.action)).not.toContain('listen-recording')
+  })
+
   it('lets only an administrator delete a recording, which is then purged: no audio, the record and the journal stay', async () => {
     const { get, post, app, state } = await setup()
     const rec = (await post(`/supervision/calls/${CALL}/recording`, { action: 'start' })).json()
@@ -291,14 +314,51 @@ describe('supervising', () => {
     const { post, state } = await setup()
     state.spy = 'never'
     expect((await post(`/supervision/calls/${CALL}/spy`, { mode: 'listen' })).json()).toEqual({ state: 'ringing' })
+    // Asked again while the phone still rings: the same call, not a second one.
+    const again = await post(`/supervision/calls/${CALL}/spy`, { mode: 'listen' })
+    expect([again.statusCode, again.json().code]).toEqual([409, 'SPY_UNDER_WAY'])
+    expect(state.spied).toHaveLength(1)
     expect((await post(`/supervision/calls/${CALL}/spy`, { mode: 'whisper' }, 'bdurand')).json().code).toBe('OWN_CALL')
     expect((await post(`/supervision/calls/${CALL}/spy`, { mode: 'shout' })).statusCode).toBe(400)
     expect((await post(`/supervision/calls/${CALL}/spy`, { mode: 'listen' }, 'nobody-has-no-extension')).json().code).toBe('NO_EXTENSION')
     expect((await post('/supervision/calls/1792479546.99/spy', { mode: 'listen' })).statusCode).toBe(404)
+  })
+
+  it('says the supervisor\'s phone did not take the call when it is refused at once, and lets them ask again', async () => {
+    const { post, state } = await setup()
     state.spy = 'refused'
     const r = await post(`/supervision/calls/${CALL}/spy`, { mode: 'listen' })
-    expect(r.statusCode).toBe(409)
-    expect(r.json().code).toBe('SPY_REFUSED')
+    expect([r.statusCode, r.json().code]).toEqual([409, 'SPY_REFUSED'])
+    state.spy = 'answered'
+    expect((await post(`/supervision/calls/${CALL}/spy`, { mode: 'listen' })).json()).toEqual({ state: 'answered' })
+  })
+
+  it('does nothing that leaves no trace: no supervision, recording, listening or deletion when the journal cannot be written', async () => {
+    const { post, get, app, store, state } = await setup()
+    const rec = (await post(`/supervision/calls/${CALL}/recording`, { action: 'start' })).json()
+    await post(`/supervision/calls/${CALL}/recording`, { action: 'stop' })
+    const write = store.addSupervisionLog.bind(store)
+    store.addSupervisionLog = async () => {
+      throw new Error('database down')
+    }
+    try {
+      for (const r of [
+        await post(`/supervision/calls/${CALL}/spy`, { mode: 'listen' }),
+        await get(`/supervision/recordings/${rec.id}/audio`),
+        await app.inject({ method: 'DELETE', url: `/api/v1/supervision/recordings/${rec.id}`, headers: as('root', ADMIN) })
+      ])
+        expect([r.statusCode, r.json().code]).toEqual([503, 'JOURNAL_UNAVAILABLE'])
+      state.started.length = 0
+      const started = await post(`/supervision/calls/${CALL}/recording`, { action: 'start' })
+      expect([started.statusCode, started.json().code]).toEqual([503, 'JOURNAL_UNAVAILABLE'])
+      expect(state.started).toEqual([])
+      expect(state.spied).toEqual([])
+      expect(state.files.size).toBe(1)
+    } finally {
+      store.addSupervisionLog = write
+    }
+    // The call is recordable again once the journal is back (the refused attempt left no recording under way).
+    expect((await post(`/supervision/calls/${CALL}/recording`, { action: 'start' })).statusCode).toBe(201)
   })
 })
 
@@ -458,6 +518,8 @@ describe('the environment', () => {
     expect(tenantFolder('acme-1')).toBe('acme-1')
     expect(tenantFolder('../x')).toMatch(/^t-[0-9a-f]{32}$/)
     expect(tenantFolder('../x')).not.toBe(tenantFolder('../y'))
+    // `sound` is the recordings server's own route.
+    expect(tenantFolder('sound')).toMatch(/^t-[0-9a-f]{32}$/)
     expect(publicRecording({ id: 'i', tenantId: 't', callId: 'c', extension: '103', startedBy: 'a', startedAt: '2026-10-20T10:00:00.000Z', endedAt: '2026-10-20T10:01:05.400Z', state: 'ready' })).toEqual({ id: 'i', extension: '103', startedAt: '2026-10-20T10:00:00.000Z', endedAt: '2026-10-20T10:01:05.400Z', durationSec: 65, state: 'ready', startedBy: 'a' })
   })
 })

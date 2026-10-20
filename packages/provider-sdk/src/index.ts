@@ -390,8 +390,8 @@ export interface SupervisionProvider {
   spy(call: { id: string }, supervisor: { extension: string }, mode: SupervisionMode): Promise<void>
   /** The audio of a recording (WAV) as a stream read once, undefined when the server has no such file. */
   getRecording(file: { tenant: string; name: string }): Promise<{ contentType: string; size?: number; body: AsyncIterable<Uint8Array> } | undefined>
-  /** What the server has of a recording's file: its size, undefined when it has none. */
-  statRecording(file: { tenant: string; name: string }): Promise<{ size: number } | undefined>
+  /** What the server has of a recording's file: its size and when it was last written (the end of the recording), undefined when it has none. */
+  statRecording(file: { tenant: string; name: string }): Promise<{ size: number; modifiedAt?: string } | undefined>
   /** Erases a recording's file; false when there was none. */
   deleteRecording(file: { tenant: string; name: string }): Promise<boolean>
   close(): Promise<void>

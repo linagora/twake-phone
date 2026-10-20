@@ -205,7 +205,7 @@ if (voicemail && !transcription) console.warn('WARNING: the messages are not tra
 if (notices && !env.LDAP_ATTR_MATRIX && !notices.userTemplate) console.warn("WARNING: the bot knows nobody's Matrix account: set LDAP_ATTR_MATRIX or MATRIX_USER_TEMPLATE")
 if (notices && !notices.appUrl) console.warn("WARNING: the bot's notices carry no link to TwakePhone: set APP_URL (or an https origin in CORS_ORIGINS)")
 // The recording and the supervision of the calls that have a channel at Wazo (step 11d, ADR 0029): the AMI of its
-// Asterisk (WAZO_AMI, WAZO_AMI_USER, WAZO_AMI_PASSWORD) and its recordings server (WAZO_RECORDINGS_URL,
+// Asterisk (WAZO_AMI, and its two accounts WAZO_GATEWAY_AMI_*, WAZO_GATEWAY_ORIGINATE_*) and its recordings server (WAZO_RECORDINGS_URL,
 // WAZO_RECORDINGS_TOKEN). Recordings are kept RECORDING_RETENTION_DAYS (30 by default).
 const supervision = supervisionFromEnv(env)
 const recordingRetentionDays = recordingRetentionDaysOf(env)

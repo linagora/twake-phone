@@ -86,7 +86,8 @@ export const supervisionFromEnv = (env: NodeJS.ProcessEnv): WazoSupervision | un
 }
 
 /** The folder of a tenant's recordings at the recordings server: its id when that is a name, else a print of it. */
-export const tenantFolder = (tenantId: string) => (/^[A-Za-z0-9_-]{1,64}$/.test(tenantId) ? tenantId : `t-${createHash('sha256').update(tenantId).digest('hex').slice(0, 32)}`)
+// `sound` is the recordings server's own route: no tenant is named like it.
+export const tenantFolder = (tenantId: string) => (/^[A-Za-z0-9_-]{1,64}$/.test(tenantId) && tenantId !== 'sound' ? tenantId : `t-${createHash('sha256').update(tenantId).digest('hex').slice(0, 32)}`)
 
 const secondsBetween = (from: string, to: string) => Math.max(0, Math.round((Date.parse(to) - Date.parse(from)) / 1000))
 
@@ -108,7 +109,7 @@ const EMPTY_WAV = 44
 /** How long the Gateway keeps the journal: a year, and a month. */
 const LOG_KEPT_MS = 395 * 86_400_000
 /** How many recordings a sweep takes in hand. */
-const SWEEP_BATCH = 100
+const SWEEP_BATCH = 500
 
 export interface SupervisionDeps {
   store: Store
@@ -135,6 +136,8 @@ export interface SupervisionDeps {
  */
 export class Supervision {
   private readonly cache = new Map<string, { at: number; calls: Promise<SupervisedCall[]> }>()
+  /** The supervisors whose phone is being called for a supervision (by tenant and user). */
+  private readonly spies = new Set<string>()
   private timer: NodeJS.Timeout | undefined
   private sweeping: Promise<void> | undefined
   private stopped = false
@@ -172,26 +175,42 @@ export class Supervision {
     return calls
   }
 
-  private async journal(tenantId: string, entry: Omit<SupervisionLogEntry, 'at'>) {
-    await this.deps.store.addSupervisionLog(tenantId, { at: new Date().toISOString(), ...entry }).catch((err: unknown) => this.deps.log.error({ err }, 'supervision journal not written'))
+  /**
+   * Writes a line of the journal. `strict`: for what must leave a trace (a recording, a supervision, a listening, a deletion):
+   * when the line cannot be written, nothing is done (503), never an action without its trace.
+   */
+  private async journal(tenantId: string, entry: Omit<SupervisionLogEntry, 'at'>, strict = false) {
+    try {
+      await this.deps.store.addSupervisionLog(tenantId, { at: new Date().toISOString(), ...entry })
+    } catch (err) {
+      this.deps.log.error({ err }, 'supervision journal not written')
+      if (strict) throw fail(503, 'The journal of the supervision cannot be written: nothing was done', 'JOURNAL_UNAVAILABLE')
+    }
   }
 
   /** Closes the recording of a call that ended (or was stopped): ready when the file has sound, failed when it has none. */
   private async close(r: RecordingRecord, p: SupervisionProvider) {
     let size: number | undefined
+    let modifiedAt: string | undefined
     let last = -1
     // The file is closed a moment after the stop: its size is read until it has sound and stopped growing, or the wait is over.
     const until = Date.now() + (this.deps.settleMs ?? 2000)
     for (;;) {
       // A recordings server that does not answer leaves the recording under way (closed at the next look), never failed.
-      size = (await p.statRecording(this.file(r)))?.size
+      const stat = await p.statRecording(this.file(r))
+      size = stat?.size
+      modifiedAt = stat?.modifiedAt
       if ((size ?? 0) > EMPTY_WAV && size === last) break
       last = size ?? -1
       if (Date.now() >= until) break
       await new Promise(resolve => setTimeout(resolve, 250))
     }
     const ok = (size ?? 0) > EMPTY_WAV
-    return this.deps.store.updateRecording(r.tenantId, r.id, ['recording'], { state: ok ? 'ready' : 'failed', endedAt: new Date().toISOString(), ...(size !== undefined ? { sizeBytes: size } : {}) })
+    // The recording ended when its file was last written (not when it was looked at, minutes later maybe).
+    const now = Date.now()
+    const wrote = modifiedAt ? Date.parse(modifiedAt) : Number.NaN
+    const endedAt = new Date(Number.isNaN(wrote) ? now : Math.min(now, Math.max(wrote, Date.parse(r.startedAt)))).toISOString()
+    return this.deps.store.updateRecording(r.tenantId, r.id, ['recording'], { state: ok ? 'ready' : 'failed', endedAt, ...(size !== undefined ? { sizeBytes: size } : {}) })
   }
 
   /**
@@ -217,18 +236,7 @@ export class Supervision {
         if (p) await this.settle(tenantId, p).catch((err: unknown) => this.deps.log.warn({ err, tenantId }, 'recordings under way not closed'))
       }
       const before = this.deps.retentionDays > 0 ? new Date(Date.now() - this.deps.retentionDays * 86_400_000).toISOString() : null
-      for (const r of await store.listRecordingsToErase(before, SWEEP_BATCH)) {
-        const p = this.deps.provider(r.tenantId)
-        if (!p || this.stopped) continue
-        try {
-          // Already gone (false) is as good as erased.
-          await p.deleteRecording(this.file(r))
-          const done = await store.updateRecording(r.tenantId, r.id, ['ready', 'failed', 'erasing'], { state: 'purged', forget: true })
-          if (done) await this.journal(r.tenantId, { actor: 'system', action: r.state === 'erasing' ? 'erase' : 'purge', ...(r.extension ? { extension: r.extension } : {}), recordingId: r.id })
-        } catch (err) {
-          this.deps.log.warn({ err, recording: r.id }, 'recording not erased, tried again at the next sweep')
-        }
-      }
+      await this.eraseDue(before)
       // The journal and the records of what is erased go together, a year and a month on.
       const kept = new Date(Date.now() - LOG_KEPT_MS).toISOString()
       await store.purgeSupervisionLog(kept).catch((err: unknown) => this.deps.log.error({ err }, 'supervision journal not purged'))
@@ -237,6 +245,36 @@ export class Supervision {
       this.sweeping = undefined
     })
     return this.sweeping
+  }
+
+  /**
+   * Erases the audio of the recordings that are due (marked `erasing`, or past `before`), page after page: a record whose
+   * server does not answer, or that has no supervision server, is left (tried again at the next sweep) and does not hold the
+   * ones behind it back. Of one tenant when `tenantId` is given.
+   */
+  private async eraseDue(before: string | null, tenantId?: string) {
+    const store = this.deps.store
+    const left = new Set<string>()
+    for (;;) {
+      const page = (await store.listRecordingsToErase(before, SWEEP_BATCH + left.size, tenantId)).filter(r => !left.has(r.id))
+      if (!page.length || this.stopped) return
+      for (const r of page.slice(0, SWEEP_BATCH)) {
+        const p = this.deps.provider(r.tenantId)
+        if (!p) {
+          left.add(r.id)
+          continue
+        }
+        try {
+          // Already gone (false) is as good as erased.
+          await p.deleteRecording(this.file(r))
+          const done = await store.updateRecording(r.tenantId, r.id, ['ready', 'failed', 'erasing'], { state: 'purged', forget: true })
+          if (done) await this.journal(r.tenantId, { actor: 'system', action: r.state === 'erasing' ? 'erase' : 'purge', ...(r.extension ? { extension: r.extension } : {}), recordingId: r.id })
+        } catch (err) {
+          left.add(r.id)
+          this.deps.log.warn({ err, recording: r.id }, 'recording not erased, tried again at the next sweep')
+        }
+      }
+    }
   }
 
   /**
@@ -259,7 +297,8 @@ export class Supervision {
       }
     }
     const n = await this.deps.store.eraseRecordingsOf(tenantId, userId)
-    if (n && p) void this.sweep().catch((err: unknown) => this.deps.log.error({ err }, 'recordings not erased'))
+    // At once, not behind a sweep that is under way (it read what was due before this erasure marked it).
+    if (n && p) void this.eraseDue(null, tenantId).catch((err: unknown) => this.deps.log.error({ err }, 'recordings not erased'))
     return n
   }
 
@@ -337,6 +376,13 @@ export class Supervision {
         if (err instanceof RecordingUnderWay) throw fail(409, 'This call is being recorded', 'RECORDING_UNDER_WAY')
         throw err
       }
+      // Its trace before the recording: no recording without a line of the journal.
+      try {
+        await this.journal(tenantId, { actor: identity.userId, action: 'record-start', extension: call.extension, recordingId: rec.id }, true)
+      } catch (err) {
+        await store.updateRecording(tenantId, rec.id, ['recording'], { state: 'failed', endedAt: new Date().toISOString() }).catch(() => undefined)
+        throw err
+      }
       try {
         await provider.startRecording({ id: call.id }, this.file(rec))
       } catch (err) {
@@ -345,7 +391,6 @@ export class Supervision {
         await store.updateRecording(tenantId, rec.id, ['recording'], { state: 'failed', endedAt: new Date().toISOString() }).catch(() => undefined)
         return this.unavailable(err)
       }
-      await this.journal(tenantId, { actor: identity.userId, action: 'record-start', extension: call.extension, recordingId: rec.id })
       return reply.code(201).send(publicRecording(rec))
     })
 
@@ -358,8 +403,13 @@ export class Supervision {
       const call = (await this.calls(user.tenantId, provider).catch(err => this.unavailable(err))).find(c => c.id === req.params.id)
       if (!call) throw fail(404, 'Call not found', 'CALL_GONE')
       if (call.extension === user.extension) throw fail(409, 'You cannot supervise your own call', 'OWN_CALL')
-      await this.journal(user.tenantId, { actor: identity.userId, action: `spy-${mode}` as SupervisionLogEntry['action'], extension: call.extension })
+      // One call to the supervisor's phone at a time: a second request while it still rings is the same one asked again.
+      const spying = `${user.tenantId}\u0000${user.id}`
+      if (this.spies.has(spying)) throw fail(409, 'Your phone is already being called for a supervision', 'SPY_UNDER_WAY')
+      await this.journal(user.tenantId, { actor: identity.userId, action: `spy-${mode}` as SupervisionLogEntry['action'], extension: call.extension }, true)
+      this.spies.add(spying)
       const joined = provider.spy({ id: call.id }, { extension: user.extension }, mode).then(() => 'answered' as const)
+      void joined.then(() => undefined, () => undefined).finally(() => this.spies.delete(spying))
       // The refusals come at once (no line, the call over); a supervisor who has not answered yet keeps ringing.
       const outcome = await Promise.race([joined, new Promise<'ringing'>(resolve => setTimeout(() => resolve('ringing'), this.deps.spyWaitMs ?? 6000).unref())]).catch(err => {
         if (err instanceof SupervisionError && err.code === 'refused') throw fail(409, 'Your line did not take the call: is your phone connected?', 'SPY_REFUSED')
@@ -376,13 +426,15 @@ export class Supervision {
       return { items: (await store.listRecordings(user.tenantId, Number.isInteger(limit) && limit > 0 ? limit : 50)).map(publicRecording) }
     })
 
+    // A HEAD is no listening: Fastify would run the GET (and journal a listening) for it.
+    v1.head('/supervision/recordings/:id/audio', async (_req, reply) => reply.code(405).header('allow', 'GET').send())
     v1.get<{ Params: { id: string } }>('/supervision/recordings/:id/audio', async (req, reply) => {
       const { identity, user, provider } = await supervisor(req)
       const rec = UUID.test(req.params.id) ? await store.getRecording(user.tenantId, req.params.id) : null
       if (!rec || rec.state !== 'ready') throw fail(404, 'Recording not found')
       const audio = await provider.getRecording(this.file(rec)).catch(err => this.unavailable(err))
       if (!audio) throw fail(404, 'Recording not found')
-      await this.journal(user.tenantId, { actor: identity.userId, action: 'listen-recording', extension: rec.extension, recordingId: rec.id })
+      await this.journal(user.tenantId, { actor: identity.userId, action: 'listen-recording', extension: rec.extension, recordingId: rec.id }, true)
       const body = Readable.from(audio.body, { objectMode: false })
       body.on('error', err => req.log.warn({ err }, 'recording not sent whole'))
       reply.header('content-type', audio.contentType).header('cache-control', 'private, no-store')
@@ -398,9 +450,9 @@ export class Supervision {
       const rec = UUID.test(req.params.id) ? await store.getRecording(user.tenantId, req.params.id) : null
       if (!rec || rec.state === 'purged') throw fail(404, 'Recording not found')
       if (rec.state === 'recording') throw fail(409, 'This recording is under way: stop it first', 'RECORDING_UNDER_WAY')
+      await this.journal(user.tenantId, { actor: identity.userId, action: 'delete-recording', extension: rec.extension, recordingId: rec.id }, true)
       await provider.deleteRecording(this.file(rec)).catch(err => this.unavailable(err))
       await store.updateRecording(user.tenantId, rec.id, ['ready', 'failed', 'erasing'], { state: 'purged', forget: true })
-      await this.journal(user.tenantId, { actor: identity.userId, action: 'delete-recording', extension: rec.extension, recordingId: rec.id })
       return reply.code(204).send()
     })
 

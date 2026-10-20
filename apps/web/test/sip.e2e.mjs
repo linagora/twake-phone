@@ -525,6 +525,8 @@ const gateway = await buildApp(registry, {
   recordingRetentionDays: 30,
   recordingSweepMs: 2_000,
   supervisionSpyWaitMs: 20_000,
+  // Every read of the calls is a fresh one here: the steps look at what has just changed.
+  supervisionCallsCacheMs: 0,
   // Step 11b: LinTO STT of the stack, the bot on its homeserver, each person's Matrix id from their uid.
   transcription: { provider: new LintoTranscription({ url: LINTO_URL, timeoutMs: 60_000 }), maxSec: 180, queueMax: 100, maxBytes: 180 * 48_000 + 65_536, lang: 'fr' },
   notices: { bot: new MatrixBot({ homeserverUrl: SYNAPSE_URL, token: matrixTokens['twakephone-bot'] }), userTemplate: `@{uid}:${MATRIX_SERVER}`, appUrl: appOrigin, timeZone: 'Europe/Paris' }

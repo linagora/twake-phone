@@ -78,22 +78,35 @@ export const SupervisionPage = () => {
   const allowed = me?.features?.supervision === true
   const admin = me?.features?.admin === true
 
-  const readCalls = useCallback(
-    () =>
-      client.listSupervisedCalls().then(
-        page => {
-          setCalls(page.items)
-          setError(null)
-          setStale(false)
-        },
-        (err: { status?: number; message?: string }) => {
-          setStale(true)
-          setError(err.status === 501 ? 'unavailable' : err.status === 403 ? 'forbidden' : (err.message ?? 'load'))
-        }
-      ),
-    [client]
-  )
-  const readRecordings = useCallback(() => client.listRecordings().then(page => setRecordings(page.items), () => undefined), [client])
+  /** The last reading of the calls and of the recordings asked, and whether a round of readings is under way: a slow answer neither doubles the round nor replaces a newer one. */
+  const callsSeq = useRef(0)
+  const recordingsSeq = useRef(0)
+  const polling = useRef(false)
+  const readCalls = useCallback(() => {
+    const mine = ++callsSeq.current
+    return client.listSupervisedCalls().then(
+      page => {
+        if (mine !== callsSeq.current) return
+        setCalls(page.items)
+        setError(null)
+        setStale(false)
+      },
+      (err: { status?: number; message?: string }) => {
+        if (mine !== callsSeq.current) return
+        setStale(true)
+        setError(err.status === 501 ? 'unavailable' : err.status === 403 ? 'forbidden' : (err.message ?? 'load'))
+      }
+    )
+  }, [client])
+  const readRecordings = useCallback(() => {
+    const mine = ++recordingsSeq.current
+    return client.listRecordings().then(
+      page => {
+        if (mine === recordingsSeq.current) setRecordings(page.items)
+      },
+      () => undefined
+    )
+  }, [client])
   const readLog = useCallback(() => client.getSupervisionLog().then(page => setLog(page.items), () => undefined), [client])
 
   useEffect(() => {
@@ -101,7 +114,11 @@ export const SupervisionPage = () => {
     void Promise.all([readCalls(), readRecordings(), readLog()])
     // A tab nobody looks at asks nothing of the telephony server.
     const timer = setInterval(() => {
-      if (typeof document === 'undefined' || document.visibilityState !== 'hidden') void Promise.all([readCalls(), readRecordings()])
+      if (polling.current || (typeof document !== 'undefined' && document.visibilityState === 'hidden')) return
+      polling.current = true
+      void Promise.all([readCalls(), readRecordings()]).finally(() => {
+        polling.current = false
+      })
     }, CALLS_EVERY_MS)
     return () => clearInterval(timer)
   }, [allowed, readCalls, readRecordings, readLog])
@@ -180,6 +197,8 @@ export const SupervisionPage = () => {
   }
   const remove = (r: Recording) =>
     act(null, async () => {
+      // Given up (the deletion fails), the focus is back on « Supprimer »; deleted, the button is gone and the title has it.
+      focusAfter.current = { remove: r.id }
       setConfirming(null)
       await client.deleteRecording(r.id)
       if (playing?.id === r.id) {

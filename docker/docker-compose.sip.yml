@@ -302,8 +302,8 @@ services:
       WAZO_DB_PASSWORD: twake-wazo-dev-only-db
       # The AMI account of wazo-sysconfd below (module reloads and the list of the mailboxes only, no event).
       WAZO_SYSCONFD_AMI_PASSWORD: twake-wazo-dev-only-sysconfd
-      # The AMI accounts of the Gateway (step 11d, ADR 0029): the calls and MixMonitor; Originate. Its WAZO_AMI_PASSWORD and
-      # WAZO_AMI_ORIGINATE_PASSWORD.
+      # The AMI accounts of the Gateway (step 11d, ADR 0029): the calls and MixMonitor; Originate. The Gateway's
+      # WAZO_GATEWAY_AMI_PASSWORD and WAZO_GATEWAY_ORIGINATE_PASSWORD (never WAZO_AMI_PASSWORD, which is wazo-amid's).
       WAZO_GATEWAY_AMI_PASSWORD: twake-wazo-dev-only-gateway-ami
       WAZO_GATEWAY_ORIGINATE_PASSWORD: twake-wazo-dev-only-gateway-originate
       # The longest a call to a mailbox lasts, as OpenSIPS bounds it.

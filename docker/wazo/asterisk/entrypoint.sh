@@ -223,7 +223,7 @@ permit = 127.0.0.1/255.255.255.255
 read =
 write = system,reporting
 
-; The Gateway's (step 11d, ADR 0029; provider-wazo's WAZO_AMI_USER): two accounts, because Asterisk lets an account that
+; The Gateway's (step 11d, ADR 0029; the Gateway's WAZO_GATEWAY_AMI_USER and WAZO_GATEWAY_ORIGINATE_USER): two accounts, because Asterisk lets an account that
 ; holds both `system` and `originate` have Originate run any application (System included: a shell). The first holds
 ; `system` (MixMonitor, StopMixMonitor) and `reporting` (CoreShowChannels): it is refused Originate, `command` and
 ; `config`. The second holds `originate` alone, read `call` (the OriginateResponse it waits for): its Originate may run
