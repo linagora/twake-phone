@@ -126,6 +126,8 @@ export const storedOpensipsFactory = ({ store, key, env = process.env, provision
         voicemailBoxes: provisioner.voicemailBoxes({ ready: ensureSchema, tenantId }),
         // The extensions that have a line at Wazo (step 11c-1), which OpenSIPS registers there too.
         wazoLines: provisioner.wazoLines({ ready: ensureSchema, tenantId }),
+        // The sequential groups, queues and voice menus Wazo runs (step 11c-2), which OpenSIPS sends calls to.
+        callFlows: provisioner.callFlows({ ready: ensureSchema, tenantId }),
         // The trunks to an operator and their direct numbers, as OpenSIPS reads them, in the same database (ADR 0016).
         trunks: provisioner.trunkTables({ ready: ensureSchema, tenantId, socket: config.trunkSocket ?? (env.OPENSIPS_TRUNK_SOCKET || DEFAULT_TRUNK_SOCKET), ...((config.trunkAdvertise ?? env.OPENSIPS_TRUNK_ADVERTISE) ? { advertise: (config.trunkAdvertise ?? env.OPENSIPS_TRUNK_ADVERTISE)! } : {}) }),
         // The SIP accounts follow the mappings: one written for a user who no longer holds the extension goes (ADR 0014).

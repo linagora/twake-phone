@@ -1,6 +1,8 @@
-import type { Call, Capabilities, ConferenceParticipant, Contact, DialInConfiguration, DidRange, EmergencySite, ForwardingRules, FraudRule, MediaSession, OperatorLineForwards, OutboundAssignment, OutboundCaps, OutboundPolicy, OutboundProfile, Presence, PresenceStatus, Recording, RingGroup, SupervisedCall, SupervisionLogEntry, SupervisionMode, TelephonyAlert, TelephonyEvent, Trunk, TrunkInput, TrunkStatus, Voicemail, WebhookEventType } from '@twake/telephony-types'
+import type { Call, Capabilities, ConferenceParticipant, Contact, DialInConfiguration, DidRange, EmergencySite, ForwardingRules, FraudRule, MediaSession, OperatorLineForwards, OutboundAssignment, OutboundCaps, OutboundPolicy, OutboundProfile, Presence, PresenceStatus, Recording, RingGroup, SupervisedCall, SupervisionLogEntry, SupervisionMode, TelephonyAlert, TelephonyEvent, Trunk, TrunkInput, TrunkStatus, Voicemail, WebhookEventType, CallFlow } from '@twake/telephony-types'
 
 export type {
+  CallFlow,
+  CallFlowKind,
   Contact,
   ContactNumber,
   DidRange,
@@ -370,6 +372,18 @@ export interface PushState {
   subscriptions: number
 }
 
+/** What a flow is written as to the Gateway: only what it takes (the lists it adds when reading are its own). */
+const flowBody = (f: CallFlow, withNumber: boolean) => ({
+  ...(withNumber ? { number: f.number } : {}),
+  name: f.name,
+  kind: f.kind,
+  ...(f.members ? { members: f.members } : {}),
+  ...(f.ringSec !== undefined ? { ringSec: f.ringSec } : {}),
+  ...(f.waitSec !== undefined ? { waitSec: f.waitSec } : {}),
+  ...(f.choices ? { choices: f.choices } : {}),
+  ...(f.greeting ? { greeting: f.greeting } : {})
+})
+
 export class TelephonyClient {
   constructor(private readonly options: TelephonyClientOptions) {}
 
@@ -434,6 +448,25 @@ export class TelephonyClient {
 
   async deleteGroup(number: string) {
     await this.request<void>(`/admin/groups/${encodeURIComponent(number)}`, { method: 'DELETE' })
+  }
+
+  /** The sequential groups, queues and voice menus of the organisation (step 11c-2), for administrators (501: not on this platform). */
+  listFlows() {
+    return this.request<{ items: CallFlow[] }>('/admin/flows')
+  }
+
+  /** Creates a flow; refusals carry a `code` (FLOW_EXISTS, FLOW_NUMBER_TAKEN, FLOW_MEMBERS…). */
+  createFlow(flow: CallFlow) {
+    return this.request<CallFlow>('/admin/flows', { method: 'POST', body: JSON.stringify(flowBody(flow, true)) })
+  }
+
+  /** Replaces a flow (404: there is none of that number; 409 FLOW_IN_USE: a menu leads to it). */
+  setFlow(flow: CallFlow) {
+    return this.request<CallFlow>(`/admin/flows/${encodeURIComponent(flow.number)}`, { method: 'PUT', body: JSON.stringify(flowBody(flow, false)) })
+  }
+
+  async deleteFlow(number: string) {
+    await this.request<void>(`/admin/flows/${encodeURIComponent(number)}`, { method: 'DELETE' })
   }
 
   /** The people who hold an extension (administrators only). */

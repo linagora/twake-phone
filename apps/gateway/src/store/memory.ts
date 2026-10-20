@@ -1,5 +1,5 @@
 import type { OperatorCdr, Recording, SupervisionLogEntry } from '@twake/telephony-types'
-import { RecordingUnderWay, clampLimit, isDeclined, isMissed, type HistoryEntry, type HistoryNearQuery, type HistoryPage, type HistoryQuery, type OperatorCdrOutcome, type OperatorCdrRecord, type OperatorCdrStats, type ConferenceDecision, type VisioPerson, type VisioRecord, type VisioStatus, type ConferenceRecord, type AlertRecord, type AlertQuery, type DidRecord, type RecordingRecord, type SiteRecord, type OutboundHand, type OutboundRecord, type OutboundRules, ALERT_DEDUP_MS, alertKey, type ProviderRecord, type StoredAlert, type PushSaveResult, type PushSubscriptionRecord, type Store, type TrunkRecord, type MappingChange, type UserMapping, type UserPresenceRecord, type VapidKeysRecord, type ClaimedDelivery, type ErasedCall, type ErasedCallsKept, type WebhookAttemptResult, type WebhookClaimCaps, type WebhookClaimTime, allocateClaims, type WebhookDeliveryQuery, type WebhookLease, type WebhookSendQuota, type WebhookDeliveryRecord, type WebhookQueueOptions, type WebhookStateChange, type WebhookStateEvent, type WebhookSubscriptionRecord, WEBHOOK_STATE_ROLE, type FencedLease, type NewTranscript, type TranscriptChange, type TranscriptLane, type TranscriptMatch, type TranscriptNotice, type TranscriptRecord } from './types.js'
+import { RecordingUnderWay, clampLimit, isDeclined, isMissed, type HistoryEntry, type HistoryNearQuery, type HistoryPage, type HistoryQuery, type OperatorCdrOutcome, type OperatorCdrRecord, type OperatorCdrStats, type ConferenceDecision, type VisioPerson, type VisioRecord, type VisioStatus, type ConferenceRecord, type AlertRecord, type AlertQuery, type DidRecord, type RecordingRecord, type SiteRecord, type OutboundHand, type OutboundRecord, type OutboundRules, ALERT_DEDUP_MS, alertKey, type ProviderRecord, type StoredAlert, type PushSaveResult, type PushSubscriptionRecord, type Store, type TrunkRecord, type MappingChange, type UserMapping, type UserPresenceRecord, type VapidKeysRecord, type ClaimedDelivery, type ErasedCall, type ErasedCallsKept, type WebhookAttemptResult, type WebhookClaimCaps, type WebhookClaimTime, allocateClaims, type WebhookDeliveryQuery, type WebhookLease, type WebhookSendQuota, type WebhookDeliveryRecord, type WebhookQueueOptions, type WebhookStateChange, type WebhookStateEvent, type WebhookSubscriptionRecord, WEBHOOK_STATE_ROLE, type FencedLease, type NewTranscript, type TranscriptChange, type TranscriptLane, type TranscriptMatch, type TranscriptNotice, type TranscriptRecord, type CallFlowRecord } from './types.js'
 import type { WebhookEventType } from '@twake/telephony-types'
 import { randomBytes } from 'node:crypto'
 import { EMPTY_OUTBOUND, outboundVersion, staleOutbound } from '../outbound.js'
@@ -54,6 +54,7 @@ export class MemoryStore implements Store {
   private trunks: TrunkRecord[] = []
   private dids = new Map<string, DidRecord>()
   private sites = new Map<string, SiteRecord>()
+  private callFlows = new Map<string, CallFlowRecord>()
   private recordings = new Map<string, RecordingRecord>()
   private supervisionLog: (SupervisionLogEntry & { tenantId: string })[] = []
   private outbound = new Map<string, OutboundRecord>()
@@ -733,6 +734,18 @@ export class MemoryStore implements Store {
 
   async deleteSite(tenantId: string, id: string) {
     return this.sites.delete(key(tenantId, id))
+  }
+
+  async listCallFlows(tenantId: string) {
+    return [...this.callFlows.values()].filter(x => x.tenantId === tenantId).sort((a, b) => (a.number < b.number ? -1 : a.number > b.number ? 1 : 0)).map(x => structuredClone(x))
+  }
+
+  async upsertCallFlow(record: CallFlowRecord) {
+    this.callFlows.set(key(record.tenantId, record.number), structuredClone(record))
+  }
+
+  async deleteCallFlow(tenantId: string, number: string) {
+    return this.callFlows.delete(key(tenantId, number))
   }
 
   async getOutbound(tenantId: string) {

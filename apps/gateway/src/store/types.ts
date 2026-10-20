@@ -1,4 +1,4 @@
-import type { CallDirection, CallState, DidRange, EmergencySite, OperatorCdr, OutboundAssignment, OutboundPolicy, OutboundProfile, PresenceStatus, Recording, SupervisionLogEntry, TelephonyAlert, Trunk, WebhookEventType } from '@twake/telephony-types'
+import type { CallDirection, CallState, DidRange, EmergencySite, OperatorCdr, OutboundAssignment, OutboundPolicy, OutboundProfile, PresenceStatus, Recording, SupervisionLogEntry, TelephonyAlert, Trunk, WebhookEventType, CallFlowKind } from '@twake/telephony-types'
 
 export interface ProviderRecord {
   tenantId: string
@@ -262,6 +262,19 @@ export interface DidRecord extends DidRange {
 /** A site of a tenant for its emergency calls (step 6c, ADR 0024), with the people in it. */
 export interface SiteRecord extends EmergencySite {
   tenantId: string
+}
+
+/** A call flow of a tenant (step 11c-2, ADR 0028), as an administrator set it (the lists are never absent: empty). */
+export interface CallFlowRecord {
+  tenantId: string
+  number: string
+  name: string
+  kind: CallFlowKind
+  members: string[]
+  ringSec?: number
+  waitSec?: number
+  choices: Record<string, string>
+  greeting?: string
 }
 
 /**
@@ -936,6 +949,12 @@ export interface Store {
    */
   upsertSite(record: SiteRecord): Promise<void>
   deleteSite(tenantId: string, id: string): Promise<boolean>
+  /** The call flows of a tenant, by number (step 11c-2). */
+  listCallFlows(tenantId: string): Promise<CallFlowRecord[]>
+  /** Adds a flow or replaces the one of that number. */
+  upsertCallFlow(record: CallFlowRecord): Promise<void>
+  /** Removes it. Whether it was there. */
+  deleteCallFlow(tenantId: string, number: string): Promise<boolean>
 
   /** The outbound rules of a tenant; null when none was ever set. */
   getOutbound(tenantId: string): Promise<OutboundRecord | null>

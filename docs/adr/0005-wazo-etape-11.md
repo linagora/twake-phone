@@ -10,7 +10,7 @@ Cinq exigences du CCTP CANUT §7.4.6.2 demandent un serveur média : messagerie 
 
 Wazo Platform est l'étape 11 du plan, obligatoire pour la recette, et non « si besoin ». Il se place derrière OpenSIPS, qui passe de `registrar` à `mid_registrar` ; `provider-wazo` (wazo-calld, wazo-confd, wazo-websocketd) remplace alors les règles `dialplan` d'OpenSIPS pour les renvois et les groupes.
 
-Précisé par l'ADR 0022 (2026-10-18) : pas de `mid_registrar` pour la messagerie (11a), il vient avec 11c, quand Wazo devra faire sonner les navigateurs (files, groupes séquentiels) ; les renvois et les groupes simultanés restent à OpenSIPS, qui seul décide du chemin d'un appel (deux serveurs décideraient sinon du même appel).
+Précisé par l'ADR 0022 (2026-10-18) : pas de `mid_registrar` pour la messagerie (11a), il vient avec 11c, quand Wazo devra faire sonner les navigateurs (files, groupes séquentiels : l'ADR 0027 pose les lignes, l'ADR 0028 les parcours) ; les renvois et les groupes simultanés restent à OpenSIPS, qui seul décide du chemin d'un appel (deux serveurs décideraient sinon du même appel).
 
 ## Conséquences
 

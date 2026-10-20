@@ -3,8 +3,8 @@ import pg from 'pg'
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import { VOICEMAIL_BOXES_SCHEMA, VOICEMAIL_FENCE_RESET, VoicemailBoxes } from '@twake/provider-opensips'
 import { WazoVoicemail, holderKey, mailboxNumber, type WebSocketLike } from '@twake/provider-wazo'
-import type { ProviderFactory, RoutedEvent, TelephonyProvider, VoicemailBox, VoicemailBoxesWrite, VoicemailOwner, VoicemailProvider, VoicemailSubscribeOptions, VoicemailSync, VoicemailSyncOptions } from '@twake/telephony-provider-sdk'
-import type { TelephonyEvent, Voicemail } from '@twake/telephony-types'
+import type { CallFlowRoute, ProviderFactory, RoutedEvent, TelephonyProvider, VoicemailBox, VoicemailBoxesWrite, VoicemailOwner, VoicemailProvider, VoicemailSubscribeOptions, VoicemailSync, VoicemailSyncOptions } from '@twake/telephony-provider-sdk'
+import type { RingGroup, TelephonyEvent, Voicemail } from '@twake/telephony-types'
 import { buildApp } from './app.js'
 import { TicketStore } from './auth.js'
 import { RateLimiter, type ContactDirectory } from './contacts.js'
@@ -267,6 +267,11 @@ const sipServer = (withMailboxes = true, access?: boolean | 'error', db?: Voicem
   let lines: string[] = []
   const linesTold: string[][] = []
   const linesHook: { onTold?: (extensions: string[]) => void } = {}
+  /** The call flows the SIP server was told Wazo runs (call_flows), each telling, and the ring groups it has (call_groups). */
+  let flowRoutes: CallFlowRoute[] = []
+  const flowsTold: CallFlowRoute[][] = []
+  const flowsHook: { onTold?: (routes: CallFlowRoute[]) => void } = {}
+  const groups: RingGroup[] = []
   const provider = {
     ...(access !== undefined
       ? {
@@ -326,7 +331,16 @@ const sipServer = (withMailboxes = true, access?: boolean | 'error', db?: Voicem
             linesTold.push(lines)
             linesHook.onTold?.(lines)
           },
-          listWazoLines: async () => lines
+          listWazoLines: async () => lines,
+          setCallFlowRoutes: async (routes: CallFlowRoute[]) => {
+            flowRoutes = [...routes].sort((a, b) => (a.number < b.number ? -1 : 1))
+            flowsTold.push(flowRoutes)
+            flowsHook.onTold?.(flowRoutes)
+          },
+          listCallFlowRoutes: async () => flowRoutes,
+          listGroups: async () => groups,
+          setGroup: async (g: RingGroup) => void groups.push(g),
+          deleteGroup: async () => false
         }
       : {}),
     subscribe: async function* () {},
@@ -335,7 +349,7 @@ const sipServer = (withMailboxes = true, access?: boolean | 'error', db?: Voicem
   const factory: ProviderFactory<unknown> = { type: 'sip', create: () => provider as unknown as TelephonyProvider }
   /** A withdrawal by another Gateway (the same SIP server). */
   const withdraw = (extensions: string[]) => (provider as unknown as { withdrawVoicemailBoxes(e: string[]): Promise<void> }).withdrawVoicemailBoxes(extensions)
-  return { factory, given, withdrawn, asked, order, hooks, writes, errors, withdraw, lines: () => lines, linesTold, linesHook }
+  return { factory, given, withdrawn, asked, order, hooks, writes, errors, withdraw, lines: () => lines, linesTold, linesHook, flows: () => flowRoutes, flowsTold, flowsHook, groups }
 }
 
 const setup = async (opts: { withMailboxes?: boolean; access?: boolean | 'error'; voicemail?: boolean | 'other-tenant'; directorySync?: DirectorySync; store?: MemoryStore; slow?: boolean; retentionDays?: number; purgeMs?: number; syncMs?: number; hub?: boolean; accessCacheMs?: number; changeMs?: number; alertMs?: number; mapped?: boolean; db?: VoicemailBoxes; erasureLimiter?: RateLimiter; voicemailProvider?: VoicemailProvider; retryMs?: number[] } = {}) => {
@@ -396,7 +410,7 @@ const person = (id: string, extension: string): Person => ({ id, displayName: `P
  * The Gateway's own path against provider-wazo and a Wazo in memory: the directory lists `people` (`list` changes it,
  * then synchronises it), each of them given a mailbox. `db`: `voicemail_boxes` on PostgreSQL.
  */
-const throughTheGateway = async (people: Person[], db?: VoicemailBoxes, absenceMs?: number, lineKey?: string) => {
+const throughTheGateway = async (people: Person[], db?: VoicemailBoxes, absenceMs?: number, lineKey?: string, alertMs?: number) => {
   const secret = Buffer.alloc(32, 9)
   const wazo = fakeWazo(userId => mailboxNumber(holderKey(secret, userId)))
   // wazo-websocketd as it spoke on the Docker stack: init, then start; `created` sends the news of a message.
@@ -422,7 +436,7 @@ const throughTheGateway = async (people: Person[], db?: VoicemailBoxes, absenceM
   const directory = { listAll: async () => listed } as unknown as ContactDirectory
   const directorySync = new DirectorySync({ store, directory, tenantId: 'A', ...(absenceMs !== undefined ? { absenceMs } : {}) })
   await directorySync.run()
-  const { app, sip, as, heard } = await setup({ store, directorySync, mapped: false, voicemailProvider: vm, changeMs: 30, ...(db ? { db } : {}) })
+  const { app, sip, as, heard } = await setup({ store, directorySync, mapped: false, voicemailProvider: vm, changeMs: 30, ...(alertMs !== undefined ? { alertMs } : {}), ...(db ? { db } : {}) })
   /** A message left in the mailbox at the number of `userId`, as wazo-websocketd tells it. */
   const created = (userId: string, id: string) => {
     const message = { caller_id_name: 'Alice Martin', caller_id_num: '101', timestamp: 1792289524, folder: { type: 'new', name: 'inbox', id: 1 }, duration: 7, id }
@@ -443,6 +457,7 @@ const throughTheGateway = async (people: Person[], db?: VoicemailBoxes, absenceM
   const nameOf = (userId: string) => wazo.nameOf(userId)
   return { wazo, store, app, sip, as, heard, created, reached, list, messagesOf, allMessages, nameOf }
 }
+
 
 /**
  * The guard of a mass set aside, through the Gateway's own path: six people of the directory have their mailbox; the
@@ -1981,5 +1996,152 @@ describe('the lines of Wazo (step 11c-1, ADR 0027)', () => {
     expect(() => wazoFromEnv({ ...urls, WAZO_LINES: '1' }, secret)).toThrow(/WAZO_LINE_KEY/)
     expect(() => wazoFromEnv({ ...urls, WAZO_LINES: '1', WAZO_LINE_KEY: 'short' }, secret)).toThrow(/WAZO_LINE_KEY/)
     expect(() => wazoFromEnv({ ...urls, WAZO_LINES: 'yes', WAZO_LINE_KEY: lineKey }, secret)).toThrow(/WAZO_LINES must be/)
+    expect(() => wazoFromEnv({ ...urls, WAZO_MEMBERS_CONTEXT: 'a b;c' }, secret)).toThrow(/WAZO_MEMBERS_CONTEXT/)
+    expect(() => wazoFromEnv({ ...urls, WAZO_MEMBERS_CONTEXT: 'users' }, secret)).not.toThrow()
+  })
+})
+
+describe('the call flows (step 11c-2, ADR 0028)', () => {
+  const lineKey = 'twake-wazo-line-test-key-0123456789abcdef'
+  const root = { 'x-dev-user': 'root', 'x-dev-tenant': 'A' }
+  const flowOf = (over: Record<string, unknown>) => ({ number: '810', name: 'Astreinte', kind: 'sequential', members: ['201', '202'], ringSec: 8, ...over })
+  const post = (g: Awaited<ReturnType<typeof throughTheGateway>>, body: Record<string, unknown>, headers: Record<string, string> = root) => g.app.inject({ method: 'POST', url: '/api/v1/admin/flows', headers, payload: body })
+  const labels = (g: Awaited<ReturnType<typeof throughTheGateway>>) => g.wazo.state.groups.map(x => x.label).sort()
+
+  it('has Wazo run a sequential group, a queue and a menu an administrator sets, and tells the SIP server once each is there (never before)', async () => {
+    const g = await throughTheGateway([person('p1', '201'), person('p2', '202'), person('p3', '203')], undefined, undefined, lineKey)
+    // What the SIP server is told is never ahead of Wazo: each group a route names is there when it is told.
+    const aheadOfWazo: string[] = []
+    g.sip.flowsHook.onTold = routes => {
+      const have = new Set(g.wazo.state.groups.map(x => x.name))
+      for (const r of routes) for (const name of r.route.match(/grp-[a-z0-9-]+/g) ?? []) if (!have.has(name)) aheadOfWazo.push(`${r.number} ${name}`)
+    }
+    expect((await post(g, flowOf({}))).statusCode).toBe(201)
+    expect((await post(g, flowOf({ number: '801', name: 'Support', kind: 'queue', members: ['203', '201'], ringSec: 12, waitSec: 90 }))).statusCode).toBe(201)
+    expect((await post(g, { number: '800', name: 'Standard', kind: 'menu', choices: { '1': '801', '2': '810', '3': '203' }, greeting: 'custom/accueil' })).statusCode).toBe(201)
+    await until('the three flows told to the SIP server', () => g.sip.flows().length === 3, 5_000)
+    expect(labels(g)).toEqual(['TwakePhone 801', 'TwakePhone 810'])
+    const named = (number: string) => g.wazo.state.groups.find(x => x.label === `TwakePhone ${number}`)!.name
+    expect(g.sip.flows()).toEqual([
+      { number: '800', route: `menu|1=q:${named('801')}:90~2=s:${named('810')}:18~3=e:203|custom/accueil` },
+      { number: '801', route: `queue|${named('801')}|90` },
+      { number: '810', route: `seq|${named('810')}|18` }
+    ])
+    expect(aheadOfWazo).toEqual([])
+    const listed = (await g.app.inject({ method: 'GET', url: '/api/v1/admin/flows', headers: root })).json().items
+    expect(listed.map((f: { number: string; kind: string; ready: boolean }) => [f.number, f.kind, f.ready])).toEqual([['800', 'menu', true], ['801', 'queue', true], ['810', 'sequential', true]])
+    expect(listed.find((f: { number: string }) => f.number === '801')).toMatchObject({ members: ['203', '201'], vacant: [], ringSec: 12, waitSec: 90 })
+    // Only an administrator reads or sets them; each person sees the capability only where it is run.
+    expect((await g.app.inject({ method: 'GET', url: '/api/v1/admin/flows', headers: g.as('p1') })).statusCode).toBe(403)
+    expect((await g.app.inject({ method: 'GET', url: '/api/v1/capabilities', headers: g.as('p1') })).json().callFlows).toBe(true)
+  })
+
+  it('changes a flow in place and removes one: the SIP server stops sending calls there first, then Wazo drops the group', async () => {
+    const g = await throughTheGateway([person('p1', '201'), person('p2', '202')], undefined, undefined, lineKey)
+    await post(g, flowOf({}))
+    await until('told', () => g.sip.flows().length === 1, 5_000)
+    const changed = await g.app.inject({ method: 'PUT', url: '/api/v1/admin/flows/810', headers: root, payload: flowOf({ members: ['202', '201'], ringSec: 20 }) })
+    expect(changed.statusCode).toBe(200)
+    await until('the group changed', () => g.wazo.state.groups[0]?.user_timeout === 20, 5_000)
+    expect(g.wazo.state.groups[0]!.members.extensions.map(e => e.exten)).toEqual(['202', '201'])
+    expect(g.wazo.state.groupStrategyEdits).toEqual([])
+    const seen: [string[], string[]][] = []
+    g.sip.flowsHook.onTold = told => void seen.push([told.map(r => r.number), labels(g)])
+    expect((await g.app.inject({ method: 'DELETE', url: '/api/v1/admin/flows/810', headers: root })).statusCode).toBe(204)
+    await until('the group gone', () => g.wazo.state.groups.length === 0 && g.sip.flows().length === 0, 5_000)
+    // First told without 810 while Wazo still had its group, then (nothing left) told again.
+    expect(seen[0]).toEqual([[], ['TwakePhone 810']])
+    expect((await g.app.inject({ method: 'DELETE', url: '/api/v1/admin/flows/810', headers: root })).statusCode).toBe(404)
+    expect((await g.app.inject({ method: 'PUT', url: '/api/v1/admin/flows/810', headers: root, payload: flowOf({}) })).statusCode).toBe(404)
+  })
+
+  it('refuses a number that is an extension, a ring group\'s or another flow\'s, a menu that leads to what is no flow of the organisation, and a flow that a menu leads to going', async () => {
+    const g = await throughTheGateway([person('p1', '201'), person('p2', '202')], undefined, undefined, lineKey)
+    g.sip.groups.push({ number: '200', name: 'Accueil', members: ['201'] })
+    for (const [body, status, code] of [
+      [flowOf({ number: '201' }), 409, 'FLOW_NUMBER_TAKEN'],
+      [flowOf({ number: '200' }), 409, 'FLOW_NUMBER_TAKEN'],
+      [flowOf({ number: '112' }), 400, 'FLOW_NUMBER_RESERVED'],
+      [flowOf({ number: '0810' }), 400, 'FLOW_NUMBER'],
+      [flowOf({ name: '' }), 400, 'FLOW_NAME'],
+      [flowOf({ kind: 'carousel' }), 400, 'FLOW_KIND'],
+      [flowOf({ members: ['999'] }), 400, 'FLOW_MEMBER_NOT_EXTENSION'],
+      [flowOf({ members: [] }), 400, 'FLOW_MEMBERS'],
+      [flowOf({ ringSec: 2 }), 400, 'FLOW_RING'],
+      [flowOf({ waitSec: 60 }), 400, 'FLOW_WAIT'],
+      [flowOf({ kind: 'queue', waitSec: 5 }), 400, 'FLOW_WAIT'],
+      [{ number: '800', name: 'M', kind: 'menu', choices: {} }, 400, 'FLOW_CHOICES'],
+      [{ number: '800', name: 'M', kind: 'menu', choices: { a: '201' } }, 400, 'FLOW_CHOICES'],
+      [{ number: '800', name: 'M', kind: 'menu', choices: { '1': '200' } }, 400, 'FLOW_CHOICE_TARGET'],
+      [{ number: '800', name: 'M', kind: 'menu', choices: { '1': '800' } }, 400, 'FLOW_CHOICE_TARGET'],
+      [{ number: '800', name: 'M', kind: 'menu', choices: { '1': '201' }, greeting: 'a;b' }, 400, 'FLOW_GREETING']
+    ] as const) {
+      const res = await post(g, body)
+      expect([res.statusCode, res.json().code], JSON.stringify(body)).toEqual([status, code])
+    }
+    expect((await post(g, flowOf({}))).statusCode).toBe(201)
+    expect((await post(g, flowOf({ name: 'Autre' }))).json().code).toBe('FLOW_EXISTS')
+    expect((await post(g, { number: '800', name: 'M', kind: 'menu', choices: { '1': '810' } })).statusCode).toBe(201)
+    // A menu in a menu, a flow turned into a menu while one leads to it, and the removal of what a menu leads to.
+    expect((await post(g, { number: '801', name: 'M2', kind: 'menu', choices: { '1': '800' } })).json().code).toBe('FLOW_CHOICE_TARGET')
+    expect((await g.app.inject({ method: 'PUT', url: '/api/v1/admin/flows/810', headers: root, payload: { name: 'M', kind: 'menu', choices: { '1': '201' } } })).json().code).toBe('FLOW_IN_USE')
+    expect((await g.app.inject({ method: 'DELETE', url: '/api/v1/admin/flows/810', headers: root })).json().code).toBe('FLOW_IN_USE')
+    // A group cannot take a flow's number either.
+    const group = await g.app.inject({ method: 'POST', url: '/api/v1/admin/groups', headers: root, payload: { number: '810', name: 'G', members: ['201'] } })
+    expect([group.statusCode, group.json().code]).toEqual([409, 'GROUP_NUMBER_TAKEN'])
+  })
+
+  it('never fails the round of the mailboxes and lines because the flows could not be read: the new holder has their mailbox and line all the same, and the flows are tried again', async () => {
+    const g = await throughTheGateway([person('p1', '201')], undefined, undefined, lineKey)
+    expect((await post(g, flowOf({ members: ['201'] }))).statusCode).toBe(201)
+    await until('the flow told', () => g.sip.flows().length === 1, 5_000)
+    g.wazo.state.failGroups = 2
+    await g.list([person('p1', '201'), person('p2', '202')])
+    await until('the mailbox and the line of the new holder, the flows unreadable meanwhile', () => g.reached().includes('202') && g.sip.lines().includes('202'), 5_000)
+    // No alert of a synchronisation that fails: the mailboxes were synchronised; the flows are tried again and found as they were.
+    expect((await g.store.listAlerts('A', {})).filter(a => a.alert.param === 'sync-failing')).toEqual([])
+    await until('the flows read again', () => g.wazo.state.failGroups === 0, 5_000)
+    expect(g.sip.flows().map(r => r.number)).toEqual(['810'])
+  })
+
+  it('tells the administrators when the flows keep failing (flows-failing), and keeps trying while the SIP server still holds routes of a flow deleted meanwhile', async () => {
+    const g = await throughTheGateway([person('p1', '201')], undefined, undefined, lineKey, 60)
+    expect((await post(g, flowOf({ members: ['201'] }))).statusCode).toBe(201)
+    await until('the flow told', () => g.sip.flows().length === 1, 5_000)
+    g.wazo.state.failGroups = 1_000
+    // The last flow deleted while Wazo answers 5xx: none stored, the SIP server still has its route.
+    expect((await g.app.inject({ method: 'DELETE', url: '/api/v1/admin/flows/810', headers: root })).statusCode).toBeLessThan(300)
+    let alerted = false
+    await until('the alert', () => (void g.store.listAlerts('A', {}).then(a => (alerted = a.some(x => x.alert.kind === 'voicemail' && x.alert.param === 'flows-failing'))), alerted), 8_000)
+    g.wazo.state.failGroups = 0
+    await until('the route withdrawn once Wazo answers again', () => g.sip.flows().length === 0, 8_000)
+  })
+
+  it('is not there without lines: 501, no capability, nothing at Wazo', async () => {
+    const g = await throughTheGateway([person('p1', '201')])
+    expect((await g.app.inject({ method: 'GET', url: '/api/v1/admin/flows', headers: root })).statusCode).toBe(501)
+    expect((await post(g, flowOf({}))).statusCode).toBe(501)
+    expect((await g.app.inject({ method: 'GET', url: '/api/v1/capabilities', headers: g.as('p1') })).json().callFlows).toBeUndefined()
+    expect(g.wazo.state.groups).toEqual([])
+  })
+
+  it('keeps the members nobody holds any more, as positions (vacant), and drops them only when an administrator does', async () => {
+    const g = await throughTheGateway([person('p1', '201'), person('p2', '202')], undefined, undefined, lineKey)
+    await post(g, flowOf({}))
+    await g.list([person('p1', '201')])
+    const read = async () => (await g.app.inject({ method: 'GET', url: '/api/v1/admin/flows', headers: root })).json().items[0]
+    await until('202 vacant', async () => (await read()).vacant?.join() === '202', 5_000)
+    expect((await g.app.inject({ method: 'PUT', url: '/api/v1/admin/flows/810', headers: root, payload: flowOf({ members: ['202', '201'] }) })).statusCode).toBe(200)
+    expect((await g.app.inject({ method: 'PUT', url: '/api/v1/admin/flows/810', headers: root, payload: flowOf({ members: ['203'] }) })).json().code).toBe('FLOW_MEMBER_NOT_EXTENSION')
+  })
+
+  it('keeps a key of a menu that leads to an extension nobody holds now, so that renaming the menu is not refused, and refuses a new one', async () => {
+    const g = await throughTheGateway([person('p1', '201'), person('p2', '202')], undefined, undefined, lineKey)
+    expect((await post(g, { number: '800', name: 'Standard', kind: 'menu', choices: { '1': '202' } })).statusCode).toBe(201)
+    await g.list([person('p1', '201')])
+    await until('202 held by nobody', async () => !(await g.store.listMappings('A')).some(m => m.extension === '202'), 5_000)
+    const put = (choices: Record<string, string>) => g.app.inject({ method: 'PUT', url: '/api/v1/admin/flows/800', headers: root, payload: { name: 'Accueil', kind: 'menu', choices } })
+    expect((await put({ '1': '202' })).statusCode).toBe(200)
+    expect((await put({ '1': '202', '2': '203' })).json().code).toBe('FLOW_CHOICE_TARGET')
   })
 })

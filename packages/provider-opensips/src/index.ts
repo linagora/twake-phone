@@ -1,4 +1,4 @@
-import type { CallParties, CallWithOperator, MediaProvider, ProviderFactory, RoomCallGrant, RoomCallGrantToken, RoutedEvent, TelephonyProvider, VoicemailBox, VoicemailBoxesWrite } from '@twake/telephony-provider-sdk'
+import type { CallFlowRoute, CallParties, CallWithOperator, MediaProvider, ProviderFactory, RoomCallGrant, RoomCallGrantToken, RoutedEvent, TelephonyProvider, VoicemailBox, VoicemailBoxesWrite } from '@twake/telephony-provider-sdk'
 import type { Call, Capabilities, DidRange, Endpoint, EmergencySite, ForwardingRules, MediaSession, OriginateRequest, OutboundAssignment, OutboundPolicy, OutboundProfile, Presence, ProviderStatus, RingGroup, Trunk, TrunkStatus, User } from '@twake/telephony-types'
 import type { CallGroups } from './call-groups.js'
 import type { CallRules } from './call-rules.js'
@@ -7,6 +7,7 @@ import type { DialOutGrants } from './dial-out-grants.js'
 import type { OutboundTables } from './outbound.js'
 import type { VoicemailBoxes } from './voicemail-boxes.js'
 import type { WazoLines } from './wazo-lines.js'
+import type { CallFlows } from './call-flows.js'
 import { trunkStatusFrom, type TrunkTables } from './trunks.js'
 import { OpensipsEvents, parseDlgContext, parseDlgList, parseUlDump, type EventsLogger } from './events.js'
 import { classify } from './numbering.js'
@@ -22,6 +23,7 @@ export { PushTargets, PUSH_TARGETS_SCHEMA, type PushTargetsOptions } from './pus
 export { DialOutGrants, DIAL_OUT_GRANTS_SCHEMA, GRANT_HEADER, GRANT_TTL_SEC, JOIN_HEADER, JOIN_TOKEN, REPLACES, type DialOutGrantsOptions } from './dial-out-grants.js'
 export { AsyncQueue } from './queue.js'
 export { WazoLines, WAZO_LINES_SCHEMA, type WazoLinesOptions } from './wazo-lines.js'
+export { CallFlows, CALL_FLOWS_SCHEMA, type CallFlowsOptions } from './call-flows.js'
 export { VoicemailBoxes, VoicemailFenced, VOICEMAIL_BOXES_SCHEMA, VOICEMAIL_FENCE_RESET, MAILBOX, type VoicemailBoxesOptions } from './voicemail-boxes.js'
 export { TrunkTables, TRUNK_SCHEMA, TRUNK_SQL, DEFAULT_TRUNK_SOCKET, SOURCES_SET, DISPATCHER_TABLE_VERSION, DIALPLAN_TABLE_VERSION, REGISTRANT_TABLE_VERSION, codecFlags, projectTrunks, trunkSecret, trunkStatusFrom, type TrunkTablesOptions } from './trunks.js'
 export { OutboundTables, OUTBOUND_SCHEMA, ACC_EXTERNAL_SQL, FRAUD_PROFILE, FRAUD_RULE_INTERNATIONAL, FRAUD_RULE_NATIONAL, FRAUD_TABLE_VERSION, FRAUD_OVERSEAS_PREFIXES, DR_TABLE_VERSIONS, DIALOG_TABLE_VERSION, OUTBOUND_TIME_ZONE, CAP_MAX, PROFILE_ID, fraudRow, projectOutbound, type OutboundTablesOptions } from './outbound.js'
@@ -126,6 +128,8 @@ export interface OpensipsConfig {
   voicemailBoxes?: VoicemailBoxes
   /** The extensions that have a line at Wazo (step 11c-1, ADR 0027; `wazo_lines`). */
   wazoLines?: WazoLines
+  /** The call flows Wazo runs (step 11c-2, ADR 0028; `call_flows`). */
+  callFlows?: CallFlows
   /**
    * The SIP accounts (`subscriber`) OpenSIPS authenticates and routes by: `reconcile` removes those the Gateway
    * wrote for a user who no longer holds the extension, and returns their extensions (SubscriberProvisioner's
@@ -404,6 +408,21 @@ export class OpensipsProvider implements TelephonyProvider, MediaProvider {
   /** The extensions that have a line at Wazo as OpenSIPS has them (`wazo_lines`): none without the table. */
   async listWazoLines() {
     return (await this.config.wazoLines?.list()) ?? []
+  }
+
+  /**
+   * The call flows Wazo runs (step 11c-2, ADR 0028): written in `call_flows`, which OpenSIPS reads with the rules of the number
+   * dialled to send the call to Wazo. Replaces the list; a flow OpenSIPS would not read is left out, and said.
+   */
+  async setCallFlowRoutes(routes: CallFlowRoute[]) {
+    if (!this.config.callFlows) return
+    const { skipped } = await this.config.callFlows.set(routes)
+    if (skipped.length) (this.config.logger ?? console).warn(`OpenSIPS: ${skipped.length} call flow(s) left out, not a number or a route it reads: ${skipped.join(', ')}`)
+  }
+
+  /** The call flows OpenSIPS sends calls to now (`call_flows`): none without the table. */
+  async listCallFlowRoutes() {
+    return (await this.config.callFlows?.list()) ?? []
   }
 
   /** The mailboxes OpenSIPS sends calls to now (`voicemail_boxes`), by extension: none without the table. */

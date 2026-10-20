@@ -7,7 +7,7 @@ import type { Key } from '../../i18n/index.js'
 import { useT } from '../../i18n/useT.js'
 
 const KINDS: NonNullable<AlertFilter['kind']>[] = ['fraud-warning', 'fraud-critical', 'limit', 'rights', 'emergency', 'meet', 'webhook', 'operator', 'voicemail']
-const PARAMS = [...FRAUD_PARAMS, ...OUTBOUND_CAPS, ...TRUNK_OUTBOUND_CLASSES, 'premium', 'burst', 'pin-tries', 'meet-calls', 'call-diverted', 'trunk-changed', 'disabled', 'unauthorized', 'forbidden', 'reconciliation', 'removal-changed', 'removal-gone', 'removal-late', 'sync-failing', 'sync-fenced', 'boxes-refused', 'hidden-calls', 'hidden-hour', 'hidden-all', 'calls-all', 'held-back', 'held-back-remove']
+const PARAMS = [...FRAUD_PARAMS, ...OUTBOUND_CAPS, ...TRUNK_OUTBOUND_CLASSES, 'premium', 'burst', 'pin-tries', 'meet-calls', 'call-diverted', 'trunk-changed', 'disabled', 'unauthorized', 'forbidden', 'reconciliation', 'removal-changed', 'removal-gone', 'removal-late', 'sync-failing', 'flows-failing', 'sync-fenced', 'boxes-refused', 'hidden-calls', 'hidden-hour', 'hidden-all', 'calls-all', 'held-back', 'held-back-remove']
 const PAGE = 25
 /** How long after an answer the first page is read again while shown: a repeat counted meanwhile is seen (review 7 n°2). */
 export const ALERTS_REFRESH_MS = 30_000
@@ -47,6 +47,7 @@ const paramKey = (alert: Pick<AdminAlert, 'kind' | 'param'>): Key | undefined =>
   // the voicemail server keeps refusing; a cap of the calls to the mailboxes reached: by the callers with no number at
   // a mailbox or at all of them, or by all callers.
   if (alert.param === 'sync-failing') return 'admin.alert.voicemailSyncFailing'
+  if (alert.param === 'flows-failing') return 'admin.alert.voicemailFlowsFailing'
   if (alert.param === 'sync-fenced') return 'admin.alert.voicemailSyncFenced'
   if (alert.param === 'boxes-refused') return 'admin.alert.voicemailBoxesRefused'
   if (alert.param === 'hidden-calls') return 'admin.alert.voicemailHiddenCalls'

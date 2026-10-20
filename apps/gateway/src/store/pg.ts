@@ -3,7 +3,7 @@ import { readdir, readFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import pg from 'pg'
 import { EMPTY_OUTBOUND, outboundVersion, staleOutbound } from '../outbound.js'
-import { ALERT_DEDUP_MS, RecordingUnderWay, alertKey, clampLimit, type RecordingRecord, type AlertQuery, type AlertRecord, type StoredAlert, type ConferenceDecision, type VisioPerson, type VisioRecord, type VisioStatus, type ConferenceRecord, type DidRecord, type SiteRecord, type OutboundHand, type OutboundRecord, type OutboundRules, type HistoryEntry, type HistoryNearQuery, type HistoryPage, type HistoryQuery, type OperatorCdrOutcome, type OperatorCdrRecord, type OperatorCdrStats, type MappingSource, type ErasedCallsKept, type ProviderRecord, type PushSaveResult, type PushSubscriptionRecord, type Store, type TrunkRecord, type MappingChange, type UserMapping, type UserPresenceRecord, type VapidKeysRecord, type ClaimedDelivery, type WebhookAttemptResult, type WebhookClaimCaps, type WebhookClaimTime, allocateClaims, claimOrder, type WebhookDeliveryQuery, type WebhookLease, type WebhookSendQuota, type WebhookDeliveryRecord, type WebhookHealth, type WebhookQueueOptions, type WebhookStateChange, type WebhookStateEvent, type WebhookSubscriptionRecord, WEBHOOK_STATE_ROLE , type FencedLease, type NewTranscript, type TranscriptChange, type TranscriptLane, holderIn, holderOut, type TranscriptMatch, type TranscriptNotice, type TranscriptRecord } from './types.js'
+import { ALERT_DEDUP_MS, RecordingUnderWay, alertKey, clampLimit, type RecordingRecord, type AlertQuery, type AlertRecord, type StoredAlert, type ConferenceDecision, type VisioPerson, type VisioRecord, type VisioStatus, type ConferenceRecord, type DidRecord, type SiteRecord, type OutboundHand, type OutboundRecord, type OutboundRules, type HistoryEntry, type HistoryNearQuery, type HistoryPage, type HistoryQuery, type OperatorCdrOutcome, type OperatorCdrRecord, type OperatorCdrStats, type MappingSource, type ErasedCallsKept, type ProviderRecord, type PushSaveResult, type PushSubscriptionRecord, type Store, type TrunkRecord, type MappingChange, type UserMapping, type UserPresenceRecord, type VapidKeysRecord, type ClaimedDelivery, type WebhookAttemptResult, type WebhookClaimCaps, type WebhookClaimTime, allocateClaims, claimOrder, type WebhookDeliveryQuery, type WebhookLease, type WebhookSendQuota, type WebhookDeliveryRecord, type WebhookHealth, type WebhookQueueOptions, type WebhookStateChange, type WebhookStateEvent, type WebhookSubscriptionRecord, WEBHOOK_STATE_ROLE , type FencedLease, type NewTranscript, type TranscriptChange, type TranscriptLane, holderIn, holderOut, type TranscriptMatch, type TranscriptNotice, type TranscriptRecord, type CallFlowRecord } from './types.js'
 import type { OperatorCdr, Recording, SupervisionLogEntry, WebhookEventType } from '@twake/telephony-types'
 
 const MIGRATIONS = fileURLToPath(new URL('../../migrations/', import.meta.url))
@@ -1152,6 +1152,37 @@ export class PgStore implements Store {
 
   async deleteSite(tenantId: string, id: string) {
     const r = await this.pool.query('DELETE FROM sites WHERE tenant_id = $1 AND id = $2', [tenantId, id])
+    return (r.rowCount ?? 0) > 0
+  }
+
+  async listCallFlows(tenantId: string): Promise<CallFlowRecord[]> {
+    const { rows } = await this.pool.query<{ number: string; name: string; kind: CallFlowRecord['kind']; members: string[]; ring_sec: number | null; wait_sec: number | null; choices: Record<string, string>; greeting: string | null }>(
+      'SELECT number, name, kind, members, ring_sec, wait_sec, choices, greeting FROM call_flow_configs WHERE tenant_id = $1 ORDER BY number COLLATE "C"',
+      [tenantId]
+    )
+    return rows.map(r => ({
+      tenantId,
+      number: r.number,
+      name: r.name,
+      kind: r.kind,
+      members: r.members,
+      ...(r.ring_sec !== null ? { ringSec: r.ring_sec } : {}),
+      ...(r.wait_sec !== null ? { waitSec: r.wait_sec } : {}),
+      choices: r.choices,
+      ...(r.greeting !== null ? { greeting: r.greeting } : {})
+    }))
+  }
+
+  async upsertCallFlow(f: CallFlowRecord) {
+    await this.pool.query(
+      `INSERT INTO call_flow_configs (tenant_id, number, kind, name, members, ring_sec, wait_sec, choices, greeting) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+       ON CONFLICT (tenant_id, number) DO UPDATE SET kind = EXCLUDED.kind, name = EXCLUDED.name, members = EXCLUDED.members, ring_sec = EXCLUDED.ring_sec, wait_sec = EXCLUDED.wait_sec, choices = EXCLUDED.choices, greeting = EXCLUDED.greeting`,
+      [f.tenantId, f.number, f.kind, f.name, f.members, f.ringSec ?? null, f.waitSec ?? null, JSON.stringify(f.choices), f.greeting ?? null]
+    )
+  }
+
+  async deleteCallFlow(tenantId: string, number: string) {
+    const r = await this.pool.query('DELETE FROM call_flow_configs WHERE tenant_id = $1 AND number = $2', [tenantId, number])
     return (r.rowCount ?? 0) > 0
   }
 
