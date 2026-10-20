@@ -337,6 +337,16 @@ try {
     expectEqual(typed.replace(/\s/g, ''), '+33612345601', 'number sent to the dialer')
     expectEqual(new URL(page.url()).search, '', 'address bar cleaned')
   })
+  await step('a link from Twake Chat (/?dial=) fills the dialer with the normalised number and dials nothing', async () => {
+    await page.goto(`${appOrigin}/?dial=${encodeURIComponent('06 12 34 56 02')}`)
+    await page.getByRole('heading', { level: 1, name: 'Téléphone' }).waitFor()
+    await page.waitForFunction(() => document.querySelector('#number')?.value === '+33612345602')
+    expectEqual(new URL(page.url()).search, '', 'address bar cleaned')
+    // Text that is not a number is refused out loud and never reaches the field
+    await page.goto(`${appOrigin}/?dial=${encodeURIComponent('FR123456789')}`)
+    await page.getByRole('alert').getByText('ne contient pas un numéro valide').waitFor()
+    expectEqual(await page.getByLabel('Numéro à appeler').inputValue(), '', 'field after a refused ?dial=')
+  })
   await step('switching the language to English changes the UI, the title and the document language', async () => {
     await page.getByRole('link', { name: 'Réglages' }).click()
     // The audio devices live here too; without a phone on this platform the ringtone cannot be tested.

@@ -310,6 +310,7 @@
   "settings.notificationsError": "Notifications could not be set.",
   "auth.openingCall": "Signing in to take the call…",
   "dialer.zeroPlus": "0 (hold for +)",
+  "dialer.invalidDial": "This link does not hold a valid number: nothing was dialled.",
   "call.endedRefusedEmergency": "The call to {who} could not go through Twake Phone: call {who} from another phone (mobile or landline).",
   "call.endedRefusedPremium": "Premium-rate numbers are not allowed: {who} was not called.",
   "call.endedRefusedInternational": "Calls abroad are not allowed: {who} was not called.",
