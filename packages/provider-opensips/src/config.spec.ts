@@ -330,8 +330,8 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     // OpenSIPS itself): the calls of a caller, of those with no number at a mailbox and at all of them, and of all at
     // the same time, and those of a caller to one mailbox in an hour, all read and counted under one lock; counted in
     // the hour only once the call has its place, counted out when the mailbox does not take it.
-    expect(cfg).toContain('modparam("dialog", "profiles_with_value", "trunk_caller;meet_caller;vm_caller")')
-    expect(cfg).toContain('modparam("dialog", "profiles_no_value", "trunk_out;trunk_emergency;meet_all;vm_all;vm_hidden")')
+    expect(cfg).toContain('modparam("dialog", "profiles_with_value", "trunk_caller;meet_caller;vm_caller;flow_caller")')
+    expect(cfg).toContain('modparam("dialog", "profiles_no_value", "trunk_out;trunk_emergency;meet_all;vm_all;vm_hidden;flow_all")')
     const room = vm.slice(vm.indexOf('get_static_lock("vm_count");'), vm.indexOf('release_static_lock("vm_count");'))
     const order = ['get_profile_size("vm_caller"', 'get_profile_size("vm_all"', 'get_profile_size("vm_hidden"', 'cache_add("local", "vm:h:', 'set_dlg_profile("vm_caller"', 'set_dlg_profile("vm_all")', 'set_dlg_profile("vm_hidden")']
     for (const [i, step] of order.entries()) {
@@ -623,7 +623,7 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(cfg).toContain('modparam("cfgutils", "shvset", "meet_max_sec=i:1800")')
     expect(call).toContain('if ($dlg_val(trunk) == NULL)\n\t\tcreate_dialog("B");\n\tif ($DLG_timeout > $shv(meet_max_sec))\n\t\t$DLG_timeout = $shv(meet_max_sec);')
     expect(cfg).toContain('if ($dlg_val(meet) == "caller" && $DLG_timeout > $shv(meet_max_sec))\n\t\t$DLG_timeout = $shv(meet_max_sec);')
-    expect(cfg).toContain('modparam("dialog", "profiles_with_value", "trunk_caller;meet_caller;vm_caller")')
+    expect(cfg).toContain('modparam("dialog", "profiles_with_value", "trunk_caller;meet_caller;vm_caller;flow_caller")')
     // The defaults.
     const defaults = render({ MEET_SIP: '192.0.2.20:5080', MEET_SIP_PASSWORD: 'not-a-real-secret-0' }).cfg
     expect(defaults).toContain('$var(pin_cap) = 10;\n\t$var(m_cap) = 2;')
@@ -1888,7 +1888,7 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(section('route[default_trunk]', 'timer_route[default_trunk, 15]')).toContain('$(var(dn){s.select,1,|}{s.int}) >= $shv(dn_gen)')
     expect(cfg).toContain('modparam("cfgutils", "shvset", "dn_gen=i:0")')
     // n°10: the emergency calls known as such in the database (their profile), a day at most, 2 h once restored.
-    expect(cfg).toContain('modparam("dialog", "profiles_no_value", "trunk_out;trunk_emergency;meet_all;vm_all;vm_hidden")')
+    expect(cfg).toContain('modparam("dialog", "profiles_no_value", "trunk_out;trunk_emergency;meet_all;vm_all;vm_hidden;flow_all")')
     const entry = readFileSync(join(dir, 'entrypoint.sh'), 'utf8')
     expect(entry).toContain(`-c "SELECT twake_outbound_restart(${EMERGENCY_RESTORED_SEC})"`)
     // n°4: before OpenSIPS starts, after the tables are there.

@@ -192,8 +192,8 @@ modparam("dialog", "options_ping_interval", ${CALL_PING_SEC})
 # The calls to the public network in progress (step 6b, route[outbound_count]): per caller's extension, and all of them
 # (one organisation per OpenSIPS). An emergency call is in neither, but in trunk_emergency: how a restart knows it.
 # The calls to the access number of Meet's rooms in progress (step 8, route[meet_call]): per caller, and all of them.
-modparam("dialog", "profiles_with_value", "trunk_caller;meet_caller;vm_caller")
-modparam("dialog", "profiles_no_value", "trunk_out;trunk_emergency;meet_all;vm_all;vm_hidden")
+modparam("dialog", "profiles_with_value", "trunk_caller;meet_caller;vm_caller;flow_caller")
+modparam("dialog", "profiles_no_value", "trunk_out;trunk_emergency;meet_all;vm_all;vm_hidden;flow_all")
 loadmodule "rtpengine.so"
 modparam("rtpengine", "rtpengine_sock", "${RTPENGINE_SOCK}")
 
@@ -248,10 +248,9 @@ modparam("cfgutils", "shvset", "wazo_lines_mute_until=i:0")
 # line for 30 s, as for the tables of the steps before.
 modparam("cfgutils", "shvset", "wazo_lines_nodb_until=i:0")
 # wazo-lines: begin
-# The calls to the call flows in progress (step 11c-2, route[rules_step]): per caller, and all of them; the bounds
+# The calls to the call flows in progress (step 11c-2, route[rules_step]): per caller, and all of them (profiles flow_caller and
+# flow_all, declared with the others above: a second profiles_* line replaces the first); the bounds
 # FLOW_CALLS_PER_CALLER and FLOW_CALLS_ALL, changeable by MI shv_set for the calls to come.
-modparam("dialog", "profiles_with_value", "flow_caller")
-modparam("dialog", "profiles_no_value", "flow_all")
 modparam("cfgutils", "shvset", "flow_per_caller=i:${FLOW_CALLS_PER_CALLER}")
 modparam("cfgutils", "shvset", "flow_calls_all=i:${FLOW_CALLS_ALL}")
 # wazo-lines: end
