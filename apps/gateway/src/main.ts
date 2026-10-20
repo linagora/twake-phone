@@ -159,7 +159,8 @@ const contacts = ldapDirectoryFromEnv(env, message => console.warn(`WARNING: ${m
 const groupNumbers = async (tenantId: string) => {
   if (!registry.serves(tenantId)) return []
   const provider = registry.forTenant(tenantId)
-  return provider.listGroups ? (await provider.listGroups()).map(g => g.number) : []
+  // The numbers of the call flows (step 11c-2) are no one's extension either.
+  return [...(provider.listGroups ? (await provider.listGroups()).map(g => g.number) : []), ...(await store.listCallFlows(tenantId)).map(f => f.number)]
 }
 const directorySync = contacts && env.LDAP_ATTR_EXTENSION ? new DirectorySync({ store, directory: contacts, tenantId: env.LDAP_TENANT ?? tenant, absenceMs: absenceMsOf(env), recordKeepMs: holderRecordKeepMsOf(env), reserved: async t => [...(await groupNumbers(t)), ...(conference && accessNumber ? [accessNumber] : [])] }) : undefined
 // Webhooks (step 10a, ADR 0020), with SECRETS_KEY: deliveries in https only, on port 443 (80 in http; WEBHOOK_PORTS:

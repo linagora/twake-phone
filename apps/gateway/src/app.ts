@@ -1,4 +1,5 @@
 import { createHmac, hkdfSync, randomBytes } from 'node:crypto'
+import { menusLeadingTo, parseCallFlow, publicFlow } from './call-flows.js'
 import { Readable } from 'node:stream'
 import Fastify, { type FastifyReply, type FastifyRequest } from 'fastify'
 import cors from '@fastify/cors'
@@ -1111,6 +1112,26 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
               state.pause = true
             }
           }
+          // The sequential groups, queues and voice menus (step 11c-2, ADR 0028), once the lines their members ring through
+          // are there: Wazo makes them, then the SIP server is told which numbers go there (and stops sending calls to
+          // one before Wazo loses it).
+          if (vm.linesOn && vm.syncFlows && provider.setCallFlowRoutes) {
+            const flows = await vm.syncFlows(
+              (await store.listCallFlows(tenantId)).map(f => ({ number: f.number, name: f.name, kind: f.kind, ...(f.kind !== 'menu' ? { members: f.members, ringSec: f.ringSec ?? 15 } : {}), ...(f.waitSec ? { waitSec: f.waitSec } : {}), ...(f.kind === 'menu' ? { choices: f.choices, ...(f.greeting ? { greeting: f.greeting } : {}) } : {}) })),
+              {
+                mayWrite: () => mayWriteVoicemail(tenantId),
+                beforeRemoval: async gone => {
+                  const told = (await provider.listCallFlowRoutes?.()) ?? []
+                  await provider.setCallFlowRoutes?.(told.filter(r => !gone.includes(r.number)))
+                }
+              }
+            )
+            await provider.setCallFlowRoutes(flows.routes)
+            if (flows.failed > 0) {
+              state.again = true
+              state.pause = true
+            }
+          }
           attempt = 0
           forgetFailing(tenantId, 'sync-failing')
           // Done, but with mailboxes the voicemail server refused (each said in the log, tried again at each round).
@@ -1717,7 +1738,9 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         // A mailbox (step 11a): with a voicemail server for the tenant, and a SIP server that sends calls to it.
         // Its shared variable says so when it can: a SIP server started without Wazo has none.
         const voicemail = !!options.voicemail?.(user.tenantId) && !!provider.setVoicemailBoxes && !!user.extension && (await voicemailOn(user.tenantId, provider))
-        return { ...caps, conference: { dialIn: enabled, dialOut: enabled, ...(enabled && options.conference?.meet ? { visio: true } : {}) }, ...(voicemail ? { voicemail: true, ...(transcripts.transcribes ? { voicemailTranscription: true } : {}) } : {}) }
+        // The call flows (step 11c-2): where Wazo runs them for the tenant, and the SIP server sends calls there.
+        const callFlows = !!options.voicemail?.(user.tenantId)?.flowsOn && !!provider.setCallFlowRoutes && (await voicemailOn(user.tenantId, provider))
+        return { ...caps, conference: { dialIn: enabled, dialOut: enabled, ...(enabled && options.conference?.meet ? { visio: true } : {}) }, ...(voicemail ? { voicemail: true, ...(transcripts.transcribes ? { voicemailTranscription: true } : {}) } : {}), ...(callFlows ? { callFlows: true } : {}) }
       })
 
       // What the others see, and what the person chose (`choice`: kept in the store, with its end and message).
@@ -1970,6 +1993,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
           throw refused('GROUP_NUMBER_RESERVED', `${number} is the access number of the meeting rooms`)
         const group = await exclusive(user.tenantId, async () => {
           const g = await parseGroup(number, req.body, isExtensionOf(user.tenantId))
+          if ((await store.listCallFlows(user.tenantId)).some(f => f.number === number)) throw Object.assign(new Error('this number is taken'), { statusCode: 409, code: 'GROUP_NUMBER_TAKEN' })
           await groups.set(g, 'create')
           return g
         })
@@ -1990,6 +2014,80 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         const user = await administrator(req)
         const groups = groupsOf(registry.forTenant(user.tenantId))
         if (!(await inTurn(user.tenantId, () => groups.remove(req.params.number)))) throw Object.assign(new Error('No such group'), { statusCode: 404 })
+        return reply.code(204).send()
+      })
+
+      // Sequential groups, queues and voice menus (capability `callFlows`, step 11c-2, ADR 0028): administrators only, one
+      // change at a time per tenant. Kept in the store; the Gateway that writes the mailboxes has Wazo run them and tells
+      // OpenSIPS (a round of the synchronisation, started by the mark VOICEMAIL_CHANGED), which is why each is listed with
+      // whether it runs yet (`ready`). A flow's number is never an extension, a ring group's nor the access number of the
+      // meeting rooms; a menu leads to an extension, a sequential group or a queue, which stays while a menu does.
+      const flowsOn = (tenantId: string, provider: TelephonyProvider) => {
+        const vm = options.voicemail?.(tenantId)
+        if (!vm?.flowsOn || !vm.syncFlows || !provider.setCallFlowRoutes) throw Object.assign(new Error('Call flows are not available on this platform'), { statusCode: 501 })
+      }
+      const flowChanged = async (tenantId: string, provider: TelephonyProvider) => {
+        await store.putOperatorState(tenantId, VOICEMAIL_CHANGED, { at: new Date().toISOString(), flows: true })
+        void syncVoicemail(tenantId, provider)
+      }
+      const flowChecks = async (tenantId: string, provider: TelephonyProvider, records: Awaited<ReturnType<typeof store.listCallFlows>>) => ({
+        isExtension: isExtensionOf(tenantId),
+        taken: async (number: string) => (options.conference?.accessNumber ? number === options.conference.accessNumber : false) || !!(await provider.listGroups?.())?.some(g => g.number === number),
+        flows: new Map(records.map(f => [f.number, f]))
+      })
+      v1.get('/admin/flows', async req => {
+        const user = await administrator(req)
+        const provider = registry.forTenant(user.tenantId)
+        flowsOn(user.tenantId, provider)
+        const held = new Set((await store.listMappings(user.tenantId)).map(m => m.extension))
+        const running = await provider.listCallFlowRoutes?.().then(
+          routes => new Set(routes.map(r => r.number)),
+          () => undefined
+        )
+        return { items: (await store.listCallFlows(user.tenantId)).map(f => publicFlow(f, held, running)) }
+      })
+      v1.post<{ Body: { number?: unknown } | undefined }>('/admin/flows', async (req, reply) => {
+        const user = await administrator(req)
+        const provider = registry.forTenant(user.tenantId)
+        flowsOn(user.tenantId, provider)
+        const number = typeof req.body?.number === 'string' ? req.body.number.trim() : ''
+        const flow = await exclusive(user.tenantId, async () => {
+          const records = await store.listCallFlows(user.tenantId)
+          const f = await parseCallFlow(user.tenantId, number, req.body, await flowChecks(user.tenantId, provider, records), 'create')
+          await store.upsertCallFlow(f)
+          return f
+        })
+        await flowChanged(user.tenantId, provider)
+        return reply.code(201).send(publicFlow(flow, new Set((await store.listMappings(user.tenantId)).map(m => m.extension)), undefined))
+      })
+      v1.put<{ Params: { number: string } }>('/admin/flows/:number', async req => {
+        const user = await administrator(req)
+        const provider = registry.forTenant(user.tenantId)
+        flowsOn(user.tenantId, provider)
+        const flow = await exclusive(user.tenantId, async () => {
+          const records = await store.listCallFlows(user.tenantId)
+          const current = records.find(f => f.number === req.params.number)
+          if (!current) throw Object.assign(new Error('No such flow'), { statusCode: 404 })
+          const f = await parseCallFlow(user.tenantId, req.params.number, req.body, await flowChecks(user.tenantId, provider, records), 'replace', current.members)
+          const leading = f.kind === 'menu' ? menusLeadingTo(records, f.number) : []
+          if (leading.length) throw Object.assign(new Error(`the menu ${leading[0]} leads to it: a menu cannot lead to a menu`), { statusCode: 409, code: 'FLOW_IN_USE' })
+          await store.upsertCallFlow(f)
+          return f
+        })
+        await flowChanged(user.tenantId, provider)
+        return publicFlow(flow, new Set((await store.listMappings(user.tenantId)).map(m => m.extension)), undefined)
+      })
+      v1.delete<{ Params: { number: string } }>('/admin/flows/:number', async (req, reply) => {
+        const user = await administrator(req)
+        const provider = registry.forTenant(user.tenantId)
+        flowsOn(user.tenantId, provider)
+        await inTurn(user.tenantId, async () => {
+          const records = await store.listCallFlows(user.tenantId)
+          const leading = menusLeadingTo(records, req.params.number)
+          if (leading.length) throw Object.assign(new Error(`the menu ${leading[0]} leads to it: change or remove the menu first`), { statusCode: 409, code: 'FLOW_IN_USE' })
+          if (!(await store.deleteCallFlow(user.tenantId, req.params.number))) throw Object.assign(new Error('No such flow'), { statusCode: 404 })
+        })
+        await flowChanged(user.tenantId, provider)
         return reply.code(204).send()
       })
 

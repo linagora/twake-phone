@@ -1,4 +1,5 @@
 import { createHash, createHmac } from 'node:crypto'
+import type { CallFlow } from '@twake/telephony-types'
 import { afterEach, describe, expect, it } from 'vitest'
 import { CONTEXT, fakeWazo as fakeWazoOf, made } from '../test/fake-wazo.js'
 import { MESSAGE_ID, WazoStopped, WazoVoicemail, holderKey as keyedWith, mailboxNumber, voicemailOf, type Fetch, type WebSocketLike } from './index.js'
@@ -1156,5 +1157,100 @@ describe('WazoVoicemail, the lines (step 11c-1)', () => {
     expect(await vm.syncLines(['102'])).toEqual({ ready: ['102'], failed: 0 })
     expect(wazo.state.lines).toHaveLength(1)
     expect(wazo.state.endpoints[0]!.line).not.toBeNull()
+  })
+})
+
+describe('WazoVoicemail, the call flows (step 11c-2)', () => {
+  const LINE_KEY = 'twake-wazo-line-test-key-0123456789abcdef'
+  const flows: CallFlow[] = [
+    { number: '810', name: 'Astreinte', kind: 'sequential', members: ['102', '103'], ringSec: 8 },
+    { number: '801', name: 'Support', kind: 'queue', members: ['102', '103', '104'], ringSec: 12, waitSec: 90 },
+    { number: '800', name: 'Standard', kind: 'menu', choices: { '1': '801', '2': '810', '3': '104' }, greeting: 'custom/accueil' }
+  ]
+
+  it('makes nothing without a line key', async () => {
+    const { vm, wazo } = make()
+    expect(await vm.syncFlows(flows)).toEqual({ routes: [], failed: 0 })
+    expect(wazo.state.requests).toEqual([])
+  })
+
+  it('makes a group for each sequential group and queue (their strategy, times and members), and routes a menu to its digits', async () => {
+    const { vm, wazo } = make({ lineKey: LINE_KEY })
+    const done = await vm.syncFlows(flows)
+    expect(done.failed).toBe(0)
+    expect(wazo.state.groups.map(g => [g.label, g.ring_strategy, g.timeout, g.user_timeout, g.ring_in_use, g.members.extensions.map(e => `${e.exten}@${e.context}`)])).toEqual([
+      ['TwakePhone 810', 'linear', 16, 8, false, ['102@twake-members', '103@twake-members']],
+      ['TwakePhone 801', 'least_recent', 90, 12, false, ['102@twake-members', '103@twake-members', '104@twake-members']]
+    ])
+    // Nothing of the people or of their names in Wazo, nor a user: the extensions only.
+    expect(wazo.state.users).toEqual([])
+    expect(done.routes).toEqual([
+      { number: '810', route: 'seq|twakephone-810|16' },
+      { number: '801', route: 'queue|twakephone-801|90' },
+      { number: '800', route: 'menu|1=q:twakephone-801:90~2=q:twakephone-810:16~3=e:104|custom/accueil' }
+    ])
+    // Again: nothing is written.
+    const before = writes(wazo).length
+    expect((await vm.syncFlows(flows)).routes).toHaveLength(3)
+    expect(writes(wazo).length).toBe(before)
+  })
+
+  it('changes the times and the members of a group in place, never its strategy, and removes the group of a flow that is gone once the SIP server has been told', async () => {
+    const { vm, wazo } = make({ lineKey: LINE_KEY })
+    await vm.syncFlows(flows)
+    const uuid = wazo.state.groups.find(g => g.label === 'TwakePhone 801')!.uuid
+    const told: string[][] = []
+    const done = await vm.syncFlows(
+      [
+        { ...flows[0]!, members: ['103', '102'] },
+        { ...flows[1]!, ringSec: 20, waitSec: 60 },
+        { number: '800', name: 'Standard', kind: 'menu', choices: { '1': '801' } }
+      ],
+      { beforeRemoval: async gone => void told.push(gone) }
+    )
+    expect(told).toEqual([])
+    expect(wazo.state.groups.find(g => g.label === 'TwakePhone 801')).toMatchObject({ uuid, timeout: 60, user_timeout: 20 })
+    expect(wazo.state.groups.find(g => g.label === 'TwakePhone 810')!.members.extensions.map(e => e.exten)).toEqual(['103', '102'])
+    expect(wazo.state.groupStrategyEdits).toEqual([])
+    expect(done.routes.find(r => r.number === '800')!.route).toBe('menu|1=q:twakephone-801:60|twake-menu')
+    const gone = await vm.syncFlows([flows[1]!], { beforeRemoval: async g => void told.push(g) })
+    expect(told).toEqual([['810']])
+    expect(wazo.state.groups.map(g => g.label)).toEqual(['TwakePhone 801'])
+    expect(gone.routes.map(r => r.number)).toEqual(['801'])
+  })
+
+  it('remakes a group whose strategy is not the kind of its flow, and never touches a group that is not ours', async () => {
+    const { vm, wazo } = make({ lineKey: LINE_KEY })
+    wazo.state.groups.push({ id: 900, uuid: 'other', name: 'sales', label: 'Sales', ring_strategy: 'all', timeout: null, user_timeout: null, retry_delay: null, ring_in_use: true, members: { extensions: [] } })
+    await vm.syncFlows([{ number: '810', name: 'A', kind: 'queue', members: ['102'] }])
+    const done = await vm.syncFlows([{ number: '810', name: 'A', kind: 'sequential', members: ['102'] }])
+    expect(wazo.state.groups.filter(g => g.label === 'TwakePhone 810').map(g => g.ring_strategy)).toEqual(['linear'])
+    expect(wazo.state.groupStrategyEdits).toEqual([])
+    expect(done.routes).toEqual([{ number: '810', route: 'seq|twakephone-810|15' }])
+    await vm.syncFlows([])
+    expect(wazo.state.groups.map(g => g.label)).toEqual(['Sales'])
+  })
+
+  it('leaves out what Wazo refuses (said, done again at the next round), a digit that leads to a group not made yet, and a menu with no digit left', async () => {
+    const { vm, wazo, logs } = make({ lineKey: LINE_KEY })
+    wazo.state.refuseGroups.add('TwakePhone 801')
+    const done = await vm.syncFlows(flows)
+    expect(done.failed).toBe(1)
+    expect(logs.some(l => /flow 801 not made/.test(l))).toBe(true)
+    expect(done.routes.map(r => r.route)).toEqual(['seq|twakephone-810|16', 'menu|2=q:twakephone-810:16~3=e:104|custom/accueil'])
+    wazo.state.refuseGroups.clear()
+    expect((await vm.syncFlows(flows)).routes).toHaveLength(3)
+    const none = await vm.syncFlows([{ number: '800', name: 'x', kind: 'menu', choices: { a: '104', '1': 'abc' } }])
+    expect(none.routes).toEqual([])
+  })
+
+  it('stops once it may no longer write, and reads the name Wazo gave for a name Asterisk would not read as a refusal', async () => {
+    const { vm, wazo } = make({ lineKey: LINE_KEY })
+    let may = true
+    await expect(vm.syncFlows(flows, { mayWrite: () => may && ((may = false), true) })).rejects.toBeInstanceOf(WazoStopped)
+    wazo.state.groups = []
+    wazo.state.groupName = () => 'bad name;'
+    const done = await vm.syncFlows([flows[0]!])
+    expect(done).toEqual({ routes: [], failed: 1 })
   })
 })

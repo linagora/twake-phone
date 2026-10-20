@@ -81,6 +81,38 @@ export interface RingGroup {
 }
 
 /**
+ * What a call to the number of a call flow does (step 11c-2, ADR 0028): `sequential`, the members ring one after the
+ * other, each for `ringSec` seconds, the first to answer takes the call; `queue`, the caller waits (up to `waitSec`
+ * seconds) until a member is free, each one ringing for `ringSec` seconds in turn; `menu`, an interactive voice
+ * response (SVI): the caller hears the greeting and types a digit, which leads to the number it is set to. The
+ * telephony server of Wazo runs all three.
+ */
+export type CallFlowKind = 'sequential' | 'queue' | 'menu'
+
+/** A call flow of the organisation: a number of its own (never an extension nor a ring group's), set by an administrator. */
+export interface CallFlow {
+  /** What callers dial. */
+  number: string
+  /** What the administrators call it. */
+  name: string
+  kind: CallFlowKind
+  /** `sequential` and `queue`: the extensions that ring, in the order the administrator gave. */
+  members?: string[]
+  /** `sequential` and `queue`: seconds each member rings before the next one does. */
+  ringSec?: number
+  /** `queue`: seconds a caller waits at most. */
+  waitSec?: number
+  /** `menu`: the number each digit (0 to 9) leads to: an extension, or the number of a sequential group or a queue. */
+  choices?: Record<string, string>
+  /** `menu`: the sound played to the caller (a name of a sound of the telephony server); a default one when absent. */
+  greeting?: string
+  /** When listed: the members nobody holds right now (a person left). They stay members, as positions. */
+  vacant?: string[]
+  /** When listed: whether the telephony server runs it now (a flow just set is not, until it has made it). */
+  ready?: boolean
+}
+
+/**
  * How the platform authenticates to its operator: it registers with a login and a password (`register`), or the
  * operator recognises the address it sends from (`ip`; a password may still answer its challenges).
  */
@@ -571,6 +603,8 @@ export interface Capabilities {
   forwarding?: boolean
   /** Administrators can set simultaneous ring groups (`RingGroup`). */
   groups?: boolean
+  /** Administrators can set sequential groups, queues and voice menus (`CallFlow`, step 11c-2, ADR 0028). */
+  callFlows?: boolean
   /**
    * A call to someone with no device online waits a while for one of theirs to come online, while the Gateway wakes
    * their browsers (Web Push): the provider tells it whom to wake (`call.wake`), and the Gateway tells it who can be

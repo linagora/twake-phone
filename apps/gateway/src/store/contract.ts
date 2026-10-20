@@ -886,6 +886,30 @@ export const storeContract = (name: string, make: () => Promise<Store>) =>
       await s.close()
     })
 
+    it('keeps the call flows of each tenant by number, replaces one, and removes it in its tenant only (step 11c-2)', async () => {
+      const s = await make()
+      const queue = { tenantId: 'A', number: '801', name: 'Support', kind: 'queue' as const, members: ['102', '103'], ringSec: 12, waitSec: 90, choices: {} }
+      const menu = { tenantId: 'A', number: '800', name: 'Standard', kind: 'menu' as const, members: [] as string[], choices: { '1': '801', '2': '104' }, greeting: 'custom/accueil' }
+      await s.upsertCallFlow(queue)
+      await s.upsertCallFlow(menu)
+      await s.upsertCallFlow({ tenantId: 'B', number: '801', name: 'Other', kind: 'sequential', members: ['201'], ringSec: 20, choices: {} })
+      // By number, the lists as they were given (the order of members is the order they ring in).
+      expect(await s.listCallFlows('A')).toEqual([menu, queue])
+      expect((await s.listCallFlows('B')).map(f => `${f.number}:${f.kind}:${f.name}`)).toEqual(['801:sequential:Other'])
+      expect(await s.listCallFlows('C')).toEqual([])
+      await s.upsertCallFlow({ ...queue, members: ['103', '102'], waitSec: 60 })
+      expect((await s.listCallFlows('A')).find(f => f.number === '801')).toEqual({ ...queue, members: ['103', '102'], waitSec: 60 })
+      // Replaced by a flow of another kind: what it no longer has is gone.
+      await s.upsertCallFlow({ tenantId: 'A', number: '801', name: 'Support', kind: 'sequential', members: ['102'], choices: {} })
+      expect((await s.listCallFlows('A')).find(f => f.number === '801')).toEqual({ tenantId: 'A', number: '801', name: 'Support', kind: 'sequential', members: ['102'], choices: {} })
+      expect(await s.deleteCallFlow('B', '800')).toBe(false)
+      expect(await s.deleteCallFlow('A', '800')).toBe(true)
+      expect(await s.deleteCallFlow('A', '800')).toBe(false)
+      expect((await s.listCallFlows('A')).map(f => f.number)).toEqual(['801'])
+      expect((await s.listCallFlows('B')).map(f => f.number)).toEqual(['801'])
+      await s.close()
+    })
+
     it('keeps the sites of each tenant with their people, one site a person, and removes them with their trunk (step 6c)', async () => {
       const s = await make()
       const config = { auth: 'ip' as const, domain: 'operator.example', codecs: ['PCMA' as const], numberFormat: 'e164' as const, defaultNumber: '+33199000100' }
