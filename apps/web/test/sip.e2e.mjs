@@ -3616,6 +3616,8 @@ try {
     // ---- Step 11c-2 (ADR 0028): sequential groups, queues and voice menus, run by Wazo, ringing the windows through the lines
     let jeanW
     let bobW
+    /** The names Wazo gave the groups of the flows (what Asterisk calls the queues). */
+    let groupNames = []
     /** The windows of the members, and the one of them that rings (the others stay silent). */
     const ringing = who => who.page.getByTestId('incoming-call')
     const anyRings = async windows => Promise.any(windows.map(async w => (await ringing(w).waitFor({ timeout: 40_000 }), w)))
@@ -3658,6 +3660,7 @@ try {
       await sysconfdSettled()
       // Asterisk has them as Wazo's queues (one strategy for each kind), their members the lines of the extensions.
       const nameOf = number => byNumber[number].split('|')[1]
+      groupNames = ['810', '811', '801', '802'].map(nameOf)
       const sequential = asteriskCli(`queue show ${nameOf('810')}`)
       if (!/in 'linear' strategy/.test(sequential) || !sequential.includes('Local/102@twake-members') || !sequential.includes('Local/103@twake-members')) throw new Error(`the sequential group in Asterisk: ${sequential}`)
       const queue = asteriskCli(`queue show ${nameOf('801')}`)
@@ -3804,7 +3807,8 @@ try {
       await until('no flow left in call_flows', async () => ((await flowRows()).length === 0 ? true : null), { timeout: 120_000 })
       await sysconfdSettled()
       const queues = asteriskCli('queue show')
-      if (/twakephone/.test(queues)) throw new Error(`queues Wazo kept: ${queues}`)
+      for (const name of groupNames) if (queues.includes(name)) throw new Error(`Wazo kept the queue ${name}: ${queues}`)
+      expectEqual(groupNames.length, 4, 'the queues the flows had')
       await signOut(jeanW)
       await signOut(bobW)
     })
