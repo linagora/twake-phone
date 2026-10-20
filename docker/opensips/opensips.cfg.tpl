@@ -650,6 +650,12 @@ route {
 		# A browser's Contact names a ".invalid" host (RFC 7118): point it at the WebSocket it came from, so the
 		# other side's in-dialog requests reach it on that same connection.
 		fix_nated_contact();
+		# A re-INVITE records the route again: an operator (Cirpack) builds its route set from the 2xx of a re-INVITE,
+		# which the phone answers with the Record-Route of the request alone; without our entries its ACK and BYE come
+		# with no Route to us and a Contact that is the phone's own (404). After fix_route_dialog, so that both sockets
+		# of the route (r2) are known.
+		if (is_method("INVITE"))
+			record_route();
 		if (is_method("INVITE|UPDATE") && has_body_part("application/sdp")) {
 			route(rtp_offer);
 			t_on_reply("rtp");

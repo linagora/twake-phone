@@ -532,6 +532,26 @@ try {
     expect('the BYE at the phone, at its own Contact', got.requests.at(-1)?.uri === p301.contactUri, got.requests.at(-1)?.uri)
   })
 
+  // OVH (Cirpack) rebuilds its route set from the 2xx of a re-INVITE it sends 20 ms after the call is answered: the
+  // phone answers with the Record-Route of the request, so the proxy has to put its own entries back in it, or the
+  // next ACK and BYE come with no Route to us, to the phone's own Contact (404).
+  await step('review OVH: an operator that takes its route set from the 2xx of a re-INVITE still reaches the phone with its ACK and BYE', async () => {
+    const placed = await A.call('+33199000301', { from: '+33639980002' })
+    expect('final answer', (await placed.final).status === 200)
+    const got = await p301.incoming(i => header(i, 'call-id') === placed.callId)
+    const entries = msg => (msg.headers.get('record-route') ?? []).flatMap(v => v.split(/,\s*(?=<)/))
+    const first = entries(placed.answer)
+    const answer = await A.reinvite(placed)
+    expect('re-INVITE answered', answer.status === 200, answer.first)
+    expect('the 2xx of the re-INVITE carries the route of the call', JSON.stringify(entries(answer)) === JSON.stringify(first), `${entries(answer)} / ${first}`)
+    placed.route = entries(answer).reverse()
+    placed.remoteTarget = /<([^>]+)>/.exec(header(answer, 'contact'))?.[1] ?? placed.remoteTarget
+    expect('re-INVITE by the new route set', (await A.reinvite(placed)).status === 200)
+    expect('both re-INVITEs and their ACKs at the phone', got.reinvites.length === 2, `${got.reinvites.length}`)
+    expect('BYE by the new route set', (await placed.hangup()).status === 200)
+    await p301.callState(got, 'ended', 5_000)
+  })
+
   await step('n°5: a call from the operator whose phone went: ended, a BYE to the operator', async () => {
     const placed = await A.call('+33199000301', { from: '+33639980002' })
     expect('final answer', (await placed.final).status === 200)
