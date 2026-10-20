@@ -9,7 +9,7 @@ export interface Me {
   displayName: string
   extension?: string
   /** What this platform offers; absent on an older Gateway. */
-  features?: { directory?: boolean; admin?: boolean }
+  features?: { directory?: boolean; admin?: boolean; supervision?: boolean }
 }
 
 interface Gateway {

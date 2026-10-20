@@ -33,7 +33,7 @@ import subprocess
 import sys
 
 SERVICES = ['wazo-db', 'rabbitmq', 'wazo-auth', 'wazo-bootstrap', 'wazo-confd', 'wazo-confgend', 'wazo-asterisk',
-            'wazo-sysconfd', 'wazo-amid', 'wazo-calld', 'wazo-websocketd',
+            'wazo-sysconfd', 'wazo-recordings', 'wazo-amid', 'wazo-calld', 'wazo-websocketd',
             # Step 11b: the transcription service and the Matrix homeserver of the bot.
             'linto-stt', 'synapse']
 # The states of /proc/net/tcp that listen (TCP_LISTEN), and of an unconnected UDP socket (TCP_CLOSE: bound, no peer).

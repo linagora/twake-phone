@@ -14,6 +14,7 @@ import { PgStore } from './store/pg.js'
 import { trunkFromEnv, trunkRecord } from './trunks.js'
 import { absenceMsOf, holderRecordKeepMsOf, retentionDaysOf, voicemailMismatch, wazoFromEnv } from './voicemail.js'
 import { matrixFromEnv, transcriptionFromEnv } from './voicemail-transcripts.js'
+import { recordingRetentionDaysOf, supervisionFromEnv } from './supervision.js'
 import { networkInterfaces } from 'node:os'
 import { denyNetworks, parsePorts, parseTenantNetworks } from './webhook-delivery.js'
 
@@ -204,6 +205,12 @@ if (transcription) console.info(`voicemail transcription: on, messages of ${tran
 if (voicemail && !transcription) console.warn('WARNING: the messages are not transcribed (LINTO_URL)')
 if (notices && !env.LDAP_ATTR_MATRIX && !notices.userTemplate) console.warn("WARNING: the bot knows nobody's Matrix account: set LDAP_ATTR_MATRIX or MATRIX_USER_TEMPLATE")
 if (notices && !notices.appUrl) console.warn("WARNING: the bot's notices carry no link to TwakePhone: set APP_URL (or an https origin in CORS_ORIGINS)")
+// The recording and the supervision of the calls that have a channel at Wazo (step 11d, ADR 0029): the AMI of its
+// Asterisk (WAZO_AMI, and its two accounts WAZO_GATEWAY_AMI_*, WAZO_GATEWAY_ORIGINATE_*) and its recordings server (WAZO_RECORDINGS_URL,
+// WAZO_RECORDINGS_TOKEN). Recordings are kept RECORDING_RETENTION_DAYS (30 by default).
+const supervision = supervisionFromEnv(env)
+const recordingRetentionDays = recordingRetentionDaysOf(env)
+if (supervision) console.info(`supervision: on, the recordings of ${JSON.stringify(tenant)} kept ${recordingRetentionDays ? `${recordingRetentionDays} days` : 'for ever'}`)
 const hstsMaxAge = env.HSTS_MAX_AGE ? Number(env.HSTS_MAX_AGE) : undefined
 if (hstsMaxAge !== undefined && !(Number.isInteger(hstsMaxAge) && hstsMaxAge >= 0)) throw new Error('HSTS_MAX_AGE must be a number of seconds')
 const app = await buildApp(registry, {
@@ -219,11 +226,13 @@ const app = await buildApp(registry, {
   ...(ovh ? { operators: new Map([[tenant, ovh]]) } : {}),
   ...(conference ? { conference } : {}),
   ...(voicemail ? { voicemail: (t: string) => (t === tenant ? voicemail : undefined), voicemailRetentionDays } : {}),
+  ...(supervision ? { supervision: (t: string) => (t === tenant ? supervision : undefined), recordingRetentionDays } : {}),
   ...(transcription ? { transcription } : {}),
   ...(notices ? { notices: { ...notices, ...(contacts && env.LDAP_ATTR_MATRIX ? { matrixIdOf: (t: string, userId: string) => contacts.matrixIdOf(t, userId) } : {}) } } : {})
 })
 directorySync?.useLogger(app.log)
 app.addHook('onClose', async () => voicemail?.close())
+app.addHook('onClose', async () => supervision?.close())
 const syncEvery = parseInterval(env.LDAP_SYNC_INTERVAL, 3_600_000)
 if (directorySync && syncEvery > 0) directorySync.start(syncEvery)
 app.addHook('onClose', async () => directorySync?.stop())

@@ -1,4 +1,4 @@
-import type { Call, CallFlow, Capabilities, ConferenceParticipant, Contact, DialInConfiguration, DidRange, EmergencySite, ForwardingRules, FraudRule, MediaSession, OperatorLineForwards, OutboundAssignment, OutboundCaps, OutboundPolicy, OutboundProfile, Presence, PresenceStatus, RingGroup, TelephonyAlert, TelephonyEvent, Trunk, TrunkInput, TrunkStatus, Voicemail, WebhookEventType } from '@twake/telephony-types'
+import type { Call, Capabilities, ConferenceParticipant, Contact, DialInConfiguration, DidRange, EmergencySite, ForwardingRules, FraudRule, MediaSession, OperatorLineForwards, OutboundAssignment, OutboundCaps, OutboundPolicy, OutboundProfile, Presence, PresenceStatus, Recording, RingGroup, SupervisedCall, SupervisionLogEntry, SupervisionMode, TelephonyAlert, TelephonyEvent, Trunk, TrunkInput, TrunkStatus, Voicemail, WebhookEventType, CallFlow } from '@twake/telephony-types'
 
 export type {
   CallFlow,
@@ -18,7 +18,11 @@ export type {
   OutboundCaps,
   OutboundPolicy,
   OutboundProfile,
+  Recording,
   RingGroup,
+  SupervisedCall,
+  SupervisionLogEntry,
+  SupervisionMode,
   TelephonyAlert,
   Trunk,
   TrunkAuth,
@@ -412,7 +416,7 @@ export class TelephonyClient {
   }
 
   getMe() {
-    return this.request<{ id: string; displayName: string; extension?: string; features?: { directory?: boolean; admin?: boolean } }>('/me')
+    return this.request<{ id: string; displayName: string; extension?: string; features?: { directory?: boolean; admin?: boolean; supervision?: boolean } }>('/me')
   }
 
   /** The directory source and its synchronisation, for administrators (403 otherwise; 501 without a directory). */
@@ -714,6 +718,57 @@ export class TelephonyClient {
   /** Deletes a message, for good (a `voicemail.deleted` event follows). */
   deleteVoicemail(id: string) {
     return this.request<void>(`/voicemails/${encodeURIComponent(id)}`, { method: 'DELETE' })
+  }
+
+  /**
+   * The calls in progress that have a channel at the telephony server, for supervisors (step 11d; 403 otherwise, 501: the
+   * platform has no supervision). `recording`: the recording under way of the call.
+   */
+  listSupervisedCalls() {
+    return this.request<{ items: (SupervisedCall & { displayName?: string; recording?: { id: string; startedAt: string } })[] }>('/supervision/calls')
+  }
+
+  /** Starts the recording of a call, after the notice to both parties (201); refusals carry a `code` (RECORDING_UNDER_WAY, CALL_GONE, SUPERVISION_FAILED). */
+  startRecording(callId: string) {
+    return this.request<Recording>(`/supervision/calls/${encodeURIComponent(callId)}/recording`, { method: 'POST', body: JSON.stringify({ action: 'start' }) })
+  }
+
+  /** Stops the recording of a call (NO_RECORDING when there is none). */
+  stopRecording(callId: string) {
+    return this.request<Recording>(`/supervision/calls/${encodeURIComponent(callId)}/recording`, { method: 'POST', body: JSON.stringify({ action: 'stop' }) })
+  }
+
+  /** Calls the supervisor's own line into a call; `state`: `answered`, or `ringing` while they have not picked up. Refusals: NO_EXTENSION, OWN_CALL, SPY_REFUSED, CALL_GONE. */
+  superviseCall(callId: string, mode: SupervisionMode) {
+    return this.request<{ state: 'answered' | 'ringing' }>(`/supervision/calls/${encodeURIComponent(callId)}/spy`, { method: 'POST', body: JSON.stringify({ mode }) })
+  }
+
+  /** The recordings of the organisation, newest first. */
+  listRecordings() {
+    return this.request<{ items: Recording[] }>('/supervision/recordings')
+  }
+
+  /** The audio of a recording, to play (a WAV); each listening is journalled. */
+  async getRecordingAudio(id: string): Promise<Blob> {
+    const path = `/supervision/recordings/${encodeURIComponent(id)}/audio`
+    const res = await fetch(`${this.options.baseUrl}/api/v1${path}`, {
+      headers: { authorization: `Bearer ${await this.options.getToken()}`, ...(this.options.getInstance ? { 'x-cozy-instance': this.options.getInstance() } : {}) }
+    })
+    if (!res.ok) {
+      await res.text().catch(() => undefined)
+      throw Object.assign(new Error(`Gateway ${res.status} on ${path}`), { status: res.status })
+    }
+    return res.blob()
+  }
+
+  /** Erases a recording's audio, for administrators (its record stays, as purged). */
+  deleteRecording(id: string) {
+    return this.request<void>(`/supervision/recordings/${encodeURIComponent(id)}`, { method: 'DELETE' })
+  }
+
+  /** What supervisors did: recorded, listened, joined, erased; newest first. */
+  getSupervisionLog() {
+    return this.request<{ items: (SupervisionLogEntry & { actorName?: string })[] }>('/supervision/log')
   }
 
   /** People matching the words of `q` in the organisation's directory (`truncated`: refine the search). 501: no directory. */

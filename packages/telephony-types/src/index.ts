@@ -544,6 +544,56 @@ export interface Voicemail {
 }
 
 /**
+ * A call in progress on a line at the voicemail server (Wazo's Asterisk), as the supervision screen lists it (step 11d,
+ * ADR 0029). Only calls that have a channel there: a call between two people never does (ADR 0027).
+ */
+export interface SupervisedCall {
+  /** Opaque, stable for the life of the call. */
+  id: string
+  /** The extension whose line this call is on. */
+  extension: string
+  /** The other number (an extension, an E.164 number, or what Wazo gives), absent when none is given. */
+  peer?: string
+  peerName?: string
+  state: 'ringing' | 'up'
+  /** When the call began (ISO 8601). */
+  startedAt: string
+}
+
+/** How a supervisor joins a call: nobody hears them (`listen`), only the line's person (`whisper`), both (`barge`). */
+export type SupervisionMode = 'listen' | 'whisper' | 'barge'
+
+/**
+ * The recording of a call (step 11d, ADR 0029). `recording`: under way; `ready`: its audio can be listened to;
+ * `failed`: nothing was kept; `erasing`: its audio is to go (the person asked for their history to be erased) and the
+ * server did not do it yet; `purged`: its audio is gone (retention, erasure or an administrator), only this record stays.
+ */
+export interface Recording {
+  id: string
+  extension: string
+  /** Who held the extension then, by the name the directory gives, absent when it gives none. */
+  displayName?: string
+  startedAt: string
+  endedAt?: string
+  durationSec?: number
+  state: 'recording' | 'ready' | 'failed' | 'erasing' | 'purged'
+  /** Who started it (a supervisor's user id). */
+  startedBy: string
+  sizeBytes?: number
+}
+
+/** One line of the journal of the supervision (step 11d): who did what to which call or recording, and when. */
+export interface SupervisionLogEntry {
+  at: string
+  actor: string
+  action: 'record-start' | 'record-stop' | 'listen-recording' | 'delete-recording' | 'spy-listen' | 'spy-whisper' | 'spy-barge' | 'purge' | 'erase'
+  /** The extension concerned. */
+  extension?: string
+  /** The recording concerned. */
+  recordingId?: string
+}
+
+/**
  * What a message says (step 11b, ADR 0023): on its way (`pending`), its text (`done`; an empty text when nothing was
  * heard in it, `lang` the language it is in), or no transcription (`none`), `reason` saying why: longer than the
  * platform transcribes (`too-long`), too many messages waiting for theirs (`busy`), the transcription service did not
@@ -566,6 +616,8 @@ export interface VoicemailTranscript {
  */
 export interface HistoryErasure {
   deleted: number
+  /** Step 11d: how many recordings of calls on their line are to be erased (their audio goes at once, or at the next sweep). Absent when none. */
+  recordings?: number
   voicemailErasure?: 'asked' | 'limited'
   /**
    * Step 11b: `not-withdrawn` when the bot's notices of their messages in Chat cannot be withdrawn any more (the
@@ -627,6 +679,8 @@ export interface Capabilities {
   voicemail?: boolean
   /** Each new message is transcribed (step 11b, ADR 0023): `Voicemail.transcript`, the `voicemail.transcribed` events. */
   voicemailTranscription?: boolean
+  /** Supervisors list the calls in progress at the voicemail server, record them and join them (step 11d, ADR 0029). */
+  supervision?: boolean
 }
 
 /** Media plane description handed to the client; opaque to the Gateway. */
