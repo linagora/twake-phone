@@ -3624,6 +3624,8 @@ try {
     const flowRows = async () => (await db.query('SELECT number, route FROM call_flows ORDER BY number')).rows
     await step('step 11c-2, the demo set up: Alice, an administrator, makes in Administration a sequential group 810 (Jean, then Bob, 5 s each), a queue 801 (Jean and Bob, 8 s each, 40 s at most), a sequential group 811 and a queue 802 of 104 (nobody has a window there) and a voice menu 800 (1: the queue, 2: the group); an extension, a ring group or a number twice is no flow number; Wazo makes the groups, then OpenSIPS is told which numbers go there', async () => {
       // Windows of Jean and Bob opened now, their line existing: Wazo holds their contact (the windows of before registered without it).
+      // Not while OpenSIPS leaves the lines out (30 s after a silent Wazo, the step before): a window registers here only then.
+      await until('the lines taken again by OpenSIPS', async () => (Number(await shvOf('wazo_lines_mute_until')) <= Date.now() / 1000 ? true : null), { timeout: 45_000 })
       jeanW = await open('jdupont', 'Jean Dupont')
       bobW = await open('bdurand', 'Bob Durand')
       await until('the contacts of 102 and 103 at Wazo', async () => (contactsOf('102').length && contactsOf('103').length ? true : null), { timeout: 30_000 })
