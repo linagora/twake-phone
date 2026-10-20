@@ -22,7 +22,8 @@ const NUMBER = /^[0-9]{1,40}$/
  * What a route may hold: the characters the script lets through to a SIP header and Asterisk's dialplan reads as
  * words (no comma, parenthesis, quote, space or semicolon).
  */
-export const ROUTE = /^[A-Za-z0-9_.:=/~|-]{1,500}$/
+// (A menu of ten queues is some 700 characters: wazo-confd names a group `grp-<tenant>-<uuid>`.)
+export const ROUTE = /^[A-Za-z0-9_.:=/~|-]{1,2000}$/
 
 export interface CallFlowsOptions {
   pool: Queryable

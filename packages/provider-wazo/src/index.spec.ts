@@ -109,6 +109,8 @@ const until = async (fn: () => boolean, ms = 2_000) => {
 const jean = { extension: '102', userId: 'jean' }
 const alice = { extension: '103', userId: 'alice' }
 
+/** The name wazo-confd gave the group of the flow at `number` (what Asterisk calls the queue). */
+const groupOf = (wazo: ReturnType<typeof fakeWazo>, number: string) => wazo.state.groups.find(g => g.label === `TwakePhone ${number}`)!.name
 const writes = (wazo: ReturnType<typeof fakeWazo>) => wazo.state.requests.filter(r => !r.startsWith('GET') && r !== 'POST /0.1/token')
 
 describe('WazoVoicemail, the mailboxes', () => {
@@ -1184,10 +1186,12 @@ describe('WazoVoicemail, the call flows (step 11c-2)', () => {
     ])
     // Nothing of the people or of their names in Wazo, nor a user: the extensions only.
     expect(wazo.state.users).toEqual([])
+    const [g810, g801] = [groupOf(wazo, '810'), groupOf(wazo, '801')]
+    expect(g810).toMatch(/^grp-[a-z0-9-]+$/)
     expect(done.routes).toEqual([
-      { number: '810', route: 'seq|twakephone-810|18' },
-      { number: '801', route: 'queue|twakephone-801|90' },
-      { number: '800', route: 'menu|1=q:twakephone-801:90~2=q:twakephone-810:18~3=e:104|custom/accueil' }
+      { number: '810', route: `seq|${g810}|18` },
+      { number: '801', route: `queue|${g801}|90` },
+      { number: '800', route: `menu|1=q:${g801}:90~2=q:${g810}:18~3=e:104|custom/accueil` }
     ])
     // Again: nothing is written.
     const before = writes(wazo).length
@@ -1212,7 +1216,7 @@ describe('WazoVoicemail, the call flows (step 11c-2)', () => {
     expect(wazo.state.groups.find(g => g.label === 'TwakePhone 801')).toMatchObject({ uuid, timeout: 60, user_timeout: 20 })
     expect(wazo.state.groups.find(g => g.label === 'TwakePhone 810')!.members.extensions.map(e => e.exten)).toEqual(['103', '102'])
     expect(wazo.state.groupStrategyEdits).toEqual([])
-    expect(done.routes.find(r => r.number === '800')!.route).toBe('menu|1=q:twakephone-801:60|twake-menu')
+    expect(done.routes.find(r => r.number === '800')!.route).toBe(`menu|1=q:${groupOf(wazo, '801')}:60|twake-menu`)
     const gone = await vm.syncFlows([flows[1]!], { beforeRemoval: async g => void told.push(g) })
     expect(told).toEqual([['810']])
     expect(wazo.state.groups.map(g => g.label)).toEqual(['TwakePhone 801'])
@@ -1229,7 +1233,7 @@ describe('WazoVoicemail, the call flows (step 11c-2)', () => {
     expect(told).toEqual([['810']])
     expect(wazo.state.groups.filter(g => g.label === 'TwakePhone 810').map(g => g.ring_strategy)).toEqual(['linear'])
     expect(wazo.state.groupStrategyEdits).toEqual([])
-    expect(done.routes).toEqual([{ number: '810', route: 'seq|twakephone-810|16' }])
+    expect(done.routes).toEqual([{ number: '810', route: `seq|${groupOf(wazo, '810')}|16` }])
     await vm.syncFlows([])
     expect(wazo.state.groups.map(g => g.label)).toEqual(['Sales'])
   })
@@ -1240,7 +1244,7 @@ describe('WazoVoicemail, the call flows (step 11c-2)', () => {
     const done = await vm.syncFlows(flows)
     expect(done.failed).toBe(1)
     expect(logs.some(l => /flow 801 not made/.test(l))).toBe(true)
-    expect(done.routes.map(r => r.route)).toEqual(['seq|twakephone-810|18', 'menu|2=q:twakephone-810:18~3=e:104|custom/accueil'])
+    expect(done.routes.map(r => r.route)).toEqual([`seq|${groupOf(wazo, '810')}|18`, `menu|2=q:${groupOf(wazo, '810')}:18~3=e:104|custom/accueil`])
     wazo.state.refuseGroups.clear()
     expect((await vm.syncFlows(flows)).routes).toHaveLength(3)
     const none = await vm.syncFlows([{ number: '800', name: 'x', kind: 'menu', choices: { a: '104', '1': 'abc' } }])

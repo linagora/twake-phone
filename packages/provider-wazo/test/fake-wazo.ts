@@ -170,9 +170,9 @@ export const fakeWazo = (numberOf: (userId: string) => string) => {
       if (state.refuseGroups.has(body.label)) return json(400, ['Resource Error - refused'])
       if (!/^[-_.a-zA-Z0-9 ]+$/.test(body.label ?? '')) return json(400, ['label does not match'])
       if (state.groups.some(g => g.label === body.label)) return json(400, ['Resource Error - Group already exists'])
-      // wazo-confd names the group after its label (lowercased, spaces to dashes).
+      // wazo-confd names the group `grp-<tenant slug>-<uuid>` (GroupList.group_name_fmt), whatever its label.
       const id = next++
-      const group = { id, uuid: `00000000-0000-4000-a000-${String(id).padStart(12, '0')}`, name: state.groupName?.(String(body.label)) ?? String(body.label).toLowerCase().replace(/[^a-z0-9]+/g, '-'), label: body.label, ring_strategy: body.ring_strategy ?? 'all', timeout: body.timeout ?? null, user_timeout: body.user_timeout ?? null, retry_delay: body.retry_delay ?? null, ring_in_use: body.ring_in_use ?? true, members: { extensions: [] } }
+      const group = { id, uuid: `00000000-0000-4000-a000-${String(id).padStart(12, '0')}`, name: state.groupName?.(String(body.label)) ?? `grp-test-00000000-0000-4000-a000-${String(id).padStart(12, '0')}`, label: body.label, ring_strategy: body.ring_strategy ?? 'all', timeout: body.timeout ?? null, user_timeout: body.user_timeout ?? null, retry_delay: body.retry_delay ?? null, ring_in_use: body.ring_in_use ?? true, members: { extensions: [] } }
       state.groups.push(group)
       return json(201, group)
     }

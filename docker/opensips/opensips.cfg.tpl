@@ -3299,7 +3299,7 @@ route[rules_next] {
 			# Gateway writes once Wazo runs it. Only what a route is made of passes, and never a number an extension holds (an
 			# extension wins, as over a ring group).
 			if ($shv(wazo_lines_on) == 1)
-				$var(flow_col) = ", (SELECT f.route FROM call_flows f WHERE f.number = '" + $rU + "' AND length(f.route) <= 500 AND f.route ~ '^[A-Za-z0-9_.:=/~|-]+$' AND NOT EXISTS (SELECT 1 FROM subscriber s WHERE s.username = '" + $rU + "'))";
+				$var(flow_col) = ", (SELECT f.route FROM call_flows f WHERE f.number = '" + $rU + "' AND length(f.route) <= 2000 AND f.route ~ '^[A-Za-z0-9_.:=/~|-]+$' AND NOT EXISTS (SELECT 1 FROM subscriber s WHERE s.username = '" + $rU + "'))";
 			# wazo-lines: end
 		}
 		$var(rules_query) = "SELECT " + $var(rules_cols) + $var(first_cols) + $var(vm_col) + $var(flow_col) + $var(rules_from);
