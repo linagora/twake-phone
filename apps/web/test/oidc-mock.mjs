@@ -39,7 +39,10 @@ export const startOidcMock = async ({ port, appOrigin, audience, resource = 'htt
       claims: async () => ({ sub: id, name: NAMES[id] ?? id, email: `${id}@example.test` })
     }),
     cookies: { keys: ['twakephone-e2e'] },
-    ttl: { AccessToken: 600, IdToken: 600, Session: 600, Grant: 600, Interaction: 600 }
+    // Access tokens stay short (the app renews them: that is played all along the run). The grant and the session behind a renewal last
+    // an hour: a window that stays idle for ten minutes (the renewal of a tab the browser throttles comes late) is not signed out, as the
+    // runs that last half an hour with windows idle for most of it need (a renewal that comes after 600 s was refused: "grant request is invalid").
+    ttl: { AccessToken: 600, IdToken: 600, Session: 3600, Grant: 3600, Interaction: 600 }
   })
   // The app runs on another origin: no SameSite trap, and plain http is fine for a local test.
   provider.proxy = true
