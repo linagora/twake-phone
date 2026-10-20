@@ -1870,7 +1870,7 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(tpl).toContain('route(rtp_flags, $var(answer_to));')
     const flags = tpl.slice(tpl.indexOf('\nroute[rtp_flags] {'), tpl.indexOf('\nroute[sides] {'))
     expect(flags).toContain('if ($param(2) != NULL && $shv(rtp_directions) == 1) {')
-    expect(flags).toContain('" direction=" + $var(from_if) + " direction=" + $var(to_if)')
+    expect(flags).toContain('" in-iface=" + $var(from_if) + " out-iface=" + $var(to_if)')
     expect(flags.match(/if \(\$param\([12]\) == 1\)\n\t+\$var\((from|to)_if\) = "external";/g)).toHaveLength(2)
   })
   it('starts rtpengine with one interface as before, or with an internal and an external one (ADR 0030)', () => {

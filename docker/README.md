@@ -41,7 +41,7 @@ Sans Docker (poste de dev sans démon) : OpenSIPS se compile depuis GitHub (`mak
 
 Le e2e : `yarn e2e:sip` (README, section « Vérifier »). Le rapport DTMF de rtpengine (`--dtmf-log-dest`) s'ouvre sur un socket IPv6 double pile : sans IPv6 sur la machine (certains conteneurs), `RTPENGINE_DTMF_LOG=off` saute cette vérification.
 
-Deux interfaces rtpengine (ADR 0030) : `RTPENGINE_INTERFACE_INTERNAL` (navigateurs, LiveKit SIP, Wazo) et `RTPENGINE_INTERFACE_EXTERNAL` (l'opérateur), chacune de la forme `adresse` ou `privée!publique`, les deux ou aucune (`RTPENGINE_INTERFACE` est alors ignorée). OpenSIPS dit à chaque offre quelle interface fait face à quel côté (`direction=internal`/`external`) ; sans elles, une seule interface et aucun `direction=`, comme avant. À donner aux deux services (`rtpengine` et `opensips`) ; la CI joue `127.0.0.1` et `127.0.0.2`.
+Deux interfaces rtpengine (ADR 0030) : `RTPENGINE_INTERFACE_INTERNAL` (navigateurs, LiveKit SIP, Wazo) et `RTPENGINE_INTERFACE_EXTERNAL` (l'opérateur), chacune de la forme `adresse` ou `privée!publique`, les deux ou aucune (`RTPENGINE_INTERFACE` est alors ignorée). OpenSIPS dit à chaque offre quelle interface fait face à quel côté (`in-iface=` et `out-iface=`) ; sans elles, une seule interface et aucune interface dite, comme avant. À donner aux deux services (`rtpengine` et `opensips`) ; la CI joue `127.0.0.1` et `127.0.0.2`.
 
 Pour un test réel, à plusieurs et depuis Internet, c'est le kit pilote qu'il faut ([pilot/README.md](pilot/README.md)) : les mêmes images, derrière Caddy en HTTPS sur un seul domaine, avec la passerelle, l'app et un Keycloak et un LDAP de démo.
 

@@ -359,7 +359,7 @@ route[rtp_flags] {
 		$var(to_if) = "internal";
 		if ($param(1) == 1)
 			$var(to_if) = "external";
-		$var(rtp_flags) = $var(rtp_flags) + " direction=" + $var(from_if) + " direction=" + $var(to_if);
+		$var(rtp_flags) = $var(rtp_flags) + " in-iface=" + $var(from_if) + " out-iface=" + $var(to_if);
 	}
 }
 

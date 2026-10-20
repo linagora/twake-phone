@@ -1,4 +1,4 @@
-# ADR 0030 : Deux interfaces rtpengine, interne et externe, choisies par côté d'appel avec `direction=`
+# ADR 0030 : Deux interfaces rtpengine, interne et externe, choisies par côté d'appel avec `in-iface=` et `out-iface=`
 
 Date : 2026-10-20. État : proposée. Décidée à la PR `fix/rtpengine-interfaces`, après un appel réel sur un trunk OVHcloud (2026-10-20) ; précise l'ADR 0016 (trunk vers l'opérateur) et l'ADR 0018 (média vers LiveKit SIP) ; remplacé par : aucun.
 
@@ -12,11 +12,11 @@ Constaté sur un appel réel avec OVHcloud : le côté opérateur marchait (1219
 
 ### 1. Deux interfaces nommées, ou une seule comme avant
 
-`RTPENGINE_INTERFACE_INTERNAL` et `RTPENGINE_INTERFACE_EXTERNAL`, chacune dans la forme de `RTPENGINE_INTERFACE` (`adresse` ou `privée!publique`), donnent deux interfaces rtpengine nommées `internal` et `external` (`--interface=internal/…`, `--interface=external/…`). **Les deux ou aucune** : une seule des deux arrête rtpengine et OpenSIPS au démarrage. Sans elles, rien ne change : `RTPENGINE_INTERFACE` seule, aucun `direction=` dans les offres. Avec elles, `RTPENGINE_INTERFACE` est ignorée.
+`RTPENGINE_INTERFACE_INTERNAL` et `RTPENGINE_INTERFACE_EXTERNAL`, chacune dans la forme de `RTPENGINE_INTERFACE` (`adresse` ou `privée!publique`), donnent deux interfaces rtpengine nommées `internal` et `external` (`--interface=internal/…`, `--interface=external/…`). **Les deux ou aucune** : une seule des deux arrête rtpengine et OpenSIPS au démarrage. Sans elles, rien ne change : `RTPENGINE_INTERFACE` seule, aucune interface dans les offres. Avec elles, `RTPENGINE_INTERFACE` est ignorée.
 
 ### 2. Le script dit, à chaque offre, quelle interface fait face à quel côté
 
-Les côtés ont déjà un genre (`route[sides]`) : 0 un navigateur, 1 l'opérateur, 2 LiveKit SIP. `route[rtp_flags]` reçoit, en plus du genre du côté où va l'offre, celui du côté d'où elle vient, et ajoute `direction=<d'où> direction=<où>` : **`external` pour l'opérateur (genre 1), `internal` pour tout le reste** (navigateurs, LiveKit SIP, les postes et la messagerie de Wazo, qui sont du côté de la machine). Les trois endroits qui font une offre le font : l'offre initiale, l'offre dans un 2xx (INVITE sans SDP, de l'appelant ou, en dialogue, de l'opérateur qui rafraîchit sa session : le 2xx vient alors du côté opposé à l'expéditeur) et celle de la messagerie. Une réponse ne le dit pas : rtpengine retient les interfaces de l'offre pour la réponse et les offres suivantes (documentation du protocole ng, clé `direction`).
+Les côtés ont déjà un genre (`route[sides]`) : 0 un navigateur, 1 l'opérateur, 2 LiveKit SIP. `route[rtp_flags]` reçoit, en plus du genre du côté où va l'offre, celui du côté d'où elle vient, et ajoute `in-iface=<d'où> out-iface=<où>` (le module rtpengine d'OpenSIPS 3.6 en fait la clé `direction` du protocole ng ; `direction=a direction=b`, lui, envoie deux clés du même nom et rtpengine n'en lit qu'une : mesuré, les deux côtés restaient sur l'interface `internal`) : **`external` pour l'opérateur (genre 1), `internal` pour tout le reste** (navigateurs, LiveKit SIP, les postes et la messagerie de Wazo, qui sont du côté de la machine). Les trois endroits qui font une offre le font : l'offre initiale, l'offre dans un 2xx (INVITE sans SDP, de l'appelant ou, en dialogue, de l'opérateur qui rafraîchit sa session : le 2xx vient alors du côté opposé à l'expéditeur) et celle de la messagerie. Une réponse ne le dit pas : rtpengine retient les interfaces de l'offre pour la réponse et les offres suivantes (documentation du protocole ng, clé `direction`).
 
 ### 3. Une seule variable partagée dans le script
 
