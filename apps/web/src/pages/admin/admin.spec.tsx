@@ -355,7 +355,7 @@ describe('the administration screens (step 7)', () => {
     // A set-aside held back: who waits for a mailbox, and the voicemail off for everyone, said.
     expect(text()).toContain("(le temps de la retenue ne compte pas) : 6 pour 6 ; 6 nouveau(x) titulaire(s) sans boîte jusqu'à la levée ; messagerie coupée pour tout le tenant : aucun poste ne joint de boîte")
     const causes = [...host.querySelectorAll('option')].map(o => o.value)
-    for (const param of ['sync-failing', 'sync-fenced', 'boxes-refused', 'hidden-calls', 'hidden-hour', 'hidden-all', 'calls-all', 'held-back', 'held-back-remove']) expect(causes).toContain(param)
+    for (const param of ['sync-failing', 'flows-failing', 'sync-fenced', 'boxes-refused', 'hidden-calls', 'hidden-hour', 'hidden-all', 'calls-all', 'held-back', 'held-back-remove']) expect(causes).toContain(param)
   })
 
   it('puts the focus back on the delete button when told no or Escape, and on what is said once deleted (review 7 n°3)', async () => {

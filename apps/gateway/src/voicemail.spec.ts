@@ -410,7 +410,7 @@ const person = (id: string, extension: string): Person => ({ id, displayName: `P
  * The Gateway's own path against provider-wazo and a Wazo in memory: the directory lists `people` (`list` changes it,
  * then synchronises it), each of them given a mailbox. `db`: `voicemail_boxes` on PostgreSQL.
  */
-const throughTheGateway = async (people: Person[], db?: VoicemailBoxes, absenceMs?: number, lineKey?: string) => {
+const throughTheGateway = async (people: Person[], db?: VoicemailBoxes, absenceMs?: number, lineKey?: string, alertMs?: number) => {
   const secret = Buffer.alloc(32, 9)
   const wazo = fakeWazo(userId => mailboxNumber(holderKey(secret, userId)))
   // wazo-websocketd as it spoke on the Docker stack: init, then start; `created` sends the news of a message.
@@ -436,7 +436,7 @@ const throughTheGateway = async (people: Person[], db?: VoicemailBoxes, absenceM
   const directory = { listAll: async () => listed } as unknown as ContactDirectory
   const directorySync = new DirectorySync({ store, directory, tenantId: 'A', ...(absenceMs !== undefined ? { absenceMs } : {}) })
   await directorySync.run()
-  const { app, sip, as, heard } = await setup({ store, directorySync, mapped: false, voicemailProvider: vm, changeMs: 30, ...(db ? { db } : {}) })
+  const { app, sip, as, heard } = await setup({ store, directorySync, mapped: false, voicemailProvider: vm, changeMs: 30, ...(alertMs !== undefined ? { alertMs } : {}), ...(db ? { db } : {}) })
   /** A message left in the mailbox at the number of `userId`, as wazo-websocketd tells it. */
   const created = (userId: string, id: string) => {
     const message = { caller_id_name: 'Alice Martin', caller_id_num: '101', timestamp: 1792289524, folder: { type: 'new', name: 'inbox', id: 1 }, duration: 7, id }
@@ -2023,7 +2023,7 @@ describe('the call flows (step 11c-2, ADR 0028)', () => {
     expect(labels(g)).toEqual(['TwakePhone 801', 'TwakePhone 810'])
     const named = (number: string) => g.wazo.state.groups.find(x => x.label === `TwakePhone ${number}`)!.name
     expect(g.sip.flows()).toEqual([
-      { number: '800', route: `menu|1=q:${named('801')}:90~2=q:${named('810')}:18~3=e:203|custom/accueil` },
+      { number: '800', route: `menu|1=q:${named('801')}:90~2=s:${named('810')}:18~3=e:203|custom/accueil` },
       { number: '801', route: `queue|${named('801')}|90` },
       { number: '810', route: `seq|${named('810')}|18` }
     ])
@@ -2102,6 +2102,19 @@ describe('the call flows (step 11c-2, ADR 0028)', () => {
     expect((await g.store.listAlerts('A', {})).filter(a => a.alert.param === 'sync-failing')).toEqual([])
     await until('the flows read again', () => g.wazo.state.failGroups === 0, 5_000)
     expect(g.sip.flows().map(r => r.number)).toEqual(['810'])
+  })
+
+  it('tells the administrators when the flows keep failing (flows-failing), and keeps trying while the SIP server still holds routes of a flow deleted meanwhile', async () => {
+    const g = await throughTheGateway([person('p1', '201')], undefined, undefined, lineKey, 60)
+    expect((await post(g, flowOf({ members: ['201'] }))).statusCode).toBe(201)
+    await until('the flow told', () => g.sip.flows().length === 1, 5_000)
+    g.wazo.state.failGroups = 1_000
+    // The last flow deleted while Wazo answers 5xx: none stored, the SIP server still has its route.
+    expect((await g.app.inject({ method: 'DELETE', url: '/api/v1/admin/flows/810', headers: root })).statusCode).toBeLessThan(300)
+    let alerted = false
+    await until('the alert', () => (void g.store.listAlerts('A', {}).then(a => (alerted = a.some(x => x.alert.kind === 'voicemail' && x.alert.param === 'flows-failing'))), alerted), 8_000)
+    g.wazo.state.failGroups = 0
+    await until('the route withdrawn once Wazo answers again', () => g.sip.flows().length === 0, 8_000)
   })
 
   it('is not there without lines: 501, no capability, nothing at Wazo', async () => {

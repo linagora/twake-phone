@@ -145,7 +145,7 @@ type ReleaseRecord = ReleaseAsked & { applied: boolean; interrupted?: true; repl
 /** The release a round was given, until that round finishes: one that finds it again knows the one before stopped. */
 const VOICEMAIL_RELEASE_TRIED = 'voicemail:release-tried'
 /** What the administrators are told of the synchronisation of the mailboxes (kind `voicemail`). */
-const VOICEMAIL_FAILING = ['sync-failing', 'boxes-refused'] as const
+const VOICEMAIL_FAILING = ['sync-failing', 'boxes-refused', 'flows-failing'] as const
 /**
  * The erasures of the messages of a person asked (DELETE /me/history, POST /admin/voicemail/erase), by person:
  * `voicemail:erase:<userId>`, done by the Gateway that writes the mailboxes, at its next round.
@@ -1027,7 +1027,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
   const syncingVoicemail = new Map<string, { again: boolean; ended: Promise<void> }>()
   const voicemailRetryMs = options.voicemailRetryMs ?? RESTORE_RETRY_MS
   /**
-   * Since when each tenant's synchronisation fails (`sync-failing`), or leaves out mailboxes the voicemail server
+   * Since when each tenant's synchronisation fails (`sync-failing`), or its call flows (`flows-failing`), or leaves out mailboxes the voicemail server
    * refuses (`boxes-refused`), and whether the administrators were told: by tenant and what.
    */
   const voicemailFailing = new Map<string, { since: number; told: boolean }>()
@@ -1152,14 +1152,17 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
               if (flows.failed > 0) {
                 state.again = true
                 state.pause = true
-              }
+                await failingVoicemail(tenantId, 'flows-failing')
+              } else forgetFailing(tenantId, 'flows-failing')
             } catch (err) {
               if (!mayWriteVoicemail(tenantId) || fenced(err)) throw err
               app.log.error({ err, tenantId }, 'call flows not synchronised with the voicemail server (the SIP server keeps what it had)')
-              if (stored.length) {
+              // Flows stored, or routes still told to the SIP server while none is stored (the last flow deleted during the failure).
+              if (stored.length || ((await provider.listCallFlowRoutes?.().catch(() => [])) ?? []).length) {
                 state.again = true
                 state.pause = true
               }
+              await failingVoicemail(tenantId, 'flows-failing')
             }
           }
           attempt = 0

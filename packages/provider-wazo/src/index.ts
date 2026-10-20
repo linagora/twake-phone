@@ -1127,7 +1127,7 @@ export class WazoVoicemail implements VoicemailProvider {
           if (LINE_EXTENSION.test(target)) choices.push(`${digit}=e:${target}`)
         } else if (flow.kind !== 'menu') {
           const route = routes.find(r => r.number === target)
-          if (route) choices.push(`${digit}=q:${route.route.split('|')[1]}:${route.route.split('|')[2]}`)
+          if (route) choices.push(`${digit}=${flow.kind === 'queue' ? 'q' : 's'}:${route.route.split('|')[1]}:${route.route.split('|')[2]}`)
         }
       }
       if (!choices.length) continue

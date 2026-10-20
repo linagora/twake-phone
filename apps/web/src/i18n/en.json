@@ -938,6 +938,7 @@
   "admin.alert.operatorRemovalGone": "Removal of a forward let go: the operator no longer knows the line",
   "admin.alert.kind.voicemail": "Voicemail",
   "admin.alert.voicemailSyncFailing": "The mailboxes are no longer synchronised with the voicemail server (minutes of failure)",
+  "admin.alert.voicemailFlowsFailing": "The call flows are no longer synchronised with the voicemail server (minutes of failure)",
   "admin.alert.voicemailSyncFenced": "The SIP server refused a write of the mailboxes made under an older lease than its last one: see the documentation to reset its fence",
   "admin.alert.voicemailBoxesRefused": "Mailboxes the voicemail server keeps refusing to create or change (how many)",
   "admin.alert.voicemailHiddenCalls": "Callers with no number at their cap of calls at the same time to this mailbox",

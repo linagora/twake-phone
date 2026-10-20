@@ -939,6 +939,7 @@
   "admin.alert.operatorRemovalLate": "Renvoi d'une ligne à retirer chez l'opérateur depuis plus d'un jour",
   "admin.alert.kind.voicemail": "Messagerie vocale",
   "admin.alert.voicemailSyncFailing": "Les boîtes vocales ne sont plus synchronisées avec le serveur de messagerie (minutes d'échec)",
+  "admin.alert.voicemailFlowsFailing": "Les parcours d'appel ne sont plus synchronisés avec le serveur de messagerie (minutes d'échec)",
   "admin.alert.voicemailSyncFenced": "Le serveur SIP a refusé une écriture des boîtes vocales faite sous un bail plus ancien que son dernier : voir la documentation pour remettre sa barrière",
   "admin.alert.voicemailBoxesRefused": "Des boîtes vocales que le serveur de messagerie refuse toujours de créer ou de modifier (combien)",
   "admin.alert.voicemailHiddenCalls": "Les appelants sans numéro ont atteint leur plafond d'appels simultanés vers cette boîte",

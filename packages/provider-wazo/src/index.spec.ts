@@ -1191,7 +1191,7 @@ describe('WazoVoicemail, the call flows (step 11c-2)', () => {
     expect(done.routes).toEqual([
       { number: '810', route: `seq|${g810}|18` },
       { number: '801', route: `queue|${g801}|90` },
-      { number: '800', route: `menu|1=q:${g801}:90~2=q:${g810}:18~3=e:104|custom/accueil` }
+      { number: '800', route: `menu|1=q:${g801}:90~2=s:${g810}:18~3=e:104|custom/accueil` }
     ])
     // Again: nothing is written.
     const before = writes(wazo).length
@@ -1314,7 +1314,7 @@ describe('WazoVoicemail, the call flows (step 11c-2)', () => {
     expect(done.routes).toEqual([
       { number: '810', route: `seq|${g810}|18` },
       { number: '801', route: `queue|${g801}|90` },
-      { number: '800', route: `menu|1=q:${g801}:90~2=q:${g810}:18~3=e:104|custom/accueil` }
+      { number: '800', route: `menu|1=q:${g801}:90~2=s:${g810}:18~3=e:104|custom/accueil` }
     ])
     // Again: nothing is written.
     const before = writes(wazo).length
@@ -1386,7 +1386,7 @@ describe('WazoVoicemail, the call flows (step 11c-2)', () => {
     const done = await vm.syncFlows(flows)
     expect(done.failed).toBe(1)
     expect(logs.some(l => /flow 801 not made/.test(l))).toBe(true)
-    expect(done.routes.map(r => r.route)).toEqual([`seq|${groupOf(wazo, '810')}|18`, `menu|2=q:${groupOf(wazo, '810')}:18~3=e:104|custom/accueil`])
+    expect(done.routes.map(r => r.route)).toEqual([`seq|${groupOf(wazo, '810')}|18`, `menu|2=s:${groupOf(wazo, '810')}:18~3=e:104|custom/accueil`])
     wazo.state.refuseGroups.clear()
     expect((await vm.syncFlows(flows)).routes).toHaveLength(3)
     const none = await vm.syncFlows([{ number: '800', name: 'x', kind: 'menu', choices: { a: '104', '1': 'abc' } }])

@@ -277,7 +277,7 @@ export interface TelephonyAlert {
    * review 10b, n°2 and n°4, `number` the line): left as it was because someone changed it in the manager since
    * (`removal-changed`), let go because the operator no longer has the line (`removal-gone`), owed for over a day
    * (`removal-late`). `voicemail` (step 11a): raised by the Gateway, the synchronisation of the mailboxes fails since
-   * `value` minutes (`sync-failing`), the SIP server's database refused its write under the lease it holds
+   * `value` minutes (`sync-failing`; `flows-failing` for the call flows of step 11c-2), the SIP server's database refused its write under the lease it holds
    * (`sync-fenced`), or it keeps leaving out `value` mailboxes the voicemail server refuses (`boxes-refused`), or it holds back `value`
    * mailboxes of `threshold` reached, too many set aside at once (`held-back`), or `value` mailboxes past their grace
    * period, too many removed at once (`held-back-remove`); raised by
