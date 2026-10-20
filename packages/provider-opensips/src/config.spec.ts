@@ -121,7 +121,7 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     const key = 'twake-wazo-line-test-key-0123456789abcdef'
     const { cfg } = renderWhole({ WAZO_SIP: '127.0.0.1:5100', WAZO_LINES: '1', WAZO_LINE_KEY: key })
     // Read with the rules of the number dialled, one more column of the first query, never for an account an extension holds.
-    expect(cfg).toContain(`$var(flow_col) = ", (SELECT f.route FROM call_flows f WHERE f.number = '" + $rU + "' AND f.route ~ '^[A-Za-z0-9_.:=/~|-]{1,500}$' AND NOT EXISTS (SELECT 1 FROM subscriber s WHERE s.username = '" + $rU + "'))";`)
+    expect(cfg).toContain(`$var(flow_col) = ", (SELECT f.route FROM call_flows f WHERE f.number = '" + $rU + "' AND length(f.route) <= 500 AND f.route ~ '^[A-Za-z0-9_.:=/~|-]+$' AND NOT EXISTS (SELECT 1 FROM subscriber s WHERE s.username = '" + $rU + "'))";`)
     expect(cfg).toContain('$avp(vm_box);$avp(r_flow)"), rules_loaded);')
     const next = cfg.slice(cfg.indexOf('route[rules_next] {'), cfg.indexOf('route[rules_loaded] {'))
     expect(next.indexOf('if ($shv(wazo_lines_on) == 1)')).toBeGreaterThan(next.indexOf('$avp(q11) = 1;'))
@@ -157,7 +157,9 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     const before = render({ WAZO_SIP: '127.0.0.1:5100' }).cfg
     expect(before).not.toContain('call_flows')
     expect(before).not.toContain('flow_failed')
-    expect(before).not.toContain('X-Twake-Flow')
+    // Whatever a phone or the operator sent of the header goes with the others, with the lines or without (Wazo's dialplan reads it).
+    expect(before).not.toContain('append_hf("X-Twake-Flow')
+    expect(before).toContain('remove_hf("X-Twake-Flow");')
     // The table missing: the read goes again without it, as for the mailboxes.
     expect(cfg).toContain("to_regclass('call_flows') IS NULL")
   })
@@ -269,7 +271,7 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     }
     for (const header of ['route', 'route[trunk_in]']) {
       const body = routeBody(header)
-      for (const name of ['X-Twake-Mailbox', 'X-Twake-Voicemail']) {
+      for (const name of ['X-Twake-Mailbox', 'X-Twake-Voicemail', 'X-Twake-Flow']) {
         expect(body.match(new RegExp(`\\n\\tremove_hf\\("${name}"\\);\\n`, 'g')), `${header} ${name}`).toHaveLength(1)
         // Before the first of the routes it calls that could take the call to a mailbox.
         const removed = body.indexOf(`remove_hf("${name}");`)

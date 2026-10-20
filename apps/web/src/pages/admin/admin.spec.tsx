@@ -1212,7 +1212,7 @@ describe('the administration screens (step 7)', () => {
     expect($('#group-number-error')?.textContent).toContain('Un groupe de votre organisation a déjà ce numéro')
     expect(document.activeElement?.id).toBe('group-number')
   })
-  it('lists the call flows with what each does and whether Wazo runs it yet, and makes a queue after checking it as the Gateway does (step 11c-2)', async () => {
+  it('lists the call flows with what each does and whether the platform runs it yet, and makes a queue after checking it as the Gateway does (step 11c-2)', async () => {
     const listFlows = vi.fn(async () => ({
       items: [
         { number: '801', name: 'Support', kind: 'queue', members: ['102', '109'], ringSec: 12, waitSec: 90, vacant: ['109'], ready: true },
@@ -1307,7 +1307,7 @@ describe('the administration screens (step 7)', () => {
     expect(text()).toContain('Parcours 801 supprimé.')
   })
 
-  it('says a platform without Wazo has no call flows', async () => {
+  it('says a platform without lines has no call flows', async () => {
     admin({ listFlows: vi.fn(async () => Promise.reject(Object.assign(new Error('Gateway 501'), { status: 501 }))) })
     await render('/admin/flows', <CallFlows />)
     expect(text()).toContain('ne gère pas les standards vocaux')

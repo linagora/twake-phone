@@ -2018,9 +2018,9 @@ describe('the call flows (step 11c-2, ADR 0028)', () => {
     await until('the three flows told to the SIP server', () => g.sip.flows().length === 3, 5_000)
     expect(labels(g)).toEqual(['TwakePhone 801', 'TwakePhone 810'])
     expect(g.sip.flows()).toEqual([
-      { number: '800', route: 'menu|1=q:twakephone-801:90~2=q:twakephone-810:16~3=e:203|custom/accueil' },
+      { number: '800', route: 'menu|1=q:twakephone-801:90~2=q:twakephone-810:18~3=e:203|custom/accueil' },
       { number: '801', route: 'queue|twakephone-801|90' },
-      { number: '810', route: 'seq|twakephone-810|16' }
+      { number: '810', route: 'seq|twakephone-810|18' }
     ])
     // Nothing was told to the SIP server about a group Wazo did not have yet.
     for (const seen of seenAtTelling) expect(seen.length).toBeGreaterThan(0)

@@ -3653,7 +3653,7 @@ try {
       const rows = await until('the five flows in call_flows', async () => ((await flowRows()).length === 5 ? await flowRows() : null), { timeout: 180_000 })
       expectEqual(rows.map(r => r.number), ['800', '801', '802', '810', '811'], 'the numbers OpenSIPS sends to Wazo')
       const byNumber = Object.fromEntries(rows.map(r => [r.number, r.route]))
-      for (const [number, shape] of [['810', /^seq\|[A-Za-z0-9_.-]+\|10$/], ['811', /^seq\|[A-Za-z0-9_.-]+\|5$/], ['801', /^queue\|[A-Za-z0-9_.-]+\|40$/], ['802', /^queue\|[A-Za-z0-9_.-]+\|15$/], ['800', /^menu\|1=q:[A-Za-z0-9_.-]+:40~2=q:[A-Za-z0-9_.-]+:10\|twake-menu$/]])
+      for (const [number, shape] of [['810', /^seq\|[A-Za-z0-9_.-]+\|12$/], ['811', /^seq\|[A-Za-z0-9_.-]+\|6$/], ['801', /^queue\|[A-Za-z0-9_.-]+\|40$/], ['802', /^queue\|[A-Za-z0-9_.-]+\|15$/], ['800', /^menu\|1=q:[A-Za-z0-9_.-]+:40~2=q:[A-Za-z0-9_.-]+:12\|twake-menu$/]])
         if (!shape.test(byNumber[number])) throw new Error(`the route of ${number}: ${byNumber[number]}`)
       await sysconfdSettled()
       // Asterisk has them as Wazo's queues (one strategy for each kind), their members the lines of the extensions.

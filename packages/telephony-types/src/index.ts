@@ -85,7 +85,7 @@ export interface RingGroup {
  * other, each for `ringSec` seconds, the first to answer takes the call; `queue`, the caller waits (up to `waitSec`
  * seconds) until a member is free, each one ringing for `ringSec` seconds in turn; `menu`, an interactive voice
  * response (SVI): the caller hears the greeting and types a digit, which leads to the number it is set to. The
- * telephony server of Wazo runs all three.
+ * voicemail and telephony server (step 11) runs all three.
  */
 export type CallFlowKind = 'sequential' | 'queue' | 'menu'
 

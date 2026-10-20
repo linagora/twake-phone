@@ -1179,15 +1179,15 @@ describe('WazoVoicemail, the call flows (step 11c-2)', () => {
     const done = await vm.syncFlows(flows)
     expect(done.failed).toBe(0)
     expect(wazo.state.groups.map(g => [g.label, g.ring_strategy, g.timeout, g.user_timeout, g.ring_in_use, g.members.extensions.map(e => `${e.exten}@${e.context}`)])).toEqual([
-      ['TwakePhone 810', 'linear', 16, 8, false, ['102@twake-members', '103@twake-members']],
+      ['TwakePhone 810', 'linear', 18, 8, false, ['102@twake-members', '103@twake-members']],
       ['TwakePhone 801', 'least_recent', 90, 12, false, ['102@twake-members', '103@twake-members', '104@twake-members']]
     ])
     // Nothing of the people or of their names in Wazo, nor a user: the extensions only.
     expect(wazo.state.users).toEqual([])
     expect(done.routes).toEqual([
-      { number: '810', route: 'seq|twakephone-810|16' },
+      { number: '810', route: 'seq|twakephone-810|18' },
       { number: '801', route: 'queue|twakephone-801|90' },
-      { number: '800', route: 'menu|1=q:twakephone-801:90~2=q:twakephone-810:16~3=e:104|custom/accueil' }
+      { number: '800', route: 'menu|1=q:twakephone-801:90~2=q:twakephone-810:18~3=e:104|custom/accueil' }
     ])
     // Again: nothing is written.
     const before = writes(wazo).length
@@ -1223,10 +1223,13 @@ describe('WazoVoicemail, the call flows (step 11c-2)', () => {
     const { vm, wazo } = make({ lineKey: LINE_KEY })
     wazo.state.groups.push({ id: 900, uuid: 'other', name: 'sales', label: 'Sales', ring_strategy: 'all', timeout: null, user_timeout: null, retry_delay: null, ring_in_use: true, members: { extensions: [] } })
     await vm.syncFlows([{ number: '810', name: 'A', kind: 'queue', members: ['102'] }])
-    const done = await vm.syncFlows([{ number: '810', name: 'A', kind: 'sequential', members: ['102'] }])
+    const told: string[][] = []
+    const done = await vm.syncFlows([{ number: '810', name: 'A', kind: 'sequential', members: ['102'] }], { beforeRemoval: async gone => void told.push(gone) })
+    // The SIP server stops sending calls to the number before Wazo drops the group that is made again.
+    expect(told).toEqual([['810']])
     expect(wazo.state.groups.filter(g => g.label === 'TwakePhone 810').map(g => g.ring_strategy)).toEqual(['linear'])
     expect(wazo.state.groupStrategyEdits).toEqual([])
-    expect(done.routes).toEqual([{ number: '810', route: 'seq|twakephone-810|15' }])
+    expect(done.routes).toEqual([{ number: '810', route: 'seq|twakephone-810|16' }])
     await vm.syncFlows([])
     expect(wazo.state.groups.map(g => g.label)).toEqual(['Sales'])
   })
@@ -1237,7 +1240,7 @@ describe('WazoVoicemail, the call flows (step 11c-2)', () => {
     const done = await vm.syncFlows(flows)
     expect(done.failed).toBe(1)
     expect(logs.some(l => /flow 801 not made/.test(l))).toBe(true)
-    expect(done.routes.map(r => r.route)).toEqual(['seq|twakephone-810|16', 'menu|2=q:twakephone-810:16~3=e:104|custom/accueil'])
+    expect(done.routes.map(r => r.route)).toEqual(['seq|twakephone-810|18', 'menu|2=q:twakephone-810:18~3=e:104|custom/accueil'])
     wazo.state.refuseGroups.clear()
     expect((await vm.syncFlows(flows)).routes).toHaveLength(3)
     const none = await vm.syncFlows([{ number: '800', name: 'x', kind: 'menu', choices: { a: '104', '1': 'abc' } }])

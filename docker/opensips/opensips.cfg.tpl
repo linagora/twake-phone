@@ -934,9 +934,11 @@ route {
 	remove_hf("Twake-Room");
 	remove_hf("Twake-Join");
 	remove_hf("Twake-Conference");
-	# Which mailbox takes a call, and with which greeting (step 11a, route[voicemail]): this script says it, never a phone.
+	# Which mailbox takes a call, and with which greeting (step 11a, route[voicemail]), and which call flow (step 11c-2,
+	# route[rules_step]): this script says it, never a phone.
 	remove_hf("X-Twake-Mailbox");
 	remove_hf("X-Twake-Voicemail");
+	remove_hf("X-Twake-Flow");
 
 	if ($rU == NULL) {
 		send_reply(484, "Address Incomplete");
@@ -2059,6 +2061,7 @@ route[trunk_in] {
 	remove_hf("Twake-Conference");
 	remove_hf("X-Twake-Mailbox");
 	remove_hf("X-Twake-Voicemail");
+	remove_hf("X-Twake-Flow");
 	$var(n1) = "";
 	$var(n2) = "";
 	if (route(inbound_number, $rU))
@@ -2507,7 +2510,7 @@ route[read_failed] {
 	# the read goes again without it.
 	if ($avp(q11) == 1 && route(table_11_missing)) {
 		$shv(no11_until) = $Ts + 30;
-		xlog("L_WARN", "call $ci: the database has no voicemail_boxes (the Gateway of step 11a creates it): no mailbox for 30 s\n");
+		xlog("L_WARN", "call $ci: the database has no voicemail_boxes, or no table of the call flows (the Gateway of steps 11a and 11c-2 creates them): no mailbox and no call flow for 30 s\n");
 		return(1);
 	}
 	if ($avp(q4c) == 1 && route(tables_4c_missing)) {
@@ -3296,7 +3299,7 @@ route[rules_next] {
 			# Gateway writes once Wazo runs it. Only what a route is made of passes, and never a number an extension holds (an
 			# extension wins, as over a ring group).
 			if ($shv(wazo_lines_on) == 1)
-				$var(flow_col) = ", (SELECT f.route FROM call_flows f WHERE f.number = '" + $rU + "' AND f.route ~ '^[A-Za-z0-9_.:=/~|-]{1,500}$' AND NOT EXISTS (SELECT 1 FROM subscriber s WHERE s.username = '" + $rU + "'))";
+				$var(flow_col) = ", (SELECT f.route FROM call_flows f WHERE f.number = '" + $rU + "' AND length(f.route) <= 500 AND f.route ~ '^[A-Za-z0-9_.:=/~|-]+$' AND NOT EXISTS (SELECT 1 FROM subscriber s WHERE s.username = '" + $rU + "'))";
 			# wazo-lines: end
 		}
 		$var(rules_query) = "SELECT " + $var(rules_cols) + $var(first_cols) + $var(vm_col) + $var(flow_col) + $var(rules_from);

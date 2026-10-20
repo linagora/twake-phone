@@ -11,8 +11,8 @@ const statusOf = (err: unknown) => (err as { status?: unknown } | null)?.status
 /**
  * The organisation's call flows (step 11c-2, ADR 0028): sequential groups, queues and voice menus (SVI), each with a
  * number of its own. Administrators only; checked here as the Gateway checks it (each problem next to its field, the
- * focus on the first one); the Gateway checks every field again and says whether the number is free. A flow Wazo does
- * not run yet says so, a deletion is confirmed first, and a member nobody holds now is shown as vacant.
+ * focus on the first one); the Gateway checks every field again and says whether the number is free. A flow the telephony
+ * platform does not run yet says so, a deletion is confirmed first, and a member nobody holds now is shown as vacant.
  */
 export const CallFlows = () => {
   const { t } = useT()
