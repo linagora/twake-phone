@@ -3838,6 +3838,12 @@ try {
         throw err
       })
       expectEqual(await left(), { 101: 0, 102: 1, 103: 1 }, 'the windows of the people at OpenSIPS once the windows of this step left')
+      // Nothing of the calls of this step is left running at OpenSIPS (a dialog nobody ended), nor in the presence of the people they rang.
+      await until('no dialog left at OpenSIPS', async () => (((await mi('dlg_list')).result?.Dialogs ?? []).length ? null : true), { timeout: 30_000 }).catch(async err => {
+        console.log(`[11c-2] dialogs left: ${JSON.stringify(((await mi('dlg_list')).result?.Dialogs ?? []).map(d => [d.callid, d.state, d.from_uri, d.to_uri]))}`)
+        throw err
+      })
+      await presenceIs(jean.page, 'Durand', '103', 'Disponible', 30_000)
     })
   }
   await lineSteps()
