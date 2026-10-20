@@ -1240,12 +1240,12 @@ describe('WazoVoicemail, the call flows (step 11c-2)', () => {
 
   it('keeps the route of a group Wazo goes on running when it refuses a change of it, and takes the menus that lead to a group made again out of the SIP server first', async () => {
     let refuse = false
-    const inner!: Fetch
+    const inner: { fetch?: Fetch } = {}
     const { vm, wazo } = make({
       lineKey: LINE_KEY,
-      fetch: (url, init) => (refuse && init.method === 'PUT' && /\/groups\/[^/]+$/.test(new URL(url).pathname) ? Promise.resolve({ status: 400, headers: { get: () => 'application/json' }, json: async () => ['refused'], text: async () => '["refused"]', body: null }) : inner(url, init))
+      fetch: (url, init) => (refuse && init.method === 'PUT' && /\/groups\/[^/]+$/.test(new URL(url).pathname) ? Promise.resolve({ status: 400, headers: { get: () => 'application/json' }, json: async () => ['refused'], text: async () => '["refused"]', body: null }) : inner.fetch!(url, init))
     })
-    inner = wazo.fetch
+    inner.fetch = wazo.fetch
     const first = await vm.syncFlows(flows)
     const route = first.routes.find(r => r.number === '801')!
     // A change Wazo refuses: the queue it has goes on, so does its route; the failure is counted, and the next round tries again.
