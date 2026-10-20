@@ -2010,8 +2010,12 @@ describe('the call flows (step 11c-2, ADR 0028)', () => {
 
   it('has Wazo run a sequential group, a queue and a menu an administrator sets, and tells the SIP server once each is there (never before)', async () => {
     const g = await throughTheGateway([person('p1', '201'), person('p2', '202'), person('p3', '203')], undefined, undefined, lineKey)
-    const seenAtTelling: string[][] = []
-    g.sip.flowsHook.onTold = () => void seenAtTelling.push(labels(g))
+    // What the SIP server is told is never ahead of Wazo: each group a route names is there when it is told.
+    const aheadOfWazo: string[] = []
+    g.sip.flowsHook.onTold = routes => {
+      const have = new Set(g.wazo.state.groups.map(x => x.name))
+      for (const r of routes) for (const name of r.route.match(/grp-[a-z0-9-]+/g) ?? []) if (!have.has(name)) aheadOfWazo.push(`${r.number} ${name}`)
+    }
     expect((await post(g, flowOf({}))).statusCode).toBe(201)
     expect((await post(g, flowOf({ number: '801', name: 'Support', kind: 'queue', members: ['203', '201'], ringSec: 12, waitSec: 90 }))).statusCode).toBe(201)
     expect((await post(g, { number: '800', name: 'Standard', kind: 'menu', choices: { '1': '801', '2': '810', '3': '203' }, greeting: 'custom/accueil' })).statusCode).toBe(201)
@@ -2023,8 +2027,7 @@ describe('the call flows (step 11c-2, ADR 0028)', () => {
       { number: '801', route: `queue|${named('801')}|90` },
       { number: '810', route: `seq|${named('810')}|18` }
     ])
-    // Nothing was told to the SIP server about a group Wazo did not have yet.
-    for (const seen of seenAtTelling) expect(seen.length).toBeGreaterThan(0)
+    expect(aheadOfWazo).toEqual([])
     const listed = (await g.app.inject({ method: 'GET', url: '/api/v1/admin/flows', headers: root })).json().items
     expect(listed.map((f: { number: string; kind: string; ready: boolean }) => [f.number, f.kind, f.ready])).toEqual([['800', 'menu', true], ['801', 'queue', true], ['810', 'sequential', true]])
     expect(listed.find((f: { number: string }) => f.number === '801')).toMatchObject({ members: ['203', '201'], vacant: [], ringSec: 12, waitSec: 90 })
@@ -2088,6 +2091,19 @@ describe('the call flows (step 11c-2, ADR 0028)', () => {
     expect([group.statusCode, group.json().code]).toEqual([409, 'GROUP_NUMBER_TAKEN'])
   })
 
+  it('never fails the round of the mailboxes and lines because the flows could not be read: the new holder has their mailbox and line all the same, and the flows are tried again', async () => {
+    const g = await throughTheGateway([person('p1', '201')], undefined, undefined, lineKey)
+    expect((await post(g, flowOf({ members: ['201'] }))).statusCode).toBe(201)
+    await until('the flow told', () => g.sip.flows().length === 1, 5_000)
+    g.wazo.state.failGroups = 2
+    await g.list([person('p1', '201'), person('p2', '202')])
+    await until('the mailbox and the line of the new holder, the flows unreadable meanwhile', () => g.reached().includes('202') && g.sip.lines().includes('202'), 5_000)
+    // No alert of a synchronisation that fails: the mailboxes were synchronised; the flows are tried again and found as they were.
+    expect((await g.store.listAlerts('A', {})).filter(a => a.alert.param === 'sync-failing')).toEqual([])
+    await until('the flows read again', () => g.wazo.state.failGroups === 0, 5_000)
+    expect(g.sip.flows().map(r => r.number)).toEqual(['810'])
+  })
+
   it('is not there without lines: 501, no capability, nothing at Wazo', async () => {
     const g = await throughTheGateway([person('p1', '201')])
     expect((await g.app.inject({ method: 'GET', url: '/api/v1/admin/flows', headers: root })).statusCode).toBe(501)
@@ -2104,5 +2120,15 @@ describe('the call flows (step 11c-2, ADR 0028)', () => {
     await until('202 vacant', async () => (await read()).vacant?.join() === '202', 5_000)
     expect((await g.app.inject({ method: 'PUT', url: '/api/v1/admin/flows/810', headers: root, payload: flowOf({ members: ['202', '201'] }) })).statusCode).toBe(200)
     expect((await g.app.inject({ method: 'PUT', url: '/api/v1/admin/flows/810', headers: root, payload: flowOf({ members: ['203'] }) })).json().code).toBe('FLOW_MEMBER_NOT_EXTENSION')
+  })
+
+  it('keeps a key of a menu that leads to an extension nobody holds now, so that renaming the menu is not refused, and refuses a new one', async () => {
+    const g = await throughTheGateway([person('p1', '201'), person('p2', '202')], undefined, undefined, lineKey)
+    expect((await post(g, { number: '800', name: 'Standard', kind: 'menu', choices: { '1': '202' } })).statusCode).toBe(201)
+    await g.list([person('p1', '201')])
+    await until('202 held by nobody', async () => !(await g.store.listMappings('A')).some(m => m.extension === '202'), 5_000)
+    const put = (choices: Record<string, string>) => g.app.inject({ method: 'PUT', url: '/api/v1/admin/flows/800', headers: root, payload: { name: 'Accueil', kind: 'menu', choices } })
+    expect((await put({ '1': '202' })).statusCode).toBe(200)
+    expect((await put({ '1': '202', '2': '203' })).json().code).toBe('FLOW_CHOICE_TARGET')
   })
 })

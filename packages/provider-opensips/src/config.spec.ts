@@ -162,7 +162,7 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     // An unregistration is made here at once (never relayed to wait for Wazo): a last window whose connection closed before
     // Wazo answered stayed in `location` (measured against the OpenSIPS of the stack with a slow Wazo).
     const register = cfg.slice(cfg.indexOf('$var(wl_line) = 0;'), cfg.indexOf('mid_registrar_save("location");'))
-    expect(register).toContain('if ($var(wl_line) == 1 && ($hdr(Expires) == "0" || $hdr(Contact) == "*" || $hdr(Contact) =~ ";expires=0($|[;,])"))\n\t\t\t$var(wl_line) = 0;')
+    expect(register).toContain('$hdr(Contact) =~ ";expires=0($|[;,])" || ($hdr(Expires) == "0" && !($hdr(Contact) =~ ";expires=[1-9]"))))\n\t\t\t$var(wl_line) = 0;')
     expect(register.indexOf('$hdr(Expires) == "0"')).toBeLessThan(register.indexOf('if ($var(wl_line) == 1) {'))
     // Whatever a phone or the operator sent of the header goes with the others, with the lines or without (Wazo's dialplan reads it).
     expect(before).not.toContain('append_hf("X-Twake-Flow')
@@ -1809,6 +1809,23 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(render({ PUSH_WAIT_SEC: '5' }).status).toBe(0)
     expect(render({ PUSH_WAIT_SEC: '120' }).cfg).toContain('$var(wait) = 120;')
     expect(render().cfg).toContain('$var(wait) = 30;')
+  })
+
+  it('bounds the calls of the flows per caller and in all (step 11c-2, ADR 0028)', () => {
+    const { cfg } = renderWhole({ WAZO_SIP: '127.0.0.1:5100', WAZO_LINES: '1', WAZO_LINE_KEY: 'k'.repeat(40) })
+    expect(cfg).toContain('flow_per_caller')
+    expect(cfg).toContain('flow_calls_all')
+    expect(cfg).toContain('route(group_missed, "486 Busy Here")')
+    expect(cfg).toContain('"flow_per_caller=i:3"')
+    expect(cfg).toContain('"flow_calls_all=i:60"')
+    for (const v of ['FLOW_CALLS_PER_CALLER', 'FLOW_CALLS_ALL']) {
+      for (const bad of ['0', 'abc', '-1', '1000000']) {
+        const { status, stderr } = render({ [v]: bad })
+        expect(status, `${v}=${bad}`).toBe(1)
+        expect(stderr).toMatch(new RegExp(v))
+      }
+    }
+    expect(renderWhole({ WAZO_SIP: '127.0.0.1:5100', WAZO_LINES: '1', WAZO_LINE_KEY: 'k'.repeat(40), FLOW_CALLS_PER_CALLER: '7', FLOW_CALLS_ALL: '90' }).cfg).toContain('flow_per_caller=i:7')
   })
 
   it('never answers 404 for a number whose rules could not be read: it may be a ring group', () => {

@@ -247,6 +247,14 @@ modparam("cfgutils", "shvset", "wazo_lines_mute_until=i:0")
 # `wazo_lines` (the extensions that have a line) unreadable (the Gateway has not made it, the database cannot say): no
 # line for 30 s, as for the tables of the steps before.
 modparam("cfgutils", "shvset", "wazo_lines_nodb_until=i:0")
+# wazo-lines: begin
+# The calls to the call flows in progress (step 11c-2, route[rules_step]): per caller, and all of them; the bounds
+# FLOW_CALLS_PER_CALLER and FLOW_CALLS_ALL, changeable by MI shv_set for the calls to come.
+modparam("dialog", "profiles_with_value", "flow_caller")
+modparam("dialog", "profiles_no_value", "flow_all")
+modparam("cfgutils", "shvset", "flow_per_caller=i:${FLOW_CALLS_PER_CALLER}")
+modparam("cfgutils", "shvset", "flow_calls_all=i:${FLOW_CALLS_ALL}")
+# wazo-lines: end
 # The bounds of the calls to the mailboxes (route[voicemail]), for the calls to come once changed (MI shv_set; the e2e
 # lowers the caps a moment): VOICEMAIL_MAX_CALL_SEC, which the Gateway reads (shv_get) and compares with the longest
 # message of its voicemail server at its start; VOICEMAIL_CALLS_PER_CALLER,
@@ -849,7 +857,7 @@ route {
 		# stayed in `location` when the answer came too late, a window gone that calls kept ringing (477) until its
 		# registration expired. Wazo keeps its contact for the extension until it expires (outgoing_expires): a call it
 		# places there finds no window and fails at once, and the next window's registration is absorbed as a refresh.
-		if ($var(wl_line) == 1 && ($hdr(Expires) == "0" || $hdr(Contact) == "*" || $hdr(Contact) =~ ";expires=0($|[;,])"))
+		if ($var(wl_line) == 1 && ($hdr(Contact) == "*" || $hdr(Contact) =~ ";expires=0($|[;,])" || ($hdr(Expires) == "0" && !($hdr(Contact) =~ ";expires=[1-9]"))))
 			$var(wl_line) = 0;
 		if ($var(wl_line) == 1) {
 			consume_credentials();
@@ -3364,6 +3372,25 @@ route[rules_step] {
 			route(calling);
 			route(group_missed, "480 Temporarily Unavailable");
 			t_reply(480, "Temporarily Unavailable");
+			exit;
+		}
+		# The calls to the flows at the same time, under a lock: of two calls at once, one counts the other. Past a bound, busy:
+		# each call holds a channel of Wazo's Asterisk and a session of rtpengine, a queue's for as long as its callers wait.
+		$var(fl_room) = 0;
+		get_static_lock("flow_count");
+		get_profile_size("flow_caller", "$avp(caller)", $var(fl_mine));
+		get_profile_size("flow_all", , $var(fl_all));
+		if ($var(fl_mine) < $shv(flow_per_caller) && $var(fl_all) < $shv(flow_calls_all)) {
+			set_dlg_profile("flow_caller", "$avp(caller)");
+			set_dlg_profile("flow_all");
+			$var(fl_room) = 1;
+		}
+		release_static_lock("flow_count");
+		if ($var(fl_room) != 1) {
+			xlog("L_NOTICE", "call $ci: the flow $rU refused, $var(fl_mine) calls of this caller and $var(fl_all) of all callers to the flows\n");
+			route(calling);
+			route(group_missed, "486 Busy Here");
+			t_reply(486, "Busy Here");
 			exit;
 		}
 		$var(from_kind) = 0;

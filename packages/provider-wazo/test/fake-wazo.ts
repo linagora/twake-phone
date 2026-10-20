@@ -46,6 +46,8 @@ export const fakeWazo = (numberOf: (userId: string) => string) => {
     groupName: undefined as ((label: string) => string) | undefined,
     /** Every edit of a group's strategy (wazo-confd takes it, Asterisk does not for `linear`): there must be none. */
     groupStrategyEdits: [] as string[],
+    /** The next reads of the groups fail (500) this many times. */
+    failGroups: 0,
     /** The groups wazo-confd refuses to make (400), by label. */
     refuseGroups: new Set<string>(),
     /** The next line made is made, then refused (500: wazo-sysconfd failing after wazo-confd committed). */
@@ -165,7 +167,13 @@ export const fakeWazo = (numberOf: (userId: string) => string) => {
       state.lines = state.lines.filter(l => l.id !== Number(m![1]))
       return json(204)
     }
-    if (path === '/1.1/groups' && init.method === 'GET') return page(state.groups)
+    if (path === '/1.1/groups' && init.method === 'GET') {
+      if (state.failGroups > 0) {
+        state.failGroups--
+        return json(500, ['groups unavailable'])
+      }
+      return page(state.groups)
+    }
     if (path === '/1.1/groups' && init.method === 'POST') {
       if (state.refuseGroups.has(body.label)) return json(400, ['Resource Error - refused'])
       if (!/^[-_.a-zA-Z0-9 ]+$/.test(body.label ?? '')) return json(400, ['label does not match'])

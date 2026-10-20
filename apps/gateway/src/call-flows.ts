@@ -39,10 +39,11 @@ const integerIn = (value: unknown, range: { min: number; max: number; default: n
 
 /**
  * Validates a call flow an administrator sets and returns the record to keep. `keep`: the members the flow already has (a
- * vacant extension stays a member until an administrator takes it out, as in a ring group). A 400 or 409 with a `code`
- * the app turns into words.
+ * vacant extension stays a member until an administrator takes it out, as in a ring group), `keepTargets` the numbers the keys
+ * of a menu already lead to (likewise: changing a menu's name is not refused because a key's extension is vacant now). A 400 or
+ * 409 with a `code` the app turns into words.
  */
-export const parseCallFlow = async (tenantId: string, number: string, body: unknown, checks: FlowChecks, mode: 'create' | 'replace', keep: readonly string[] = []): Promise<CallFlowRecord> => {
+export const parseCallFlow = async (tenantId: string, number: string, body: unknown, checks: FlowChecks, mode: 'create' | 'replace', keep: readonly string[] = [], keepTargets: readonly string[] = []): Promise<CallFlowRecord> => {
   if (!EXTENSION_FORMAT.test(number)) throw refused('FLOW_NUMBER', 'invalid number: 2 to 6 digits, the first not 0')
   if (isReservedNumber(number)) throw refused('FLOW_NUMBER_RESERVED', `${number} is an emergency number or another short number of the French plan: calls to it go to the operator`)
   if ((await checks.isExtension(number)) || (await checks.taken(number))) throw refused('FLOW_NUMBER_TAKEN', `${number} is already a number of the organisation`, 409)
@@ -62,7 +63,7 @@ export const parseCallFlow = async (tenantId: string, number: string, body: unkn
       if (target === number) throw refused('FLOW_CHOICE_TARGET', 'a menu cannot lead to itself')
       const other = checks.flows.get(target)
       // An extension of the organisation, or a sequential group or a queue of it (a menu in a menu waits for a use that asks).
-      if (other ? other.kind === 'menu' : !(EXTENSION_FORMAT.test(target) && (await checks.isExtension(target)))) throw refused('FLOW_CHOICE_TARGET', `${target.slice(0, 64)}: a choice leads to an extension, a sequential group or a queue of your organisation`)
+      if (other ? other.kind === 'menu' : !(EXTENSION_FORMAT.test(target) && (keepTargets.includes(target) || (await checks.isExtension(target))))) throw refused('FLOW_CHOICE_TARGET', `${target.slice(0, 64)}: a choice leads to an extension, a sequential group or a queue of your organisation`)
       choices[digit] = target
     }
     if (Object.keys(choices).length === 0) throw refused('FLOW_CHOICES', 'a menu needs choices: a digit and the number it leads to')

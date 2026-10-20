@@ -1115,21 +1115,33 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
           // The sequential groups, queues and voice menus (step 11c-2, ADR 0028), once the lines their members ring through
           // are there: Wazo makes them, then the SIP server is told which numbers go there (and stops sending calls to
           // one before Wazo loses it).
+          // A failure of the flows (the right to read Wazo's groups missing, a Wazo that answers 5xx there) never fails the round of the
+          // mailboxes and lines above: it is said, and tried again after a pause when the tenant has flows to run.
           if (vm.linesOn && vm.syncFlows && provider.setCallFlowRoutes) {
-            const flows = await vm.syncFlows(
-              (await store.listCallFlows(tenantId)).map(f => ({ number: f.number, name: f.name, kind: f.kind, ...(f.kind !== 'menu' ? { members: f.members, ringSec: f.ringSec ?? 15 } : {}), ...(f.waitSec ? { waitSec: f.waitSec } : {}), ...(f.kind === 'menu' ? { choices: f.choices, ...(f.greeting ? { greeting: f.greeting } : {}) } : {}) })),
-              {
-                mayWrite: () => mayWriteVoicemail(tenantId),
-                beforeRemoval: async gone => {
-                  const told = (await provider.listCallFlowRoutes?.()) ?? []
-                  await provider.setCallFlowRoutes?.(told.filter(r => !gone.includes(r.number)))
+            const stored = await store.listCallFlows(tenantId)
+            try {
+              const flows = await vm.syncFlows(
+                stored.map(f => ({ number: f.number, name: f.name, kind: f.kind, ...(f.kind !== 'menu' ? { members: f.members, ringSec: f.ringSec ?? 15 } : {}), ...(f.waitSec ? { waitSec: f.waitSec } : {}), ...(f.kind === 'menu' ? { choices: f.choices, ...(f.greeting ? { greeting: f.greeting } : {}) } : {}) })),
+                {
+                  mayWrite: () => mayWriteVoicemail(tenantId),
+                  beforeRemoval: async gone => {
+                    const told = (await provider.listCallFlowRoutes?.()) ?? []
+                    await provider.setCallFlowRoutes?.(told.filter(r => !gone.includes(r.number)))
+                  }
                 }
+              )
+              await provider.setCallFlowRoutes(flows.routes)
+              if (flows.failed > 0) {
+                state.again = true
+                state.pause = true
               }
-            )
-            await provider.setCallFlowRoutes(flows.routes)
-            if (flows.failed > 0) {
-              state.again = true
-              state.pause = true
+            } catch (err) {
+              if (!mayWriteVoicemail(tenantId) || fenced(err)) throw err
+              app.log.error({ err, tenantId }, 'call flows not synchronised with the voicemail server (the SIP server keeps what it had)')
+              if (stored.length) {
+                state.again = true
+                state.pause = true
+              }
             }
           }
           attempt = 0
@@ -2068,7 +2080,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
           const records = await store.listCallFlows(user.tenantId)
           const current = records.find(f => f.number === req.params.number)
           if (!current) throw Object.assign(new Error('No such flow'), { statusCode: 404 })
-          const f = await parseCallFlow(user.tenantId, req.params.number, req.body, await flowChecks(user.tenantId, provider, records), 'replace', current.members)
+          const f = await parseCallFlow(user.tenantId, req.params.number, req.body, await flowChecks(user.tenantId, provider, records), 'replace', current.members, Object.values(current.choices))
           const leading = f.kind === 'menu' ? menusLeadingTo(records, f.number) : []
           if (leading.length) throw Object.assign(new Error(`the menu ${leading[0]} leads to it: a menu cannot lead to a menu`), { statusCode: 409, code: 'FLOW_IN_USE' })
           await store.upsertCallFlow(f)

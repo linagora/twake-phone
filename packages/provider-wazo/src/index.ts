@@ -1060,7 +1060,10 @@ export class WazoVoicemail implements VoicemailProvider {
     const gone = [...have.keys()].filter(n => !groupFlows.some(f => f.number === n))
     // A group made again (its flow changed kind) leaves the SIP server first as well.
     const remade = groupFlows.filter(f => have.get(f.number)?.ring_strategy && have.get(f.number)!.ring_strategy !== strategyOf(f)).map(f => f.number)
-    if (gone.length || remade.length) await options.beforeRemoval?.([...gone, ...remade])
+    // The menus that lead to a group that goes or is made again leave the SIP server first too: their route names the group.
+    const leaving = new Set([...gone, ...remade])
+    const menus = [...wanted.values()].filter(f => f.kind === 'menu' && Object.values(f.choices ?? {}).some(t => leaving.has(t))).map(f => f.number)
+    if (leaving.size) await options.beforeRemoval?.([...leaving, ...menus])
     for (const number of gone) {
       try {
         await this.json(`${confd}/groups/${have.get(number)!.uuid}`, 'DELETE', undefined, guard)
@@ -1098,6 +1101,9 @@ export class WazoVoicemail implements VoicemailProvider {
         made.set(f.number, group)
       } catch (err) {
         refused('made', f.number, err)
+        // A change Wazo refused leaves the group it had, which goes on running: its route stays (the next round tries again).
+        const kept = have.get(f.number)
+        if (kept && (!kept.ring_strategy || kept.ring_strategy === strategyOf(f)) && QUEUE_NAME.test(kept.name ?? '')) made.set(f.number, kept)
       }
     }
     const routes: CallFlowRoute[] = []
