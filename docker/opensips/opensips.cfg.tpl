@@ -653,8 +653,9 @@ route {
 		# A re-INVITE records the route again: an operator (Cirpack) builds its route set from the 2xx of a re-INVITE,
 		# which the phone answers with the Record-Route of the request alone; without our entries its ACK and BYE come
 		# with no Route to us and a Contact that is the phone's own (404). After fix_route_dialog, so that both sockets
-		# of the route (r2) are known.
-		if (is_method("INVITE"))
+		# of the route (r2) are known. Only from the side of the caller: record_route writes the From tag of the request
+		# as ftag, and the direction of every later request (is_direction) reads it; a re-INVITE of the callee would turn it.
+		if (is_method("INVITE") && is_direction("downstream"))
 			record_route();
 		if (is_method("INVITE|UPDATE") && has_body_part("application/sdp")) {
 			route(rtp_offer);

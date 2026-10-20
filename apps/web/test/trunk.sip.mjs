@@ -539,7 +539,7 @@ try {
     const placed = await A.call('+33199000301', { from: '+33639980002' })
     expect('final answer', (await placed.final).status === 200)
     const got = await p301.incoming(i => header(i, 'call-id') === placed.callId)
-    const entries = msg => (msg.headers.get('record-route') ?? []).flatMap(v => v.split(/,\s*(?=<)/))
+    const entries = msg => (msg.headers.get('record-route') ?? []).flatMap(v => v.split(/,\s*(?=<)/)).map(v => v.replace(/;did=[^;>]*/, ''))
     const first = entries(placed.answer)
     const answer = await A.reinvite(placed)
     expect('re-INVITE answered', answer.status === 200, answer.first)
