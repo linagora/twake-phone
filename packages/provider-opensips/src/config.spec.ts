@@ -1864,7 +1864,7 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     // Every offer (the initial one, the one in a 2xx, the mailbox's) says it; an answer does not, rtpengine remembers.
     const tpl = readFileSync(join(dir, 'opensips.cfg.tpl'), 'utf8')
     expect(tpl).toContain('route(rtp_flags, $var(to_kind), $var(from_kind));')
-    expect(tpl).toContain('route(rtp_flags, $var(offer_to), $var(callee_kind));')
+    expect(tpl).toContain('route(rtp_flags, $var(offer_to), $var(offer_origin));')
     expect(tpl).toContain('route(rtp_flags, 0, $var(from_kind));')
     // An answer does not (rtpengine remembers the offer's), and only the operator (kind 1) is the external network.
     expect(tpl).toContain('route(rtp_flags, $var(answer_to));')

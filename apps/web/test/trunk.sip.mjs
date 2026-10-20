@@ -391,6 +391,9 @@ try {
     const at = await atOperator(A, call)
     expect('the operator is offered the external address', connectionOf(at.invite.body) === EXTERNAL, at.invite.body)
     expect('the phone is given the internal address', connectionOf(call.final.body) === INTERNAL, call.final.body)
+    // The operator refreshing its session with an INVITE without SDP: the offer in the phone's 2xx still goes out on the external interface.
+    const refresh = await A.reinvite(at)
+    expect('the operator\'s refresh is answered with the external address', refresh.status === 200 && connectionOf(refresh.body) === EXTERNAL, refresh.body)
     await p301.hangup(call)
     const placed = await A.call('+33199000301', { from: '+33639980002' })
     const answer = await placed.final
@@ -398,6 +401,8 @@ try {
     expect('the operator is given the external address', connectionOf(answer.body) === EXTERNAL, answer.body)
     const got = await p301.incoming(i => header(i, 'call-id') === placed.callId)
     expect('the phone is offered the internal address', connectionOf(got.invite.body) === INTERNAL, got.invite.body)
+    const refreshed = await A.reinvite(placed)
+    expect('the operator\'s refresh is answered with the external address', refreshed.status === 200 && connectionOf(refreshed.body) === EXTERNAL, refreshed.body)
     await placed.hangup()
     await p301.callState(got, 'ended', 5_000)
   })

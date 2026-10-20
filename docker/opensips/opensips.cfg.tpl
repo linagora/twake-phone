@@ -467,11 +467,12 @@ route[rtp_late_offer] {
 		$var(offer_to) = 1;
 	else if ($avp(late_offer) == "meet")
 		$var(offer_to) = 2;
-	# The 2xx that carries this offer comes from the callee.
-	$var(callee_kind) = 0;
-	if ($dlg_val(trunk) == "callee")
-		$var(callee_kind) = 1;
-	route(rtp_flags, $var(offer_to), $var(callee_kind));
+	# The 2xx that carries this offer comes from the other side than the INVITE's sender: the operator's when the
+	# call has one and the offer is not going to it.
+	$var(offer_origin) = 0;
+	if ($dlg_val(trunk) != NULL && $var(offer_to) != 1)
+		$var(offer_origin) = 1;
+	route(rtp_flags, $var(offer_to), $var(offer_origin));
 	if (rtpengine_offer("$var(rtp_flags)")) {
 		$avp(rtp_on) = 1;
 		$dlg_val(late_answer) = "1";

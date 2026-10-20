@@ -16,7 +16,7 @@ Constaté sur un appel réel avec OVHcloud : le côté opérateur marchait (1219
 
 ### 2. Le script dit, à chaque offre, quelle interface fait face à quel côté
 
-Les côtés ont déjà un genre (`route[sides]`) : 0 un navigateur, 1 l'opérateur, 2 LiveKit SIP. `route[rtp_flags]` reçoit, en plus du genre du côté où va l'offre, celui du côté d'où elle vient, et ajoute `direction=<d'où> direction=<où>` : **`external` pour l'opérateur (genre 1), `internal` pour tout le reste** (navigateurs, LiveKit SIP, les postes et la messagerie de Wazo, qui sont du côté de la machine). Les trois endroits qui font une offre le font : l'offre initiale, l'offre dans un 2xx (INVITE sans SDP) et celle de la messagerie. Une réponse ne le dit pas : rtpengine retient les interfaces de l'offre pour la réponse et les offres suivantes (documentation du protocole ng, clé `direction`).
+Les côtés ont déjà un genre (`route[sides]`) : 0 un navigateur, 1 l'opérateur, 2 LiveKit SIP. `route[rtp_flags]` reçoit, en plus du genre du côté où va l'offre, celui du côté d'où elle vient, et ajoute `direction=<d'où> direction=<où>` : **`external` pour l'opérateur (genre 1), `internal` pour tout le reste** (navigateurs, LiveKit SIP, les postes et la messagerie de Wazo, qui sont du côté de la machine). Les trois endroits qui font une offre le font : l'offre initiale, l'offre dans un 2xx (INVITE sans SDP, de l'appelant ou, en dialogue, de l'opérateur qui rafraîchit sa session : le 2xx vient alors du côté opposé à l'expéditeur) et celle de la messagerie. Une réponse ne le dit pas : rtpengine retient les interfaces de l'offre pour la réponse et les offres suivantes (documentation du protocole ng, clé `direction`).
 
 ### 3. Une seule variable partagée dans le script
 
