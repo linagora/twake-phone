@@ -3257,6 +3257,8 @@ try {
       await alice.page.getByTestId('conference-participant').nth(2).waitFor({ timeout: 20_000 })
       const firsts = {}
       for (const [typed, uri] of [['06 39 98 00 07', '+33639980007'], ['06 39 98 00 08', '+33639980008']]) {
+        // The form of the one before closes when that participant has joined: a click before it closes would close it, not open it.
+        await alice.page.getByLabel('Participant à ajouter (poste ou numéro)').waitFor({ state: 'hidden', timeout: 20_000 })
         await alice.page.getByRole('button', { name: 'Ajouter un participant' }).click()
         await alice.page.getByLabel('Participant à ajouter (poste ou numéro)').fill(typed)
         await alice.page.getByRole('button', { name: 'Appeler et ajouter' }).click()
