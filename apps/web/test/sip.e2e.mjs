@@ -3778,27 +3778,22 @@ try {
       expectEqual([menuLoop.statusCode, menuLoop.json().code], [400, 'FLOW_CHOICE_TARGET'], 'a menu that leads to a menu')
       expectEqual((await flowRows()).length, 5, 'flows after the refusals')
     })
-    await step('step 11c-2, no regression: Wazo silent (its Asterisk paused), a call to a flow is told unreachable (480, never 404) within seconds; once it answers again, and the OpenSIPS that left the flows out for 30 s takes them again, the people call each other as before', async () => {
-      compose('pause', 'wazo-asterisk')
+    await step('step 11c-2: a flow Wazo no longer has (its route names a queue Asterisk lacks) is told unreachable (480, never 404) and is a missed call of the flow; a route OpenSIPS would not read is left out', async () => {
+      // A row written by hand, as the Gateway's would be had Wazo lost the group meanwhile (the next round of the Gateway puts the rows right).
+      const missedAfter = await lastId('missed_calls')
+      await db.query("INSERT INTO call_flows (number, tenant_id, route) VALUES ('819', $1, 'queue|grp-nobody-has-it|20') ON CONFLICT (number) DO UPDATE SET route = EXCLUDED.route", [TENANT])
       try {
-        const ended = await dialUntilEnded(alice.page, '810')
-        expectEqual(ended.endStatus, 480, 'SIP status of a call to a flow while Wazo is silent')
-        await alice.page.getByText('810 est injoignable.').waitFor()
-        // The server that does not answer leaves the flows and the mailboxes out for 30 s.
-        const muted = Number(await shvOf('wazo_mute_until'))
-        if (!(muted > Date.now() / 1000 - 5)) throw new Error(`Wazo was not left out: wazo_mute_until ${muted}`)
-        await dial(alice.page, '102')
-        await jean.page.getByTestId('incoming-call').getByText('Appel entrant de Alice Martin (101)').waitFor({ timeout: 20_000 })
-        await jean.page.getByTestId('incoming-call').getByRole('button', { name: 'Refuser' }).click()
-        await alice.page.getByText("102 a refusé l'appel.").waitFor({ timeout: 20_000 })
+        const ended = await dialUntilEnded(alice.page, '819')
+        expectEqual(ended.endStatus, 480, 'SIP status of a call to a flow Asterisk lacks')
+        await alice.page.getByText('819 est injoignable.').waitFor()
+        await until('the missed call of 819', async () => ((await missedSince(missedAfter)).includes('101>819 480') ? true : null), { timeout: 15_000 })
+        // A route with other characters than a route has is never read (the print of the SQL regular expression: nothing reaches Asterisk).
+        await db.query("UPDATE call_flows SET route = 'queue|a b;c|20' WHERE number = '819'")
+        const refused = await dialUntilEnded(alice.page, '819')
+        expectEqual(refused.endStatus, 404, 'SIP status of a call to a number whose route OpenSIPS does not read')
       } finally {
-        compose('unpause', 'wazo-asterisk')
+        await db.query("DELETE FROM call_flows WHERE number = '819'")
       }
-      // What Asterisk read after the pause (the INVITE and its CANCEL, in order) rings nobody.
-      await sleep(3_000)
-      for (const w of [jean, jeanW, bob, bobW]) expectEqual(await ringing(w).count(), 0, `incoming calls of ${w.name} after Wazo answers again`)
-      await until('Wazo taken again by OpenSIPS', async () => (Number(await shvOf('wazo_mute_until')) <= Date.now() / 1000 ? true : null), { timeout: 45_000 })
-      await sysconfdSettled()
     })
     await step('step 11c-2: Alice removes the flows in Administration, each once confirmed (the menu first: a menu that leads to a flow keeps it): OpenSIPS stops sending calls there before Wazo drops the groups', async () => {
       await openAdmin(alice.page, "Parcours d'appel")
