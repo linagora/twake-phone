@@ -1,6 +1,6 @@
 # ADR 0027 : Wazo fait sonner les navigateurs : `mid_registrar` pour les extensions qui ont une ligne chez Wazo, un socket de lignes à part, aucun appel interne par Wazo
 
-Date : 2026-10-19. État : proposée. Décidée à la PR de l'étape 11c-1, dans le fil de discussion du projet (ligne « 11. Wazo » du plan, découpée en 11a à 11d dans `stories/etape-11-wazo.md`) ; précise l'ADR 0005 et l'ADR 0022 (« `mid_registrar` vient avec 11c ») ; amende l'ADR 0022 sur deux points (Wazo n'a plus « rien de la personne » : une ligne par extension tenue ; un changement d'extension écrit dans Wazo) ; remplacé par : aucun.
+Date : 2026-10-19. État : proposée. Décidée à la PR de l'étape 11c-1, dans le fil de discussion du projet (ligne « 11. Wazo » du plan, découpée en 11a à 11d dans `stories/etape-11-wazo.md`) ; précise l'ADR 0005 et l'ADR 0022 ; l'ADR 0028 y met le SVI, les files et les groupes séquentiels (« `mid_registrar` vient avec 11c ») ; amende l'ADR 0022 sur deux points (Wazo n'a plus « rien de la personne » : une ligne par extension tenue ; un changement d'extension écrit dans Wazo) ; remplacé par : aucun.
 
 ## Contexte
 
@@ -36,7 +36,7 @@ Le choix est le moins risqué : OpenSIPS seul décide du chemin d'un appel inter
 ### 5. Ce qui est éteint, et ce qui n'est pas fait
 
 - `WAZO_LINES` vide (défaut) ou Wazo éteint (`WAZO_SIP` vide) : pas de socket de lignes, `wazo_lines_on` à 0, aucune lecture de `wazo_lines`, aucun appel à `mid_registrar`. Les tests de configuration lisent le gabarit sans les blocs de lignes (`# wazo-lines: begin` à `end`) pour tout ce que les étapes d'avant tiennent, et le gabarit entier pour ce qui est neuf (dont le plafond de 99 routes nommées que ce OpenSIPS accepte : les blocs sont dans la route principale, aucune route nommée de plus).
-- 11c-1 ne fait pas : un SVI, une file, un groupe séquentiel, un transfert ou un renvoi d'un appel de Wazo, la présence des lignes (l'état de l'enregistrement chez Wazo n'est lu nulle part), un appel d'un navigateur par Wazo, une rotation de `WAZO_LINE_KEY` (les mots de passe des lignes faites ne changent pas), le retrait d'un contact chez Wazo quand une extension perd sa ligne (il expire).
+- 11c-1 ne fait pas (le SVI, les files et les groupes séquentiels viennent avec l'ADR 0028) : un SVI, une file, un groupe séquentiel, un transfert ou un renvoi d'un appel de Wazo, la présence des lignes (l'état de l'enregistrement chez Wazo n'est lu nulle part), un appel d'un navigateur par Wazo, une rotation de `WAZO_LINE_KEY` (les mots de passe des lignes faites ne changent pas), le retrait d'un contact chez Wazo quand une extension perd sa ligne (il expire).
 
 ## Conséquences
 
