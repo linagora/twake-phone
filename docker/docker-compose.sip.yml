@@ -51,6 +51,9 @@ services:
     build: ./rtpengine
     environment:
       RTPENGINE_INTERFACE: ${RTPENGINE_INTERFACE:-127.0.0.1}
+      # Two interfaces instead (ADR 0030; the CI sets 127.0.0.1 and 127.0.0.2): browsers and local services, the operator.
+      RTPENGINE_INTERFACE_INTERNAL: ${RTPENGINE_INTERFACE_INTERNAL:-}
+      RTPENGINE_INTERFACE_EXTERNAL: ${RTPENGINE_INTERFACE_EXTERNAL:-}
       RTPENGINE_LISTEN: 127.0.0.1:22222
       RTPENGINE_PORT_MIN: "30000"
       RTPENGINE_PORT_MAX: "30400"
@@ -460,6 +463,8 @@ services:
       MI_LISTEN_IP: ${MI_LISTEN_IP:-127.0.0.1}
       OPENSIPS_DB_URL: postgres://twake:twake@127.0.0.1:54320/twake
       RTPENGINE_SOCK: udp:127.0.0.1:22222
+      RTPENGINE_INTERFACE_INTERNAL: ${RTPENGINE_INTERFACE_INTERNAL:-}
+      RTPENGINE_INTERFACE_EXTERNAL: ${RTPENGINE_INTERFACE_EXTERNAL:-}
       OPENSIPS_LOG_LEVEL: ${OPENSIPS_LOG_LEVEL:-2}
       # How long a call to someone without a window waits for the browser a notification wakes (5 to 120 s, ADR 0015).
       PUSH_WAIT_SEC: ${PUSH_WAIT_SEC:-30}

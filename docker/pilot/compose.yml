@@ -66,6 +66,10 @@ services:
       # The address written in the SDP, which the browsers send their media to: the machine's public address, or
       # "<private>!<public>" when the machine only has a private one behind a 1:1 NAT (most cloud providers).
       RTPENGINE_INTERFACE: "${RTPENGINE_INTERFACE:?RTPENGINE_INTERFACE is required (the public IP or private!public)}"
+      # Browsers on the machine's own network (a NAT with browsers on the LAN): two interfaces, internal for them,
+      # external for the operator; RTPENGINE_INTERFACE is then ignored (ADR 0030). Empty: one interface, as before.
+      RTPENGINE_INTERFACE_INTERNAL: "${RTPENGINE_INTERFACE_INTERNAL:-}"
+      RTPENGINE_INTERFACE_EXTERNAL: "${RTPENGINE_INTERFACE_EXTERNAL:-}"
       RTPENGINE_LISTEN: 127.0.0.1:22222
       # About 4 ports a call to the public network (2 for the browser, 2 for the operator), each kept 30 s after its end:
       # some 200 calls at once. rtpengine reserves none for the emergency calls: the organisation's cap of calls to the
@@ -94,6 +98,8 @@ services:
       LISTEN_IP: 127.0.0.1
       OPENSIPS_DB_URL: postgres://twake:${POSTGRES_PASSWORD}@127.0.0.1:54320/twake
       RTPENGINE_SOCK: udp:127.0.0.1:22222
+      RTPENGINE_INTERFACE_INTERNAL: "${RTPENGINE_INTERFACE_INTERNAL:-}"
+      RTPENGINE_INTERFACE_EXTERNAL: "${RTPENGINE_INTERFACE_EXTERNAL:-}"
       OPENSIPS_LOG_LEVEL: ${OPENSIPS_LOG_LEVEL:-2}
       # How long a call to someone without a window of the app waits for the browser the notification wakes (ADR 0015).
       PUSH_WAIT_SEC: ${PUSH_WAIT_SEC:-30}

@@ -2,6 +2,9 @@
 # rtpengine in the foreground, user-space forwarding, control socket for OpenSIPS on RTPENGINE_LISTEN.
 # RTPENGINE_INTERFACE is the address written in the SDP (what the browsers must reach): the host's address on a
 # host-network stack, or "<private>!<public>" behind a NAT.
+# With RTPENGINE_INTERFACE_INTERNAL (browsers and local services) and RTPENGINE_INTERFACE_EXTERNAL (the operator's
+# trunk), each in the same forms, there are two interfaces named "internal" and "external" instead, which OpenSIPS picks
+# per side of a call (ADR 0030); RTPENGINE_INTERFACE is then ignored.
 set -eu
 : "${RTPENGINE_INTERFACE:=127.0.0.1}"
 : "${RTPENGINE_LISTEN:=127.0.0.1:22222}"
@@ -12,6 +15,17 @@ set -eu
 : "${RTPENGINE_LOG_LEVEL:=5}"
 # Where detected RFC 4733 tones are reported (JSON over UDP), for the e2e; empty disables it.
 : "${RTPENGINE_DTMF_LOG:=}"
+: "${RTPENGINE_INTERFACE_INTERNAL:=}"
+: "${RTPENGINE_INTERFACE_EXTERNAL:=}"
+if [ -n "$RTPENGINE_INTERFACE_INTERNAL$RTPENGINE_INTERFACE_EXTERNAL" ]; then
+  if [ -z "$RTPENGINE_INTERFACE_INTERNAL" ] || [ -z "$RTPENGINE_INTERFACE_EXTERNAL" ]; then
+    echo "RTPENGINE_INTERFACE_INTERNAL and RTPENGINE_INTERFACE_EXTERNAL go together: set both or neither" >&2
+    exit 1
+  fi
+  set -- --interface="internal/$RTPENGINE_INTERFACE_INTERNAL" --interface="external/$RTPENGINE_INTERFACE_EXTERNAL" "$@"
+else
+  set -- --interface="$RTPENGINE_INTERFACE" "$@"
+fi
 exec rtpengine --foreground --log-stderr --no-fallback --table=-1 \
-  --interface="$RTPENGINE_INTERFACE" --listen-ng="$RTPENGINE_LISTEN" --listen-cli="$RTPENGINE_CLI" \
+  --listen-ng="$RTPENGINE_LISTEN" --listen-cli="$RTPENGINE_CLI" \
   --port-min="$RTPENGINE_PORT_MIN" --port-max="$RTPENGINE_PORT_MAX" --log-level="$RTPENGINE_LOG_LEVEL" ${RTPENGINE_DTMF_LOG:+--dtmf-log-dest="$RTPENGINE_DTMF_LOG"} "$@"

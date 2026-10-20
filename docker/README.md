@@ -41,6 +41,8 @@ Sans Docker (poste de dev sans démon) : OpenSIPS se compile depuis GitHub (`mak
 
 Le e2e : `yarn e2e:sip` (README, section « Vérifier »). Le rapport DTMF de rtpengine (`--dtmf-log-dest`) s'ouvre sur un socket IPv6 double pile : sans IPv6 sur la machine (certains conteneurs), `RTPENGINE_DTMF_LOG=off` saute cette vérification.
 
+Deux interfaces rtpengine (ADR 0030) : `RTPENGINE_INTERFACE_INTERNAL` (navigateurs, LiveKit SIP, Wazo) et `RTPENGINE_INTERFACE_EXTERNAL` (l'opérateur), chacune de la forme `adresse` ou `privée!publique`, les deux ou aucune (`RTPENGINE_INTERFACE` est alors ignorée). OpenSIPS dit à chaque offre quelle interface fait face à quel côté (`direction=internal`/`external`) ; sans elles, une seule interface et aucun `direction=`, comme avant. À donner aux deux services (`rtpengine` et `opensips`) ; la CI joue `127.0.0.1` et `127.0.0.2`.
+
 Pour un test réel, à plusieurs et depuis Internet, c'est le kit pilote qu'il faut ([pilot/README.md](pilot/README.md)) : les mêmes images, derrière Caddy en HTTPS sur un seul domaine, avec la passerelle, l'app et un Keycloak et un LDAP de démo.
 
 Limites de cette stack, à lever avant toute exposition : tout écoute sur `127.0.0.1` (passer `LISTEN_IP` et `RTPENGINE_INTERFACE` pour un autre poste de test ; le MI reste sur la boucle locale, `MI_LISTEN_IP`), certificat auto-signé, identifiants PostgreSQL de dev, pas de limitation de débit sur les REGISTER (`pike`, étape 6 avec l'anti-fraude), un seul tenant (voir ARCHITECTURE §5). `SIP_DOMAIN` doit être identique ici et dans la passerelle (`SIP_DOMAIN`, ou l'hôte de `OPENSIPS_WS_URL`) : c'est le realm des empreintes ; s'ils divergent, aucun enregistrement ne passe.
