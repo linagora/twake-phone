@@ -121,7 +121,9 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     const key = 'twake-wazo-line-test-key-0123456789abcdef'
     const { cfg } = renderWhole({ WAZO_SIP: '127.0.0.1:5100', WAZO_LINES: '1', WAZO_LINE_KEY: key })
     // Read with the rules of the number dialled, one more column of the first query, never for an account an extension holds.
-    expect(cfg).toContain(`$var(flow_col) = ", (SELECT f.route FROM call_flows f WHERE f.number = '" + $rU + "' AND length(f.route) <= 2000 AND f.route ~ '^[A-Za-z0-9_.:=/~|-]+$' AND NOT EXISTS (SELECT 1 FROM subscriber s WHERE s.username = '" + $rU + "'))";`)
+    expect(cfg).toContain(`$var(flow_join) = " LEFT JOIN call_flows f ON f.number = '" + $rU + "' AND length(f.route) <= 2000 AND f.route ~ '^[A-Za-z0-9_.:=/~|-]+$' AND NOT EXISTS (SELECT 1 FROM subscriber s WHERE s.username = '" + $rU + "')";`)
+    // After the join of the rules, never among the columns: pg_stat_activity shows 1023 characters of a query, and the SIP e2e looks for that join in it.
+    expect(cfg).toContain('$var(flow_col) + $var(rules_from) + $var(flow_join);')
     expect(cfg).toContain('$avp(vm_box);$avp(r_flow)"), rules_loaded);')
     const next = cfg.slice(cfg.indexOf('route[rules_next] {'), cfg.indexOf('route[rules_loaded] {'))
     expect(next.indexOf('if ($shv(wazo_lines_on) == 1)')).toBeGreaterThan(next.indexOf('$avp(q11) = 1;'))

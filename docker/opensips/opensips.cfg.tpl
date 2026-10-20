@@ -3291,18 +3291,23 @@ route[rules_next] {
 		$(avp(r_flow)[*]) = NULL;
 		$var(vm_col) = ", NULL";
 		$var(flow_col) = ", NULL";
+		$var(flow_join) = "";
 		if ($shv(wazo_on) == 1 && $shv(no11_until) <= $Ts) {
 			$avp(q11) = 1;
 			$var(vm_col) = ", (SELECT v.mailbox FROM voicemail_boxes v WHERE v.extension = '" + $rU + "' AND v.mailbox ~ '^[0-9]{1,40}@[A-Za-z0-9_-]{1,79}$')";
 			# wazo-lines: begin
 			# The call flow at the number dialled (step 11c-2, ADR 0028): how Wazo's Asterisk reaches it, `call_flows`, which the
 			# Gateway writes once Wazo runs it. Only what a route is made of passes, and never a number an extension holds (an
-			# extension wins, as over a ring group).
-			if ($shv(wazo_lines_on) == 1)
-				$var(flow_col) = ", (SELECT f.route FROM call_flows f WHERE f.number = '" + $rU + "' AND length(f.route) <= 2000 AND f.route ~ '^[A-Za-z0-9_.:=/~|-]+$' AND NOT EXISTS (SELECT 1 FROM subscriber s WHERE s.username = '" + $rU + "'))";
+			# extension wins, as over a ring group). Joined after the rules, never a subquery among the columns: the query
+			# stays short enough for pg_stat_activity (1024 characters) to show where it waits (the e2e looks for the rules'
+			# join there).
+			if ($shv(wazo_lines_on) == 1) {
+				$var(flow_col) = ", f.route";
+				$var(flow_join) = " LEFT JOIN call_flows f ON f.number = '" + $rU + "' AND length(f.route) <= 2000 AND f.route ~ '^[A-Za-z0-9_.:=/~|-]+$' AND NOT EXISTS (SELECT 1 FROM subscriber s WHERE s.username = '" + $rU + "')";
+			}
 			# wazo-lines: end
 		}
-		$var(rules_query) = "SELECT " + $var(rules_cols) + $var(first_cols) + $var(vm_col) + $var(flow_col) + $var(rules_from);
+		$var(rules_query) = "SELECT " + $var(rules_cols) + $var(first_cols) + $var(vm_col) + $var(flow_col) + $var(rules_from) + $var(flow_join);
 		async(sql_query_one("$var(rules_query)", "$avp(r_always);$avp(r_busy);$avp(r_noanswer);$avp(r_delay);$avp(r_dnd);$avp(r_message);$avp(r_retry);$avp(r_name);$avp(n_caller);$avp(r_group);$avp(vm_box);$avp(r_flow)"), rules_loaded);
 		exit;
 	}
