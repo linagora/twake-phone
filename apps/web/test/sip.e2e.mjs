@@ -628,9 +628,9 @@ const windowsOf = async ext => {
  * depended on the speed of the runner.
  */
 const forgetWindows = async ext => {
+  // Nothing to forget is not an error to us (OpenSIPS may say so): what counts is that nothing is left.
   const res = await mi('ul_rm', ['location', ext])
-  if (res.error) throw new Error(`MI ul_rm ${ext}: ${JSON.stringify(res.error)}`)
-  expectEqual(await windowsOf(ext), [], `the windows of ${ext} in OpenSIPS once forgotten`)
+  expectEqual(await windowsOf(ext), [], `the windows of ${ext} in OpenSIPS once forgotten (MI ul_rm said ${JSON.stringify(res.error ?? 'ok')})`)
 }
 /**
  * Opens the form « Ajouter un participant » of a conference and types the target in it. Opened only when it is not: the
@@ -640,11 +640,12 @@ const forgetWindows = async ext => {
 const openAddForm = async (page, target) => {
   const button = page.getByRole('button', { name: 'Ajouter un participant' })
   const field = page.getByLabel('Participant à ajouter (poste ou numéro)')
-  await until('the form to add a participant open', async () => {
-    if (!(await field.isVisible()) && (await button.getAttribute('aria-pressed')) !== 'true' && (await button.isEnabled())) await button.click({ timeout: 2_000 }).catch(() => {})
-    return (await field.isVisible()) ? true : null
+  await until('the form to add a participant open with its target typed', async () => {
+    if (!(await field.isVisible()) && (await button.getAttribute('aria-pressed', { timeout: 1_000 })) !== 'true' && (await button.isEnabled({ timeout: 1_000 }))) await button.click({ timeout: 2_000 }).catch(() => {})
+    if (!(await field.isVisible())) return null
+    await field.fill(target, { timeout: 2_000 }).catch(() => {})
+    return (await field.inputValue({ timeout: 1_000 }).catch(() => null)) === target ? true : null
   }, { timeout: 30_000 })
-  await field.fill(target)
 }
 /** Waits for the ringtone element to play (not paused, live stream) or to be quiet; says what it saw otherwise. */
 const ringerPlaying = async (page, playing) => {
@@ -3258,10 +3259,14 @@ try {
       const ringing = bob.page.getByTestId('incoming-call')
       await ringing.waitFor({ timeout: 30_000 }).catch(async err => {
         // For whoever reads the failure: whether Bob's window was registered, and what OpenSIPS and LiveKit SIP said of the call to 103.
-        const logs = service => execFileSync('docker', ['compose', '-f', fileURLToPath(new URL('../../../docker/docker-compose.sip.yml', import.meta.url)), 'logs', '--no-color', '--no-log-prefix', '--tail', '400', service], { encoding: 'utf8', timeout: 30_000, maxBuffer: 64 << 20 }).split('\n')
-        const said = logs('opensips').filter(l => /103|INVITE|call /.test(l) && !/from' key|failed to unregister/.test(l)).slice(-30)
-        const sip = logs('livekit-sip').filter(l => /"toUser": "103"/.test(l) && /fail|error|status/i.test(l)).slice(-6).map(l => l.slice(0, 700))
-        console.log(`[8d] Bob did not ring. Windows of 103: ${JSON.stringify(await windowsOf('103'))}\n[8d] OpenSIPS: ${said.join('\n')}\n[8d] LiveKit SIP: ${sip.join('\n')}`)
+        try {
+          const logs = service => execFileSync('docker', ['compose', '-f', fileURLToPath(new URL('../../../docker/docker-compose.sip.yml', import.meta.url)), 'logs', '--no-color', '--no-log-prefix', '--tail', '400', service], { encoding: 'utf8', timeout: 30_000, maxBuffer: 64 << 20 }).split('\n')
+          const said = logs('opensips').filter(l => /103|INVITE|call /.test(l) && !/from' key|failed to unregister/.test(l)).slice(-30)
+          const sip = logs('livekit-sip').filter(l => /"toUser": "103"/.test(l) && /fail|error|status/i.test(l)).slice(-6).map(l => l.slice(0, 700))
+          console.log(`[8d] Bob did not ring. Windows of 103: ${JSON.stringify(await windowsOf('103'))}\n[8d] OpenSIPS: ${said.join('\n')}\n[8d] LiveKit SIP: ${sip.join('\n')}`)
+        } catch (diagnosis) {
+          console.log(`[8d] Bob did not ring, and the diagnosis failed: ${diagnosis}`)
+        }
         throw err
       })
       await ringing.getByRole('button', { name: 'Répondre' }).click()
@@ -3880,7 +3885,8 @@ try {
           ended = await dialUntilEnded(bob.page, '104')
         } catch (err) {
           const [now] = (await db.query("SELECT mailbox FROM voicemail_boxes WHERE extension = '104'")).rows
-          if (now.mailbox === '104@twake-gone' || attempt >= 3) throw err
+          const reached = (await calls(bob.page)).some(c => c.state === 'connected')
+          if (now.mailbox === '104@twake-gone' || !reached || attempt >= 3) throw err
           console.log(`[11a] the row of 104 in voicemail_boxes was written back (${now.mailbox}) during the call, tried again (${attempt})`)
           await bob.page.getByRole('button', { name: 'Raccrocher' }).click()
           await until('the end of the call to 104', async () => ((await calls(bob.page)).length === 0 ? true : null))
