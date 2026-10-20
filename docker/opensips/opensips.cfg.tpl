@@ -851,6 +851,7 @@ route {
 		# places there finds no window and fails at once, and the next window's registration is absorbed as a refresh.
 		if ($var(wl_line) == 1 && ($hdr(Expires) == "0" || $hdr(Contact) == "*" || $hdr(Contact) =~ ";expires=0($|[;,])"))
 			$var(wl_line) = 0;
+		xlog("L_NOTICE", "wazo: REGISTER of $tU, line $var(wl_line), Expires [$hdr(Expires)], Contact [$hdr(Contact)]\n");
 		if ($var(wl_line) == 1) {
 			consume_credentials();
 			$(avp(wl_pass)[*]) = NULL;

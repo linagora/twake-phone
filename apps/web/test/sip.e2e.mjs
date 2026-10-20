@@ -3820,7 +3820,14 @@ try {
       // answer that may come after the softphone closed its connection (a window gone, its dead contact kept for 10 minutes).
       compose('pause', 'wazo-asterisk')
       try {
+        const state = await alice.page.evaluate(() => window.twakephone.state)
         await signOut(alice)
+        if ((await windowsOf('101')).length) {
+          const dump = (await mi('ul_dump', {})).result
+          console.log(`[11c-2] Alice's softphone said ${state} before she left; contacts: ${JSON.stringify((dump?.Domains ?? []).flatMap(d => d.AORs ?? []).filter(a => a.AOR === '101'))}`)
+          const said = execFileSync('docker', ['compose', '-f', COMPOSE_FILE, 'logs', '--no-color', '--no-log-prefix', '--tail', '400', 'opensips'], { encoding: 'utf8', timeout: 30_000, maxBuffer: 64 << 20 }).split('\n').filter(l => /REGISTER of 101|wazo|mid_reg/i.test(l) && !/'from' key not found|failed to unregister/.test(l)).slice(-25)
+          console.log(`[11c-2] OpenSIPS: ${said.join('\n')}`)
+        }
         expectEqual((await windowsOf('101')).length, 0, 'the windows of 101 once the last one left while Wazo was silent')
       } finally {
         compose('unpause', 'wazo-asterisk')
