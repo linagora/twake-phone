@@ -843,6 +843,14 @@ route {
 				}
 			}
 		}
+		# An unregistration (a Contact with expires=0, Expires: 0, Contact: *) is made here at once, never waiting for Wazo
+		# (step 11c-2): the window that leaves closes its connection a moment after (1.5 s in the softphone), and a last
+		# window whose registration waited for Wazo's answer (REGISTER, challenge, REGISTER, 200: slow when Asterisk is busy)
+		# stayed in `location` when the answer came too late, a window gone that calls kept ringing (477) until its
+		# registration expired. Wazo keeps its contact for the extension until it expires (outgoing_expires): a call it
+		# places there finds no window and fails at once, and the next window's registration is absorbed as a refresh.
+		if ($var(wl_line) == 1 && ($hdr(Expires) == "0" || $hdr(Contact) == "*" || $hdr(Contact) =~ ";expires=0($|[;,])"))
+			$var(wl_line) = 0;
 		if ($var(wl_line) == 1) {
 			consume_credentials();
 			$(avp(wl_pass)[*]) = NULL;

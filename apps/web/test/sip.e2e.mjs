@@ -3816,7 +3816,16 @@ try {
       expectEqual(groupNames.length, 4, 'the queues the flows had')
       await signOut(jeanW)
       await signOut(bobW)
-      await signOut(alice)
+      // The last window of an extension leaves while Wazo is silent: its registration goes at once, never waiting for an
+      // answer that may come after the softphone closed its connection (a window gone, its dead contact kept for 10 minutes).
+      compose('pause', 'wazo-asterisk')
+      try {
+        await signOut(alice)
+        expectEqual((await windowsOf('101')).length, 0, 'the windows of 101 once the last one left while Wazo was silent')
+      } finally {
+        compose('unpause', 'wazo-asterisk')
+      }
+      await sysconfdSettled()
       // Each window that left took its registration with it (the mailbox steps that follow need Alice without a window).
       const left = async () => Object.fromEntries(await Promise.all(['101', '102', '103'].map(async ext => [ext, (await windowsOf(ext)).length])))
       await until('the windows that signed out gone from OpenSIPS', async () => ((await left())['101'] === 0 ? true : null), { timeout: 20_000 }).catch(async err => {

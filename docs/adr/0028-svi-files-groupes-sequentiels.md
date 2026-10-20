@@ -48,7 +48,11 @@ Alice, administratrice, règle dans l'administration, sans console, quatre parco
 - Le tour du tenant (celui qui tient le bail, ADR 0022) fait les parcours juste après les lignes, une écriture à la fois (`mayWrite` demandé avant chacune) : `syncFlows`, puis `setCallFlowRoutes` donne la liste à OpenSIPS (`listCallFlowRoutes` la lit pour `beforeRemoval`). Un parcours réglé met la marque `voicemail:changed` : le Gateway qui écrit s'en saisit dans les 2 s, quel que soit celui qui a reçu la requête. Wazo qui refuse un groupe : un nouveau tour après une pause (`voicemailRetryMs`, comme pour une ligne ou une boîte refusée ; jamais une boucle serrée, mais un refus permanent est retenté à chaque pause et dit au journal).
 - Coût dans Asterisk : un groupe est un rechargement de ses files, et l'association de ses membres un rechargement de PJSIP en plus (wazo-sysconfd les fond, ADR 0022).
 
-### 7. Ce que 11c-2 ne fait pas
+### 7. Une correction de 11c-1 trouvée en chemin : la désinscription ne dépend pas de Wazo
+
+L'e2e de cette étape ferme la fenêtre d'une personne qui n'en a qu'une, une fois Wazo occupé à relire ses files : son contact restait dans `location` et un appel y sonnait une fenêtre partie (477). Cause, reproduite contre l'OpenSIPS de la stack avec un faux Wazo lent : `mid_registrar` ne retire le contact de la dernière fenêtre qu'à la réponse de Wazo, et le softphone ferme sa connexion 1,5 s après avoir désinscrit. Une désinscription (`expires=0`, `Expires: 0`, `Contact: *`) est donc faite à OpenSIPS seul, tout de suite ; Wazo garde son contact jusqu'à son terme (600 s), ce que ses appels supportent (aucune fenêtre : ils échouent, le membre suivant est essayé). L'e2e ferme la dernière fenêtre d'Alice pendant que l'Asterisk de Wazo est en pause.
+
+### 8. Ce que 11c-2 ne fait pas
 
 Un numéro direct (SDA) qui mène à un parcours (une SDA mène à un poste ou à un groupe d'appel), le renvoi d'un poste vers un parcours (refusé comme vers tout numéro qui n'est pas un poste), un standard dans un standard, un enregistrement ou une supervision (11d), la musique d'attente et les annonces de position d'une file (la stack n'a pas de fichier de musique : l'appelant entend le silence), la connexion et la pause d'un agent, les rapports de file, un message vocal en débordement, une horloge (horaires d'ouverture), un son déposé depuis l'administration (le nom d'un son que Wazo a), les plafonds et alertes propres aux parcours.
 

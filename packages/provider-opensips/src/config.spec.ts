@@ -159,6 +159,11 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     const before = render({ WAZO_SIP: '127.0.0.1:5100' }).cfg
     expect(before).not.toContain('call_flows')
     expect(before).not.toContain('flow_failed')
+    // An unregistration is made here at once (never relayed to wait for Wazo): a last window whose connection closed before
+    // Wazo answered stayed in `location` (measured against the OpenSIPS of the stack with a slow Wazo).
+    const register = cfg.slice(cfg.indexOf('$var(wl_line) = 0;'), cfg.indexOf('mid_registrar_save("location");'))
+    expect(register).toContain('if ($var(wl_line) == 1 && ($hdr(Expires) == "0" || $hdr(Contact) == "*" || $hdr(Contact) =~ ";expires=0($|[;,])"))\n\t\t\t$var(wl_line) = 0;')
+    expect(register.indexOf('$hdr(Expires) == "0"')).toBeLessThan(register.indexOf('if ($var(wl_line) == 1) {'))
     // Whatever a phone or the operator sent of the header goes with the others, with the lines or without (Wazo's dialplan reads it).
     expect(before).not.toContain('append_hf("X-Twake-Flow')
     expect(before).toContain('remove_hf("X-Twake-Flow");')
