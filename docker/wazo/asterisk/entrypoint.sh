@@ -2,7 +2,7 @@
 # Asterisk of Wazo (wazoplatform/asterisk, ADR 0022) for the development and CI stack: Wazo's own configuration, with
 # what this stack replaces. Wazo's packaging includes every file of /etc/asterisk/*.d; the files written here take the
 # place of Wazo's for the SIP side (a single trunk, OpenSIPS's socket for Wazo), the media and the dialplan (calls
-# OpenSIPS sends to a mailbox), and add the AMI accounts of wazo-amid and of this stack's wazo-sysconfd. The voicemails
+# OpenSIPS sends to a mailbox), and add the AMI accounts of wazo-amid, of this stack's wazo-sysconfd and of the Gateway. The voicemails
 # come from Wazo's database through wazo-confgend, as on a Wazo (voicemail.d/01-wazo.conf), with the format of the
 # recordings set here (wav: what the Gateway's bound on a recording's size counts); so does
 # modules.conf, read once here.
@@ -14,6 +14,9 @@
 #   WAZO_AMI_PASSWORD  the password of wazo-amid's AMI account (this stack's own, as in wazo-amid's configuration)
 #   WAZO_SYSCONFD_AMI_PASSWORD
 #                      the password of the AMI account of docker/wazo/sysconfd.py (its own: reloads, no event)
+#   WAZO_GATEWAY_AMI_PASSWORD, WAZO_GATEWAY_ORIGINATE_PASSWORD
+#                      the passwords of the two AMI accounts of the Gateway (step 11d, ADR 0029): the calls in progress
+#                      and MixMonitor; Originate (the recording notice, a supervisor's call), nothing else
 #   WAZO_ARI_PASSWORD  the password of the ARI account of wazo-calld and wazo-confd (this stack's own, as in theirs)
 #   WAZO_DB            Wazo's database (ip:port, 127.0.0.1:54330 by default), WAZO_DB_PASSWORD its password
 #   VOICEMAIL_MAX_CALL_SEC
@@ -36,6 +39,8 @@ set -euo pipefail
 : "${WAZO_CONFGEND:=127.0.0.1:8669}"
 : "${WAZO_AMI_PASSWORD:=twake-wazo-dev-only-ami}"
 : "${WAZO_SYSCONFD_AMI_PASSWORD:=twake-wazo-dev-only-sysconfd}"
+: "${WAZO_GATEWAY_AMI_PASSWORD:=twake-wazo-dev-only-gateway-ami}"
+: "${WAZO_GATEWAY_ORIGINATE_PASSWORD:=twake-wazo-dev-only-gateway-originate}"
 : "${WAZO_ARI_PASSWORD:=twake-wazo-dev-only-ari}"
 : "${WAZO_DB:=127.0.0.1:54330}"
 : "${WAZO_DB_PASSWORD:=twake-wazo-dev-only-db}"
@@ -47,7 +52,7 @@ for v in WAZO_SIP_LISTEN WAZO_OPENSIPS WAZO_CONFGEND WAZO_DB; do
 done
 [[ $WAZO_RTP_ADDRESS =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || { echo "WAZO_RTP_ADDRESS must be an IPv4 address" >&2; exit 1; }
 [[ $WAZO_RTP_MIN =~ ^[0-9]+$ && $WAZO_RTP_MAX =~ ^[0-9]+$ && $WAZO_RTP_MIN -lt $WAZO_RTP_MAX ]] || { echo "WAZO_RTP_MIN and WAZO_RTP_MAX must be ports, the first below the second" >&2; exit 1; }
-for v in WAZO_AMI_PASSWORD WAZO_SYSCONFD_AMI_PASSWORD WAZO_ARI_PASSWORD WAZO_DB_PASSWORD; do
+for v in WAZO_AMI_PASSWORD WAZO_SYSCONFD_AMI_PASSWORD WAZO_GATEWAY_AMI_PASSWORD WAZO_GATEWAY_ORIGINATE_PASSWORD WAZO_ARI_PASSWORD WAZO_DB_PASSWORD; do
   [[ ${!v} =~ ^[A-Za-z0-9._-]{8,64}$ ]] || { echo "$v: 8 to 64 letters, digits, '.', '_' or '-'" >&2; exit 1; }
 done
 [[ $VOICEMAIL_MAX_CALL_SEC =~ ^[0-9]{2,4}$ && $VOICEMAIL_MAX_CALL_SEC -ge 30 && $VOICEMAIL_MAX_CALL_SEC -le 3600 ]] || { echo "VOICEMAIL_MAX_CALL_SEC must be 30 to 3600 seconds" >&2; exit 1; }
@@ -217,6 +222,28 @@ deny = 0.0.0.0/0.0.0.0
 permit = 127.0.0.1/255.255.255.255
 read =
 write = system,reporting
+
+; The Gateway's (step 11d, ADR 0029; the Gateway's WAZO_GATEWAY_AMI_USER and WAZO_GATEWAY_ORIGINATE_USER): two accounts, because Asterisk lets an account that
+; holds both `system` and `originate` have Originate run any application (System included: a shell). The first holds
+; `system` (MixMonitor, StopMixMonitor) and `reporting` (CoreShowChannels): it is refused Originate, `command` and
+; `config`. The second holds `originate` alone, read `call` (the OriginateResponse it waits for): its Originate may run
+; the applications Asterisk does not blacklist (Playback, ChanSpy: what this feature calls), never System, Exec or AGI.
+; `system` still lets the first read any configuration file (GetConfig, this one included), hang up a channel and, with
+; MixMonitor's `Command` header, run a command when a recording ends: the account is as trusted as the Gateway, a
+; development and CI account on the loopback; on a Wazo, accounts of their own.
+[twake_gateway]
+secret = ${WAZO_GATEWAY_AMI_PASSWORD}
+deny = 0.0.0.0/0.0.0.0
+permit = 127.0.0.1/255.255.255.255
+read =
+write = system,reporting
+
+[twake_gateway_originate]
+secret = ${WAZO_GATEWAY_ORIGINATE_PASSWORD}
+deny = 0.0.0.0/0.0.0.0
+permit = 127.0.0.1/255.255.255.255
+read = call
+write = originate
 EOF
 
 # The HTTP server of ARI, on the loopback (the image's says so; written here so that nothing else decides it), and the
@@ -268,6 +295,8 @@ sed -i -E "s/^password[[:space:]]*=>.*/password => ${WAZO_DB_PASSWORD}/" /etc/as
 
 # The mailboxes: wazo-calld reads them under its own account (www-data), as the files Asterisk makes are (0644).
 install -d -o asterisk -g asterisk -m 0755 /var/spool/asterisk/voicemail
+# The recordings (step 11d): <tenant>/monitor/<uuid>.wav, which MixMonitor makes and docker/wazo/recordings.py serves.
+install -d -o asterisk -g asterisk -m 0755 /var/lib/wazo/sounds/tenants
 # The dialplan reads it (TIMEOUT(absolute) of a call to a mailbox).
 export VOICEMAIL_MAX_CALL_SEC
 exec asterisk -f -U asterisk -G asterisk

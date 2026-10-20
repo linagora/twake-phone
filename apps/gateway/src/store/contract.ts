@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { OperatorCdr } from '@twake/telephony-types'
-import { WEBHOOK_STATE_ROLE, type FencedLease, type HistoryEntry, type HistoryNearQuery, type NewTranscript, type Store, type WebhookDeliveryRecord, type WebhookSubscriptionRecord } from './types.js'
+import { WEBHOOK_STATE_ROLE, type FencedLease, type HistoryEntry, type HistoryNearQuery, type NewTranscript, type RecordingRecord, RecordingUnderWay, type Store, type WebhookDeliveryRecord, type WebhookSubscriptionRecord } from './types.js'
 import { EMPTY_OUTBOUND, outboundVersion } from '../outbound.js'
 
 const entry = (over: Partial<HistoryEntry>): HistoryEntry => ({
@@ -1716,6 +1716,86 @@ export const storeContract = (name: string, make: () => Promise<Store>) =>
       expect(await s.transcriptsChangedSince('A', changed[1]!.updatedAt, 10)).toEqual([])
       expect((await s.transcriptsChangedSince('A', start, 1)).map(t => t.messageId)).toEqual(['m2'])
       expect(await s.transcriptsChangedSince('B', start, 10)).toEqual([])
+      await s.close()
+    })
+
+    it('keeps the recordings of each tenant, one under way per call, and closes or erases each once (step 11d)', async () => {
+      const s = await make()
+      const rec = (id: string, over: Partial<RecordingRecord> = {}): RecordingRecord => ({
+        id, tenantId: 'A', extension: '103', userId: 'bdurand', displayName: 'Bob Durand', callId: '1792479546.12', startedBy: 'alice', startedAt: '2026-10-20T10:00:00.000Z', state: 'recording', ...over
+      })
+      const R1 = '3f2b8c0e-4d1a-4b7e-9c55-0a1b2c3d4e51'
+      const R2 = '3f2b8c0e-4d1a-4b7e-9c55-0a1b2c3d4e52'
+      const R3 = '3f2b8c0e-4d1a-4b7e-9c55-0a1b2c3d4e53'
+      const R4 = '3f2b8c0e-4d1a-4b7e-9c55-0a1b2c3d4e54'
+      await s.addRecording(rec(R1))
+      // One under way per call, in a tenant; the same call number of another tenant is another call.
+      await expect(s.addRecording(rec(R2))).rejects.toBeInstanceOf(RecordingUnderWay)
+      await s.addRecording(rec(R2, { tenantId: 'B', userId: 'carol', extension: '104' }))
+      expect(await s.getRecordingUnderWay('A', '1792479546.12')).toMatchObject({ id: R1, userId: 'bdurand', displayName: 'Bob Durand' })
+      expect(await s.getRecordingUnderWay('A', '1792479546.99')).toBeNull()
+      expect((await s.listRecordingsUnderWay('A')).map(r => r.id)).toEqual([R1])
+      expect(await s.getRecording('B', R1)).toBeNull()
+      // Closing: only from the state it is in; a second closing, or one of a recording erased meanwhile, changes nothing.
+      expect(await s.updateRecording('B', R1, ['recording'], { state: 'ready' })).toBeNull()
+      expect(await s.updateRecording('A', R1, ['recording'], { state: 'ready', endedAt: '2026-10-20T10:02:00.000Z', sizeBytes: 16044 })).toMatchObject({ state: 'ready', endedAt: '2026-10-20T10:02:00.000Z', sizeBytes: 16044 })
+      expect(await s.updateRecording('A', R1, ['recording'], { state: 'failed' })).toBeNull()
+      expect(await s.getRecordingUnderWay('A', '1792479546.12')).toBeNull()
+      // The call may be recorded again once the first is closed; the list is newest first, of the tenant only.
+      await s.addRecording(rec(R3, { startedAt: '2026-10-20T11:00:00.000Z', callId: '1792479546.12' }))
+      await s.addRecording(rec(R4, { startedAt: '2026-10-01T09:00:00.000Z', callId: '1792479500.1', userId: 'jdupont', extension: '102', state: 'ready', endedAt: '2026-10-01T09:05:00.000Z' }))
+      expect((await s.listRecordings('A')).map(r => r.id)).toEqual([R3, R1, R4])
+      expect((await s.listRecordings('A', 2)).map(r => r.id)).toEqual([R3, R1])
+      expect((await s.listRecordings('B')).map(r => r.id)).toEqual([R2])
+      // What is to go: the erasing ones, and with a limit date the ready ones older than it; oldest first.
+      expect(await s.listRecordingsToErase(null, 10)).toEqual([])
+      expect((await s.listRecordingsToErase('2026-10-10T00:00:00.000Z', 10, 'A')).map(r => r.id)).toEqual([R4])
+      expect((await s.listRecordingsToErase('2026-10-30T00:00:00.000Z', 10)).map(r => r.id)).toEqual([R4, R1])
+      expect((await s.listRecordingsToErase('2026-10-30T00:00:00.000Z', 1)).map(r => r.id)).toEqual([R4])
+      // The erasure of a person marks what is closed; what is under way (R3) is not, it is stopped first.
+      expect(await s.eraseRecordingsOf('A', 'bdurand')).toBe(1)
+      expect(await s.eraseRecordingsOf('A', 'bdurand')).toBe(0)
+      expect(await s.eraseRecordingsOf('A', 'nobody')).toBe(0)
+      expect((await s.listRecordingsToErase(null, 10, 'A')).map(r => r.id)).toEqual([R1])
+      expect((await s.getRecording('A', R3))?.state).toBe('recording')
+      expect((await s.getRecording('B', R2))?.state).toBe('recording')
+      // Closed, it is marked at the next erasure. An erasure and a closing never overwrite each other.
+      expect(await s.updateRecording('A', R3, ['recording'], { state: 'ready', endedAt: '2026-10-20T11:01:00.000Z' })).toMatchObject({ state: 'ready' })
+      expect(await s.updateRecording('A', R3, ['recording'], { state: 'failed' })).toBeNull()
+      expect(await s.eraseRecordingsOf('A', 'bdurand')).toBe(1)
+      expect(await s.updateRecording('A', R3, ['recording'], { state: 'ready' })).toBeNull()
+      // Purged: the person and their name go from the record, the line, the times and who started it stay.
+      const purged = await s.updateRecording('A', R1, ['ready', 'failed', 'erasing'], { state: 'purged', forget: true })
+      expect(purged).toMatchObject({ state: 'purged', extension: '103', startedBy: 'alice' })
+      expect(purged?.userId).toBeUndefined()
+      expect(purged?.displayName).toBeUndefined()
+      expect((await s.getRecording('A', R1))?.userId).toBeUndefined()
+      expect(await s.updateRecording('A', R1, ['ready', 'failed', 'erasing'], { state: 'purged' })).toBeNull()
+      expect((await s.listRecordingsToErase(null, 10, 'A')).map(r => r.id)).toEqual([R3])
+      // The records of what is purged go by age, those of what is not never.
+      expect(await s.deletePurgedRecordings('2026-10-01T00:00:00.000Z')).toBe(0)
+      expect(await s.deletePurgedRecordings('2026-10-30T00:00:00.000Z')).toBe(1)
+      expect(await s.getRecording('A', R1)).toBeNull()
+      expect((await s.listRecordings('A')).map(r => r.id)).toEqual([R3, R4])
+      await s.close()
+    })
+
+    it('keeps the journal of the supervision by tenant, newest first, and purges the old lines (step 11d)', async () => {
+      const s = await make()
+      await s.addSupervisionLog('A', { at: '2026-10-20T10:00:00.000Z', actor: 'alice', action: 'record-start', extension: '103', recordingId: '3f2b8c0e-4d1a-4b7e-9c55-0a1b2c3d4e51' })
+      await s.addSupervisionLog('A', { at: '2026-10-20T10:00:05.000Z', actor: 'alice', action: 'spy-listen', extension: '103' })
+      await s.addSupervisionLog('A', { at: '2026-10-20T10:00:05.000Z', actor: 'alice', action: 'purge' })
+      await s.addSupervisionLog('B', { at: '2026-10-20T10:00:06.000Z', actor: 'carol', action: 'record-stop' })
+      expect(await s.listSupervisionLog('A')).toEqual([
+        { at: '2026-10-20T10:00:05.000Z', actor: 'alice', action: 'purge' },
+        { at: '2026-10-20T10:00:05.000Z', actor: 'alice', action: 'spy-listen', extension: '103' },
+        { at: '2026-10-20T10:00:00.000Z', actor: 'alice', action: 'record-start', extension: '103', recordingId: '3f2b8c0e-4d1a-4b7e-9c55-0a1b2c3d4e51' }
+      ])
+      expect((await s.listSupervisionLog('A', 1)).map(e => e.action)).toEqual(['purge'])
+      expect((await s.listSupervisionLog('B')).map(e => e.actor)).toEqual(['carol'])
+      expect(await s.purgeSupervisionLog('2026-10-20T10:00:05.000Z')).toBe(1)
+      expect(await s.purgeSupervisionLog('2026-10-21T00:00:00.000Z')).toBe(3)
+      expect(await s.listSupervisionLog('A')).toEqual([])
       await s.close()
     })
 

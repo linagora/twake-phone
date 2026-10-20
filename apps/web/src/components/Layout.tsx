@@ -16,6 +16,7 @@ const LINKS: [string, Key][] = [
   ['/recents', 'nav.recents'],
   ['/voicemail', 'nav.voicemail'],
   ['/directory', 'nav.directory'],
+  ['/supervision', 'nav.supervision'],
   ['/settings', 'nav.settings'],
   ['/admin', 'nav.admin']
 ]
@@ -32,7 +33,8 @@ export const Layout = () => {
   // number of messages not listened to, said in the link's name.
   const voicemail = useVoicemailTab(client, me?.extension, onConnected, onEvent)
   // The administration link shows only to administrators; the Gateway refuses the others anyway.
-  const links = LINKS.filter(([to]) => (to !== '/admin' || me?.features?.admin) && (to !== '/voicemail' || (voicemail.on && me?.extension)))
+  // The supervision (step 11d) shows to supervisors, whom the Gateway says in /me (and refuses the others anyway).
+  const links = LINKS.filter(([to]) => (to !== '/admin' || me?.features?.admin) && (to !== '/supervision' || me?.features?.supervision) && (to !== '/voicemail' || (voicemail.on && me?.extension)))
   const { pathname, search } = useLocation()
   // Opened by the notification of a call: signed in, the softphone registers and the call rings here. The address
   // keeps no trace of it (a reload is no reason to do anything about that call).
