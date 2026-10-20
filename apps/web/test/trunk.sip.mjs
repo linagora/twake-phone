@@ -269,6 +269,8 @@ try {
     const call = await p301.dial('115')
     const at = await atOperator(A, call)
     expect('Request-URI at the operator', at.invite.uri === 'sip:115@operator.example', at.invite.uri)
+    // OVH takes the received= of a lower Via for the caller and answers 403 "not registered": only our Via goes out.
+    expect('only our Via reaches the operator', at.invite.headers.get('via')?.length === 1, `${at.invite.headers.get('via')}`)
     expect('INVITEs to the account 115', ![...p115.calls.values()].some(c => c.invite), `${p115.calls.size}`)
   })
 

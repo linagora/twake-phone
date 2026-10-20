@@ -674,6 +674,7 @@ route {
 		if (route(to_trunk)) {
 			route(trunk_headers);
 			route(trunk_contact);
+			t_on_branch("trunk_via");
 		}
 		# From the operator to the phone: the phone's answers carry its Contact (onreply_route[rtp] rewrites it too).
 		if ($var(from_trunk) == 1) {
@@ -1891,9 +1892,16 @@ route[trunk_target] {
 	$avp(t_ruri) = $ru;
 }
 
+# Only our own Via goes to the operator (added when the branch leaves): the phone's one carries received=<its
+# address>, and OVH (siptrunk.ovh.net) takes that address for the caller and answers 403 "not registered".
+branch_route[trunk_via] {
+	remove_hf("Via");
+}
+
 # Each INVITE to the operator, from the trunk it goes to (route[trunk_target]; another one for an emergency call that
 # failed on its own, failure_route[trunk_failed]): From and To its way, and the P-Asserted-Identity it may want.
 branch_route[trunk_out] {
+	remove_hf("Via");
 	uac_replace_from("", "sip:$avp(t_from_user)@$avp(t_domain)");
 	uac_replace_to("", "sip:$avp(t_to_user)@$avp(t_domain)");
 	if ($avp(t_pai) == 1)
