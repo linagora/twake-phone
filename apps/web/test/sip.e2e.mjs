@@ -3817,6 +3817,16 @@ try {
       await signOut(jeanW)
       await signOut(bobW)
       await signOut(alice)
+      // Each window that left took its registration with it (the mailbox steps that follow need Alice without a window).
+      const left = async () => Object.fromEntries(await Promise.all(['101', '102', '103'].map(async ext => [ext, (await windowsOf(ext)).length])))
+      await until('the windows that signed out gone from OpenSIPS', async () => ((await left())['101'] === 0 ? true : null), { timeout: 20_000 }).catch(async err => {
+        const dump = (await mi('ul_dump', {})).result
+        console.log(`[11c-2] windows left: ${JSON.stringify(await left())} ${JSON.stringify((dump?.Domains ?? []).flatMap(d => d.AORs ?? []).filter(a => a.AOR === '101'))}`)
+        const said = execFileSync('docker', ['compose', '-f', COMPOSE_FILE, 'logs', '--no-color', '--no-log-prefix', '--tail', '300', 'opensips'], { encoding: 'utf8', timeout: 30_000, maxBuffer: 64 << 20 }).split('\n').filter(l => /wazo|mid_reg|101/i.test(l) && !/'from' key not found|failed to unregister/.test(l)).slice(-30)
+        console.log(`[11c-2] OpenSIPS: ${said.join('\n')}`)
+        throw err
+      })
+      expectEqual(await left(), { 101: 0, 102: 1, 103: 1 }, 'the windows of the people at OpenSIPS once the windows of this step left')
     })
   }
   await lineSteps()
