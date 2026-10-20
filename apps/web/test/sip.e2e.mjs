@@ -3670,9 +3670,9 @@ try {
       if (!/in 'linear' strategy/.test(sequential) || !sequential.includes('Local/102@twake-members') || !sequential.includes('Local/103@twake-members')) throw new Error(`the sequential group in Asterisk: ${sequential}`)
       const queue = asteriskCli(`queue show ${nameOf('801')}`)
       if (!/in 'leastrecent' strategy/.test(queue) || !queue.includes('Local/102@twake-members')) throw new Error(`the queue in Asterisk: ${queue}`)
-      // Read again by the screen: every flow says it runs.
-      await alice.page.reload()
-      await alice.page.getByRole('heading', { level: 2, name: "Parcours d'appel", exact: true }).waitFor()
+      // Read again by the screen (not a reload of the page: its softphone would register anew and leave the registration of the old page behind): every flow says it runs.
+      await alice.page.getByRole('navigation', { name: "Rubriques de l'administration" }).getByRole('link', { name: 'Comptes', exact: true }).click()
+      await openAdmin(alice.page, "Parcours d'appel")
       const list = alice.page.getByRole('list', { name: 'Parcours existants' })
       await list.getByText(/— en service$/).first().waitFor()
       expectEqual(await list.getByText(/— en cours de mise en service$/).count(), 0, 'flows said to be set up still')
@@ -3825,7 +3825,7 @@ try {
         if ((await windowsOf('101')).length) {
           const dump = (await mi('ul_dump', {})).result
           console.log(`[11c-2] Alice's softphone said ${state} before she left; contacts: ${JSON.stringify((dump?.Domains ?? []).flatMap(d => d.AORs ?? []).filter(a => a.AOR === '101'))}`)
-          const said = execFileSync('docker', ['compose', '-f', COMPOSE_FILE, 'logs', '--no-color', '--no-log-prefix', '--tail', '400', 'opensips'], { encoding: 'utf8', timeout: 30_000, maxBuffer: 64 << 20 }).split('\n').filter(l => /REGISTER of 101|wazo|mid_reg/i.test(l) && !/'from' key not found|failed to unregister/.test(l)).slice(-25)
+          const said = execFileSync('docker', ['compose', '-f', COMPOSE_FILE, 'logs', '--no-color', '--no-log-prefix', '--tail', '400', 'opensips'], { encoding: 'utf8', timeout: 30_000, maxBuffer: 64 << 20 }).split('\n').filter(l => /wazo|mid_reg/i.test(l) && !/'from' key not found|failed to unregister/.test(l)).slice(-25)
           console.log(`[11c-2] OpenSIPS: ${said.join('\n')}`)
         }
         expectEqual((await windowsOf('101')).length, 0, 'the windows of 101 once the last one left while Wazo was silent')
