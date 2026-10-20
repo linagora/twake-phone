@@ -3628,6 +3628,9 @@ try {
       await until('the lines taken again by OpenSIPS', async () => (Number(await shvOf('wazo_lines_mute_until')) <= Date.now() / 1000 ? true : null), { timeout: 45_000 })
       jeanW = await open('jdupont', 'Jean Dupont')
       bobW = await open('bdurand', 'Bob Durand')
+      // Alice signed out a few steps ago (and signs out again at the end: the mailbox steps that follow need her without a window).
+      alice = await open('amartin', 'Alice Martin')
+      await phoneState(alice.page).getByText('En ligne').waitFor({ timeout: 20_000 })
       await until('the contacts of 102 and 103 at Wazo', async () => (contactsOf('102').length && contactsOf('103').length ? true : null), { timeout: 30_000 })
       await openAdmin(alice.page, "Parcours d'appel")
       const make = async ({ kind, number, name, members, ring, wait, choices }) => {
@@ -3813,6 +3816,7 @@ try {
       expectEqual(groupNames.length, 4, 'the queues the flows had')
       await signOut(jeanW)
       await signOut(bobW)
+      await signOut(alice)
     })
   }
   await lineSteps()
