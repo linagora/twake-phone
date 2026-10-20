@@ -307,6 +307,8 @@ services:
     volumes:
       - ./wazo/asterisk/entrypoint.sh:/twake/entrypoint.sh:ro
       - ./wazo/asterisk/extensions.conf:/etc/asterisk/extensions.d/01-wazo.conf:ro
+      # The call flows (step 11c-2): the dialplan of a sequential group, a queue and a voice menu, and of their members.
+      - ./wazo/asterisk/extensions-flows.conf:/etc/asterisk/extensions.d/02-twake-flows.conf:ro
       # The prompts a mailbox plays, in French, made for this stack (docker/wazo/asterisk/sounds/README.md): the image
       # has none, Wazo's packages bring them on a Wazo.
       - ./wazo/asterisk/sounds:/usr/share/asterisk/sounds/fr_FR:ro

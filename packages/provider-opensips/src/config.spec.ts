@@ -117,6 +117,51 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(cfg).toContain('$dlg_val(meet) != NULL || $dlg_val(wline) == "1")) {')
   })
 
+  it('sends the call to a number of `call_flows` to Wazo as it sends one to a mailbox, only with the lines on, before any ring group, and refuses what cannot go there as unreachable, never as a number that does not exist (step 11c-2, ADR 0028)', () => {
+    const key = 'twake-wazo-line-test-key-0123456789abcdef'
+    const { cfg } = renderWhole({ WAZO_SIP: '127.0.0.1:5100', WAZO_LINES: '1', WAZO_LINE_KEY: key })
+    // Read with the rules of the number dialled, one more column of the first query, never for an account an extension holds.
+    expect(cfg).toContain(`$var(flow_col) = ", (SELECT f.route FROM call_flows f WHERE f.number = '" + $rU + "' AND f.route ~ '^[A-Za-z0-9_.:=/~|-]{1,500}$' AND NOT EXISTS (SELECT 1 FROM subscriber s WHERE s.username = '" + $rU + "'))";`)
+    expect(cfg).toContain('$avp(vm_box);$avp(r_flow)"), rules_loaded);')
+    const next = cfg.slice(cfg.indexOf('route[rules_next] {'), cfg.indexOf('route[rules_loaded] {'))
+    expect(next.indexOf('if ($shv(wazo_lines_on) == 1)')).toBeGreaterThan(next.indexOf('$avp(q11) = 1;'))
+    // The call: before the ring group of the same number, guarded as a mailbox's call is, to Wazo's socket with the route.
+    const step = cfg.slice(cfg.indexOf('route[rules_step] {'), cfg.indexOf('route[rules_decide] {'))
+    expect(step.indexOf('$avp(r_flow) != NULL')).toBeGreaterThan(-1)
+    expect(step.indexOf('$avp(r_flow) != NULL')).toBeLessThan(step.indexOf('$avp(r_group) == 1'))
+    const flow = step.slice(step.indexOf('$avp(r_flow) != NULL'), step.indexOf('$avp(r_group) == 1'))
+    for (const part of [
+      'if ($shv(wazo_on) != 1 || $shv(wazo_mute_until) > $Ts || $dlg_val(meet) != NULL || $avp(conference) != NULL || is_present_hf("Replaces") || ($avp(rtp_on) == NULL && !has_body_part("application/sdp"))) {',
+      't_reply(480, "Temporarily Unavailable");',
+      'rtpengine_offer("$var(rtp_flags)")',
+      '$acc_extra(via) = "flow";',
+      // The side of Wazo of the call speaks from its socket and never transfers, as in a call to a mailbox.
+      '$dlg_val(voicemail) = "1";',
+      '$ru = "sip:" + $rU + "@127.0.0.1:5100";',
+      '$socket_out = "udp:127.0.0.1:5095";',
+      'remove_hf("X-Twake-Flow");',
+      'append_hf("X-Twake-Flow: $avp(flow)\\r\\n");',
+      't_on_failure("flow_failed");'
+    ])
+      expect(flow, part).toContain(part)
+    // The route is the one the Gateway wrote, never what a caller sent: the header is removed before it is written.
+    expect(flow.indexOf('remove_hf("X-Twake-Flow");')).toBeLessThan(flow.indexOf('append_hf("X-Twake-Flow'))
+    // Answered: told once as an answer of the callee; nothing of Asterisk shown to the caller.
+    const reply = cfg.slice(cfg.indexOf('onreply_route[rtp] {'), cfg.indexOf('route[event_attrs] {'))
+    expect(reply).toContain('if ($avp(flow) != NULL) {\n\t\tremove_hf("Server");\n\t\tremove_hf("User-Agent");')
+    expect(reply.indexOf('if ($avp(flow) != NULL) {')).toBeLessThan(reply.indexOf('if ($avp(callee) != NULL) {'))
+    // Not complete (an error, no answer): 480 and a missed call; a server that does not answer is left out 30 s.
+    const failed = cfg.slice(cfg.indexOf('failure_route[flow_failed] {'))
+    for (const part of ['route(account_missed);', 't_reply(480, "Temporarily Unavailable");', '$shv(wazo_mute_until) = $Ts + 30;']) expect(failed.slice(0, failed.indexOf('\n}\n')), part).toContain(part)
+    // Without the lines none of it is in the configuration the steps before read, and `call_flows` is never named.
+    const before = render({ WAZO_SIP: '127.0.0.1:5100' }).cfg
+    expect(before).not.toContain('call_flows')
+    expect(before).not.toContain('flow_failed')
+    expect(before).not.toContain('X-Twake-Flow')
+    // The table missing: the read goes again without it, as for the mailboxes.
+    expect(cfg).toContain("to_regclass('call_flows') IS NULL")
+  })
+
   it('stays under the 99 named routes OpenSIPS 3.6 has room for (one more fails the start: "no slot left")', () => {
     const { cfg } = renderWhole({ WAZO_SIP: '127.0.0.1:5100', WAZO_LINES: '1', WAZO_LINE_KEY: 'twake-wazo-line-test-key-0123456789abcdef' })
     expect(cfg.match(/^route\[/gm)!.length).toBeLessThanOrEqual(99)
