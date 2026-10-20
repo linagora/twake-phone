@@ -2,7 +2,7 @@ import { createHmac } from 'node:crypto'
 import type { RoutedEvent, VoicemailBox, VoicemailOwner, VoicemailProvider, VoicemailSubscribeOptions, VoicemailSync, VoicemailSyncOptions } from '@twake/telephony-provider-sdk'
 import type { ProviderStatus, Voicemail } from '@twake/telephony-types'
 
-export { WazoSupervision, SupervisionError, CALL_ID, type WazoSupervisionConfig } from './supervision.js'
+export { WazoSupervision, SupervisionError, CALL_ID, SUPERVISION_CALLER, type WazoSupervisionConfig } from './supervision.js'
 export { AmiError, amiAction, type AmiConfig } from './ami.js'
 
 // Everything about Wazo Platform lives here (step 11a, ADR 0022): the Gateway only sees a VoicemailProvider. Wazo's own

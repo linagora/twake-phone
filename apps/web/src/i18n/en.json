@@ -1043,5 +1043,7 @@
   "supervision.action.spy-whisper": "Whispered in a call",
   "supervision.action.spy-barge": "Barged in on a call",
   "supervision.action.purge": "Recording erased (retention period)",
-  "supervision.action.erase": "Recording erased (the person asked)"
+  "supervision.action.erase": "Recording erased (the person asked)",
+  "supervision.errNotice": "The recording notice is not on the telephony server: nothing is recorded.",
+  "supervision.stale": "The list could not be read again: what is shown may be out of date."
 }

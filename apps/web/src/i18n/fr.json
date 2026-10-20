@@ -1043,5 +1043,7 @@
   "supervision.action.spy-whisper": "A soufflé dans un appel",
   "supervision.action.spy-barge": "Est intervenu dans un appel",
   "supervision.action.purge": "Enregistrement effacé (durée de conservation)",
-  "supervision.action.erase": "Enregistrement effacé (demande de la personne)"
+  "supervision.action.erase": "Enregistrement effacé (demande de la personne)",
+  "supervision.errNotice": "L'annonce de l'enregistrement est introuvable sur le serveur téléphonique : rien n'est enregistré.",
+  "supervision.stale": "La liste n'a pas pu être relue : ce qui est affiché peut ne plus être à jour."
 }

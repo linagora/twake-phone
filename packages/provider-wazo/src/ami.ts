@@ -68,9 +68,11 @@ export const amiAction = (config: AmiConfig, action: Record<string, string | str
     const actionId = `twake-${Math.random().toString(36).slice(2, 10)}`
     let socket: Socket
     let request: string
+    let login: string
     try {
       // Built first: a header that is not one fails here, never inside an event handler.
       request = frame({ ...action, ActionID: actionId })
+      login = frame({ Action: 'Login', Username: config.username, Secret: config.password, Events: options.events ?? 'off', ActionID: 'login' })
       socket = (config.connect ?? ((port, host) => connect(port, host)))(config.port, config.host)
     } catch (err) {
       reject(err instanceof AmiError ? err : new AmiError(`AMI: ${(err as Error).message}`, 'unreachable'))
@@ -108,7 +110,7 @@ export const amiAction = (config: AmiConfig, action: Record<string, string | str
         if (end < 0) return
         banner = true
         buffer = buffer.slice(end + 2)
-        socket.write(frame({ Action: 'Login', Username: config.username, Secret: config.password, Events: options.events ?? 'off', ActionID: 'login' }))
+        socket.write(login)
       }
       for (;;) {
         const end = buffer.indexOf('\r\n\r\n')

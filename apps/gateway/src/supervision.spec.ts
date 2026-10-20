@@ -22,6 +22,7 @@ const fakeSupervision = () => {
     stopped: [] as string[],
     spied: [] as { id: string; supervisor: string; mode: SupervisionMode }[],
     announceFails: false,
+    noticeMissing: false,
     down: false,
     spy: 'answered' as 'answered' | 'refused' | 'never',
     sizeAfterStop: undefined as number | undefined
@@ -38,6 +39,7 @@ const fakeSupervision = () => {
     },
     async startRecording(call, file) {
       unavailable()
+      if (state.noticeMissing) throw new SupervisionError('no notice', 'notice')
       if (state.announceFails) throw new SupervisionError('the call did not come up', 'refused')
       if (!state.calls.some(c => c.id === call.id)) throw new SupervisionError('gone', 'gone')
       state.started.push({ id: call.id, file })
@@ -194,6 +196,22 @@ describe('recording', () => {
     expect((await post(`/supervision/calls/${CALL}/recording`, { action: 'pause' })).statusCode).toBe(400)
   })
 
+  it('refuses to record, and keeps a failed record, when the notice is not on the telephony server', async () => {
+    const { post, get, state } = await setup()
+    state.noticeMissing = true
+    const r = await post(`/supervision/calls/${CALL}/recording`, { action: 'start' })
+    expect([r.statusCode, r.json().code]).toEqual([503, 'NOTICE_MISSING'])
+    expect(state.started).toEqual([])
+    expect((await get('/supervision/recordings')).json().items.map((x: { state: string }) => x.state)).toEqual(['failed'])
+  })
+
+  it('stops what an unanswered request may have started before it says nothing was kept', async () => {
+    const { post, state } = await setup()
+    state.announceFails = true
+    await post(`/supervision/calls/${CALL}/recording`, { action: 'start' })
+    expect(state.stopped).toEqual([CALL])
+  })
+
   it('closes the recording of a call that ended without a stop, ready with its file, the next time anyone looks', async () => {
     const { get, post, state } = await setup()
     const rec = (await post(`/supervision/calls/${CALL}/recording`, { action: 'start' })).json()
@@ -323,7 +341,7 @@ describe('what is kept, and for how long', () => {
   it('keeps everything with 0 days, and tries again at the next sweep when the recordings server does not answer', async () => {
     const s = await setup()
     const id = await recordAndStop(s)
-    await age(s, id, '2020-01-01T00:00:00.000Z')
+    await age(s, id, new Date(Date.now() - 60 * 86_400_000).toISOString())
     await sweeper(s, 0).sweep()
     expect(s.state.files.size).toBe(1)
     s.state.down = true
@@ -342,6 +360,48 @@ describe('what is kept, and for how long', () => {
     s.state.calls = []
     await sweeper(s, 30).sweep()
     expect((await s.store.getRecording('dev', rec.id))?.state).toBe('ready')
+  })
+
+  it('stops the recording under way of a person who erases their history, then erases it whole, never leaving a file behind', async () => {
+    const s = await setup()
+    const rec = (await s.post(`/supervision/calls/${CALL}/recording`, { action: 'start' })).json()
+    const bob = await s.app.inject({ method: 'DELETE', url: '/api/v1/me/history', headers: as('bdurand', 'staff') })
+    expect(bob.json()).toMatchObject({ recordings: 1 })
+    expect(s.state.stopped).toEqual([CALL])
+    await until(async () => (await s.store.getRecording('dev', rec.id))?.state === 'purged')
+    expect(s.state.files.size).toBe(0)
+    // Nothing of the person is left in the record of what was erased.
+    expect(await s.store.getRecording('dev', rec.id)).not.toHaveProperty('userId')
+    expect(await s.store.getRecording('dev', rec.id)).not.toHaveProperty('displayName')
+  })
+
+  it('leaves a recording under way that could not be stopped, and does not say it was erased', async () => {
+    const s = await setup()
+    await s.post(`/supervision/calls/${CALL}/recording`, { action: 'start' })
+    s.state.down = true
+    const bob = await s.app.inject({ method: 'DELETE', url: '/api/v1/me/history', headers: as('bdurand', 'staff') })
+    expect(bob.json().recordings).toBeUndefined()
+    s.state.down = false
+    expect((await s.store.listRecordingsUnderWay('dev')).map(r => r.userId)).toEqual(['bdurand'])
+  })
+
+  it('removes the records of what was erased once they are as old as the journal', async () => {
+    const s = await setup()
+    const id = await recordAndStop(s)
+    await age(s, id, new Date(Date.now() - 60 * 86_400_000).toISOString())
+    await sweeper(s, 30).sweep()
+    expect((await s.store.getRecording('dev', id))?.state).toBe('purged')
+    // A year and a month on: nothing is left of it.
+    const orig = Date.now
+    Date.now = () => orig() + 400 * 86_400_000
+    try {
+      const fresh = await recordAndStop(s)
+      await age(s, fresh, new Date(orig() + 10 * 86_400_000).toISOString())
+      await sweeper(s, 30).sweep()
+    } finally {
+      Date.now = orig
+    }
+    expect(await s.store.getRecording('dev', id)).toBeNull()
   })
 
   it('erases the recordings of a person who erases their history, and says how many', async () => {
@@ -368,16 +428,18 @@ const until = async (ok: () => Promise<boolean>) => {
 }
 
 describe('the environment', () => {
-  const env = { WAZO_AMI: '127.0.0.1:5038', WAZO_AMI_USER: 'twake', WAZO_AMI_PASSWORD: 'pw', WAZO_AMI_ORIGINATE_USER: 'twake-originate', WAZO_AMI_ORIGINATE_PASSWORD: 'pw2', WAZO_RECORDINGS_URL: 'http://127.0.0.1:8670', WAZO_RECORDINGS_TOKEN: 'a'.repeat(40) }
+  const env = { WAZO_AMI: '127.0.0.1:5038', WAZO_GATEWAY_AMI_USER: 'twake', WAZO_GATEWAY_AMI_PASSWORD: 'pw', WAZO_GATEWAY_ORIGINATE_USER: 'twake-originate', WAZO_GATEWAY_ORIGINATE_PASSWORD: 'pw2', WAZO_RECORDINGS_URL: 'http://127.0.0.1:8670', WAZO_RECORDINGS_TOKEN: 'a'.repeat(40) }
 
   it('makes the supervision with its AMI and its recordings server, none without them, and refuses what is half set or wrong', () => {
     expect(supervisionFromEnv({})).toBeUndefined()
     expect(supervisionFromEnv(env)?.id).toBe('wazo')
     expect(() => supervisionFromEnv({ ...env, WAZO_AMI: 'nowhere' })).toThrow('WAZO_AMI')
     expect(() => supervisionFromEnv({ ...env, WAZO_AMI: 'host:99999' })).toThrow('WAZO_AMI')
-    expect(() => supervisionFromEnv({ ...env, WAZO_AMI_PASSWORD: '' })).toThrow('WAZO_AMI_USER')
-    expect(() => supervisionFromEnv({ ...env, WAZO_AMI_ORIGINATE_PASSWORD: '' })).toThrow('WAZO_AMI_ORIGINATE_USER')
-    expect(() => supervisionFromEnv({ ...env, WAZO_AMI_ORIGINATE_USER: 'twake' })).toThrow('must not be')
+    expect(() => supervisionFromEnv({ ...env, WAZO_GATEWAY_AMI_PASSWORD: '' })).toThrow('WAZO_GATEWAY_AMI_USER')
+    expect(() => supervisionFromEnv({ ...env, WAZO_GATEWAY_ORIGINATE_PASSWORD: '' })).toThrow('WAZO_GATEWAY_ORIGINATE_USER')
+    expect(() => supervisionFromEnv({ ...env, WAZO_GATEWAY_ORIGINATE_USER: 'twake' })).toThrow('must not be')
+    // wazo-amid's own account (write = all) is not the Gateway's: its variable is never read.
+    expect(() => supervisionFromEnv({ WAZO_AMI: env.WAZO_AMI, WAZO_AMI_USER: 'wazo_amid', WAZO_AMI_PASSWORD: 'x', WAZO_RECORDINGS_URL: env.WAZO_RECORDINGS_URL, WAZO_RECORDINGS_TOKEN: env.WAZO_RECORDINGS_TOKEN })).toThrow('WAZO_GATEWAY_AMI_USER')
     expect(() => supervisionFromEnv({ ...env, WAZO_RECORDINGS_URL: 'ftp://x' })).toThrow('WAZO_RECORDINGS_URL')
     expect(() => supervisionFromEnv({ ...env, WAZO_RECORDINGS_URL: 'http://u:p@x' })).toThrow('credentials')
     expect(() => supervisionFromEnv({ ...env, WAZO_RECORDINGS_TOKEN: 'short' })).toThrow('WAZO_RECORDINGS_TOKEN')

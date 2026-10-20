@@ -1,5 +1,5 @@
 import type { OperatorCdr, Recording, SupervisionLogEntry } from '@twake/telephony-types'
-import { clampLimit, isDeclined, isMissed, type HistoryEntry, type HistoryNearQuery, type HistoryPage, type HistoryQuery, type OperatorCdrOutcome, type OperatorCdrRecord, type OperatorCdrStats, type ConferenceDecision, type VisioPerson, type VisioRecord, type VisioStatus, type ConferenceRecord, type AlertRecord, type AlertQuery, type DidRecord, type RecordingRecord, type SiteRecord, type OutboundHand, type OutboundRecord, type OutboundRules, ALERT_DEDUP_MS, alertKey, type ProviderRecord, type StoredAlert, type PushSaveResult, type PushSubscriptionRecord, type Store, type TrunkRecord, type MappingChange, type UserMapping, type UserPresenceRecord, type VapidKeysRecord, type ClaimedDelivery, type ErasedCall, type ErasedCallsKept, type WebhookAttemptResult, type WebhookClaimCaps, type WebhookClaimTime, allocateClaims, type WebhookDeliveryQuery, type WebhookLease, type WebhookSendQuota, type WebhookDeliveryRecord, type WebhookQueueOptions, type WebhookStateChange, type WebhookStateEvent, type WebhookSubscriptionRecord, WEBHOOK_STATE_ROLE, type FencedLease, type NewTranscript, type TranscriptChange, type TranscriptLane, type TranscriptMatch, type TranscriptNotice, type TranscriptRecord } from './types.js'
+import { RecordingUnderWay, clampLimit, isDeclined, isMissed, type HistoryEntry, type HistoryNearQuery, type HistoryPage, type HistoryQuery, type OperatorCdrOutcome, type OperatorCdrRecord, type OperatorCdrStats, type ConferenceDecision, type VisioPerson, type VisioRecord, type VisioStatus, type ConferenceRecord, type AlertRecord, type AlertQuery, type DidRecord, type RecordingRecord, type SiteRecord, type OutboundHand, type OutboundRecord, type OutboundRules, ALERT_DEDUP_MS, alertKey, type ProviderRecord, type StoredAlert, type PushSaveResult, type PushSubscriptionRecord, type Store, type TrunkRecord, type MappingChange, type UserMapping, type UserPresenceRecord, type VapidKeysRecord, type ClaimedDelivery, type ErasedCall, type ErasedCallsKept, type WebhookAttemptResult, type WebhookClaimCaps, type WebhookClaimTime, allocateClaims, type WebhookDeliveryQuery, type WebhookLease, type WebhookSendQuota, type WebhookDeliveryRecord, type WebhookQueueOptions, type WebhookStateChange, type WebhookStateEvent, type WebhookSubscriptionRecord, WEBHOOK_STATE_ROLE, type FencedLease, type NewTranscript, type TranscriptChange, type TranscriptLane, type TranscriptMatch, type TranscriptNotice, type TranscriptRecord } from './types.js'
 import type { WebhookEventType } from '@twake/telephony-types'
 import { randomBytes } from 'node:crypto'
 import { EMPTY_OUTBOUND, outboundVersion, staleOutbound } from '../outbound.js'
@@ -1150,7 +1150,7 @@ export class MemoryStore implements Store {
   }
 
   async addRecording(record: RecordingRecord) {
-    if (record.state === 'recording' && (await this.getRecordingUnderWay(record.tenantId, record.callId))) throw new Error('a recording is under way for this call')
+    if (record.state === 'recording' && (await this.getRecordingUnderWay(record.tenantId, record.callId))) throw new RecordingUnderWay()
     this.recordings.set(key(record.tenantId, record.id), structuredClone(record))
   }
 
@@ -1176,11 +1176,16 @@ export class MemoryStore implements Store {
       .map(x => structuredClone(x))
   }
 
-  async updateRecording(tenantId: string, id: string, from: Recording['state'][], change: Partial<Pick<RecordingRecord, 'state' | 'endedAt' | 'sizeBytes'>>) {
+  async updateRecording(tenantId: string, id: string, from: Recording['state'][], change: Partial<Pick<RecordingRecord, 'state' | 'endedAt' | 'sizeBytes'>> & { forget?: boolean }) {
     const r = this.recordings.get(key(tenantId, id))
     if (!r || !from.includes(r.state)) return null
-    const next = { ...r, ...change }
-    if (next.state === 'recording' && r.state !== 'recording' && (await this.getRecordingUnderWay(tenantId, r.callId))) throw new Error('a recording is under way for this call')
+    const { forget, ...set } = change
+    const next = { ...r, ...set }
+    if (forget) {
+      delete next.userId
+      delete next.displayName
+    }
+    if (next.state === 'recording' && r.state !== 'recording' && (await this.getRecordingUnderWay(tenantId, r.callId))) throw new RecordingUnderWay()
     this.recordings.set(key(tenantId, id), next)
     return structuredClone(next)
   }
@@ -1196,8 +1201,18 @@ export class MemoryStore implements Store {
   async eraseRecordingsOf(tenantId: string, userId: string) {
     let n = 0
     for (const [k, r] of this.recordings) {
-      if (r.tenantId !== tenantId || r.userId !== userId || r.state === 'purged' || r.state === 'erasing') continue
+      if (r.tenantId !== tenantId || r.userId !== userId || (r.state !== 'ready' && r.state !== 'failed')) continue
       this.recordings.set(k, { ...r, state: 'erasing' })
+      n++
+    }
+    return n
+  }
+
+  async deletePurgedRecordings(before: string) {
+    let n = 0
+    for (const [k, r] of this.recordings) {
+      if (r.state !== 'purged' || r.startedAt >= before) continue
+      this.recordings.delete(k)
       n++
     }
     return n

@@ -30,7 +30,8 @@ const ERRORS: Record<string, Key> = {
   SUPERVISION_FAILED: 'supervision.errFailed',
   NO_EXTENSION: 'supervision.errNoExtension',
   OWN_CALL: 'supervision.errOwn',
-  SPY_REFUSED: 'supervision.errSpyRefused'
+  SPY_REFUSED: 'supervision.errSpyRefused',
+  NOTICE_MISSING: 'supervision.errNotice'
 }
 const MODES: { mode: SupervisionMode; label: Key; named: Key }[] = [
   { mode: 'listen', label: 'supervision.listen', named: 'supervision.listenFor' },
@@ -62,8 +63,18 @@ export const SupervisionPage = () => {
   const [playing, setPlaying] = useState<{ id: string; url: string } | null>(null)
   const url = useRef<string | null>(null)
   const listening = useRef(0)
+  const mounted = useRef(true)
   const [confirming, setConfirming] = useState<string | null>(null)
+  /** What the last read could not do: the list shown is then the one before. */
+  const [stale, setStale] = useState(false)
+  /** The calls whose action is under way: asked once, not twice by a second click. */
+  const asking = useRef(new Set<string>())
+  const [busy, setBusy] = useState<ReadonlySet<string>>(new Set())
   const title = useRef<HTMLHeadingElement>(null)
+  const removeButtons = useRef(new Map<string, HTMLButtonElement>())
+  const confirmButtons = useRef(new Map<string, HTMLButtonElement>())
+  /** Where the focus goes once an action took its button away: the confirmation, the button it replaced, or the title. */
+  const focusAfter = useRef<{ confirm: string } | { remove: string } | 'title' | null>(null)
   const allowed = me?.features?.supervision === true
   const admin = me?.features?.admin === true
 
@@ -73,8 +84,12 @@ export const SupervisionPage = () => {
         page => {
           setCalls(page.items)
           setError(null)
+          setStale(false)
         },
-        (err: { status?: number; message?: string }) => setError(err.status === 501 ? 'unavailable' : err.status === 403 ? 'forbidden' : (err.message ?? 'load'))
+        (err: { status?: number; message?: string }) => {
+          setStale(true)
+          setError(err.status === 501 ? 'unavailable' : err.status === 403 ? 'forbidden' : (err.message ?? 'load'))
+        }
       ),
     [client]
   )
@@ -84,32 +99,56 @@ export const SupervisionPage = () => {
   useEffect(() => {
     if (!allowed) return
     void Promise.all([readCalls(), readRecordings(), readLog()])
-    const timer = setInterval(() => void Promise.all([readCalls(), readRecordings()]), CALLS_EVERY_MS)
+    // A tab nobody looks at asks nothing of the telephony server.
+    const timer = setInterval(() => {
+      if (typeof document === 'undefined' || document.visibilityState !== 'hidden') void Promise.all([readCalls(), readRecordings()])
+    }, CALLS_EVERY_MS)
     return () => clearInterval(timer)
   }, [allowed, readCalls, readRecordings, readLog])
-  useEffect(
-    () => () => {
+  useEffect(() => {
+    mounted.current = true
+    return () => {
+      mounted.current = false
       if (url.current) URL.revokeObjectURL(url.current)
-    },
-    []
-  )
+    }
+  }, [])
+  // The focus an action asked for, once the page is without its button (or with the confirmation).
+  useEffect(() => {
+    const target = focusAfter.current
+    if (!target) return
+    focusAfter.current = null
+    const button = target === 'title' ? undefined : 'confirm' in target ? confirmButtons.current.get(target.confirm) : removeButtons.current.get(target.remove)
+    if (button) return button.focus()
+    title.current?.focus()
+  }, [recordings, confirming])
 
   const whoOf = (c: { extension: string; displayName?: string }) => (c.displayName ? `${c.displayName} (${c.extension})` : t('auth.extension', { extension: c.extension }))
   const peerOf = (c: Call) => (c.peerName ? `${c.peerName} (${formatNumber(c.peer ?? '')})` : c.peer ? formatNumber(c.peer) : t('call.hiddenNumber'))
-  const act = async (run: () => Promise<void>) => {
+  const act = async (key: string | null, run: () => Promise<void>) => {
+    // The buttons of a call whose action is under way are told so (aria-disabled, the focus stays) and ignore a click.
+    if (key !== null) {
+      if (asking.current.has(key)) return
+      asking.current.add(key)
+      setBusy(new Set(asking.current))
+    }
     setProblem(null)
     try {
       await run()
     } catch (err) {
       const code = (err as { code?: string }).code
       setProblem(t(code && ERRORS[code] ? ERRORS[code] : 'supervision.errOther'))
+    } finally {
+      if (key !== null) {
+        asking.current.delete(key)
+        setBusy(new Set(asking.current))
+      }
     }
     void Promise.all([readCalls(), readRecordings(), readLog()])
   }
-  const record = (c: Call) => act(async () => (await client.startRecording(c.id), say(t('supervision.recordingStarted', { who: whoOf(c) }))))
-  const stop = (c: Call) => act(async () => (await client.stopRecording(c.id), say(t('supervision.recordingStopped', { who: whoOf(c) }))))
+  const record = (c: Call) => act(c.id, async () => (await client.startRecording(c.id), say(t('supervision.recordingStarted', { who: whoOf(c) }))))
+  const stop = (c: Call) => act(c.id, async () => (await client.stopRecording(c.id), say(t('supervision.recordingStopped', { who: whoOf(c) }))))
   const join = (c: Call, mode: SupervisionMode) =>
-    act(async () => {
+    act(c.id, async () => {
       say(t('supervision.spyRinging', { who: whoOf(c) }))
       const r = await client.superviseCall(c.id, mode)
       if (r.state === 'answered') say(t('supervision.spyAnswered', { who: whoOf(c) }))
@@ -119,7 +158,8 @@ export const SupervisionPage = () => {
     const ticket = ++listening.current
     try {
       const blob = await client.getRecordingAudio(r.id)
-      if (ticket !== listening.current) return
+      // Another recording was asked meanwhile, or the page went: this one is not played.
+      if (ticket !== listening.current || !mounted.current) return
       const next = URL.createObjectURL(blob)
       if (url.current) URL.revokeObjectURL(url.current)
       url.current = next
@@ -129,11 +169,27 @@ export const SupervisionPage = () => {
       if (ticket === listening.current) setProblem(t('supervision.audioFailed'))
     }
   }
+  // A deletion is for good: asked first, then confirmed (the focus on the confirmation), or given up (back on « Supprimer »).
+  const askRemove = (r: Recording) => {
+    focusAfter.current = { confirm: r.id }
+    setConfirming(r.id)
+  }
+  const keep = (r: Recording) => {
+    focusAfter.current = { remove: r.id }
+    setConfirming(null)
+  }
   const remove = (r: Recording) =>
-    act(async () => {
+    act(null, async () => {
       setConfirming(null)
       await client.deleteRecording(r.id)
-      if (playing?.id === r.id) setPlaying(null)
+      if (playing?.id === r.id) {
+        setPlaying(null)
+        if (url.current === playing.url) {
+          URL.revokeObjectURL(playing.url)
+          url.current = null
+        }
+      }
+      focusAfter.current = 'title'
       say(t('supervision.deleted'))
     })
 
@@ -161,6 +217,12 @@ export const SupervisionPage = () => {
       {problem ? (
         <p className="alert alert-error" role="alert">
           {problem}
+        </p>
+      ) : null}
+
+      {stale && calls ? (
+        <p className="alert" role="status">
+          {t('supervision.stale')}
         </p>
       ) : null}
 
@@ -197,16 +259,16 @@ export const SupervisionPage = () => {
                   </td>
                   <td className="actions">
                     {c.recording ? (
-                      <button type="button" className="btn" aria-label={t('supervision.stopFor', { who })} onClick={() => void stop(c)}>
+                      <button type="button" className="btn" aria-label={t('supervision.stopFor', { who })} aria-disabled={busy.has(c.id) || undefined} onClick={() => void stop(c)}>
                         {t('supervision.stopRecord')}
                       </button>
                     ) : (
-                      <button type="button" className="btn btn-primary" aria-label={t('supervision.recordFor', { who })} onClick={() => void record(c)}>
+                      <button type="button" className="btn btn-primary" aria-label={t('supervision.recordFor', { who })} aria-disabled={busy.has(c.id) || undefined} onClick={() => void record(c)}>
                         {t('supervision.record')}
                       </button>
                     )}
                     {MODES.map(m => (
-                      <button key={m.mode} type="button" className="btn" aria-label={t(m.named, { who })} onClick={() => void join(c, m.mode)}>
+                      <button key={m.mode} type="button" className="btn" aria-label={t(m.named, { who })} aria-disabled={busy.has(c.id) || undefined} onClick={() => void join(c, m.mode)}>
                         {t(m.label)}
                       </button>
                     ))}
@@ -246,17 +308,21 @@ export const SupervisionPage = () => {
                   ) : null}
                   {admin && r.state !== 'recording' && r.state !== 'purged' ? (
                     confirming === r.id ? (
-                      <>
+                      <span
+                        onKeyDown={e => {
+                          if (e.key === 'Escape') keep(r)
+                        }}
+                      >
                         <span role="alert">{t('supervision.confirmDelete', named)}</span>
-                        <button type="button" className="btn btn-danger" onClick={() => void remove(r)}>
+                        <button type="button" className="btn btn-danger" ref={el => void (el ? confirmButtons.current.set(r.id, el) : confirmButtons.current.delete(r.id))} onClick={() => void remove(r)}>
                           {t('supervision.confirm')}
                         </button>
-                        <button type="button" className="btn" onClick={() => setConfirming(null)}>
+                        <button type="button" className="btn" onClick={() => keep(r)}>
                           {t('supervision.keep')}
                         </button>
-                      </>
+                      </span>
                     ) : (
-                      <button type="button" className="btn" aria-label={t('supervision.deleteFor', named)} onClick={() => setConfirming(r.id)}>
+                      <button type="button" className="btn" ref={el => void (el ? removeButtons.current.set(r.id, el) : removeButtons.current.delete(r.id))} aria-label={t('supervision.deleteFor', named)} onClick={() => askRemove(r)}>
                         {t('supervision.delete')}
                       </button>
                     )

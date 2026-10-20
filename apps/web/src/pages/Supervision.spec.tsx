@@ -174,6 +174,57 @@ describe('the supervision page', () => {
     expect(said()).toContain('supervision.deleted')
   })
 
+  it('asks an action once when it is clicked twice, and says so to the buttons of that call', async () => {
+    let finish: () => void = () => undefined
+    client.startRecording.mockImplementationOnce(() => new Promise(resolve => (finish = () => resolve(rec('r1', 'recording')))))
+    await render()
+    await act(async () => button('supervision.recordFor')!.click())
+    await act(async () => button('supervision.recordFor')!.click())
+    expect(client.startRecording).toHaveBeenCalledTimes(1)
+    expect(button('supervision.recordFor')!.getAttribute('aria-disabled')).toBe('true')
+    expect(button('supervision.listenFor')!.getAttribute('aria-disabled')).toBe('true')
+    await act(async () => finish())
+    await flush()
+    expect(button('supervision.recordFor')!.getAttribute('aria-disabled')).toBeNull()
+  })
+
+  it('moves the focus where the person is: the confirmation, then back to « Supprimer » if they keep the recording (or press Escape), the title once it is deleted', async () => {
+    await render({ supervision: true, admin: true })
+    const active = () => document.activeElement?.textContent
+    await click('supervision.deleteFor')
+    expect(active()).toBe('supervision.confirm')
+    await act(async () => {
+      document.activeElement!.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+    })
+    await flush()
+    expect((document.activeElement as HTMLElement).getAttribute('aria-label')).toMatch(/^supervision\.deleteFor/)
+    await click('supervision.deleteFor')
+    await click('supervision.keep')
+    expect((document.activeElement as HTMLElement).getAttribute('aria-label')).toMatch(/^supervision\.deleteFor/)
+    await click('supervision.deleteFor')
+    recordings = []
+    await click('supervision.confirm')
+    expect(document.activeElement).toBe(host.querySelector('h1'))
+  })
+
+  it('keeps the list it has and says it may be out of date when a reading fails, and asks nothing of a tab nobody looks at', async () => {
+    await render()
+    client.listSupervisedCalls.mockRejectedValueOnce(new Error('network down'))
+    await act(() => vi.advanceTimersByTimeAsync(CALLS_EVERY_MS))
+    expect(host.textContent).toContain('supervision.stale')
+    expect(host.querySelector('[data-testid="supervision-call"]')).not.toBeNull()
+    await act(() => vi.advanceTimersByTimeAsync(CALLS_EVERY_MS))
+    expect(host.textContent).not.toContain('supervision.stale')
+    const reads = client.listSupervisedCalls.mock.calls.length
+    Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'hidden' })
+    try {
+      await act(() => vi.advanceTimersByTimeAsync(CALLS_EVERY_MS * 3))
+      expect(client.listSupervisedCalls.mock.calls.length).toBe(reads)
+    } finally {
+      delete (document as { visibilityState?: unknown }).visibilityState
+    }
+  })
+
   it('reads the calls again every few seconds, and stops when the page goes', async () => {
     await render()
     expect(client.listSupervisedCalls).toHaveBeenCalledTimes(1)

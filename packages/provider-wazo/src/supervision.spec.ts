@@ -69,7 +69,7 @@ const supervision = async (behave: Parameters<typeof fakeAmi>[0], extra: { fetch
   const ami = await fakeAmi(behave)
   opened.push(ami)
   const account = { host: '127.0.0.1', port: ami.port, username: 'twake', password: 'ami-secret', timeoutMs: 2000 }
-  const sup = new WazoSupervision({ ami: account, originate: account, recordingsUrl: 'http://recordings.test:8670', recordingsToken: 't'.repeat(40), ...extra })
+  const sup = new WazoSupervision({ ami: account, originate: account, recordingsUrl: 'http://recordings.test:8670', recordingsToken: 't'.repeat(40), fetch: () => Promise.resolve(new Response(null, { status: 200 })), ...extra })
   return { ami, sup }
 }
 
@@ -81,6 +81,15 @@ describe('the AMI client', () => {
     expect(r.response.Message).toBe('done')
     expect(ami.state.actions.map(a => a.Action)).toEqual(['Ping'])
     expect(ami.state.actions[0]!.ActionID).toMatch(/^twake-/)
+  })
+
+  it('rejects, never crashes the process, on a user name or a password with a line break', async () => {
+    const ami = await fakeAmi((a, reply) => reply({ Response: 'Success', ActionID: a.ActionID! }))
+    opened.push(ami)
+    const cfg = { host: '127.0.0.1', port: ami.port, username: 'twake', password: 'ami-secret' }
+    await expect(amiAction({ ...cfg, username: 'twake\r\nAction: Hangup' }, { Action: 'Ping' })).rejects.toBeInstanceOf(AmiError)
+    await expect(amiAction({ ...cfg, password: 'a\nb' }, { Action: 'Ping' })).rejects.toBeInstanceOf(AmiError)
+    expect(ami.state.logins).toBe(0)
   })
 
   it('says refused for a login or an action Asterisk refuses, unreachable when nothing listens, and rejects a line break in a header', async () => {
@@ -110,6 +119,8 @@ describe('listCalls', () => {
         channel({ Channel: 'PJSIP/opensips-00000001', Uniqueid: '1792479546.14' }),
         channel({ Channel: 'Local/s@wazo-play-beep-00000001;1', Uniqueid: '1792479546.15' }),
         channel({ Channel: 'PJSIP/101-0000000c', Uniqueid: '1792479546.16', Application: 'ChanSpy' }),
+        // A supervisor's line still ringing: no application yet, but the number of the supervision.
+        channel({ Channel: 'PJSIP/102-0000000e', Uniqueid: '1792479546.17', ChannelStateDesc: 'Ring', CallerIDNum: '0199', CallerIDName: 'Supervision', Application: '' }),
         channel({ Channel: 'PJSIP/105-0000000d', Uniqueid: 'not-an-id' })
       ])
     )
@@ -148,6 +159,23 @@ describe('startRecording', () => {
     const [, notice, record] = ami.state.actions
     expect(notice).toMatchObject({ Action: 'Originate', Channel: 'Local/s@wazo-play-beep', Application: 'Playback', Data: 'custom/twake-recording-notice', Variable: 'WAZO_PLAYBACK_CHANNEL=1792479546.12', Async: 'true' })
     expect(record).toMatchObject({ Action: 'MixMonitor', Channel: '1792479546.12', File: `/var/lib/wazo/sounds/tenants/${TENANT}/monitor/${NAME}.wav` })
+  })
+
+  it('records nothing, and touches nothing, when the notice is not a sound of the telephony server', async () => {
+    const sounds: string[] = []
+    const missing = (async (url: string, init: RequestInit) => {
+      sounds.push(`${init.method} ${url} ${new Headers(init.headers).get('authorization')}`)
+      return new Response(null, { status: 404 })
+    }) as unknown as typeof fetch
+    const { sup, ami } = await supervision(answering(), { fetch: missing })
+    await expect(sup.startRecording({ id: '1792479546.12' }, { tenant: TENANT, name: NAME })).rejects.toMatchObject({ code: 'notice' })
+    expect(sounds).toEqual([`HEAD http://recordings.test:8670/sound/custom/twake-recording-notice Bearer ${'t'.repeat(40)}`])
+    expect(ami.state.actions).toEqual([])
+    const down = await supervision(answering(), { fetch: () => Promise.reject(new Error('ECONNREFUSED')) })
+    await expect(down.sup.startRecording({ id: '1792479546.12' }, { tenant: TENANT, name: NAME })).rejects.toMatchObject({ code: 'unavailable' })
+    expect(down.ami.state.actions).toEqual([])
+    const odd = await supervision(answering(), { fetch: () => Promise.resolve(new Response(null, { status: 500 })) })
+    await expect(odd.sup.startRecording({ id: '1792479546.12' }, { tenant: TENANT, name: NAME })).rejects.toMatchObject({ code: 'unavailable' })
   })
 
   it('records nothing when the announcement does not go, or when the call is over', async () => {
@@ -198,7 +226,8 @@ describe('the two accounts', () => {
       ami: { host: '127.0.0.1', port: system.port, username: 'twake', password: 'ami-secret' },
       originate: { host: '127.0.0.1', port: originate.port, username: 'twake', password: 'ami-secret' },
       recordingsUrl: 'http://x',
-      recordingsToken: 't'
+      recordingsToken: 't',
+      fetch: () => Promise.resolve(new Response(null, { status: 200 }))
     })
     await sup.startRecording({ id: '1792479546.12' }, { tenant: TENANT, name: NAME })
     await sup.spy({ id: '1792479546.12' }, { extension: '101' }, 'listen')

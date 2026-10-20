@@ -215,6 +215,8 @@ const wazoAmi = () =>
         },
         /** The events heard since the login whose text matches `pattern`. */
         heard: pattern => events.filter(e => pattern.test(e)),
+        /** The place in the order they came of the first event `test` says yes to (-1: none). */
+        firstIndex: test => events.findIndex(test),
         field,
         channelsOf: prefix => events.filter(e => /^Event: Newchannel/m.test(e) && field(e, 'Channel')?.startsWith(prefix)).map(e => field(e, 'Channel')),
         hangup: channel => send({ Action: 'Hangup', Channel: channel, Cause: 16 }),
@@ -3601,6 +3603,11 @@ try {
         await refused(amiAction(AMI_ORIGINATE, { Action: 'CoreShowChannels' }, { wait: 'list' }), /Permission denied/, 'CoreShowChannels by the second account')
         await refused(amiAction(AMI_ORIGINATE, { Action: 'MixMonitor', Channel: '1.1', File: '/tmp/never.wav' }), /Permission denied/, 'MixMonitor by the second account')
         await refused(amiAction(AMI_ORIGINATE, { Action: 'Originate', Channel: 'Local/s@twake-opensips', Application: 'System', Data: 'true', Async: 'true' }, { events: 'call', wait: 'event' }), /blacklisted/, 'an Originate that runs a shell, by the second account')
+        // No recording without its notice: a sound the telephony server has not is refused before anything is asked of Asterisk.
+        const silent = new WazoSupervision({ ami: AMI_GATEWAY, originate: AMI_ORIGINATE, recordingsUrl: WAZO_RECORDINGS_URL, recordingsToken: WAZO_RECORDINGS_TOKEN, noticeSound: 'custom/absent-notice' })
+        const absent = await silent.startRecording({ id: '1.1' }, { tenant: TENANT, name: '3f2b8c0e-4d1a-4b7e-9c55-0a1b2c3d4e5f' }).then(() => null, e => e)
+        expectEqual(absent?.code, 'notice', 'a recording whose notice is not on the telephony server')
+        expectEqual(await supervision.noticeAvailable(), true, 'the notice of the stack on the telephony server')
         // The recordings server asks its token, and the Gateway's reads and erasures are by it.
         expectEqual((await fetch(`${WAZO_RECORDINGS_URL}/e2e/3f2b8c0e-4d1a-4b7e-9c55-0a1b2c3d4e5f`)).status, 401, 'the recordings server without its token')
         expectEqual((await fetch(`${WAZO_RECORDINGS_URL}/e2e/3f2b8c0e-4d1a-4b7e-9c55-0a1b2c3d4e5f`, { headers: { authorization: `Bearer ${WAZO_RECORDINGS_TOKEN}` } })).status, 404, 'the recordings server with its token, a file it has not')
@@ -3627,7 +3634,7 @@ try {
         await phoneState(alice2.page).getByText('En ligne').waitFor({ timeout: 20_000 })
         await until('the contact of 101 at Wazo', async () => (contactsOf('101').length ? true : null), { timeout: 20_000 })
         wazoSide = await wazoCallsBob()
-        supApi = await asPerson(alice)
+        supApi = await asPerson(alice2)
         bobApi = await asPerson(bob)
         const call = await callOfBob()
         expectEqual([call.peer, call.peerName, call.displayName, call.state], ['0100', 'Standard', 'Bob Durand', 'up'], 'the call as the supervision lists it')
@@ -3650,6 +3657,10 @@ try {
         // The notice: Wazo's wazo-play-beep context spies the channel of Bob's line; and the recording of that channel.
         await until('the ChanSpy of the notice on the channel of 103', async () => wazoSide.heard(/^Event: ChanSpyStart/m).find(e => /SpyerChannel: Local\/s@wazo-play-beep/.test(e) && /SpyeeChannel: PJSIP\/103-/.test(e)) ?? null, { timeout: 20_000 })
         await until('the MixMonitor of the channel of 103', async () => wazoSide.heard(/^Event: MixMonitorStart/m).find(e => /Channel: PJSIP\/103-/.test(e)) ?? null, { timeout: 20_000 })
+        // The notice first: the spy of Wazo's context on the channel came before the recording of it.
+        const noticeAt = wazoSide.firstIndex(e => /^Event: ChanSpyStart/m.test(e) && /SpyerChannel: Local\/s@wazo-play-beep/.test(e) && /SpyeeChannel: PJSIP\/103-/.test(e))
+        const recordAt = wazoSide.firstIndex(e => /^Event: MixMonitorStart/m.test(e) && /Channel: PJSIP\/103-/.test(e))
+        if (!(noticeAt >= 0 && noticeAt < recordAt)) throw new Error(`the notice (event ${noticeAt}) was not before the recording (event ${recordAt})`)
         // A second recording of the same call is refused while one is under way.
         const twice = await supApi('POST', `/supervision/calls/${callId}/recording`, { action: 'start' })
         expectEqual([twice.statusCode, twice.json().code], [409, 'RECORDING_UNDER_WAY'], 'a second recording of the call')
@@ -3674,12 +3685,15 @@ try {
         expectEqual(audio.headers['content-type'], 'audio/wav', 'its type')
         const wav = audio.rawPayload
         expectEqual([wav.subarray(0, 4).toString(), wav.subarray(8, 12).toString()], ['RIFF', 'WAVE'], 'its header')
-        // The size the record says is what the recordings server has, and enough for 3 s of 8 kHz, 16 bits.
+        // The size the record says is what the recordings server has. Its sound lasts what the call lasted after the notice (the notice is 1.5 s),
+        // and the end of it, long after the notice, still has the voice of the window and its echo in it.
         if (wav.length < recording.sizeBytes) throw new Error(`the audio is ${wav.length} bytes, the record says ${recording.sizeBytes}`)
-        if (wav.length < 2.5 * 16_000) throw new Error(`the recording is ${wav.length} bytes`)
-        let peak = 0
-        for (let i = 44; i + 1 < wav.length; i += 2) peak = Math.max(peak, Math.abs(wav.readInt16LE(i)))
-        if (peak < 100) throw new Error(`the recording is silent (peak ${peak})`)
+        const byteRate = wav.readUInt32LE(28)
+        const seconds = (wav.length - 44) / byteRate
+        if (!(seconds >= 3)) throw new Error(`the recording lasts ${seconds} s of sound (${wav.length} bytes at ${byteRate} a second)`)
+        let tail = 0
+        for (let i = Math.max(44, wav.length - Math.floor(1.5 * byteRate)); i + 1 < wav.length; i += 2) tail = Math.max(tail, Math.abs(wav.readInt16LE(i)))
+        if (tail < 100) throw new Error(`the last 1.5 s of the recording are silent (peak ${tail}): only the notice is in it`)
         expectEqual((await bobApi('GET', `/supervision/recordings/${recording.id}/audio`)).statusCode, 403, 'the audio as Bob')
         const file = await fetch(`${WAZO_RECORDINGS_URL}/${TENANT}/${recording.id}`, { headers: { authorization: `Bearer ${WAZO_RECORDINGS_TOKEN}` } })
         expectEqual(Number(file.headers.get('content-length')), wav.length, 'the file at the recordings server')
@@ -3696,6 +3710,8 @@ try {
           const posted = supApi('POST', `/supervision/calls/${callId}/spy`, { mode })
           const card = alice2.page.getByTestId('incoming-call')
           await card.getByText(/Supervision \(01 99\)/).waitFor({ timeout: 20_000 })
+          // Her line is ringing with the call of the supervision: it is no call to supervise.
+          expectEqual((await supApi('GET', '/supervision/calls')).json().items.map(c => c.extension), ['103'], 'the calls listed while the supervisor\'s line rings')
           await card.getByRole('button', { name: 'Répondre' }).click()
           const r = await posted
           expectEqual([r.statusCode, r.json().state], [202, 'answered'], `the supervision call (${mode})`)

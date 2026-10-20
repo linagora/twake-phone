@@ -274,6 +274,14 @@ export interface RecordingRecord extends Recording {
   userId?: string
 }
 
+/** A recording is already under way for the call (addRecording): one at a time, whatever Gateway and screen ask. */
+export class RecordingUnderWay extends Error {
+  constructor() {
+    super('a recording is under way for this call')
+    this.name = 'RecordingUnderWay'
+  }
+}
+
 /** The rules of a tenant's calls to the public network (step 6b, ADR 0017), as an administrator set them. */
 export interface OutboundRecord {
   tenantId: string
@@ -969,16 +977,23 @@ export interface Store {
   listRecordings(tenantId: string, limit?: number): Promise<RecordingRecord[]>
   /**
    * Changes a recording's state, end or size, only if it is still in state `from` (one of them; a closing and an erasure
-   * never overwrite each other): the recording as it is now, null when it is not (or not of this tenant).
+   * never overwrite each other): the recording as it is now, null when it is not (or not of this tenant). `forget`: the
+   * record keeps nothing of the person (their id, their name) any more: what an erased recording leaves is the line, the
+   * times and who started it.
    */
-  updateRecording(tenantId: string, id: string, from: Recording['state'][], change: Partial<Pick<RecordingRecord, 'state' | 'endedAt' | 'sizeBytes'>>): Promise<RecordingRecord | null>
+  updateRecording(tenantId: string, id: string, from: Recording['state'][], change: Partial<Pick<RecordingRecord, 'state' | 'endedAt' | 'sizeBytes'>> & { forget?: boolean }): Promise<RecordingRecord | null>
   /**
    * The recordings whose audio is to go: those `erasing`, and, with `before` (ISO), those ready or failed that began
    * before it (the retention period); oldest first, `limit` at most. Of every tenant when `tenantId` is undefined.
    */
   listRecordingsToErase(before: string | null, limit: number, tenantId?: string): Promise<RecordingRecord[]>
-  /** Marks `erasing` the recordings of a person's calls (under way, ready or failed); how many. */
+  /**
+   * Marks `erasing` the recordings of a person's calls that are closed (ready or failed); how many. One under way is not:
+   * it is stopped first, then marked (its file does not exist yet, or is being written).
+   */
   eraseRecordingsOf(tenantId: string, userId: string): Promise<number>
+  /** Removes the records of the recordings purged before `before` (ISO, their start); how many. */
+  deletePurgedRecordings(before: string): Promise<number>
   /** Adds a line to the journal of the supervision (step 11d). */
   addSupervisionLog(tenantId: string, entry: SupervisionLogEntry): Promise<void>
   /** The journal of a tenant, newest first, `limit` at most (clamped as a page). */

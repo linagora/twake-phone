@@ -374,6 +374,8 @@ services:
       - ./wazo/recordings.py:/twake/recordings.py:ro
       - ./wazo/healthcheck.py:/twake/healthcheck.py:ro
       - wazo-recordings:/var/lib/wazo/sounds/tenants
+      # The notice a recording starts with, where it says whether the host of Asterisk has it (HEAD /sound/custom/twake-recording-notice).
+      - ./wazo/asterisk/recording-notice/twake-recording-notice.wav:/usr/share/asterisk/sounds/custom/twake-recording-notice.wav:ro
     network_mode: host
     healthcheck:
       test: ["CMD", "python3", "/twake/healthcheck.py", "tcp:127.0.0.1:8670"]

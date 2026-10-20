@@ -2742,8 +2742,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         const deleted = await store.deleteHistory(user.tenantId, user.id, await erasedNumbersOf(store, user.tenantId, user.id), kept)
         // Their recordings too (step 11d, ADR 0029): marked, their audio erased by the next sweep (at once, below), whether
         // the recordings server answers now or not.
-        const recordings = await store.eraseRecordingsOf(user.tenantId, user.id)
-        if (recordings) void supervision.sweep().catch((err: unknown) => req.log.error({ err }, 'recordings not erased'))
+        const recordings = await supervision.eraseRecordingsOf(user.tenantId, user.id)
         const recorded = recordings ? { recordings } : {}
         // Their messages too, in every mailbox held for them: asked of the Gateway that writes the mailboxes (the only
         // one that writes the voicemail server), done at its next round, Wazo down or not.

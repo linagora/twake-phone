@@ -5,7 +5,7 @@ import { SupervisionError, WazoSupervision } from '@twake/provider-wazo'
 import type { SupervisionProvider } from '@twake/telephony-provider-sdk'
 import type { Recording, SupervisedCall, SupervisionLogEntry, User } from '@twake/telephony-types'
 import type { Identity } from './auth.js'
-import type { RecordingRecord, Store } from './store/types.js'
+import { RecordingUnderWay, type RecordingRecord, type Store } from './store/types.js'
 
 // Recording and supervision of the calls that have a channel at Wazo (step 11d, ADR 0029): who may (a supervisor), what
 // is kept (the record, never the voice, in the store; the audio on the recordings server), for how long, and the journal.
@@ -49,10 +49,10 @@ export const recordingRetentionDaysOf = (env: NodeJS.ProcessEnv) => {
 
 /**
  * Supervision from the environment, or nothing when it is not set (no supervision, the routes say so):
- *   WAZO_AMI, WAZO_AMI_USER, WAZO_AMI_PASSWORD
+ *   WAZO_AMI, WAZO_GATEWAY_AMI_USER, WAZO_GATEWAY_AMI_PASSWORD
  *                          the AMI of Wazo's Asterisk (host:port) and the Gateway's account in it, for the calls and
- *                          MixMonitor (`system`, `reporting`);
- *   WAZO_AMI_ORIGINATE_USER, WAZO_AMI_ORIGINATE_PASSWORD
+ *                          MixMonitor (`system`, `reporting`; never `WAZO_AMI_PASSWORD`, which is wazo-amid's account);
+ *   WAZO_GATEWAY_ORIGINATE_USER, WAZO_GATEWAY_ORIGINATE_PASSWORD
  *                          its other account there, for Originate only (`originate`, read `call`): never the same as
  *                          the first, whose `system` would let an Originate run any application;
  *   WAZO_RECORDINGS_URL, WAZO_RECORDINGS_TOKEN
@@ -65,9 +65,9 @@ export const supervisionFromEnv = (env: NodeJS.ProcessEnv): WazoSupervision | un
   if (!env.WAZO_AMI && !env.WAZO_RECORDINGS_URL) return undefined
   const ami = /^(.+):([0-9]{1,5})$/.exec(env.WAZO_AMI ?? '')
   if (!ami || Number(ami[2]) < 1 || Number(ami[2]) > 65535) throw new Error('Supervision: WAZO_AMI must be host:port (the AMI of the Asterisk of Wazo)')
-  if (!env.WAZO_AMI_USER || !env.WAZO_AMI_PASSWORD) throw new Error('Supervision: WAZO_AMI_USER and WAZO_AMI_PASSWORD are required with WAZO_AMI')
-  if (!env.WAZO_AMI_ORIGINATE_USER || !env.WAZO_AMI_ORIGINATE_PASSWORD) throw new Error('Supervision: WAZO_AMI_ORIGINATE_USER and WAZO_AMI_ORIGINATE_PASSWORD (a second account, for Originate only) are required with WAZO_AMI')
-  if (env.WAZO_AMI_ORIGINATE_USER === env.WAZO_AMI_USER) throw new Error('Supervision: WAZO_AMI_ORIGINATE_USER must not be WAZO_AMI_USER: the account that holds `system` must not originate')
+  if (!env.WAZO_GATEWAY_AMI_USER || !env.WAZO_GATEWAY_AMI_PASSWORD) throw new Error('Supervision: WAZO_GATEWAY_AMI_USER and WAZO_GATEWAY_AMI_PASSWORD are required with WAZO_AMI')
+  if (!env.WAZO_GATEWAY_ORIGINATE_USER || !env.WAZO_GATEWAY_ORIGINATE_PASSWORD) throw new Error('Supervision: WAZO_GATEWAY_ORIGINATE_USER and WAZO_GATEWAY_ORIGINATE_PASSWORD (a second account, for Originate only) are required with WAZO_AMI')
+  if (env.WAZO_GATEWAY_ORIGINATE_USER === env.WAZO_GATEWAY_AMI_USER) throw new Error('Supervision: WAZO_GATEWAY_ORIGINATE_USER must not be WAZO_GATEWAY_AMI_USER: the account that holds `system` must not originate')
   let url: URL
   try {
     url = new URL(env.WAZO_RECORDINGS_URL ?? '')
@@ -77,8 +77,8 @@ export const supervisionFromEnv = (env: NodeJS.ProcessEnv): WazoSupervision | un
   if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) throw new Error('Supervision: WAZO_RECORDINGS_URL must be http: or https:, without credentials')
   if (!/^[A-Za-z0-9._-]{32,128}$/.test(env.WAZO_RECORDINGS_TOKEN ?? '')) throw new Error('Supervision: WAZO_RECORDINGS_TOKEN (32 to 128 letters, digits, dots, dashes or underscores) is required with WAZO_RECORDINGS_URL')
   return new WazoSupervision({
-    ami: { host: ami[1] as string, port: Number(ami[2]), username: env.WAZO_AMI_USER, password: env.WAZO_AMI_PASSWORD },
-    originate: { host: ami[1] as string, port: Number(ami[2]), username: env.WAZO_AMI_ORIGINATE_USER, password: env.WAZO_AMI_ORIGINATE_PASSWORD },
+    ami: { host: ami[1] as string, port: Number(ami[2]), username: env.WAZO_GATEWAY_AMI_USER, password: env.WAZO_GATEWAY_AMI_PASSWORD },
+    originate: { host: ami[1] as string, port: Number(ami[2]), username: env.WAZO_GATEWAY_ORIGINATE_USER, password: env.WAZO_GATEWAY_ORIGINATE_PASSWORD },
     recordingsUrl: env.WAZO_RECORDINGS_URL as string,
     recordingsToken: env.WAZO_RECORDINGS_TOKEN as string,
     ...(env.RECORDING_NOTICE_SOUND ? { noticeSound: env.RECORDING_NOTICE_SOUND } : {})
@@ -153,6 +153,7 @@ export class Supervision {
 
   private unavailable(err: unknown): never {
     if (err instanceof SupervisionError && err.code === 'gone') throw fail(404, 'Call not found', 'CALL_GONE')
+    if (err instanceof SupervisionError && err.code === 'notice') throw fail(503, 'The recording notice is not available on the telephony server: nothing is recorded', 'NOTICE_MISSING')
     this.deps.log.warn({ err }, 'supervision failed')
     throw fail(502, 'The telephony server is not available, try again later', 'SUPERVISION_FAILED')
   }
@@ -162,8 +163,12 @@ export class Supervision {
     const hit = this.cache.get(tenantId)
     if (hit && Date.now() - hit.at < (this.deps.callsCacheMs ?? 2000)) return hit.calls
     const calls = p.listCalls()
-    this.cache.set(tenantId, { at: Date.now(), calls })
-    calls.catch(() => this.cache.delete(tenantId))
+    const entry = { at: Date.now(), calls }
+    this.cache.set(tenantId, entry)
+    // A failure is not kept; a newer entry is not this one's.
+    calls.catch(() => {
+      if (this.cache.get(tenantId) === entry) this.cache.delete(tenantId)
+    })
     return calls
   }
 
@@ -189,11 +194,14 @@ export class Supervision {
     return this.deps.store.updateRecording(r.tenantId, r.id, ['recording'], { state: ok ? 'ready' : 'failed', endedAt: new Date().toISOString(), ...(size !== undefined ? { sizeBytes: size } : {}) })
   }
 
-  /** Closes the recordings under way whose call is no longer there. */
-  private async settle(tenantId: string | undefined, p: SupervisionProvider, calls?: SupervisedCall[]) {
+  /**
+   * Closes the recordings under way whose call is no longer there. The calls are read now, never from what a screen was
+   * given a moment ago (another Gateway may have started a recording of a call that list did not have yet).
+   */
+  private async settle(tenantId: string | undefined, p: SupervisionProvider) {
     const underWay = await this.deps.store.listRecordingsUnderWay(tenantId)
     if (!underWay.length) return
-    const alive = new Set((calls ?? (await p.listCalls())).map(c => c.id))
+    const alive = new Set((await p.listCalls()).map(c => c.id))
     for (const r of underWay) if (!alive.has(r.callId)) await this.close(r, p)
   }
 
@@ -215,17 +223,44 @@ export class Supervision {
         try {
           // Already gone (false) is as good as erased.
           await p.deleteRecording(this.file(r))
-          const done = await store.updateRecording(r.tenantId, r.id, ['ready', 'failed', 'erasing'], { state: 'purged' })
+          const done = await store.updateRecording(r.tenantId, r.id, ['ready', 'failed', 'erasing'], { state: 'purged', forget: true })
           if (done) await this.journal(r.tenantId, { actor: 'system', action: r.state === 'erasing' ? 'erase' : 'purge', ...(r.extension ? { extension: r.extension } : {}), recordingId: r.id })
         } catch (err) {
           this.deps.log.warn({ err, recording: r.id }, 'recording not erased, tried again at the next sweep')
         }
       }
-      await store.purgeSupervisionLog(new Date(Date.now() - LOG_KEPT_MS).toISOString()).catch((err: unknown) => this.deps.log.error({ err }, 'supervision journal not purged'))
+      // The journal and the records of what is erased go together, a year and a month on.
+      const kept = new Date(Date.now() - LOG_KEPT_MS).toISOString()
+      await store.purgeSupervisionLog(kept).catch((err: unknown) => this.deps.log.error({ err }, 'supervision journal not purged'))
+      await store.deletePurgedRecordings(kept).catch((err: unknown) => this.deps.log.error({ err }, 'records of erased recordings not removed'))
     })().finally(() => {
       this.sweeping = undefined
     })
     return this.sweeping
+  }
+
+  /**
+   * The recordings of a person's calls to be erased (their right to erasure): those under way are stopped and closed first
+   * (their file is then whole, and nothing writes it any more), those closed are marked, and the audio goes at once, or at
+   * the next sweep when the recordings server does not answer. One that could not be stopped is left as it is (and not
+   * counted): they ask again. Without a supervision server for the tenant the rows are marked all the same, and erased as
+   * soon as there is one.
+   */
+  async eraseRecordingsOf(tenantId: string, userId: string): Promise<number> {
+    const p = this.deps.provider(tenantId)
+    if (p) {
+      for (const r of (await this.deps.store.listRecordingsUnderWay(tenantId)).filter(x => x.userId === userId)) {
+        try {
+          await p.stopRecording({ id: r.callId })
+          await this.close(r, p)
+        } catch (err) {
+          this.deps.log.warn({ err, tenantId }, 'a recording under way could not be stopped for an erasure')
+        }
+      }
+    }
+    const n = await this.deps.store.eraseRecordingsOf(tenantId, userId)
+    if (n && p) void this.sweep().catch((err: unknown) => this.deps.log.error({ err }, 'recordings not erased'))
+    return n
   }
 
   start(everyMs: number) {
@@ -254,7 +289,7 @@ export class Supervision {
     v1.get('/supervision/calls', async req => {
       const { user, provider } = await supervisor(req)
       const calls = await this.calls(user.tenantId, provider).catch(err => this.unavailable(err))
-      await this.settle(user.tenantId, provider, calls).catch((err: unknown) => req.log.warn({ err }, 'recordings under way not closed'))
+      await this.settle(user.tenantId, provider).catch((err: unknown) => req.log.warn({ err }, 'recordings under way not closed'))
       const underWay = new Map((await store.listRecordingsUnderWay(user.tenantId)).map(r => [r.callId, r] as const))
       const items = await Promise.all(
         calls.map(async c => {
@@ -298,12 +333,15 @@ export class Supervision {
       // Reserved first: a call is recorded once at a time, whatever Gateway and screen ask.
       try {
         await store.addRecording(rec)
-      } catch {
-        throw fail(409, 'This call is being recorded', 'RECORDING_UNDER_WAY')
+      } catch (err) {
+        if (err instanceof RecordingUnderWay) throw fail(409, 'This call is being recorded', 'RECORDING_UNDER_WAY')
+        throw err
       }
       try {
         await provider.startRecording({ id: call.id }, this.file(rec))
       } catch (err) {
+        // An answer that did not come may be a recording that did: stopped, before the record says nothing was kept.
+        await provider.stopRecording({ id: call.id }).catch(() => undefined)
         await store.updateRecording(tenantId, rec.id, ['recording'], { state: 'failed', endedAt: new Date().toISOString() }).catch(() => undefined)
         return this.unavailable(err)
       }
@@ -361,7 +399,7 @@ export class Supervision {
       if (!rec || rec.state === 'purged') throw fail(404, 'Recording not found')
       if (rec.state === 'recording') throw fail(409, 'This recording is under way: stop it first', 'RECORDING_UNDER_WAY')
       await provider.deleteRecording(this.file(rec)).catch(err => this.unavailable(err))
-      await store.updateRecording(user.tenantId, rec.id, ['ready', 'failed', 'erasing'], { state: 'purged' })
+      await store.updateRecording(user.tenantId, rec.id, ['ready', 'failed', 'erasing'], { state: 'purged', forget: true })
       await this.journal(user.tenantId, { actor: identity.userId, action: 'delete-recording', extension: rec.extension, recordingId: rec.id })
       return reply.code(204).send()
     })

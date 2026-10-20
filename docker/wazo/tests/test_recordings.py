@@ -14,7 +14,8 @@ from http.server import ThreadingHTTPServer
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = tempfile.mkdtemp()
 TOKEN = 'a' * 40
-os.environ.update({'RECORDINGS_DIR': ROOT, 'RECORDINGS_TOKEN': TOKEN, 'RECORDINGS_LISTEN': '127.0.0.1:0'})
+SOUNDS = tempfile.mkdtemp()
+os.environ.update({'RECORDINGS_DIR': ROOT, 'RECORDINGS_TOKEN': TOKEN, 'RECORDINGS_LISTEN': '127.0.0.1:0', 'RECORDINGS_SOUNDS': SOUNDS})
 spec = importlib.util.spec_from_file_location('recordings', os.path.join(HERE, '..', 'recordings.py'))
 recordings = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(recordings)
@@ -37,6 +38,7 @@ class RecordingsTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.server.shutdown()
         shutil.rmtree(ROOT, ignore_errors=True)
+        shutil.rmtree(SOUNDS, ignore_errors=True)
 
     def setUp(self):
         os.makedirs(os.path.join(ROOT, 'acme', 'monitor'), exist_ok=True)
@@ -106,6 +108,33 @@ class RecordingsTest(unittest.TestCase):
         self.assertEqual(res.status, 404)
         res, _ = self.request('GET', f'/acme/{NAME}')
         self.assertEqual(res.status, 404)
+
+    def test_says_whether_asterisk_has_a_sound_and_nothing_else_of_the_sounds(self):
+        os.makedirs(os.path.join(SOUNDS, 'custom'), exist_ok=True)
+        with open(os.path.join(SOUNDS, 'custom', 'twake-recording-notice.wav'), 'wb') as f:
+            f.write(b'RIFF')
+        res, _ = self.request('HEAD', '/sound/custom/twake-recording-notice')
+        self.assertEqual(res.status, 200)
+        for path in ('/sound/custom/absent', '/sound/custom', '/sound/../etc/passwd', '/sound/custom/twake-recording-notice.wav', '/sound/'):
+            res, _ = self.request('HEAD', path)
+            self.assertEqual(res.status, 404, path)
+        # Only to know whether it is there: no body of a sound, no sound without the token.
+        res, _ = self.request('GET', '/sound/custom/twake-recording-notice')
+        self.assertEqual(res.status, 405)
+        res, _ = self.request('HEAD', '/sound/custom/twake-recording-notice', None)
+        self.assertEqual(res.status, 401)
+
+    def test_reads_no_more_than_the_length_it_said(self):
+        path = os.path.join(ROOT, 'acme', 'monitor', NAME + '.wav')
+        original = recordings.CHUNK
+        recordings.CHUNK = 1000
+        try:
+            res, body = self.request('GET', f'/acme/{NAME}')
+            self.assertEqual(len(body), int(res.getheader('Content-Length')))
+            self.assertIsNone(res.getheader('Accept-Ranges'))
+        finally:
+            recordings.CHUNK = original
+        self.assertTrue(os.path.exists(path))
 
     def test_takes_no_write(self):
         for method in ('POST', 'PUT', 'PATCH'):

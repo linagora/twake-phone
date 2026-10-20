@@ -34,12 +34,14 @@ export interface WazoSupervisionConfig {
 
 /** Why an operation did not happen: the call is gone, Asterisk refused it, or nothing answered. */
 export class SupervisionError extends Error {
-  constructor(message: string, readonly code: 'gone' | 'refused' | 'unavailable') {
+  constructor(message: string, readonly code: 'gone' | 'refused' | 'unavailable' | 'notice') {
     super(message)
     this.name = 'SupervisionError'
   }
 }
 
+/** The number a supervisor's call comes from: not an extension, and never a call to supervise. */
+export const SUPERVISION_CALLER = '0199'
 /** An Asterisk unique id, which is what a call is for the Gateway. */
 export const CALL_ID = /^[0-9]{1,12}\.[0-9]{1,12}$/
 const LINE_CHANNEL = /^PJSIP\/([0-9]{1,40})-[0-9a-f]+$/i
@@ -86,7 +88,8 @@ export class WazoSupervision implements SupervisionProvider {
     for (const e of events) {
       if (e.Event !== 'CoreShowChannel') continue
       const line = LINE_CHANNEL.exec(e.Channel ?? '')
-      if (!line || !CALL_ID.test(e.Uniqueid ?? '') || e.Application === 'ChanSpy') continue
+      // The call of a supervisor is no call to supervise: it runs ChanSpy once answered, and before that it is the line ringing with its number.
+      if (!line || !CALL_ID.test(e.Uniqueid ?? '') || e.Application === 'ChanSpy' || known(e.CallerIDNum) === SUPERVISION_CALLER) continue
       const extension = line[1] as string
       // The number of the other party: the caller of a call Wazo placed (its caller id), else who the line is connected to.
       const peer = [known(e.CallerIDNum), known(e.ConnectedLineNum)].find(n => n && n !== extension)
@@ -118,6 +121,9 @@ export class WazoSupervision implements SupervisionProvider {
 
   async startRecording(call: { id: string }, file: { tenant: string; name: string }): Promise<void> {
     this.checkFile(file)
+    // The notice must be a sound the telephony server has: Playback of one it has not fails without a word, and the recording
+    // would start in silence. The recordings server, on the host of Asterisk, says whether it is there.
+    if (!(await this.noticeAvailable())) throw new SupervisionError('the recording notice is not on the telephony server', 'notice')
     if (!(await this.has(call.id))) throw new SupervisionError('the call is over', 'gone')
     // The announcement first, to both parties (Wazo's context for its recording beep: ChanSpy in barge mode on the
     // channel, whose peer hears it as well). No announcement, no recording: its failure ends here.
@@ -145,7 +151,7 @@ export class WazoSupervision implements SupervisionProvider {
         Application: 'ChanSpy',
         Data: `${call.id},${SPY_OPTIONS[mode]}`,
         // Not an extension (the screen would give it the name of the person who holds it): the supervisor reads who calls.
-        CallerID: '"Supervision" <0199>',
+        CallerID: `"Supervision" <${SUPERVISION_CALLER}>`,
         Timeout: '30000'
       },
       40_000
@@ -168,6 +174,24 @@ export class WazoSupervision implements SupervisionProvider {
     } catch (err) {
       throw new SupervisionError(`the recordings server did not answer: ${(err as Error).message}`, 'unavailable')
     }
+  }
+
+  /** Whether the sound of the recording notice is on the host of Asterisk (its sounds directories, no language). */
+  async noticeAvailable(): Promise<boolean> {
+    let res: Response
+    try {
+      res = await (this.config.fetch ?? fetch)(`${this.config.recordingsUrl.replace(/\/+$/, '')}/sound/${this.notice}`, {
+        method: 'HEAD',
+        headers: { authorization: `Bearer ${this.config.recordingsToken}` },
+        signal: AbortSignal.timeout(this.config.requestTimeoutMs ?? 10_000),
+        redirect: 'error'
+      })
+    } catch (err) {
+      throw new SupervisionError(`the recordings server did not answer: ${(err as Error).message}`, 'unavailable')
+    }
+    if (res.status === 404) return false
+    if (!res.ok) throw new SupervisionError(`the recordings server answered ${res.status}`, 'unavailable')
+    return true
   }
 
   async statRecording(file: { tenant: string; name: string }): Promise<{ size: number } | undefined> {

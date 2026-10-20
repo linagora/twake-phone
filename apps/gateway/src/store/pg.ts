@@ -3,7 +3,7 @@ import { readdir, readFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import pg from 'pg'
 import { EMPTY_OUTBOUND, outboundVersion, staleOutbound } from '../outbound.js'
-import { ALERT_DEDUP_MS, alertKey, clampLimit, type RecordingRecord, type AlertQuery, type AlertRecord, type StoredAlert, type ConferenceDecision, type VisioPerson, type VisioRecord, type VisioStatus, type ConferenceRecord, type DidRecord, type SiteRecord, type OutboundHand, type OutboundRecord, type OutboundRules, type HistoryEntry, type HistoryNearQuery, type HistoryPage, type HistoryQuery, type OperatorCdrOutcome, type OperatorCdrRecord, type OperatorCdrStats, type MappingSource, type ErasedCallsKept, type ProviderRecord, type PushSaveResult, type PushSubscriptionRecord, type Store, type TrunkRecord, type MappingChange, type UserMapping, type UserPresenceRecord, type VapidKeysRecord, type ClaimedDelivery, type WebhookAttemptResult, type WebhookClaimCaps, type WebhookClaimTime, allocateClaims, claimOrder, type WebhookDeliveryQuery, type WebhookLease, type WebhookSendQuota, type WebhookDeliveryRecord, type WebhookHealth, type WebhookQueueOptions, type WebhookStateChange, type WebhookStateEvent, type WebhookSubscriptionRecord, WEBHOOK_STATE_ROLE , type FencedLease, type NewTranscript, type TranscriptChange, type TranscriptLane, holderIn, holderOut, type TranscriptMatch, type TranscriptNotice, type TranscriptRecord } from './types.js'
+import { ALERT_DEDUP_MS, RecordingUnderWay, alertKey, clampLimit, type RecordingRecord, type AlertQuery, type AlertRecord, type StoredAlert, type ConferenceDecision, type VisioPerson, type VisioRecord, type VisioStatus, type ConferenceRecord, type DidRecord, type SiteRecord, type OutboundHand, type OutboundRecord, type OutboundRules, type HistoryEntry, type HistoryNearQuery, type HistoryPage, type HistoryQuery, type OperatorCdrOutcome, type OperatorCdrRecord, type OperatorCdrStats, type MappingSource, type ErasedCallsKept, type ProviderRecord, type PushSaveResult, type PushSubscriptionRecord, type Store, type TrunkRecord, type MappingChange, type UserMapping, type UserPresenceRecord, type VapidKeysRecord, type ClaimedDelivery, type WebhookAttemptResult, type WebhookClaimCaps, type WebhookClaimTime, allocateClaims, claimOrder, type WebhookDeliveryQuery, type WebhookLease, type WebhookSendQuota, type WebhookDeliveryRecord, type WebhookHealth, type WebhookQueueOptions, type WebhookStateChange, type WebhookStateEvent, type WebhookSubscriptionRecord, WEBHOOK_STATE_ROLE , type FencedLease, type NewTranscript, type TranscriptChange, type TranscriptLane, holderIn, holderOut, type TranscriptMatch, type TranscriptNotice, type TranscriptRecord } from './types.js'
 import type { OperatorCdr, Recording, SupervisionLogEntry, WebhookEventType } from '@twake/telephony-types'
 
 const MIGRATIONS = fileURLToPath(new URL('../../migrations/', import.meta.url))
@@ -1762,10 +1762,16 @@ export class PgStore implements Store {
   }
 
   async addRecording(r: RecordingRecord) {
-    await this.pool.query(
-      'INSERT INTO recordings (id, tenant_id, extension, user_id, display_name, call_id, started_by, started_at, ended_at, state, size_bytes) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)',
-      [r.id, r.tenantId, r.extension, r.userId ?? null, r.displayName ?? null, r.callId, r.startedBy, r.startedAt, r.endedAt ?? null, r.state, r.sizeBytes ?? null]
-    )
+    try {
+      await this.pool.query(
+        'INSERT INTO recordings (id, tenant_id, extension, user_id, display_name, call_id, started_by, started_at, ended_at, state, size_bytes) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)',
+        [r.id, r.tenantId, r.extension, r.userId ?? null, r.displayName ?? null, r.callId, r.startedBy, r.startedAt, r.endedAt ?? null, r.state, r.sizeBytes ?? null]
+      )
+    } catch (err) {
+      // The unique index of the recording under way of a call, and nothing else: another failure is not "already recorded".
+      if ((err as { code?: string }).code === '23505' && (err as { constraint?: string }).constraint === 'recordings_one_per_call') throw new RecordingUnderWay()
+      throw err
+    }
   }
 
   async getRecording(tenantId: string, id: string) {
@@ -1788,13 +1794,19 @@ export class PgStore implements Store {
     return rows.map(recordingOf)
   }
 
-  async updateRecording(tenantId: string, id: string, from: Recording['state'][], change: Partial<Pick<RecordingRecord, 'state' | 'endedAt' | 'sizeBytes'>>) {
-    const { rows } = await this.pool.query<RecordingRow>(
-      `UPDATE recordings SET state = coalesce($4, state), ended_at = coalesce($5, ended_at), size_bytes = coalesce($6, size_bytes)
-       WHERE tenant_id = $1 AND id = $2 AND state = ANY($3::text[]) RETURNING ${RECORDING_COLUMNS}`,
-      [tenantId, id, from, change.state ?? null, change.endedAt ?? null, change.sizeBytes ?? null]
-    )
-    return rows[0] ? recordingOf(rows[0]) : null
+  async updateRecording(tenantId: string, id: string, from: Recording['state'][], change: Partial<Pick<RecordingRecord, 'state' | 'endedAt' | 'sizeBytes'>> & { forget?: boolean }) {
+    try {
+      const { rows } = await this.pool.query<RecordingRow>(
+        `UPDATE recordings SET state = coalesce($4, state), ended_at = coalesce($5, ended_at), size_bytes = coalesce($6, size_bytes),
+           user_id = CASE WHEN $7 THEN NULL ELSE user_id END, display_name = CASE WHEN $7 THEN NULL ELSE display_name END
+         WHERE tenant_id = $1 AND id = $2 AND state = ANY($3::text[]) RETURNING ${RECORDING_COLUMNS}`,
+        [tenantId, id, from, change.state ?? null, change.endedAt ?? null, change.sizeBytes ?? null, change.forget === true]
+      )
+      return rows[0] ? recordingOf(rows[0]) : null
+    } catch (err) {
+      if ((err as { code?: string }).code === '23505' && (err as { constraint?: string }).constraint === 'recordings_one_per_call') throw new RecordingUnderWay()
+      throw err
+    }
   }
 
   async listRecordingsToErase(before: string | null, limit: number, tenantId?: string) {
@@ -1808,7 +1820,12 @@ export class PgStore implements Store {
   }
 
   async eraseRecordingsOf(tenantId: string, userId: string) {
-    const r = await this.pool.query("UPDATE recordings SET state = 'erasing' WHERE tenant_id = $1 AND user_id = $2 AND state NOT IN ('purged', 'erasing')", [tenantId, userId])
+    const r = await this.pool.query("UPDATE recordings SET state = 'erasing' WHERE tenant_id = $1 AND user_id = $2 AND state IN ('ready', 'failed')", [tenantId, userId])
+    return r.rowCount ?? 0
+  }
+
+  async deletePurgedRecordings(before: string) {
+    const r = await this.pool.query("DELETE FROM recordings WHERE state = 'purged' AND started_at < $1", [before])
     return r.rowCount ?? 0
   }
 
