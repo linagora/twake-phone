@@ -150,6 +150,8 @@ describe('startRecording', () => {
       if (a.Action === 'Originate') {
         reply({ Response: 'Success', ActionID: a.ActionID!, Message: 'Originate successfully queued' })
         if (originate !== 'never') reply({ ...originate, ActionID: a.ActionID! })
+        // As Asterisk does: the notice's ChanSpy is on the channel after the Originate was answered.
+        if (originate !== 'never' && originate.Response === 'Success') reply({ Event: 'ChanSpyStart', SpyerChannel: 'Local/s@wazo-play-beep-00000001;2', SpyeeChannel: 'PJSIP/103-0000000a', SpyeeUniqueid: a.Data === 'custom/twake-recording-notice' ? ((a.Variable ?? '').split('=')[1] ?? '') : '' })
       } else reply({ ...monitor, ActionID: a.ActionID! })
     }
 
@@ -195,6 +197,28 @@ describe('startRecording', () => {
     expect(ami.state.actions).toEqual([])
   })
 
+  it('waits for the spy of the notice on this call before it records, not for the answer of the Originate alone, and not for another call\'s spy', async () => {
+    const order: string[] = []
+    const behave = (a: Frame, reply: (...b: Frame[]) => void) => {
+      order.push(a.Action!)
+      if (a.Action === 'CoreShowChannels') return channelsOf([channel({})])(a, reply)
+      if (a.Action === 'Originate') {
+        reply({ Response: 'Success', ActionID: a.ActionID!, Message: 'queued' }, { Event: 'OriginateResponse', Response: 'Success', ActionID: a.ActionID!, Reason: '4' })
+        // The spy of another call first, then this call's, a moment later.
+        reply({ Event: 'ChanSpyStart', SpyeeUniqueid: '1792479546.99' })
+        setTimeout(() => reply({ Event: 'ChanSpyStart', SpyeeUniqueid: a.Variable!.split('=')[1]! }), 200)
+        return
+      }
+      order.push('record')
+      reply({ Response: 'Success', ActionID: a.ActionID! })
+    }
+    const { sup } = await supervision(behave)
+    const started = Date.now()
+    await sup.startRecording({ id: '1792479546.12' }, { tenant: TENANT, name: NAME })
+    expect(Date.now() - started).toBeGreaterThanOrEqual(190)
+    expect(order).toEqual(['CoreShowChannels', 'Originate', 'MixMonitor', 'record'])
+  })
+
   it('rejects an announcement that nobody answers in time', async () => {
     const { sup } = await supervision(answering('never'))
     const started = sup.startRecording({ id: '1792479546.12' }, { tenant: TENANT, name: NAME })
@@ -216,7 +240,7 @@ describe('the two accounts', () => {
   it('sends Originate by the account that holds originate and everything else by the one that holds system', async () => {
     const answer = (a: Frame, reply: (...b: Frame[]) => void) => {
       if (a.Action === 'CoreShowChannels') return channelsOf([channel({})])(a, reply)
-      if (a.Action === 'Originate') return reply({ Response: 'Success', ActionID: a.ActionID!, Message: 'queued' }, { Event: 'OriginateResponse', Response: 'Success', ActionID: a.ActionID!, Reason: '4' })
+      if (a.Action === 'Originate') return reply({ Response: 'Success', ActionID: a.ActionID!, Message: 'queued' }, { Event: 'OriginateResponse', Response: 'Success', ActionID: a.ActionID!, Reason: '4' }, { Event: 'ChanSpyStart', SpyeeUniqueid: '1792479546.12' })
       reply({ Response: 'Success', ActionID: a.ActionID! })
     }
     const system = await fakeAmi(answer)

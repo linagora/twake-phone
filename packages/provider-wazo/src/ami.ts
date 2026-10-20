@@ -51,6 +51,12 @@ export interface AmiOptions {
    * `EventList: Complete`), or the event that answers it (`event`: an OriginateResponse of its ActionID).
    */
   wait?: 'response' | 'list' | 'event'
+  /**
+   * With `wait: 'event'`: an event (of the connection, whichever action it answers) that ends the wait by itself, such as the
+   * ChanSpyStart of an Originate's ChanSpy, which comes after its OriginateResponse. An OriginateResponse that says it did not
+   * come up still ends it, as a failure.
+   */
+  until?: (event: AmiMessage) => boolean
   /** Overrides the timeout of the operation. */
   timeoutMs?: number
 }
@@ -124,7 +130,8 @@ export const amiAction = (config: AmiConfig, action: Record<string, string | str
           socket.write(request)
         } else if (stage === 'action') {
           if (message.ActionID !== actionId) {
-            // An event nobody asked for (the connection's own): kept only if it answers this action.
+            // An event nobody asked for (the connection's own): it counts only when it is the one waited for.
+            if (wait === 'event' && message.Event !== undefined && options.until?.(message)) return finish(undefined, { response: answer ?? message, events: [message] })
             continue
           }
           if (message.Response !== undefined && !answer) {
@@ -132,7 +139,7 @@ export const amiAction = (config: AmiConfig, action: Record<string, string | str
             if (message.Response !== 'Success') return finish(new AmiError(`AMI: ${message.Message ?? message.Response}`, 'refused'))
             if (wait === 'response') return finish(undefined, { response: message, events })
           } else if (message.Event !== undefined) {
-            if (wait === 'event' && message.Event === 'OriginateResponse') return finish(undefined, { response: answer ?? message, events: [message] })
+            if (wait === 'event' && message.Event === 'OriginateResponse' && (!options.until || message.Response !== 'Success')) return finish(undefined, { response: answer ?? message, events: [message] })
             if (message.EventList === 'Complete') return finish(undefined, { response: answer ?? message, events })
             events.push(message)
           }

@@ -112,11 +112,14 @@ export class WazoSupervision implements SupervisionProvider {
     return (await this.listCalls()).some(c => c.id === id)
   }
 
-  /** An Originate that answers by its OriginateResponse: resolves when the called channel answered. */
-  private async originate(fields: Record<string, string | string[]>, timeoutMs: number) {
-    const { events } = await this.ami({ Action: 'Originate', Async: 'true', ...fields }, { events: 'call', wait: 'event', timeoutMs }, this.config.originate)
+  /**
+   * An Originate that answers by its OriginateResponse: resolves when the called channel answered; or, with `until`, when that
+   * event of the connection came (an OriginateResponse that says the call did not come up fails it all the same).
+   */
+  private async originate(fields: Record<string, string | string[]>, timeoutMs: number, until?: (event: AmiMessage) => boolean) {
+    const { events } = await this.ami({ Action: 'Originate', Async: 'true', ...fields }, { events: 'call', wait: 'event', timeoutMs, ...(until ? { until } : {}) }, this.config.originate)
     const done: AmiMessage | undefined = events[0]
-    if (done?.Response !== 'Success') throw new SupervisionError('the call did not come up', 'refused')
+    if (!done || (done.Event === 'OriginateResponse' && done.Response !== 'Success')) throw new SupervisionError('the call did not come up', 'refused')
   }
 
   async startRecording(call: { id: string }, file: { tenant: string; name: string }): Promise<void> {
@@ -127,7 +130,13 @@ export class WazoSupervision implements SupervisionProvider {
     if (!(await this.has(call.id))) throw new SupervisionError('the call is over', 'gone')
     // The announcement first, to both parties (Wazo's context for its recording beep: ChanSpy in barge mode on the
     // channel, whose peer hears it as well). No announcement, no recording: its failure ends here.
-    await this.originate({ Channel: 'Local/s@wazo-play-beep', Application: 'Playback', Data: this.notice, Variable: `WAZO_PLAYBACK_CHANNEL=${call.id}`, Timeout: '15000' }, 25_000)
+    // The recording starts once the notice has: Asterisk answers the Originate before its ChanSpy is on the channel, so it is the
+    // ChanSpyStart of that channel (by its unique id) that is waited for.
+    await this.originate(
+      { Channel: 'Local/s@wazo-play-beep', Application: 'Playback', Data: this.notice, Variable: `WAZO_PLAYBACK_CHANNEL=${call.id}`, Timeout: '15000' },
+      25_000,
+      e => e.Event === 'ChanSpyStart' && e.SpyeeUniqueid === call.id
+    )
     await this.ami({ Action: 'MixMonitor', Channel: call.id, File: `${this.monitorDir}/${file.tenant}/monitor/${file.name}.wav` })
   }
 
