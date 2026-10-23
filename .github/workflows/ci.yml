@@ -182,11 +182,12 @@ jobs:
       - name: Wazo, LinTO STT et Synapse n'écoutent toujours que sur la boucle locale, après l'e2e SIP
         run: sudo python3 -I docker/wazo/check-loopback.py docker/docker-compose.sip.yml
       # Service par service (étape 8 : LiveKit et LiveKit SIP écrivent beaucoup), la fin de chacun ; Wazo (étape 11a) :
-      # l'Asterisk des messageries et les services que la passerelle appelle ; LinTO STT et Synapse (étape 11b).
+      # l'Asterisk des messageries et les services que la passerelle appelle (et, étape 11d, le serveur d'enregistrements) ;
+      # LinTO STT et Synapse (étape 11b).
       - name: Journaux de la stack SIP en cas d'échec
         if: failure()
         run: |
-          for service in opensips rtpengine livekit-sip livekit wazo-asterisk wazo-calld wazo-confd wazo-websocketd wazo-auth wazo-bootstrap wazo-amid wazo-sysconfd wazo-confgend wazo-db rabbitmq linto-stt synapse; do
+          for service in opensips rtpengine livekit-sip livekit wazo-asterisk wazo-calld wazo-confd wazo-websocketd wazo-auth wazo-bootstrap wazo-amid wazo-sysconfd wazo-recordings wazo-confgend wazo-db rabbitmq linto-stt synapse; do
             echo "::group::$service"
             docker compose -f docker/docker-compose.sip.yml logs --no-color --timestamps --tail 300 "$service"
             echo "::endgroup::"

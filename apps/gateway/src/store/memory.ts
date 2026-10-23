@@ -1,5 +1,5 @@
-import type { OperatorCdr } from '@twake/telephony-types'
-import { clampLimit, isDeclined, isMissed, type HistoryEntry, type HistoryNearQuery, type HistoryPage, type HistoryQuery, type OperatorCdrOutcome, type OperatorCdrRecord, type OperatorCdrStats, type ConferenceDecision, type VisioPerson, type VisioRecord, type VisioStatus, type ConferenceRecord, type AlertRecord, type AlertQuery, type DidRecord, type SiteRecord, type OutboundHand, type OutboundRecord, type OutboundRules, ALERT_DEDUP_MS, alertKey, type ProviderRecord, type StoredAlert, type PushSaveResult, type PushSubscriptionRecord, type Store, type TrunkRecord, type MappingChange, type UserMapping, type UserPresenceRecord, type VapidKeysRecord, type ClaimedDelivery, type ErasedCall, type ErasedCallsKept, type WebhookAttemptResult, type WebhookClaimCaps, type WebhookClaimTime, allocateClaims, type WebhookDeliveryQuery, type WebhookLease, type WebhookSendQuota, type WebhookDeliveryRecord, type WebhookQueueOptions, type WebhookStateChange, type WebhookStateEvent, type WebhookSubscriptionRecord, WEBHOOK_STATE_ROLE, type FencedLease, type NewTranscript, type TranscriptChange, type TranscriptLane, type TranscriptMatch, type TranscriptNotice, type TranscriptRecord } from './types.js'
+import type { OperatorCdr, Recording, SupervisionLogEntry } from '@twake/telephony-types'
+import { RecordingUnderWay, clampLimit, isDeclined, isMissed, type HistoryEntry, type HistoryNearQuery, type HistoryPage, type HistoryQuery, type OperatorCdrOutcome, type OperatorCdrRecord, type OperatorCdrStats, type ConferenceDecision, type VisioPerson, type VisioRecord, type VisioStatus, type ConferenceRecord, type AlertRecord, type AlertQuery, type DidRecord, type RecordingRecord, type SiteRecord, type OutboundHand, type OutboundRecord, type OutboundRules, ALERT_DEDUP_MS, alertKey, type ProviderRecord, type StoredAlert, type PushSaveResult, type PushSubscriptionRecord, type Store, type TrunkRecord, type MappingChange, type UserMapping, type UserPresenceRecord, type VapidKeysRecord, type ClaimedDelivery, type ErasedCall, type ErasedCallsKept, type WebhookAttemptResult, type WebhookClaimCaps, type WebhookClaimTime, allocateClaims, type WebhookDeliveryQuery, type WebhookLease, type WebhookSendQuota, type WebhookDeliveryRecord, type WebhookQueueOptions, type WebhookStateChange, type WebhookStateEvent, type WebhookSubscriptionRecord, WEBHOOK_STATE_ROLE, type FencedLease, type NewTranscript, type TranscriptChange, type TranscriptLane, type TranscriptMatch, type TranscriptNotice, type TranscriptRecord, type CallFlowRecord } from './types.js'
 import type { WebhookEventType } from '@twake/telephony-types'
 import { randomBytes } from 'node:crypto'
 import { EMPTY_OUTBOUND, outboundVersion, staleOutbound } from '../outbound.js'
@@ -54,6 +54,9 @@ export class MemoryStore implements Store {
   private trunks: TrunkRecord[] = []
   private dids = new Map<string, DidRecord>()
   private sites = new Map<string, SiteRecord>()
+  private callFlows = new Map<string, CallFlowRecord>()
+  private recordings = new Map<string, RecordingRecord>()
+  private supervisionLog: (SupervisionLogEntry & { tenantId: string })[] = []
   private outbound = new Map<string, OutboundRecord>()
   private alerts: StoredAlert[] = []
   private alertId = 0
@@ -733,6 +736,18 @@ export class MemoryStore implements Store {
     return this.sites.delete(key(tenantId, id))
   }
 
+  async listCallFlows(tenantId: string) {
+    return [...this.callFlows.values()].filter(x => x.tenantId === tenantId).sort((a, b) => (a.number < b.number ? -1 : a.number > b.number ? 1 : 0)).map(x => structuredClone(x))
+  }
+
+  async upsertCallFlow(record: CallFlowRecord) {
+    this.callFlows.set(key(record.tenantId, record.number), structuredClone(record))
+  }
+
+  async deleteCallFlow(tenantId: string, number: string) {
+    return this.callFlows.delete(key(tenantId, number))
+  }
+
   async getOutbound(tenantId: string) {
     const r = this.outbound.get(tenantId)
     return r ? structuredClone(r) : null
@@ -1145,6 +1160,95 @@ export class MemoryStore implements Store {
       if (t === tenantId && subject!.startsWith(prefix)) out.push({ subject: subject!, state: s.state })
     }
     return out.sort((a, b) => (a.subject < b.subject ? -1 : 1))
+  }
+
+  async addRecording(record: RecordingRecord) {
+    if (record.state === 'recording' && (await this.getRecordingUnderWay(record.tenantId, record.callId))) throw new RecordingUnderWay()
+    this.recordings.set(key(record.tenantId, record.id), structuredClone(record))
+  }
+
+  async getRecording(tenantId: string, id: string) {
+    const r = this.recordings.get(key(tenantId, id))
+    return r ? structuredClone(r) : null
+  }
+
+  async getRecordingUnderWay(tenantId: string, callId: string) {
+    const r = [...this.recordings.values()].find(x => x.tenantId === tenantId && x.callId === callId && x.state === 'recording')
+    return r ? structuredClone(r) : null
+  }
+
+  async listRecordingsUnderWay(tenantId?: string) {
+    return [...this.recordings.values()].filter(x => (tenantId === undefined || x.tenantId === tenantId) && x.state === 'recording').map(x => structuredClone(x))
+  }
+
+  async listRecordings(tenantId: string, limit?: number) {
+    return [...this.recordings.values()]
+      .filter(x => x.tenantId === tenantId)
+      .sort((a, b) => (a.startedAt === b.startedAt ? (a.id < b.id ? 1 : -1) : a.startedAt < b.startedAt ? 1 : -1))
+      .slice(0, clampLimit(limit))
+      .map(x => structuredClone(x))
+  }
+
+  async updateRecording(tenantId: string, id: string, from: Recording['state'][], change: Partial<Pick<RecordingRecord, 'state' | 'endedAt' | 'sizeBytes'>> & { forget?: boolean }) {
+    const r = this.recordings.get(key(tenantId, id))
+    if (!r || !from.includes(r.state)) return null
+    const { forget, ...set } = change
+    const next = { ...r, ...set }
+    if (forget) {
+      delete next.userId
+      delete next.displayName
+    }
+    if (next.state === 'recording' && r.state !== 'recording' && (await this.getRecordingUnderWay(tenantId, r.callId))) throw new RecordingUnderWay()
+    this.recordings.set(key(tenantId, id), next)
+    return structuredClone(next)
+  }
+
+  async listRecordingsToErase(before: string | null, limit: number, tenantId?: string) {
+    return [...this.recordings.values()]
+      .filter(x => (tenantId === undefined || x.tenantId === tenantId) && (x.state === 'erasing' || (before !== null && (x.state === 'ready' || x.state === 'failed') && x.startedAt < before)))
+      .sort((a, b) => (a.startedAt < b.startedAt ? -1 : a.startedAt > b.startedAt ? 1 : a.id < b.id ? -1 : 1))
+      .slice(0, Math.max(limit, 0))
+      .map(x => structuredClone(x))
+  }
+
+  async eraseRecordingsOf(tenantId: string, userId: string) {
+    let n = 0
+    for (const [k, r] of this.recordings) {
+      if (r.tenantId !== tenantId || r.userId !== userId || (r.state !== 'ready' && r.state !== 'failed')) continue
+      this.recordings.set(k, { ...r, state: 'erasing' })
+      n++
+    }
+    return n
+  }
+
+  async deletePurgedRecordings(before: string) {
+    let n = 0
+    for (const [k, r] of this.recordings) {
+      if (r.state !== 'purged' || r.startedAt >= before) continue
+      this.recordings.delete(k)
+      n++
+    }
+    return n
+  }
+
+  async addSupervisionLog(tenantId: string, entry: SupervisionLogEntry) {
+    this.supervisionLog.push({ ...structuredClone(entry), tenantId })
+  }
+
+  async listSupervisionLog(tenantId: string, limit?: number) {
+    return this.supervisionLog
+      .map((e, i) => [e, i] as const)
+      .filter(([e]) => e.tenantId === tenantId)
+      .sort(([a, i], [b, j]) => (a.at === b.at ? j - i : a.at < b.at ? 1 : -1))
+      .slice(0, clampLimit(limit))
+      .map(([{ tenantId: _tenant, ...e }]) => e)
+  }
+
+  async purgeSupervisionLog(before: string) {
+    const kept = this.supervisionLog.filter(e => e.at >= before)
+    const n = this.supervisionLog.length - kept.length
+    this.supervisionLog = kept
+    return n
   }
 
   async clock() {

@@ -1,4 +1,5 @@
 import { createHmac, hkdfSync, randomBytes } from 'node:crypto'
+import { menusLeadingTo, parseCallFlow, publicFlow } from './call-flows.js'
 import { Readable } from 'node:stream'
 import Fastify, { type FastifyReply, type FastifyRequest } from 'fastify'
 import cors from '@fastify/cors'
@@ -7,7 +8,7 @@ import swagger from '@fastify/swagger'
 import swaggerUi from '@fastify/swagger-ui'
 import { LiveKitError, PIN_DIGITS, maskNumber, splitParticipantId, verifyWebhook, type LiveKitConferenceBridge, type MeetApi, type MeetRoom, type ParticipantCall } from '@twake/conference-livekit'
 import { OUTBOUND_ALLOWED, REPLACES, classify, countryAllowed } from '@twake/provider-opensips'
-import type { DialedParticipant, MediaProvider, OperatorProvider, RoomCallGrantToken, TelephonyProvider, VoicemailBox, VoicemailProvider, VoicemailSync } from '@twake/telephony-provider-sdk'
+import type { DialedParticipant, MediaProvider, OperatorProvider, RoomCallGrantToken, SupervisionProvider, TelephonyProvider, VoicemailBox, VoicemailProvider, VoicemailSync } from '@twake/telephony-provider-sdk'
 import { EXTENSION_FORMAT, FRAUD_DEFAULTS, OUTBOUND_CAP_DEFAULTS, isReservedNumber, type CallDirection, type DidRange, type EmergencySite, type Endpoint, type ForwardingRules, type HistoryErasure, type Presence, type PresenceStatus, type RingGroup, type TelephonyEvent, type TrunkStatus, type User } from '@twake/telephony-types'
 import { adminPolicyFromEnv, isAdmin, type AdminPolicy } from './admin.js'
 import { authenticatorFromEnv, TicketStore, type Authenticator, type Identity } from './auth.js'
@@ -20,6 +21,7 @@ import { historyEntryFor } from './history.js'
 import { ENDED_TTL_SEC, MISSED_TTL_SEC, type PushMessage, type WebPush } from './push.js'
 import type { ProviderRegistry } from './registry.js'
 import { securityHeadersFor, type SecurityOptions } from './security.js'
+import { Supervision, isSupervisor, supervisorPolicyFromEnv, type SupervisorPolicy } from './supervision.js'
 import { TrunkWatch } from './trunk-health.js'
 import { OPERATOR_KEPT_MS, OperatorRoundError, OperatorSync, askKey, erasedNumbersOf, type OperatorRemoval, type OperatorRestoreRefusal } from './operator.js'
 import { e164Of } from './e164.js'
@@ -143,7 +145,7 @@ type ReleaseRecord = ReleaseAsked & { applied: boolean; interrupted?: true; repl
 /** The release a round was given, until that round finishes: one that finds it again knows the one before stopped. */
 const VOICEMAIL_RELEASE_TRIED = 'voicemail:release-tried'
 /** What the administrators are told of the synchronisation of the mailboxes (kind `voicemail`). */
-const VOICEMAIL_FAILING = ['sync-failing', 'boxes-refused'] as const
+const VOICEMAIL_FAILING = ['sync-failing', 'boxes-refused', 'flows-failing'] as const
 /**
  * The erasures of the messages of a person asked (DELETE /me/history, POST /admin/voicemail/erase), by person:
  * `voicemail:erase:<userId>`, done by the Gateway that writes the mailboxes, at its next round.
@@ -267,6 +269,23 @@ export interface BuildOptions {
    * server sends the calls nobody takes. Absent (or undefined for the tenant): no mailboxes, the endpoints answer 501.
    */
   voicemail?: (tenantId: string) => VoicemailProvider | undefined
+  /**
+   * What a supervisor can do with the calls that have a channel at Wazo (step 11d, ADR 0029): list them, record them,
+   * join them, and keep the recordings. Absent (or undefined for the tenant): no supervision, the endpoints answer 501.
+   */
+  supervision?: (tenantId: string) => SupervisionProvider | undefined
+  /** Who supervises besides the administrators. Default: from SUPERVISOR_ROLE and SUPERVISOR_USERS. */
+  supervisor?: SupervisorPolicy
+  /** How long a recording is kept (RECORDING_RETENTION_DAYS, 30 by default; 0: for good). */
+  recordingRetentionDays?: number
+  /** How often the recordings past their days or asked to be erased are erased, and those whose call ended closed (default 10 minutes; 0: never). */
+  recordingSweepMs?: number
+  /** How long a supervisor's call is waited for before saying it still rings (tests). Default: 6 s. */
+  supervisionSpyWaitMs?: number
+  /** How long the closing of a recording waits for its file to be whole (tests). Default: 2 s. */
+  supervisionSettleMs?: number
+  /** How long the calls listed are kept for the screens that ask at once (tests). Default: 2 s. */
+  supervisionCallsCacheMs?: number
   /** The waits between two tries of a synchronisation of the mailboxes that failed, the last repeated (tests). */
   voicemailRetryMs?: number[]
   /**
@@ -1008,7 +1027,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
   const syncingVoicemail = new Map<string, { again: boolean; ended: Promise<void> }>()
   const voicemailRetryMs = options.voicemailRetryMs ?? RESTORE_RETRY_MS
   /**
-   * Since when each tenant's synchronisation fails (`sync-failing`), or leaves out mailboxes the voicemail server
+   * Since when each tenant's synchronisation fails (`sync-failing`), or its call flows (`flows-failing`), or leaves out mailboxes the voicemail server
    * refuses (`boxes-refused`), and whether the administrators were told: by tenant and what.
    */
   const voicemailFailing = new Map<string, { since: number; told: boolean }>()
@@ -1109,6 +1128,41 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
             if (lines.failed > 0) {
               state.again = true
               state.pause = true
+            }
+          }
+          // The sequential groups, queues and voice menus (step 11c-2, ADR 0028), once the lines their members ring through
+          // are there: Wazo makes them, then the SIP server is told which numbers go there (and stops sending calls to
+          // one before Wazo loses it).
+          // A failure of the flows (the right to read Wazo's groups missing, a Wazo that answers 5xx there) never fails the round of the
+          // mailboxes and lines above: it is said, and tried again after a pause when the tenant has flows to run.
+          if (vm.linesOn && vm.syncFlows && provider.setCallFlowRoutes) {
+            const stored = await store.listCallFlows(tenantId)
+            try {
+              const flows = await vm.syncFlows(
+                stored.map(f => ({ number: f.number, name: f.name, kind: f.kind, ...(f.kind !== 'menu' ? { members: f.members, ringSec: f.ringSec ?? 15 } : {}), ...(f.waitSec ? { waitSec: f.waitSec } : {}), ...(f.kind === 'menu' ? { choices: f.choices, ...(f.greeting ? { greeting: f.greeting } : {}) } : {}) })),
+                {
+                  mayWrite: () => mayWriteVoicemail(tenantId),
+                  beforeRemoval: async gone => {
+                    const told = (await provider.listCallFlowRoutes?.()) ?? []
+                    await provider.setCallFlowRoutes?.(told.filter(r => !gone.includes(r.number)))
+                  }
+                }
+              )
+              await provider.setCallFlowRoutes(flows.routes)
+              if (flows.failed > 0) {
+                state.again = true
+                state.pause = true
+                await failingVoicemail(tenantId, 'flows-failing')
+              } else forgetFailing(tenantId, 'flows-failing')
+            } catch (err) {
+              if (!mayWriteVoicemail(tenantId) || fenced(err)) throw err
+              app.log.error({ err, tenantId }, 'call flows not synchronised with the voicemail server (the SIP server keeps what it had)')
+              // Flows stored, or routes still told to the SIP server while none is stored (the last flow deleted during the failure).
+              if (stored.length || ((await provider.listCallFlowRoutes?.().catch(() => [])) ?? []).length) {
+                state.again = true
+                state.pause = true
+              }
+              await failingVoicemail(tenantId, 'flows-failing')
             }
           }
           attempt = 0
@@ -1621,6 +1675,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
     if (options.operatorSyncMs !== 0) operatorSync?.start()
     transcripts.start()
     void transcriptWatcher?.start()
+    if (options.supervision) supervision.start(options.recordingSweepMs ?? 600_000)
   })
   app.addHook('onClose', async () => {
     closing = true
@@ -1631,6 +1686,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
     clearInterval(purgeTimer)
     clearInterval(voicemailSyncTimer)
     clearInterval(voicemailChangeTimer)
+    await supervision.stop()
     transcriptWatcher?.stop()
     // A transcription or a notice under way ends first: nothing written after (and nothing under a lease given back).
     await transcripts.stop()
@@ -1661,6 +1717,23 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
   })
   app.get('/openapi.json', async () => app.swagger())
 
+  // Recording and supervision (step 11d, ADR 0029): who may, the record of each recording, the sweep (retention, erasure).
+  const supervisorPolicy = options.supervisor ?? supervisorPolicyFromEnv(process.env)
+  const supervision = new Supervision({
+    store,
+    provider: tenantId => options.supervision?.(tenantId),
+    retentionDays: options.recordingRetentionDays ?? 30,
+    ...(options.supervisionSpyWaitMs !== undefined ? { spyWaitMs: options.supervisionSpyWaitMs } : {}),
+    ...(options.supervisionSettleMs !== undefined ? { settleMs: options.supervisionSettleMs } : {}),
+    ...(options.supervisionCallsCacheMs !== undefined ? { callsCacheMs: options.supervisionCallsCacheMs } : {}),
+    isSupervisor: identity => isSupervisor(identity, supervisorPolicy, isAdmin(identity, admin)),
+    isAdmin: identity => isAdmin(identity, admin),
+    authenticate: req => auth.authenticate(req),
+    resolve: identity => dir.forUser(identity.tenantId, identity.userId, identity.displayName),
+    userIdForExtension: (tenantId, extension) => dir.userIdForExtension(tenantId, extension),
+    log: app.log
+  })
+
   const resolve = async (identity: Identity): Promise<User> => dir.forUser(identity.tenantId, identity.userId, identity.displayName)
 
   app.register(
@@ -1682,7 +1755,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
       v1.get('/me', async req => {
         const identity = await auth.authenticate(req)
         const user = await resolve(identity)
-        return { ...user, features: { directory: hasDirectory(user), admin: isAdmin(identity, admin) } }
+        return { ...user, features: { directory: hasDirectory(user), admin: isAdmin(identity, admin), ...(options.supervision?.(user.tenantId) && isSupervisor(identity, supervisorPolicy, isAdmin(identity, admin)) ? { supervision: true } : {}) } }
       })
       v1.get('/me/endpoints', async req => (await whoIs(req), [BROWSER_ENDPOINT]))
 
@@ -1713,11 +1786,15 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
       v1.get('/capabilities', async req => {
         const { user, provider } = await who(req)
         const caps = await provider.getCapabilities()
+        const identity = await auth.authenticate(req)
+        const supervising = !!options.supervision?.(user.tenantId) && isSupervisor(identity, supervisorPolicy, isAdmin(identity, admin))
         const enabled = !!options.conference?.bridge(user.tenantId)
         // A mailbox (step 11a): with a voicemail server for the tenant, and a SIP server that sends calls to it.
         // Its shared variable says so when it can: a SIP server started without Wazo has none.
         const voicemail = !!options.voicemail?.(user.tenantId) && !!provider.setVoicemailBoxes && !!user.extension && (await voicemailOn(user.tenantId, provider))
-        return { ...caps, conference: { dialIn: enabled, dialOut: enabled, ...(enabled && options.conference?.meet ? { visio: true } : {}) }, ...(voicemail ? { voicemail: true, ...(transcripts.transcribes ? { voicemailTranscription: true } : {}) } : {}) }
+        // The call flows (step 11c-2): where Wazo runs them for the tenant, and the SIP server sends calls there.
+        const callFlows = !!options.voicemail?.(user.tenantId)?.flowsOn && !!provider.setCallFlowRoutes && (await voicemailOn(user.tenantId, provider))
+        return { ...caps, conference: { dialIn: enabled, dialOut: enabled, ...(enabled && options.conference?.meet ? { visio: true } : {}) }, ...(voicemail ? { voicemail: true, ...(transcripts.transcribes ? { voicemailTranscription: true } : {}) } : {}), ...(supervising ? { supervision: true } : {}), ...(callFlows ? { callFlows: true } : {}) }
       })
 
       // What the others see, and what the person chose (`choice`: kept in the store, with its end and message).
@@ -1970,6 +2047,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
           throw refused('GROUP_NUMBER_RESERVED', `${number} is the access number of the meeting rooms`)
         const group = await exclusive(user.tenantId, async () => {
           const g = await parseGroup(number, req.body, isExtensionOf(user.tenantId))
+          if ((await store.listCallFlows(user.tenantId)).some(f => f.number === number)) throw Object.assign(new Error('this number is taken'), { statusCode: 409, code: 'GROUP_NUMBER_TAKEN' })
           await groups.set(g, 'create')
           return g
         })
@@ -1990,6 +2068,80 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         const user = await administrator(req)
         const groups = groupsOf(registry.forTenant(user.tenantId))
         if (!(await inTurn(user.tenantId, () => groups.remove(req.params.number)))) throw Object.assign(new Error('No such group'), { statusCode: 404 })
+        return reply.code(204).send()
+      })
+
+      // Sequential groups, queues and voice menus (capability `callFlows`, step 11c-2, ADR 0028): administrators only, one
+      // change at a time per tenant. Kept in the store; the Gateway that writes the mailboxes has Wazo run them and tells
+      // OpenSIPS (a round of the synchronisation, started by the mark VOICEMAIL_CHANGED), which is why each is listed with
+      // whether it runs yet (`ready`). A flow's number is never an extension, a ring group's nor the access number of the
+      // meeting rooms; a menu leads to an extension, a sequential group or a queue, which stays while a menu does.
+      const flowsOn = (tenantId: string, provider: TelephonyProvider) => {
+        const vm = options.voicemail?.(tenantId)
+        if (!vm?.flowsOn || !vm.syncFlows || !provider.setCallFlowRoutes) throw Object.assign(new Error('Call flows are not available on this platform'), { statusCode: 501 })
+      }
+      const flowChanged = async (tenantId: string, provider: TelephonyProvider) => {
+        await store.putOperatorState(tenantId, VOICEMAIL_CHANGED, { at: new Date().toISOString(), flows: true })
+        void syncVoicemail(tenantId, provider)
+      }
+      const flowChecks = async (tenantId: string, provider: TelephonyProvider, records: Awaited<ReturnType<typeof store.listCallFlows>>) => ({
+        isExtension: isExtensionOf(tenantId),
+        taken: async (number: string) => (options.conference?.accessNumber ? number === options.conference.accessNumber : false) || !!(await provider.listGroups?.())?.some(g => g.number === number),
+        flows: new Map(records.map(f => [f.number, f]))
+      })
+      v1.get('/admin/flows', async req => {
+        const user = await administrator(req)
+        const provider = registry.forTenant(user.tenantId)
+        flowsOn(user.tenantId, provider)
+        const held = new Set((await store.listMappings(user.tenantId)).map(m => m.extension))
+        const running = await provider.listCallFlowRoutes?.().then(
+          routes => new Set(routes.map(r => r.number)),
+          () => undefined
+        )
+        return { items: (await store.listCallFlows(user.tenantId)).map(f => publicFlow(f, held, running)) }
+      })
+      v1.post<{ Body: { number?: unknown } | undefined }>('/admin/flows', async (req, reply) => {
+        const user = await administrator(req)
+        const provider = registry.forTenant(user.tenantId)
+        flowsOn(user.tenantId, provider)
+        const number = typeof req.body?.number === 'string' ? req.body.number.trim() : ''
+        const flow = await exclusive(user.tenantId, async () => {
+          const records = await store.listCallFlows(user.tenantId)
+          const f = await parseCallFlow(user.tenantId, number, req.body, await flowChecks(user.tenantId, provider, records), 'create')
+          await store.upsertCallFlow(f)
+          return f
+        })
+        await flowChanged(user.tenantId, provider)
+        return reply.code(201).send(publicFlow(flow, new Set((await store.listMappings(user.tenantId)).map(m => m.extension)), undefined))
+      })
+      v1.put<{ Params: { number: string } }>('/admin/flows/:number', async req => {
+        const user = await administrator(req)
+        const provider = registry.forTenant(user.tenantId)
+        flowsOn(user.tenantId, provider)
+        const flow = await exclusive(user.tenantId, async () => {
+          const records = await store.listCallFlows(user.tenantId)
+          const current = records.find(f => f.number === req.params.number)
+          if (!current) throw Object.assign(new Error('No such flow'), { statusCode: 404 })
+          const f = await parseCallFlow(user.tenantId, req.params.number, req.body, await flowChecks(user.tenantId, provider, records), 'replace', current.members, Object.values(current.choices))
+          const leading = f.kind === 'menu' ? menusLeadingTo(records, f.number) : []
+          if (leading.length) throw Object.assign(new Error(`the menu ${leading[0]} leads to it: a menu cannot lead to a menu`), { statusCode: 409, code: 'FLOW_IN_USE' })
+          await store.upsertCallFlow(f)
+          return f
+        })
+        await flowChanged(user.tenantId, provider)
+        return publicFlow(flow, new Set((await store.listMappings(user.tenantId)).map(m => m.extension)), undefined)
+      })
+      v1.delete<{ Params: { number: string } }>('/admin/flows/:number', async (req, reply) => {
+        const user = await administrator(req)
+        const provider = registry.forTenant(user.tenantId)
+        flowsOn(user.tenantId, provider)
+        await inTurn(user.tenantId, async () => {
+          const records = await store.listCallFlows(user.tenantId)
+          const leading = menusLeadingTo(records, req.params.number)
+          if (leading.length) throw Object.assign(new Error(`the menu ${leading[0]} leads to it: change or remove the menu first`), { statusCode: 409, code: 'FLOW_IN_USE' })
+          if (!(await store.deleteCallFlow(user.tenantId, req.params.number))) throw Object.assign(new Error('No such flow'), { statusCode: 404 })
+        })
+        await flowChanged(user.tenantId, provider)
         return reply.code(204).send()
       })
 
@@ -2704,15 +2856,19 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         // their calls were is kept only with an operator, for those a record read later may be of (third review n°3).
         const kept = operatorSync?.keptOfErasure(user.tenantId)
         const deleted = await store.deleteHistory(user.tenantId, user.id, await erasedNumbersOf(store, user.tenantId, user.id), kept)
+        // Their recordings too (step 11d, ADR 0029): marked, their audio erased by the next sweep (at once, below), whether
+        // the recordings server answers now or not.
+        const recordings = await supervision.eraseRecordingsOf(user.tenantId, user.id)
+        const recorded = recordings ? { recordings } : {}
         // Their messages too, in every mailbox held for them: asked of the Gateway that writes the mailboxes (the only
         // one that writes the voicemail server), done at its next round, Wazo down or not.
-        if (!vm) return reply.send({ deleted } satisfies HistoryErasure)
-        if (!erasures.allow(`user:${user.tenantId}\u0000${user.id}`)) return reply.send({ deleted, voicemailErasure: 'limited' } satisfies HistoryErasure)
+        if (!vm) return reply.send({ deleted, ...recorded } satisfies HistoryErasure)
+        if (!erasures.allow(`user:${user.tenantId}\u0000${user.id}`)) return reply.send({ deleted, ...recorded, voicemailErasure: 'limited' } satisfies HistoryErasure)
         // Their transcriptions are erased whether the transcription and the bot are on or not (step 11b); without a bot
         // any more, the notices of their messages in Chat cannot be withdrawn: said.
         const left = await transcripts.noticesLeft(user.tenantId, await holderIdFor(user.tenantId, user.id)).catch(() => false)
         await askErasure(user.tenantId, user.id)
-        return reply.send({ deleted, voicemailErasure: 'asked', ...(left ? { chatNotices: 'not-withdrawn' as const } : {}) } satisfies HistoryErasure)
+        return reply.send({ deleted, ...recorded, voicemailErasure: 'asked', ...(left ? { chatNotices: 'not-withdrawn' as const } : {}) } satisfies HistoryErasure)
       })
 
       // The person's mailbox (step 11a, ADR 0022): their messages, newest first, each one's audio, marked as read
@@ -2778,6 +2934,9 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         void transcripts.deleted(tenantId, owner.userId, req.params.id).catch((err: unknown) => req.log.error({ err }, 'voicemail transcription not erased'))
         return reply.code(204).send()
       })
+
+      // The recording and the supervision of the calls that have a channel at Wazo (step 11d, ADR 0029).
+      supervision.routes(v1)
 
       const action = (name: string, run: (p: TelephonyProvider, id: string, body: { digits?: string; destination?: string }) => Promise<void>) =>
         v1.post<{ Params: { id: string }; Body: { digits?: string; destination?: string } | undefined }>(`/calls/:id/${name}`, async (req, reply) => {

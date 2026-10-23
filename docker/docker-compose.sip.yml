@@ -305,15 +305,25 @@ services:
       WAZO_DB_PASSWORD: twake-wazo-dev-only-db
       # The AMI account of wazo-sysconfd below (module reloads and the list of the mailboxes only, no event).
       WAZO_SYSCONFD_AMI_PASSWORD: twake-wazo-dev-only-sysconfd
+      # The AMI accounts of the Gateway (step 11d, ADR 0029): the calls and MixMonitor; Originate. The Gateway's
+      # WAZO_GATEWAY_AMI_PASSWORD and WAZO_GATEWAY_ORIGINATE_PASSWORD (never WAZO_AMI_PASSWORD, which is wazo-amid's).
+      WAZO_GATEWAY_AMI_PASSWORD: twake-wazo-dev-only-gateway-ami
+      WAZO_GATEWAY_ORIGINATE_PASSWORD: twake-wazo-dev-only-gateway-originate
       # The longest a call to a mailbox lasts, as OpenSIPS bounds it.
       VOICEMAIL_MAX_CALL_SEC: ${VOICEMAIL_MAX_CALL_SEC:-300}
     volumes:
       - ./wazo/asterisk/entrypoint.sh:/twake/entrypoint.sh:ro
       - ./wazo/asterisk/extensions.conf:/etc/asterisk/extensions.d/01-wazo.conf:ro
+      # The call flows (step 11c-2): the dialplan of a sequential group, a queue and a voice menu, and of their members.
+      - ./wazo/asterisk/extensions-flows.conf:/etc/asterisk/extensions.d/02-twake-flows.conf:ro
       # The prompts a mailbox plays, in French, made for this stack (docker/wazo/asterisk/sounds/README.md): the image
       # has none, Wazo's packages bring them on a Wazo.
       - ./wazo/asterisk/sounds:/usr/share/asterisk/sounds/fr_FR:ro
       - wazo-voicemail:/var/spool/asterisk/voicemail
+      # The recordings (step 11d): MixMonitor writes them here, wazo-recordings serves them.
+      - wazo-recordings:/var/lib/wazo/sounds/tenants
+      # The notice a recording starts with, in the sounds of Asterisk (custom/twake-recording-notice).
+      - ./wazo/asterisk/recording-notice/twake-recording-notice.wav:/usr/share/asterisk/sounds/custom/twake-recording-notice.wav:ro
     network_mode: host
     healthcheck:
       test: ["CMD", "asterisk", "-rx", "core waitfullybooted"]
@@ -347,6 +357,33 @@ services:
     network_mode: host
     healthcheck:
       test: ["CMD", "python3", "/twake/healthcheck.py", "http://127.0.0.1:8668/status-check"]
+      interval: 60s
+      start_period: 5m
+      start_interval: 2s
+      timeout: 3s
+      retries: 3
+
+  # The recordings server (step 11d, ADR 0029): what the Gateway reads and erases the recordings by, in place of
+  # wazo-call-logd (no CDR of Wazo here). As root: the files are Asterisk's. Its token is this stack's own.
+  wazo-recordings:
+    image: wazoplatform/wazo-calld:wazo-26.10@sha256:b7d9f603949572c3e6c398adbdb0361f33b30d6ea41b58aceaaaa7dc0c7c4000
+    user: "0:0"
+    depends_on:
+      wazo-asterisk:
+        condition: service_healthy
+    entrypoint: ["python3", "-u", "/twake/recordings.py"]
+    environment:
+      RECORDINGS_LISTEN: 127.0.0.1:8670
+      RECORDINGS_TOKEN: twake-wazo-dev-only-recordings-token-0123456789
+    volumes:
+      - ./wazo/recordings.py:/twake/recordings.py:ro
+      - ./wazo/healthcheck.py:/twake/healthcheck.py:ro
+      - wazo-recordings:/var/lib/wazo/sounds/tenants
+      # The notice a recording starts with, where it says whether the host of Asterisk has it (HEAD /sound/custom/twake-recording-notice).
+      - ./wazo/asterisk/recording-notice/twake-recording-notice.wav:/usr/share/asterisk/sounds/custom/twake-recording-notice.wav:ro
+    network_mode: host
+    healthcheck:
+      test: ["CMD", "python3", "/twake/healthcheck.py", "tcp:127.0.0.1:8670"]
       interval: 60s
       start_period: 5m
       start_interval: 2s
@@ -539,4 +576,5 @@ services:
 volumes:
   wazo-auth-keys:
   wazo-voicemail:
+  wazo-recordings:
   synapse-data:

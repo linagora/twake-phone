@@ -117,6 +117,60 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(cfg).toContain('$dlg_val(meet) != NULL || $dlg_val(wline) == "1")) {')
   })
 
+  it('sends the call to a number of `call_flows` to Wazo as it sends one to a mailbox, only with the lines on, before any ring group, and refuses what cannot go there as unreachable, never as a number that does not exist (step 11c-2, ADR 0028)', () => {
+    const key = 'twake-wazo-line-test-key-0123456789abcdef'
+    const { cfg } = renderWhole({ WAZO_SIP: '127.0.0.1:5100', WAZO_LINES: '1', WAZO_LINE_KEY: key })
+    // Read with the rules of the number dialled, one more column of the first query, never for an account an extension holds.
+    expect(cfg).toContain(`$var(flow_join) = " LEFT JOIN call_flows f ON f.number = '" + $rU + "' AND length(f.route) <= 2000 AND f.route ~ '^[A-Za-z0-9_.:=/~|-]+$' AND NOT EXISTS (SELECT 1 FROM subscriber s WHERE s.username = '" + $rU + "')";`)
+    // After the join of the rules, never among the columns: pg_stat_activity shows 1023 characters of a query, and the SIP e2e looks for that join in it.
+    expect(cfg).toContain('$var(flow_col) + $var(rules_from) + $var(flow_join);')
+    expect(cfg).toContain('$avp(vm_box);$avp(r_flow)"), rules_loaded);')
+    const next = cfg.slice(cfg.indexOf('route[rules_next] {'), cfg.indexOf('route[rules_loaded] {'))
+    expect(next.indexOf('if ($shv(wazo_lines_on) == 1)')).toBeGreaterThan(next.indexOf('$avp(q11) = 1;'))
+    // The call: before the ring group of the same number, guarded as a mailbox's call is, to Wazo's socket with the route.
+    const step = cfg.slice(cfg.indexOf('route[rules_step] {'), cfg.indexOf('route[rules_decide] {'))
+    expect(step.indexOf('$avp(r_flow) != NULL')).toBeGreaterThan(-1)
+    expect(step.indexOf('$avp(r_flow) != NULL')).toBeLessThan(step.indexOf('$avp(r_group) == 1'))
+    const flow = step.slice(step.indexOf('$avp(r_flow) != NULL'), step.indexOf('$avp(r_group) == 1'))
+    for (const part of [
+      'if ($shv(wazo_on) != 1 || $shv(wazo_mute_until) > $Ts || $dlg_val(meet) != NULL || $avp(conference) != NULL || is_present_hf("Replaces") || ($avp(rtp_on) == NULL && !has_body_part("application/sdp"))) {',
+      't_reply(480, "Temporarily Unavailable");',
+      'rtpengine_offer("$var(rtp_flags)")',
+      '$acc_extra(via) = "flow";',
+      // The side of Wazo of the call speaks from its socket and never transfers, as in a call to a mailbox.
+      '$dlg_val(voicemail) = "1";',
+      '$ru = "sip:" + $rU + "@127.0.0.1:5100";',
+      '$socket_out = "udp:127.0.0.1:5095";',
+      'remove_hf("X-Twake-Flow");',
+      'append_hf("X-Twake-Flow: $avp(flow)\\r\\n");',
+      't_on_failure("flow_failed");'
+    ])
+      expect(flow, part).toContain(part)
+    // The route is the one the Gateway wrote, never what a caller sent: the header is removed before it is written.
+    expect(flow.indexOf('remove_hf("X-Twake-Flow");')).toBeLessThan(flow.indexOf('append_hf("X-Twake-Flow'))
+    // Answered: told once as an answer of the callee; nothing of Asterisk shown to the caller.
+    const reply = cfg.slice(cfg.indexOf('onreply_route[rtp] {'), cfg.indexOf('route[event_attrs] {'))
+    expect(reply).toContain('if ($avp(flow) != NULL) {\n\t\tremove_hf("Server");\n\t\tremove_hf("User-Agent");')
+    expect(reply.indexOf('if ($avp(flow) != NULL) {')).toBeLessThan(reply.indexOf('if ($avp(callee) != NULL) {'))
+    // Not complete (an error, no answer): 480 and a missed call; a server that does not answer is left out 30 s.
+    const failed = cfg.slice(cfg.indexOf('failure_route[flow_failed] {'))
+    for (const part of ['route(account_missed);', 't_reply(480, "Temporarily Unavailable");', '$shv(wazo_mute_until) = $Ts + 30;']) expect(failed.slice(0, failed.indexOf('\n}\n')), part).toContain(part)
+    // Without the lines none of it is in the configuration the steps before read, and `call_flows` is never named.
+    const before = render({ WAZO_SIP: '127.0.0.1:5100' }).cfg
+    expect(before).not.toContain('call_flows')
+    expect(before).not.toContain('flow_failed')
+    // An unregistration is made here at once (never relayed to wait for Wazo): a last window whose connection closed before
+    // Wazo answered stayed in `location` (measured against the OpenSIPS of the stack with a slow Wazo).
+    const register = cfg.slice(cfg.indexOf('$var(wl_line) = 0;'), cfg.indexOf('mid_registrar_save("location");'))
+    expect(register).toContain('$hdr(Contact) =~ ";expires=0($|[;,])" || ($hdr(Expires) == "0" && !($hdr(Contact) =~ ";expires=[1-9]"))))\n\t\t\t$var(wl_line) = 0;')
+    expect(register.indexOf('$hdr(Expires) == "0"')).toBeLessThan(register.indexOf('if ($var(wl_line) == 1) {'))
+    // Whatever a phone or the operator sent of the header goes with the others, with the lines or without (Wazo's dialplan reads it).
+    expect(before).not.toContain('append_hf("X-Twake-Flow')
+    expect(before).toContain('remove_hf("X-Twake-Flow");')
+    // The table missing: the read goes again without it, as for the mailboxes.
+    expect(cfg).toContain("to_regclass('call_flows') IS NULL")
+  })
+
   it('stays under the 99 named routes OpenSIPS 3.6 has room for (one more fails the start: "no slot left")', () => {
     const { cfg } = renderWhole({ WAZO_SIP: '127.0.0.1:5100', WAZO_LINES: '1', WAZO_LINE_KEY: 'twake-wazo-line-test-key-0123456789abcdef' })
     expect(cfg.match(/^route\[/gm)!.length).toBeLessThanOrEqual(99)
@@ -224,7 +278,7 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     }
     for (const header of ['route', 'route[trunk_in]']) {
       const body = routeBody(header)
-      for (const name of ['X-Twake-Mailbox', 'X-Twake-Voicemail']) {
+      for (const name of ['X-Twake-Mailbox', 'X-Twake-Voicemail', 'X-Twake-Flow']) {
         expect(body.match(new RegExp(`\\n\\tremove_hf\\("${name}"\\);\\n`, 'g')), `${header} ${name}`).toHaveLength(1)
         // Before the first of the routes it calls that could take the call to a mailbox.
         const removed = body.indexOf(`remove_hf("${name}");`)
@@ -276,8 +330,8 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     // OpenSIPS itself): the calls of a caller, of those with no number at a mailbox and at all of them, and of all at
     // the same time, and those of a caller to one mailbox in an hour, all read and counted under one lock; counted in
     // the hour only once the call has its place, counted out when the mailbox does not take it.
-    expect(cfg).toContain('modparam("dialog", "profiles_with_value", "trunk_caller;meet_caller;vm_caller")')
-    expect(cfg).toContain('modparam("dialog", "profiles_no_value", "trunk_out;trunk_emergency;meet_all;vm_all;vm_hidden")')
+    expect(cfg).toContain('modparam("dialog", "profiles_with_value", "trunk_caller;meet_caller;vm_caller;flow_caller")')
+    expect(cfg).toContain('modparam("dialog", "profiles_no_value", "trunk_out;trunk_emergency;meet_all;vm_all;vm_hidden;flow_all")')
     const room = vm.slice(vm.indexOf('get_static_lock("vm_count");'), vm.indexOf('release_static_lock("vm_count");'))
     const order = ['get_profile_size("vm_caller"', 'get_profile_size("vm_all"', 'get_profile_size("vm_hidden"', 'cache_add("local", "vm:h:', 'set_dlg_profile("vm_caller"', 'set_dlg_profile("vm_all")', 'set_dlg_profile("vm_hidden")']
     for (const [i, step] of order.entries()) {
@@ -569,7 +623,7 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(cfg).toContain('modparam("cfgutils", "shvset", "meet_max_sec=i:1800")')
     expect(call).toContain('if ($dlg_val(trunk) == NULL)\n\t\tcreate_dialog("B");\n\tif ($DLG_timeout > $shv(meet_max_sec))\n\t\t$DLG_timeout = $shv(meet_max_sec);')
     expect(cfg).toContain('if ($dlg_val(meet) == "caller" && $DLG_timeout > $shv(meet_max_sec))\n\t\t$DLG_timeout = $shv(meet_max_sec);')
-    expect(cfg).toContain('modparam("dialog", "profiles_with_value", "trunk_caller;meet_caller;vm_caller")')
+    expect(cfg).toContain('modparam("dialog", "profiles_with_value", "trunk_caller;meet_caller;vm_caller;flow_caller")')
     // The defaults.
     const defaults = render({ MEET_SIP: '192.0.2.20:5080', MEET_SIP_PASSWORD: 'not-a-real-secret-0' }).cfg
     expect(defaults).toContain('$var(pin_cap) = 10;\n\t$var(m_cap) = 2;')
@@ -1757,6 +1811,23 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(render().cfg).toContain('$var(wait) = 30;')
   })
 
+  it('bounds the calls of the flows per caller and in all (step 11c-2, ADR 0028)', () => {
+    const { cfg } = renderWhole({ WAZO_SIP: '127.0.0.1:5100', WAZO_LINES: '1', WAZO_LINE_KEY: 'k'.repeat(40) })
+    expect(cfg).toContain('flow_per_caller')
+    expect(cfg).toContain('flow_calls_all')
+    expect(cfg).toContain('route(group_missed, "486 Busy Here")')
+    expect(cfg).toContain('"flow_per_caller=i:3"')
+    expect(cfg).toContain('"flow_calls_all=i:60"')
+    for (const v of ['FLOW_CALLS_PER_CALLER', 'FLOW_CALLS_ALL']) {
+      for (const bad of ['0', 'abc', '-1', '1000000']) {
+        const { status, stderr } = render({ [v]: bad })
+        expect(status, `${v}=${bad}`).toBe(1)
+        expect(stderr).toMatch(new RegExp(v))
+      }
+    }
+    expect(renderWhole({ WAZO_SIP: '127.0.0.1:5100', WAZO_LINES: '1', WAZO_LINE_KEY: 'k'.repeat(40), FLOW_CALLS_PER_CALLER: '7', FLOW_CALLS_ALL: '90' }).cfg).toContain('flow_per_caller=i:7')
+  })
+
   it('never answers 404 for a number whose rules could not be read: it may be a ring group', () => {
     const { cfg } = render()
     const section = (name: string, next: string) => cfg.slice(cfg.indexOf(`${name} {`), cfg.indexOf(`${next} {`))
@@ -1817,7 +1888,7 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(section('route[default_trunk]', 'timer_route[default_trunk, 15]')).toContain('$(var(dn){s.select,1,|}{s.int}) >= $shv(dn_gen)')
     expect(cfg).toContain('modparam("cfgutils", "shvset", "dn_gen=i:0")')
     // n°10: the emergency calls known as such in the database (their profile), a day at most, 2 h once restored.
-    expect(cfg).toContain('modparam("dialog", "profiles_no_value", "trunk_out;trunk_emergency;meet_all;vm_all;vm_hidden")')
+    expect(cfg).toContain('modparam("dialog", "profiles_no_value", "trunk_out;trunk_emergency;meet_all;vm_all;vm_hidden;flow_all")')
     const entry = readFileSync(join(dir, 'entrypoint.sh'), 'utf8')
     expect(entry).toContain(`-c "SELECT twake_outbound_restart(${EMERGENCY_RESTORED_SEC})"`)
     // n°4: before OpenSIPS starts, after the tables are there.
