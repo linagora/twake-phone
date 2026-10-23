@@ -1921,4 +1921,45 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(init).toContain('internal ones included')
     expect(init).toContain("! ufw status 2>/dev/null | grep -q '30000:30999/udp'")
   })
+  it('names the rtpengine interface that faces each side of an offer when there are two, and changes nothing with one (ADR 0030)', () => {
+    const one = renderWhole()
+    expect(one.cfg).toContain('modparam("cfgutils", "shvset", "rtp_directions=i:0")')
+    const two = renderWhole({ RTPENGINE_INTERFACE_INTERNAL: '192.168.65.3', RTPENGINE_INTERFACE_EXTERNAL: '192.168.65.3!54.36.52.8' })
+    expect(two.status, two.stderr).toBe(0)
+    expect(two.cfg).toContain('modparam("cfgutils", "shvset", "rtp_directions=i:1")')
+    for (const half of [{ RTPENGINE_INTERFACE_INTERNAL: '10.0.0.1' }, { RTPENGINE_INTERFACE_EXTERNAL: '10.0.0.1' }] as Record<string, string>[]) {
+      const bad = renderWhole(half)
+      expect(bad.status).toBe(1)
+      expect(bad.stderr).toMatch(/go together/)
+    }
+    // Every offer (the initial one, the one in a 2xx, the mailbox's, the Wazo flows') says it; an answer does not, rtpengine remembers.
+    const tpl = readFileSync(join(dir, 'opensips.cfg.tpl'), 'utf8')
+    expect(tpl).toContain('route(rtp_flags, $var(to_kind), $var(from_kind));')
+    expect(tpl).toContain('route(rtp_flags, $var(offer_to), $var(offer_origin));')
+    expect(tpl).toContain('route(rtp_flags, 0, $var(from_kind));')
+    // An answer does not (rtpengine remembers the offer's), and only the operator (kind 1) is the external network.
+    // Any other one-argument call would be an offer without directions (the Wazo flows' once was).
+    expect(tpl.match(/route\(rtp_flags, [^,;]+\);/g)).toEqual(['route(rtp_flags, $var(answer_to));'])
+    const flags = tpl.slice(tpl.indexOf('\nroute[rtp_flags] {'), tpl.indexOf('\nroute[sides] {'))
+    expect(flags).toContain('if ($param(2) != NULL && $shv(rtp_directions) == 1) {')
+    expect(flags).toContain('" in-iface=" + $var(from_if) + " out-iface=" + $var(to_if)')
+    expect(flags.match(/if \(\$param\([12]\) == 1\)\n\t+\$var\((from|to)_if\) = "external";/g)).toHaveLength(2)
+  })
+  it('starts rtpengine with one interface as before, or with an internal and an external one (ADR 0030)', () => {
+    const bin = join(tmp, 'bin')
+    mkdirSync(bin, { recursive: true })
+    writeFileSync(join(bin, 'rtpengine'), '#!/bin/sh\nprintf "%s\\n" "$@"\n')
+    chmodSync(join(bin, 'rtpengine'), 0o755)
+    const start = (env: Record<string, string>) => {
+      const run = spawnSync('sh', [join(dir, '../rtpengine/entrypoint.sh')], { env: { PATH: `${bin}:${process.env.PATH ?? '/usr/bin:/bin'}`, ...env }, encoding: 'utf8' })
+      return { status: run.status, args: run.stdout.split('\n'), stderr: run.stderr }
+    }
+    expect(start({}).args).toContain('--interface=127.0.0.1')
+    expect(start({ RTPENGINE_INTERFACE: '10.0.0.5!203.0.113.7' }).args).toContain('--interface=10.0.0.5!203.0.113.7')
+    const two = start({ RTPENGINE_INTERFACE: '203.0.113.7', RTPENGINE_INTERFACE_INTERNAL: '10.0.0.5', RTPENGINE_INTERFACE_EXTERNAL: '10.0.0.5!203.0.113.7' })
+    expect(two.args.filter(a => a.startsWith('--interface='))).toEqual(['--interface=internal/10.0.0.5', '--interface=external/10.0.0.5!203.0.113.7'])
+    const half = start({ RTPENGINE_INTERFACE_INTERNAL: '10.0.0.5' })
+    expect(half.status).toBe(1)
+    expect(half.stderr).toMatch(/go together/)
+  })
 })

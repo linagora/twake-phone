@@ -226,6 +226,7 @@ modparam("cfgutils", "shvset", "no5_until=i:0")
 # Whether the phone access of Meet's rooms is on (step 8, ADR 0018): MEET_SIP set (entrypoint.sh); and its access
 # number. The Gateway reads both through the MI (shv_get) and says at its start when it has another view of them.
 modparam("cfgutils", "shvset", "meet_on=i:${MEET_ON}")
+modparam("cfgutils", "shvset", "rtp_directions=i:${RTPENGINE_DIRECTIONS}")
 modparam("cfgutils", "shvset", "meet_number=s:${MEET_NUMBER}")
 # The longest a call with LiveKit SIP lasts (MEET_MAX_CALL_SEC): for the calls to come once changed (MI shv_set; the e2e
 # shortens it a moment).
@@ -354,6 +355,19 @@ route[rtp_flags] {
 		$var(rtp_flags) = "ICE=remove RTP/AVP rtcp-mux-demux DTLS=off SDES-off replace-origin replace-session-connection codec-strip-all codec-except-G722 codec-except-PCMA codec-except-PCMU codec-except-telephone-event";
 	else if ($dlg_val(trunk) != NULL || $dlg_val(meet) != NULL)
 		$var(rtp_flags) = "ICE=force RTP/SAVPF rtcp-mux-require generate-mid SDES-off replace-origin replace-session-connection";
+	# With two rtpengine interfaces (RTPENGINE_INTERFACE_INTERNAL and _EXTERNAL, ADR 0030) an offer ($param(2): the kind
+	# of the side it comes from) says which one faces each side: the operator is the external network, everything else
+	# (browsers, LiveKit SIP, Wazo) the internal one. Only the offer says it, rtpengine remembers it for the answer and
+	# the later offers. With one interface (rtp_directions 0) nothing is added.
+	if ($param(2) != NULL && $shv(rtp_directions) == 1) {
+		$var(from_if) = "internal";
+		if ($param(2) == 1)
+			$var(from_if) = "external";
+		$var(to_if) = "internal";
+		if ($param(1) == 1)
+			$var(to_if) = "external";
+		$var(rtp_flags) = $var(rtp_flags) + " in-iface=" + $var(from_if) + " out-iface=" + $var(to_if);
+	}
 }
 
 # The kind of the side the request in hand goes to ($var(to_kind)) and of the side it comes from ($var(from_kind)):
@@ -405,7 +419,7 @@ route[rtp_offer] {
 	route(sides);
 	$(avp(offer_from)[*]) = NULL;
 	$avp(offer_from) = $var(from_kind);
-	route(rtp_flags, $var(to_kind));
+	route(rtp_flags, $var(to_kind), $var(from_kind));
 	# LiveKit SIP draws the session id and version of its o= line as any 64-bit number (step 8), half of them past the
 	# 2^63 - 1 that JSEP (RFC 8829) allows: Firefox refuses such an offer (488). rtpengine keeps them as they are; it is
 	# given them as "1" and their last 17 digits instead (below 2^63, the same in each offer of the call, a version that
@@ -460,7 +474,12 @@ route[rtp_late_offer] {
 		$var(offer_to) = 1;
 	else if ($avp(late_offer) == "meet")
 		$var(offer_to) = 2;
-	route(rtp_flags, $var(offer_to));
+	# The 2xx that carries this offer comes from the other side than the INVITE's sender: the operator's when the
+	# call has one and the offer is not going to it.
+	$var(offer_origin) = 0;
+	if ($dlg_val(trunk) != NULL && $var(offer_to) != 1)
+		$var(offer_origin) = 1;
+	route(rtp_flags, $var(offer_to), $var(offer_origin));
 	if (rtpengine_offer("$var(rtp_flags)")) {
 		$avp(rtp_on) = 1;
 		$dlg_val(late_answer) = "1";
@@ -3417,7 +3436,7 @@ route[rules_step] {
 			$var(from_kind) = 1;
 		$(avp(offer_from)[*]) = NULL;
 		$avp(offer_from) = $var(from_kind);
-		route(rtp_flags, 0);
+		route(rtp_flags, 0, $var(from_kind));
 		if (!rtpengine_offer("$var(rtp_flags)")) {
 			xlog("L_ERR", "call $ci: rtpengine offer for the flow $rU failed\n");
 			route(group_missed, "503 Media Unavailable");
@@ -4057,7 +4076,7 @@ route[voicemail] {
 			$var(from_kind) = 1;
 		$(avp(offer_from)[*]) = NULL;
 		$avp(offer_from) = $var(from_kind);
-		route(rtp_flags, 0);
+		route(rtp_flags, 0, $var(from_kind));
 		if (!rtpengine_offer("$var(rtp_flags)")) {
 			xlog("L_ERR", "call $ci: rtpengine offer for the mailbox of $avp(dialled) failed\n");
 			route(voicemail_unhour);

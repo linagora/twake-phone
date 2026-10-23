@@ -93,7 +93,11 @@ jobs:
     # Les essais de PIN d'une salle (étape 8) : 3 par appelant (refusé au-delà) et 6 pour tous en 10 minutes
     # (l'alerte des administrateurs, le plafond de ceux qui masquent leur numéro) plutôt que 10 et 300, et 10 appels
     # simultanés au numéro d'accès plutôt que 100, pour que trunk.sip.mjs et l'e2e les jouent en quelques appels.
+    # Deux interfaces rtpengine (ADR 0030) : 127.0.0.1 pour les navigateurs et LiveKit SIP, 127.0.0.2 pour l'opérateur.
+    # trunk.sip.mjs prouve que le téléphone reçoit la première adresse et l'opérateur la seconde.
     env:
+      RTPENGINE_INTERFACE_INTERNAL: 127.0.0.1
+      RTPENGINE_INTERFACE_EXTERNAL: 127.0.0.2
       TRUNK_ADVERTISE: 192.0.2.10:5070
       CALL_PING_SEC: "5"
       TRUNK_MIN_CALL_SEC: "5"

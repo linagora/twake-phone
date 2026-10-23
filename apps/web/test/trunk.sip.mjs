@@ -23,6 +23,9 @@
 //   SIP_MEET             its socket for LiveKit SIP (step 8, default 127.0.0.1:5090), which these steps play from the
 //                        loopback (LiveKit SIP's address, MEET_SIP), and from 127.0.0.2 for an address that is not
 //   MEET_SIP_USER, MEET_SIP_PASSWORD, MEET_NUMBER   its MEET_* (default livekit, the stack's development password, 8000)
+//   RTPENGINE_INTERFACE_INTERNAL, RTPENGINE_INTERFACE_EXTERNAL   the stack's two rtpengine interfaces (ADR 0030), when it
+//                        has them: the steps then prove that a phone is given the internal address and the operator the
+//                        external one; unset, those steps are skipped (one interface: both get the same)
 //   MEET_MAX_CALL_SEC, MEET_PIN_TRIES, MEET_PIN_TRIES_ALL, MEET_CALLS_PER_CALLER, MEET_CALLS_ALL   its MEET_* (default
 //                        7200, 10, 300, 2, 100); the calls to the access number of the steps go to LiveKit SIP at
 //                        MEET_SIP, which must not answer them (as LiveKit SIP without a room's rule: it rings, or not,
@@ -54,6 +57,11 @@ const MI_URL = process.env.OPENSIPS_MI_URL ?? 'udp:127.0.0.1:8880'
 const PING_SEC = Number(process.env.CALL_PING_SEC ?? 30)
 const PING_TIMEOUT_SEC = Number(process.env.CALL_PING_TIMEOUT_SEC ?? 15)
 const RTPENGINE_NG = process.env.RTPENGINE_NG ?? '127.0.0.1:22222'
+// The address an interface writes in the SDP: the part after "!" when it has a private and a public one.
+const advertised = interfaceName => interfaceName.split('!').pop()
+const INTERNAL = process.env.RTPENGINE_INTERFACE_INTERNAL ? advertised(process.env.RTPENGINE_INTERFACE_INTERNAL) : ''
+const EXTERNAL = process.env.RTPENGINE_INTERFACE_EXTERNAL ? advertised(process.env.RTPENGINE_INTERFACE_EXTERNAL) : ''
+const connectionOf = sdp => /^c=IN IP4 (\S+)/m.exec(sdp ?? '')?.[1]
 const MAX_CALL_SEC = Number(process.env.TRUNK_MAX_CALL_SEC ?? 14400)
 const MIN_CALL_SEC = Number(process.env.TRUNK_MIN_CALL_SEC ?? 60)
 const RESTART = process.env.OPENSIPS_RESTART ?? ''
@@ -386,6 +394,29 @@ try {
     await A.until('the ACK at the operator', () => at.acks.length > 0, 5_000)
     expect('answer in the ACK, plain RTP', plainRtp(at.acks[0].body), at.acks[0].body)
     await p301.hangup(call)
+  })
+
+  await step('ADR 0030: with two rtpengine interfaces, the phone is given the internal address and the operator the external one, in a call to the operator and in one from it', async () => {
+    if (!INTERNAL || !EXTERNAL) return console.log('    (skipped: RTPENGINE_INTERFACE_INTERNAL and _EXTERNAL are not set)')
+    const call = await p301.dial('0199000017')
+    expect('final answer', call.final.status === 200, call.final.first)
+    const at = await atOperator(A, call)
+    expect('the operator is offered the external address', connectionOf(at.invite.body) === EXTERNAL, at.invite.body)
+    expect('the phone is given the internal address', connectionOf(call.final.body) === INTERNAL, call.final.body)
+    // The operator refreshing its session with an INVITE without SDP: the offer in the phone's 2xx still goes out on the external interface.
+    const refresh = await A.reinvite(at)
+    expect('the operator\'s refresh is answered with the external address', refresh.status === 200 && connectionOf(refresh.body) === EXTERNAL, refresh.body)
+    await p301.hangup(call)
+    const placed = await A.call('+33199000301', { from: '+33639980002' })
+    const answer = await placed.final
+    expect('answer to the operator', answer.status === 200, answer.first)
+    expect('the operator is given the external address', connectionOf(answer.body) === EXTERNAL, answer.body)
+    const got = await p301.incoming(i => header(i, 'call-id') === placed.callId)
+    expect('the phone is offered the internal address', connectionOf(got.invite.body) === INTERNAL, got.invite.body)
+    const refreshed = await A.reinvite(placed)
+    expect('the operator\'s refresh is answered with the external address', refreshed.status === 200 && connectionOf(refreshed.body) === EXTERNAL, refreshed.body)
+    await placed.hangup()
+    await p301.callState(got, 'ended', 5_000)
   })
 
   await step('n°10: a BYE from an address of the operator the trunk does not declare, in a call under way, ends it; out of a call, it is refused', async () => {
@@ -1241,6 +1272,7 @@ try {
     const rung = await w302.incoming(i => header(i, 'call-id') === call.callId)
     const origin = /^o=\S+ (\d+) (\d+) /m.exec(rung.invite.body)
     expect('the o= line 302 got', origin?.[1] === '112345678901234567' && origin[2] === '112345678901234567', rung.invite.body)
+    if (INTERNAL) expect('LiveKit SIP and the browser are both on the internal interface', connectionOf(rung.invite.body) === INTERNAL, rung.invite.body)
     expect('the codecs 302 got', ['G722/8000', 'PCMU/8000', 'PCMA/8000', 'telephone-event/8000'].every(c => rung.invite.body.includes(` ${c}`)), rung.invite.body)
     const bye = await lk.hangup(call)
     expect('the room\'s BYE', bye.status === 200, bye.first)
