@@ -3436,7 +3436,7 @@ route[rules_step] {
 			$var(from_kind) = 1;
 		$(avp(offer_from)[*]) = NULL;
 		$avp(offer_from) = $var(from_kind);
-		route(rtp_flags, 0);
+		route(rtp_flags, 0, $var(from_kind));
 		if (!rtpengine_offer("$var(rtp_flags)")) {
 			xlog("L_ERR", "call $ci: rtpengine offer for the flow $rU failed\n");
 			route(group_missed, "503 Media Unavailable");

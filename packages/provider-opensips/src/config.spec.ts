@@ -1932,13 +1932,14 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
       expect(bad.status).toBe(1)
       expect(bad.stderr).toMatch(/go together/)
     }
-    // Every offer (the initial one, the one in a 2xx, the mailbox's) says it; an answer does not, rtpengine remembers.
+    // Every offer (the initial one, the one in a 2xx, the mailbox's, the Wazo flows') says it; an answer does not, rtpengine remembers.
     const tpl = readFileSync(join(dir, 'opensips.cfg.tpl'), 'utf8')
     expect(tpl).toContain('route(rtp_flags, $var(to_kind), $var(from_kind));')
     expect(tpl).toContain('route(rtp_flags, $var(offer_to), $var(offer_origin));')
     expect(tpl).toContain('route(rtp_flags, 0, $var(from_kind));')
     // An answer does not (rtpengine remembers the offer's), and only the operator (kind 1) is the external network.
-    expect(tpl).toContain('route(rtp_flags, $var(answer_to));')
+    // Any other one-argument call would be an offer without directions (the Wazo flows' once was).
+    expect(tpl.match(/route\(rtp_flags, [^,;]+\);/g)).toEqual(['route(rtp_flags, $var(answer_to));'])
     const flags = tpl.slice(tpl.indexOf('\nroute[rtp_flags] {'), tpl.indexOf('\nroute[sides] {'))
     expect(flags).toContain('if ($param(2) != NULL && $shv(rtp_directions) == 1) {')
     expect(flags).toContain('" in-iface=" + $var(from_if) + " out-iface=" + $var(to_if)')
