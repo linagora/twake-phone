@@ -1,6 +1,6 @@
 # Build context: repository root. Serves the TwakePhone web app with its runtime config and security headers
 # (apps/web/server): GATEWAY_URL, OIDC_AUTHORITY, OIDC_CLIENT_ID, OIDC_RESOURCE, FRAME_ANCESTORS, CONNECT_SRC, HSTS_MAX_AGE.
-FROM node:22-slim AS build
+FROM node:24-slim AS build
 WORKDIR /app
 COPY package.json yarn.lock tsconfig.base.json ./
 COPY packages ./packages
@@ -13,7 +13,7 @@ RUN yarn install --frozen-lockfile --ignore-scripts \
     && yarn workspace @twake/softphone build \
     && yarn workspace @twake/phone-web build
 
-FROM node:22-slim
+FROM node:24-slim
 WORKDIR /app
 COPY --from=build /app/apps/web/dist ./dist
 COPY apps/web/server ./server

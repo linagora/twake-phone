@@ -14,7 +14,7 @@ Ce que le dépôt n'enforce pas encore et qui est à régler par un administrate
 
 ## Avant d'ouvrir une PR
 
-Node 22.13 et plus, ou 24 et plus (ESLint 10 le demande ; pas Node 23).
+Node 24 et plus (`@linagora/twake-css` le demande ; `.nvmrc`).
 
 ```bash
 yarn install && yarn build

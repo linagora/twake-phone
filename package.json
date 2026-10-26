@@ -3,7 +3,7 @@
   "private": true,
   "license": "AGPL-3.0",
   "engines": {
-    "node": "^22.13.0 || >=24"
+    "node": ">=24"
   },
   "workspaces": [
     "packages/*",
