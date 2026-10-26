@@ -74,7 +74,9 @@ const Player = ({ url, audio, fallbackSec, label, describedBy, onPaused }: { url
         className="u-flex-grow-1"
         min={0}
         max={duration || 1}
-        step={0.1}
+        // A second per arrow key, ten with Shift (or Page Up/Down): usable from the keyboard.
+        step={1}
+        shiftStep={10}
         value={Math.min(time, duration)}
         onChange={(_, v) => {
           if (audio.current) audio.current.currentTime = v
@@ -311,7 +313,7 @@ export const VoicemailPage = () => {
       {t('voicemail.title')}
     </Typography>
   )
-  if (error === 'unavailable') return <>{heading}<Alert severity="info">{t('voicemail.unavailable')}</Alert></>
+  if (error === 'unavailable') return <>{heading}<Alert severity="info" role="status">{t('voicemail.unavailable')}</Alert></>
   if (error) return <>{heading}<Alert severity="error" role="alert">{t('voicemail.error')}</Alert></>
   if (!items) return heading
   const when = new Intl.DateTimeFormat(lang, { dateStyle: 'medium', timeStyle: 'short' })
@@ -363,7 +365,7 @@ export const VoicemailPage = () => {
                       <span>
                         <strong>{who}</strong>
                         {v.unread ? (
-                          <Typography component="span" color="error" className="u-fw-bold">
+                          <Typography component="span" color="error.dark" className="u-fw-bold">
                             {' '}
                             · {t('voicemail.new')}
                           </Typography>

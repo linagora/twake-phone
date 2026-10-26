@@ -1,26 +1,26 @@
 import { describe, expect, it } from 'vitest'
-import { MODE_KEY, forgetSystemMode } from './colorMode.js'
+import { LIGHT_SCHEME_KEY, MODE_KEY, forgetStoredMode } from './colorMode.js'
 
-const store = (value: string | null) => {
-  const map = new Map<string, string>(value === null ? [] : [[MODE_KEY, value]])
+const store = (entries: Record<string, string>) => {
+  const map = new Map(Object.entries(entries))
   return { map, storage: { getItem: (k: string) => map.get(k) ?? null, removeItem: (k: string) => void map.delete(k) } }
 }
 
-describe('forgetSystemMode', () => {
-  it('drops the `system` mode an earlier version stored, so the app opens light', () => {
-    const { map, storage } = store('system')
-    forgetSystemMode(storage)
-    expect(map.has(MODE_KEY)).toBe(false)
+describe('forgetStoredMode', () => {
+  it('drops a stored `system` or `dark` mode and a dark scheme for the light mode: the app has no theme setting, it opens light', () => {
+    for (const mode of ['system', 'dark']) {
+      const { map, storage } = store({ [MODE_KEY]: mode, [LIGHT_SCHEME_KEY]: 'dark' })
+      forgetStoredMode(storage)
+      expect([...map.keys()]).toEqual([])
+    }
   })
 
-  it('keeps an explicit choice, and copes with no or refused storage', () => {
-    for (const mode of ['light', 'dark']) {
-      const { map, storage } = store(mode)
-      forgetSystemMode(storage)
-      expect(map.get(MODE_KEY)).toBe(mode)
-    }
-        expect(() =>
-      forgetSystemMode({
+  it('keeps light as it is, and copes with refused storage', () => {
+    const { map, storage } = store({ [MODE_KEY]: 'light', [LIGHT_SCHEME_KEY]: 'light' })
+    forgetStoredMode(storage)
+    expect(map.size).toBe(2)
+    expect(() =>
+      forgetStoredMode({
         getItem: () => {
           throw new Error('SecurityError')
         },

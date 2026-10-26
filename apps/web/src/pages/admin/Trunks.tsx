@@ -609,7 +609,7 @@ export const Trunks = () => {
   if (unavailable)
     return (
       <Section id="trunks" title={t('admin.nav.trunks')}>
-        <Alert severity="warning">{t('admin.trunk.unavailable')}</Alert>
+        <Alert severity="warning" role="status">{t('admin.trunk.unavailable')}</Alert>
       </Section>
     )
 

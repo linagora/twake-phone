@@ -261,7 +261,7 @@ export const Accounts = () => {
                 {last ? <Report report={last} /> : null}
               </>
             ) : (
-              <Alert severity="info">{t('admin.syncUnavailable')}</Alert>
+              <Alert severity="info" role="status">{t('admin.syncUnavailable')}</Alert>
             )}
           </CardContent>
         </Card>

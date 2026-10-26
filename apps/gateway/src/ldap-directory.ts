@@ -152,9 +152,10 @@ export class LdapDirectory implements ContactDirectory {
     return tenantId === this.config.tenantId
   }
 
-  private attributes() {
+  /** What is read of each person; the photo only where it is shown (a search, a card), never for a full listing. */
+  private attributes(photo = true) {
     const a = this.config.attributes
-    return [...new Set([a.id, a.name, a.surname, a.givenName, a.email, a.phone, a.mobile, a.extension, a.department, a.title, a.photo].filter(Boolean))]
+    return [...new Set([a.id, a.name, a.surname, a.givenName, a.email, a.phone, a.mobile, a.extension, a.department, a.title, photo ? a.photo : ''].filter(Boolean))]
   }
 
   /** The source as the administration screen shows it: the bind password never leaves the configuration. */
@@ -168,7 +169,8 @@ export class LdapDirectory implements ContactDirectory {
 
   /** One bound connection per request: simple, and immune to a connection the server dropped meanwhile. */
   private async query(filter: string, sizeLimit: number, paged = false): Promise<Contact[]> {
-    return (await this.entries(filter, sizeLimit, paged, this.attributes())).map(e => contactOf(e, this.config.attributes)).filter((c): c is Contact => c !== null)
+    // The synchronisation of the accounts (the paged full listing) needs no photo: thousands of them, every hour.
+    return (await this.entries(filter, sizeLimit, paged, this.attributes(!paged))).map(e => contactOf(e, this.config.attributes)).filter((c): c is Contact => c !== null)
   }
 
   private async entries(filter: string, sizeLimit: number, paged: boolean, attributes: string[]): Promise<Entry[]> {

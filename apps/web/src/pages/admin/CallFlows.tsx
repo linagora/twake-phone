@@ -120,7 +120,7 @@ export const CallFlows = () => {
   if (unavailable)
     return (
       <Section id="flows" title={t('admin.flows')}>
-        <Alert severity="info">{t('admin.flowsUnavailable')}</Alert>
+        <Alert severity="info" role="status">{t('admin.flowsUnavailable')}</Alert>
       </Section>
     )
   const count = Object.keys(problems).length

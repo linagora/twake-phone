@@ -9,7 +9,7 @@ export const Phone = () => {
   return (
     <>
       <Typography variant="h4" component="h1" className="u-visuallyhidden">
-        {t('nav.dialer')}
+        {t('phone.title')}
       </Typography>
       <Grid container spacing={4}>
         <Grid size={{ xs: 12, md: 7 }} component="section" aria-labelledby="directory-title">

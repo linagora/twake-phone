@@ -132,7 +132,7 @@ export const Sites = () => {
   if (unavailable)
     return (
       <Section id="sites" title={t('admin.nav.sites')}>
-        <Alert severity="info">{t('admin.trunk.unavailable')}</Alert>
+        <Alert severity="info" role="status">{t('admin.trunk.unavailable')}</Alert>
       </Section>
     )
 
@@ -228,7 +228,7 @@ export const Sites = () => {
       </Section>
       <Section id="site-form" title={editing ? t('admin.site.edit', { id: editing.id }) : t('admin.site.new')}>
         {sites !== null && !trunks.length ? (
-          <Alert severity="info">{t('admin.site.noTrunk')}</Alert>
+          <Alert severity="info" role="status">{t('admin.site.noTrunk')}</Alert>
         ) : (
           <form onSubmit={e => void save(e)} noValidate aria-labelledby="site-form">
             <ProblemSummary count={count} />

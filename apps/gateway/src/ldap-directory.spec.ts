@@ -146,6 +146,8 @@ describe('LdapDirectory against a real LDAP server', () => {
       expect((await d.search('t', 'dup', 10)).items[0]?.photo).toBe(url)
       expect((await d.getMany('t', ['jdupont', 'amartin'])).map(c => c.photo)).toEqual([url, undefined])
       expect((await make({ url: mock.url, attributes: { ...DEFAULT_ATTRIBUTES, photo: '' } }).getMany('t', ['jdupont']))[0]?.photo).toBeUndefined()
+      // The synchronisation's full listing reads no photo (thousands of them, every hour).
+      expect((await make({ url: mock.url, attributes: { ...DEFAULT_ATTRIBUTES, extension: 'ipPhone' } }).listAll('t')).find(c => c.id === 'jdupont')?.photo).toBeUndefined()
     } finally {
       await mock.stop()
     }

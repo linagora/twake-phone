@@ -59,7 +59,7 @@ export const Directory = () => {
         {t('directory.title')}
       </Typography>
       {noDirectory || error === 'unavailable' ? (
-        <Alert severity="info" className="u-mb-1">
+        <Alert severity="info" role="status" className="u-mb-1">
           {t('directory.unavailable')}
         </Alert>
       ) : null}
@@ -90,7 +90,7 @@ export const Directory = () => {
         <>
           {results.items.length === 0 && !searching && !error ? (
             <>
-              <Typography component="p">{t('directory.empty', { query: q })}</Typography>
+              <Typography component="p">{q ? t('directory.empty', { query: q }) : t('directory.nobody')}</Typography>
               {/* Nobody has it, but it is a number: it is called from here, as a phone would. */}
               {can(q) ? (
                 <Button className="u-mt-1" onClick={() => void call(q)}>
@@ -102,7 +102,7 @@ export const Directory = () => {
             <ContactList contacts={results.items} />
           )}
           {results.truncated ? (
-            <Alert severity="info" className="u-mt-1">
+            <Alert severity="info" role="status" className="u-mt-1">
               {t('directory.truncated')}
             </Alert>
           ) : null}

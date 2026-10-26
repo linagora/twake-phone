@@ -18,7 +18,7 @@
 
 ## Pourquoi
 
-Les administrations qui passent à Twake gardent un PABX propriétaire déconnecté de leur outil collaboratif, ou cèdent à Teams Phone et Zoom Phone : américains, facturés par utilisateur. Il leur faut une softphonie intégrée, auto-hébergée, à parité avec ces offres.
+Les administrations qui passent à Twake gardent un PABX propriétaire déconnecté de leur outil collaboratif, ou cèdent à Teams Phone et Zoom Phone : américains, facturés par utilisateur. Le marché CANUT (CCTP §7.4.6.2) demande une softphonie intégrée, auto-hébergée, à parité avec ces offres.
 
 TwakePhone y répond avec du logiciel libre, déployé chez le bénéficiaire :
 

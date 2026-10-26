@@ -116,7 +116,7 @@ export const RingGroups = () => {
   if (unavailable)
     return (
       <Section id="groups" title={t('admin.groups')}>
-        <Alert severity="info">{t('admin.groupsUnavailable')}</Alert>
+        <Alert severity="info" role="status">{t('admin.groupsUnavailable')}</Alert>
       </Section>
     )
   const count = Object.keys(problems).length
