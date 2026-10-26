@@ -12,7 +12,7 @@ concurrency:
 
 jobs:
   gateway-and-packages:
-    name: Paquets et passerelle (Node 22, PostgreSQL)
+    name: Paquets et passerelle (Node 24, PostgreSQL)
     runs-on: ubuntu-latest
     timeout-minutes: 20
     services:
