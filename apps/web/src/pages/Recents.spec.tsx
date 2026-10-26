@@ -104,6 +104,15 @@ describe('the Récents page', () => {
       'actions.copyNumberWhen 103',
       'actions.copyNumberWhen 104'
     ])
+    // The phone of every row, as in the directory, after « copy »; none either for those two.
+    const icons = [...host.querySelectorAll('li')].map(li => [...li.querySelectorAll('button')].map(b => b.getAttribute('aria-label')?.split(' ')[0]))
+    expect(icons).toEqual([['actions.copyNumberWhen', 'actions.callNumberWhen'], [], [], ['actions.copyNumberWhen', 'actions.callNumberWhen']])
+  })
+
+  it('calls by the phone of the row too', async () => {
+    await render([item('a', '103')])
+    await act(async () => button(/^actions\.callNumberWhen 103 /)!.click())
+    expect(call).toHaveBeenCalledWith('103')
   })
 
   it('calls from the browser when the softphone is registered and free, else fills the keypad in', async () => {

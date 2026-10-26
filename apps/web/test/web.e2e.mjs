@@ -727,6 +727,8 @@ try {
     const jean = page.locator('[data-testid=recents] > li', { hasText: 'Jean Dupont' })
     await jean.getByTestId('recent-number').getByText('102', { exact: true }).waitFor()
     await jean.getByRole('link', { name: 'Fiche de Jean Dupont' }).waitFor()
+    // The same icons as in the directory: copy, then the phone.
+    expectEqual(JSON.stringify(await jean.locator('button[aria-label]').evaluateAll(bs => bs.map(b => b.getAttribute('aria-label').replace(/ \(.*/, '')))), JSON.stringify(['Copier le 102', 'Appeler le 102']), 'icons of the row')
     await page.getByRole('button', { name: 'Manqués' }).click()
     await page.locator('[data-testid=recents] > li', { hasText: '+33 6 39 98 00 02' }).waitFor()
     await jean.waitFor({ state: 'detached' })

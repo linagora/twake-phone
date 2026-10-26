@@ -6,7 +6,7 @@ import type { Key } from '../i18n/index.js'
 import { useT } from '../i18n/useT.js'
 import { Reloader } from '../reload.js'
 import { ContactAvatar } from '../components/ContactList.js'
-import { CopyAction, OpenCardAction } from '../components/RowActions.js'
+import { CallAction, CopyAction, OpenCardAction } from '../components/RowActions.js'
 import { useContactsByNumber } from '../contactsByNumber.js'
 import { HoverActions } from '../ds/HoverActions/HoverActions.js'
 import { useCallNumber } from '../useCallNumber.js'
@@ -166,7 +166,9 @@ export const Recents = () => {
                     </Typography>
                   </>
                 )
-                const actions = [contact ? <OpenCardAction key="card" id={contact.id} label={t('actions.openCard', { name: contact.displayName })} /> : null, !mine && !hidden ? <CopyAction key="copy" number={it.remoteNumber} label={t('actions.copyNumberWhen', { number, when: when.format(new Date(it.startedAt)) })} /> : null].filter(Boolean)
+                const actions = [contact ? <OpenCardAction key="card" id={contact.id} label={t('actions.openCard', { name: contact.displayName })} /> : null, !mine && !hidden ? <CopyAction key="copy" number={it.remoteNumber} label={t('actions.copyNumberWhen', { number, when: when.format(new Date(it.startedAt)) })} /> : null,
+                  // The same phone as everywhere else (the row calls too); none for a hidden number or one's own conference.
+                  callable ? <CallAction key="call" number={it.remoteNumber} label={t('actions.callNumberWhen', { number, when: when.format(new Date(it.startedAt)) })} /> : null].filter(Boolean)
                 return (
                   // The actions follow the row in the flow (not over it): the time stays readable.
                   <ListItem key={it.id} divider disablePadding={callable}>

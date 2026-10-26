@@ -1100,5 +1100,6 @@
   "actions.copied": "{number} copié.",
   "actions.copyFailed": "Le navigateur n'a pas permis de copier le numéro.",
   "actions.openCard": "Fiche de {name}",
-  "actions.copyNumberWhen": "Copier le {number} ({when})"
+  "actions.copyNumberWhen": "Copier le {number} ({when})",
+  "actions.callNumberWhen": "Appeler le {number} ({when})"
 }

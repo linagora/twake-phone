@@ -1100,5 +1100,6 @@
   "actions.copied": "{number} copied.",
   "actions.copyFailed": "The browser did not allow copying the number.",
   "actions.openCard": "{name}'s card",
-  "actions.copyNumberWhen": "Copy {number} ({when})"
+  "actions.copyNumberWhen": "Copy {number} ({when})",
+  "actions.callNumberWhen": "Call {number} ({when})"
 }
