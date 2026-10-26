@@ -867,7 +867,6 @@
   "voicemail.listenTo": "Listen to the message from {who} left {when}",
   "voicemail.player": "Message from {who} left {when}",
   "voicemail.callBackWho": "Call back {who} (message left {when})",
-  "voicemail.delete": "Delete",
   "voicemail.deleteWho": "Delete the message from {who} left {when}",
   "voicemail.audioFailed": "The message could not be loaded. Try again in a moment.",
   "voicemail.actionFailed": "Voicemail did not answer. Try again in a moment.",

@@ -1,3 +1,4 @@
+import { useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { toDialTarget } from '@twake/telephony-client'
 import { describeCallError } from './components/callErrors.js'
@@ -9,8 +10,10 @@ import { usePhone } from './softphone.js'
  * Whether a number shown somewhere can be called from there: not a hidden caller, not text, not the person's own
  * conference room (its number is their own extension).
  */
-export const canCallNumber = (number: string | undefined | null, ownExtension?: string) =>
-  !!number && number !== 'anonymous' && number !== ownExtension && toDialTarget(number) !== null
+export const canCallNumber = (number: string | undefined | null, ownExtension?: string) => {
+  const target = number && number !== 'anonymous' ? toDialTarget(number) : null
+  return target !== null && target !== ownExtension
+}
 
 /**
  * The one way the app calls a number shown on a screen (Récents, messagerie, annuaire, fiche): from the browser when
@@ -23,18 +26,23 @@ export const useCallNumber = (onError: (text: string | null) => void = () => und
   const { me } = useGateway()
   const phone = usePhone()
   const navigate = useNavigate()
+  // A double click on a row is one call: the softphone lists the call only once the INVITE is out.
+  const placing = useRef(false)
   const call = async (number: string) => {
     const target = canCallNumber(number, me?.extension) ? toDialTarget(number) : null
-    if (!target) return
+    if (!target || placing.current) return
     onError(null)
     if (phone.state !== 'registered' || phone.calls.length) {
       void navigate(`/?number=${encodeURIComponent(number)}`)
       return
     }
+    placing.current = true
     try {
       await phone.call(target)
     } catch (err) {
       onError(t('dialer.failed', { reason: describeCallError(err, t) }))
+    } finally {
+      placing.current = false
     }
   }
   return { call, can: (number: string | undefined | null) => canCallNumber(number, me?.extension) }

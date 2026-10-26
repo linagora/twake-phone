@@ -24,18 +24,8 @@ export const ContactList = ({ contacts }: { contacts: Contact[] }) => {
       {contacts.map(c => {
         const n = mainNumber(c)
         return (
-          <ListItem
-            key={c.id}
-            divider
-            secondaryAction={
-              n ? (
-                <HoverActions>
-                  <CopyAction number={n.number} label={t('actions.copyNumber', { number: formatNumber(n.number) })} />
-                  <CallAction number={n.number} label={t('contact.callName', { name: c.displayName })} />
-                </HoverActions>
-              ) : null
-            }
-          >
+          // The actions follow the row in the flow (not over it): nothing of the row is covered, on a phone either.
+          <ListItem key={c.id} divider>
             <ListItemAvatar>
               <ContactAvatar contact={c} />
             </ListItemAvatar>
@@ -48,6 +38,12 @@ export const ContactList = ({ contacts }: { contacts: Contact[] }) => {
               secondary={[c.department, n ? formatNumber(n.number) : t('contact.noNumber')].filter(Boolean).join(' · ')}
             />
             {n?.type === 'extension' ? <PresenceBadge extension={n.number} /> : null}
+            {n ? (
+              <HoverActions>
+                <CopyAction number={n.number} label={t('actions.copyNumber', { number: formatNumber(n.number) })} />
+                <CallAction number={n.number} label={t('contact.callName', { name: c.displayName })} />
+              </HoverActions>
+            ) : null}
           </ListItem>
         )
       })}

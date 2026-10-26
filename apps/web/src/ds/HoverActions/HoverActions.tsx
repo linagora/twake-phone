@@ -4,7 +4,7 @@ import { styled } from '@linagora/twake-mui'
 
 /**
  * The actions of a row: with a mouse, they appear as the row is hovered or holds the focus (keyboard), in a short fade;
- * on a touch screen (no hover), they are always there. Only their opacity changes: they keep their place and stay in
+ * on a touch screen (no hover, or a finger besides the mouse), they are always there. Only their opacity changes: they keep their place and stay in
  * the tab order, so a keyboard or a screen reader reaches them as any button.
  */
 export const HoverActions = styled('span')(({ theme }) => ({
@@ -16,5 +16,7 @@ export const HoverActions = styled('span')(({ theme }) => ({
     transition: theme.transitions.create('opacity', { duration: theme.transitions.duration.shorter, easing: theme.transitions.easing.easeOut }),
     '.MuiListItem-root:hover &, .MuiListItem-root:focus-within &': { opacity: 1 }
   },
+  // A touch screen with a mouse too (a tactile laptop): a finger cannot hover, the actions stay shown.
+  '@media (any-pointer: coarse)': { opacity: 1 },
   '@media (prefers-reduced-motion: reduce)': { transition: 'none' }
 }))

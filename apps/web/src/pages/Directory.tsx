@@ -92,7 +92,7 @@ export const Directory = () => {
             <>
               <Typography component="p">{q ? t('directory.empty', { query: q }) : t('directory.nobody')}</Typography>
               {/* Nobody has it, but it is a number: it is called from here, as a phone would. */}
-              {can(q) ? (
+              {can(q) && q.replace(/\D/g, '').length >= 3 ? (
                 <Button className="u-mt-1" onClick={() => void call(q)}>
                   {t('contact.callNumber', { number: formatNumber(q) })}
                 </Button>

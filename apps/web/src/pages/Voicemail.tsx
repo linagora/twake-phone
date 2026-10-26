@@ -338,11 +338,12 @@ export const VoicemailPage = () => {
           </Typography>
           <List>
             {items.map(v => {
-              const who = whoOf(v)
+              const contact = v.from ? contacts.get(v.from) : undefined
+              // The name the voicemail server gives, else the directory's (the photo beside it is the directory's).
+              const who = !v.fromName && contact && v.from ? `${contact.displayName} (${formatNumber(v.from)})` : whoOf(v)
               const at = when.format(new Date(v.receivedAt))
               const named = { who, when: at }
               const sounding = playing?.id === v.id && !paused
-              const contact = v.from ? contacts.get(v.from) : undefined
               return (
                 <ListItem key={v.id} divider alignItems="flex-start" className="u-flex-wrap" data-testid="voicemail" data-id={v.id} data-unread={v.unread ? '1' : '0'}>
                   <ListItemAvatar>
@@ -399,6 +400,7 @@ export const VoicemailPage = () => {
                       <Button variant="outlined" onClick={() => keep(v)} aria-label={t('voicemail.keepWho', named)}>
                         {t('voicemail.keep')}
                       </Button>
+                      {v.from ? <CallAction number={v.from} label={t('voicemail.callBackWho', named)} /> : null}
                     </Stack>
                   ) : (
                     <HoverActions>

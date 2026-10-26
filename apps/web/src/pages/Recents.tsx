@@ -35,7 +35,8 @@ const recentLabel = (it: HistoryItem, t: (key: Key) => string) =>
 export const dayLabel = (iso: string, now: Date, lang: string, t: (key: Key) => string) => {
   const day = (d: Date) => new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime()
   const days = Math.round((day(now) - day(new Date(iso))) / 86_400_000)
-  return days === 0 ? t('recents.today') : days === 1 ? t('recents.yesterday') : new Intl.DateTimeFormat(lang, { dateStyle: 'full' }).format(new Date(iso))
+  // A call a few seconds ahead (clocks apart) is today too.
+  return days <= 0 ? t('recents.today') : days === 1 ? t('recents.yesterday') : new Intl.DateTimeFormat(lang, { dateStyle: 'full' }).format(new Date(iso))
 }
 
 /** The calls, newest first, in runs of the same day (the list is already in that order). */
@@ -57,7 +58,7 @@ export const Recents = () => {
   const [filter, setFilter] = useState<'all' | 'missed'>('all')
   const { showAlert } = useAlert()
   const { call, can } = useCallNumber(text => text && showAlert({ message: text, severity: 'error' }))
-  const contacts = useContactsByNumber(items?.map(it => it.remoteNumber) ?? [])
+  const contacts = useContactsByNumber((filter === 'missed' ? items?.filter(it => it.missed) : items)?.map(it => it.remoteNumber) ?? [])
   // Read when the event stream is established (at once when it already is: the ends told while it was closed were
   // not heard), each time one of the user's calls ends (the Gateway records it before telling), and after a few
   // seconds without a stream (the history reads without it). One read at a time; an outage is tried again.
@@ -133,6 +134,9 @@ export const Recents = () => {
                 const number = mine ? t('recents.conferenceMine') : hidden ? t('call.hiddenNumber') : formatNumber(it.remoteNumber)
                 const who = contact ? `${contact.displayName} (${number})` : number
                 const label = recentLabel(it, t)
+                // Step 10b: a call the operator recorded, reconciled with ours, or that reached only it (the platform out);
+                // forwarded there to the fallback number (second review 10b, n°4): missed here, taken there perhaps.
+                const extras = [it.sources?.includes('opensips') === false ? t('recents.operatorOnly') : it.sources && it.sources.length > 1 ? t('recents.reconciled') : null, it.forwardedToFallback ? t('recents.forwardedToFallback') : null].filter(Boolean)
                 const callable = !mine && can(it.remoteNumber)
                 const content = (
                   <>
@@ -152,10 +156,8 @@ export const Recents = () => {
                           <Typography data-testid="recent-label" variant="body2" component="span" color={it.missed ? 'error' : 'textSecondary'} className={it.missed ? 'u-fw-bold' : undefined}>
                             {label}
                           </Typography>
-                          {/* Step 10b: a call the operator recorded, reconciled with ours, or that reached only it (the platform out). */}
-                          {it.sources?.includes('opensips') === false ? ` · ${t('recents.operatorOnly')}` : it.sources && it.sources.length > 1 ? ` · ${t('recents.reconciled')}` : null}
                           {/* Forwarded there to the fallback number (second review 10b, n°4): missed here, taken there perhaps. */}
-                          {it.forwardedToFallback ? ` · ${t('recents.forwardedToFallback')}` : null}
+                          {extras.map(e => ` · ${e}`).join('')}
                         </>
                       }
                     />
@@ -170,7 +172,7 @@ export const Recents = () => {
                   <ListItem key={it.id} divider disablePadding={callable}>
                     {callable ? (
                       // The row calls back, as on a phone; its name says who, what and when (the visible text says it in parts).
-                      <ListItemButton onClick={() => void call(it.remoteNumber)} aria-label={t('recents.callBack', { who, what: label, when: when.format(new Date(it.startedAt)) })}>
+                      <ListItemButton onClick={() => void call(it.remoteNumber)} aria-label={t('recents.callBack', { who, what: [label, ...extras].join(', '), when: when.format(new Date(it.startedAt)) })}>
                         {content}
                       </ListItemButton>
                     ) : (

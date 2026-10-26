@@ -83,14 +83,12 @@ export const ContactPage = () => {
                 <ListItem
                   key={`${n.type}-${n.number}`}
                   divider
-                  secondaryAction={
-                    <Stack direction="row" spacing={0.5}>
-                      <CopyAction number={n.number} label={t('actions.copyNumber', { number: formatNumber(n.number) })} />
-                      <CallAction number={n.number} label={t('contact.callNumber', { number: formatNumber(n.number) })} />
-                    </Stack>
-                  }
-                >
+>
                   <ListItemText primary={<strong>{formatNumber(n.number)}</strong>} secondary={t(`contact.${n.type}`)} />
+                  <Stack direction="row" spacing={0.5}>
+                    <CopyAction number={n.number} label={t('actions.copyNumber', { number: formatNumber(n.number) })} />
+                    <CallAction number={n.number} label={t('contact.callNumber', { number: formatNumber(n.number) })} />
+                  </Stack>
                 </ListItem>
               ))}
             </List>

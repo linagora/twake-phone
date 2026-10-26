@@ -31,6 +31,10 @@ describe('the days of the Récents', () => {
     expect(dayLabel('2026-10-26T08:00:00', now, 'fr', t)).toBe('recents.today')
     expect(dayLabel('2026-10-25T23:59:00', now, 'fr', t)).toBe('recents.yesterday')
     expect(dayLabel('2026-10-20T10:00:00', now, 'fr', t)).toMatch(/20 octobre 2026/)
+    // A call a few seconds ahead of this clock is today; a time in UTC is placed in the local day.
+    expect(dayLabel('2026-10-26T15:00:30', now, 'fr', t)).toBe('recents.today')
+    const lateUtc = new Date(Date.UTC(2026, 9, 25, 23, 30))
+    expect(dayLabel(lateUtc.toISOString(), now, 'fr', t)).toBe(lateUtc.getDate() === 26 ? 'recents.today' : 'recents.yesterday')
   })
   it('keeps the order and puts the calls of a day together', () => {
     const items = [{ startedAt: 'a1' }, { startedAt: 'a2' }, { startedAt: 'b1' }]

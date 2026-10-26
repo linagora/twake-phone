@@ -4211,7 +4211,8 @@ try {
   await step('Jean calls Bob back from his Récents (the row): Bob\'s browser rings, they talk', async () => {
     const lines = await recents(jean.page, 1)
     if (!lines.some(l => l.startsWith('103: '))) throw new Error(`Jean's Récents: ${JSON.stringify(lines)}`)
-    await jean.page.getByRole('button', { name: /^Rappeler 103 \(/ }).first().click()
+    // Named by the directory when one person has 103 there (Bob Durand and Marc Petit share it in the test's).
+    await jean.page.getByRole('button', { name: /^Rappeler (Bob Durand \()?103\)? \(/ }).first().click()
     const ringing = bob.page.getByTestId('incoming-call')
     await ringing.getByText('Appel entrant de Jean Dupont (102)').waitFor({ timeout: 20_000 })
     await ringing.getByRole('button', { name: 'Répondre' }).click()
