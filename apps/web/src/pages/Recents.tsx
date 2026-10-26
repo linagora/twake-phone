@@ -170,7 +170,7 @@ export const Recents = () => {
                     </Typography>
                   </>
                 )
-                const actions = [contact ? <OpenCardAction key="card" id={contact.id} label={t('actions.openCard', { name: contact.displayName })} /> : null, !mine && !hidden ? <CopyAction key="copy" number={it.remoteNumber} label={t('actions.copyNumber', { number })} /> : null].filter(Boolean)
+                const actions = [contact ? <OpenCardAction key="card" id={contact.id} label={t('actions.openCard', { name: contact.displayName })} /> : null, !mine && !hidden ? <CopyAction key="copy" number={it.remoteNumber} label={t('actions.copyNumberWhen', { number, when: when.format(new Date(it.startedAt)) })} /> : null].filter(Boolean)
                 return (
                   <ListItem key={it.id} divider disablePadding={callable} secondaryAction={actions.length ? <HoverActions>{actions}</HoverActions> : undefined}>
                     {callable ? (

@@ -40,25 +40,14 @@ export const ContactList = ({ contacts }: { contacts: Contact[] }) => {
               <ContactAvatar contact={c} />
             </ListItemAvatar>
             <ListItemText
-              // The presence is a chip (a div): the second line is a div too.
-              slotProps={{ secondary: { component: 'div' } }}
               primary={
                 <Link component={RouterLink} to={`/directory/${encodeURIComponent(c.id)}`} underline="hover" color="textPrimary">
                   <strong>{c.displayName}</strong>
                 </Link>
               }
-              secondary={
-                <>
-                  {[c.department, n ? formatNumber(n.number) : t('contact.noNumber')].filter(Boolean).join(' · ')}
-                  {n?.type === 'extension' ? (
-                    <>
-                      {' '}
-                      <PresenceBadge extension={n.number} />
-                    </>
-                  ) : null}
-                </>
-              }
+              secondary={[c.department, n ? formatNumber(n.number) : t('contact.noNumber')].filter(Boolean).join(' · ')}
             />
+            {n?.type === 'extension' ? <PresenceBadge extension={n.number} /> : null}
           </ListItem>
         )
       })}

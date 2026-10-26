@@ -18,10 +18,13 @@ const cache = createCache({ key: 'twake', ...(nonce ? { nonce } : {}) })
 // Light by default: a `system` mode stored by an earlier version would make the app dark on a dark system.
 forgetSystemMode()
 
+// Motion follows the system setting (prefers-reduced-motion): MUI's transitions take no time when it asks for less.
+const MOTION = { motion: { reducedMotion: 'system' as const } }
+
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
     <CacheProvider value={cache}>
-      <TwakeMuiThemeProvider mode="light">
+      <TwakeMuiThemeProvider mode="light" themeOptions={MOTION}>
         <App />
       </TwakeMuiThemeProvider>
     </CacheProvider>

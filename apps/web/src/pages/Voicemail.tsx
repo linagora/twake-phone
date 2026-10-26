@@ -1,13 +1,16 @@
-import { Alert, Button, IconButton, List, ListItem, Slider, Stack, Typography } from '@linagora/twake-mui'
+import { Trash } from '@linagora/twake-icons'
+import { Alert, Avatar, Button, IconButton, List, ListItem, ListItemAvatar, Slider, Stack, SvgIcon, Tooltip, Typography } from '@linagora/twake-mui'
 import { useCallback, useEffect, useRef, useState, type RefObject } from 'react'
-import { useNavigate } from 'react-router-dom'
-import { formatNumber, toDialTarget, type Voicemail } from '@twake/telephony-client'
+import { formatNumber, type Voicemail } from '@twake/telephony-client'
 import type { TelephonyEvent } from '@twake/telephony-types'
-import { describeCallError } from '../components/callErrors.js'
+import { ContactAvatar } from '../components/ContactList.js'
+import { CallAction, CopyAction, OpenCardAction } from '../components/RowActions.js'
+import { useContactsByNumber } from '../contactsByNumber.js'
+import { Appear } from '../ds/Appear/Appear.js'
+import { HoverActions } from '../ds/HoverActions/HoverActions.js'
 import { useGateway } from '../gateway.js'
 import { useT } from '../i18n/useT.js'
 import { Reloader } from '../reload.js'
-import { usePhone } from '../softphone.js'
 import { PauseIcon, PlayIcon } from '../ds/MediaIcons/MediaIcons.js'
 
 /** Why a message has no transcription, in the person's language. */
@@ -50,6 +53,7 @@ const Player = ({ url, audio, fallbackSec, label, describedBy, onPaused }: { url
   const [time, setTime] = useState(0)
   const [duration, setDuration] = useState(fallbackSec)
   return (
+    <Appear>
     <Stack direction="row" spacing={1.5} className="u-flex-items-center u-mt-half" data-testid="voicemail-player">
       <audio
         ref={audio}
@@ -84,6 +88,7 @@ const Player = ({ url, audio, fallbackSec, label, describedBy, onPaused }: { url
         -{clock(Math.max(0, duration - time))}
       </Typography>
     </Stack>
+    </Appear>
   )
 }
 
@@ -136,9 +141,8 @@ type FocusTarget = { listen: string } | { remove: string } | { confirm: string }
 export const VoicemailPage = () => {
   const { t, lang } = useT()
   const { client, onEvent, onConnected } = useGateway()
-  const phone = usePhone()
-  const navigate = useNavigate()
   const [items, setItems] = useState<Voicemail[] | null>(null)
+  const contacts = useContactsByNumber(items?.flatMap(v => (v.from ? [v.from] : [])) ?? [])
   const [error, setError] = useState<'load' | 'unavailable' | null>(null)
   /** What an action said (a recording that would not load, the server down a moment). */
   const [notice, setNotice] = useState<string | null>(null)
@@ -302,22 +306,6 @@ export const VoicemailPage = () => {
       }
       say(t('voicemail.deleted', { who: whoOf(v) }))
     }, t('voicemail.actionFailed'))
-  // Called back from the browser when its softphone can (the call panel takes over), else from the dialer, filled in.
-  const callBack = async (v: Voicemail) => {
-    const target = v.from ? toDialTarget(v.from) : null
-    if (!target) return
-    setNotice(null)
-    if (phone.state !== 'registered' || phone.calls.length) {
-      void navigate(`/?number=${encodeURIComponent(v.from!)}`)
-      return
-    }
-    try {
-      await phone.call(target)
-    } catch (err) {
-      setNotice(t('dialer.failed', { reason: describeCallError(err, t) }))
-    }
-  }
-
   const heading = (
     <Typography variant="h4" component="h1" gutterBottom ref={title} tabIndex={-1}>
       {t('voicemail.title')}
@@ -352,76 +340,83 @@ export const VoicemailPage = () => {
               const at = when.format(new Date(v.receivedAt))
               const named = { who, when: at }
               const sounding = playing?.id === v.id && !paused
+              const contact = v.from ? contacts.get(v.from) : undefined
               return (
                 <ListItem key={v.id} divider alignItems="flex-start" className="u-flex-wrap" data-testid="voicemail" data-id={v.id} data-unread={v.unread ? '1' : '0'}>
-                  <IconButton
-                    color="primary"
-                    className="u-mr-1"
-                    ref={el => {
-                      if (el) listenButtons.current.set(v.id, el)
-                      else listenButtons.current.delete(v.id)
-                    }}
-                    onClick={() => (playing?.id === v.id ? toggle() : void listen(v))}
-                    aria-label={t(sounding ? 'voicemail.pauseWho' : 'voicemail.listenTo', named)}
-                  >
-                    {sounding ? <PauseIcon /> : <PlayIcon />}
-                  </IconButton>
+                  <ListItemAvatar>
+                    {contact ? <ContactAvatar contact={contact} /> : <Avatar aria-hidden="true">{v.fromName ? v.fromName.slice(0, 1).toUpperCase() : '?'}</Avatar>}
+                  </ListItemAvatar>
                   <div className="u-flex-grow-1">
-                    <strong>{who}</strong>
-                    {v.unread ? (
-                      <Typography component="span" color="error" className="u-fw-bold">
-                        {' '}
-                        · {t('voicemail.new')}
-                      </Typography>
-                    ) : null}
-                    <br />
-                    <Typography variant="body2" color="textSecondary" component="span" data-testid="voicemail-duration">
-                      <time dateTime={v.receivedAt}>{at}</time> · <span className="u-visuallyhidden">{t('voicemail.durationLabel', { duration: clock(v.durationSec) })}</span>
-                      <span aria-hidden="true">{clock(v.durationSec)}</span>
-                    </Typography>
+                    <Stack direction="row" spacing={1} className="u-flex-items-center">
+                      <IconButton
+                        color="primary"
+                        size="small"
+                        ref={el => {
+                          if (el) listenButtons.current.set(v.id, el)
+                          else listenButtons.current.delete(v.id)
+                        }}
+                        onClick={() => (playing?.id === v.id ? toggle() : void listen(v))}
+                        aria-label={t(sounding ? 'voicemail.pauseWho' : 'voicemail.listenTo', named)}
+                      >
+                        {sounding ? <PauseIcon /> : <PlayIcon />}
+                      </IconButton>
+                      <span>
+                        <strong>{who}</strong>
+                        {v.unread ? (
+                          <Typography component="span" color="error" className="u-fw-bold">
+                            {' '}
+                            · {t('voicemail.new')}
+                          </Typography>
+                        ) : null}
+                        <br />
+                        <Typography variant="body2" color="textSecondary" component="span" data-testid="voicemail-duration">
+                          <time dateTime={v.receivedAt}>{at}</time> · <span className="u-visuallyhidden">{t('voicemail.durationLabel', { duration: clock(v.durationSec) })}</span>
+                          <span aria-hidden="true">{clock(v.durationSec)}</span>
+                        </Typography>
+                      </span>
+                    </Stack>
                     {v.transcript ? <Transcript id={`transcript-${v.id}`} transcript={v.transcript} /> : null}
                     {playing?.id === v.id ? (
                       <Player url={playing.url} audio={audio} fallbackSec={v.durationSec} label={t('voicemail.player', named)} {...(v.transcript ? { describedBy: `transcript-${v.id}` } : {})} onPaused={setPaused} />
                     ) : null}
                   </div>
-                  <Stack direction="row" spacing={1} useFlexGap className="u-flex-wrap">
-                    {v.from && toDialTarget(v.from) ? (
-                      <Button onClick={() => void callBack(v)} aria-label={t('voicemail.callBackWho', named)}>
-                        {t('voicemail.callBack')}
-                      </Button>
-                    ) : null}
-                    {confirming === v.id ? (
-                      <Stack direction="row" spacing={1} useFlexGap role="group" aria-label={t('voicemail.confirmDeleteWho', named)}>
-                        <Button
-                          variant="outlined"
-                          color="error"
-                          ref={el => {
-                            if (el) confirmButtons.current.set(v.id, el)
-                            else confirmButtons.current.delete(v.id)
-                          }}
-                          onClick={() => void remove(v)}
-                          aria-label={t('voicemail.confirmDelete', named)}
-                        >
-                          {t('voicemail.confirmDeleteShort')}
-                        </Button>
-                        <Button variant="outlined" onClick={() => keep(v)} aria-label={t('voicemail.keepWho', named)}>
-                          {t('voicemail.keep')}
-                        </Button>
-                      </Stack>
-                    ) : (
+                  {confirming === v.id ? (
+                    <Stack direction="row" spacing={1} useFlexGap role="group" aria-label={t('voicemail.confirmDeleteWho', named)} className="u-flex-wrap">
                       <Button
                         variant="outlined"
+                        color="error"
                         ref={el => {
-                          if (el) removeButtons.current.set(v.id, el)
-                          else removeButtons.current.delete(v.id)
+                          if (el) confirmButtons.current.set(v.id, el)
+                          else confirmButtons.current.delete(v.id)
                         }}
-                        onClick={() => askRemove(v)}
-                        aria-label={t('voicemail.deleteWho', named)}
+                        onClick={() => void remove(v)}
+                        aria-label={t('voicemail.confirmDelete', named)}
                       >
-                        {t('voicemail.delete')}
+                        {t('voicemail.confirmDeleteShort')}
                       </Button>
-                    )}
-                  </Stack>
+                      <Button variant="outlined" onClick={() => keep(v)} aria-label={t('voicemail.keepWho', named)}>
+                        {t('voicemail.keep')}
+                      </Button>
+                    </Stack>
+                  ) : (
+                    <HoverActions>
+                      {contact ? <OpenCardAction id={contact.id} label={t('actions.openCard', { name: contact.displayName })} /> : null}
+                      {v.from ? <CopyAction number={v.from} label={t('actions.copyNumberWhen', { number: formatNumber(v.from), when: at })} /> : null}
+                      <Tooltip title={t('voicemail.deleteWho', named)}>
+                        <IconButton
+                          ref={el => {
+                            if (el) removeButtons.current.set(v.id, el)
+                            else removeButtons.current.delete(v.id)
+                          }}
+                          onClick={() => askRemove(v)}
+                          aria-label={t('voicemail.deleteWho', named)}
+                        >
+                          <SvgIcon component={Trash} inheritViewBox />
+                        </IconButton>
+                      </Tooltip>
+                      {v.from ? <CallAction number={v.from} label={t('voicemail.callBackWho', named)} /> : null}
+                    </HoverActions>
+                  )}
                 </ListItem>
               )
             })}

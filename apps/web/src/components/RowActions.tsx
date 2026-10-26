@@ -1,12 +1,12 @@
 import { Copy, InfoOutlined, Telephone } from '@linagora/twake-icons'
 import { IconButton, SvgIcon, Tooltip, useAlert } from '@linagora/twake-mui'
-import type { ComponentProps, ElementType } from 'react'
+import type { ElementType } from 'react'
 import { Link as RouterLink } from 'react-router-dom'
 import { formatNumber } from '@twake/telephony-client'
 import { useT } from '../i18n/useT.js'
 import { useCallNumber } from '../useCallNumber.js'
 
-type IconProps = { label: string; icon: ComponentProps<typeof SvgIcon>['component'] }
+type IconProps = { label: string; icon: typeof Telephone }
 
 /** An action of a row: an icon, named by its label (aria-label and tooltip, the same text). */
 const RowAction = ({ label, icon, ...rest }: IconProps & ({ onClick: () => void } | { to: string })) => (

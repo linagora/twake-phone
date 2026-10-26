@@ -1090,5 +1090,17 @@
   "supervision.action.purge": "Enregistrement effacé (durée de conservation)",
   "supervision.action.erase": "Enregistrement effacé (demande de la personne)",
   "supervision.errNotice": "L'annonce de l'enregistrement est introuvable sur le serveur téléphonique : rien n'est enregistré.",
-  "supervision.stale": "La liste n'a pas pu être relue : ce qui est affiché peut ne plus être à jour."
+  "supervision.stale": "La liste n'a pas pu être relue : ce qui est affiché peut ne plus être à jour.",
+  "recents.today": "Aujourd'hui",
+  "recents.yesterday": "Hier",
+  "recents.filter": "Afficher",
+  "recents.all": "Tous",
+  "recents.missedFilter": "Manqués",
+  "recents.noMissed": "Aucun appel manqué.",
+  "recents.callBack": "Rappeler {who} ({what}, {when})",
+  "actions.copyNumber": "Copier le {number}",
+  "actions.copied": "{number} copié.",
+  "actions.copyFailed": "Le navigateur n'a pas permis de copier le numéro.",
+  "actions.openCard": "Fiche de {name}",
+  "actions.copyNumberWhen": "Copier le {number} ({when})"
 }

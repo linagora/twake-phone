@@ -1090,5 +1090,17 @@
   "supervision.action.purge": "Recording erased (retention period)",
   "supervision.action.erase": "Recording erased (the person asked)",
   "supervision.errNotice": "The recording notice is not on the telephony server: nothing is recorded.",
-  "supervision.stale": "The list could not be read again: what is shown may be out of date."
+  "supervision.stale": "The list could not be read again: what is shown may be out of date.",
+  "recents.today": "Today",
+  "recents.yesterday": "Yesterday",
+  "recents.filter": "Show",
+  "recents.all": "All",
+  "recents.missedFilter": "Missed",
+  "recents.noMissed": "No missed calls.",
+  "recents.callBack": "Call back {who} ({what}, {when})",
+  "actions.copyNumber": "Copy {number}",
+  "actions.copied": "{number} copied.",
+  "actions.copyFailed": "The browser did not allow copying the number.",
+  "actions.openCard": "{name}'s card",
+  "actions.copyNumberWhen": "Copy {number} ({when})"
 }

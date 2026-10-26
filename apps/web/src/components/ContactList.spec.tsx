@@ -4,10 +4,13 @@ import { createRoot } from 'react-dom/client'
 import { MemoryRouter } from 'react-router-dom'
 import { describe, expect, it, vi } from 'vitest'
 import type { Contact } from '@twake/telephony-client'
+import { AlertProvider } from '@linagora/twake-mui'
 import { ContactList } from './ContactList.js'
 
 vi.mock('../i18n/useT.js', () => ({ useT: () => ({ lang: 'fr', t: (key: string) => key }) }))
 vi.mock('../presence.js', () => ({ PresenceBadge: () => null }))
+vi.mock('../gateway.js', () => ({ useGateway: () => ({ me: { extension: '101' } }) }))
+vi.mock('../softphone.js', () => ({ usePhone: () => ({ state: 'off', calls: [] }) }))
 
 describe('ContactList', () => {
   it('shows the directory photo as a decorative image, and the initials without one', () => {
@@ -19,7 +22,7 @@ describe('ContactList', () => {
     ]
     const div = document.createElement('div')
     const root = createRoot(div)
-    act(() => root.render(<MemoryRouter><ContactList contacts={contacts} /></MemoryRouter>))
+    act(() => root.render(<MemoryRouter><AlertProvider><ContactList contacts={contacts} /></AlertProvider></MemoryRouter>))
     const imgs = div.querySelectorAll('img')
     expect(imgs).toHaveLength(1)
     expect(imgs[0]?.getAttribute('src')).toBe(photo)
