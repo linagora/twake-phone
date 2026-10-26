@@ -3,8 +3,8 @@ import { readdir, readFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import pg from 'pg'
 import { EMPTY_OUTBOUND, outboundVersion, staleOutbound } from '../outbound.js'
-import { ALERT_DEDUP_MS, alertKey, clampLimit, type AlertQuery, type AlertRecord, type StoredAlert, type ConferenceDecision, type VisioPerson, type VisioRecord, type VisioStatus, type ConferenceRecord, type DidRecord, type SiteRecord, type OutboundHand, type OutboundRecord, type OutboundRules, type HistoryEntry, type HistoryNearQuery, type HistoryPage, type HistoryQuery, type OperatorCdrOutcome, type OperatorCdrRecord, type OperatorCdrStats, type MappingSource, type ErasedCallsKept, type ProviderRecord, type PushSaveResult, type PushSubscriptionRecord, type Store, type TrunkRecord, type MappingChange, type UserMapping, type UserPresenceRecord, type VapidKeysRecord, type ClaimedDelivery, type WebhookAttemptResult, type WebhookClaimCaps, type WebhookClaimTime, allocateClaims, claimOrder, type WebhookDeliveryQuery, type WebhookLease, type WebhookSendQuota, type WebhookDeliveryRecord, type WebhookHealth, type WebhookQueueOptions, type WebhookStateChange, type WebhookStateEvent, type WebhookSubscriptionRecord, WEBHOOK_STATE_ROLE , type FencedLease, type NewTranscript, type TranscriptChange, type TranscriptLane, holderIn, holderOut, type TranscriptMatch, type TranscriptNotice, type TranscriptRecord } from './types.js'
-import type { OperatorCdr, WebhookEventType } from '@twake/telephony-types'
+import { ALERT_DEDUP_MS, RecordingUnderWay, alertKey, clampLimit, type RecordingRecord, type AlertQuery, type AlertRecord, type StoredAlert, type ConferenceDecision, type VisioPerson, type VisioRecord, type VisioStatus, type ConferenceRecord, type DidRecord, type SiteRecord, type OutboundHand, type OutboundRecord, type OutboundRules, type HistoryEntry, type HistoryNearQuery, type HistoryPage, type HistoryQuery, type OperatorCdrOutcome, type OperatorCdrRecord, type OperatorCdrStats, type MappingSource, type ErasedCallsKept, type ProviderRecord, type PushSaveResult, type PushSubscriptionRecord, type Store, type TrunkRecord, type MappingChange, type UserMapping, type UserPresenceRecord, type VapidKeysRecord, type ClaimedDelivery, type WebhookAttemptResult, type WebhookClaimCaps, type WebhookClaimTime, allocateClaims, claimOrder, type WebhookDeliveryQuery, type WebhookLease, type WebhookSendQuota, type WebhookDeliveryRecord, type WebhookHealth, type WebhookQueueOptions, type WebhookStateChange, type WebhookStateEvent, type WebhookSubscriptionRecord, WEBHOOK_STATE_ROLE , type FencedLease, type NewTranscript, type TranscriptChange, type TranscriptLane, holderIn, holderOut, type TranscriptMatch, type TranscriptNotice, type TranscriptRecord, type CallFlowRecord } from './types.js'
+import type { OperatorCdr, Recording, SupervisionLogEntry, WebhookEventType } from '@twake/telephony-types'
 
 const MIGRATIONS = fileURLToPath(new URL('../../migrations/', import.meta.url))
 
@@ -135,6 +135,33 @@ const transcriptOf = (r: TranscriptRow): TranscriptRecord => ({
   ...(r.notice_edit ? { noticeEdit: r.notice_edit } : {}),
   createdAt: iso(r.created_at),
   updatedAt: iso(r.updated_at)
+})
+interface RecordingRow {
+  id: string
+  tenant_id: string
+  extension: string
+  user_id: string | null
+  display_name: string | null
+  call_id: string
+  started_by: string
+  started_at: Timestamp
+  ended_at: Timestamp | null
+  state: Recording['state']
+  size_bytes: string | null
+}
+const RECORDING_COLUMNS = 'id, tenant_id, extension, user_id, display_name, call_id, started_by, started_at, ended_at, state, size_bytes'
+const recordingOf = (r: RecordingRow): RecordingRecord => ({
+  id: r.id,
+  tenantId: r.tenant_id,
+  extension: r.extension,
+  ...(r.user_id ? { userId: r.user_id } : {}),
+  ...(r.display_name ? { displayName: r.display_name } : {}),
+  callId: r.call_id,
+  startedBy: r.started_by,
+  startedAt: iso(r.started_at),
+  ...(r.ended_at ? { endedAt: iso(r.ended_at) } : {}),
+  state: r.state,
+  ...(r.size_bytes !== null ? { sizeBytes: Number(r.size_bytes) } : {})
 })
 /** The columns a change of a transcription may set (updateTranscript). */
 const TRANSCRIPT_COLUMNS: Record<keyof TranscriptChange, string> = { status: 'status', reason: 'reason', text: 'text', attempts: 'attempts', nextAt: 'next_at', notice: 'notice', noticeAttempts: 'notice_attempts', noticeNextAt: 'notice_next_at', noticeRoom: 'notice_room', noticeEvent: 'notice_event', noticeEdit: 'notice_edit' }
@@ -1128,6 +1155,37 @@ export class PgStore implements Store {
     return (r.rowCount ?? 0) > 0
   }
 
+  async listCallFlows(tenantId: string): Promise<CallFlowRecord[]> {
+    const { rows } = await this.pool.query<{ number: string; name: string; kind: CallFlowRecord['kind']; members: string[]; ring_sec: number | null; wait_sec: number | null; choices: Record<string, string>; greeting: string | null }>(
+      'SELECT number, name, kind, members, ring_sec, wait_sec, choices, greeting FROM call_flow_configs WHERE tenant_id = $1 ORDER BY number COLLATE "C"',
+      [tenantId]
+    )
+    return rows.map(r => ({
+      tenantId,
+      number: r.number,
+      name: r.name,
+      kind: r.kind,
+      members: r.members,
+      ...(r.ring_sec !== null ? { ringSec: r.ring_sec } : {}),
+      ...(r.wait_sec !== null ? { waitSec: r.wait_sec } : {}),
+      choices: r.choices,
+      ...(r.greeting !== null ? { greeting: r.greeting } : {})
+    }))
+  }
+
+  async upsertCallFlow(f: CallFlowRecord) {
+    await this.pool.query(
+      `INSERT INTO call_flow_configs (tenant_id, number, kind, name, members, ring_sec, wait_sec, choices, greeting) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+       ON CONFLICT (tenant_id, number) DO UPDATE SET kind = EXCLUDED.kind, name = EXCLUDED.name, members = EXCLUDED.members, ring_sec = EXCLUDED.ring_sec, wait_sec = EXCLUDED.wait_sec, choices = EXCLUDED.choices, greeting = EXCLUDED.greeting`,
+      [f.tenantId, f.number, f.kind, f.name, f.members, f.ringSec ?? null, f.waitSec ?? null, JSON.stringify(f.choices), f.greeting ?? null]
+    )
+  }
+
+  async deleteCallFlow(tenantId: string, number: string) {
+    const r = await this.pool.query('DELETE FROM call_flow_configs WHERE tenant_id = $1 AND number = $2', [tenantId, number])
+    return (r.rowCount ?? 0) > 0
+  }
+
   async getOutbound(tenantId: string): Promise<OutboundRecord | null> {
     const { rows } = await this.pool.query<OutboundRow>('SELECT tenant_id, policy, profiles, assignments FROM outbound_policies WHERE tenant_id = $1', [tenantId])
     const r = rows[0]
@@ -1732,6 +1790,91 @@ export class PgStore implements Store {
       [tenantId, prefix]
     )
     return rows
+  }
+
+  async addRecording(r: RecordingRecord) {
+    try {
+      await this.pool.query(
+        'INSERT INTO recordings (id, tenant_id, extension, user_id, display_name, call_id, started_by, started_at, ended_at, state, size_bytes) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)',
+        [r.id, r.tenantId, r.extension, r.userId ?? null, r.displayName ?? null, r.callId, r.startedBy, r.startedAt, r.endedAt ?? null, r.state, r.sizeBytes ?? null]
+      )
+    } catch (err) {
+      // The unique index of the recording under way of a call, and nothing else: another failure is not "already recorded".
+      if ((err as { code?: string }).code === '23505' && (err as { constraint?: string }).constraint === 'recordings_one_per_call') throw new RecordingUnderWay()
+      throw err
+    }
+  }
+
+  async getRecording(tenantId: string, id: string) {
+    const { rows } = await this.pool.query<RecordingRow>(`SELECT ${RECORDING_COLUMNS} FROM recordings WHERE tenant_id = $1 AND id = $2`, [tenantId, id])
+    return rows[0] ? recordingOf(rows[0]) : null
+  }
+
+  async getRecordingUnderWay(tenantId: string, callId: string) {
+    const { rows } = await this.pool.query<RecordingRow>(`SELECT ${RECORDING_COLUMNS} FROM recordings WHERE tenant_id = $1 AND call_id = $2 AND state = 'recording'`, [tenantId, callId])
+    return rows[0] ? recordingOf(rows[0]) : null
+  }
+
+  async listRecordingsUnderWay(tenantId?: string) {
+    const { rows } = await this.pool.query<RecordingRow>(`SELECT ${RECORDING_COLUMNS} FROM recordings WHERE ($1::text IS NULL OR tenant_id = $1) AND state = 'recording' ORDER BY started_at, id`, [tenantId ?? null])
+    return rows.map(recordingOf)
+  }
+
+  async listRecordings(tenantId: string, limit?: number) {
+    const { rows } = await this.pool.query<RecordingRow>(`SELECT ${RECORDING_COLUMNS} FROM recordings WHERE tenant_id = $1 ORDER BY started_at DESC, id DESC LIMIT $2`, [tenantId, clampLimit(limit)])
+    return rows.map(recordingOf)
+  }
+
+  async updateRecording(tenantId: string, id: string, from: Recording['state'][], change: Partial<Pick<RecordingRecord, 'state' | 'endedAt' | 'sizeBytes'>> & { forget?: boolean }) {
+    try {
+      const { rows } = await this.pool.query<RecordingRow>(
+        `UPDATE recordings SET state = coalesce($4, state), ended_at = coalesce($5, ended_at), size_bytes = coalesce($6, size_bytes),
+           user_id = CASE WHEN $7 THEN NULL ELSE user_id END, display_name = CASE WHEN $7 THEN NULL ELSE display_name END
+         WHERE tenant_id = $1 AND id = $2 AND state = ANY($3::text[]) RETURNING ${RECORDING_COLUMNS}`,
+        [tenantId, id, from, change.state ?? null, change.endedAt ?? null, change.sizeBytes ?? null, change.forget === true]
+      )
+      return rows[0] ? recordingOf(rows[0]) : null
+    } catch (err) {
+      if ((err as { code?: string }).code === '23505' && (err as { constraint?: string }).constraint === 'recordings_one_per_call') throw new RecordingUnderWay()
+      throw err
+    }
+  }
+
+  async listRecordingsToErase(before: string | null, limit: number, tenantId?: string) {
+    const { rows } = await this.pool.query<RecordingRow>(
+      `SELECT ${RECORDING_COLUMNS} FROM recordings
+       WHERE ($3::text IS NULL OR tenant_id = $3) AND (state = 'erasing' OR ($1::timestamptz IS NOT NULL AND state IN ('ready', 'failed') AND started_at < $1))
+       ORDER BY started_at, id LIMIT $2`,
+      [before, Math.max(limit, 0), tenantId ?? null]
+    )
+    return rows.map(recordingOf)
+  }
+
+  async eraseRecordingsOf(tenantId: string, userId: string) {
+    const r = await this.pool.query("UPDATE recordings SET state = 'erasing' WHERE tenant_id = $1 AND user_id = $2 AND state IN ('ready', 'failed')", [tenantId, userId])
+    return r.rowCount ?? 0
+  }
+
+  async deletePurgedRecordings(before: string) {
+    const r = await this.pool.query("DELETE FROM recordings WHERE state = 'purged' AND started_at < $1", [before])
+    return r.rowCount ?? 0
+  }
+
+  async addSupervisionLog(tenantId: string, e: SupervisionLogEntry) {
+    await this.pool.query('INSERT INTO supervision_log (tenant_id, at, actor, action, extension, recording_id) VALUES ($1, $2, $3, $4, $5, $6)', [tenantId, e.at, e.actor, e.action, e.extension ?? null, e.recordingId ?? null])
+  }
+
+  async listSupervisionLog(tenantId: string, limit?: number) {
+    const { rows } = await this.pool.query<{ at: Timestamp; actor: string; action: SupervisionLogEntry['action']; extension: string | null; recording_id: string | null }>(
+      'SELECT at, actor, action, extension, recording_id FROM supervision_log WHERE tenant_id = $1 ORDER BY at DESC, id DESC LIMIT $2',
+      [tenantId, clampLimit(limit)]
+    )
+    return rows.map(r => ({ at: iso(r.at), actor: r.actor, action: r.action, ...(r.extension ? { extension: r.extension } : {}), ...(r.recording_id ? { recordingId: r.recording_id } : {}) }))
+  }
+
+  async purgeSupervisionLog(before: string) {
+    const r = await this.pool.query('DELETE FROM supervision_log WHERE at < $1', [before])
+    return r.rowCount ?? 0
   }
 
   async clock() {

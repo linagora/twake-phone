@@ -11,6 +11,7 @@ L'image d'Asterisk de Wazo (`wazoplatform/asterisk`) n'a aucun fichier de son : 
 | `vm-intro.wav` | « Laissez votre message après le bip, puis raccrochez. » |
 | `beep.wav` | le bip : 1 kHz, 250 ms |
 | `vm-msgsaved.wav`, `vm-goodbye.wav` | « Votre message est enregistré. », « Au revoir. » |
+| `twake-menu.wav` | le message d'un standard vocal (étape 11c-2, ADR 0028) quand l'administrateur n'en nomme pas : un carillon de deux notes (660 et 880 Hz) répété six fois, 5,2 s, sans voix |
 | `vm-mailboxfull.wav` | « La messagerie de votre correspondant est pleine, vous ne pouvez pas laisser de message. » (une boîte à `VOICEMAIL_MAX_MESSAGES` messages) |
 
 Faites par synthèse vocale : mespeak 2.0.2 (eSpeak, voix `fr`, vitesse 155, hauteur 45), puis ramenées au format d'Asterisk (WAV 8 kHz, 16 bits, mono : filtre passe-bas à 3,4 kHz, rééchantillonnage, silences des bords réduits à 80 ms) ; le bip est une sinusoïde à 1 kHz avec des rampes de 10 ms. Ce ne sont que des annonces de test : une plateforme utilise les sons de Wazo, ou les siens.

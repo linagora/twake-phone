@@ -7,6 +7,7 @@ export const ADMIN_SECTIONS: readonly (readonly [string, Key])[] = [
   ['numbers', 'admin.nav.numbers'],
   ['sites', 'admin.nav.sites'],
   ['groups', 'admin.nav.groups'],
+  ['flows', 'admin.nav.flows'],
   ['rights', 'admin.nav.rights'],
   ['limits', 'admin.nav.limits'],
   ['alerts', 'admin.nav.alerts'],

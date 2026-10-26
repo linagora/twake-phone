@@ -192,8 +192,8 @@ modparam("dialog", "options_ping_interval", ${CALL_PING_SEC})
 # The calls to the public network in progress (step 6b, route[outbound_count]): per caller's extension, and all of them
 # (one organisation per OpenSIPS). An emergency call is in neither, but in trunk_emergency: how a restart knows it.
 # The calls to the access number of Meet's rooms in progress (step 8, route[meet_call]): per caller, and all of them.
-modparam("dialog", "profiles_with_value", "trunk_caller;meet_caller;vm_caller")
-modparam("dialog", "profiles_no_value", "trunk_out;trunk_emergency;meet_all;vm_all;vm_hidden")
+modparam("dialog", "profiles_with_value", "trunk_caller;meet_caller;vm_caller;flow_caller")
+modparam("dialog", "profiles_no_value", "trunk_out;trunk_emergency;meet_all;vm_all;vm_hidden;flow_all")
 loadmodule "rtpengine.so"
 modparam("rtpengine", "rtpengine_sock", "${RTPENGINE_SOCK}")
 
@@ -226,6 +226,7 @@ modparam("cfgutils", "shvset", "no5_until=i:0")
 # Whether the phone access of Meet's rooms is on (step 8, ADR 0018): MEET_SIP set (entrypoint.sh); and its access
 # number. The Gateway reads both through the MI (shv_get) and says at its start when it has another view of them.
 modparam("cfgutils", "shvset", "meet_on=i:${MEET_ON}")
+modparam("cfgutils", "shvset", "rtp_directions=i:${RTPENGINE_DIRECTIONS}")
 modparam("cfgutils", "shvset", "meet_number=s:${MEET_NUMBER}")
 # The longest a call with LiveKit SIP lasts (MEET_MAX_CALL_SEC): for the calls to come once changed (MI shv_set; the e2e
 # shortens it a moment).
@@ -247,6 +248,13 @@ modparam("cfgutils", "shvset", "wazo_lines_mute_until=i:0")
 # `wazo_lines` (the extensions that have a line) unreadable (the Gateway has not made it, the database cannot say): no
 # line for 30 s, as for the tables of the steps before.
 modparam("cfgutils", "shvset", "wazo_lines_nodb_until=i:0")
+# wazo-lines: begin
+# The calls to the call flows in progress (step 11c-2, route[rules_step]): per caller, and all of them (profiles flow_caller and
+# flow_all, declared with the others above: a second profiles_* line replaces the first); the bounds
+# FLOW_CALLS_PER_CALLER and FLOW_CALLS_ALL, changeable by MI shv_set for the calls to come.
+modparam("cfgutils", "shvset", "flow_per_caller=i:${FLOW_CALLS_PER_CALLER}")
+modparam("cfgutils", "shvset", "flow_calls_all=i:${FLOW_CALLS_ALL}")
+# wazo-lines: end
 # The bounds of the calls to the mailboxes (route[voicemail]), for the calls to come once changed (MI shv_set; the e2e
 # lowers the caps a moment): VOICEMAIL_MAX_CALL_SEC, which the Gateway reads (shv_get) and compares with the longest
 # message of its voicemail server at its start; VOICEMAIL_CALLS_PER_CALLER,
@@ -347,6 +355,19 @@ route[rtp_flags] {
 		$var(rtp_flags) = "ICE=remove RTP/AVP rtcp-mux-demux DTLS=off SDES-off replace-origin replace-session-connection codec-strip-all codec-except-G722 codec-except-PCMA codec-except-PCMU codec-except-telephone-event";
 	else if ($dlg_val(trunk) != NULL || $dlg_val(meet) != NULL)
 		$var(rtp_flags) = "ICE=force RTP/SAVPF rtcp-mux-require generate-mid SDES-off replace-origin replace-session-connection";
+	# With two rtpengine interfaces (RTPENGINE_INTERFACE_INTERNAL and _EXTERNAL, ADR 0030) an offer ($param(2): the kind
+	# of the side it comes from) says which one faces each side: the operator is the external network, everything else
+	# (browsers, LiveKit SIP, Wazo) the internal one. Only the offer says it, rtpengine remembers it for the answer and
+	# the later offers. With one interface (rtp_directions 0) nothing is added.
+	if ($param(2) != NULL && $shv(rtp_directions) == 1) {
+		$var(from_if) = "internal";
+		if ($param(2) == 1)
+			$var(from_if) = "external";
+		$var(to_if) = "internal";
+		if ($param(1) == 1)
+			$var(to_if) = "external";
+		$var(rtp_flags) = $var(rtp_flags) + " in-iface=" + $var(from_if) + " out-iface=" + $var(to_if);
+	}
 }
 
 # The kind of the side the request in hand goes to ($var(to_kind)) and of the side it comes from ($var(from_kind)):
@@ -398,7 +419,7 @@ route[rtp_offer] {
 	route(sides);
 	$(avp(offer_from)[*]) = NULL;
 	$avp(offer_from) = $var(from_kind);
-	route(rtp_flags, $var(to_kind));
+	route(rtp_flags, $var(to_kind), $var(from_kind));
 	# LiveKit SIP draws the session id and version of its o= line as any 64-bit number (step 8), half of them past the
 	# 2^63 - 1 that JSEP (RFC 8829) allows: Firefox refuses such an offer (488). rtpengine keeps them as they are; it is
 	# given them as "1" and their last 17 digits instead (below 2^63, the same in each offer of the call, a version that
@@ -453,7 +474,12 @@ route[rtp_late_offer] {
 		$var(offer_to) = 1;
 	else if ($avp(late_offer) == "meet")
 		$var(offer_to) = 2;
-	route(rtp_flags, $var(offer_to));
+	# The 2xx that carries this offer comes from the other side than the INVITE's sender: the operator's when the
+	# call has one and the offer is not going to it.
+	$var(offer_origin) = 0;
+	if ($dlg_val(trunk) != NULL && $var(offer_to) != 1)
+		$var(offer_origin) = 1;
+	route(rtp_flags, $var(offer_to), $var(offer_origin));
 	if (rtpengine_offer("$var(rtp_flags)")) {
 		$avp(rtp_on) = 1;
 		$dlg_val(late_answer) = "1";
@@ -650,6 +676,13 @@ route {
 		# A browser's Contact names a ".invalid" host (RFC 7118): point it at the WebSocket it came from, so the
 		# other side's in-dialog requests reach it on that same connection.
 		fix_nated_contact();
+		# A re-INVITE records the route again: an operator (Cirpack) builds its route set from the 2xx of a re-INVITE,
+		# which the phone answers with the Record-Route of the request alone; without our entries its ACK and BYE come
+		# with no Route to us and a Contact that is the phone's own (404). After fix_route_dialog, so that both sockets
+		# of the route (r2) are known. Only from the side of the caller: record_route writes the From tag of the request
+		# as ftag, and the direction of every later request (is_direction) reads it; a re-INVITE of the callee would turn it.
+		if (is_method("INVITE") && is_direction("downstream"))
+			record_route();
 		if (is_method("INVITE|UPDATE") && has_body_part("application/sdp")) {
 			route(rtp_offer);
 			t_on_reply("rtp");
@@ -843,6 +876,14 @@ route {
 				}
 			}
 		}
+		# An unregistration (a Contact with expires=0, Expires: 0, Contact: *) is made here at once, never waiting for Wazo
+		# (step 11c-2): the window that leaves closes its connection a moment after (1.5 s in the softphone), and a last
+		# window whose registration waited for Wazo's answer (REGISTER, challenge, REGISTER, 200: slow when Asterisk is busy)
+		# stayed in `location` when the answer came too late, a window gone that calls kept ringing (477) until its
+		# registration expired. Wazo keeps its contact for the extension until it expires (outgoing_expires): a call it
+		# places there finds no window and fails at once, and the next window's registration is absorbed as a refresh.
+		if ($var(wl_line) == 1 && ($hdr(Contact) == "*" || $hdr(Contact) =~ ";expires=0($|[;,])" || ($hdr(Expires) == "0" && !($hdr(Contact) =~ ";expires=[1-9]"))))
+			$var(wl_line) = 0;
 		if ($var(wl_line) == 1) {
 			consume_credentials();
 			$(avp(wl_pass)[*]) = NULL;
@@ -934,9 +975,11 @@ route {
 	remove_hf("Twake-Room");
 	remove_hf("Twake-Join");
 	remove_hf("Twake-Conference");
-	# Which mailbox takes a call, and with which greeting (step 11a, route[voicemail]): this script says it, never a phone.
+	# Which mailbox takes a call, and with which greeting (step 11a, route[voicemail]), and which call flow (step 11c-2,
+	# route[rules_step]): this script says it, never a phone.
 	remove_hf("X-Twake-Mailbox");
 	remove_hf("X-Twake-Voicemail");
+	remove_hf("X-Twake-Flow");
 
 	if ($rU == NULL) {
 		send_reply(484, "Address Incomplete");
@@ -1637,6 +1680,15 @@ route[trunk_out_send] {
 	# for each branch (branch_route[trunk_out]).
 	route(trunk_headers);
 	route(trunk_contact, $avp(t_contact));
+	# The Vias of the phone are kept apart (in the dialog) before branch_route[trunk_out] takes them off the request,
+	# and put back by onreply_route in the replies, which the phone matches by branch.
+	$var(i) = 0;
+	$var(vias) = "";
+	while ($var(i) < $hdrcnt(Via)) {
+		$var(vias) = $var(vias) + "Via: " + $(hdr(Via)[$var(i)]) + "\r\n";
+		$var(i) = $var(i) + 1;
+	}
+	$dlg_val(orig_via) = $var(vias);
 	t_on_branch("trunk_out");
 	# An emergency call lasts until a party hangs up (no OPTIONS to the phone, above): never cut at TRUNK_MAX_CALL_SEC.
 	# A day bounds what the dialog module keeps of one both sides forgot (second review 6b, n°10; restored by a
@@ -1894,6 +1946,10 @@ route[trunk_target] {
 # Each INVITE to the operator, from the trunk it goes to (route[trunk_target]; another one for an emergency call that
 # failed on its own, failure_route[trunk_failed]): From and To its way, and the P-Asserted-Identity it may want.
 branch_route[trunk_out] {
+	# Only our own Via goes to the operator (tm adds it when the branch leaves): the phone's one carries received=<its
+	# address>, and OVH (siptrunk.ovh.net) takes that address for the caller and answers 403 "not registered". The
+	# phone's Vias were kept by the route above, to be put back in the replies (onreply_route).
+	remove_hf("Via");
 	uac_replace_from("", "sip:$avp(t_from_user)@$avp(t_domain)");
 	uac_replace_to("", "sip:$avp(t_to_user)@$avp(t_domain)");
 	if ($avp(t_pai) == 1)
@@ -2059,6 +2115,7 @@ route[trunk_in] {
 	remove_hf("Twake-Conference");
 	remove_hf("X-Twake-Mailbox");
 	remove_hf("X-Twake-Voicemail");
+	remove_hf("X-Twake-Flow");
 	$var(n1) = "";
 	$var(n2) = "";
 	if (route(inbound_number, $rU))
@@ -2507,7 +2564,7 @@ route[read_failed] {
 	# the read goes again without it.
 	if ($avp(q11) == 1 && route(table_11_missing)) {
 		$shv(no11_until) = $Ts + 30;
-		xlog("L_WARN", "call $ci: the database has no voicemail_boxes (the Gateway of step 11a creates it): no mailbox for 30 s\n");
+		xlog("L_WARN", "call $ci: the database has no voicemail_boxes, or no table of the call flows (the Gateway of steps 11a and 11c-2 creates them): no mailbox and no call flow for 30 s\n");
 		return(1);
 	}
 	if ($avp(q4c) == 1 && route(tables_4c_missing)) {
@@ -2537,6 +2594,16 @@ route[table_11_missing] {
 		return(-1);
 	if ($var(missing) == 1)
 		return(1);
+	# wazo-lines: begin
+	# `call_flows` (step 11c-2) likewise, when the read named it: the mailboxes' table says nothing of it.
+	if ($shv(wazo_lines_on) == 1) {
+		$var(missing) = 0;
+		if (!sql_query_one("SELECT CASE WHEN to_regclass('call_flows') IS NULL THEN 1 ELSE 0 END", "$var(missing)"))
+			return(-1);
+		if ($var(missing) == 1)
+			return(1);
+	}
+	# wazo-lines: end
 	return(-1);
 }
 
@@ -3275,13 +3342,27 @@ route[rules_next] {
 		# its table (route[read_failed]). Only the characters of a mailbox's address (`number@context`) are kept.
 		$(avp(q11)[*]) = NULL;
 		$(avp(vm_box)[*]) = NULL;
+		$(avp(r_flow)[*]) = NULL;
 		$var(vm_col) = ", NULL";
+		$var(flow_col) = ", NULL";
+		$var(flow_join) = "";
 		if ($shv(wazo_on) == 1 && $shv(no11_until) <= $Ts) {
 			$avp(q11) = 1;
 			$var(vm_col) = ", (SELECT v.mailbox FROM voicemail_boxes v WHERE v.extension = '" + $rU + "' AND v.mailbox ~ '^[0-9]{1,40}@[A-Za-z0-9_-]{1,79}$')";
+			# wazo-lines: begin
+			# The call flow at the number dialled (step 11c-2, ADR 0028): how Wazo's Asterisk reaches it, `call_flows`, which the
+			# Gateway writes once Wazo runs it. Only what a route is made of passes, and never a number an extension holds (an
+			# extension wins, as over a ring group). Joined after the rules, never a subquery among the columns: the query
+			# stays short enough for pg_stat_activity (1024 characters) to show where it waits (the e2e looks for the rules'
+			# join there).
+			if ($shv(wazo_lines_on) == 1) {
+				$var(flow_col) = ", f.route";
+				$var(flow_join) = " LEFT JOIN call_flows f ON f.number = '" + $rU + "' AND length(f.route) <= 2000 AND f.route ~ '^[A-Za-z0-9_.:=/~|-]+$' AND NOT EXISTS (SELECT 1 FROM subscriber s WHERE s.username = '" + $rU + "')";
+			}
+			# wazo-lines: end
 		}
-		$var(rules_query) = "SELECT " + $var(rules_cols) + $var(first_cols) + $var(vm_col) + $var(rules_from);
-		async(sql_query_one("$var(rules_query)", "$avp(r_always);$avp(r_busy);$avp(r_noanswer);$avp(r_delay);$avp(r_dnd);$avp(r_message);$avp(r_retry);$avp(r_name);$avp(n_caller);$avp(r_group);$avp(vm_box)"), rules_loaded);
+		$var(rules_query) = "SELECT " + $var(rules_cols) + $var(first_cols) + $var(vm_col) + $var(flow_col) + $var(rules_from) + $var(flow_join);
+		async(sql_query_one("$var(rules_query)", "$avp(r_always);$avp(r_busy);$avp(r_noanswer);$avp(r_delay);$avp(r_dnd);$avp(r_message);$avp(r_retry);$avp(r_name);$avp(n_caller);$avp(r_group);$avp(vm_box);$avp(r_flow)"), rules_loaded);
 		exit;
 	}
 	async(sql_query_one("$var(rules_query)", "$avp(r_always);$avp(r_busy);$avp(r_noanswer);$avp(r_delay);$avp(r_dnd);$avp(r_message);$avp(r_retry);$avp(r_name)"), rules_loaded);
@@ -3315,6 +3396,84 @@ route[rules_loaded] {
 # What the rules just read say, in the request route: another extension (its rules are read in turn), the windows
 # to ring, a refusal (route[dnd_refuse], which ends the script) or nobody to ring.
 route[rules_step] {
+	# wazo-lines: begin
+	# A call flow, as dialled (step 11c-2, ADR 0028): a sequential group, a queue or a voice menu that Wazo's Asterisk runs,
+	# which rings the windows of the people through the lines (the INVITE it places comes back on the lines socket). The
+	# INVITE goes to it as one to a mailbox does (the Wazo socket, the offer of rtpengine, `Twake-*` headers only this script
+	# writes): X-Twake-Flow carries the route the Gateway wrote. The call is Wazo's from here: the rules of the people it
+	# rings, their mailboxes and groups do not apply. A call that cannot go there (Wazo left out for 30 s, a room's call, an
+	# INVITE with Replaces, no offer) is not told as a number that does not exist: 480, a missed call.
+	if ($avp(fwd_hops) == 0 && $avp(d_loaded) == NULL && $avp(r_flow) != NULL) {
+		$avp(d_loaded) = 1;
+		if ($shv(wazo_on) != 1 || $shv(wazo_mute_until) > $Ts || $dlg_val(meet) != NULL || $avp(conference) != NULL || is_present_hf("Replaces") || ($avp(rtp_on) == NULL && !has_body_part("application/sdp"))) {
+			xlog("L_NOTICE", "call $ci: the flow $rU cannot be called now\n");
+			route(calling);
+			route(group_missed, "480 Temporarily Unavailable");
+			t_reply(480, "Temporarily Unavailable");
+			exit;
+		}
+		# The calls to the flows at the same time, under a lock: of two calls at once, one counts the other. Past a bound, busy:
+		# each call holds a channel of Wazo's Asterisk and a session of rtpengine, a queue's for as long as its callers wait.
+		$var(fl_room) = 0;
+		get_static_lock("flow_count");
+		get_profile_size("flow_caller", "$avp(caller)", $var(fl_mine));
+		get_profile_size("flow_all", , $var(fl_all));
+		if ($var(fl_mine) < $shv(flow_per_caller) && $var(fl_all) < $shv(flow_calls_all)) {
+			set_dlg_profile("flow_caller", "$avp(caller)");
+			set_dlg_profile("flow_all");
+			$var(fl_room) = 1;
+		}
+		release_static_lock("flow_count");
+		if ($var(fl_room) != 1) {
+			xlog("L_NOTICE", "call $ci: the flow $rU refused, $var(fl_mine) calls of this caller and $var(fl_all) of all callers to the flows\n");
+			route(calling);
+			route(group_missed, "486 Busy Here");
+			t_reply(486, "Busy Here");
+			exit;
+		}
+		$var(from_kind) = 0;
+		if ($dlg_val(trunk) == "caller")
+			$var(from_kind) = 1;
+		$(avp(offer_from)[*]) = NULL;
+		$avp(offer_from) = $var(from_kind);
+		route(rtp_flags, 0, $var(from_kind));
+		if (!rtpengine_offer("$var(rtp_flags)")) {
+			xlog("L_ERR", "call $ci: rtpengine offer for the flow $rU failed\n");
+			route(group_missed, "503 Media Unavailable");
+			t_reply(503, "Media Unavailable");
+			exit;
+		}
+		$avp(rtp_on) = 1;
+		$(avp(flow)[*]) = NULL;
+		$avp(flow) = $avp(r_flow);
+		$(avp(callee)[*]) = NULL;
+		$avp(callee) = $rU;
+		$acc_extra(callee) = $rU;
+		$acc_extra(via) = "flow";
+		$dlg_val(callee) = $rU;
+		# Wazo's side of the call speaks from its socket and never transfers, as in a call to a mailbox.
+		$dlg_val(voicemail) = "1";
+		$ru = "sip:" + $rU + "@${WAZO_SIP}";
+		$du = NULL;
+		$socket_out = "udp:${WAZO_LISTEN_IP}:${WAZO_PORT}";
+		remove_hf("X-Twake-Flow");
+		append_hf("X-Twake-Flow: $avp(flow)\r\n");
+		# Asterisk answers at once (100 Trying within 2 s); a call waits for a member as long as a queue lets it.
+		$T_fr_timeout = 2;
+		$T_fr_inv_timeout = 800;
+		route(calling);
+		t_on_reply("rtp");
+		t_on_failure("flow_failed");
+		xlog("L_INFO", "call $ci: to the flow $rU\n");
+		if (t_relay())
+			exit;
+		xlog("L_WARN", "call $ci: the flow $rU could not be called ($rc)\n");
+		rtpengine_delete();
+		route(group_missed, "480 Temporarily Unavailable");
+		t_reply(480, "Temporarily Unavailable");
+		exit;
+	}
+	# wazo-lines: end
 	# A ring group, as dialled: its members ring, without anyone's rules.
 	if ($avp(fwd_hops) == 0 && $avp(d_loaded) == NULL && $avp(r_group) == 1) {
 		$avp(d_loaded) = 1;
@@ -3917,7 +4076,7 @@ route[voicemail] {
 			$var(from_kind) = 1;
 		$(avp(offer_from)[*]) = NULL;
 		$avp(offer_from) = $var(from_kind);
-		route(rtp_flags, 0);
+		route(rtp_flags, 0, $var(from_kind));
 		if (!rtpengine_offer("$var(rtp_flags)")) {
 			xlog("L_ERR", "call $ci: rtpengine offer for the mailbox of $avp(dialled) failed\n");
 			route(voicemail_unhour);
@@ -4065,6 +4224,30 @@ failure_route[voicemail_failed] {
 	exit;
 }
 
+# wazo-lines: begin
+# A call flow Wazo's Asterisk did not take or could not complete (step 11c-2): the caller is told nobody can be reached
+# (480), never that the number does not exist, and it is a missed call of the flow, as the caller is told it (not what Wazo's
+# Asterisk answered: group_missed). A server that does not answer at all
+# leaves the flows and the mailboxes out for 30 s.
+failure_route[flow_failed] {
+	$var(relay_request) = 0;
+	if (t_was_cancelled()) {
+		rtpengine_delete();
+		route(account_missed);
+		exit;
+	}
+	xlog("L_NOTICE", "call $ci: the flow $rU did not complete ($T_reply_code)\n");
+	if (t_check_status("408") && t_local_replied("all")) {
+		$shv(wazo_mute_until) = $Ts + 30;
+		xlog("L_WARN", "Wazo's Asterisk does not answer: the flows and the mailboxes are left out 30 s\n");
+	}
+	rtpengine_delete();
+	route(group_missed, "480 Temporarily Unavailable");
+	t_reply(480, "Temporarily Unavailable");
+	exit;
+}
+# wazo-lines: end
+
 # Requests OpenSIPS sends of its own (tm). The dialog's OPTIONS to the phone of a call with the operator wait
 # CALL_PING_TIMEOUT_SEC for an answer, not the 5 s of fr_timeout: the dialog ends the call on the first one that times
 # out (408). The BYEs the dialog sends to end a call (its phone gone, TRUNK_MAX_CALL_SEC) free the call's media in
@@ -4089,6 +4272,10 @@ onreply_route {
 }
 
 onreply_route[rtp] {
+	# The Vias of the phone, taken off the request to the operator (main route, branch_route[trunk_out]): put back
+	# after ours when the reply has no other one. A request in the dialog keeps the phone's Vias, so its replies do.
+	if ($hdrcnt(Via) == 1 && $dlg_val(orig_via) != NULL && $hdr(CSeq) =~ "INVITE$")
+		append_hf("$dlg_val(orig_via)", "Via");
 	# Only this script tells a "do not disturb" (route[dnd_reply]) and who answered (below): an UA's own Twake-Dnd or
 	# P-Asserted-Identity headers do not pass, or the caller would show them as the dialled extension's.
 	remove_hf_glob("Twake-Dnd*");
@@ -4138,6 +4325,20 @@ onreply_route[rtp] {
 		}
 		exit;
 	}
+	# wazo-lines: begin
+	# A call flow (step 11c-2, route[rules_step]): Wazo's Asterisk answered it. Told once, as an answer of the callee (the
+	# number of the flow); nobody's identity is asserted to the caller, nor what answered.
+	if ($avp(flow) != NULL) {
+		remove_hf("Server");
+		remove_hf("User-Agent");
+		if ($rs >= 200 && $rs < 300 && $avp(answered) == NULL) {
+			$avp(answered) = 1;
+			route(event_attrs);
+			raise_event("E_TWAKEPHONE_ANSWERED", $avp(ev_attr), $avp(ev_val));
+		}
+		exit;
+	}
+	# wazo-lines: end
 	if ($avp(callee) != NULL) {
 		# A window declining (6xx) declines the call, its other windows stop ringing (tm's 6xx block, off for the
 		# ring groups: one member declining leaves the colleagues' phones ringing).

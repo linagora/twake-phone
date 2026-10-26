@@ -26,6 +26,7 @@ const PARAMS = [
   'removal-gone',
   'removal-late',
   'sync-failing',
+  'flows-failing',
   'sync-fenced',
   'boxes-refused',
   'hidden-calls',
@@ -74,6 +75,7 @@ const paramKey = (alert: Pick<AdminAlert, 'kind' | 'param'>): Key | undefined =>
   // the voicemail server keeps refusing; a cap of the calls to the mailboxes reached: by the callers with no number at
   // a mailbox or at all of them, or by all callers.
   if (alert.param === 'sync-failing') return 'admin.alert.voicemailSyncFailing'
+  if (alert.param === 'flows-failing') return 'admin.alert.voicemailFlowsFailing'
   if (alert.param === 'sync-fenced') return 'admin.alert.voicemailSyncFenced'
   if (alert.param === 'boxes-refused') return 'admin.alert.voicemailBoxesRefused'
   if (alert.param === 'hidden-calls') return 'admin.alert.voicemailHiddenCalls'

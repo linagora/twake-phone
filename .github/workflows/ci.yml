@@ -93,7 +93,11 @@ jobs:
     # Les essais de PIN d'une salle (étape 8) : 3 par appelant (refusé au-delà) et 6 pour tous en 10 minutes
     # (l'alerte des administrateurs, le plafond de ceux qui masquent leur numéro) plutôt que 10 et 300, et 10 appels
     # simultanés au numéro d'accès plutôt que 100, pour que trunk.sip.mjs et l'e2e les jouent en quelques appels.
+    # Deux interfaces rtpengine (ADR 0030) : 127.0.0.1 pour les navigateurs et LiveKit SIP, 127.0.0.2 pour l'opérateur.
+    # trunk.sip.mjs prouve que le téléphone reçoit la première adresse et l'opérateur la seconde.
     env:
+      RTPENGINE_INTERFACE_INTERNAL: 127.0.0.1
+      RTPENGINE_INTERFACE_EXTERNAL: 127.0.0.2
       TRUNK_ADVERTISE: 192.0.2.10:5070
       CALL_PING_SEC: "5"
       TRUNK_MIN_CALL_SEC: "5"
@@ -178,11 +182,12 @@ jobs:
       - name: Wazo, LinTO STT et Synapse n'écoutent toujours que sur la boucle locale, après l'e2e SIP
         run: sudo python3 -I docker/wazo/check-loopback.py docker/docker-compose.sip.yml
       # Service par service (étape 8 : LiveKit et LiveKit SIP écrivent beaucoup), la fin de chacun ; Wazo (étape 11a) :
-      # l'Asterisk des messageries et les services que la passerelle appelle ; LinTO STT et Synapse (étape 11b).
+      # l'Asterisk des messageries et les services que la passerelle appelle (et, étape 11d, le serveur d'enregistrements) ;
+      # LinTO STT et Synapse (étape 11b).
       - name: Journaux de la stack SIP en cas d'échec
         if: failure()
         run: |
-          for service in opensips rtpengine livekit-sip livekit wazo-asterisk wazo-calld wazo-confd wazo-websocketd wazo-auth wazo-bootstrap wazo-amid wazo-sysconfd wazo-confgend wazo-db rabbitmq linto-stt synapse; do
+          for service in opensips rtpengine livekit-sip livekit wazo-asterisk wazo-calld wazo-confd wazo-websocketd wazo-auth wazo-bootstrap wazo-amid wazo-sysconfd wazo-recordings wazo-confgend wazo-db rabbitmq linto-stt synapse; do
             echo "::group::$service"
             docker compose -f docker/docker-compose.sip.yml logs --no-color --timestamps --tail 300 "$service"
             echo "::endgroup::"

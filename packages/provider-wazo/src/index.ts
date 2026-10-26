@@ -1,6 +1,9 @@
 import { createHmac } from 'node:crypto'
-import type { RoutedEvent, VoicemailBox, VoicemailOwner, VoicemailProvider, VoicemailSubscribeOptions, VoicemailSync, VoicemailSyncOptions } from '@twake/telephony-provider-sdk'
-import type { ProviderStatus, Voicemail } from '@twake/telephony-types'
+import type { CallFlowRoute, RoutedEvent, VoicemailBox, VoicemailOwner, VoicemailProvider, VoicemailSubscribeOptions, VoicemailSync, VoicemailSyncOptions } from '@twake/telephony-provider-sdk'
+import type { CallFlow, ProviderStatus, Voicemail } from '@twake/telephony-types'
+
+export { WazoSupervision, SupervisionError, CALL_ID, SUPERVISION_CALLER, type WazoSupervisionConfig } from './supervision.js'
+export { AmiError, amiAction, type AmiConfig } from './ami.js'
 
 // Everything about Wazo Platform lives here (step 11a, ADR 0022): the Gateway only sees a VoicemailProvider. Wazo's own
 // words (users, voicemails, folders, contexts) stay inside this package.
@@ -87,6 +90,12 @@ export interface WazoConfig {
    * WAZO_LINE_KEY). Without it, no line is made (`syncLines` does nothing).
    */
   lineKey?: string
+  /**
+   * The context of the dialplan the members of a sequential group or a queue are called in (step 11c-2, ADR 0028): Wazo
+   * calls `Local/<extension>@<context>`, whose dialplan rings the line of the extension. Default: twake-members (the
+   * stack's own, docker/wazo/asterisk/extensions.conf).
+   */
+  membersContext?: string
   /** How long a token of wazo-auth lasts, in seconds; renewed at four fifths of it. Default: 3600. */
   tokenTtlSec?: number
   /** How long a request to Wazo may take, in milliseconds. Default: 10 s. */
@@ -103,6 +112,24 @@ export interface WazoConfig {
   logger?: WazoLogger
   /** The provider's id (the Gateway names the tenant with it). Default: wazo. */
   id?: string
+}
+
+/** The number of a flow: digits, as OpenSIPS reads them. */
+const FLOW_NUMBER = /^[0-9]{1,40}$/
+const membersOf = (f: CallFlow) => [...new Set((f.members ?? []).filter(m => /^[0-9]{1,40}$/.test(m)))]
+/**
+ * Seconds Asterisk's queue waits between two members (the group's `retry_delay`: it also holds between the last member and
+ * the next round, and for members that fail at once, so that a group of unreachable members does not spin).
+ */
+const RETRY_SEC = 1
+/**
+ * Seconds each member rings, and a caller waits at most: a sequential group is done after one round of its members, each
+ * ringing `ring` seconds and the queue waiting `RETRY_SEC` between two (measured against Asterisk 22: with a timeout of 5 s
+ * and a retry of 2 s, the second member is called 7 s after the first).
+ */
+const timesOf = (f: CallFlow) => {
+  const ring = f.ringSec ?? 15
+  return { ring, wait: f.kind === 'queue' ? (f.waitSec ?? 120) : (ring + RETRY_SEC) * Math.max(1, membersOf(f).length) }
 }
 
 /** The extensions that have a line: digits, as the SIP server's REGISTER names them (`wazo_lines`). */
@@ -124,6 +151,25 @@ interface WazoLineRow {
   users?: unknown[]
   extensions?: unknown[]
 }
+
+/** A group of wazo-confd, as a sequential group or a queue of TwakePhone (step 11c-2): its name is what Asterisk calls the queue. */
+interface WazoGroup {
+  uuid: string
+  name: string
+  label: string
+  ring_strategy?: string
+  timeout?: number | null
+  user_timeout?: number | null
+  members?: { extensions?: { exten: string; context: string }[] }
+}
+
+/** The label of the group of the flow at `number`: how a group of ours is told from another, and from its number. */
+const GROUP_LABEL = /^TwakePhone ([0-9]{1,40})$/
+/** What reaches Asterisk's dialplan as a word: a queue's name and a sound's. */
+const QUEUE_NAME = /^[A-Za-z0-9_.-]{1,128}$/
+const SOUND = /^[A-Za-z0-9_/-]{1,64}$/
+/** The sound a menu plays without a greeting of its own (docker/wazo/asterisk/sounds). */
+const DEFAULT_GREETING = 'twake-menu'
 
 /** Wazo's answer to a request it did not do (its status, and its own words, cut short). */
 export class WazoError extends Error {
@@ -972,6 +1018,123 @@ export class WazoVoicemail implements VoicemailProvider {
     // The lines left over by an error, nothing at Wazo any more: removed.
     for (const line of orphans) await this.json(`${confd}/lines/${line.id}`, 'DELETE', undefined, guard).catch((err: unknown) => this.log.warn(`Wazo: a line without an endpoint not removed: ${err instanceof Error ? err.message : String(err)}`))
     return { ready, failed }
+  }
+
+  // ---- wazo-confd: the call flows (step 11c-2, ADR 0028) ----------------------------------------------------------
+
+  /** Whether flows are run: they ring the members through their lines, so when lines are made. */
+  get flowsOn() {
+    return this.linesOn
+  }
+
+  /**
+   * The sequential groups and queues of the tenant are groups of wazo-confd, labelled `TwakePhone <number>`: a strategy
+   * (`linear`: one member after the other; `least_recent`: the one idle longest), the seconds each member rings, the
+   * seconds at most a caller waits, and the extensions of the members, called in the context of the dialplan of this
+   * server (`membersContext`). A voice menu is not a resource of Wazo's: its digits and sound are the route OpenSIPS
+   * hands Asterisk's dialplan. Nothing of the people is in Wazo but the extensions. A group of ours that the tenant no
+   * longer has, or whose strategy is not its flow's kind (it is made again: a strategy edited to `linear` fails in
+   * Asterisk), goes once `beforeRemoval` has heard its number (the SIP server stops sending calls there first). Returns
+   * how the SIP server reaches each flow that exists now, and how many Wazo refused (said in the log, done again at the
+   * next round). One request at a time, each a reload of Asterisk's queues that wazo-sysconfd melts; `mayWrite` is asked
+   * before each.
+   */
+  async syncFlows(flows: CallFlow[], options: { mayWrite?(): boolean; beforeRemoval?(numbers: string[]): Promise<void> } = {}): Promise<{ routes: CallFlowRoute[]; failed: number }> {
+    if (!this.config.lineKey) return { routes: [], failed: 0 }
+    const guard = () => {
+      if (options.mayWrite && !options.mayWrite()) throw new WazoStopped()
+    }
+    const confd = this.config.confdUrl
+    const context = this.config.membersContext ?? 'twake-members'
+    const wanted = new Map(flows.filter(f => FLOW_NUMBER.test(f.number)).map(f => [f.number, f]))
+    const have = new Map<string, WazoGroup>()
+    for (const g of await this.list<WazoGroup>('/groups')) {
+      const n = GROUP_LABEL.exec(g.label ?? '')?.[1]
+      if (n) have.set(n, g)
+    }
+    let failed = 0
+    const refused = (what: string, number: string, err: unknown) => {
+      if (err instanceof WazoStopped || (err instanceof WazoError && err.status >= 500)) throw err
+      failed++
+      this.log.warn(`Wazo: the flow ${number} not ${what}: ${err instanceof Error ? err.message : String(err)}`)
+    }
+    const groupFlows = [...wanted.values()].filter(f => f.kind !== 'menu')
+    const strategyOf = (f: CallFlow) => (f.kind === 'queue' ? 'least_recent' : 'linear')
+    const gone = [...have.keys()].filter(n => !groupFlows.some(f => f.number === n))
+    // A group made again (its flow changed kind) leaves the SIP server first as well.
+    const remade = groupFlows.filter(f => have.get(f.number)?.ring_strategy && have.get(f.number)!.ring_strategy !== strategyOf(f)).map(f => f.number)
+    // The menus that lead to a group that goes or is made again leave the SIP server first too: their route names the group.
+    const leaving = new Set([...gone, ...remade])
+    const menus = [...wanted.values()].filter(f => f.kind === 'menu' && Object.values(f.choices ?? {}).some(t => leaving.has(t))).map(f => f.number)
+    if (leaving.size) await options.beforeRemoval?.([...leaving, ...menus])
+    for (const number of gone) {
+      try {
+        await this.json(`${confd}/groups/${have.get(number)!.uuid}`, 'DELETE', undefined, guard)
+      } catch (err) {
+        refused('removed', number, err)
+      }
+    }
+    /** The group of each queue or sequential flow that is made now. */
+    const made = new Map<string, WazoGroup>()
+    for (const f of groupFlows) {
+      try {
+        const members = membersOf(f)
+        if (!members.length) throw new WazoError(400, 'no member')
+        const { ring, wait } = timesOf(f)
+        const fields = { label: `TwakePhone ${f.number}`, timeout: wait, user_timeout: ring, retry_delay: RETRY_SEC, ring_in_use: false }
+        let group = have.get(f.number)
+        if (!group) {
+          group = await this.json<WazoGroup>(`${confd}/groups`, 'POST', { ...fields, ring_strategy: f.kind === 'queue' ? 'least_recent' : 'linear' }, guard)
+        } else if (group.timeout !== wait || group.user_timeout !== ring) {
+          await this.json(`${confd}/groups/${group.uuid}`, 'PUT', fields, guard)
+          group = { ...group, timeout: wait, user_timeout: ring }
+        }
+        // The kind never changes a group (a strategy edited to `linear` fails in Asterisk): a group of the other kind goes and comes back.
+        const strategy = strategyOf(f)
+        if (group.ring_strategy && group.ring_strategy !== strategy) {
+          await this.json(`${confd}/groups/${group.uuid}`, 'DELETE', undefined, guard)
+          group = await this.json<WazoGroup>(`${confd}/groups`, 'POST', { ...fields, ring_strategy: strategy }, guard)
+        }
+        const current = (group.members?.extensions ?? []).map(e => `${e.exten}@${e.context}`)
+        const asked = members.map(m => `${m}@${context}`)
+        if (current.length !== asked.length || current.some((c, i) => c !== asked[i])) {
+          await this.json(`${confd}/groups/${group.uuid}/members/extensions`, 'PUT', { extensions: members.map(exten => ({ exten, context })) }, guard)
+        }
+        if (!QUEUE_NAME.test(group.name ?? '')) throw new WazoError(422, 'Wazo gave the group a name Asterisk\'s dialplan would not read')
+        made.set(f.number, group)
+      } catch (err) {
+        refused('made', f.number, err)
+        // A change Wazo refused leaves the group it had, which goes on running: its route stays (the next round tries again).
+        const kept = have.get(f.number)
+        if (kept && (!kept.ring_strategy || kept.ring_strategy === strategyOf(f)) && QUEUE_NAME.test(kept.name ?? '')) made.set(f.number, kept)
+      }
+    }
+    const routes: CallFlowRoute[] = []
+    for (const f of wanted.values()) {
+      if (f.kind === 'menu') continue
+      const group = made.get(f.number)
+      if (!group) continue
+      routes.push({ number: f.number, route: `${f.kind === 'queue' ? 'queue' : 'seq'}|${group.name}|${timesOf(f).wait}` })
+    }
+    // A menu: its digits lead to an extension, or to a group that is made (a digit leading to one that is not is left out until it is).
+    for (const f of wanted.values()) {
+      if (f.kind !== 'menu') continue
+      const choices: string[] = []
+      for (const [digit, target] of Object.entries(f.choices ?? {}).sort(([a], [b]) => (a < b ? -1 : 1))) {
+        if (!/^[0-9]$/.test(digit)) continue
+        const flow = wanted.get(target)
+        if (!flow) {
+          if (LINE_EXTENSION.test(target)) choices.push(`${digit}=e:${target}`)
+        } else if (flow.kind !== 'menu') {
+          const route = routes.find(r => r.number === target)
+          if (route) choices.push(`${digit}=${flow.kind === 'queue' ? 'q' : 's'}:${route.route.split('|')[1]}:${route.route.split('|')[2]}`)
+        }
+      }
+      if (!choices.length) continue
+      const greeting = f.greeting && SOUND.test(f.greeting) ? f.greeting : DEFAULT_GREETING
+      routes.push({ number: f.number, route: `menu|${choices.join('~')}|${greeting}` })
+    }
+    return { routes, failed }
   }
 
   /** A mailbox of the SIP server (`number@context`) is a person's when it is at their number, which is theirs only. */

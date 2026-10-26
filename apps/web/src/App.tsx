@@ -15,11 +15,13 @@ import { Limits } from './pages/admin/Limits.js'
 import { Numbers } from './pages/admin/Numbers.js'
 import { Sites } from './pages/admin/Sites.js'
 import { Rights } from './pages/admin/Rights.js'
+import { CallFlows } from './pages/admin/CallFlows.js'
 import { RingGroups } from './pages/admin/RingGroups.js'
 import { Trunks } from './pages/admin/Trunks.js'
 import { Webhooks } from './pages/admin/Webhooks.js'
 import { ContactPage } from './pages/ContactPage.js'
 import { Phone } from './pages/Phone.js'
+import { SupervisionPage } from './pages/Supervision.js'
 import { VoicemailPage } from './pages/Voicemail.js'
 import { FavoritesProvider } from './favorites.js'
 import { PresenceProvider } from './presence.js'
@@ -44,6 +46,7 @@ const Gate = ({ config }: { config: AppConfig }) => {
                 <Route index element={<Phone />} />
                 <Route path="recents" element={<Recents />} />
                 <Route path="voicemail" element={<VoicemailPage />} />
+                <Route path="supervision" element={<SupervisionPage />} />
                 <Route path="directory" element={<Navigate to="/" replace />} />
                 <Route path="directory/:id" element={<ContactPage />} />
                 <Route path="settings" element={<Settings config={config} />} />
@@ -53,6 +56,7 @@ const Gate = ({ config }: { config: AppConfig }) => {
                   <Route path="numbers" element={<Numbers />} />
                   <Route path="sites" element={<Sites />} />
                   <Route path="groups" element={<RingGroups />} />
+                  <Route path="flows" element={<CallFlows />} />
                   <Route path="rights" element={<Rights />} />
                   <Route path="limits" element={<Limits />} />
                   <Route path="alerts" element={<Alerts />} />

@@ -1,4 +1,4 @@
-import { Gear, History, Logout, Shield, Sound, Telephone } from '@linagora/twake-icons'
+import { Eye, Gear, History, Logout, Shield, Sound, Telephone } from '@linagora/twake-icons'
 import { AppBar, Button, Chip, Container, IconButton, Link, SvgIcon, Content, Layout as TwakeLayout, Main, Nav, NavIcon, NavItem, NavText, Sidebar, Stack, Toolbar, Typography, type ChipProps } from '@linagora/twake-mui'
 import { useEffect, useMemo, useRef } from 'react'
 import { NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom'
@@ -19,6 +19,7 @@ const LINKS: [string, Key, typeof Telephone][] = [
   ['/', 'nav.dialer', Telephone],
   ['/recents', 'nav.recents', History],
   ['/voicemail', 'nav.voicemail', Sound],
+  ['/supervision', 'nav.supervision', Eye],
   ['/settings', 'nav.settings', Gear],
   ['/admin', 'nav.admin', Shield]
 ]
@@ -38,7 +39,8 @@ export const Layout = () => {
   // number of messages not listened to, said in the link's name.
   const voicemail = useVoicemailTab(client, me?.extension, onConnected, onEvent)
   // The administration link shows only to administrators; the Gateway refuses the others anyway.
-  const links = LINKS.filter(([to]) => (to !== '/admin' || me?.features?.admin) && (to !== '/voicemail' || (voicemail.on && me?.extension)))
+  // The supervision (step 11d) shows to supervisors, whom the Gateway says in /me (and refuses the others anyway).
+  const links = LINKS.filter(([to]) => (to !== '/admin' || me?.features?.admin) && (to !== '/supervision' || me?.features?.supervision) && (to !== '/voicemail' || (voicemail.on && me?.extension)))
   const { pathname, search } = useLocation()
   // Opened by the notification of a call: signed in, the softphone registers and the call rings here. The address
   // keeps no trace of it (a reload is no reason to do anything about that call).

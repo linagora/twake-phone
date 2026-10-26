@@ -7,6 +7,7 @@ import type { AdminAlert, DidRange, EmergencySite, OutboundSettings, Trunk, Webh
 import type { useGateway } from '../../gateway.js'
 import { I18nProvider, useT } from '../../i18n/useT.js'
 import { Admin } from './Admin.js'
+import { CallFlows } from './CallFlows.js'
 import { ALERTS_REFRESH_MS, Alerts } from './Alerts.js'
 import { Limits } from './Limits.js'
 import { Numbers } from './Numbers.js'
@@ -80,6 +81,10 @@ const client = (over: Record<string, unknown> = {}) =>
   ({
     listAdminUsers: vi.fn(async () => ({ items: [{ userId: 'alice', extension: '101', displayName: 'Alice' }] })),
     listGroups: vi.fn(async () => ({ items: [] })),
+    listFlows: vi.fn(async () => ({ items: [] })),
+    createFlow: vi.fn(),
+    setFlow: vi.fn(),
+    deleteFlow: vi.fn(),
     listTrunks: vi.fn(async () => ({ items: [trunk] })),
     getTrunkStatus: vi.fn(async () => ({ available: true, items: [{ id: 'operator', registration: { state: 'registered' }, servers: [{ address: 'sip.operator.example', state: 'up' }] }] })),
     setTrunk: vi.fn(),
@@ -154,7 +159,7 @@ describe('the administration screens (step 7)', () => {
     gateway = { client: client(), me: { id: 'alice', displayName: 'Alice', features: { admin: true } }, meError: null }
     await render('/admin/trunks', <Trunks />)
     const links = [...host.querySelectorAll('nav a')]
-    expect(links.map(a => a.textContent)).toEqual(['Comptes', 'Trunks', 'Numéros directs', 'Sites', "Groupes d'appel", "Droits d'appel", 'Plafonds et seuils', 'Alertes', 'Webhooks'])
+    expect(links.map(a => a.textContent)).toEqual(['Comptes', 'Trunks', 'Numéros directs', 'Sites', "Groupes d'appel", "Parcours d'appel", "Droits d'appel", 'Plafonds et seuils', 'Alertes', 'Webhooks'])
     expect(links.find(a => a.getAttribute('aria-current') === 'page')?.textContent).toBe('Trunks')
     // The trunk, how it is doing, and its password never shown.
     expect(text()).toContain('Opérateur (operator)')
@@ -350,7 +355,7 @@ describe('the administration screens (step 7)', () => {
     // A set-aside held back: who waits for a mailbox, and the voicemail off for everyone, said.
     expect(text()).toContain("(le temps de la retenue ne compte pas) : 6 pour 6 ; 6 nouveau(x) titulaire(s) sans boîte jusqu'à la levée ; messagerie coupée pour tout le tenant : aucun poste ne joint de boîte")
     const causes = [...host.querySelectorAll('option')].map(o => o.value)
-    for (const param of ['sync-failing', 'sync-fenced', 'boxes-refused', 'hidden-calls', 'hidden-hour', 'hidden-all', 'calls-all', 'held-back', 'held-back-remove']) expect(causes).toContain(param)
+    for (const param of ['sync-failing', 'flows-failing', 'sync-fenced', 'boxes-refused', 'hidden-calls', 'hidden-hour', 'hidden-all', 'calls-all', 'held-back', 'held-back-remove']) expect(causes).toContain(param)
   })
 
   it('puts the focus back on the delete button when told no or Escape, and on what is said once deleted (review 7 n°3)', async () => {
@@ -1207,6 +1212,108 @@ describe('the administration screens (step 7)', () => {
     expect($('#group-number-error')?.textContent).toContain('Un groupe de votre organisation a déjà ce numéro')
     expect(document.activeElement?.id).toBe('group-number')
   })
+  it('lists the call flows with what each does and whether the platform runs it yet, and makes a queue after checking it as the Gateway does (step 11c-2)', async () => {
+    const listFlows = vi.fn(async () => ({
+      items: [
+        { number: '801', name: 'Support', kind: 'queue', members: ['102', '109'], ringSec: 12, waitSec: 90, vacant: ['109'], ready: true },
+        { number: '810', name: 'Astreinte', kind: 'sequential', members: ['102'], ringSec: 15, vacant: [], ready: false },
+        { number: '800', name: 'Standard', kind: 'menu', choices: { '1': '801', '2': '810' }, ready: true }
+      ]
+    }))
+    const createFlow = vi.fn(async (f: { number: string }) => f)
+    admin({ listFlows, createFlow })
+    await render('/admin/flows', <CallFlows />)
+    const rows = [...host.querySelectorAll('ul[aria-label="Parcours existants"] li')].map(li => li.textContent)
+    expect(rows[0]).toContain("801 Support (File d'attente) : 102, 109 (poste libre), 12 s chacun, attente de 90 s au plus — en service")
+    expect(rows[1]).toContain('810 Astreinte (Groupe séquentiel) : 102, 15 s chacun — en cours de mise en service')
+    expect(rows[2]).toContain('800 Standard (Standard vocal (SVI)) : touches : 1=801, 2=810 — en service')
+    // Wrong: the problems next to their fields, nothing sent, the focus on the first.
+    choose($('#flow-kind'), 'queue')
+    type($('#flow-number'), '112')
+    type($('#flow-ringSec'), '2')
+    type($('#flow-waitSec'), '5')
+    await submit($('form'))
+    expect(createFlow).not.toHaveBeenCalled()
+    expect(document.activeElement?.id).toBe('flow-number')
+    expect($('#flow-number-error')?.textContent).toContain("numéro d'urgence")
+    expect($('#flow-name-error')?.textContent).toContain('une ligne')
+    expect($('#flow-members-error')?.textContent).toContain('de 1 à 12 membres')
+    expect($('#flow-ringSec-error')?.textContent).toContain('de 5 à 60 secondes')
+    expect($('#flow-waitSec-error')?.textContent).toContain('de 15 à 600 secondes')
+    type($('#flow-number'), '802')
+    type($('#flow-name'), 'Accueil')
+    type($('#flow-members'), '102, 103')
+    type($('#flow-ringSec'), '20')
+    type($('#flow-waitSec'), '60')
+    await submit($('form'))
+    await flush()
+    expect(createFlow).toHaveBeenCalledWith({ number: '802', name: 'Accueil', kind: 'queue', members: ['102', '103'], ringSec: 20, waitSec: 60 })
+    expect(text()).toContain('Parcours 802 enregistré.')
+  })
+
+  it('reads a voice menu as keys and numbers, with a greeting if any, and says what the Gateway refuses next to the field (step 11c-2)', async () => {
+    const createFlow = vi.fn(async () => {
+      throw refused(400, 'FLOW_CHOICE_TARGET', 'a choice leads to an extension, a sequential group or a queue of your organisation')
+    })
+    admin({ createFlow })
+    await render('/admin/flows', <CallFlows />)
+    choose($('#flow-kind'), 'menu')
+    // A menu has keys, not members.
+    expect($('#flow-members')).toBeNull()
+    type($('#flow-number'), '800')
+    type($('#flow-name'), 'Standard')
+    type($('#flow-choices'), '1=801, 1=802')
+    await submit($('form'))
+    expect(createFlow).not.toHaveBeenCalled()
+    expect($('#flow-choices-error')?.textContent).toContain('1=802')
+    type($('#flow-choices'), '1=801, x=102')
+    await submit($('form'))
+    expect($('#flow-choices-error')?.textContent).toContain('x=102')
+    type($('#flow-choices'), '1=801, 2=102')
+    type($('#flow-greeting'), 'custom/accueil')
+    await submit($('form'))
+    await flush()
+    expect(createFlow).toHaveBeenCalledWith({ number: '800', name: 'Standard', kind: 'menu', choices: { '1': '801', '2': '102' }, greeting: 'custom/accueil' })
+    expect($('#flow-choices-error')?.textContent).toContain('jamais à un autre standard')
+    expect(document.activeElement?.id).toBe('flow-choices')
+  })
+
+  it('changes a flow keeping its number, removes one once confirmed, says a flow a menu leads to stays, and says the platform has none (step 11c-2)', async () => {
+    const flow = { number: '801', name: 'Support', kind: 'queue', members: ['102'], ringSec: 12, waitSec: 90, vacant: [], ready: true }
+    const listFlows = vi.fn(async () => ({ items: [flow] }))
+    const setFlow = vi.fn(async (f: { number: string }) => f)
+    const deleteFlow = vi
+      .fn()
+      .mockRejectedValueOnce(refused(409, 'FLOW_IN_USE', 'the menu 800 leads to it'))
+      .mockResolvedValue(undefined)
+    admin({ listFlows, setFlow, deleteFlow })
+    await render('/admin/flows', <CallFlows />)
+    click($('[aria-label="Modifier le parcours 801"]'))
+    await flush()
+    expect(($('#flow-number') as HTMLInputElement).disabled).toBe(true)
+    expect(($('#flow-waitSec') as HTMLInputElement).value).toBe('90')
+    type($('#flow-members'), '102, 103')
+    await submit($('form'))
+    await flush()
+    expect(setFlow).toHaveBeenCalledWith({ number: '801', name: 'Support', kind: 'queue', members: ['102', '103'], ringSec: 12, waitSec: 90 })
+    click($('[aria-label="Supprimer le parcours 801"]'))
+    click(button(host, 'Oui, supprimer'))
+    await flush()
+    expect(deleteFlow).toHaveBeenCalledWith('801')
+    expect($('[role="alert"]')?.textContent).toContain('Un standard mène à ce parcours')
+    click($('[aria-label="Supprimer le parcours 801"]'))
+    click(button(host, 'Oui, supprimer'))
+    await flush()
+    expect(text()).toContain('Parcours 801 supprimé.')
+  })
+
+  it('says a platform without lines has no call flows', async () => {
+    admin({ listFlows: vi.fn(async () => Promise.reject(Object.assign(new Error('Gateway 501'), { status: 501 }))) })
+    await render('/admin/flows', <CallFlows />)
+    expect(text()).toContain('ne gère pas les standards vocaux')
+    expect($('form')).toBeNull()
+  })
+
   /** Types into a text area as a person does. */
   const typeArea = (el: Element | null, value: string) => {
     const area = el as HTMLTextAreaElement

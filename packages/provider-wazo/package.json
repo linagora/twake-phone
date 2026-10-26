@@ -1,7 +1,7 @@
 {
   "name": "@twake/provider-wazo",
   "version": "0.1.0",
-  "description": "Wazo Platform provider of the TwakePhone Gateway: the mailboxes of the people of the platform (wazo-confd), their messages (wazo-calld) and the events of a new one (wazo-websocketd).",
+  "description": "Wazo Platform provider of the TwakePhone Gateway: the mailboxes of the people of the platform (wazo-confd), their messages (wazo-calld) and the events of a new one (wazo-websocketd); the recording and the supervision of the calls Wazo has (the AMI of Asterisk, a recordings server).",
   "license": "AGPL-3.0",
   "type": "module",
   "main": "dist/index.js",

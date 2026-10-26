@@ -1,5 +1,6 @@
 import type {
   Call,
+  CallFlow,
   Capabilities,
   ConferenceParticipant,
   DialInConfiguration,
@@ -18,6 +19,8 @@ import type {
   ProviderStatus,
   RingGroup,
   DidRange,
+  SupervisedCall,
+  SupervisionMode,
   EmergencySite,
   TelephonyEvent,
   Trunk,
@@ -141,6 +144,14 @@ export interface TelephonyProvider {
   setWazoLines?(extensions: string[]): Promise<void>
   /** The extensions the SIP server has a line for now: what the last writes left. */
   listWazoLines?(): Promise<string[]>
+  /**
+   * The call flows the voicemail and telephony server runs now (step 11c-2, ADR 0028; VoicemailProvider's syncFlows):
+   * replaces the list. A call to one of these numbers goes to that server with `route`, which it understands; a number
+   * not in it is no flow.
+   */
+  setCallFlowRoutes?(routes: CallFlowRoute[]): Promise<void>
+  /** The call flows the SIP server sends calls to now: what the last writes left. */
+  listCallFlowRoutes?(): Promise<CallFlowRoute[]>
   /** Where the calls of the user's extension go (capability `forwarding`). */
   getForwarding?(user: User): Promise<ForwardingRules>
   /** Replaces those rules; targets are extensions the Gateway checked. */
@@ -192,6 +203,15 @@ export interface TelephonyProvider {
 export interface VoicemailBoxesWrite {
   fence?: number
   since?: number
+}
+
+/**
+ * A call flow the voicemail and telephony server runs (step 11c-2, ADR 0028): the number callers dial, and how the SIP
+ * server reaches it there (`route`, opaque to the Gateway and to the SIP server, which hands it over as it is).
+ */
+export interface CallFlowRoute {
+  number: string
+  route: string
 }
 
 /** A person's mailbox, where the SIP server sends the calls of `extension` it cannot get through (step 11a). */
@@ -325,6 +345,16 @@ export interface VoicemailProvider {
   readonly linesOn?: boolean
   syncLines?(extensions: string[], options?: { mayWrite?(): boolean; beforeRemoval?(extensions: string[]): Promise<void> }): Promise<{ ready: string[]; failed: number }>
   /**
+   * The call flows (step 11c-2, ADR 0028): sequential groups, queues and voice menus, run by the server, which rings the
+   * windows of their members through the lines. Each flow gets what it needs there, and those the server has that the
+   * tenant no longer does go, once `beforeRemoval` has heard their numbers (the SIP server stops sending calls there
+   * first). Returns how the SIP server reaches each flow that is made now (`routes`: TelephonyProvider's setCallFlowRoutes)
+   * and how many the server refused (done again at the next round). `mayWrite` is asked before each request. Without
+   * lines (no `linesOn`), none and none.
+   */
+  readonly flowsOn?: boolean
+  syncFlows?(flows: CallFlow[], options?: { mayWrite?(): boolean; beforeRemoval?(numbers: string[]): Promise<void> }): Promise<{ routes: CallFlowRoute[]; failed: number }>
+  /**
    * Whether `owner.userId` has a mailbox (the events of a mailbox go to its holder only); with `owner.mailbox`, whether
    * that mailbox is theirs (read again from the voicemail server).
    */
@@ -362,6 +392,36 @@ export interface VoicemailProvider {
    * theirs (owns).
    */
   subscribe(options?: VoicemailSubscribeOptions): AsyncIterable<RoutedEvent>
+  close(): Promise<void>
+}
+
+/**
+ * What a supervisor can do with the calls that have a channel at the voicemail server (step 11d, ADR 0029; Wazo's,
+ * provider-wazo): list them, record them with an announcement to both parties, and join them. The audio of a recording
+ * is read from, and erased at, a recordings server the provider knows.
+ */
+export interface SupervisionProvider {
+  readonly id: string
+  /** The calls in progress on a line of the tenant. */
+  listCalls(): Promise<SupervisedCall[]>
+  /**
+   * Announces the recording to both parties, then starts it. Rejects (and records nothing) when the announcement did not
+   * go. `file` is the recording's own name (a UUID), `tenant` the folder it is kept in.
+   */
+  startRecording(call: { id: string }, file: { tenant: string; name: string }): Promise<void>
+  /** Stops the recording of a call; a call already gone is not an error. */
+  stopRecording(call: { id: string }): Promise<void>
+  /**
+   * Calls `supervisor`'s line (an extension) and puts them in the call, as `mode` says; resolves once they answered, and
+   * rejects when the call did not come up (unanswered, refused, the call ended meanwhile).
+   */
+  spy(call: { id: string }, supervisor: { extension: string }, mode: SupervisionMode): Promise<void>
+  /** The audio of a recording (WAV) as a stream read once, undefined when the server has no such file. */
+  getRecording(file: { tenant: string; name: string }): Promise<{ contentType: string; size?: number; body: AsyncIterable<Uint8Array> } | undefined>
+  /** What the server has of a recording's file: its size and when it was last written (the end of the recording), undefined when it has none. */
+  statRecording(file: { tenant: string; name: string }): Promise<{ size: number; modifiedAt?: string } | undefined>
+  /** Erases a recording's file; false when there was none. */
+  deleteRecording(file: { tenant: string; name: string }): Promise<boolean>
   close(): Promise<void>
 }
 

@@ -37,6 +37,11 @@
 // Step 11a (ADR 0022): the mailboxes, on the Wazo of the same stack, behind OpenSIPS (the Gateway with provider-wazo):
 //   WAZO_AUTH_URL, WAZO_CONFD_URL, WAZO_CALLD_URL, WAZO_WEBSOCKETD_URL  its APIs (default the stack's, on the loopback)
 //   WAZO_USER, WAZO_PASSWORD             the Gateway's account in Wazo (default the stack's development one)
+// Step 11d (ADR 0029): the recording and the supervision of the calls that have a channel at Wazo, by the Gateway
+// (provider-wazo: the AMI of Wazo's Asterisk with two accounts of its own, a recordings server):
+//   WAZO_AMI             Wazo's AMI (default 127.0.0.1:5038); WAZO_GATEWAY_AMI_PASSWORD and WAZO_GATEWAY_ORIGINATE_PASSWORD
+//                        the passwords of the Gateway's two accounts there (default the stack's development ones)
+//   WAZO_RECORDINGS_URL, WAZO_RECORDINGS_TOKEN  the recordings server (default http://127.0.0.1:8670 and the stack's token)
 // Step 11b (ADR 0023): each message transcribed by the LinTO STT of the same stack, the bot's notice of it in the
 // stack's Matrix homeserver (Synapse), where this process makes the bot's account and those of the cast (its
 // shared-secret registration): the bot's access token is the one Synapse gives at its registration, never written.
@@ -68,7 +73,7 @@ import { JwtAuthenticator } from '../../gateway/dist/auth.js'
 import { DirectorySync } from '../../gateway/dist/directory-sync.js'
 import { DEFAULT_ATTRIBUTES, LdapDirectory } from '../../gateway/dist/ldap-directory.js'
 import { storedOpensipsFactory } from '../../gateway/dist/providers.js'
-import { WazoVoicemail, holderKey, mailboxNumber } from '../../../packages/provider-wazo/dist/index.js'
+import { WazoSupervision, WazoVoicemail, amiAction, holderKey, mailboxNumber } from '../../../packages/provider-wazo/dist/index.js'
 import { holderSecretOf } from '../../gateway/dist/voicemail.js'
 import { MatrixBot } from '../../gateway/dist/matrix.js'
 import { LintoTranscription } from '../../../packages/transcription-linto/dist/index.js'
@@ -122,6 +127,11 @@ const WAZO = {
 const WAZO_LINE_KEY = process.env.WAZO_LINE_KEY ?? 'twake-wazo-line-dev-only-key-0123456789abcdef'
 const WAZO_AMI = process.env.WAZO_AMI ?? '127.0.0.1:5038'
 const WAZO_AMI_PASSWORD = process.env.WAZO_AMI_PASSWORD ?? 'twake-wazo-dev-only-ami'
+// Step 11d (ADR 0029): the Gateway's two AMI accounts (the calls and MixMonitor; Originate) and the recordings server.
+const WAZO_GATEWAY_AMI_PASSWORD = process.env.WAZO_GATEWAY_AMI_PASSWORD ?? 'twake-wazo-dev-only-gateway-ami'
+const WAZO_GATEWAY_ORIGINATE_PASSWORD = process.env.WAZO_GATEWAY_ORIGINATE_PASSWORD ?? 'twake-wazo-dev-only-gateway-originate'
+const WAZO_RECORDINGS_URL = process.env.WAZO_RECORDINGS_URL ?? 'http://127.0.0.1:8670'
+const WAZO_RECORDINGS_TOKEN = process.env.WAZO_RECORDINGS_TOKEN ?? 'twake-wazo-dev-only-recordings-token-0123456789'
 const TENANT = 'e2e'
 const BROWSER = process.env.BROWSER ?? 'chromium'
 // Step 11b: LinTO STT and the Matrix homeserver of the stack.
@@ -203,6 +213,11 @@ const wazoAmi = () =>
           send({ Action: 'Originate', Channel: channel, Application: application, ...(data ? { Data: data } : {}), CallerID: callerId, Async: 'true', ActionID: id })
           return waitFor(e => /^Event: OriginateResponse/m.test(e) && field(e, 'ActionID') === id, 'the answer to the call', 60_000).then(e => ({ response: field(e, 'Response'), reason: field(e, 'Reason') }))
         },
+        /** The events heard since the login whose text matches `pattern`. */
+        heard: pattern => events.filter(e => pattern.test(e)),
+        /** The place in the order they came of the first event `test` says yes to (-1: none). */
+        firstIndex: test => events.findIndex(test),
+        field,
         channelsOf: prefix => events.filter(e => /^Event: Newchannel/m.test(e) && field(e, 'Channel')?.startsWith(prefix)).map(e => field(e, 'Channel')),
         hangup: channel => send({ Action: 'Hangup', Channel: channel, Cause: 16 }),
         close: () => socket.end()
@@ -457,6 +472,11 @@ const wazo = new WazoVoicemail({
   // What it says while out of reach is what the steps expect; once reachable, everything.
   logger: { info: () => {}, warn: m => wazoOpen && console.log(`[wazo] ${m}`), error: m => console.log(`[wazo] ${m}`) }
 })
+// Step 11d (ADR 0029): the recording and the supervision, by the AMI of Wazo's Asterisk (the Gateway's two accounts) and its recordings server.
+const [AMI_HOST, AMI_PORT] = WAZO_AMI.split(':')
+const AMI_GATEWAY = { host: AMI_HOST, port: Number(AMI_PORT), username: 'twake_gateway', password: WAZO_GATEWAY_AMI_PASSWORD }
+const AMI_ORIGINATE = { host: AMI_HOST, port: Number(AMI_PORT), username: 'twake_gateway_originate', password: WAZO_GATEWAY_ORIGINATE_PASSWORD }
+const supervision = new WazoSupervision({ ami: AMI_GATEWAY, originate: AMI_ORIGINATE, recordingsUrl: WAZO_RECORDINGS_URL, recordingsToken: WAZO_RECORDINGS_TOKEN })
 // Step 11b: the client-server API of the stack's homeserver, as a person's Twake Chat (or the bot) calls it.
 const matrix = async (token, method, path, body) => {
   const res = await fetch(`${SYNAPSE_URL}/_matrix/client/v3${path}`, {
@@ -500,6 +520,13 @@ const gateway = await buildApp(registry, {
   voicemail: tenantId => (tenantId === TENANT ? wazo : undefined),
   // A synchronisation of the mailboxes that failed (Wazo out of reach) is tried again every 2 s here (the steps wait for it, not for the 30 s of the Gateway's default).
   voicemailRetryMs: [1_000, 2_000],
+  // Step 11d: the supervision of the calls Wazo has (Alice administers, so supervises; Bob does not); a recording is kept 30 days, the sweep looks every 2 s here.
+  supervision: tenantId => (tenantId === TENANT ? supervision : undefined),
+  recordingRetentionDays: 30,
+  recordingSweepMs: 2_000,
+  supervisionSpyWaitMs: 20_000,
+  // Every read of the calls is a fresh one here: the steps look at what has just changed.
+  supervisionCallsCacheMs: 0,
   // Step 11b: LinTO STT of the stack, the bot on its homeserver, each person's Matrix id from their uid.
   transcription: { provider: new LintoTranscription({ url: LINTO_URL, timeoutMs: 60_000 }), maxSec: 180, queueMax: 100, maxBytes: 180 * 48_000 + 65_536, lang: 'fr' },
   notices: { bot: new MatrixBot({ homeserverUrl: SYNAPSE_URL, token: matrixTokens['twakephone-bot'] }), userTemplate: `@{uid}:${MATRIX_SERVER}`, appUrl: appOrigin, timeZone: 'Europe/Paris' }
@@ -610,10 +637,55 @@ const mi = (method, params) =>
     const [, host, port] = /^udp:(.+):(\d+)$/.exec(OPENSIPS_MI_URL) ?? []
     const socket = createSocket('udp4')
     const timer = setTimeout(() => (socket.close(), reject(new Error(`MI ${method}: no answer`))), 5_000)
-    socket.on('message', msg => (clearTimeout(timer), socket.close(), resolve(JSON.parse(msg.toString()))))
+    // The reply comes from the MI socket and is JSON: a stray datagram on this ephemeral port (media, a late packet) is not it.
+    socket.on('message', (msg, from) => {
+      if (from.port !== Number(port)) return
+      let reply
+      try {
+        reply = JSON.parse(msg.toString())
+      } catch {
+        return
+      }
+      clearTimeout(timer)
+      socket.close()
+      resolve(reply)
+    })
     socket.send(JSON.stringify({ jsonrpc: '2.0', method, ...(params ? { params } : {}), id: 1 }), Number(port), host)
   })
 const soundBlocked = page => page.evaluate(() => window.twakephone.soundBlocked)
+/** The windows OpenSIPS keeps for `ext` (MI ul_dump), by their Contact. */
+const windowsOf = async ext => {
+  const dump = (await mi('ul_dump', {})).result
+  const aor = (dump?.Domains ?? []).flatMap(d => d.AORs ?? []).find(a => a.AOR === ext)
+  return (aor?.Contacts ?? []).map(c => c.Contact)
+}
+/**
+ * Forgets every window OpenSIPS keeps for `ext` (MI ul_rm, as for an account that goes), to be called once no page of that
+ * person is open any more. A window closed without a clean unregister leaves its registration on a dead connection, which
+ * OpenSIPS drops only when it expires (300 s after its last REGISTER, at the next sweep of the table): left to expire, it
+ * is gone for a slow run and still there for a quick one, so that a later count of windows or a call to the extension
+ * depended on the speed of the runner.
+ */
+const forgetWindows = async ext => {
+  // Nothing to forget is not an error to us (OpenSIPS may say so): what counts is that nothing is left.
+  const res = await mi('ul_rm', ['location', ext])
+  expectEqual(await windowsOf(ext), [], `the windows of ${ext} in OpenSIPS once forgotten (MI ul_rm said ${JSON.stringify(res.error ?? 'ok')})`)
+}
+/**
+ * Opens the form « Ajouter un participant » of a conference and types the target in it. Opened only when it is not: the
+ * panel is drawn again as the room's list changes, which closes a form opened a moment before, and a button pressed
+ * twice closes it.
+ */
+const openAddForm = async (page, target) => {
+  const button = page.getByRole('button', { name: 'Ajouter un participant' })
+  const field = page.getByLabel('Participant à ajouter (poste ou numéro)')
+  await until('the form to add a participant open with its target typed', async () => {
+    if (!(await field.isVisible()) && (await button.getAttribute('aria-pressed', { timeout: 1_000 })) !== 'true' && (await button.isEnabled({ timeout: 1_000 }))) await button.click({ timeout: 2_000 }).catch(() => {})
+    if (!(await field.isVisible())) return null
+    await field.fill(target, { timeout: 2_000 }).catch(() => {})
+    return (await field.inputValue({ timeout: 1_000 }).catch(() => null)) === target ? true : null
+  }, { timeout: 30_000 })
+}
 /** Waits for the ringtone element to play (not paused, live stream) or to be quiet; says what it saw otherwise. */
 const ringerPlaying = async (page, playing) => {
   const state = () => page.evaluate(() => {
@@ -2249,6 +2321,8 @@ try {
   })
   await step('Jean opens TwakePhone again for what follows', async () => {
     await jean.context.close()
+    // Nobody of his is on line: what OpenSIPS keeps for 102 is what his closed windows left (leaveApp), which no longer serves.
+    await forgetWindows('102')
     jean = await open('jdupont', 'Jean Dupont')
     await phoneState(jean.page).getByText('En ligne').waitFor({ timeout: 20_000 })
   })
@@ -2458,6 +2532,8 @@ try {
     await operator.callState(placed, 'ended', 45_000)
   })
   await step('Jean opens TwakePhone again; the operator calls Bob\'s direct number and gives up while it rings (CANCEL): Bob stops ringing', async () => {
+    // The window closed just before (the call of the operator to it ended on its dead connection) leaves its registration as well.
+    await forgetWindows('102')
     jean = await open('jdupont', 'Jean Dupont')
     await phoneState(jean.page).getByText('En ligne').waitFor({ timeout: 20_000 })
     const placed = await operator.call('+33199000103', { from: '+33639980002' })
@@ -2920,8 +2996,7 @@ try {
         look()
       })
     const statusTexts = who => who.page.evaluate(() => window.__statusTexts ?? [])
-    await alice.page.getByRole('button', { name: 'Ajouter un participant' }).click()
-    await alice.page.getByLabel('Participant à ajouter (poste ou numéro)').fill('103')
+    await openAddForm(alice.page, '103')
     await alice.page.getByRole('button', { name: 'Appeler et ajouter' }).click()
     // Alice: the room's call to her window only, her call with Jean ended as a conference.
     const [mine] = await until('Alice in the conference', async () => {
@@ -3023,8 +3098,7 @@ try {
   // Step 8c (ADR 0025): a call with the operator becomes a conference by the room calling the same number again.
   const OPERATED = 'sip:+33639980006@operator.example'
   const operatorConference = async () => {
-    await alice.page.getByRole('button', { name: 'Ajouter un participant' }).click()
-    await alice.page.getByLabel('Participant à ajouter (poste ou numéro)').fill('103')
+    await openAddForm(alice.page, '103')
     await alice.page.getByRole('button', { name: 'Appeler et ajouter' }).click()
   }
   await step('step 8c: a mailbox of the operator answers the number called again (here the operator answers the second call as it would a mailbox): the first call is never hung up by itself; Alice, who does not hear her correspondent, gives up (« Annuler et reprendre l\'appel »): the room ends, the callback is hung up, the first call goes on with its sound back, and Bob was never rung', async () => {
@@ -3106,8 +3180,7 @@ try {
     await bothHearEachOther(alice, bob)
   })
   await step('step 8c: the number is added to a conference too (« Ajouter un participant » with an external number, the rights and caps of Alice): the room calls it from her direct number and it joins; Alice removes it and ends the conference for everyone', async () => {
-    await alice.page.getByRole('button', { name: 'Ajouter un participant' }).click()
-    await alice.page.getByLabel('Participant à ajouter (poste ou numéro)').fill('06 39 98 00 07')
+    await openAddForm(alice.page, '06 39 98 00 07')
     await alice.page.getByRole('button', { name: 'Appeler et ajouter' }).click()
     const { call, at } = await invitedAtOperator(invite => invite.uri === 'sip:+33639980007@operator.example')
     if (!(call.invite.headers.get('from')?.[0] ?? '').includes('<sip:+33199000101@operator.example>')) throw new Error(`From of the call to the added number: ${call.invite.headers.get('from')}`)
@@ -3220,18 +3293,27 @@ try {
     try {
       // The conference: Alice, Jean, Bob, and two numbers of the operator.
       await aliceCallsJean(alice, jean)
-      await alice.page.getByRole('button', { name: 'Ajouter un participant' }).click()
-      await alice.page.getByLabel('Participant à ajouter (poste ou numéro)').fill('103')
+      await openAddForm(alice.page, '103')
       await alice.page.getByRole('button', { name: 'Appeler et ajouter' }).click()
       const ringing = bob.page.getByTestId('incoming-call')
-      await ringing.waitFor({ timeout: 30_000 })
+      await ringing.waitFor({ timeout: 30_000 }).catch(async err => {
+        // For whoever reads the failure: whether Bob's window was registered, and what OpenSIPS and LiveKit SIP said of the call to 103.
+        try {
+          const logs = service => execFileSync('docker', ['compose', '-f', fileURLToPath(new URL('../../../docker/docker-compose.sip.yml', import.meta.url)), 'logs', '--no-color', '--no-log-prefix', '--tail', '400', service], { encoding: 'utf8', timeout: 30_000, maxBuffer: 64 << 20 }).split('\n')
+          const said = logs('opensips').filter(l => /103|INVITE|call /.test(l) && !/from' key|failed to unregister/.test(l)).slice(-30)
+          const sip = logs('livekit-sip').filter(l => /"toUser": "103"/.test(l) && /fail|error|status/i.test(l)).slice(-6).map(l => l.slice(0, 700))
+          console.log(`[8d] Bob did not ring. Windows of 103: ${JSON.stringify(await windowsOf('103'))}\n[8d] OpenSIPS: ${said.join('\n')}\n[8d] LiveKit SIP: ${sip.join('\n')}`)
+        } catch (diagnosis) {
+          console.log(`[8d] Bob did not ring, and the diagnosis failed: ${diagnosis}`)
+        }
+        throw err
+      })
       await ringing.getByRole('button', { name: 'Répondre' }).click()
       await until('Bob in the conference', async () => ((await calls(bob.page))[0]?.state === 'connected' ? true : null), { timeout: 30_000 })
       await alice.page.getByTestId('conference-participant').nth(2).waitFor({ timeout: 20_000 })
       const firsts = {}
       for (const [typed, uri] of [['06 39 98 00 07', '+33639980007'], ['06 39 98 00 08', '+33639980008']]) {
-        await alice.page.getByRole('button', { name: 'Ajouter un participant' }).click()
-        await alice.page.getByLabel('Participant à ajouter (poste ou numéro)').fill(typed)
+        await openAddForm(alice.page, typed)
         await alice.page.getByRole('button', { name: 'Appeler et ajouter' }).click()
         const { call, at } = await invitedAtOperator(invite => invite.uri === `sip:${uri}@operator.example`)
         await at.callState(call, 'answered')
@@ -3483,12 +3565,6 @@ try {
     const compose = (...args) => execFileSync('docker', ['compose', '-f', COMPOSE_FILE, ...args], { encoding: 'utf8', timeout: 60_000 })
     /** What Asterisk has of the contacts of a line: "103/sip:103@127.0.0.2:5096" and the like. */
     const contactsOf = ext => asteriskCli('pjsip show contacts').split('\n').map(l => /^\s*Contact:\s+(\S+)/.exec(l)?.[1]).filter(c => c?.startsWith(`${ext}/`))
-    /** The windows OpenSIPS keeps for `ext` (MI ul_dump), by their Contact. */
-    const windowsOf = async ext => {
-      const dump = (await mi('ul_dump', {})).result
-      const aor = (dump?.Domains ?? []).flatMap(d => d.AORs ?? []).find(a => a.AOR === ext)
-      return (aor?.Contacts ?? []).map(c => c.Contact)
-    }
     await step('step 11c-1: each holder of an extension has a line at Wazo (an endpoint named after the extension, nothing of the person) and OpenSIPS was told once Wazo had it (wazo_lines)', async () => {
       const holders = (await store.listMappings(TENANT)).map(m => m.extension).sort()
       const rows = await until('a line for each holder in wazo_lines', async () => {
@@ -3560,6 +3636,185 @@ try {
         wazoSide.close()
       }
     })
+    // ---- Step 11d (ADR 0029): the recording and the supervision of the calls Wazo has ----------------------------
+    const supervisionSteps = async () => {
+      const refused = async (promise, pattern, what) => {
+        const err = await promise.then(() => null, e => e)
+        if (!err || !pattern.test(err.message)) throw new Error(`${what}: expected a refusal matching ${pattern}, got ${err ? err.message : 'success'}`)
+      }
+      await step('step 11d: the Gateway\'s two accounts in the AMI of Wazo hold what they must and no more: the first lists the calls and records but may not originate, the second originates (a notice, a supervisor\'s call) but may not run a shell nor list the calls, neither has the CLI or the configuration to write', async () => {
+        const listed = await amiAction(AMI_GATEWAY, { Action: 'CoreShowChannels' }, { wait: 'list' })
+        expectEqual(listed.response.Response, 'Success', 'CoreShowChannels by the first account')
+        await refused(amiAction(AMI_GATEWAY, { Action: 'MixMonitor', Channel: '1.1', File: '/tmp/never.wav' }), /No such channel/, 'MixMonitor of a channel that is not there, by the first account (allowed, so the channel is what is missing)')
+        for (const [name, account] of [['first', AMI_GATEWAY], ['second', AMI_ORIGINATE]]) {
+          await refused(amiAction(account, { Action: 'Command', Command: 'core show version' }), /Permission denied/, `Command by the ${name} account`)
+          await refused(amiAction(account, { Action: 'UpdateConfig', SrcFilename: 'manager.conf', DstFilename: 'manager.conf' }), /Permission denied/, `UpdateConfig by the ${name} account`)
+        }
+        await refused(amiAction(AMI_GATEWAY, { Action: 'Originate', Channel: 'Local/s@twake-opensips', Application: 'Playback', Data: 'beep', Async: 'true' }), /Permission denied/, 'Originate by the first account')
+        await refused(amiAction(AMI_ORIGINATE, { Action: 'CoreShowChannels' }, { wait: 'list' }), /Permission denied/, 'CoreShowChannels by the second account')
+        await refused(amiAction(AMI_ORIGINATE, { Action: 'MixMonitor', Channel: '1.1', File: '/tmp/never.wav' }), /Permission denied/, 'MixMonitor by the second account')
+        await refused(amiAction(AMI_ORIGINATE, { Action: 'Originate', Channel: 'Local/s@twake-opensips', Application: 'System', Data: 'true', Async: 'true' }, { events: 'call', wait: 'event' }), /blacklisted/, 'an Originate that runs a shell, by the second account')
+        // No recording without its notice: a sound the telephony server has not is refused before anything is asked of Asterisk.
+        const silent = new WazoSupervision({ ami: AMI_GATEWAY, originate: AMI_ORIGINATE, recordingsUrl: WAZO_RECORDINGS_URL, recordingsToken: WAZO_RECORDINGS_TOKEN, noticeSound: 'custom/absent-notice' })
+        const absent = await silent.startRecording({ id: '1.1' }, { tenant: TENANT, name: '3f2b8c0e-4d1a-4b7e-9c55-0a1b2c3d4e5f' }).then(() => null, e => e)
+        expectEqual(absent?.code, 'notice', 'a recording whose notice is not on the telephony server')
+        expectEqual(await supervision.noticeAvailable(), true, 'the notice of the stack on the telephony server')
+        // The recordings server asks its token, and the Gateway's reads and erasures are by it.
+        expectEqual((await fetch(`${WAZO_RECORDINGS_URL}/e2e/3f2b8c0e-4d1a-4b7e-9c55-0a1b2c3d4e5f`)).status, 401, 'the recordings server without its token')
+        expectEqual((await fetch(`${WAZO_RECORDINGS_URL}/e2e/3f2b8c0e-4d1a-4b7e-9c55-0a1b2c3d4e5f`, { headers: { authorization: `Bearer ${WAZO_RECORDINGS_TOKEN}` } })).status, 404, 'the recordings server with its token, a file it has not')
+      })
+      let alice2
+      let wazoSide
+      let callId
+      let supApi
+      let bobApi
+      /** Wazo places an echo call to 103: both windows of Bob ring, the second answers. */
+      const wazoCallsBob = async () => {
+        const side = await wazoAmi()
+        const ended = side.originate({ channel: 'PJSIP/103', application: 'Echo', callerId: '"Standard" <0100>' })
+        ended.catch(() => undefined)
+        for (const who of [bob, bob2]) await who.page.getByTestId('incoming-call').getByText(/Standard \(01 00\)/).waitFor({ timeout: 20_000 })
+        await bob2.page.getByTestId('incoming-call').getByRole('button', { name: 'Répondre' }).click()
+        expectEqual((await ended).response, 'Success', 'the answer of Wazo to its call')
+        await rtpBothWays(bob2)
+        return side
+      }
+      // The list is shared for 2 s between readers: the call that ended may still be in it, so another one than `not` is waited for.
+      const callOfBob = (not) => until('the call of Bob in the supervision', async () => (await supApi('GET', '/supervision/calls')).json().items?.find(c => c.extension === '103' && c.id !== not) ?? null, { timeout: 20_000 })
+      await step('step 11d, the demo: Wazo calls 103 (a call it holds); Alice, an administrator and so a supervisor, has her line at Wazo by a window of her own; the supervision lists the call (Bob\'s line, the number Wazo gives, his name from the directory) and keeps Bob, who is no supervisor, out of every route', async () => {
+        alice2 = await open('amartin', 'Alice Martin')
+        await phoneState(alice2.page).getByText('En ligne').waitFor({ timeout: 20_000 })
+        await until('the contact of 101 at Wazo', async () => (contactsOf('101').length ? true : null), { timeout: 20_000 })
+        wazoSide = await wazoCallsBob()
+        supApi = await asPerson(alice2)
+        bobApi = await asPerson(bob)
+        const call = await callOfBob()
+        expectEqual([call.peer, call.peerName, call.displayName, call.state], ['0100', 'Standard', 'Bob Durand', 'up'], 'the call as the supervision lists it')
+        callId = call.id
+        for (const [method, url, payload] of [['GET', '/supervision/calls'], ['POST', `/supervision/calls/${callId}/recording`, { action: 'start' }], ['POST', `/supervision/calls/${callId}/spy`, { mode: 'listen' }], ['GET', '/supervision/recordings'], ['GET', '/supervision/log'], ['DELETE', '/supervision/recordings/3f2b8c0e-4d1a-4b7e-9c55-0a1b2c3d4e5f']]) {
+          expectEqual((await bobApi(method, url, payload)).statusCode, 403, `${method} ${url} as Bob`)
+        }
+        expectEqual((await bobApi('GET', '/me')).json().features.supervision, undefined, 'what /me says to Bob of the supervision')
+        expectEqual((await supApi('GET', '/me')).json().features.supervision, true, 'what /me says to Alice of the supervision')
+      })
+      let recording
+      await step('step 11d, recording: from the screen Alice records the call (the notice is spied onto the channel by Wazo\'s own context, then MixMonitor records both ways), the screen says it is being recorded, she stops it and listens to it in the page', async () => {
+        const page = alice2.page
+        await page.getByRole('link', { name: 'Supervision' }).click()
+        await page.getByRole('heading', { name: 'Supervision', level: 1 }).waitFor()
+        const row = page.getByTestId('supervision-call').filter({ hasText: 'Bob Durand (103)' })
+        await row.getByText(/Standard \(01 00\)/).waitFor({ timeout: 20_000 })
+        await row.getByRole('button', { name: "Enregistrer l'appel de Bob Durand (103)" }).click()
+        await row.getByText('Enregistrement en cours').waitFor({ timeout: 30_000 })
+        // The notice: Wazo's wazo-play-beep context spies the channel of Bob's line; and the recording of that channel.
+        await until('the ChanSpy of the notice on the channel of 103', async () => wazoSide.heard(/^Event: ChanSpyStart/m).find(e => /SpyerChannel: Local\/s@wazo-play-beep/.test(e) && /SpyeeChannel: PJSIP\/103-/.test(e)) ?? null, { timeout: 20_000 })
+        await until('the MixMonitor of the channel of 103', async () => wazoSide.heard(/^Event: MixMonitorStart/m).find(e => /Channel: PJSIP\/103-/.test(e)) ?? null, { timeout: 20_000 })
+        // The notice first: the spy of Wazo's context on the channel came before the recording of it.
+        const noticeAt = wazoSide.firstIndex(e => /^Event: ChanSpyStart/m.test(e) && /SpyerChannel: Local\/s@wazo-play-beep/.test(e) && /SpyeeChannel: PJSIP\/103-/.test(e))
+        const recordAt = wazoSide.firstIndex(e => /^Event: MixMonitorStart/m.test(e) && /Channel: PJSIP\/103-/.test(e))
+        if (!(noticeAt >= 0 && noticeAt < recordAt)) throw new Error(`the notice (event ${noticeAt}) was not before the recording (event ${recordAt})`)
+        // A second recording of the same call is refused while one is under way.
+        const twice = await supApi('POST', `/supervision/calls/${callId}/recording`, { action: 'start' })
+        expectEqual([twice.statusCode, twice.json().code], [409, 'RECORDING_UNDER_WAY'], 'a second recording of the call')
+        await rtpBothWays(bob2)
+        await sleep(3_000)
+        await row.getByRole('button', { name: "Arrêter l'enregistrement de l'appel de Bob Durand (103)" }).click()
+        const ready = page.locator('[data-testid=supervision-recording][data-state=ready]').first()
+        await ready.waitFor({ timeout: 30_000 })
+        await ready.getByRole('button', { name: /^Écouter l'enregistrement de Bob Durand \(103\)/ }).click()
+        await page.waitForFunction(() => {
+          const a = document.querySelector('[data-testid=supervision-audio]')
+          return !!a && a.src.startsWith('blob:') && a.duration > 1
+        }, null, { timeout: 20_000 })
+        recording = (await supApi('GET', '/supervision/recordings')).json().items.find(r => r.state === 'ready')
+        if (!recording) throw new Error('no recording ready after the stop')
+        expectEqual([recording.extension, recording.displayName, recording.startedBy], ['103', 'Bob Durand', 'amartin'], 'the recording as the supervision lists it')
+        if (!(recording.durationSec >= 3)) throw new Error(`the recording lasts ${recording.durationSec} s`)
+      })
+      await step('step 11d, the audio is a WAV with sound in it (what Bob said and the echo gave back), journalled each time it is listened to; the recordings server has the file, Bob cannot reach it, and the journal says who did what without a number or a word', async () => {
+        const audio = await supApi('GET', `/supervision/recordings/${recording.id}/audio`)
+        expectEqual(audio.statusCode, 200, 'the audio')
+        expectEqual(audio.headers['content-type'], 'audio/wav', 'its type')
+        const wav = audio.rawPayload
+        expectEqual([wav.subarray(0, 4).toString(), wav.subarray(8, 12).toString()], ['RIFF', 'WAVE'], 'its header')
+        // The size the record says is what the recordings server has. Its sound lasts what the call lasted after the notice (the notice is 1.5 s),
+        // and the end of it, long after the notice, still has the voice of the window and its echo in it.
+        if (wav.length < recording.sizeBytes) throw new Error(`the audio is ${wav.length} bytes, the record says ${recording.sizeBytes}`)
+        const byteRate = wav.readUInt32LE(28)
+        const seconds = (wav.length - 44) / byteRate
+        if (!(seconds >= 3)) throw new Error(`the recording lasts ${seconds} s of sound (${wav.length} bytes at ${byteRate} a second)`)
+        let tail = 0
+        for (let i = Math.max(44, wav.length - Math.floor(1.5 * byteRate)); i + 1 < wav.length; i += 2) tail = Math.max(tail, Math.abs(wav.readInt16LE(i)))
+        if (tail < 100) throw new Error(`the last 1.5 s of the recording are silent (peak ${tail}): only the notice is in it`)
+        expectEqual((await bobApi('GET', `/supervision/recordings/${recording.id}/audio`)).statusCode, 403, 'the audio as Bob')
+        const file = await fetch(`${WAZO_RECORDINGS_URL}/${TENANT}/${recording.id}`, { headers: { authorization: `Bearer ${WAZO_RECORDINGS_TOKEN}` } })
+        expectEqual(Number(file.headers.get('content-length')), wav.length, 'the file at the recordings server')
+        await file.arrayBuffer()
+        const log = (await supApi('GET', '/supervision/log')).json().items
+        const mine = log.filter(e => e.recordingId === recording.id).map(e => e.action)
+        for (const action of ['record-start', 'record-stop', 'listen-recording']) if (!mine.includes(action)) throw new Error(`the journal has no ${action}: ${JSON.stringify(mine)}`)
+        expectEqual(log.find(e => e.action === 'record-start').actorName, 'Alice Martin', 'who the journal says started it')
+        if (/0100|Standard|Bob/.test(JSON.stringify(log))) throw new Error(`the journal holds a number or a name of the call: ${JSON.stringify(log).slice(0, 300)}`)
+      })
+      await step('step 11d, supervising: Alice listens, then barges in (her own line is called, she answers, ChanSpy runs on the channel of Bob\'s line in the mode asked, the call goes on, her channel is no call of the list)', async () => {
+        for (const [mode, options] of [['listen', 'uqE'], ['barge', 'uqEB']]) {
+          const before = wazoSide.heard(/^Event: ChanSpyStart/m).filter(e => /SpyerChannel: PJSIP\/101-/.test(e)).length
+          const posted = supApi('POST', `/supervision/calls/${callId}/spy`, { mode })
+          const card = alice2.page.getByTestId('incoming-call')
+          await card.getByText(/Supervision \(01 99\)/).waitFor({ timeout: 20_000 })
+          // Her line is ringing with the call of the supervision: it is no call to supervise.
+          expectEqual((await supApi('GET', '/supervision/calls')).json().items.map(c => c.extension), ['103'], 'the calls listed while the supervisor\'s line rings')
+          await card.getByRole('button', { name: 'Répondre' }).click()
+          const r = await posted
+          expectEqual([r.statusCode, r.json().state], [202, 'answered'], `the supervision call (${mode})`)
+          await until(`the ChanSpy of the supervisor (${mode})`, async () => (wazoSide.heard(/^Event: ChanSpyStart/m).filter(e => /SpyerChannel: PJSIP\/101-/.test(e) && /SpyeeChannel: PJSIP\/103-/.test(e)).length > before ? true : null), { timeout: 20_000 })
+          const channels = asteriskCli('core show channels concise')
+          if (!channels.includes(`ChanSpy!${callId},${options}!`)) throw new Error(`no ChanSpy in mode ${mode} (${options}) on ${callId}:\n${channels}`)
+          // Alice hears the call through her phone; Bob's call goes on; the supervisor's channel is not one of the calls to supervise.
+          await rtpBothWays(alice2)
+          expectEqual((await calls(bob2.page)).length, 1, 'calls of Bob while he is supervised')
+          expectEqual((await supApi('GET', '/supervision/calls')).json().items.map(c => c.extension), ['103'], 'the calls listed while Alice is in one')
+          await alice2.page.getByRole('button', { name: 'Raccrocher' }).click()
+          await until('the supervisor\'s channel ended', async () => (asteriskCli('core show channels concise').includes('PJSIP/101-') ? null : true), { timeout: 20_000 })
+        }
+        const spied = (await supApi('GET', '/supervision/log')).json().items.map(e => e.action)
+        for (const action of ['spy-listen', 'spy-barge']) if (!spied.includes(action)) throw new Error(`the journal has no ${action}`)
+        // Her own call is hers to make: Bob's phone is the one called, never a call of Alice's.
+        expectEqual((await supApi('POST', '/supervision/calls/1792479546.99/spy', { mode: 'listen' })).statusCode, 404, 'a call that does not exist')
+      })
+      await step('step 11d: Bob hangs up; the recording of the call is closed ready by the Gateway when nobody stopped it (a second call of Wazo, recorded, the call ended)', async () => {
+        await bob2.page.getByRole('button', { name: 'Raccrocher' }).click()
+        await until('the channel of Wazo ended', async () => (asteriskCli('core show channels concise').includes('PJSIP/103-') ? null : true), { timeout: 20_000 })
+        wazoSide.close()
+        wazoSide = await wazoCallsBob()
+        const second = await callOfBob(callId)
+        const started = await supApi('POST', `/supervision/calls/${second.id}/recording`, { action: 'start' })
+        expectEqual(started.statusCode, 201, started.body)
+        await rtpBothWays(bob2)
+        await sleep(2_000)
+        await bob2.page.getByRole('button', { name: 'Raccrocher' }).click()
+        // The Gateway looks every 2 s here: the recording is closed, with a file of its own.
+        const closed = await until('the recording of the call that ended closed', async () => (await supApi('GET', '/supervision/recordings')).json().items.find(r => r.id === started.json().id && r.state === 'ready') ?? null, { timeout: 30_000 })
+        if (!closed.endedAt || !(closed.sizeBytes > 44)) throw new Error(`the recording closed: ${JSON.stringify(closed)}`)
+        wazoSide.close()
+        wazoSide = undefined
+      })
+      await step('step 11d, retention: a recording older than RECORDING_RETENTION_DAYS is erased by the Gateway (its file at the recordings server and in Asterisk\'s folder, its record kept as purged, the journal says the platform did it), and is no longer listened to; the newer one stays', async () => {
+        const all = (await supApi('GET', '/supervision/recordings')).json().items
+        const young = all.find(r => r.state === 'ready' && r.id !== recording.id)
+        await store.pool.query("UPDATE recordings SET started_at = now() - interval '31 days' WHERE tenant_id = $1 AND id = $2", [TENANT, recording.id])
+        await until('the old recording purged', async () => ((await supApi('GET', '/supervision/recordings')).json().items.find(r => r.id === recording.id)?.state === 'purged' ? true : null), { timeout: 30_000 })
+        expectEqual((await supApi('GET', `/supervision/recordings/${recording.id}/audio`)).statusCode, 404, 'the audio of the purged recording')
+        const folder = inAsterisk('ls', `/var/lib/wazo/sounds/tenants/${TENANT}/monitor`)
+        if (folder.includes(recording.id)) throw new Error(`the file is still in Asterisk's folder: ${folder}`)
+        if (!folder.includes(young.id)) throw new Error(`the newer recording's file is gone: ${folder}`)
+        expectEqual((await supApi('GET', `/supervision/recordings/${young.id}/audio`)).statusCode, 200, 'the audio of the newer recording')
+        const purged = (await supApi('GET', '/supervision/log')).json().items.find(e => e.action === 'purge' && e.recordingId === recording.id)
+        expectEqual(purged?.actor, 'system', 'who the journal says erased it')
+      })
+      await signOut(alice2)
+    }
+    await supervisionSteps()
     await step('step 11c-1: Wazo calls 103 and Bob declines: Wazo is told it was refused (no mailbox, no forward: Wazo decided); a call from Wazo to a number that has no window leaves Wazo the failure', async () => {
       const wazoSide = await wazoAmi()
       try {
@@ -3595,7 +3850,8 @@ try {
         await phoneState(jean3.page).getByText('En ligne').waitFor({ timeout: 90_000 })
         const muted = Number(await shvOf('wazo_lines_mute_until'))
         if (!(muted > Date.now() / 1000 - 5)) throw new Error(`the lines were not left out: wazo_lines_mute_until ${muted}`)
-        expectEqual((await windowsOf('102')).length, 2, 'the windows of 102 in OpenSIPS')
+        const windows102 = await windowsOf('102')
+        expectEqual(windows102.length, 2, `the windows of 102 in OpenSIPS (${JSON.stringify(windows102)})`)
         await dial(bob.page, '102')
         for (const who of [jean, jean3]) await who.page.getByTestId('incoming-call').getByText('Appel entrant de Bob Durand (103)').waitFor({ timeout: 20_000 })
         await jean3.page.getByTestId('incoming-call').getByRole('button', { name: 'Répondre' }).click()
@@ -3612,6 +3868,238 @@ try {
     await step('step 11c-1: Bob\'s second window signs out: 103 is reached in the first one only', async () => {
       await signOut(bob2)
       expectEqual((await windowsOf('103')).length, 1, 'the windows of 103 in OpenSIPS')
+    })
+    // ---- Step 11c-2 (ADR 0028): sequential groups, queues and voice menus, run by Wazo, ringing the windows through the lines
+    let jeanW
+    let bobW
+    /** The names Wazo gave the groups of the flows (what Asterisk calls the queues). */
+    let groupNames = []
+    /** The windows of the members, and the one of them that rings (the others stay silent). */
+    const ringing = who => who.page.getByTestId('incoming-call')
+    const anyRings = async windows => Promise.any(windows.map(async w => (await ringing(w).waitFor({ timeout: 40_000 }), w)))
+    const flowRows = async () => (await db.query('SELECT number, route FROM call_flows ORDER BY number')).rows
+    await step('step 11c-2, the demo set up: Alice, an administrator, makes in Administration a sequential group 810 (Jean, then Bob, 5 s each), a queue 801 (Jean and Bob, 8 s each, 40 s at most), a sequential group 811 and a queue 802 of 104 (nobody has a window there) and a voice menu 800 (1: the queue, 2: the group); an extension, a ring group or a number twice is no flow number; Wazo makes the groups, then OpenSIPS is told which numbers go there', async () => {
+      // Windows of Jean and Bob opened now, their line existing: Wazo holds their contact (the windows of before registered without it).
+      // Not while OpenSIPS leaves the lines out (30 s after a silent Wazo, the step before): a window registers here only then.
+      await until('the lines taken again by OpenSIPS', async () => (Number(await shvOf('wazo_lines_mute_until')) <= Date.now() / 1000 ? true : null), { timeout: 45_000 })
+      jeanW = await open('jdupont', 'Jean Dupont')
+      bobW = await open('bdurand', 'Bob Durand')
+      // Alice signed out a few steps ago (and signs out again at the end: the mailbox steps that follow need her without a window).
+      alice = await open('amartin', 'Alice Martin')
+      await phoneState(alice.page).getByText('En ligne').waitFor({ timeout: 20_000 })
+      await until('the contacts of 102 and 103 at Wazo', async () => (contactsOf('102').length && contactsOf('103').length ? true : null), { timeout: 30_000 })
+      await openAdmin(alice.page, "Parcours d'appel")
+      const make = async ({ kind, number, name, members, ring, wait, choices }) => {
+        await alice.page.getByLabel('Type').selectOption(kind)
+        await alice.page.getByLabel('Numéro du parcours').fill(number)
+        await alice.page.getByLabel('Nom affiché').fill(name)
+        if (members) await alice.page.getByLabel('Postes membres').fill(members)
+        if (ring) await alice.page.getByLabel('Sonnerie de chaque membre (secondes)').fill(ring)
+        if (wait) await alice.page.getByLabel("Attente d'un appelant (secondes)").fill(wait)
+        if (choices) await alice.page.getByLabel('Touches').fill(choices)
+        const answered = alice.page.waitForResponse(r => r.request().method() === 'POST' && r.url().endsWith('/admin/flows'))
+        await alice.page.getByRole('button', { name: 'Enregistrer le parcours' }).click()
+        const res = await answered
+        return `${res.status()} ${res.ok() ? '' : (await res.json()).code}`.trim()
+      }
+      // An extension is no flow number; neither is a ring group's (200 was removed, 210 and the like are not: 105 is an account OpenSIPS may keep).
+      expectEqual(await make({ kind: 'sequential', number: '102', name: 'Pris', members: '103', ring: '5' }), '409 FLOW_NUMBER_TAKEN', 'creating flow 102')
+      await alice.page.locator('#flow-number-error').filter({ hasText: 'Ce numéro est déjà pris' }).waitFor()
+      expectEqual(await make({ kind: 'sequential', number: '810', name: 'Astreinte', members: '102, 103', ring: '5' }), '201', 'creating flow 810')
+      expectEqual(await make({ kind: 'sequential', number: '810', name: 'Encore', members: '102', ring: '5' }), '409 FLOW_EXISTS', 'creating flow 810 again')
+      await alice.page.locator('#flow-number-error').filter({ hasText: 'Un parcours de votre organisation a déjà ce numéro' }).waitFor()
+      expectEqual(await make({ kind: 'queue', number: '801', name: 'Support', members: '102, 103', ring: '8', wait: '40' }), '201', 'creating flow 801')
+      expectEqual(await make({ kind: 'sequential', number: '811', name: 'Absents', members: '104', ring: '5' }), '201', 'creating flow 811')
+      expectEqual(await make({ kind: 'queue', number: '802', name: 'File vide', members: '104', ring: '5', wait: '15' }), '201', 'creating flow 802')
+      expectEqual(await make({ kind: 'menu', number: '800', name: 'Standard', choices: '1=801, 2=810' }), '201', 'creating flow 800')
+      // Wazo makes the groups (each a reload of its queues), then OpenSIPS is told, once each exists.
+      const rows = await until('the five flows in call_flows', async () => ((await flowRows()).length === 5 ? await flowRows() : null), { timeout: 180_000 })
+      expectEqual(rows.map(r => r.number), ['800', '801', '802', '810', '811'], 'the numbers OpenSIPS sends to Wazo')
+      const byNumber = Object.fromEntries(rows.map(r => [r.number, r.route]))
+      for (const [number, shape] of [['810', /^seq\|[A-Za-z0-9_.-]+\|12$/], ['811', /^seq\|[A-Za-z0-9_.-]+\|6$/], ['801', /^queue\|[A-Za-z0-9_.-]+\|40$/], ['802', /^queue\|[A-Za-z0-9_.-]+\|15$/], ['800', /^menu\|1=q:[A-Za-z0-9_.-]+:40~2=s:[A-Za-z0-9_.-]+:12\|twake-menu$/]])
+        if (!shape.test(byNumber[number])) throw new Error(`the route of ${number}: ${byNumber[number]}`)
+      await sysconfdSettled()
+      // Asterisk has them as Wazo's queues (one strategy for each kind), their members the lines of the extensions.
+      const nameOf = number => byNumber[number].split('|')[1]
+      groupNames = ['810', '811', '801', '802'].map(nameOf)
+      const sequential = asteriskCli(`queue show ${nameOf('810')}`)
+      if (!/in 'linear' strategy/.test(sequential) || !sequential.includes('Local/102@twake-members') || !sequential.includes('Local/103@twake-members')) throw new Error(`the sequential group in Asterisk: ${sequential}`)
+      const queue = asteriskCli(`queue show ${nameOf('801')}`)
+      if (!/in 'leastrecent' strategy/.test(queue) || !queue.includes('Local/102@twake-members')) throw new Error(`the queue in Asterisk: ${queue}`)
+      // Read again by the screen (not a reload of the page: its softphone would register anew and leave the registration of the old page behind): every flow says it runs.
+      await alice.page.getByRole('navigation', { name: "Rubriques de l'administration" }).getByRole('link', { name: 'Comptes', exact: true }).click()
+      await openAdmin(alice.page, "Parcours d'appel")
+      const list = alice.page.getByRole('list', { name: 'Parcours existants' })
+      await list.getByText(/— en service$/).first().waitFor()
+      expectEqual(await list.getByText(/— en cours de mise en service$/).count(), 0, 'flows said to be set up still')
+      expectEqual(await list.getByText(/— en service$/).count(), 5, 'flows said to run')
+    })
+    await step('step 11c-2, the demo: Alice dials the sequential group 810; Jean\'s windows ring and he lets them, then Bob\'s ring and he answers on one: Alice and Bob hear each other, the other window is told it was answered elsewhere; the CDR says the call went to a flow', async () => {
+      const after = await lastId('acc')
+      await dial(alice.page, '810')
+      for (const w of [jean, jeanW]) await ringing(w).getByText(/101/).waitFor({ timeout: 20_000 })
+      for (const w of [bob, bobW]) expectEqual(await ringing(w).count(), 0, `incoming calls of ${w.name} while Jean rings`)
+      // Alice hears it ringing, not answered, while the members ring.
+      expectEqual((await calls(alice.page))[0]?.state === 'connected', false, 'the call to a sequential group answered before a member answers')
+      // After 5 s the next member rings; Jean's windows go quiet.
+      for (const w of [bob, bobW]) await ringing(w).getByText(/101/).waitFor({ timeout: 30_000 })
+      for (const w of [jean, jeanW]) await ringing(w).waitFor({ state: 'hidden', timeout: 20_000 })
+      await ringing(bobW).getByRole('button', { name: 'Répondre' }).click()
+      await alice.page.getByText(/^En communication avec/).waitFor({ timeout: 20_000 })
+      await bob.page.getByText(/pris sur un autre poste/).waitFor({ timeout: 20_000 })
+      await bothHearEachOther(alice, bobW)
+      await alice.page.getByRole('button', { name: 'Raccrocher' }).click()
+      await bobW.page.getByText(/terminé\./).waitFor({ timeout: 20_000 })
+      const cdrs = await until('the CDR of the flow', async () => {
+        const got = await cdrsViaSince(after)
+        return got.includes('101>810 200 flow') ? got : null
+      }, { timeout: 30_000 })
+      if (!cdrs.includes('101>103 200 wazo')) throw new Error(`the call Wazo placed to Bob: ${cdrs.join(', ')}`)
+    })
+    await step('step 11c-2: a sequential group whose only member has no window (811, the desk 104) fails at once: Alice is told nobody can be reached (480), never that the number does not exist, and it is a missed call of the flow', async () => {
+      const missedAfter = await lastId('missed_calls')
+      const ended = await dialUntilEnded(alice.page, '811')
+      expectEqual(ended.endStatus, 480, 'SIP status of a call to a flow nobody can take')
+      await alice.page.getByText('811 est injoignable.').waitFor()
+      expectEqual(await until('the missed call of 811', async () => ((await missedSince(missedAfter)).includes('101>811 480') ? true : null), { timeout: 15_000 }), true, 'missed_calls of 811')
+    })
+    await step('step 11c-2, the queue 801: Alice is answered and waits; one member\'s windows ring, he answers: they hear each other; the queue has the call as its members come and go', async () => {
+      const after = await lastId('acc')
+      await dial(alice.page, '801')
+      // A queue answers its callers (they wait on the line), a sequential group does not.
+      await alice.page.getByText(/^En communication avec/).waitFor({ timeout: 20_000 })
+      const taker = await anyRings([jean, jeanW, bob, bobW])
+      await ringing(taker).getByRole('button', { name: 'Répondre' }).click()
+      await bothHearEachOther(alice, taker)
+      await alice.page.getByRole('button', { name: 'Raccrocher' }).click()
+      await taker.page.getByText(/terminé\./).waitFor({ timeout: 20_000 })
+      const cdrs = await until('the CDR of the queue', async () => {
+        const got = await cdrsViaSince(after)
+        return got.includes('101>801 200 flow') ? got : null
+      }, { timeout: 30_000 })
+      if (!cdrs.some(c => /^101>10[23] 200 wazo$/.test(c))) throw new Error(`the call the queue placed: ${cdrs.join(', ')}`)
+      // Nobody left ringing.
+      for (const w of [jean, jeanW, bob, bobW]) expectEqual(await ringing(w).count(), 0, `incoming calls of ${w.name} after the queue call`)
+    })
+    await step('step 11c-2: a queue nobody is there for (802, 15 s at most): Alice is answered, waits, and the queue ends the call by itself after its time', async () => {
+      const before = await lastEnded(alice.page)
+      const started = Date.now()
+      await dial(alice.page, '802')
+      await alice.page.getByText(/^En communication avec/).waitFor({ timeout: 20_000 })
+      const ended = await until('the end of the call to the queue', async () => {
+        const e = await lastEnded(alice.page)
+        return e && e.id !== before?.id ? e : null
+      }, { timeout: 60_000 })
+      const waited = (Date.now() - started) / 1000
+      if (waited < 12 || waited > 40) throw new Error(`the queue kept Alice ${waited} s, ${ended.id}`)
+    })
+    await step('step 11c-2, the voice menu: Alice dials 800, hears its greeting (the audio flows from Wazo), types 2: the sequential group rings Jean, who answers; they hear each other', async () => {
+      await dial(alice.page, '800')
+      await alice.page.getByText(/^En communication avec/).waitFor({ timeout: 20_000 })
+      // The greeting plays: media comes from Wazo's Asterisk through rtpengine.
+      await rtpBothWays({ page: alice.page, name: alice.name })
+      await alice.page.getByRole('button', { name: 'Clavier' }).click()
+      await alice.page.getByRole('button', { name: 'Envoyer la touche 2' }).click()
+      await alice.page.getByText('Touches envoyées : 2').waitFor()
+      // The digit leads to the sequential group: Jean first.
+      for (const w of [jean, jeanW]) await ringing(w).getByText(/101/).waitFor({ timeout: 30_000 })
+      await ringing(jeanW).getByRole('button', { name: 'Répondre' }).click()
+      await jean.page.getByText(/pris sur un autre poste/).waitFor({ timeout: 20_000 })
+      await bothHearEachOther(alice, jeanW)
+      await alice.page.getByRole('button', { name: 'Raccrocher' }).click()
+      await jeanW.page.getByText(/terminé\./).waitFor({ timeout: 20_000 })
+    })
+    await step('step 11c-2: a key the menu has nothing for, or none typed, asks again and then hangs up (the call ends by itself)', async () => {
+      const before = await lastEnded(alice.page)
+      await dial(alice.page, '800')
+      await alice.page.getByText(/^En communication avec/).waitFor({ timeout: 20_000 })
+      await alice.page.getByRole('button', { name: 'Clavier' }).click()
+      await alice.page.getByRole('button', { name: 'Envoyer la touche 7' }).click()
+      // Three tries of 6 s, the greeting between them: the menu hangs up.
+      await until('the end of the call to the menu', async () => {
+        const e = await lastEnded(alice.page)
+        return e && e.id !== before?.id ? e : null
+      }, { timeout: 90_000 })
+    })
+    await step('step 11c-2: only an administrator sets flows (403 for Bob); a flow a menu leads to stays (409 FLOW_IN_USE), and no ring group takes the number of a flow (409 GROUP_NUMBER_TAKEN)', async () => {
+      const bobApi = await asPerson(bob)
+      for (const [method, url, payload] of [['GET', '/admin/flows'], ['POST', '/admin/flows', { number: '812', name: 'Pirate', kind: 'sequential', members: ['103'] }], ['PUT', '/admin/flows/810', { name: 'Pirate', kind: 'sequential', members: ['103'] }], ['DELETE', '/admin/flows/810']])
+        expectEqual((await bobApi(method, url, payload)).statusCode, 403, `${method} ${url} as Bob`)
+      const aliceApi = await asPerson(alice)
+      const used = await aliceApi('DELETE', '/admin/flows/801')
+      expectEqual([used.statusCode, used.json().code], [409, 'FLOW_IN_USE'], 'DELETE of a flow a menu leads to')
+      const group = await aliceApi('POST', '/admin/groups', { number: '810', name: 'Groupe', members: ['103'] })
+      expectEqual([group.statusCode, group.json().code], [409, 'GROUP_NUMBER_TAKEN'], 'a ring group at the number of a flow')
+      const menuLoop = await aliceApi('POST', '/admin/flows', { number: '803', name: 'Boucle', kind: 'menu', choices: { 1: '800' } })
+      expectEqual([menuLoop.statusCode, menuLoop.json().code], [400, 'FLOW_CHOICE_TARGET'], 'a menu that leads to a menu')
+      expectEqual((await flowRows()).length, 5, 'flows after the refusals')
+    })
+    await step('step 11c-2: a flow Wazo no longer has (its route names a queue Asterisk lacks) is told unreachable (480, never 404) and is a missed call of the flow; a route OpenSIPS would not read is left out', async () => {
+      // A row written by hand, as the Gateway's would be had Wazo lost the group meanwhile (the next round of the Gateway puts the rows right).
+      const missedAfter = await lastId('missed_calls')
+      await db.query("INSERT INTO call_flows (number, tenant_id, route) VALUES ('819', $1, 'queue|grp-nobody-has-it|20') ON CONFLICT (number) DO UPDATE SET route = EXCLUDED.route", [TENANT])
+      try {
+        const ended = await dialUntilEnded(alice.page, '819')
+        expectEqual(ended.endStatus, 480, 'SIP status of a call to a flow Asterisk lacks')
+        await alice.page.getByText('819 est injoignable.').waitFor()
+        await until('the missed call of 819', async () => ((await missedSince(missedAfter)).includes('101>819 480') ? true : null), { timeout: 15_000 })
+        // A route with other characters than a route has is never read (the print of the SQL regular expression: nothing reaches Asterisk).
+        await db.query("UPDATE call_flows SET route = 'queue|a b;c|20' WHERE number = '819'")
+        const refused = await dialUntilEnded(alice.page, '819')
+        expectEqual(refused.endStatus, 404, 'SIP status of a call to a number whose route OpenSIPS does not read')
+      } finally {
+        await db.query("DELETE FROM call_flows WHERE number = '819'")
+      }
+    })
+    await step('step 11c-2: Alice removes the flows in Administration, each once confirmed (the menu first: a menu that leads to a flow keeps it): OpenSIPS stops sending calls there before Wazo drops the groups', async () => {
+      await openAdmin(alice.page, "Parcours d'appel")
+      for (const number of ['800', '801', '802', '810', '811']) {
+        const gone = alice.page.waitForResponse(r => r.request().method() === 'DELETE' && r.url().endsWith(`/admin/flows/${number}`))
+        await alice.page.getByRole('button', { name: `Supprimer le parcours ${number}`, exact: true }).click()
+        await alice.page.getByRole('button', { name: 'Oui, supprimer' }).click()
+        expectEqual((await gone).status(), 204, `DELETE /admin/flows/${number}`)
+        await alice.page.getByRole('status').filter({ hasText: `Parcours ${number} supprimé.` }).waitFor()
+      }
+      await until('no flow left in call_flows', async () => ((await flowRows()).length === 0 ? true : null), { timeout: 120_000 })
+      await sysconfdSettled()
+      const queues = asteriskCli('queue show')
+      for (const name of groupNames) if (queues.includes(name)) throw new Error(`Wazo kept the queue ${name}: ${queues}`)
+      expectEqual(groupNames.length, 4, 'the queues the flows had')
+      await signOut(jeanW)
+      await signOut(bobW)
+      // The last window of an extension leaves while Wazo is silent: its registration goes at once, never waiting for an
+      // answer that may come after the softphone closed its connection (a window gone, its dead contact kept for 10 minutes).
+      compose('pause', 'wazo-asterisk')
+      try {
+        const state = await alice.page.evaluate(() => window.twakephone.state)
+        await signOut(alice)
+        if ((await windowsOf('101')).length) {
+          const dump = (await mi('ul_dump', {})).result
+          console.log(`[11c-2] Alice's softphone said ${state} before she left; contacts: ${JSON.stringify((dump?.Domains ?? []).flatMap(d => d.AORs ?? []).filter(a => a.AOR === '101'))}`)
+          const said = execFileSync('docker', ['compose', '-f', COMPOSE_FILE, 'logs', '--no-color', '--no-log-prefix', '--tail', '400', 'opensips'], { encoding: 'utf8', timeout: 30_000, maxBuffer: 64 << 20 }).split('\n').filter(l => /wazo|mid_reg/i.test(l) && !/'from' key not found|failed to unregister/.test(l)).slice(-25)
+          console.log(`[11c-2] OpenSIPS: ${said.join('\n')}`)
+        }
+        expectEqual((await windowsOf('101')).length, 0, 'the windows of 101 once the last one left while Wazo was silent')
+      } finally {
+        compose('unpause', 'wazo-asterisk')
+      }
+      await sysconfdSettled()
+      // Each window that left took its registration with it (the mailbox steps that follow need Alice without a window).
+      const left = async () => Object.fromEntries(await Promise.all(['101', '102', '103'].map(async ext => [ext, (await windowsOf(ext)).length])))
+      await until('the windows that signed out gone from OpenSIPS', async () => ((await left())['101'] === 0 ? true : null), { timeout: 20_000 }).catch(async err => {
+        const dump = (await mi('ul_dump', {})).result
+        console.log(`[11c-2] windows left: ${JSON.stringify(await left())} ${JSON.stringify((dump?.Domains ?? []).flatMap(d => d.AORs ?? []).filter(a => a.AOR === '101'))}`)
+        const said = execFileSync('docker', ['compose', '-f', COMPOSE_FILE, 'logs', '--no-color', '--no-log-prefix', '--tail', '300', 'opensips'], { encoding: 'utf8', timeout: 30_000, maxBuffer: 64 << 20 }).split('\n').filter(l => /wazo|mid_reg|101/i.test(l) && !/'from' key not found|failed to unregister/.test(l)).slice(-30)
+        console.log(`[11c-2] OpenSIPS: ${said.join('\n')}`)
+        throw err
+      })
+      expectEqual(await left(), { 101: 0, 102: 1, 103: 1 }, 'the windows of the people at OpenSIPS once the windows of this step left')
+      // Nothing of the calls of this step is left running at OpenSIPS (a dialog nobody ended), nor in the presence of the people they rang.
+      await until('no dialog left at OpenSIPS', async () => (((await mi('dlg_list')).result?.Dialogs ?? []).length ? null : true), { timeout: 30_000 }).catch(async err => {
+        console.log(`[11c-2] dialogs left: ${JSON.stringify(((await mi('dlg_list')).result?.Dialogs ?? []).map(d => [d.callid, d.state, d.from_uri, d.to_uri]))}`)
+        throw err
+      })
+      await presenceIs(jean.page, 'Durand', '103', 'Disponible', 30_000)
     })
   }
   await lineSteps()
@@ -3836,8 +4324,23 @@ try {
     const [row] = (await db.query("SELECT mailbox FROM voicemail_boxes WHERE extension = '104'")).rows
     const gone = `vm:h:${await whoOf('103')}:104@twake-gone`
     try {
-      await db.query("UPDATE voicemail_boxes SET mailbox = '104@twake-gone' WHERE extension = '104'")
-      const ended = await dialUntilEnded(bob.page, '104')
+      // The Gateway synchronises the mailboxes in the background (again and again while Wazo was out of reach, as just before) and writes
+      // the right one back over this row: the call then reaches the mailbox of 104, which is no proof about a mailbox Wazo does not
+      // have. A call that did not end with the row still out of date is that; only then is it hung up and tried again.
+      let ended
+      for (let attempt = 1; !ended; attempt++) {
+        await db.query("UPDATE voicemail_boxes SET mailbox = '104@twake-gone' WHERE extension = '104'")
+        try {
+          ended = await dialUntilEnded(bob.page, '104')
+        } catch (err) {
+          const [now] = (await db.query("SELECT mailbox FROM voicemail_boxes WHERE extension = '104'")).rows
+          const reached = (await calls(bob.page)).some(c => c.state === 'connected')
+          if (now.mailbox === '104@twake-gone' || !reached || attempt >= 3) throw err
+          console.log(`[11a] the row of 104 in voicemail_boxes was written back (${now.mailbox}) during the call, tried again (${attempt})`)
+          await bob.page.getByRole('button', { name: 'Raccrocher' }).click()
+          await until('the end of the call to 104', async () => ((await calls(bob.page)).length === 0 ? true : null))
+        }
+      }
       expectEqual(`${ended.endStatus} ${ended.endReason}`, '404 unavailable', 'how the call to a mailbox Wazo does not have ended')
       await bob.page.getByText('104 est injoignable.').waitFor()
       // Counted when it went to the mailbox, counted out when Asterisk refused it: nothing left (never -1).

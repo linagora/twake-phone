@@ -89,6 +89,12 @@ TWAKE_ACL = [
     'confd.lines.*.delete',
     'confd.lines.*.endpoints.sip.*.update',
     'confd.lines.*.endpoints.sip.*.delete',
+    # The sequential groups and queues (step 11c-2, ADR 0028): a group of wazo-confd for each, its extensions as members.
+    'confd.groups.create',
+    'confd.groups.read',
+    'confd.groups.*.update',
+    'confd.groups.*.delete',
+    'confd.groups.*.members.extensions.update',
     'calld.voicemails.*.read',
     'calld.voicemails.*.messages.*.read',
     'calld.voicemails.*.messages.*.update',

@@ -40,6 +40,16 @@ export const fakeWazo = (numberOf: (userId: string) => string) => {
     /** The SIP endpoints and lines (step 11c-1): an endpoint's `line` is the id of the line it is associated with. */
     endpoints: [] as { uuid: string; name: string; label: string; auth_section_options: [string, string][]; aor_section_options: [string, string][]; line: { id: number } | null }[],
     lines: [] as { id: number; context: string }[],
+    /** The groups (step 11c-2): a sequential group or a queue each; `name` is what wazo-confd makes of the label. */
+    groups: [] as { id: number; uuid: string; name: string; label: string; ring_strategy: string; timeout: number | null; user_timeout: number | null; retry_delay: number | null; ring_in_use: boolean; members: { extensions: { exten: string; context: string; priority: number }[] } }[],
+    /** The name wazo-confd gives a group (after its label by default). */
+    groupName: undefined as ((label: string) => string) | undefined,
+    /** Every edit of a group's strategy (wazo-confd takes it, Asterisk does not for `linear`): there must be none. */
+    groupStrategyEdits: [] as string[],
+    /** The next reads of the groups fail (500) this many times. */
+    failGroups: 0,
+    /** The groups wazo-confd refuses to make (400), by label. */
+    refuseGroups: new Set<string>(),
     /** The next line made is made, then refused (500: wazo-sysconfd failing after wazo-confd committed). */
     lineMadeThenFails: false,
     voicemails: [] as { id: number; number: string; context: string; name: string; max_messages: number | null; options: [string, string][]; users: { uuid: string }[] }[],
@@ -155,6 +165,41 @@ export const fakeWazo = (numberOf: (userId: string) => string) => {
     if ((m = /^\/1\.1\/lines\/(\d+)$/.exec(path)) && init.method === 'DELETE') {
       if (state.endpoints.some(e => e.line?.id === Number(m![1]))) return json(400, ['Resource Error - Line is associated with an Endpoint'])
       state.lines = state.lines.filter(l => l.id !== Number(m![1]))
+      return json(204)
+    }
+    if (path === '/1.1/groups' && init.method === 'GET') {
+      if (state.failGroups > 0) {
+        state.failGroups--
+        return json(500, ['groups unavailable'])
+      }
+      return page(state.groups)
+    }
+    if (path === '/1.1/groups' && init.method === 'POST') {
+      if (state.refuseGroups.has(body.label)) return json(400, ['Resource Error - refused'])
+      if (!/^[-_.a-zA-Z0-9 ]+$/.test(body.label ?? '')) return json(400, ['label does not match'])
+      if (state.groups.some(g => g.label === body.label)) return json(400, ['Resource Error - Group already exists'])
+      // wazo-confd names the group `grp-<tenant slug>-<uuid>` (GroupList.group_name_fmt), whatever its label.
+      const id = next++
+      const group = { id, uuid: `00000000-0000-4000-a000-${String(id).padStart(12, '0')}`, name: state.groupName?.(String(body.label)) ?? `grp-test-00000000-0000-4000-a000-${String(id).padStart(12, '0')}`, label: body.label, ring_strategy: body.ring_strategy ?? 'all', timeout: body.timeout ?? null, user_timeout: body.user_timeout ?? null, retry_delay: body.retry_delay ?? null, ring_in_use: body.ring_in_use ?? true, members: { extensions: [] } }
+      state.groups.push(group)
+      return json(201, group)
+    }
+    if ((m = /^\/1\.1\/groups\/([^/]+)$/.exec(path)) && (init.method === 'PUT' || init.method === 'DELETE')) {
+      const group = state.groups.find(g => g.uuid === m![1])
+      if (!group) return json(404, ['Resource Not Found'])
+      if (init.method === 'DELETE') {
+        state.groups = state.groups.filter(g => g !== group)
+        return json(204)
+      }
+      // As the doc of the schema says: a strategy edited to `linear` fails in Asterisk (ASTERISK-17049): the provider never does it.
+      if (body.ring_strategy !== undefined && body.ring_strategy !== group.ring_strategy) state.groupStrategyEdits.push(`${group.label}: ${group.ring_strategy}>${body.ring_strategy}`)
+      Object.assign(group, body)
+      return json(204)
+    }
+    if ((m = /^\/1\.1\/groups\/([^/]+)\/members\/extensions$/.exec(path)) && init.method === 'PUT') {
+      const group = state.groups.find(g => g.uuid === m![1])
+      if (!group) return json(404, ['Resource Not Found'])
+      group.members = { extensions: (body.extensions as { exten: string; context: string }[]).map((e, priority) => ({ exten: e.exten, context: e.context, priority })) }
       return json(204)
     }
     if (path === '/1.1/users' && init.method === 'GET') {
