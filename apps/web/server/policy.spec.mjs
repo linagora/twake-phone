@@ -1,7 +1,20 @@
+import { createHash } from 'node:crypto'
+import { readFileSync } from 'node:fs'
+import { createRequire } from 'node:module'
 import { describe, expect, it } from 'vitest'
-import { contentSecurityPolicy, securityHeaders, settingsFromEnv } from './policy.mjs'
+import { contentSecurityPolicy, securityHeaders, settingsFromEnv, TWAKE_ICONS_STYLE } from './policy.mjs'
 
 describe('contentSecurityPolicy', () => {
+  it('allows the <style> the installed twake-icons writes, by its hash, and no other inline style', () => {
+    const require = createRequire(new URL('../package.json', import.meta.url))
+    const source = readFileSync(require.resolve('@linagora/twake-icons'), 'utf8')
+    const style = /style\.textContent = `([\s\S]*?)`;/.exec(source)?.[1]
+    expect(style, 'twake-icons no longer writes its <style> this way: check what it does and update TWAKE_ICONS_STYLE').toBeDefined()
+    expect(TWAKE_ICONS_STYLE).toBe(`'sha256-${createHash('sha256').update(style).digest('base64')}'`)
+    const csp = contentSecurityPolicy({ gatewayUrl: 'https://phone-api.example.org/', oidcAuthority: 'https://auth.example.org/oidc' })
+    expect(csp).toContain(`style-src 'self' ${TWAKE_ICONS_STYLE};`)
+  })
+
   it('lets the app talk to the Gateway (REST and WebSocket) and the identity provider, and nothing else', () => {
     const csp = contentSecurityPolicy({ gatewayUrl: 'https://phone-api.example.org/', oidcAuthority: 'https://auth.example.org/oidc' })
     expect(csp).toContain("connect-src 'self' https://phone-api.example.org wss://phone-api.example.org https://auth.example.org")

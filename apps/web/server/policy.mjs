@@ -4,6 +4,12 @@
 const origin = url => new URL(url).origin
 const wsOrigin = url => origin(url).replace(/^http/, 'ws')
 
+/**
+ * The one <style> twake-icons writes as it loads (fill and spin of its icons), before any nonce can reach it: allowed by
+ * its hash. policy.spec.mjs reads it again from the installed package, so an upgrade that changes it fails there.
+ */
+export const TWAKE_ICONS_STYLE = "'sha256-gs8BvQ8gzJbYzI8cTybw28fZQ7yPtOVC7IcEDrtjhjA='"
+
 /** One CSP source: a keyword, a scheme, a host (with optional scheme, port and wildcard). Nothing that could end the directive. */
 const SOURCE = /^('self'|'none'|[a-z][a-z0-9+.-]*:|(?:[a-z][a-z0-9+.-]*:\/\/)?(?:\*\.)?[a-z0-9.-]+(?::(?:\d+|\*))?)$/i
 const sources = (name, list) => {
@@ -15,8 +21,10 @@ const sources = (name, list) => {
  * The policy the served page runs under. Scripts, styles and fonts are the build's only; the page connects to the
  * Gateway (REST and WebSocket) and to the identity provider, plus what `connectSrc` adds (the SIP WebSocket of step 3);
  * `frameAncestors` says who may embed the app ("'none'" by default; the Twake origins once Twake Chat shows it).
+ * `styleNonce`: the nonce of the page's answer, carried by the `<style>` tags the design system (twake-mui, through
+ * Emotion) writes at runtime; no other inline style runs.
  */
-export const contentSecurityPolicy = ({ gatewayUrl, oidcAuthority, frameAncestors = ["'none'"], connectSrc = [] }) => {
+export const contentSecurityPolicy = ({ gatewayUrl, oidcAuthority, frameAncestors = ["'none'"], connectSrc = [], styleNonce }) => {
   for (const [name, value] of Object.entries({ gatewayUrl, oidcAuthority })) {
     if (typeof value !== 'string' || !/^https?:\/\//.test(value)) throw new Error(`${name} must be an http(s) URL`)
   }
@@ -25,7 +33,7 @@ export const contentSecurityPolicy = ({ gatewayUrl, oidcAuthority, frameAncestor
   return [
     "default-src 'self'",
     "script-src 'self'",
-    "style-src 'self'",
+    `style-src 'self' ${TWAKE_ICONS_STYLE}${styleNonce ? ` 'nonce-${styleNonce}'` : ''}`,
     "img-src 'self' data:",
     // The recordings of the mailbox (step 11a), fetched with the person's token and played from a blob: URL.
     "media-src 'self' blob:",

@@ -1,3 +1,4 @@
+import { Alert, List, ListItem, Typography } from '@linagora/twake-mui'
 import { useEffect, useState } from 'react'
 import { formatNumber, type HistoryItem } from '@twake/telephony-client'
 import { useGateway } from '../gateway.js'
@@ -58,32 +59,37 @@ export const Recents = () => {
     }
   }, [client, onEvent, onConnected])
 
-  if (error) return <><h1>{t('recents.title')}</h1><p className="alert alert-error" role="alert">{t('recents.error')}</p></>
-  if (!items) return <h1>{t('recents.title')}</h1>
+  const heading = (
+    <Typography variant="h4" component="h1" gutterBottom>
+      {t('recents.title')}
+    </Typography>
+  )
+  if (error) return <>{heading}<Alert severity="error" role="alert">{t('recents.error')}</Alert></>
+  if (!items) return heading
   const when = new Intl.DateTimeFormat(lang, { dateStyle: 'medium', timeStyle: 'short' })
   return (
     <>
-      <h1>{t('recents.title')}</h1>
+      {heading}
       {items.length === 0 ? (
-        <p>{t('recents.empty')}</p>
+        <Typography component="p">{t('recents.empty')}</Typography>
       ) : (
-        <ul className="list">
+        <List data-testid="recents">
           {items.map(it => (
-            <li key={it.id}>
+            <ListItem key={it.id} divider className="u-flex-justify-between">
               <span>
                 {/* One's own conference: the room called oneself in it (its number is one's own). */}
-                <strong>{it.conference && it.remoteNumber === me?.extension ? t('recents.conferenceMine') : it.remoteNumber === 'anonymous' ? t('call.hiddenNumber') : formatNumber(it.remoteNumber)}</strong>
+                <Typography component="strong" className="u-fw-bold">{it.conference && it.remoteNumber === me?.extension ? t('recents.conferenceMine') : it.remoteNumber === 'anonymous' ? t('call.hiddenNumber') : formatNumber(it.remoteNumber)}</Typography>
                 <br />
-                <span className={`badge${it.missed ? ' missed' : ''}`}>{recentLabel(it, t)}</span>
+                <Typography data-testid="recent-label" variant="body2" component="span" color={it.missed ? 'error' : 'textSecondary'} className={it.missed ? 'u-fw-bold' : undefined}>{recentLabel(it, t)}</Typography>
                 {/* Step 10b: a call the operator recorded, reconciled with ours, or that reached only it (the platform out). */}
-                {it.sources?.includes('opensips') === false ? <span className="badge"> · {t('recents.operatorOnly')}</span> : it.sources && it.sources.length > 1 ? <span className="badge"> · {t('recents.reconciled')}</span> : null}
+                {it.sources?.includes('opensips') === false ? <Typography variant="body2" color="textSecondary" component="span"> · {t('recents.operatorOnly')}</Typography> : it.sources && it.sources.length > 1 ? <Typography variant="body2" color="textSecondary" component="span"> · {t('recents.reconciled')}</Typography> : null}
                 {/* Forwarded there to the fallback number (second review 10b, n°4): missed here, taken there perhaps. */}
-                {it.forwardedToFallback ? <span className="badge"> · {t('recents.forwardedToFallback')}</span> : null}
+                {it.forwardedToFallback ? <Typography variant="body2" color="textSecondary" component="span"> · {t('recents.forwardedToFallback')}</Typography> : null}
               </span>
               <time dateTime={it.startedAt}>{when.format(new Date(it.startedAt))}</time>
-            </li>
+            </ListItem>
           ))}
-        </ul>
+        </List>
       )}
     </>
   )

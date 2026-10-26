@@ -1,5 +1,6 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react'
 import type { Presence } from '@twake/telephony-types'
+import { Chip } from '@linagora/twake-mui'
 import { useGateway } from './gateway.js'
 import { PresenceSync } from './presenceSync.js'
 import { useT } from './i18n/useT.js'
@@ -50,6 +51,8 @@ export const usePresence = (): Presences => {
   return ctx
 }
 
+const PRESENCE_COLOR = { available: 'success', busy: 'error', dnd: 'error', away: 'warning', offline: 'default' } as const
+
 /** A coloured dot and its word (RGAA 10.2: the colour is never alone) for the presence of an extension. */
 export const PresenceBadge = ({ extension }: { extension: string }) => {
   const { t } = useT()
@@ -57,8 +60,6 @@ export const PresenceBadge = ({ extension }: { extension: string }) => {
   if (!realtime) return null
   const { status } = of(extension)
   return (
-    <span className={`presence presence-${status}`} data-testid={`presence-${extension}`}>
-      <span aria-hidden="true">●</span> {t(`presence.${status}`)}
-    </span>
+    <Chip size="small" variant="outlined" color={PRESENCE_COLOR[status]} data-testid={`presence-${extension}`} label={t(`presence.${status}`)} />
   )
 }

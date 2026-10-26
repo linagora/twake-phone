@@ -662,7 +662,7 @@ const bothHearEachOther = async (a, b, { last = false } = {}) => {
 }
 /** Opens the directory, searches `query` (one person) and waits for the presence next to that extension to read `status`. */
 const presenceIs = async (page, query, extension, status, timeout = 10_000) => {
-  await page.getByRole('link', { name: 'Annuaire' }).click()
+  await page.getByRole('link', { name: 'Clavier' }).click()
   await page.getByLabel('Rechercher').fill(query)
   await page.getByTestId(`presence-${extension}`).filter({ hasText: status }).waitFor({ timeout })
 }
@@ -671,7 +671,7 @@ const recents = async (page, atLeast) => {
   await page.getByRole('link', { name: 'Récents' }).click()
   await page.getByRole('heading', { level: 1, name: 'Récents' }).waitFor()
   return until(`${atLeast} recent calls`, async () => {
-    const lines = await page.locator('main ul.list li').evaluateAll(items => items.map(li => `${li.querySelector('strong')?.textContent}: ${li.querySelector('.badge')?.textContent}`))
+    const lines = await page.locator('[data-testid=recents] li').evaluateAll(items => items.map(li => `${li.querySelector('strong')?.textContent}: ${li.querySelector('[data-testid=recent-label]')?.textContent}`))
     return lines.length >= atLeast ? lines : null
   })
 }
@@ -3697,7 +3697,7 @@ try {
     expectEqual((await bobApi('GET', '/voicemails')).json().items.some(i => i.id === item.id), false, "Jean's message in Bob's list")
     expectEqual((await jeanMailbox('GET', '/voicemails')).json().items.map(i => `${i.id} ${i.unread}`), [`${item.id} true`], "Jean's message after Bob's requests")
   })
-  await step('step 11a: Jean listens to it in the page (the recording, from Wazo), marks it read, then calls Bob back from it: Bob\'s browser rings, they talk', async () => {
+  await step('step 11a: Jean listens to it in the page (the recording, from Wazo), which marks it read, then calls Bob back from it: Bob\'s browser rings, they talk', async () => {
     await setStatus(jean, 'Disponible')
     await jean.page.getByRole('link', { name: /^Messagerie vocale/ }).click()
     const message = jean.page.getByTestId('voicemail')
@@ -3707,7 +3707,6 @@ try {
       const a = document.querySelector('[data-testid=voicemail-audio]')
       return !!a && a.readyState >= 2 && a.duration >= 2 && a.currentTime > 0
     }, null, { timeout: 15_000 })
-    await message.getByRole('button', { name: /^Marquer comme lu le message de / }).click()
     await jean.page.locator('[data-testid=voicemail][data-unread="0"]').waitFor()
     await jean.page.getByText('Tous les messages sont lus.').waitFor()
     await jean.page.getByRole('link', { name: 'Messagerie vocale', exact: true }).waitFor()

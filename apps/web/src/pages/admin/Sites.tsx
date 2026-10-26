@@ -1,3 +1,4 @@
+import { Alert, Button, List, ListItem, Stack, Typography } from '@linagora/twake-mui'
 import { useCallback, useEffect, useState, type FormEvent } from 'react'
 import type { AdminUser, EmergencySite, Trunk } from '@twake/telephony-client'
 import { CheckGroup, ConfirmDelete, NoteLine, ProblemSummary, Section, SelectField, TextField, useFocusLater, useProblem, type Note } from '../../admin/ui.js'
@@ -46,7 +47,10 @@ export const Sites = () => {
   }, [client, t])
   useEffect(load, [load])
 
-  const set = <K extends keyof SiteForm>(key: K) => (value: SiteForm[K]) => setForm(f => ({ ...f, [key]: value }))
+  const set =
+    <K extends keyof SiteForm>(key: K) =>
+    (value: SiteForm[K]) =>
+      setForm(f => ({ ...f, [key]: value }))
   const reset = () => {
     setEditing(null)
     setForm(emptySite(trunks[0]?.id ?? ''))
@@ -57,7 +61,11 @@ export const Sites = () => {
   const save = async (e: FormEvent) => {
     e.preventDefault()
     setNote(null)
-    const checked = checkSite(form, { isNew: !editing, trunks, others: sites ?? [] })
+    const checked = checkSite(form, {
+      isNew: !editing,
+      trunks,
+      others: sites ?? []
+    })
     setProblems(checked.problems)
     if (!checked.site) {
       focusLater(SITE_FIELDS, checked.problems, 'site')
@@ -90,7 +98,10 @@ export const Sites = () => {
     setEditing(site)
     setSearch('')
     // Whoever left the directory is no longer shown, and goes from the site when it is saved.
-    setForm({ ...siteForm(site), members: site.members.filter(m => users.some(u => u.userId === m)) })
+    setForm({
+      ...siteForm(site),
+      members: site.members.filter(m => users.some(u => u.userId === m))
+    })
     setTimeout(() => document.getElementById('site-name')?.focus(), 0)
   }
 
@@ -100,10 +111,18 @@ export const Sites = () => {
     try {
       await client.deleteSite(site.id)
       // The row goes, its buttons with it: the focus goes to what is said.
-      setNote({ kind: 'ok', text: t('admin.site.deleted', { id: site.id }), focus: true })
+      setNote({
+        kind: 'ok',
+        text: t('admin.site.deleted', { id: site.id }),
+        focus: true
+      })
       if (editing?.id === site.id) reset()
     } catch (err) {
-      setNote({ kind: 'error', text: say(siteRefusal(err).problem)!, focus: true })
+      setNote({
+        kind: 'error',
+        text: say(siteRefusal(err).problem)!,
+        focus: true
+      })
     } finally {
       setBusy(false)
       load()
@@ -113,7 +132,7 @@ export const Sites = () => {
   if (unavailable)
     return (
       <Section id="sites" title={t('admin.nav.sites')}>
-        <p className="alert">{t('admin.trunk.unavailable')}</p>
+        <Alert severity="info">{t('admin.trunk.unavailable')}</Alert>
       </Section>
     )
 
@@ -128,65 +147,140 @@ export const Sites = () => {
   const visible = users.filter(u => !needle || `${u.displayName ?? ''} ${u.userId} ${u.extension}`.toLowerCase().includes(needle)).map(u => u.userId)
   const person = (userId: string) => {
     const u = users.find(x => x.userId === userId)
-    return u ? t('admin.site.person', { name: u.displayName ?? u.userId, extension: u.extension }) : userId
+    return u
+      ? t('admin.site.person', {
+          name: u.displayName ?? u.userId,
+          extension: u.extension
+        })
+      : userId
   }
   return (
     <>
       <Section id="sites" title={t('admin.nav.sites')}>
-        <p>{t('admin.site.help')}</p>
+        <Typography component="p" gutterBottom>
+          {t('admin.site.help')}
+        </Typography>
         {sites === null ? null : sites.length ? (
-          <ul className="list admin-list" aria-label={t('admin.site.list')}>
+          <List aria-label={t('admin.site.list')}>
             {sites.map(site => (
-              <li key={site.id}>
-                <div>
-                  <h3>{site.name}</h3>
-                  <dl className="facts facts-compact">
-                    <div>
-                      <dt>{t('admin.site.id')}</dt>
-                      <dd>{site.id}</dd>
-                    </div>
-                    <div>
-                      <dt>{t('admin.site.address')}</dt>
-                      <dd>{site.address}</dd>
-                    </div>
-                    <div>
-                      <dt>{t('admin.site.trunkId')}</dt>
-                      <dd>{trunkName(site.trunkId)}</dd>
-                    </div>
-                    <div>
-                      <dt>{t('admin.site.number')}</dt>
-                      <dd>{formatNumber(site.number)}</dd>
-                    </div>
-                    <div>
-                      <dt>{t('admin.site.members')}</dt>
-                      <dd>{t(plural.select(site.members.length) === 'one' ? 'admin.site.membersOne' : 'admin.site.membersMany', { count: site.members.length })}</dd>
-                    </div>
-                  </dl>
+              <ListItem key={site.id} divider>
+                <div className="u-flex-grow-1">
+                  <Typography variant="h6" component="h3">
+                    {site.name}
+                  </Typography>
+                  <Typography component="dl" className="u-m-0">
+                    <Stack direction="row" spacing={1} useFlexGap>
+                      <Typography component="dt" color="textSecondary">
+                        {t('admin.site.id')}
+                      </Typography>
+                      <Typography component="dd" className="u-m-0">
+                        {site.id}
+                      </Typography>
+                    </Stack>
+                    <Stack direction="row" spacing={1} useFlexGap>
+                      <Typography component="dt" color="textSecondary">
+                        {t('admin.site.address')}
+                      </Typography>
+                      <Typography component="dd" className="u-m-0">
+                        {site.address}
+                      </Typography>
+                    </Stack>
+                    <Stack direction="row" spacing={1} useFlexGap>
+                      <Typography component="dt" color="textSecondary">
+                        {t('admin.site.trunkId')}
+                      </Typography>
+                      <Typography component="dd" className="u-m-0">
+                        {trunkName(site.trunkId)}
+                      </Typography>
+                    </Stack>
+                    <Stack direction="row" spacing={1} useFlexGap>
+                      <Typography component="dt" color="textSecondary">
+                        {t('admin.site.number')}
+                      </Typography>
+                      <Typography component="dd" className="u-m-0">
+                        {formatNumber(site.number)}
+                      </Typography>
+                    </Stack>
+                    <Stack direction="row" spacing={1} useFlexGap>
+                      <Typography component="dt" color="textSecondary">
+                        {t('admin.site.members')}
+                      </Typography>
+                      <Typography component="dd" className="u-m-0">
+                        {t(plural.select(site.members.length) === 'one' ? 'admin.site.membersOne' : 'admin.site.membersMany', { count: site.members.length })}
+                      </Typography>
+                    </Stack>
+                  </Typography>
                 </div>
-                <div className="actions actions-end">
-                  <button type="button" className="btn" onClick={() => edit(site)} disabled={busy} aria-label={t('admin.site.edit', { id: site.id })}>
+                <Stack direction="row" spacing={1} useFlexGap className="u-flex-wrap">
+                  <Button variant="outlined" onClick={() => edit(site)} disabled={busy} aria-label={t('admin.site.edit', { id: site.id })}>
                     {t('admin.edit')}
-                  </button>
+                  </Button>
                   <ConfirmDelete label={t('admin.site.delete', { id: site.id })} question={t('admin.site.deleteConfirm', { id: site.id })} onConfirm={() => void remove(site)} disabled={busy} />
-                </div>
-              </li>
+                </Stack>
+              </ListItem>
             ))}
-          </ul>
+          </List>
         ) : (
-          <p className="muted">{t('admin.site.none')}</p>
+          <Typography component="p" variant="body2" color="textSecondary">
+            {t('admin.site.none')}
+          </Typography>
         )}
       </Section>
       <Section id="site-form" title={editing ? t('admin.site.edit', { id: editing.id }) : t('admin.site.new')}>
         {sites !== null && !trunks.length ? (
-          <p className="alert">{t('admin.site.noTrunk')}</p>
+          <Alert severity="info">{t('admin.site.noTrunk')}</Alert>
         ) : (
           <form onSubmit={e => void save(e)} noValidate aria-labelledby="site-form">
             <ProblemSummary count={count} />
-            <TextField id="site-id" label={t('admin.site.id')} hint={t('admin.slugHint')} value={form.id} onChange={set('id')} error={field('id')} required disabled={busy || !!editing} maxLength={32} />
+            <TextField
+              id="site-id"
+              label={t('admin.site.id')}
+              hint={t('admin.slugHint')}
+              value={form.id}
+              onChange={set('id')}
+              error={field('id')}
+              required
+              disabled={busy || !!editing}
+              maxLength={32}
+            />
             <TextField id="site-name" label={t('admin.site.name')} value={form.name} onChange={set('name')} error={field('name')} required disabled={busy} maxLength={64} />
-            <TextField id="site-address" label={t('admin.site.address')} hint={t('admin.site.addressHint')} autoComplete="street-address" value={form.address} onChange={set('address')} error={field('address')} required disabled={busy} maxLength={200} />
-            <SelectField id="site-trunkId" label={t('admin.site.trunkId')} value={form.trunkId} onChange={set('trunkId')} options={trunks.map(x => ({ value: x.id, label: trunkName(x.id) }))} error={field('trunkId')} disabled={busy} />
-            <TextField id="site-number" label={t('admin.site.number')} hint={`${t('admin.site.numberHint')} ${t('admin.site.numberRings')}`} type="tel" inputMode="tel" value={form.number} onChange={set('number')} error={field('number')} required disabled={busy} maxLength={24} />
+            <TextField
+              id="site-address"
+              label={t('admin.site.address')}
+              hint={t('admin.site.addressHint')}
+              autoComplete="street-address"
+              value={form.address}
+              onChange={set('address')}
+              error={field('address')}
+              required
+              disabled={busy}
+              maxLength={200}
+            />
+            <SelectField
+              id="site-trunkId"
+              label={t('admin.site.trunkId')}
+              value={form.trunkId}
+              onChange={set('trunkId')}
+              options={trunks.map(x => ({
+                value: x.id,
+                label: trunkName(x.id)
+              }))}
+              error={field('trunkId')}
+              disabled={busy}
+            />
+            <TextField
+              id="site-number"
+              label={t('admin.site.number')}
+              hint={`${t('admin.site.numberHint')} ${t('admin.site.numberRings')}`}
+              type="tel"
+              inputMode="tel"
+              value={form.number}
+              onChange={set('number')}
+              error={field('number')}
+              required
+              disabled={busy}
+              maxLength={24}
+            />
             {users.length ? (
               <>
                 {/* Enter in the search is no save of the form. */}
@@ -207,24 +301,26 @@ export const Sites = () => {
                     disabled={busy}
                   />
                 ) : (
-                  <p className="muted" role="status">
+                  <Typography component="p" variant="body2" color="textSecondary" role="status">
                     {t('admin.site.searchNone')}
-                  </p>
+                  </Typography>
                 )}
               </>
             ) : (
-              <p className="muted">{t('admin.site.noUsers')}</p>
+              <Typography component="p" variant="body2" color="textSecondary">
+                {t('admin.site.noUsers')}
+              </Typography>
             )}
-            <div className="actions actions-start">
-              <button type="submit" className="btn btn-primary" disabled={busy} aria-busy={busy}>
+            <Stack direction="row" spacing={1} useFlexGap className="u-flex-wrap">
+              <Button type="submit" disabled={busy} aria-busy={busy}>
                 {t('admin.site.save')}
-              </button>
+              </Button>
               {editing ? (
-                <button type="button" className="btn" onClick={reset} disabled={busy}>
+                <Button variant="outlined" onClick={reset} disabled={busy}>
                   {t('admin.cancel')}
-                </button>
+                </Button>
               ) : null}
-            </div>
+            </Stack>
           </form>
         )}
         <NoteLine note={note} />

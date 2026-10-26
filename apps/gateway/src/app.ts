@@ -1881,7 +1881,6 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         const limit = req.query.limit ? Number(req.query.limit) : 20
         if (!Number.isInteger(limit) || limit < 1 || limit > MAX_SEARCH) throw bad('invalid limit')
         const directory = directoryFor(user)
-        if (!q) return { items: [], truncated: false }
         if (!searches.allow(ownerKey(user.tenantId, user.id))) return reply.code(429).send({ error: 'too many searches, slow down' })
         return lookup(req, () => directory.search(user.tenantId, q, limit))
       })

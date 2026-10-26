@@ -1344,7 +1344,7 @@ describe('the administration screens (step 7)', () => {
     )
     // The name of a button holds what it shows, at its start (WCAG 2.5.3, RGAA 6.1 for the links).
     const check = (min: number) => {
-      const buttons = [...host.querySelectorAll('.admin-list button, #webhook-log-section table button, table button')]
+      const buttons = [...host.querySelectorAll('[data-testid="admin-list"] button, #webhook-log-section table button, table button')]
       expect(buttons.length).toBeGreaterThanOrEqual(min)
       for (const b of buttons) {
         const label = b.getAttribute('aria-label')

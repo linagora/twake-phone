@@ -1,4 +1,5 @@
 import { RING_TEST_MS } from '@twake/softphone'
+import { Alert, Button, Card, CardContent, Stack, TextField, Typography } from '@linagora/twake-mui'
 import { useEffect, useState } from 'react'
 import { useAuth } from '../auth/AuthProvider.js'
 import { displayNameFor } from '../auth/oidc.js'
@@ -80,34 +81,44 @@ const AudioSettings = () => {
     // A chosen device the browser does not list right now (a headset unplugged): the choice stays, and says so.
     const unplugged = chosen && !list.some(d => d.id === chosen)
     return (
-      <div className="field">
-        <label htmlFor={id}>{t(LABEL_KEY[key])}</label>
-        <select id={id} value={chosen} onChange={e => choose(key)(e.target.value)} disabled={!list.length && !unplugged}>
-          <option value="">{t('settings.defaultDevice')}</option>
-          {unplugged ? (
-            <option value={chosen} disabled>
-              {t('settings.unpluggedDevice')}
-            </option>
-          ) : null}
-          {list.map((d, i) => (
-            <option key={d.id} value={d.id}>
-              {label(d, kind, i)}
-            </option>
-          ))}
-        </select>
-      </div>
+      <TextField
+        select
+        id={id}
+        label={t(LABEL_KEY[key])}
+        value={chosen}
+        onChange={e => choose(key)(e.target.value)}
+        disabled={!list.length && !unplugged}
+        fullWidth
+        className="u-mb-1"
+        slotProps={{ select: { native: true }, inputLabel: { shrink: true } }}
+      >
+        <option value="">{t('settings.defaultDevice')}</option>
+        {unplugged ? (
+          <option value={chosen} disabled>
+            {t('settings.unpluggedDevice')}
+          </option>
+        ) : null}
+        {list.map((d, i) => (
+          <option key={d.id} value={d.id}>
+            {label(d, kind, i)}
+          </option>
+        ))}
+      </TextField>
     )
   }
   return (
-    <section className="card" aria-labelledby="audio">
-      <h2 id="audio">{t('settings.audio')}</h2>
+    <Card component="section" variant="outlined" aria-labelledby="audio" className="u-mb-1">
+      <CardContent>
+      <Typography variant="h5" component="h2" id="audio" gutterBottom>
+        {t('settings.audio')}
+      </Typography>
       {!devices.labelled ? (
-        <p>
+        <Typography component="p" className="u-mb-1">
           {t('settings.allowMicrophoneHint')}{' '}
-          <button type="button" className="btn" onClick={() => void allow()}>
+          <Button variant="outlined" onClick={() => void allow()}>
             {t('settings.allowMicrophone')}
-          </button>
-        </p>
+          </Button>
+        </Typography>
       ) : null}
       {select('microphone', 'microphoneId', devices.inputs, 'microphone')}
       {canChooseOutput ? (
@@ -116,20 +127,27 @@ const AudioSettings = () => {
           {select('ringer', 'ringerId', devices.outputs, 'output')}
         </>
       ) : (
-        <p className="badge">{t('settings.outputUnsupported')}</p>
+        <Typography variant="body2" color="textSecondary" component="p" className="u-mb-1">
+          {t('settings.outputUnsupported')}
+        </Typography>
       )}
-      <div className="actions">
-        <button type="button" className="btn" onClick={() => void ringTest()} disabled={ringing || phone.state === 'off'} aria-busy={ringing}>
+      <Stack direction="row" spacing={1} useFlexGap className="u-flex-wrap u-mb-1">
+        <Button variant="outlined" onClick={() => void ringTest()} disabled={ringing || phone.state === 'off'} aria-busy={ringing}>
           {t('settings.testRing')}
-        </button>
-      </div>
-      {phone.state === 'off' ? <p className="badge">{t('settings.audioNeedsPhone')}</p> : null}
-      {error ? (
-        <p className="alert alert-error" role="alert">
-          {error}
-        </p>
+        </Button>
+      </Stack>
+      {phone.state === 'off' ? (
+        <Typography variant="body2" color="textSecondary" component="p">
+          {t('settings.audioNeedsPhone')}
+        </Typography>
       ) : null}
-    </section>
+      {error ? (
+        <Alert severity="error" role="alert">
+          {error}
+        </Alert>
+      ) : null}
+      </CardContent>
+    </Card>
   )
 }
 
@@ -140,22 +158,28 @@ export const Settings = ({ config }: { config: AppConfig }) => {
   const user = state.status === 'signed-in' ? state.user : null
   return (
     <>
-      <h1>{t('settings.title')}</h1>
-      <section className="card" aria-labelledby="account">
-        <h2 id="account">{t('settings.account')}</h2>
-        <p>
-          <strong>{displayNameFor(me, user)}</strong>
-          <br />
-          {typeof user?.profile.email === 'string' ? user.profile.email : null}
-          <br />
-          {me ? (me.extension ? t('auth.extension', { extension: me.extension }) : t('auth.noExtension')) : null}
-        </p>
-        {meError ? (
-          <p className="alert alert-error" role="alert">
-            {meError}
-          </p>
-        ) : null}
-      </section>
+      <Typography variant="h4" component="h1" gutterBottom>
+        {t('settings.title')}
+      </Typography>
+      <Card component="section" variant="outlined" aria-labelledby="account" className="u-mb-1">
+        <CardContent>
+          <Typography variant="h5" component="h2" id="account" gutterBottom>
+            {t('settings.account')}
+          </Typography>
+          <Typography component="p">
+            <strong>{displayNameFor(me, user)}</strong>
+            <br />
+            {typeof user?.profile.email === 'string' ? user.profile.email : null}
+            <br />
+            {me ? (me.extension ? t('auth.extension', { extension: me.extension }) : t('auth.noExtension')) : null}
+          </Typography>
+          {meError ? (
+            <Alert severity="error" role="alert" className="u-mt-1">
+              {meError}
+            </Alert>
+          ) : null}
+        </CardContent>
+      </Card>
       {me ? (
         <>
           <PresenceSettings />
@@ -164,26 +188,39 @@ export const Settings = ({ config }: { config: AppConfig }) => {
           <NotificationSettings userId={me.id} />
         </>
       ) : null}
-      <section className="card" aria-labelledby="language">
-        <h2 id="language">{t('settings.language')}</h2>
-        <div className="field">
-          <label htmlFor="lang">{t('settings.languageLabel')}</label>
-          <select id="lang" value={lang} onChange={e => setLang(e.target.value as Lang)}>
+      <Card component="section" variant="outlined" aria-labelledby="language" className="u-mb-1">
+        <CardContent>
+          <Typography variant="h5" component="h2" id="language" gutterBottom>
+            {t('settings.language')}
+          </Typography>
+          <TextField
+            select
+            id="lang"
+            label={t('settings.languageLabel')}
+            value={lang}
+            onChange={e => setLang(e.target.value as Lang)}
+            fullWidth
+            slotProps={{ select: { native: true }, inputLabel: { shrink: true } }}
+          >
             {LANGS.map(l => (
               <option key={l} value={l}>
                 {l === 'fr' ? 'Français' : 'English'}
               </option>
             ))}
-          </select>
-        </div>
-      </section>
+          </TextField>
+        </CardContent>
+      </Card>
       <AudioSettings />
-      <section className="card" aria-labelledby="gateway">
-        <h2 id="gateway">{t('settings.gateway')}</h2>
-        <p>
-          <code>{config.gatewayUrl}</code>
-        </p>
-      </section>
+      <Card component="section" variant="outlined" aria-labelledby="gateway" className="u-mb-1">
+        <CardContent>
+          <Typography variant="h5" component="h2" id="gateway" gutterBottom>
+            {t('settings.gateway')}
+          </Typography>
+          <Typography component="p">
+            <code>{config.gatewayUrl}</code>
+          </Typography>
+        </CardContent>
+      </Card>
     </>
   )
 }

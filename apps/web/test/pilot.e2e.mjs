@@ -70,7 +70,7 @@ const open = async (login, name) => {
   return { page, context, name }
 }
 const presenceIs = async (page, query, extension, status) => {
-  await page.getByRole('link', { name: 'Annuaire' }).click()
+  await page.getByRole('link', { name: 'Clavier' }).click()
   await page.getByLabel('Rechercher').fill(query)
   await page.getByTestId(`presence-${extension}`).filter({ hasText: status }).waitFor({ timeout: 10_000 })
 }
@@ -107,7 +107,7 @@ try {
     await alice.page.getByRole('button', { name: 'Raccrocher' }).click()
     await presenceIs(bob.page, 'Alice', '101', 'Disponible')
     await bob.page.getByRole('link', { name: 'Récents' }).click()
-    await until('the call in Bob\'s history', async () => (await bob.page.locator('main ul.list li').filter({ hasText: '101' }).count()) > 0)
+    await until('the call in Bob\'s history', async () => (await bob.page.locator('[data-testid=recents] li').filter({ hasText: '101' }).count()) > 0)
   })
   await step('the identity provider\'s administration and account console are not served on the Internet', async () => {
     for (const path of ['/auth/admin/', '/auth/realms/master/', '/auth/realms/twakephone/account']) {

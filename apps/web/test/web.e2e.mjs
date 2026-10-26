@@ -272,11 +272,12 @@ try {
     await page.getByRole('button', { name: '5' }).click()
     expectEqual(await page.getByLabel('Numéro à appeler').inputValue(), '5', 'keypad input')
   })
-  await step('the directory finds Jean Dupont by "dup", with his number and department', async () => {
-    await page.getByRole('link', { name: 'Annuaire' }).click()
-    await page.getByText('Aucun favori pour l\'instant').waitFor()
+  await step('the directory beside the keypad lists everyone, then finds Jean Dupont by "dup", with his number and department', async () => {
+    const list = page.getByTestId('contacts')
+    await list.getByRole('link', { name: 'Zoé Lefèvre', exact: true }).waitFor()
+    await list.getByRole('link', { name: 'Jean Dupont', exact: true }).waitFor()
     await page.getByLabel('Rechercher').fill('dup')
-    const list = page.locator('ul.contacts')
+    await list.getByRole('link', { name: 'Zoé Lefèvre', exact: true }).waitFor({ state: 'detached' })
     await list.getByRole('link', { name: 'Jean Dupont', exact: true }).waitFor()
     await list.getByText(/Support · 102/).waitFor()
     expectEqual(await list.getByRole('listitem').count(), 1, 'number of results')
@@ -289,8 +290,9 @@ try {
     await list.getByRole('link', { name: 'Jean Dupont', exact: true }).waitFor()
     expectEqual(await list.getByRole('listitem').count(), 1, 'number of results by number')
   })
-  await step('a favourite survives a reload, because the Gateway keeps it', async () => {
+  await step('a favourite, set on the contact card, survives a reload, because the Gateway keeps it', async () => {
     await page.getByLabel('Rechercher').fill('dup')
+    await page.getByTestId('contacts').getByRole('link', { name: 'Jean Dupont', exact: true }).click()
     const saved = page.waitForResponse(r => r.request().method() === 'PUT' && r.url().endsWith('/me/favorites/jdupont'))
     const star = page.getByRole('button', { name: 'Favori : Jean Dupont' })
     expectEqual(await star.getAttribute('aria-pressed'), 'false', 'aria-pressed before')
@@ -298,12 +300,10 @@ try {
     expectEqual((await saved).status(), 204, 'favourite saved by the Gateway')
     await page.locator('button[aria-label="Favori : Jean Dupont"][aria-pressed="true"]:not([disabled])').waitFor()
     await page.reload()
-    await page.getByRole('heading', { level: 2, name: 'Favoris' }).waitFor()
-    await page.getByRole('link', { name: 'Jean Dupont', exact: true }).waitFor()
+    await page.getByRole('heading', { level: 1, name: 'Jean Dupont' }).waitFor()
     expectEqual(await page.getByRole('button', { name: 'Favori : Jean Dupont' }).getAttribute('aria-pressed'), 'true', 'aria-pressed after reload')
   })
   await step('the contact card lists every number, and Call sends it to the dialer', async () => {
-    await page.getByRole('link', { name: 'Jean Dupont', exact: true }).click()
     await page.getByRole('heading', { level: 1, name: 'Jean Dupont' }).waitFor()
     expectEqual(await page.title(), 'Jean Dupont – TwakePhone', 'document title')
     await page.getByText('Technicien · Support').waitFor()
@@ -314,12 +314,12 @@ try {
     expectEqual(typed.replace(/\s/g, ''), '+33612345601', 'number sent to the dialer')
     expectEqual(new URL(page.url()).search, '', 'address bar cleaned')
   })
-  await step('removing the favourite empties the list', async () => {
-    await page.getByRole('link', { name: 'Annuaire' }).click()
+  await step('the favourite is removed from the card', async () => {
+    await page.getByTestId('contacts').getByRole('link', { name: 'Jean Dupont', exact: true }).click()
     const removed = page.waitForResponse(r => r.request().method() === 'DELETE' && r.url().endsWith('/me/favorites/jdupont'))
     await page.getByRole('button', { name: 'Favori : Jean Dupont' }).click()
     expectEqual((await removed).status(), 204, 'favourite removed by the Gateway')
-    await page.getByText('Aucun favori pour l\'instant').waitFor()
+    await page.locator('button[aria-label="Favori : Jean Dupont"][aria-pressed="false"]:not([disabled])').waitFor()
   })
   await step('switching the language to English changes the UI, the title and the document language', async () => {
     await page.getByRole('link', { name: 'Réglages' }).click()
@@ -677,9 +677,9 @@ try {
     expectEqual(JSON.stringify(stats), JSON.stringify({ total: 3, matched: 1, orphan: 1, unmatchedInbound: 0, unmatchedOutbound: 0, forwarded: 1, pending: 0, invalid: 0, erased: 0 }), 'what became of the records')
     // All the calls the platform could have had (second review 10b, n°5): the one OVH alone received while it could not
     // be reached, and OVH's forward of it, aside.
-    await records.locator('div', { has: page.getByText('Taux de rapprochement', { exact: true }) }).getByRole('definition').getByText(/^100\s%$/).waitFor()
+    await records.locator('dl > div', { has: page.getByText('Taux de rapprochement', { exact: true }) }).getByRole('definition').getByText(/^100\s%$/).waitFor()
     for (const [label, n] of [["Rapprochés de l'historique", '1'], ["Reçus par l'opérateur seul", '1'], ["Renvoyés par l'opérateur", '1']])
-      await records.locator('div', { has: page.getByText(label, { exact: true }) }).getByRole('definition').getByText(n, { exact: true }).waitFor()
+      await records.locator('dl > div', { has: page.getByText(label, { exact: true }) }).getByRole('definition').getByText(n, { exact: true }).waitFor()
     // In the history, as GET /calls/history gives it: where each call is known from.
     const items = await history()
     expectEqual(JSON.stringify(items.find(i => i.id === call.id)?.sources), JSON.stringify(['opensips', 'ovh']), 'the missed call reconciled')
@@ -693,7 +693,7 @@ try {
     expectEqual(items.length, 2, 'the forward is in nobody’s history')
     // And on Alice's screen.
     await page.getByRole('link', { name: 'Récents' }).click()
-    const rows = page.locator('ul.list > li')
+    const rows = page.locator('[data-testid=recents] > li')
     await rows.filter({ hasText: '+33 6 39 98 00 01' }).getByText("Confirmé par l'opérateur").waitFor()
     const forwarded = rows.filter({ hasText: '+33 6 39 98 00 02' })
     await forwarded.getByText("Reçu par l'opérateur seul").waitFor()

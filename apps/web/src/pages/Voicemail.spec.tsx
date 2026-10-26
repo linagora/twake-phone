@@ -125,8 +125,8 @@ describe('the Messagerie vocale page', () => {
   it('says the duration with its word, in a visually hidden text, the clock hidden from assistive tech', async () => {
     lists = [[v('a', at)]]
     await render()
-    const badge = host.querySelector('[data-testid="voicemail"] .badge:not(.missed)')!
-    expect(badge.querySelector('.sr-only')!.textContent).toBe('voicemail.durationLabel 0:07')
+    const badge = host.querySelector('[data-testid="voicemail-duration"]')!
+    expect(badge.querySelector('.u-visuallyhidden')!.textContent).toBe('voicemail.durationLabel 0:07')
     expect(badge.querySelector('[aria-hidden="true"]')!.textContent).toBe('0:07')
     expect(badge.querySelector('[aria-label]')).toBeNull()
   })
@@ -156,7 +156,8 @@ describe('the Messagerie vocale page', () => {
     // A message left before the platform transcribed: nothing said.
     expect(transcriptOf('z')).toBeNull()
     await click('a', 'voicemail.listenTo')
-    const player = host.querySelector('[data-testid="voicemail-audio"]')!
+    const player = host.querySelector('[data-testid="voicemail-player"] input')!
+    expect(player.getAttribute('aria-label')).toMatch(/^voicemail\.player 101 /)
     expect(player.getAttribute('aria-describedby')).toBe(transcriptOf('a')!.id)
     send({ type: 'voicemail.transcribed', timestamp: at, payload: { id: 'c', transcript: { status: 'done', text: '' } } })
     expect(transcriptOf('c')!.textContent).toBe('voicemail.transcriptLabel voicemail.transcriptEmpty')
@@ -206,13 +207,20 @@ describe('the Messagerie vocale page', () => {
     root = createRoot(host)
   })
 
-  it('gives the focus on: after « Marquer comme lu », its « Écouter »; after « Supprimer », the next message, the previous one, then the title; and tells what was done', async () => {
+  it('marks a message read once it is listened to', async () => {
+    lists = [[{ ...v('a', at), unread: true }]]
+    markVoicemailRead.mockClear()
+    await render()
+    await click('a', 'voicemail.listenTo')
+    await flush()
+    expect(markVoicemailRead).toHaveBeenCalledWith('a')
+    expect(host.querySelector('[data-id="a"]')!.getAttribute('data-unread')).toBe('0')
+  })
+
+  it('gives the focus after « Supprimer » to the next message, the previous one, then the title; and tells what was done', async () => {
     lists = [[{ ...v('c', '2026-10-18T02:14:00.000Z'), from: '103' }, { ...v('b', '2026-10-18T02:13:00.000Z'), from: '102' }, v('a', at)]]
     await render()
     const listenOf = (id: string) => host.querySelector(`[data-id="${id}"] button`)
-    await click('b', 'voicemail.markReadWho')
-    expect(document.activeElement).toBe(listenOf('b'))
-    expect(status()).toContain('voicemail.markedRead 102')
     await remove('b')
     expect(ids()).toEqual(['c', 'a'])
     expect(document.activeElement).toBe(listenOf('a'))

@@ -1,3 +1,4 @@
+import { Alert, Typography } from '@linagora/twake-mui'
 import { useEffect, useMemo, useState } from 'react'
 import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom'
 import { AuthProvider, useAuth } from './auth/AuthProvider.js'
@@ -5,6 +6,7 @@ import { createUserManager } from './auth/oidc.js'
 import { loadConfig, type AppConfig } from './config.js'
 import { GatewayProvider } from './gateway.js'
 import { I18nProvider, useT } from './i18n/useT.js'
+import { CenteredPage } from './components/CenteredPage.js'
 import { Layout } from './components/Layout.js'
 import { Admin } from './pages/admin/Admin.js'
 import { Alerts } from './pages/admin/Alerts.js'
@@ -16,9 +18,8 @@ import { Rights } from './pages/admin/Rights.js'
 import { RingGroups } from './pages/admin/RingGroups.js'
 import { Trunks } from './pages/admin/Trunks.js'
 import { Webhooks } from './pages/admin/Webhooks.js'
-import { Dialer } from './pages/Dialer.js'
 import { ContactPage } from './pages/ContactPage.js'
-import { Directory } from './pages/Directory.js'
+import { Phone } from './pages/Phone.js'
 import { VoicemailPage } from './pages/Voicemail.js'
 import { FavoritesProvider } from './favorites.js'
 import { PresenceProvider } from './presence.js'
@@ -30,7 +31,7 @@ import { SoftphoneProvider } from './softphone.js'
 const Gate = ({ config }: { config: AppConfig }) => {
   const { t } = useT()
   const { state } = useAuth()
-  if (state.status === 'loading') return <main id="main" className="center"><p role="status">{t('auth.loading')}</p></main>
+  if (state.status === 'loading') return <CenteredPage><p role="status">{t('auth.loading')}</p></CenteredPage>
   if (state.status === 'anonymous') return <SignIn />
   return (
     <GatewayProvider config={config}>
@@ -40,10 +41,10 @@ const Gate = ({ config }: { config: AppConfig }) => {
           <BrowserRouter>
             <Routes>
               <Route element={<Layout />}>
-                <Route index element={<Dialer />} />
+                <Route index element={<Phone />} />
                 <Route path="recents" element={<Recents />} />
                 <Route path="voicemail" element={<VoicemailPage />} />
-                <Route path="directory" element={<Directory />} />
+                <Route path="directory" element={<Navigate to="/" replace />} />
                 <Route path="directory/:id" element={<ContactPage />} />
                 <Route path="settings" element={<Settings config={config} />} />
                 <Route path="admin" element={<Admin />}>
@@ -87,8 +88,18 @@ const Boot = () => {
       .then(setConfig)
       .catch(err => setError(err instanceof Error ? err.message : String(err)))
   }, [])
-  if (error) return <main id="main" className="center"><h1>{t('error.title')}</h1><p className="alert alert-error" role="alert">{t('config.error', { reason: error })}</p></main>
-  if (!config) return <main id="main" className="center"><p role="status">{t('auth.loading')}</p></main>
+  if (error)
+    return (
+      <CenteredPage>
+        <Typography variant="h4" component="h1" gutterBottom>
+          {t('error.title')}
+        </Typography>
+        <Alert severity="error" role="alert">
+          {t('config.error', { reason: error })}
+        </Alert>
+      </CenteredPage>
+    )
+  if (!config) return <CenteredPage><p role="status">{t('auth.loading')}</p></CenteredPage>
   return <Configured config={config} />
 }
 

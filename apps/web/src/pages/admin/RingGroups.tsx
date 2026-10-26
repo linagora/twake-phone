@@ -1,3 +1,4 @@
+import { Alert, Button, List, ListItem, ListItemText, Stack, Typography } from '@linagora/twake-mui'
 import { useCallback, useEffect, useState, type FormEvent } from 'react'
 import type { RingGroup } from '@twake/telephony-client'
 import { ConfirmDelete, NoteLine, ProblemSummary, Section, TextField, useFocusLater, useProblem, type Note } from '../../admin/ui.js'
@@ -59,7 +60,10 @@ export const RingGroups = () => {
     setBusy(true)
     try {
       const saved = editing ? await client.setGroup(checked.group) : await client.createGroup(checked.group)
-      setNote({ kind: 'ok', text: t('admin.groupSaved', { number: saved.number }) })
+      setNote({
+        kind: 'ok',
+        text: t('admin.groupSaved', { number: saved.number })
+      })
       reset()
       load()
     } catch (err) {
@@ -91,10 +95,18 @@ export const RingGroups = () => {
     try {
       await client.deleteGroup(g.number)
       // The row goes, its buttons with it: the focus goes to what is said.
-      setNote({ kind: 'ok', text: t('admin.groupDeleted', { number: g.number }), focus: true })
+      setNote({
+        kind: 'ok',
+        text: t('admin.groupDeleted', { number: g.number }),
+        focus: true
+      })
       if (editing === g.number) reset()
     } catch (err) {
-      setNote({ kind: 'error', text: say(refusalOf(err, () => undefined).problem)!, focus: true })
+      setNote({
+        kind: 'error',
+        text: say(refusalOf(err, () => undefined).problem)!,
+        focus: true
+      })
     } finally {
       setBusy(false)
       load()
@@ -104,51 +116,85 @@ export const RingGroups = () => {
   if (unavailable)
     return (
       <Section id="groups" title={t('admin.groups')}>
-        <p className="alert">{t('admin.groupsUnavailable')}</p>
+        <Alert severity="info">{t('admin.groupsUnavailable')}</Alert>
       </Section>
     )
   const count = Object.keys(problems).length
   return (
     <>
       <Section id="groups" title={t('admin.groups')}>
-        <p>{t('admin.groupsHelp')}</p>
+        <Typography component="p" gutterBottom>
+          {t('admin.groupsHelp')}
+        </Typography>
         {groups === null ? null : groups.length ? (
-          <ul className="list admin-list" aria-label={t('admin.groupsList')}>
+          <List aria-label={t('admin.groupsList')}>
             {groups.map(g => (
-              <li key={g.number}>
-                <span>
-                  <strong>{g.number}</strong> {g.name} :{' '}
-                  {g.members.length ? g.members.map(m => `${m}${g.vacant?.includes(m) ? ` ${t('admin.groupMemberVacant')}` : ''}`).join(', ') : t('admin.groupNoMembers')}
-                </span>
-                <div className="actions actions-end">
-                  <button type="button" className="btn" onClick={() => edit(g)} disabled={busy} aria-label={t('admin.groupEdit', { number: g.number })}>
+              <ListItem key={g.number} divider>
+                <ListItemText
+                  primary={
+                    <>
+                      <strong>{g.number}</strong> {g.name} :{' '}
+                      {g.members.length ? g.members.map(m => `${m}${g.vacant?.includes(m) ? ` ${t('admin.groupMemberVacant')}` : ''}`).join(', ') : t('admin.groupNoMembers')}
+                    </>
+                  }
+                />
+                <Stack direction="row" spacing={1} useFlexGap className="u-flex-wrap">
+                  <Button variant="outlined" onClick={() => edit(g)} disabled={busy} aria-label={t('admin.groupEdit', { number: g.number })}>
                     {t('admin.groupEditShort')}
-                  </button>
-                  <ConfirmDelete label={t('admin.groupDelete', { number: g.number })} question={t('admin.groupDeleteConfirm', { number: g.number })} onConfirm={() => void remove(g)} disabled={busy} />
-                </div>
-              </li>
+                  </Button>
+                  <ConfirmDelete
+                    label={t('admin.groupDelete', { number: g.number })}
+                    question={t('admin.groupDeleteConfirm', {
+                      number: g.number
+                    })}
+                    onConfirm={() => void remove(g)}
+                    disabled={busy}
+                  />
+                </Stack>
+              </ListItem>
             ))}
-          </ul>
+          </List>
         ) : (
-          <p className="muted">{t('admin.groupsNone')}</p>
+          <Typography component="p" variant="body2" color="textSecondary">
+            {t('admin.groupsNone')}
+          </Typography>
         )}
       </Section>
       <Section id="group-form" title={editing ? t('admin.groupEdit', { number: editing }) : t('admin.groupNew')}>
         <form onSubmit={e => void save(e)} noValidate aria-labelledby="group-form">
           <ProblemSummary count={count} />
-          <TextField id="group-number" label={t('admin.groupNumber')} inputMode="numeric" value={editing ?? form.number} onChange={set('number')} error={say(problems.number)} required disabled={busy || editing !== null} maxLength={6} />
+          <TextField
+            id="group-number"
+            label={t('admin.groupNumber')}
+            inputMode="numeric"
+            value={editing ?? form.number}
+            onChange={set('number')}
+            error={say(problems.number)}
+            required
+            disabled={busy || editing !== null}
+            maxLength={6}
+          />
           <TextField id="group-name" label={t('admin.groupName')} value={form.name} onChange={set('name')} error={say(problems.name)} required disabled={busy} maxLength={64} />
-          <TextField id="group-members" label={t('admin.groupMembers')} hint={t('admin.groupMembersHint')} value={form.members} onChange={set('members')} error={say(problems.members)} required disabled={busy} />
-          <div className="actions actions-start">
-            <button type="submit" className="btn btn-primary" disabled={busy} aria-busy={busy}>
+          <TextField
+            id="group-members"
+            label={t('admin.groupMembers')}
+            hint={t('admin.groupMembersHint')}
+            value={form.members}
+            onChange={set('members')}
+            error={say(problems.members)}
+            required
+            disabled={busy}
+          />
+          <Stack direction="row" spacing={1} useFlexGap className="u-flex-wrap">
+            <Button type="submit" disabled={busy} aria-busy={busy}>
               {t('admin.groupSave')}
-            </button>
+            </Button>
             {editing ? (
-              <button type="button" className="btn" onClick={reset} disabled={busy}>
+              <Button variant="outlined" onClick={reset} disabled={busy}>
                 {t('admin.groupCancel')}
-              </button>
+              </Button>
             ) : null}
-          </div>
+          </Stack>
         </form>
         <NoteLine note={note} />
       </Section>

@@ -1,3 +1,4 @@
+import { Alert, Button, Card, CardContent, Checkbox, FormControl, FormControlLabel, FormGroup, FormHelperText, FormLabel, Stack, TextField as MuiTextField, Typography } from '@linagora/twake-mui'
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import type { Key } from '../i18n/index.js'
 import { useT } from '../i18n/useT.js'
@@ -18,10 +19,10 @@ export const useProblem = () => {
  */
 export const FieldError = ({ id, error }: { id: string; error?: string | undefined }) =>
   error ? (
-    <span id={`${id}-error`} className="field-error">
+    <FormHelperText id={`${id}-error`} component="span" error className="u-fw-bold">
       <span aria-hidden="true">⚠ </span>
       {error}
-    </span>
+    </FormHelperText>
   ) : null
 
 /**
@@ -37,6 +38,14 @@ export const useLatest = <V,>(value: V) => {
 }
 
 const describedBy = (...ids: (string | false | undefined)[]) => ids.filter(Boolean).join(' ') || undefined
+
+/** The hint under a field, named `${id}-hint` (its aria-describedby). */
+const Hint = ({ id, hint }: { id: string; hint?: string | undefined }) =>
+  hint ? (
+    <FormHelperText id={`${id}-hint`} component="span">
+      {hint}
+    </FormHelperText>
+  ) : null
 
 interface TextFieldProps {
   id: string
@@ -56,31 +65,30 @@ interface TextFieldProps {
 }
 
 export const TextField = ({ id, label, value, onChange, hint, error, type = 'text', inputMode, autoComplete = 'off', required, disabled, maxLength = 256, list, placeholder }: TextFieldProps) => (
-  <div className="field">
-    <label htmlFor={id}>
-      {label}
-      {required ? <span aria-hidden="true"> *</span> : null}
-    </label>
-    <input
+  <div className="u-mb-1">
+    <MuiTextField
       id={id}
+      label={label}
       type={type}
-      inputMode={inputMode}
-      autoComplete={autoComplete}
       value={value}
       onChange={e => onChange(e.target.value)}
       required={required}
       disabled={disabled}
-      maxLength={maxLength}
-      list={list}
       placeholder={placeholder}
-      aria-invalid={error ? true : undefined}
-      aria-describedby={describedBy(hint && `${id}-hint`, error && `${id}-error`)}
+      error={Boolean(error)}
+      fullWidth
+      slotProps={{
+        htmlInput: {
+          inputMode,
+          autoComplete,
+          maxLength,
+          list,
+          'aria-invalid': error ? true : undefined,
+          'aria-describedby': describedBy(hint && `${id}-hint`, error && `${id}-error`)
+        }
+      }}
     />
-    {hint ? (
-      <span id={`${id}-hint`} className="badge">
-        {hint}
-      </span>
-    ) : null}
+    <Hint id={id} hint={hint} />
     <FieldError id={id} error={error} />
   </div>
 )
@@ -97,61 +105,74 @@ interface SelectFieldProps {
 }
 
 export const SelectField = ({ id, label, value, onChange, options, hint, error, disabled }: SelectFieldProps) => (
-  <div className="field">
-    <label htmlFor={id}>{label}</label>
-    <select id={id} value={value} onChange={e => onChange(e.target.value)} disabled={disabled} aria-invalid={error ? true : undefined} aria-describedby={describedBy(hint && `${id}-hint`, error && `${id}-error`)}>
+  <div className="u-mb-1">
+    <MuiTextField
+      select
+      id={id}
+      label={label}
+      value={value}
+      onChange={e => onChange(e.target.value)}
+      disabled={disabled}
+      error={Boolean(error)}
+      fullWidth
+      slotProps={{
+        // The browser's own list: the keyboard and screen readers know it, and so do the tests' change events.
+        select: { native: true },
+        inputLabel: { shrink: true },
+        htmlInput: { 'aria-invalid': error ? true : undefined, 'aria-describedby': describedBy(hint && `${id}-hint`, error && `${id}-error`) }
+      }}
+    >
       {options.map(o => (
         <option key={o.value} value={o.value}>
           {o.label}
         </option>
       ))}
-    </select>
-    {hint ? (
-      <span id={`${id}-hint`} className="badge">
-        {hint}
-      </span>
-    ) : null}
+    </MuiTextField>
+    <Hint id={id} hint={hint} />
     <FieldError id={id} error={error} />
   </div>
 )
 
 /** Several boxes under one legend; the first box carries `id` (the focus goes there when the group is in error). */
 export const CheckGroup = <V extends string>({ id, legend, values, chosen, label, onChange, hint, error, disabled }: { id: string; legend: string; values: readonly V[]; chosen: readonly V[]; label: (v: V) => string; onChange: (next: V[]) => void; hint?: string; error?: string; disabled?: boolean }) => (
-  <fieldset className="field" aria-describedby={describedBy(hint && `${id}-hint`, error && `${id}-error`)} aria-invalid={error ? true : undefined}>
-    <legend>{legend}</legend>
-    <div className="checks">
+  <FormControl component="fieldset" error={Boolean(error)} fullWidth className="u-mb-1" aria-describedby={describedBy(hint && `${id}-hint`, error && `${id}-error`)} aria-invalid={error ? true : undefined}>
+    <FormLabel component="legend">{legend}</FormLabel>
+    <FormGroup row>
       {values.map((v, i) => (
-        <label key={v} className="check">
-          <input
-            type="checkbox"
-            id={i === 0 ? id : `${id}-${v}`}
-            checked={chosen.includes(v)}
-            disabled={disabled}
-            onChange={e => onChange(e.target.checked ? values.filter(x => x === v || chosen.includes(x)) : chosen.filter(x => x !== v))}
-          />{' '}
-          {label(v)}
-        </label>
+        <FormControlLabel
+          key={v}
+          label={label(v)}
+          control={
+            <Checkbox
+              id={i === 0 ? id : `${id}-${v}`}
+              checked={chosen.includes(v)}
+              disabled={disabled}
+              onChange={e => onChange(e.target.checked ? values.filter(x => x === v || chosen.includes(x)) : chosen.filter(x => x !== v))}
+            />
+          }
+        />
       ))}
-    </div>
-    {hint ? (
-      <span id={`${id}-hint`} className="badge">
-        {hint}
-      </span>
-    ) : null}
+    </FormGroup>
+    <Hint id={id} hint={hint} />
     <FieldError id={id} error={error} />
-  </fieldset>
+  </FormControl>
 )
 
 export const CheckBox = ({ id, label, checked, onChange, hint, error, disabled }: { id: string; label: string; checked: boolean; onChange: (v: boolean) => void; hint?: string; error?: string; disabled?: boolean }) => (
-  <div className="field">
-    <label className="check" htmlFor={id}>
-      <input type="checkbox" id={id} checked={checked} disabled={disabled} onChange={e => onChange(e.target.checked)} aria-invalid={error ? true : undefined} aria-describedby={describedBy(hint && `${id}-hint`, error && `${id}-error`)} /> {label}
-    </label>
-    {hint ? (
-      <span id={`${id}-hint`} className="badge">
-        {hint}
-      </span>
-    ) : null}
+  <div className="u-mb-1">
+    <FormControlLabel
+      label={label}
+      control={
+        <Checkbox
+          id={id}
+          checked={checked}
+          disabled={disabled}
+          onChange={e => onChange(e.target.checked)}
+          slotProps={{ input: { 'aria-invalid': error ? true : undefined, 'aria-describedby': describedBy(hint && `${id}-hint`, error && `${id}-error`) } }}
+        />
+      }
+    />
+    <Hint id={id} hint={hint} />
     <FieldError id={id} error={error} />
   </div>
 )
@@ -184,18 +205,18 @@ export const useFocusLater = () => {
 export type Note = { kind: 'ok' | 'error'; text: string; focus?: boolean } | null
 
 export const NoteLine = ({ note }: { note: Note }) => {
-  const ref = useRef<HTMLParagraphElement>(null)
+  const ref = useRef<HTMLDivElement>(null)
   useEffect(() => {
     if (note?.focus) ref.current?.focus()
   }, [note])
   return note?.kind === 'error' ? (
-    <p ref={ref} className="alert alert-error" role="alert" tabIndex={-1}>
+    <Alert ref={ref} severity="error" role="alert" tabIndex={-1} className="u-mb-1">
       {note.text}
-    </p>
+    </Alert>
   ) : (
-    <p ref={ref} className="badge" role="status" tabIndex={-1}>
+    <Typography ref={ref} component="p" variant="body2" color="textSecondary" role="status" tabIndex={-1} className="u-mb-1">
       {note?.text ?? ''}
-    </p>
+    </Typography>
   )
 }
 
@@ -246,9 +267,9 @@ export const useRefresh = (read: () => Promise<unknown>, everyMs: number, enable
 export const ProblemSummary = ({ count }: { count: number }) => {
   const { t } = useT()
   return count ? (
-    <p className="alert alert-error" role="alert">
+    <Alert severity="error" role="alert" className="u-mb-1">
       {t(count === 1 ? 'admin.form.oneProblem' : 'admin.form.problems', { count })}
-    </p>
+    </Alert>
   ) : null
 }
 
@@ -291,23 +312,26 @@ export const ConfirmDelete = ({
   }
   if (!asking)
     return (
-      <button ref={button} type="button" className={tone === 'danger' ? 'btn btn-danger' : 'btn'} onClick={() => setAsking(true)} disabled={disabled} aria-label={label}>
+      <Button ref={button} variant="outlined" color={tone === 'danger' ? 'error' : 'primary'} onClick={() => setAsking(true)} disabled={disabled} aria-label={label}>
         {t(action)}
-      </button>
+      </Button>
     )
   return (
-    <span
+    <Stack
+      component="span"
+      direction="row"
+      spacing={1}
+      useFlexGap
       role="group"
       aria-label={question}
-      className="confirm"
+      className="u-flex-items-center u-flex-wrap"
       onKeyDown={e => {
         if (e.key === 'Escape') keep()
       }}
     >
       {question}{' '}
-      <button
-        type="button"
-        className="btn btn-danger"
+      <Button
+        color="error"
         autoFocus
         onClick={() => {
           setAsking(false)
@@ -316,18 +340,22 @@ export const ConfirmDelete = ({
         disabled={disabled}
       >
         {t(yes)}
-      </button>{' '}
-      <button type="button" className="btn" onClick={keep} disabled={disabled}>
+      </Button>{' '}
+      <Button variant="outlined" onClick={keep} disabled={disabled}>
         {t(no)}
-      </button>
-    </span>
+      </Button>
+    </Stack>
   )
 }
 
 /** A section of the administration with its heading. */
 export const Section = ({ id, title, children }: { id: string; title: string; children: ReactNode }) => (
-  <section className="card" aria-labelledby={id}>
-    <h2 id={id}>{title}</h2>
-    {children}
-  </section>
+  <Card component="section" variant="outlined" aria-labelledby={id} className="u-mb-1">
+    <CardContent>
+      <Typography variant="h5" component="h2" id={id} gutterBottom>
+        {title}
+      </Typography>
+      {children}
+    </CardContent>
+  </Card>
 )

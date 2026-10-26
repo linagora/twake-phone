@@ -36,7 +36,8 @@ describe('directory routes', () => {
     const app = await appWith(new MemoryContactDirectory([jean, bob]))
     expect((await app.inject({ url: '/api/v1/directory?q=dup', headers: as('alice') })).json()).toEqual({ items: [jean], truncated: false })
     expect((await app.inject({ url: '/api/v1/directory?q=support&limit=1', headers: as('alice') })).json()).toEqual({ items: [jean], truncated: true })
-    expect((await app.inject({ url: '/api/v1/directory', headers: as('alice') })).json()).toEqual({ items: [], truncated: false })
+    // No query: anyone, as many as the limit allows (the directory beside the keypad).
+    expect((await app.inject({ url: '/api/v1/directory', headers: as('alice') })).json()).toEqual({ items: [jean, bob], truncated: false })
     expect((await app.inject({ url: `/api/v1/directory?q=${'a'.repeat(101)}`, headers: as('alice') })).statusCode).toBe(400)
     expect((await app.inject({ url: '/api/v1/directory?q=a&limit=0', headers: as('alice') })).statusCode).toBe(400)
     expect((await app.inject({ url: '/api/v1/directory?q=a&limit=51', headers: as('alice') })).statusCode).toBe(400)

@@ -1,6 +1,6 @@
 import { createServer } from 'node:net'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { DEFAULT_ATTRIBUTES, LdapDirectory, contactOf, digitsOf, ldapDirectoryFromEnv, searchFilter, searchWords } from './ldap-directory.js'
+import { DEFAULT_ATTRIBUTES, LdapDirectory, MAX_PHOTO_BYTES, contactOf, digitsOf, ldapDirectoryFromEnv, searchFilter, searchWords } from './ldap-directory.js'
 // @ts-expect-error plain JavaScript test helper, shared with the browser e2e
 import { BASE_DN, PEOPLE, READER_DN, READER_PASSWORD, startLdapMock } from '../test/ldap-mock.mjs'
 
@@ -44,6 +44,20 @@ describe('contactOf', () => {
     expect(c).toEqual({ id: 'bd', displayName: 'Bob Durand', numbers: [{ type: 'work', number: '01' }, { type: 'work', number: '02' }, { type: 'mobile', number: '06' }], email: 'bob@x', department: 'Support' })
     expect(contactOf({ dn: 'x', cn: 'No Id' }, DEFAULT_ATTRIBUTES)).toBeNull()
     expect(contactOf({ dn: 'x', uid: 'u', displayName: 'Named' }, { ...DEFAULT_ATTRIBUTES, name: 'DisplayName' })?.displayName).toBe('Named')
+  })
+  it('turns a JPEG or PNG photo into a data URL, drops anything else, and is off when the attribute is empty', () => {
+    const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 1, 2, 3])
+    const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 1, 2, 3])
+    const of = (jpegPhoto: unknown, a = DEFAULT_ATTRIBUTES) => contactOf({ dn: 'x', uid: 'u', cn: 'U', jpegPhoto } as never, a)?.photo
+    expect(of(jpeg)).toBe(`data:image/jpeg;base64,${jpeg.toString('base64')}`)
+    expect(of([png])).toBe(`data:image/png;base64,${png.toString('base64')}`)
+    expect(of(Buffer.from('GIF89a...'))).toBeUndefined()
+    expect(of(jpeg.toString('latin1'))).toBeUndefined()
+    expect(of(Buffer.concat([jpeg, Buffer.alloc(MAX_PHOTO_BYTES)]))).toBeUndefined()
+    expect(of(jpeg, { ...DEFAULT_ATTRIBUTES, photo: '' })).toBeUndefined()
+    // LDAP_ATTR_PHOTO='' disables it, unset keeps jpegPhoto
+    expect(ldapDirectoryFromEnv({ LDAP_URL: 'ldap://localhost', LDAP_BASE_DN: 'dc=x', LDAP_ATTR_PHOTO: '' })?.describe().attributes).toMatchObject({ photo: '' })
+    expect(ldapDirectoryFromEnv({ LDAP_URL: 'ldap://localhost', LDAP_BASE_DN: 'dc=x' })?.describe().attributes).toMatchObject({ photo: 'jpegPhoto' })
   })
   it('reads an internal extension from its own attribute when the schema has one', () => {
     const c = contactOf({ dn: 'x', uid: 'bd', cn: 'Bob', employeeNumber: '103', telephoneNumber: '01' }, { ...DEFAULT_ATTRIBUTES, extension: 'employeeNumber' })
@@ -89,7 +103,10 @@ describe('LdapDirectory against a real LDAP server', () => {
     expect((await dir.search('t', 'support', 10)).items.map(c => c.displayName)).toEqual(['Bob Durand', 'Jean Dupont', 'Marc Petit'])
     expect((await dir.search('t', 'jean support', 10)).items.map(c => c.displayName)).toEqual(['Jean Dupont'])
     expect((await dir.search('t', 'nobody', 10)).items).toEqual([])
-    expect((await dir.search('t', '   ', 10)).items).toEqual([])
+    // A word too short to search for finds nobody; no word at all lists anyone, up to the limit.
+    expect((await dir.search('t', 'a', 10)).items).toEqual([])
+    const anyone = await dir.search('t', '   ', 2)
+    expect([anyone.items.length, anyone.truncated]).toEqual([2, true])
   })
 
   it('finds accented names typed with or without accents, in any case', async () => {
@@ -118,6 +135,20 @@ describe('LdapDirectory against a real LDAP server', () => {
       id: 'jdupont', displayName: 'Jean Dupont', email: 'jean.dupont@example.test', department: 'Support', title: 'Technicien',
       numbers: [{ type: 'work', number: '+33 1 23 45 67 01' }, { type: 'mobile', number: '+33 6 12 34 56 01' }]
     })
+  })
+
+  it('carries the photo as bytes through a real search, not as mangled text', async () => {
+    const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x80, 0xfe, 0x00, 0xc3, 0x28])
+    const mock = await startLdapMock({ people: (PEOPLE as Record<string, unknown>[]).map(p => (p.uid === 'jdupont' ? { ...p, jpegPhoto: jpeg } : p)) })
+    try {
+      const d = make({ url: mock.url })
+      const url = `data:image/jpeg;base64,${jpeg.toString('base64')}`
+      expect((await d.search('t', 'dup', 10)).items[0]?.photo).toBe(url)
+      expect((await d.getMany('t', ['jdupont', 'amartin'])).map(c => c.photo)).toEqual([url, undefined])
+      expect((await make({ url: mock.url, attributes: { ...DEFAULT_ATTRIBUTES, photo: '' } }).getMany('t', ['jdupont']))[0]?.photo).toBeUndefined()
+    } finally {
+      await mock.stop()
+    }
   })
 
   it('resolves many ids in the order asked, in batches, and skips unknown ones', async () => {

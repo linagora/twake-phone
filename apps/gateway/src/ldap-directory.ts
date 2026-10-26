@@ -18,6 +18,8 @@ export interface LdapAttributes {
   extension: string
   department: string
   title: string
+  /** Binary photo (jpegPhoto; thumbnailPhoto on Active Directory), "" when the directory has none to show. */
+  photo: string
 }
 
 export interface LdapDirectoryConfig {
@@ -47,7 +49,7 @@ export interface LdapDirectoryConfig {
   matrixAttribute?: string
 }
 
-export const DEFAULT_ATTRIBUTES: LdapAttributes = { id: 'uid', name: 'cn', surname: 'sn', givenName: 'givenName', email: 'mail', phone: 'telephoneNumber', mobile: 'mobile', extension: '', department: 'ou', title: 'title' }
+export const DEFAULT_ATTRIBUTES: LdapAttributes = { id: 'uid', name: 'cn', surname: 'sn', givenName: 'givenName', email: 'mail', phone: 'telephoneNumber', mobile: 'mobile', extension: '', department: 'ou', title: 'title', photo: 'jpegPhoto' }
 
 /** Search words shorter than this are ignored: a one-letter substring search is an unindexed scan of the directory. */
 export const MIN_WORD = 2
@@ -56,6 +58,19 @@ export const MAX_WORDS = 5
 const BATCH = 50
 /** A full listing is paged (RFC 2696): a server's size limit (500 on OpenLDAP by default) must not cut it short. */
 const PAGE = 500
+
+/**
+ * A directory photo is meant for a list, not a poster: bigger than this (raw) it is dropped, and the initials show.
+ * It travels inside every search answer, as a data URL, so it must stay small.
+ */
+export const MAX_PHOTO_BYTES = 48 * 1024
+
+/** The photo as a data URL when the bytes are a JPEG or a PNG of list size (sniffed by magic number), else undefined. */
+const photoUrl = (raw: string | Buffer | undefined): string | undefined => {
+  if (!Buffer.isBuffer(raw) || raw.length === 0 || raw.length > MAX_PHOTO_BYTES) return undefined
+  const mime = raw[0] === 0xff && raw[1] === 0xd8 ? 'jpeg' : raw.subarray(0, 4).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47])) ? 'png' : undefined
+  return mime ? `data:image/${mime};base64,${raw.toString('base64')}` : undefined
+}
 
 const str = (x: string | Buffer) => (Buffer.isBuffer(x) ? x.toString('utf8') : String(x))
 
@@ -72,6 +87,8 @@ const lowered = (entry: Entry): Record<string, string[]> => {
 /** One LDAP entry as a Contact. Exported for tests. */
 export const contactOf = (entry: Entry, a: LdapAttributes): Contact | null => {
   const e = lowered(entry)
+  const rawPhoto = a.photo ? Object.entries(entry).find(([k]) => k.toLowerCase() === a.photo.toLowerCase())?.[1] : undefined
+  const photo = photoUrl(Array.isArray(rawPhoto) ? rawPhoto[0] : rawPhoto)
   const first = (attr: string) => (attr ? e[attr.toLowerCase()]?.[0] : undefined)
   const all = (attr: string) => (attr ? (e[attr.toLowerCase()] ?? []) : [])
   const id = first(a.id)
@@ -84,7 +101,7 @@ export const contactOf = (entry: Entry, a: LdapAttributes): Contact | null => {
   const email = first(a.email)
   const department = first(a.department)
   const title = first(a.title)
-  return { id, displayName, numbers, ...(email ? { email } : {}), ...(department ? { department } : {}), ...(title ? { title } : {}) }
+  return { id, displayName, numbers, ...(email ? { email } : {}), ...(department ? { department } : {}), ...(title ? { title } : {}), ...(photo ? { photo } : {}) }
 }
 
 /** The words of a query the directory will be asked about: at most MAX_WORDS, each at least MIN_WORD characters. */
@@ -137,7 +154,7 @@ export class LdapDirectory implements ContactDirectory {
 
   private attributes() {
     const a = this.config.attributes
-    return [...new Set([a.id, a.name, a.surname, a.givenName, a.email, a.phone, a.mobile, a.extension, a.department, a.title].filter(Boolean))]
+    return [...new Set([a.id, a.name, a.surname, a.givenName, a.email, a.phone, a.mobile, a.extension, a.department, a.title, a.photo].filter(Boolean))]
   }
 
   /** The source as the administration screen shows it: the bind password never leaves the configuration. */
@@ -168,6 +185,8 @@ export class LdapDirectory implements ContactDirectory {
         scope: 'sub',
         filter,
         attributes,
+        // The photo is bytes: without this ldapts decodes every value as UTF-8 and mangles it.
+        ...(this.config.attributes.photo ? { explicitBufferAttributes: [this.config.attributes.photo] } : {}),
         sizeLimit,
         // A full listing may take a while on a large directory; a lookup must not. Both limits (server and client) agree.
         timeLimit: paged ? Math.ceil((this.config.listTimeoutMs ?? 120_000) / 1000) : 10,
@@ -180,7 +199,9 @@ export class LdapDirectory implements ContactDirectory {
   }
 
   async search(_tenantId: TenantId, query: string, limit: number): Promise<SearchResult> {
-    const filter = searchFilter(query, this.config.attributes, this.userFilter)
+    // ponytail: an empty query lists the first `limit` people the server returns, not the first in alphabetical order;
+    // a server-side sort (RFC 2891) or a paged list if the directory page must reach everyone.
+    const filter = query.trim() ? searchFilter(query, this.config.attributes, this.userFilter) : this.userFilter
     if (!filter) return { items: [], truncated: false }
     // One more than asked: the server's order is not alphabetical, so a truncated answer is said to be, not sorted into shape.
     const found = await this.query(filter, limit + 1)
@@ -228,7 +249,7 @@ export class LdapDirectory implements ContactDirectory {
  * LDAP_URL enables the directory, for the tenant LDAP_TENANT (default: DEFAULT_TENANT, else "default").
  * LDAP_BIND_DN and LDAP_BIND_PASSWORD (an account allowed to read people), LDAP_BASE_DN, LDAP_USER_FILTER
  * (default: inetOrgPerson entries), LDAP_ATTR_* to map the schema (ID, NAME, SURNAME, GIVENNAME, EMAIL, PHONE, MOBILE,
- * EXTENSION, DEPARTMENT, TITLE; "" disables one; MATRIX, the Matrix user id of step 11b, none by default),
+ * EXTENSION, DEPARTMENT, TITLE, PHOTO (jpegPhoto; thumbnailPhoto on Active Directory); "" disables one; MATRIX, the Matrix user id of step 11b, none by default),
  * LDAP_TLS_CA_FILE for a private CA, LDAP_TLS_REJECT_UNAUTHORIZED=0 only on a dev box. `warn` receives what a production deployment should not do.
  */
 export const ldapDirectoryFromEnv = (env: NodeJS.ProcessEnv, warn: (message: string) => void = message => console.warn(message)): LdapDirectory | undefined => {
@@ -247,7 +268,7 @@ export const ldapDirectoryFromEnv = (env: NodeJS.ProcessEnv, warn: (message: str
     userFilter: env.LDAP_USER_FILTER ?? '(objectClass=inetOrgPerson)',
     attributes: {
       id: attr('id'), name: attr('name'), surname: attr('surname'), givenName: attr('givenName'), email: attr('email'),
-      phone: attr('phone'), mobile: attr('mobile'), extension: attr('extension'), department: attr('department'), title: attr('title')
+      phone: attr('phone'), mobile: attr('mobile'), extension: attr('extension'), department: attr('department'), title: attr('title'), photo: attr('photo')
     },
     ...(env.LDAP_TLS_CA_FILE ? { ca: readFileSync(env.LDAP_TLS_CA_FILE, 'utf8') } : {}),
     ...(env.LDAP_TLS_REJECT_UNAUTHORIZED === '0' ? { rejectUnauthorized: false } : {}),

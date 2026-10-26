@@ -8,7 +8,7 @@ Analyse faite pendant le POC sur des dépôts clonés (shallow) par son script d
 |---|---|---|
 | Forme d'app | Deux formes : *pure cozy app* (backend = cozy-stack, ex. Drive) ou *coquille* (`client_url_flag` = `<slug>.embedded-app-url`, ex. Chat). Source : `twake-guidelines/skills/twake-create-app` | Twake Phone = **pure cozy app** côté UI (cozy-client + doctypes), le Gateway étant un service externe. Le flag `phone.gateway-url` (nom à valider) donne l'URL du Gateway. |
 | Scaffold | `cozy/cozy-app-template` (rsbuild + `rsbuild-config-cozy-app`), pas `create-cozy-app` | Partir du template. |
-| Stack UI | Drive : React 18.2, `cozy-ui` 142, `cozy-ui-plus`, `@linagora/twake-icons`, `twake-i18n`, `cozy-client` 60.x, `cozy-realtime`, `cozy-flags`, `cozy-intent`, `cozy-interapp`, `cozy-bar` 36 | Même set de versions. `twake-react-app` vise React 19 + twake-mui mais **bloqué** (twake-mui déclare react ^18) : rester sur React 18 + cozy-ui. |
+| Stack UI | Drive : React 18.2, `cozy-ui` 142, `cozy-ui-plus`, `@linagora/twake-icons`, `twake-i18n`, `cozy-client` 60.x, `cozy-realtime`, `cozy-flags`, `cozy-intent`, `cozy-interapp`, `cozy-bar` 36 | Même set de versions. `twake-react-app` vise React 19 + twake-mui. twake-mui 18 accepte React 18 et 19 : l'app web est passée sur twake-mui en restant sur React 18 (voir `docs/twake-mui-gaps.md`). |
 | Auth | Le token cozy est injecté dans `data-cozy` du DOM (`{domain, token, locale}`) ; `new CozyClient({uri, token, appMetadata, schema})`. SSO = LemonLDAP-NG (OIDC provider, `auth.<domain>/oauth2/*`), instances créées par SCIM | Pas de login propre. Le Gateway doit valider l'identité Twake : voir §3. |
 | Intents | Manifest : `intents: [{action, type[], href}]` + route `/intents` + entrée rsbuild `hasIntents: true`. Service côté fournisseur : `new Intents({client}).createService(intentId, window)` (`cozy-interapp`) puis `notifyReadyToUse()` / `terminate(result)`. Drive expose OPEN/PICK `io.cozy.files`, Contacts expose PICK/CREATE/LIST `io.cozy.contacts` | `CALL` n'existe pas dans le catalogue Cozy : à définir (cf. §2). |
 | Temps réel | `RealtimePlugin` de `cozy-realtime` + `cozy-flags` plugin enregistrés dans `registerClientPlugins.js` | Le flux d'événements d'appel vient du Gateway (WS), pas de cozy-realtime. |
@@ -60,4 +60,4 @@ Recommandation : 1, avec `tenant` dérivé du domaine/org de l'instance (`COZY_O
 - Langage du Gateway (TS/Node aligne avec `telephony-client` et les types partagés ; Go/FastAPI possibles).
 - Où héberger le singleton de réception d'appels (voir §2).
 - Pseudo-doctype et nom de flag à faire valider par l'équipe Twake/Cozy.
-- React 18 (aujourd'hui) vs 19 + twake-mui (cible, bloquée).
+- React 18 + twake-mui (aujourd'hui) vs React 19 (cible).

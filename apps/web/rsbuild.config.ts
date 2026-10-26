@@ -10,7 +10,9 @@ import { pluginReact } from '@rsbuild/plugin-react'
 const CSP = [
   "default-src 'self'",
   "script-src 'self'",
-  "style-src 'self'",
+  // The design system (twake-mui, through Emotion) writes <style> tags at runtime. A static host has no nonce to give
+  // them; the app's server does, and its header policy, enforced alongside this one, keeps them to that nonce.
+  "style-src 'self' 'unsafe-inline'",
   "img-src 'self' data:",
   // The recordings of the mailbox (step 11a), fetched with the person's token and played from a blob: URL.
   "media-src 'self' blob:",

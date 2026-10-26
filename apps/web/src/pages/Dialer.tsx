@@ -1,3 +1,4 @@
+import { Alert, Button, Grid, Stack, TextField, Typography } from '@linagora/twake-mui'
 import { useEffect, useRef, useState, type FormEvent } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { formatNumber, toDialTarget } from '@twake/telephony-client'
@@ -15,11 +16,16 @@ export const Dialer = () => {
   const { t } = useT()
   const { client } = useGateway()
   const phone = usePhone()
-  // The directory sends a number to call as ?number=: taken once, then the address bar is cleaned.
+  // The directory (beside the keypad, or a contact card) sends a number to call as ?number=: taken, then the address
+  // bar is cleaned.
   const [params, setParams] = useSearchParams()
   const [number, setNumber] = useState(() => (params.get('number') ?? '').slice(0, 32))
   useEffect(() => {
-    if (params.has('number')) setParams({}, { replace: true })
+    const sent = params.get('number')
+    if (sent === null) return
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- the keypad is already on screen when the list beside it sends a number
+    setNumber(sent.slice(0, 32))
+    setParams({}, { replace: true })
   }, [params, setParams])
   // The Gateway can place the call for us (click-to-call) or the browser does it itself (softphone registered).
   const [gatewayCalls, setGatewayCalls] = useState<boolean | null>(null)
@@ -89,20 +95,20 @@ export const Dialer = () => {
 
   return (
     <>
-      <h1>{t('dialer.title')}</h1>
-      {gatewayCalls === false && phone.state === 'off' ? <p className="alert">{t('dialer.unavailable')}</p> : null}
-      {phone.state === 'failed' || phone.state === 'unregistered' ? <p className="alert">{t('dialer.notRegistered')}</p> : null}
+      <Typography variant="h5" component="h2" id="dialer-title" gutterBottom>
+        {t('dialer.title')}
+      </Typography>
+      {gatewayCalls === false && phone.state === 'off' ? <Alert severity="info" className="u-mb-1">{t('dialer.unavailable')}</Alert> : null}
+      {phone.state === 'failed' || phone.state === 'unregistered' ? <Alert severity="info" className="u-mb-1">{t('dialer.notRegistered')}</Alert> : null}
       <form onSubmit={e => void submit(e)}>
-        <div className="field">
-          <label htmlFor="number">{t('dialer.number')}</label>
-          <input id="number" className="number" type="tel" inputMode="tel" autoComplete="off" value={number} onChange={e => setNumber(e.target.value)} />
-        </div>
-        <div className="keypad" role="group" aria-label={t('dialer.title')}>
+        <TextField id="number" label={t('dialer.number')} type="tel" fullWidth className="u-mb-1" slotProps={{ htmlInput: { inputMode: 'tel', autoComplete: 'off' } }} value={number} onChange={e => setNumber(e.target.value)} />
+        <Grid container spacing={1} className="u-mb-1" role="group" aria-label={t('dialer.title')}>
           {KEYS.map(([k, letters]) => (
-            <button
-              key={k}
+            <Grid key={k} size={4}>
+            <Button
               type="button"
-              className="btn key"
+              variant="outlined"
+              fullWidth
               onClick={() => click(k)}
               onPointerDown={() => startHold(k)}
               onPointerUp={endHold}
@@ -111,23 +117,24 @@ export const Dialer = () => {
               aria-label={k === '0' ? t('dialer.zeroPlus') : k}
             >
               {k}
-              {letters ? <small aria-hidden="true">{letters}</small> : null}
-            </button>
+              {letters ? <Typography variant="caption" component="small" aria-hidden="true">{letters}</Typography> : null}
+            </Button>
+            </Grid>
           ))}
-        </div>
-        <div className="actions">
-          <button type="button" className="btn" onClick={() => setNumber(n => n.slice(0, -1))} aria-label={t('dialer.backspace')} disabled={!number}>
+        </Grid>
+        <Stack direction="row" spacing={1} useFlexGap className="u-flex-wrap">
+          <Button type="button" variant="outlined" onClick={() => setNumber(n => n.slice(0, -1))} aria-label={t('dialer.backspace')} disabled={!number}>
             ⌫
-          </button>
-          <button type="submit" className="btn btn-primary" disabled={!canCall || !toDialTarget(number)}>
+          </Button>
+          <Button type="submit" disabled={!canCall || !toDialTarget(number)}>
             {t('dialer.call')}
-          </button>
-        </div>
+          </Button>
+        </Stack>
       </form>
       {status ? (
-        <p className={`alert${status.kind === 'error' ? ' alert-error' : ''}`} role={status.kind === 'error' ? 'alert' : 'status'}>
+        <Alert severity={status.kind} className="u-mt-1" role={status.kind === 'error' ? 'alert' : 'status'}>
           {status.text}
-        </p>
+        </Alert>
       ) : null}
     </>
   )
