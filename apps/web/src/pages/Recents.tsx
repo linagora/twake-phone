@@ -1,5 +1,4 @@
-import { Telephone } from '@linagora/twake-icons'
-import { Alert, Avatar, List, ListItem, ListItemAvatar, ListItemButton, ListItemText, SvgIcon, ToggleButton, ToggleButtonGroup, Typography, useAlert } from '@linagora/twake-mui'
+import { Alert, Avatar, List, ListItem, ListItemAvatar, ListItemButton, ListItemText, ToggleButton, ToggleButtonGroup, Typography, useAlert } from '@linagora/twake-mui'
 import { useEffect, useState } from 'react'
 import { formatNumber, type HistoryItem } from '@twake/telephony-client'
 import { useGateway } from '../gateway.js'
@@ -138,13 +137,8 @@ export const Recents = () => {
                 const content = (
                   <>
                     <ListItemAvatar>
-                      {contact ? (
-                        <ContactAvatar contact={contact} />
-                      ) : (
-                        <Avatar aria-hidden="true">
-                          <SvgIcon component={Telephone} inheritViewBox />
-                        </Avatar>
-                      )}
+                      {/* Nobody known: the design system's figure of a person. */}
+                      {contact ? <ContactAvatar contact={contact} /> : <Avatar aria-hidden="true" />}
                     </ListItemAvatar>
                     <ListItemText
                       primary={contact ? <strong>{contact.displayName}</strong> : <strong data-testid="recent-number">{number}</strong>}
@@ -172,7 +166,8 @@ export const Recents = () => {
                 )
                 const actions = [contact ? <OpenCardAction key="card" id={contact.id} label={t('actions.openCard', { name: contact.displayName })} /> : null, !mine && !hidden ? <CopyAction key="copy" number={it.remoteNumber} label={t('actions.copyNumberWhen', { number, when: when.format(new Date(it.startedAt)) })} /> : null].filter(Boolean)
                 return (
-                  <ListItem key={it.id} divider disablePadding={callable} secondaryAction={actions.length ? <HoverActions>{actions}</HoverActions> : undefined}>
+                  // The actions follow the row in the flow (not over it): the time stays readable.
+                  <ListItem key={it.id} divider disablePadding={callable}>
                     {callable ? (
                       // The row calls back, as on a phone; its name says who, what and when (the visible text says it in parts).
                       <ListItemButton onClick={() => void call(it.remoteNumber)} aria-label={t('recents.callBack', { who, what: label, when: when.format(new Date(it.startedAt)) })}>
@@ -181,6 +176,7 @@ export const Recents = () => {
                     ) : (
                       content
                     )}
+                    {actions.length ? <HoverActions>{actions}</HoverActions> : null}
                   </ListItem>
                 )
               })}

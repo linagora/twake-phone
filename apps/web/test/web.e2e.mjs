@@ -35,6 +35,8 @@ const freePort = () =>
     })
   })
 
+/** Screenshots for a review, into the folder E2E_SHOTS names (none without it). */
+const shot = (page, name) => (process.env.E2E_SHOTS ? page.screenshot({ path: `${process.env.E2E_SHOTS}/${name}.png`, fullPage: true }) : undefined)
 const step = (name, fn) => fn().then(() => console.log(`ok   ${name}`), err => { console.log(`FAIL ${name}`); throw err })
 const expectEqual = (actual, expected, what) => {
   if (actual !== expected) throw new Error(`${what}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`)
@@ -289,6 +291,10 @@ try {
     await page.getByLabel('Rechercher').fill('01 23 45 67 01')
     await list.getByRole('link', { name: 'Jean Dupont', exact: true }).waitFor()
     expectEqual(await list.getByRole('listitem').count(), 1, 'number of results by number')
+    await page.getByLabel('Rechercher').fill('')
+    await list.getByRole('link', { name: 'Zoé Lefèvre', exact: true }).waitFor()
+    await list.getByRole('listitem').filter({ hasText: 'Jean Dupont' }).hover()
+    await shot(page, 'accueil')
   })
   await step('the phone of a row calls the person (to the keypad here, no softphone); a number nobody has is called from the search', async () => {
     await page.getByLabel('Rechercher').fill('dup')
@@ -312,6 +318,7 @@ try {
     await page.getByRole('heading', { level: 1, name: 'Jean Dupont' }).waitFor()
     expectEqual(await page.title(), 'Jean Dupont – TwakePhone', 'document title')
     await page.getByText('Technicien · Support').waitFor()
+    await shot(page, 'fiche')
     await page.getByText('Mobile').waitFor()
     await page.getByRole('button', { name: /Appeler le .*6.12.34.56.01/ }).click()
     await page.getByRole('heading', { level: 1, name: 'Clavier' }).waitFor()
@@ -713,6 +720,8 @@ try {
     await page.locator('[data-testid=recents] > li', { hasText: '+33 6 39 98 00 02' }).waitFor()
     await jean.waitFor({ state: 'detached' })
     await page.getByRole('button', { name: 'Tous' }).click()
+    await jean.hover()
+    await shot(page, 'recents')
     await jean.getByRole('button', { name: /^Rappeler Jean Dupont \(102\) \(Entrant, / }).click()
     await page.getByRole('heading', { level: 1, name: 'Clavier' }).waitFor()
     expectEqual(await page.getByLabel('Numéro à appeler').inputValue(), '102', 'number sent to the keypad')

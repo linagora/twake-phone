@@ -1,5 +1,5 @@
 import { Trash } from '@linagora/twake-icons'
-import { Alert, Avatar, Button, IconButton, List, ListItem, ListItemAvatar, Slider, Stack, SvgIcon, Tooltip, Typography } from '@linagora/twake-mui'
+import { Alert, Avatar, Button, IconButton, List, ListItem, ListItemAvatar, Slider, Stack, SvgIcon, Tooltip, Typography, getInitials } from '@linagora/twake-mui'
 import { useCallback, useEffect, useRef, useState, type RefObject } from 'react'
 import { formatNumber, type Voicemail } from '@twake/telephony-client'
 import type { TelephonyEvent } from '@twake/telephony-types'
@@ -344,7 +344,7 @@ export const VoicemailPage = () => {
               return (
                 <ListItem key={v.id} divider alignItems="flex-start" className="u-flex-wrap" data-testid="voicemail" data-id={v.id} data-unread={v.unread ? '1' : '0'}>
                   <ListItemAvatar>
-                    {contact ? <ContactAvatar contact={contact} /> : <Avatar aria-hidden="true">{v.fromName ? v.fromName.slice(0, 1).toUpperCase() : '?'}</Avatar>}
+                    {contact ? <ContactAvatar contact={contact} /> : <Avatar aria-hidden="true">{v.fromName ? getInitials(v.fromName, '') : undefined}</Avatar>}
                   </ListItemAvatar>
                   <div className="u-flex-grow-1">
                     <Stack direction="row" spacing={1} className="u-flex-items-center">
