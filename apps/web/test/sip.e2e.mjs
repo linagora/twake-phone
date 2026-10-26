@@ -736,7 +736,10 @@ const bothHearEachOther = async (a, b, { last = false } = {}) => {
 const presenceIs = async (page, query, extension, status, timeout = 10_000) => {
   await page.getByRole('link', { name: 'Clavier' }).click()
   await page.getByLabel('Rechercher').fill(query)
-  await page.getByTestId(`presence-${extension}`).filter({ hasText: status }).waitFor({ timeout })
+  // Two people may share an extension (Bob Durand and Marc Petit, 103): each of their chips reads the same presence.
+  const chips = page.getByTestId(`presence-${extension}`)
+  await chips.filter({ hasText: status }).first().waitFor({ timeout })
+  await until(`every chip of ${extension} reads ${status}`, async () => ((await chips.filter({ hasText: status }).count()) === (await chips.count()) ? true : null))
 }
 /** Opens Récents and reads its lines as "number: label" (newest first), once at least `atLeast` are shown. */
 const recents = async (page, atLeast) => {
