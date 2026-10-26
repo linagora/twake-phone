@@ -719,7 +719,7 @@ const signOut = async who => {
 const dial = async (page, number) => {
   if (!(await page.getByLabel('Numéro à appeler').isVisible())) await page.getByRole('link', { name: 'Clavier' }).click()
   await page.getByLabel('Numéro à appeler').fill(number)
-  await page.getByRole('button', { name: 'Appeler' }).click()
+  await page.getByRole('button', { name: 'Appeler', exact: true }).click()
 }
 /** RTP flows both ways on each side; `last` picks the newest call of the page (a consultation) instead of the oldest. */
 const bothHearEachOther = async (a, b, { last = false } = {}) => {
@@ -743,7 +743,7 @@ const recents = async (page, atLeast) => {
   await page.getByRole('link', { name: 'Récents' }).click()
   await page.getByRole('heading', { level: 1, name: 'Récents' }).waitFor()
   return until(`${atLeast} recent calls`, async () => {
-    const lines = await page.locator('[data-testid=recents] li').evaluateAll(items => items.map(li => `${li.querySelector('strong')?.textContent}: ${li.querySelector('[data-testid=recent-label]')?.textContent}`))
+    const lines = await page.locator('[data-testid=recents] > li').evaluateAll(items => items.map(li => `${li.querySelector('[data-testid=recent-number]')?.textContent}: ${li.querySelector('[data-testid=recent-label]')?.textContent}`))
     return lines.length >= atLeast ? lines : null
   })
 }
@@ -4200,6 +4200,18 @@ try {
     await jean.page.getByRole('link', { name: 'Messagerie vocale', exact: true }).waitFor()
     expectEqual((await jeanMailbox('GET', '/voicemails')).json().items.map(i => i.unread), [false], 'the message read, as Wazo keeps it')
     await message.getByRole('button', { name: /^Rappeler / }).click()
+    const ringing = bob.page.getByTestId('incoming-call')
+    await ringing.getByText('Appel entrant de Jean Dupont (102)').waitFor({ timeout: 20_000 })
+    await ringing.getByRole('button', { name: 'Répondre' }).click()
+    await jean.page.getByText('En communication avec Bob Durand (103)').waitFor()
+    await bothHearEachOther(jean, bob)
+    await bob.page.getByRole('button', { name: 'Raccrocher' }).click()
+    await jean.page.getByText('Appel avec Bob Durand (103) terminé.').waitFor()
+  })
+  await step('Jean calls Bob back from his Récents (the row): Bob\'s browser rings, they talk', async () => {
+    const lines = await recents(jean.page, 1)
+    if (!lines.some(l => l.startsWith('103: '))) throw new Error(`Jean's Récents: ${JSON.stringify(lines)}`)
+    await jean.page.getByRole('button', { name: /^Rappeler 103 \(/ }).first().click()
     const ringing = bob.page.getByTestId('incoming-call')
     await ringing.getByText('Appel entrant de Jean Dupont (102)').waitFor({ timeout: 20_000 })
     await ringing.getByRole('button', { name: 'Répondre' }).click()
