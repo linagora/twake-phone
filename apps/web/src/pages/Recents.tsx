@@ -149,7 +149,7 @@ export const Recents = () => {
                               <span data-testid="recent-number">{number}</span> ·{' '}
                             </>
                           ) : null}
-                          <Typography data-testid="recent-label" variant="body2" component="span" color={it.missed ? 'error.dark' : 'textSecondary'} className={it.missed ? 'u-fw-bold' : undefined}>
+                          <Typography data-testid="recent-label" variant="body2" component="span" color={it.missed ? 'error' : 'textSecondary'} className={it.missed ? 'u-fw-bold' : undefined}>
                             {label}
                           </Typography>
                           {/* Step 10b: a call the operator recorded, reconciled with ours, or that reached only it (the platform out). */}
