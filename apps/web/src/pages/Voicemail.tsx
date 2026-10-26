@@ -1,12 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
 import { formatNumber, toDialTarget, type Voicemail } from '@twake/telephony-client'
 import type { TelephonyEvent } from '@twake/telephony-types'
-import { describeCallError } from '../components/callErrors.js'
 import { useGateway } from '../gateway.js'
 import { useT } from '../i18n/useT.js'
 import { Reloader } from '../reload.js'
-import { usePhone } from '../softphone.js'
+import { useCallBack } from '../useCallBack.js'
 
 /** Why a message has no transcription, in the person's language. */
 const NO_TRANSCRIPT = { 'too-long': 'voicemail.transcriptTooLong', busy: 'voicemail.transcriptBusy', failed: 'voicemail.transcriptFailed', untracked: 'voicemail.transcriptUntracked' } as const
@@ -86,8 +84,6 @@ type FocusTarget = { listen: string } | { remove: string } | { confirm: string }
 export const VoicemailPage = () => {
   const { t, lang } = useT()
   const { client, onEvent, onConnected } = useGateway()
-  const phone = usePhone()
-  const navigate = useNavigate()
   const [items, setItems] = useState<Voicemail[] | null>(null)
   const [error, setError] = useState<'load' | 'unavailable' | null>(null)
   /** What an action said (a recording that would not load, the server down a moment). */
@@ -242,21 +238,8 @@ export const VoicemailPage = () => {
       }
       say(t('voicemail.deleted', { who: whoOf(v) }))
     }, t('voicemail.actionFailed'))
-  // Called back from the browser when its softphone can (the call panel takes over), else from the dialer, filled in.
-  const callBack = async (v: Voicemail) => {
-    const target = v.from ? toDialTarget(v.from) : null
-    if (!target) return
-    setNotice(null)
-    if (phone.state !== 'registered' || phone.calls.length) {
-      void navigate(`/?number=${encodeURIComponent(v.from!)}`)
-      return
-    }
-    try {
-      await phone.call(target)
-    } catch (err) {
-      setNotice(t('dialer.failed', { reason: describeCallError(err, t) }))
-    }
-  }
+  const callBackNumber = useCallBack(setNotice)
+  const callBack = (v: Voicemail) => (v.from ? callBackNumber(v.from) : undefined)
 
   const heading = (
     <h1 ref={title} tabIndex={-1}>

@@ -1,9 +1,10 @@
 import { useEffect, useState } from 'react'
-import { formatNumber, type HistoryItem } from '@twake/telephony-client'
+import { formatNumber, toDialTarget, type HistoryItem } from '@twake/telephony-client'
 import { useGateway } from '../gateway.js'
 import type { Key } from '../i18n/index.js'
 import { useT } from '../i18n/useT.js'
 import { Reloader } from '../reload.js'
+import { useCallBack } from '../useCallBack.js'
 
 /** How long the history waits for the event stream before it is read without it. */
 const WITHOUT_STREAM_MS = 3_000
@@ -30,6 +31,8 @@ export const Recents = () => {
   const { client, me, onEvent, onConnected } = useGateway()
   const [items, setItems] = useState<HistoryItem[] | null>(null)
   const [error, setError] = useState(false)
+  const [notice, setNotice] = useState<string | null>(null)
+  const callBack = useCallBack(setNotice)
   // Read when the event stream is established (at once when it already is: the ends told while it was closed were
   // not heard), each time one of the user's calls ends (the Gateway records it before telling), and after a few
   // seconds without a stream (the history reads without it). One read at a time; an outage is tried again.
@@ -64,15 +67,20 @@ export const Recents = () => {
   return (
     <>
       <h1>{t('recents.title')}</h1>
+      {notice ? <p className="alert alert-error" role="alert">{notice}</p> : null}
       {items.length === 0 ? (
         <p>{t('recents.empty')}</p>
       ) : (
         <ul className="list">
-          {items.map(it => (
+          {items.map(it => {
+            // One's own conference: the room called oneself in it (its number is one's own).
+            const mine = it.conference && it.remoteNumber === me?.extension
+            const who = mine ? t('recents.conferenceMine') : it.remoteNumber === 'anonymous' ? t('call.hiddenNumber') : formatNumber(it.remoteNumber)
+            const at = when.format(new Date(it.startedAt))
+            return (
             <li key={it.id}>
               <span>
-                {/* One's own conference: the room called oneself in it (its number is one's own). */}
-                <strong>{it.conference && it.remoteNumber === me?.extension ? t('recents.conferenceMine') : it.remoteNumber === 'anonymous' ? t('call.hiddenNumber') : formatNumber(it.remoteNumber)}</strong>
+                <strong>{who}</strong>
                 <br />
                 <span className={`badge${it.missed ? ' missed' : ''}`}>{recentLabel(it, t)}</span>
                 {/* Step 10b: a call the operator recorded, reconciled with ours, or that reached only it (the platform out). */}
@@ -80,9 +88,15 @@ export const Recents = () => {
                 {/* Forwarded there to the fallback number (second review 10b, n°4): missed here, taken there perhaps. */}
                 {it.forwardedToFallback ? <span className="badge"> · {t('recents.forwardedToFallback')}</span> : null}
               </span>
-              <time dateTime={it.startedAt}>{when.format(new Date(it.startedAt))}</time>
+              <time dateTime={it.startedAt}>{at}</time>
+              {!mine && it.remoteNumber !== 'anonymous' && toDialTarget(it.remoteNumber) ? (
+                <button type="button" className="btn btn-primary" onClick={() => void callBack(it.remoteNumber)} aria-label={t('recents.callBackWho', { who, when: at })}>
+                  {t('recents.callBack')}
+                </button>
+              ) : null}
             </li>
-          ))}
+            )
+          })}
         </ul>
       )}
     </>

@@ -873,6 +873,8 @@
   "voicemail.listen": "Écouter",
   "voicemail.listenTo": "Écouter le message de {who} du {when}",
   "voicemail.player": "Message de {who} du {when}",
+  "recents.callBack": "Rappeler",
+  "recents.callBackWho": "Rappeler {who} (appel du {when})",
   "voicemail.callBack": "Rappeler",
   "voicemail.callBackWho": "Rappeler {who} (message du {when})",
   "voicemail.markRead": "Marquer comme lu",

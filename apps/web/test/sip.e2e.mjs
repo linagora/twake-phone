@@ -4209,6 +4209,18 @@ try {
     await bob.page.getByRole('button', { name: 'Raccrocher' }).click()
     await jean.page.getByText('Appel avec Bob Durand (103) terminé.').waitFor()
   })
+  await step('Jean calls Bob back from his Récents (« Rappeler »): Bob\'s browser rings, they talk', async () => {
+    const lines = await recents(jean.page, 1)
+    if (!lines.some(l => l.startsWith('103: '))) throw new Error(`Jean's Récents: ${JSON.stringify(lines)}`)
+    await jean.page.getByRole('button', { name: /^Rappeler 103 \(appel du / }).first().click()
+    const ringing = bob.page.getByTestId('incoming-call')
+    await ringing.getByText('Appel entrant de Jean Dupont (102)').waitFor({ timeout: 20_000 })
+    await ringing.getByRole('button', { name: 'Répondre' }).click()
+    await jean.page.getByText('En communication avec Bob Durand (103)').waitFor()
+    await bothHearEachOther(jean, bob)
+    await bob.page.getByRole('button', { name: 'Raccrocher' }).click()
+    await jean.page.getByText('Appel avec Bob Durand (103) terminé.').waitFor()
+  })
   await step('step 11a: Jean deletes it, once he confirmed: gone from his Messagerie vocale, and from Wazo; the focus on the title, the deletion told', async () => {
     await jean.page.getByRole('link', { name: /^Messagerie vocale/ }).click()
     await jean.page.getByTestId('voicemail').getByRole('button', { name: /^Supprimer le message de / }).click()
