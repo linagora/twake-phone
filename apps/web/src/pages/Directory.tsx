@@ -1,9 +1,10 @@
-import { Alert, TextField, Typography } from '@linagora/twake-mui'
+import { Alert, Button, TextField, Typography, useAlert } from '@linagora/twake-mui'
 import { useEffect, useState } from 'react'
 import { useGateway } from '../gateway.js'
 import { useT } from '../i18n/useT.js'
 import { ContactList } from '../components/ContactList.js'
-import type { Contact } from '@twake/telephony-client'
+import { formatNumber, type Contact } from '@twake/telephony-client'
+import { useCallNumber } from '../useCallNumber.js'
 
 const DEBOUNCE_MS = 250
 /** As many people as the Gateway gives at once (MAX_SEARCH): past them, the search narrows the list. */
@@ -21,6 +22,8 @@ export const Directory = () => {
   const [error, setError] = useState<'unavailable' | 'failed' | null>(null)
   // One letter is no search for the directory: the whole list stays.
   const q = query.trim().length < 2 ? '' : query.trim()
+  const { showAlert } = useAlert()
+  const { call, can } = useCallNumber(text => text && showAlert({ message: text, severity: 'error' }))
 
   useEffect(() => {
     if (noDirectory) return
@@ -85,7 +88,19 @@ export const Directory = () => {
       </div>
       {results ? (
         <>
-          {results.items.length === 0 && !searching && !error ? <Typography component="p">{t('directory.empty', { query: q })}</Typography> : <ContactList contacts={results.items} />}
+          {results.items.length === 0 && !searching && !error ? (
+            <>
+              <Typography component="p">{t('directory.empty', { query: q })}</Typography>
+              {/* Nobody has it, but it is a number: it is called from here, as a phone would. */}
+              {can(q) ? (
+                <Button className="u-mt-1" onClick={() => void call(q)}>
+                  {t('contact.callNumber', { number: formatNumber(q) })}
+                </Button>
+              ) : null}
+            </>
+          ) : (
+            <ContactList contacts={results.items} />
+          )}
           {results.truncated ? (
             <Alert severity="info" className="u-mt-1">
               {t('directory.truncated')}

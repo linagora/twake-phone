@@ -1,5 +1,5 @@
 import { Eye, Gear, History, Logout, Shield, Sound, Telephone } from '@linagora/twake-icons'
-import { AppBar, Button, Chip, Container, IconButton, Link, SvgIcon, Content, Layout as TwakeLayout, Main, Nav, NavIcon, NavItem, NavText, Sidebar, Stack, Toolbar, Typography, type ChipProps } from '@linagora/twake-mui'
+import { AppBar, Button, Chip, Container, IconButton, Link, SvgIcon, Content, Layout as TwakeLayout, Main, Nav, NavIcon, NavItem, NavText, Sidebar, Stack, Toolbar, Tooltip, Typography, type ChipProps } from '@linagora/twake-mui'
 import { useEffect, useMemo, useRef } from 'react'
 import { NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom'
 import { adminSectionOf } from '../admin/sections.js'
@@ -118,9 +118,11 @@ export const Layout = () => {
                 </Button>
               </Stack>
             ) : null}
-            <IconButton onClick={() => void signOutHere()} aria-label={t('auth.signout')} title={t('auth.signout')}>
-              <SvgIcon component={Logout} inheritViewBox />
-            </IconButton>
+            <Tooltip title={t('auth.signout')}>
+              <IconButton onClick={() => void signOutHere()} aria-label={t('auth.signout')}>
+                <SvgIcon component={Logout} inheritViewBox />
+              </IconButton>
+            </Tooltip>
           </Stack>
         </Toolbar>
       </AppBar>

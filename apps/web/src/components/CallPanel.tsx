@@ -10,6 +10,7 @@ import { useT } from '../i18n/useT.js'
 import { usePhone } from '../softphone.js'
 import { describeCallError, describeConferenceError } from './callErrors.js'
 import { CallEndIcon, MicIcon, MicOffIcon, PauseIcon } from '../ds/MediaIcons/MediaIcons.js'
+import { Appear } from '../ds/Appear/Appear.js'
 
 const TONES = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '*', '0', '#']
 
@@ -750,9 +751,22 @@ const Active = ({ call, tones, original, hasOther, onError }: { call: SoftCall; 
       <Stack className="u-flex-items-center u-mb-1">
         <RoundAction label={t('call.hangup')} icon={<CallEndIcon />} color="error" disabled={original?.transferring ?? false} onClick={guard(() => call.hangup())} />
       </Stack>
-      {transfer && connected && !hasOther && !room ? <TransferForm call={call} onClose={closeTransfer} onError={onError} /> : null}
-      {adding && connected && canAdd ? <AddParticipantForm id={`add-${call.id}`} making run={n => phone.addParticipant(call, n)} onClose={closeAdd} onError={onError} /> : null}
+      {transfer && connected && !hasOther && !room ? (
+        <Appear>
+          <div>
+            <TransferForm call={call} onClose={closeTransfer} onError={onError} />
+          </div>
+        </Appear>
+      ) : null}
+      {adding && connected && canAdd ? (
+        <Appear>
+          <div>
+            <AddParticipantForm id={`add-${call.id}`} making run={n => phone.addParticipant(call, n)} onClose={closeAdd} onError={onError} />
+          </div>
+        </Appear>
+      ) : null}
       {keypad && connected ? (
+        <Appear>
         <div id={`dtmf-${call.id}`}>
           <Grid container spacing={1} className="u-mb-1" role="group" aria-label={t('call.keypad')}>
             {TONES.map(k => (
@@ -768,6 +782,7 @@ const Active = ({ call, tones, original, hasOther, onError }: { call: SoftCall; 
           </Grid>
           {sent ? <Badge>{t('call.tonesSent', { tones: sent })}</Badge> : null}
         </div>
+        </Appear>
       ) : null}
       </CardContent>
     </Card>
@@ -778,6 +793,9 @@ const Active = ({ call, tones, original, hasOther, onError }: { call: SoftCall; 
  * Every call of the page, above the routed content: a ringing banner, the controls of the calls in progress, how
  * the last call ended (even when another goes on: a consultation that failed says so), and the last error.
  */
+/** How long a call takes to fade in (the theme's entering duration). */
+const ENTER_MS = 225
+
 export const CallPanel = () => {
   const { t } = useT()
   const { calls, lastEnded, tones } = usePhone()
@@ -798,12 +816,32 @@ export const CallPanel = () => {
     <div data-testid="calls">
       {shown.map(call => {
         if (ringing(call)) return <Incoming key={call.id} call={call} />
-        if (call.room === 'conference') return <ConferenceCall key={call.id} call={call} tones={tones[call.id] ?? ''} onError={setError} onNotice={text => setNotice(n => ({ callId: call.id, text, seq: (n?.seq ?? 0) + 1 }))} />
+        // A call shown fades in rather than pushing the page down at once (it goes at once: hanging up is immediate).
+        if (call.room === 'conference')
+          return (
+            <Appear key={call.id} ms={ENTER_MS}>
+              <div>
+                <ConferenceCall call={call} tones={tones[call.id] ?? ''} onError={setError} onNotice={text => setNotice(n => ({ callId: call.id, text, seq: (n?.seq ?? 0) + 1 }))} />
+              </div>
+            </Appear>
+          )
         const original = call.consultationOf ? ours.find(c => c.id === call.consultationOf) : undefined
-        return <Active key={call.id} call={call} tones={tones[call.id] ?? ''} hasOther={ours.length > 1} onError={setError} {...(original ? { original } : {})} />
+        return (
+          <Appear key={call.id} ms={ENTER_MS}>
+            <div>
+              <Active call={call} tones={tones[call.id] ?? ''} hasOther={ours.length > 1} onError={setError} {...(original ? { original } : {})} />
+            </div>
+          </Appear>
+        )
       })}
       <div role="status" data-testid="call-status">
-        {lastEnded ? <Typography component="p" className="u-mb-1">{t(reasonKey(lastEnded), { who: who(lastEnded, t), message: lastEnded.endMessage ?? '' })}</Typography> : null}
+        {lastEnded ? (
+          <Appear>
+            <Typography component="p" className="u-mb-1">
+              {t(reasonKey(lastEnded), { who: who(lastEnded, t), message: lastEnded.endMessage ?? '' })}
+            </Typography>
+          </Appear>
+        ) : null}
         {shownNotice ? (
           <Badge key={shownNotice.seq}>
             {shownNotice.text}
