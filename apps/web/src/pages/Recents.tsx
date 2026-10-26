@@ -80,7 +80,7 @@ export const Recents = () => {
                 {/* One's own conference: the room called oneself in it (its number is one's own). */}
                 <Typography component="strong" className="u-fw-bold">{it.conference && it.remoteNumber === me?.extension ? t('recents.conferenceMine') : it.remoteNumber === 'anonymous' ? t('call.hiddenNumber') : formatNumber(it.remoteNumber)}</Typography>
                 <br />
-                <Typography data-testid="recent-label" variant="body2" component="span" color={it.missed ? 'error.dark' : 'textSecondary'} className={it.missed ? 'u-fw-bold' : undefined}>{recentLabel(it, t)}</Typography>
+                <Typography data-testid="recent-label" variant="body2" component="span" color={it.missed ? 'error' : 'textSecondary'} className={it.missed ? 'u-fw-bold' : undefined}>{recentLabel(it, t)}</Typography>
                 {/* Step 10b: a call the operator recorded, reconciled with ours, or that reached only it (the platform out). */}
                 {it.sources?.includes('opensips') === false ? <Typography variant="body2" color="textSecondary" component="span"> · {t('recents.operatorOnly')}</Typography> : it.sources && it.sources.length > 1 ? <Typography variant="body2" color="textSecondary" component="span"> · {t('recents.reconciled')}</Typography> : null}
                 {/* Forwarded there to the fallback number (second review 10b, n°4): missed here, taken there perhaps. */}

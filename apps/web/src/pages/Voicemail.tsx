@@ -371,7 +371,7 @@ export const VoicemailPage = () => {
                   <div className="u-flex-grow-1">
                     <strong>{who}</strong>
                     {v.unread ? (
-                      <Typography component="span" color="error.dark" className="u-fw-bold">
+                      <Typography component="span" color="error" className="u-fw-bold">
                         {' '}
                         · {t('voicemail.new')}
                       </Typography>
