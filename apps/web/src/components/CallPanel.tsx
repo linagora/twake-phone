@@ -1,5 +1,5 @@
 import { Exchange, Grid as GridIcon, PersonAdd, Telephone } from '@linagora/twake-icons'
-import { Alert, Avatar, Button, Card, CardContent, Dialog, DialogContent, Fab, Grid, List, ListItem, Stack, SvgIcon, TextField, Typography, getInitials, type FabProps } from '@linagora/twake-mui'
+import { Alert, Avatar, Button, Card, CardContent, Fab, Grid, List, ListItem, Stack, SvgIcon, TextField, Typography, getInitials, type FabProps } from '@linagora/twake-mui'
 import { useEffect, useLayoutEffect, useRef, useState, type ReactNode, type Ref, type SyntheticEvent } from 'react'
 import type { SoftCall } from '@twake/softphone'
 import { formatNumber, toDialTarget, type CallVisio } from '@twake/telephony-client'
@@ -130,10 +130,11 @@ const Incoming = ({ call }: { call: SoftCall }) => {
       }
     })()
   }
-  // A dialog, as a phone's ringing screen: the person answers or refuses before anything else.
+  // A live region, not a dialog (roast of #40): nothing traps the focus, the person keeps typing where they were, and
+  // the call in progress keeps its controls while a second one rings.
   return (
-    <Dialog open maxWidth="xs" fullWidth aria-labelledby={`call-${call.id}`} data-testid="incoming-call">
-      <DialogContent>
+    <Card component="section" variant="outlined" className="u-mb-1" aria-labelledby={`call-${call.id}`} aria-live="assertive" data-testid="incoming-call">
+      <CardContent>
         <Stack spacing={2} className="u-flex-items-center u-ta-center u-pv-1">
           <CallAvatar call={call} />
           <Typography id={`call-${call.id}`} variant="h6" component="h2">
@@ -149,8 +150,8 @@ const Incoming = ({ call }: { call: SoftCall }) => {
             </Alert>
           ) : null}
         </Stack>
-      </DialogContent>
-    </Dialog>
+      </CardContent>
+    </Card>
   )
 }
 
@@ -334,8 +335,8 @@ const Participants = ({ meetingId, manage, call, parties = [], onError, onNotice
         // Ours as the Gateway marks it; by the number only when it marks none (another leg of the same extension is not us).
         const self = marked ? !!p.you : !!me?.extension && p.number === me.extension
         return (
-          <ListItem key={p.id} divider className="u-flex-justify-between" data-testid="conference-participant">
-            <span>
+          <ListItem key={p.id} divider data-testid="conference-participant">
+            <span className="u-flex-grow-1">
               {label}
               {self ? ` ${t('conference.you')}` : ''}
               {p.muted ? (

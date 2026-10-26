@@ -302,7 +302,7 @@ export const Webhooks = () => {
   if (unavailable)
     return (
       <Section id="webhooks" title={t('admin.webhooks')}>
-        <Alert severity="warning">{t('admin.webhooks.unavailable')}</Alert>
+        <Alert severity="warning" role="status">{t('admin.webhooks.unavailable')}</Alert>
       </Section>
     )
   const count = Object.keys(problems).length
@@ -351,7 +351,7 @@ export const Webhooks = () => {
 
       {secret ? (
         <Section id="webhook-secret" title={t('admin.webhooks.secret')}>
-          <Alert severity="warning" className="u-mb-1">
+          <Alert severity="warning" role="status" className="u-mb-1">
             {t('admin.webhooks.secretOnce', { url: secret.url })}
           </Alert>
           {secret.previousUntil ? (

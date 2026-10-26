@@ -124,7 +124,7 @@ export const Numbers = () => {
   if (unavailable)
     return (
       <Section id="numbers" title={t('admin.nav.numbers')}>
-        <Alert severity="info">{t('admin.trunk.unavailable')}</Alert>
+        <Alert severity="info" role="status">{t('admin.trunk.unavailable')}</Alert>
       </Section>
     )
 
@@ -207,7 +207,7 @@ export const Numbers = () => {
       </Section>
       <Section id="did-form" title={editing ? t('admin.did.edit', { id: editing.id }) : t('admin.did.new')}>
         {dids !== null && !trunks.length ? (
-          <Alert severity="info">{t('admin.did.noTrunk')}</Alert>
+          <Alert severity="info" role="status">{t('admin.did.noTrunk')}</Alert>
         ) : (
           <form onSubmit={e => void save(e)} noValidate aria-labelledby="did-form">
             <ProblemSummary count={count} />

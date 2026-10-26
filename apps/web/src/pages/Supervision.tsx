@@ -255,7 +255,7 @@ export const SupervisionPage = () => {
     return (
       <>
         {heading}
-        <Alert severity="info">{t('supervision.unavailable')}</Alert>
+        <Alert severity="info" role="status">{t('supervision.unavailable')}</Alert>
       </>
     )
   if (error && !calls)
@@ -276,7 +276,7 @@ export const SupervisionPage = () => {
       <Typography component="p" gutterBottom>
         {t('supervision.intro')}
       </Typography>
-      <Alert severity="info" className="u-mb-1">
+      <Alert severity="info" role="status" className="u-mb-1">
         {t('supervision.notice')}
       </Alert>
       <p className="u-visuallyhidden" role="status" aria-live="polite" data-testid="supervision-status">

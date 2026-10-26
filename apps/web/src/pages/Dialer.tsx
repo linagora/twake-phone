@@ -98,8 +98,8 @@ export const Dialer = () => {
       <Typography variant="h5" component="h2" id="dialer-title" gutterBottom>
         {t('dialer.title')}
       </Typography>
-      {gatewayCalls === false && phone.state === 'off' ? <Alert severity="info" className="u-mb-1">{t('dialer.unavailable')}</Alert> : null}
-      {phone.state === 'failed' || phone.state === 'unregistered' ? <Alert severity="info" className="u-mb-1">{t('dialer.notRegistered')}</Alert> : null}
+      {gatewayCalls === false && phone.state === 'off' ? <Alert severity="info" role="status" className="u-mb-1">{t('dialer.unavailable')}</Alert> : null}
+      {phone.state === 'failed' || phone.state === 'unregistered' ? <Alert severity="info" role="status" className="u-mb-1">{t('dialer.notRegistered')}</Alert> : null}
       <form onSubmit={e => void submit(e)}>
         <TextField id="number" label={t('dialer.number')} type="tel" fullWidth className="u-mb-1" slotProps={{ htmlInput: { inputMode: 'tel', autoComplete: 'off' } }} value={number} onChange={e => setNumber(e.target.value)} />
         <Grid container spacing={1} className="u-mb-1" role="group" aria-label={t('dialer.title')}>

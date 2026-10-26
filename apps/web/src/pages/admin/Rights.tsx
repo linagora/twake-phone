@@ -261,7 +261,7 @@ export const Rights = () => {
   if (unavailable)
     return (
       <Section id="rights" title={t('admin.nav.rights')}>
-        <Alert severity="info">{t('admin.rights.unavailable')}</Alert>
+        <Alert severity="info" role="status">{t('admin.rights.unavailable')}</Alert>
       </Section>
     )
   if (!settings)

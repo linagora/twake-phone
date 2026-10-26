@@ -266,6 +266,17 @@ try {
     await page.reload()
     await page.getByTestId('who').getByText('Alice Martin').waitFor()
   })
+  await step('the app stays light on a dark system, even with the `system` mode an earlier version stored', async () => {
+    await page.evaluate(() => localStorage.setItem('mui-mode', 'system'))
+    await page.emulateMedia({ colorScheme: 'dark' })
+    await page.reload()
+    await page.getByTestId('who').getByText('Alice Martin').waitFor()
+    expectEqual(await page.evaluate(() => document.documentElement.getAttribute('data-theme')), 'light', 'colour scheme applied')
+    const [r, g, b] = (await page.evaluate(() => getComputedStyle(document.body).backgroundColor)).match(/\d+/g).map(Number)
+    if (r + g + b < 600) throw new Error(`a dark page: rgb(${r}, ${g}, ${b})`)
+    expectEqual(await page.evaluate(() => localStorage.getItem('mui-mode')), null, 'the stored mode forgotten')
+    await page.emulateMedia({ colorScheme: 'light' })
+  })
   await step('the dialer explains that calling is not configured on this platform', async () => {
     await page.getByRole('link', { name: 'Clavier' }).click()
     await page.getByText(/pas encore disponible/).waitFor()
@@ -301,6 +312,8 @@ try {
     await page.locator('button[aria-label="Favori : Jean Dupont"][aria-pressed="true"]:not([disabled])').waitFor()
     await page.reload()
     await page.getByRole('heading', { level: 1, name: 'Jean Dupont' }).waitFor()
+    // Read once the favourites are loaded (the button is disabled until then).
+    await page.locator('button[aria-label="Favori : Jean Dupont"]:not([disabled])').waitFor()
     expectEqual(await page.getByRole('button', { name: 'Favori : Jean Dupont' }).getAttribute('aria-pressed'), 'true', 'aria-pressed after reload')
   })
   await step('the contact card lists every number, and Call sends it to the dialer', async () => {
@@ -309,7 +322,7 @@ try {
     await page.getByText('Technicien · Support').waitFor()
     await page.getByText('Mobile').waitFor()
     await page.getByRole('link', { name: /Appeler le .*6.12.34.56.01/ }).click()
-    await page.getByRole('heading', { level: 1, name: 'Clavier' }).waitFor()
+    await page.getByRole('heading', { level: 1, name: 'Téléphone' }).waitFor()
     const typed = await page.getByLabel('Numéro à appeler').inputValue()
     expectEqual(typed.replace(/\s/g, ''), '+33612345601', 'number sent to the dialer')
     expectEqual(new URL(page.url()).search, '', 'address bar cleaned')

@@ -56,7 +56,7 @@ export const Directory = () => {
         {t('directory.title')}
       </Typography>
       {noDirectory || error === 'unavailable' ? (
-        <Alert severity="info" className="u-mb-1">
+        <Alert severity="info" role="status" className="u-mb-1">
           {t('directory.unavailable')}
         </Alert>
       ) : null}
@@ -85,9 +85,9 @@ export const Directory = () => {
       </div>
       {results ? (
         <>
-          {results.items.length === 0 && !searching && !error ? <Typography component="p">{t('directory.empty', { query: q })}</Typography> : <ContactList contacts={results.items} />}
+          {results.items.length === 0 && !searching && !error ? <Typography component="p">{q ? t('directory.empty', { query: q }) : t('directory.nobody')}</Typography> : <ContactList contacts={results.items} />}
           {results.truncated ? (
-            <Alert severity="info" className="u-mt-1">
+            <Alert severity="info" role="status" className="u-mt-1">
               {t('directory.truncated')}
             </Alert>
           ) : null}

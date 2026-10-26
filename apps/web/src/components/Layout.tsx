@@ -81,7 +81,9 @@ export const Layout = () => {
     const current = LINKS.find(([to]) => (to === '/' ? pathname === '/' : pathname.startsWith(to)))
     // A part of the administration (step 7) is named before it: "Trunks – Administration – TwakePhone".
     const section = adminSectionOf(pathname)
-    document.title = current ? `${section ? `${t(section)} – ` : ''}${t(current[1])} – ${t('app.name')}` : t('app.name')
+    // A contact card names itself once loaded; meanwhile (or not found) it is the directory's.
+    const name = current ? t(current[1]) : pathname.startsWith('/directory/') ? t('directory.title') : null
+    document.title = name ? `${section ? `${t(section)} – ` : ''}${name} – ${t('app.name')}` : t('app.name')
     if (firstRender.current) firstRender.current = false
     else document.getElementById('main')?.focus()
   }, [pathname, t])
@@ -125,7 +127,7 @@ export const Layout = () => {
         </Toolbar>
       </AppBar>
       <CallPanel />
-      <TwakeLayout withTopBar={false} className="u-flex-grow-1 u-mih-0">
+      <TwakeLayout withTopBar={false} className="u-flex-grow-1">
         <Sidebar aria-label={t('nav.label')}>
           <Nav>
             {links.map(([to, key, icon]) => (

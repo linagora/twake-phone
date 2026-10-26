@@ -274,7 +274,7 @@ export const Limits = () => {
   if (unavailable)
     return (
       <Section id="limits" title={t('admin.nav.limits')}>
-        <Alert severity="info">{t('admin.rights.unavailable')}</Alert>
+        <Alert severity="info" role="status">{t('admin.rights.unavailable')}</Alert>
       </Section>
     )
   if (!settings || !form)
