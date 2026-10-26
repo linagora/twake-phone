@@ -1,22 +1,10 @@
-import { Telephone } from '@linagora/twake-icons'
-import { Avatar, Button, IconButton, Link, List, ListItem, SvgIcon, Typography, getInitials } from '@linagora/twake-mui'
+import { Avatar, Link, List, ListItem, ListItemAvatar, ListItemText, getInitials } from '@linagora/twake-mui'
 import { Link as RouterLink } from 'react-router-dom'
 import { formatNumber, type Contact } from '@twake/telephony-client'
-import type { Favorites } from '../favorites.js'
+import { HoverActions } from '../ds/HoverActions/HoverActions.js'
 import { useT } from '../i18n/useT.js'
 import { PresenceBadge } from '../presence.js'
-
-/** A toggle: one stable name ("Favourite: Jean Dupont") and aria-pressed for the state, as the ARIA pattern asks. */
-export const FavoriteButton = ({ contact, favorites }: { contact: Contact; favorites: Favorites }) => {
-  const { t } = useT()
-  const on = favorites.has(contact.id)
-  const busy = favorites.pending(contact.id)
-  return (
-    <Button type="button" variant={on ? 'contained' : 'outlined'} aria-pressed={on} aria-busy={busy || undefined} disabled={busy || favorites.items === null} aria-label={t('directory.favoriteToggle', { name: contact.displayName })} onClick={() => void favorites.toggle(contact)}>
-      <span aria-hidden="true">{on ? '★' : '☆'}</span>
-    </Button>
-  )
-}
+import { CallAction, CopyAction } from './RowActions.js'
 
 /** The directory photo, or the initials when there is none (or it does not load). Decorative: the name is always next to it. */
 export const ContactAvatar = ({ contact, size, className }: { contact: Contact; size?: 's' | 'm' | 'l' | 'xl'; className?: string }) => (
@@ -25,40 +13,52 @@ export const ContactAvatar = ({ contact, size, className }: { contact: Contact; 
   </Avatar>
 )
 
-/** The people to call, each with a phone button. */
+/** The number a person is called on from a list: their extension, else their first number. */
+export const mainNumber = (c: Contact) => c.numbers.find(n => n.type === 'extension') ?? c.numbers[0]
+
+/** The people to call: the name opens the card, the phone (on hover, or always on a touch screen) calls. */
 export const ContactList = ({ contacts }: { contacts: Contact[] }) => {
   const { t } = useT()
-  const main = (c: Contact) => c.numbers.find(n => n.type === 'extension') ?? c.numbers[0]
   return (
     <List data-testid="contacts">
       {contacts.map(c => {
-        const n = main(c)
+        const n = mainNumber(c)
         return (
           <ListItem
             key={c.id}
             divider
             secondaryAction={
               n ? (
-                <IconButton component={RouterLink} to={`/?number=${encodeURIComponent(n.number)}`} color="primary" aria-label={t('contact.callName', { name: c.displayName })}>
-                  <SvgIcon component={Telephone} inheritViewBox />
-                </IconButton>
+                <HoverActions>
+                  <CopyAction number={n.number} label={t('actions.copyNumber', { number: formatNumber(n.number) })} />
+                  <CallAction number={n.number} label={t('contact.callName', { name: c.displayName })} />
+                </HoverActions>
               ) : null
             }
           >
-            <ContactAvatar contact={c} className="u-mr-1" />
-            <span className="u-flex-grow-1">
-              <Link component={RouterLink} to={`/directory/${encodeURIComponent(c.id)}`}>
-                <strong>{c.displayName}</strong>
-              </Link>
-              <br />
-              <Typography variant="body2" color="textSecondary" component="span">{[c.department, n ? formatNumber(n.number) : t('contact.noNumber')].filter(Boolean).join(' · ')}</Typography>
-              {n?.type === 'extension' ? (
+            <ListItemAvatar>
+              <ContactAvatar contact={c} />
+            </ListItemAvatar>
+            <ListItemText
+              // The presence is a chip (a div): the second line is a div too.
+              slotProps={{ secondary: { component: 'div' } }}
+              primary={
+                <Link component={RouterLink} to={`/directory/${encodeURIComponent(c.id)}`} underline="hover" color="textPrimary">
+                  <strong>{c.displayName}</strong>
+                </Link>
+              }
+              secondary={
                 <>
-                  {' '}
-                  <PresenceBadge extension={n.number} />
+                  {[c.department, n ? formatNumber(n.number) : t('contact.noNumber')].filter(Boolean).join(' · ')}
+                  {n?.type === 'extension' ? (
+                    <>
+                      {' '}
+                      <PresenceBadge extension={n.number} />
+                    </>
+                  ) : null}
                 </>
-              ) : null}
-            </span>
+              }
+            />
           </ListItem>
         )
       })}
