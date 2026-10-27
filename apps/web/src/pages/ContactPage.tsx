@@ -1,9 +1,9 @@
-import { Alert, Button, Card, CardContent, List, ListItem, Link, Typography } from '@linagora/twake-mui'
+import { Alert, Card, CardContent, List, ListItem, ListItemText, Link, Stack, Typography } from '@linagora/twake-mui'
 import { useEffect, useState } from 'react'
 import { Link as RouterLink, useParams } from 'react-router-dom'
 import { formatNumber, type Contact } from '@twake/telephony-client'
-import { ContactAvatar, FavoriteButton } from '../components/ContactList.js'
-import { useFavorites } from '../favorites.js'
+import { ContactAvatar } from '../components/ContactList.js'
+import { CallAction, CopyAction } from '../components/RowActions.js'
 import { useGateway } from '../gateway.js'
 import { useT } from '../i18n/useT.js'
 import { PresenceBadge } from '../presence.js'
@@ -13,7 +13,6 @@ export const ContactPage = () => {
   const { t } = useT()
   const { id = '' } = useParams()
   const { client } = useGateway()
-  const favorites = useFavorites()
   const [contact, setContact] = useState<Contact | null | undefined>(undefined)
 
   useEffect(() => {
@@ -71,7 +70,6 @@ export const ContactPage = () => {
           <PresenceBadge extension={extension.number} />
         </Typography>
       ) : null}
-      <FavoriteButton contact={contact} favorites={favorites} />
       <Card component="section" variant="outlined" aria-labelledby="numbers" className="u-mb-1">
         <CardContent>
           <Typography variant="h5" component="h2" id="numbers" gutterBottom>
@@ -85,19 +83,12 @@ export const ContactPage = () => {
                 <ListItem
                   key={`${n.type}-${n.number}`}
                   divider
-                  secondaryAction={
-                    <Button component={RouterLink} to={`/?number=${encodeURIComponent(n.number)}`} aria-label={t('contact.callNumber', { number: formatNumber(n.number) })}>
-                      {t('contact.call')}
-                    </Button>
-                  }
-                >
-                  <span>
-                    <strong>{formatNumber(n.number)}</strong>
-                    <br />
-                    <Typography variant="body2" color="textSecondary" component="span">
-                      {t(`contact.${n.type}`)}
-                    </Typography>
-                  </span>
+>
+                  <ListItemText primary={<strong>{formatNumber(n.number)}</strong>} secondary={t(`contact.${n.type}`)} />
+                  <Stack direction="row" spacing={0.5}>
+                    <CopyAction number={n.number} label={t('actions.copyNumber', { number: formatNumber(n.number) })} />
+                    <CallAction number={n.number} label={t('contact.callNumber', { number: formatNumber(n.number) })} />
+                  </Stack>
                 </ListItem>
               ))}
             </List>

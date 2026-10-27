@@ -5,6 +5,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { TelephonyEvent, Voicemail } from '@twake/telephony-types'
 import type { useGateway } from '../gateway.js'
 import type { usePhone } from '../softphone.js'
+import { AlertProvider } from '@linagora/twake-mui'
+import { MemoryRouter } from 'react-router-dom'
 import { applyVoicemailEvent, clock, VoicemailPage } from './Voicemail.js'
 
 const v = (id: string, receivedAt: string, unread = true): Voicemail => ({ id, from: '101', receivedAt, durationSec: 7, unread })
@@ -46,7 +48,7 @@ let gateway: Pick<Gateway, 'client' | 'onEvent' | 'onConnected'>
 let phone: Pick<ReturnType<typeof usePhone>, 'state' | 'calls' | 'call'>
 vi.mock('../gateway.js', () => ({ useGateway: () => gateway }))
 vi.mock('../softphone.js', () => ({ usePhone: () => phone }))
-vi.mock('react-router-dom', () => ({ useNavigate: () => () => undefined }))
+vi.mock('react-router-dom', async () => ({ ...(await vi.importActual('react-router-dom')), useNavigate: () => () => undefined }))
 // One translator for every render: the key, then the values given.
 const i18n = { lang: 'fr', t: (key: string, vars?: Record<string, string>) => (vars ? `${key} ${Object.values(vars).join(' | ')}` : key) }
 vi.mock('../i18n/useT.js', () => ({ useT: () => i18n }))
@@ -83,7 +85,7 @@ describe('the Messagerie vocale page', () => {
     await click(id, 'voicemail.confirmDelete')
   }
   const render = async () => {
-    await act(async () => root.render(<VoicemailPage />))
+    await act(async () => root.render(<MemoryRouter><AlertProvider><VoicemailPage /></AlertProvider></MemoryRouter>))
     connected()
     await flush()
   }
@@ -96,7 +98,9 @@ describe('the Messagerie vocale page', () => {
     made = []
     revoked = []
     listVoicemails.mockClear()
-    const client: Partial<Gateway['client']> = { listVoicemails, getVoicemailAudio, markVoicemailRead, deleteVoicemail }
+    // The directory knows nobody: the messages show their numbers.
+    const searchDirectory = async () => ({ items: [], truncated: false })
+    const client: Partial<Gateway['client']> = { listVoicemails, getVoicemailAudio, markVoicemailRead, deleteVoicemail, searchDirectory }
     gateway = {
       client: client as Gateway['client'],
       onEvent: listener => {

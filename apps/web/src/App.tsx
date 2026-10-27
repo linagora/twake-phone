@@ -1,4 +1,4 @@
-import { Alert, Typography } from '@linagora/twake-mui'
+import { Alert, AlertProvider, Typography } from '@linagora/twake-mui'
 import { useEffect, useMemo, useState } from 'react'
 import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom'
 import { AuthProvider, useAuth } from './auth/AuthProvider.js'
@@ -23,7 +23,6 @@ import { ContactPage } from './pages/ContactPage.js'
 import { Phone } from './pages/Phone.js'
 import { SupervisionPage } from './pages/Supervision.js'
 import { VoicemailPage } from './pages/Voicemail.js'
-import { FavoritesProvider } from './favorites.js'
 import { PresenceProvider } from './presence.js'
 import { Recents } from './pages/Recents.js'
 import { Settings } from './pages/Settings.js'
@@ -38,7 +37,7 @@ const Gate = ({ config }: { config: AppConfig }) => {
   return (
     <GatewayProvider config={config}>
       <SoftphoneProvider>
-        <FavoritesProvider>
+        <AlertProvider>
           <PresenceProvider>
           <BrowserRouter>
             <Routes>
@@ -68,7 +67,7 @@ const Gate = ({ config }: { config: AppConfig }) => {
             </Routes>
           </BrowserRouter>
           </PresenceProvider>
-        </FavoritesProvider>
+        </AlertProvider>
       </SoftphoneProvider>
     </GatewayProvider>
   )

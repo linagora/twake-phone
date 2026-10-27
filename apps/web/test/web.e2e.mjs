@@ -35,6 +35,8 @@ const freePort = () =>
     })
   })
 
+/** Screenshots for a review, into the folder E2E_SHOTS names (none without it). */
+const shot = (page, name) => (process.env.E2E_SHOTS ? page.screenshot({ path: `${process.env.E2E_SHOTS}/${name}.png`, fullPage: true }) : undefined)
 const step = (name, fn) => fn().then(() => console.log(`ok   ${name}`), err => { console.log(`FAIL ${name}`); throw err })
 const expectEqual = (actual, expected, what) => {
   if (actual !== expected) throw new Error(`${what}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`)
@@ -280,7 +282,7 @@ try {
   await step('the dialer explains that calling is not configured on this platform', async () => {
     await page.getByRole('link', { name: 'Clavier' }).click()
     await page.getByText(/pas encore disponible/).waitFor()
-    await page.getByRole('button', { name: '5' }).click()
+    await page.getByRole('button', { name: '5', exact: true }).click()
     expectEqual(await page.getByLabel('Numéro à appeler').inputValue(), '5', 'keypad input')
   })
   await step('the directory beside the keypad lists everyone, then finds Jean Dupont by "dup", with his number and department', async () => {
@@ -300,39 +302,40 @@ try {
     await page.getByLabel('Rechercher').fill('01 23 45 67 01')
     await list.getByRole('link', { name: 'Jean Dupont', exact: true }).waitFor()
     expectEqual(await list.getByRole('listitem').count(), 1, 'number of results by number')
+    await page.getByLabel('Rechercher').fill('')
+    await list.getByRole('link', { name: 'Zoé Lefèvre', exact: true }).waitFor()
+    await list.getByRole('listitem').filter({ hasText: 'Jean Dupont' }).hover()
+    await shot(page, 'accueil')
   })
-  await step('a favourite, set on the contact card, survives a reload, because the Gateway keeps it', async () => {
+  await step('the phone of a row calls the person (to the keypad here, no softphone); a number nobody has is called from the search', async () => {
+    await page.getByLabel('Rechercher').fill('dup')
+    const row = page.getByTestId('contacts').getByRole('listitem').filter({ hasText: 'Jean Dupont' })
+    await row.hover()
+    await row.getByRole('button', { name: 'Appeler Jean Dupont' }).click()
+    await page.waitForFunction(() => document.querySelector('#number')?.value === '102')
+    await page.getByLabel('Rechercher').fill('01 99 00 01 99')
+    await page.getByText('Personne ne correspond à « 01 99 00 01 99 ».').waitFor()
+    await page.getByRole('button', { name: 'Appeler le 01 99 00 01 99' }).click()
+    await page.waitForFunction(() => document.querySelector('#number')?.value.replace(/\s/g, '') === '0199000199')
+    expectEqual(new URL(page.url()).search, '', 'address bar cleaned')
+  })
+  await step('the contact card has no favourite button any more', async () => {
     await page.getByLabel('Rechercher').fill('dup')
     await page.getByTestId('contacts').getByRole('link', { name: 'Jean Dupont', exact: true }).click()
-    const saved = page.waitForResponse(r => r.request().method() === 'PUT' && r.url().endsWith('/me/favorites/jdupont'))
-    const star = page.getByRole('button', { name: 'Favori : Jean Dupont' })
-    expectEqual(await star.getAttribute('aria-pressed'), 'false', 'aria-pressed before')
-    await star.click()
-    expectEqual((await saved).status(), 204, 'favourite saved by the Gateway')
-    await page.locator('button[aria-label="Favori : Jean Dupont"][aria-pressed="true"]:not([disabled])').waitFor()
-    await page.reload()
     await page.getByRole('heading', { level: 1, name: 'Jean Dupont' }).waitFor()
-    // Read once the favourites are loaded (the button is disabled until then).
-    await page.locator('button[aria-label="Favori : Jean Dupont"]:not([disabled])').waitFor()
-    expectEqual(await page.getByRole('button', { name: 'Favori : Jean Dupont' }).getAttribute('aria-pressed'), 'true', 'aria-pressed after reload')
+    expectEqual(await page.getByRole('button', { name: /^Favori/ }).count(), 0, 'favourite buttons')
   })
   await step('the contact card lists every number, and Call sends it to the dialer', async () => {
     await page.getByRole('heading', { level: 1, name: 'Jean Dupont' }).waitFor()
     expectEqual(await page.title(), 'Jean Dupont – TwakePhone', 'document title')
     await page.getByText('Technicien · Support').waitFor()
+    await shot(page, 'fiche')
     await page.getByText('Mobile').waitFor()
-    await page.getByRole('link', { name: /Appeler le .*6.12.34.56.01/ }).click()
+    await page.getByRole('button', { name: /Appeler le .*6.12.34.56.01/ }).click()
     await page.getByRole('heading', { level: 1, name: 'Téléphone' }).waitFor()
     const typed = await page.getByLabel('Numéro à appeler').inputValue()
     expectEqual(typed.replace(/\s/g, ''), '+33612345601', 'number sent to the dialer')
     expectEqual(new URL(page.url()).search, '', 'address bar cleaned')
-  })
-  await step('the favourite is removed from the card', async () => {
-    await page.getByTestId('contacts').getByRole('link', { name: 'Jean Dupont', exact: true }).click()
-    const removed = page.waitForResponse(r => r.request().method() === 'DELETE' && r.url().endsWith('/me/favorites/jdupont'))
-    await page.getByRole('button', { name: 'Favori : Jean Dupont' }).click()
-    expectEqual((await removed).status(), 204, 'favourite removed by the Gateway')
-    await page.locator('button[aria-label="Favori : Jean Dupont"][aria-pressed="false"]:not([disabled])').waitFor()
   })
   await step('switching the language to English changes the UI, the title and the document language', async () => {
     await page.getByRole('link', { name: 'Réglages' }).click()
@@ -712,6 +715,29 @@ try {
     await forwarded.getByText("Reçu par l'opérateur seul").waitFor()
     await forwarded.getByText('Renvoyé au numéro de repli').waitFor()
     await forwarded.getByText('Manqué', { exact: true }).waitFor()
+  })
+  await step('Récents names a caller the directory knows, by day; the row calls back (to the keypad here, no softphone), Manqués keeps only the missed calls', async () => {
+    // Jean (102) called Alice, who answered.
+    const call = { id: 'e2e-jean-calls@192.0.2.10', direction: 'inbound', remoteNumber: '102', startedAt: new Date(Date.now() - 4000).toISOString() }
+    platform.tell('101', { type: 'call.ringing', timestamp: call.startedAt, payload: { call: { ...call, state: 'ringing' } } })
+    platform.tell('101', { type: 'call.connected', timestamp: new Date(Date.now() - 3000).toISOString(), payload: { call: { ...call, state: 'connected' } } })
+    const endedAt = new Date().toISOString()
+    platform.tell('101', { type: 'call.ended', timestamp: endedAt, payload: { call: { ...call, state: 'ended', endedAt } } })
+    await page.getByRole('heading', { level: 2, name: "Aujourd'hui" }).waitFor()
+    const jean = page.locator('[data-testid=recents] > li', { hasText: 'Jean Dupont' })
+    await jean.getByTestId('recent-number').getByText('102', { exact: true }).waitFor()
+    await jean.getByRole('link', { name: 'Fiche de Jean Dupont' }).waitFor()
+    // The same icons as in the directory: copy, then the phone.
+    expectEqual(JSON.stringify(await jean.locator('button[aria-label]').evaluateAll(bs => bs.map(b => b.getAttribute('aria-label').replace(/ \(.*/, '')))), JSON.stringify(['Copier le 102', 'Appeler le 102']), 'icons of the row')
+    await page.getByRole('button', { name: 'Manqués' }).click()
+    await page.locator('[data-testid=recents] > li', { hasText: '+33 6 39 98 00 02' }).waitFor()
+    await jean.waitFor({ state: 'detached' })
+    await page.getByRole('button', { name: 'Tous' }).click()
+    await jean.hover()
+    await shot(page, 'recents')
+    await jean.getByRole('button', { name: /^Rappeler Jean Dupont \(102\) \(Entrant, / }).click()
+    await page.getByRole('heading', { level: 1, name: 'Téléphone' }).waitFor()
+    expectEqual(await page.getByLabel('Numéro à appeler').inputValue(), '102', 'number sent to the keypad')
   })
   await step('the fallback removed while OVH does not answer: said not removed yet, kept, and removed once OVH answers again, the voicemail of before put back (second review 10b, n°1; third review n°8)', async () => {
     await page.getByRole('link', { name: 'Administration' }).click()

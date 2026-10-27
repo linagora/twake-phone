@@ -91,7 +91,7 @@ try {
   await step('Alice calls Bob, who answers: audio flows both ways through rtpengine, presence shows the call', async () => {
     await alice.page.getByRole('link', { name: 'Clavier' }).click()
     await alice.page.getByLabel('Numéro à appeler').fill('102')
-    await alice.page.getByRole('button', { name: 'Appeler' }).click()
+    await alice.page.getByRole('button', { name: 'Appeler', exact: true }).click()
     await bob.page.getByTestId('incoming-call').getByText('Alice Martin (101)').waitFor({ timeout: 20_000 })
     await bob.page.getByTestId('incoming-call').getByRole('button', { name: 'Répondre' }).click()
     await bob.page.getByText('En communication avec Alice Martin (101)').waitFor()
