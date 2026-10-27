@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react'
+import { Alert, Button, Chip, FormControl, FormControlLabel, FormLabel, List, ListItem, ListItemText, Radio, RadioGroup, Stack, Typography } from '@linagora/twake-mui'
+import { useCallback, useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react'
 import {
   TRUNK_CODECS,
   TRUNK_OUTBOUND_CLASSES,
@@ -36,22 +37,60 @@ const statusOf = (err: unknown) => (err as { status?: unknown } | null)?.status
 /** The trunk those without a direct number call through: the one marked, else the first (as the Gateway). */
 const defaultOf = (trunks: readonly Trunk[]) => trunks.find(t => t.default) ?? trunks[0]
 
+/** The colour of a state word: green when up, red when down or refused, plain otherwise. */
+const toneOf = (state: string) => (['registered', 'up'].includes(state) ? 'success' : ['refused', 'timeout', 'error', 'unregistered', 'failed'].includes(state) ? 'error' : 'default')
+const State = ({ state, children }: { state: string; children: string }) => <Chip component="span" size="small" variant="outlined" color={toneOf(state)} label={children} />
+
+/** A plain list of lines (status, forwards, removals). */
+const Lines = ({ label, children }: { label?: string | undefined; children: ReactNode }) => (
+  <List dense disablePadding aria-label={label}>
+    {children}
+  </List>
+)
+const Line = ({ error, children }: { error?: boolean | undefined; children: ReactNode }) => (
+  <ListItem disableGutters>
+    <ListItemText primary={children} slotProps={{ primary: { color: error ? 'error' : undefined } }} />
+  </ListItem>
+)
+
+/** Facts as a description list. */
+const Facts = ({ label, children }: { label?: string; children: ReactNode }) => (
+  <Typography component="dl" aria-label={label} className="u-m-0">
+    {children}
+  </Typography>
+)
+const Fact = ({ term, children }: { term: string; children: ReactNode }) => (
+  <div className="u-mb-half">
+    <Typography component="dt" variant="body2" color="textSecondary">
+      {term}
+    </Typography>
+    <Typography component="dd" className="u-m-0">
+      {children}
+    </Typography>
+  </div>
+)
+
 const TrunkState = ({ status, available }: { status: TrunkStatus | undefined; available: boolean }) => {
   const { t } = useT()
-  if (!available || !status) return <p className="badge">{t('admin.trunk.statusUnknown')}</p>
+  if (!available || !status)
+    return (
+      <Typography component="p" variant="body2" color="textSecondary">
+        {t('admin.trunk.statusUnknown')}
+      </Typography>
+    )
   return (
-    <ul className="plain" aria-label={t('admin.trunk.status')}>
+    <Lines label={t('admin.trunk.status')}>
       {status.registration ? (
-        <li>
-          {t('admin.trunk.registration')} : <span className={`state state-${status.registration.state}`}>{t(`admin.trunk.reg.${status.registration.state}` as Key)}</span>
-        </li>
+        <Line>
+          {t('admin.trunk.registration')} : <State state={status.registration.state}>{t(`admin.trunk.reg.${status.registration.state}` as Key)}</State>
+        </Line>
       ) : null}
       {status.servers.map(s => (
-        <li key={s.address}>
-          {t('admin.trunk.server', { address: s.address })} : <span className={`state state-${s.state}`}>{t(`admin.trunk.srv.${s.state}` as Key)}</span>
-        </li>
+        <Line key={s.address}>
+          {t('admin.trunk.server', { address: s.address })} : <State state={s.state}>{t(`admin.trunk.srv.${s.state}` as Key)}</State>
+        </Line>
       ))}
-    </ul>
+    </Lines>
   )
 }
 
@@ -65,7 +104,13 @@ const toOf = (fw: OperatorForward, t: T) => (fw.nature === 'number' && fw.number
 const forwardsOf = (f: OperatorLineForwards | undefined, t: T) => {
   const out: string[] = []
   if (f?.onUnavailable) out.push(t('admin.operator.forwardUnavailable', { to: toOf(f.onUnavailable, t) }))
-  if (f?.onNoAnswer) out.push(t('admin.operator.forwardNoAnswer', { to: toOf(f.onNoAnswer, t), sec: f.onNoAnswer.afterSec }))
+  if (f?.onNoAnswer)
+    out.push(
+      t('admin.operator.forwardNoAnswer', {
+        to: toOf(f.onNoAnswer, t),
+        sec: f.onNoAnswer.afterSec
+      })
+    )
   return out.length ? out.join(' ; ') : t('admin.operator.noForward')
 }
 
@@ -80,35 +125,61 @@ const restoreOf = (line: string, original: OperatorLineForwards | undefined, t: 
   if (!original) return t('admin.operator.restoreUnknown', { line })
   if (!original.onUnavailable && !original.onNoAnswer) return undefined
   // Refused by the rules of the platform (fourth review 10b, n°3): a loop to it, or where its trunk may not call.
-  if (refused) return t(`admin.operator.restoreRefused.${refused}`, { line, forwards: forwardsOf(original, t) })
-  return writable(original) ? t('admin.operator.restoreLine', { line, forwards: forwardsOf(original, t) }) : t('admin.operator.restoreOther', { line, forwards: forwardsOf(original, t) })
+  if (refused)
+    return t(`admin.operator.restoreRefused.${refused}`, {
+      line,
+      forwards: forwardsOf(original, t)
+    })
+  return writable(original)
+    ? t('admin.operator.restoreLine', {
+        line,
+        forwards: forwardsOf(original, t)
+      })
+    : t('admin.operator.restoreOther', {
+        line,
+        forwards: forwardsOf(original, t)
+      })
 }
 
 /** A trunk's lines at the operator (step 10b): the forwards set there and whether they are the ones asked. */
 const OperatorLines = ({ lines }: { lines: OperatorLine[] }) => {
   const { t, lang } = useT()
-  const at = new Intl.DateTimeFormat(lang, { dateStyle: 'short', timeStyle: 'short' })
+  const at = new Intl.DateTimeFormat(lang, {
+    dateStyle: 'short',
+    timeStyle: 'short'
+  })
   return (
-    <ul className="plain" aria-label={t('admin.operator.lines')}>
+    <Lines label={t('admin.operator.lines')}>
       {lines.map(l => (
-        <li key={l.line}>
-          {t('admin.operator.line', { line: l.line, forwards: l.readAt ? forwardsOf(l.forwards, t) : t('admin.operator.notRead') })}
+        <Line key={l.line}>
+          {t('admin.operator.line', {
+            line: l.line,
+            forwards: l.readAt ? forwardsOf(l.forwards, t) : t('admin.operator.notRead')
+          })}
           {' · '}
           {l.rejected ? (
-            <span className="state state-error">{t('admin.operator.rejected')}</span>
+            <State state="error">{t('admin.operator.rejected')}</State>
           ) : l.error ? (
-            <span className="state state-error">{t(`admin.operator.err.${l.error}` as Key)}</span>
+            <State state="error">{t(`admin.operator.err.${l.error}` as Key)}</State>
           ) : !l.managed ? (
             <span>{t('admin.operator.notManaged')}</span>
           ) : l.inSync ? (
-            <span className="state state-up">{t('admin.operator.inSync')}</span>
+            <State state="up">{t('admin.operator.inSync')}</State>
           ) : (
             <span>{t('admin.operator.pending')}</span>
           )}
-          {l.restoredAt ? <> · {t('admin.operator.restored', { at: at.format(new Date(l.restoredAt)) })}</> : null}
-        </li>
+          {l.restoredAt ? (
+            <>
+              {' '}
+              ·{' '}
+              {t('admin.operator.restored', {
+                at: at.format(new Date(l.restoredAt))
+              })}
+            </>
+          ) : null}
+        </Line>
       ))}
-    </ul>
+    </Lines>
   )
 }
 
@@ -119,29 +190,34 @@ const OperatorLines = ({ lines }: { lines: OperatorLine[] }) => {
  */
 const Removals = ({ removals, onAbandon, busy }: { removals: OperatorRemoval[]; onAbandon: (line: string) => void; busy: boolean }) => {
   const { t, lang } = useT()
-  const at = new Intl.DateTimeFormat(lang, { dateStyle: 'short', timeStyle: 'short' })
+  const at = new Intl.DateTimeFormat(lang, {
+    dateStyle: 'short',
+    timeStyle: 'short'
+  })
   return (
-    <div className="field">
-      <p>{t('admin.operator.removals')}</p>
-      <ul className="plain" aria-label={t('admin.operator.removals')}>
+    <div className="u-mb-1">
+      <Typography component="p">{t('admin.operator.removals')}</Typography>
+      <Lines label={t('admin.operator.removals')}>
         {removals.map(r => (
-          <li key={r.line}>
-            {t('admin.operator.removal', { line: r.line, since: at.format(new Date(r.since)) })}
-            {r.error ? <span className="state state-error"> · {t(`admin.operator.err.${r.error}` as Key)}</span> : null}
+          <Line key={r.line}>
+            {t('admin.operator.removal', {
+              line: r.line,
+              since: at.format(new Date(r.since))
+            })}
+            {r.error ? (
+              <>
+                {' · '}
+                <State state="error">{t(`admin.operator.err.${r.error}` as Key)}</State>
+              </>
+            ) : null}
             {restoreOf(r.line, r.original, t, r.originalRefused) ? <> · {restoreOf(r.line, r.original, t, r.originalRefused)}</> : null}{' '}
-            <ConfirmDelete
-              label={t('admin.operator.abandonOf', { line: r.line })}
-              question={t('admin.operator.abandonConfirm', { line: r.line })}
-              action="admin.operator.abandon"
-              yes="admin.operator.abandonYes"
-              tone="plain"
-              onConfirm={() => onAbandon(r.line)}
-              disabled={busy}
-            />
-          </li>
+            <ConfirmDelete label={t('admin.operator.abandonOf', { line: r.line })} question={t('admin.operator.abandonConfirm', { line: r.line })} action="admin.operator.abandon" yes="admin.operator.abandonYes" tone="plain" onConfirm={() => onAbandon(r.line)} disabled={busy} />
+          </Line>
         ))}
-      </ul>
-      <p className="muted">{t('admin.operator.removalsHelp')}</p>
+      </Lines>
+      <Typography component="p" variant="body2" color="textSecondary">
+        {t('admin.operator.removalsHelp')}
+      </Typography>
     </div>
   )
 }
@@ -149,17 +225,20 @@ const Removals = ({ removals, onAbandon, busy }: { removals: OperatorRemoval[]; 
 /** What became of the removals of the last days (third review 10b, n°2 and n°4): done, left as changed, let go. */
 const ClosedRemovals = ({ removals }: { removals: OperatorClosedRemoval[] }) => {
   const { t, lang } = useT()
-  const at = new Intl.DateTimeFormat(lang, { dateStyle: 'short', timeStyle: 'short' })
+  const at = new Intl.DateTimeFormat(lang, {
+    dateStyle: 'short',
+    timeStyle: 'short'
+  })
   return (
-    <div className="field">
-      <p>{t('admin.operator.closedRemovals')}</p>
-      <ul className="plain" aria-label={t('admin.operator.closedRemovals')}>
+    <div className="u-mb-1">
+      <Typography component="p">{t('admin.operator.closedRemovals')}</Typography>
+      <Lines label={t('admin.operator.closedRemovals')}>
         {removals.map(r => (
-          <li key={r.line} className={r.outcome === 'changed' || r.outcome === 'gone' ? 'state state-error' : undefined}>
+          <Line key={r.line} error={r.outcome === 'changed' || r.outcome === 'gone'}>
             {t(`admin.operator.closed.${r.outcome === 'done' && r.restored ? 'restored' : r.outcome === 'done' && r.unrestored ? `unrestored.${r.unrestored}` : r.outcome}` as Key, { line: r.line, at: at.format(new Date(r.at)) })}
-          </li>
+          </Line>
         ))}
-      </ul>
+      </Lines>
     </div>
   )
 }
@@ -167,14 +246,23 @@ const ClosedRemovals = ({ removals }: { removals: OperatorClosedRemoval[] }) => 
 /** The records of calls the operator keeps (step 10b): when last read, and what became of those of the last days. */
 const OperatorRecords = ({ status, onSync, onAbandon, busy }: { status: OperatorStatus; onSync: () => void; onAbandon: (line: string) => void; busy: boolean }) => {
   const { t, lang } = useT()
-  const at = new Intl.DateTimeFormat(lang, { dateStyle: 'short', timeStyle: 'short' })
+  const at = new Intl.DateTimeFormat(lang, {
+    dateStyle: 'short',
+    timeStyle: 'short'
+  })
   const cdrs = status.cdrs
   const stats = cdrs?.stats
   // The share of the calls OVH recorded that the platform had too (FR-D4), over those it could have had (second review
   // 10b, n°5): those received while it was down (orphans), its forwards, those erased with a history, those not settled
   // yet and those it could not read aside.
   const reconcilable = stats ? stats.matched + stats.unmatchedInbound + stats.unmatchedOutbound : 0
-  const rate = stats && reconcilable > 0 ? new Intl.NumberFormat(lang, { style: 'percent', maximumFractionDigits: 1 }).format(stats.matched / reconcilable) : '–'
+  const rate =
+    stats && reconcilable > 0
+      ? new Intl.NumberFormat(lang, {
+          style: 'percent',
+          maximumFractionDigits: 1
+        }).format(stats.matched / reconcilable)
+      : '–'
   const rows: [Key, number | string][] = stats
     ? [
         ['admin.operator.statRate', rate],
@@ -190,37 +278,50 @@ const OperatorRecords = ({ status, onSync, onAbandon, busy }: { status: Operator
     : []
   return (
     <>
-      <p>{t('admin.operator.help')}</p>
+      <Typography component="p">{t('admin.operator.help')}</Typography>
       {status.removals?.length ? <Removals removals={status.removals} onAbandon={onAbandon} busy={busy} /> : null}
       {status.closedRemovals?.length ? <ClosedRemovals removals={status.closedRemovals} /> : null}
-      <p>
-        {cdrs?.readAt ? t('admin.operator.readAt', { at: at.format(new Date(cdrs.readAt)), count: cdrs.read ?? 0 }) : t('admin.operator.notYet')}
-      </p>
+      <Typography component="p">
+        {cdrs?.readAt
+          ? t('admin.operator.readAt', {
+              at: at.format(new Date(cdrs.readAt)),
+              count: cdrs.read ?? 0
+            })
+          : t('admin.operator.notYet')}
+      </Typography>
       {cdrs?.lines?.length ? (
-        <ul className="plain">
+        <Lines>
           {cdrs.lines.map(l => (
-            <li key={l.line} className="state state-error">
-              {t('admin.operator.cdrLine', { line: l.line, problem: t(`admin.operator.err.${l.error}` as Key) })}
-            </li>
+            <Line key={l.line} error>
+              {t('admin.operator.cdrLine', {
+                line: l.line,
+                problem: t(`admin.operator.err.${l.error}` as Key)
+              })}
+            </Line>
           ))}
-        </ul>
+        </Lines>
       ) : null}
-      {stats ? <p className="muted">{t('admin.operator.statRateHint')}</p> : null}
       {stats ? (
-        <dl className="facts facts-compact" aria-label={t('admin.operator.stats', { since: at.format(new Date(cdrs.since)) })}>
-          {rows.map(([key, n]) => (
-            <div key={key}>
-              <dt>{t(key)}</dt>
-              <dd>{n}</dd>
-            </div>
-          ))}
-        </dl>
+        <Typography component="p" variant="body2" color="textSecondary">
+          {t('admin.operator.statRateHint')}
+        </Typography>
       ) : null}
-      <p>
-        <button type="button" className="btn" onClick={onSync} disabled={busy} aria-busy={busy}>
-          {t('admin.operator.sync')}
-        </button>
-      </p>
+      {stats ? (
+        <Facts
+          label={t('admin.operator.stats', {
+            since: at.format(new Date(cdrs.since))
+          })}
+        >
+          {rows.map(([key, n]) => (
+            <Fact key={key} term={t(key)}>
+              {n}
+            </Fact>
+          ))}
+        </Facts>
+      ) : null}
+      <Button variant="outlined" onClick={onSync} disabled={busy} aria-busy={busy}>
+        {t('admin.operator.sync')}
+      </Button>
     </>
   )
 }
@@ -236,7 +337,10 @@ export const Trunks = () => {
   const { client } = useGateway()
   const targets = useTargets(client)
   const [trunks, setTrunks] = useState<Trunk[] | null>(null)
-  const [status, setStatus] = useState<{ available: boolean; items: TrunkStatus[] }>({ available: false, items: [] })
+  const [status, setStatus] = useState<{
+    available: boolean
+    items: TrunkStatus[]
+  }>({ available: false, items: [] })
   const [unavailable, setUnavailable] = useState(false)
   const [form, setForm] = useState<TrunkForm>(emptyTrunk)
   const [editing, setEditing] = useState<Trunk | null>(null)
@@ -248,7 +352,10 @@ export const Trunks = () => {
   const [operatorNote, setOperatorNote] = useState<Note>(null)
   // What the operator has on the lines of the form now, shown before a first fallback replaces it (review 10b, n°13).
   // Kept with the lines it was read for: shown only while they are the lines asked (second review 10b, n°9).
-  const [atOperator, setAtOperator] = useState<{ key: string; items: OperatorLineRead[] } | null>(null)
+  const [atOperator, setAtOperator] = useState<{
+    key: string
+    items: OperatorLineRead[]
+  } | null>(null)
   const [reading, setReading] = useState(false)
 
   // Only the answer to the last read is shown: one asked by the button never comes after a later one.
@@ -281,7 +388,10 @@ export const Trunks = () => {
   // The state of the trunks: read at once, then again after each answer while shown.
   useRefresh(readStatus, STATUS_POLL_MS, !unavailable, true)
 
-  const set = <K extends keyof TrunkForm>(key: K) => (value: TrunkForm[K]) => setForm(f => ({ ...f, [key]: value }))
+  const set =
+    <K extends keyof TrunkForm>(key: K) =>
+    (value: TrunkForm[K]) =>
+      setForm(f => ({ ...f, [key]: value }))
   const reset = () => {
     setEditing(null)
     setForm(emptyTrunk())
@@ -321,16 +431,21 @@ export const Trunks = () => {
     return () => clearTimeout(timer)
   }, [replacedKey, readAtOperator])
   // The lines or the fallback changed: the word given for other lines no longer holds.
-  const setLines = <K extends 'operatorLines' | 'fallbackManaged'>(key: K) => (value: TrunkForm[K]) =>
-    setForm(f => {
-      const next = { ...f, [key]: value }
-      return newOperatorLines(next, editing).join(',') === newOperatorLines(f, editing).join(',') ? next : { ...next, replaceConfirmed: false }
-    })
+  const setLines =
+    <K extends 'operatorLines' | 'fallbackManaged'>(key: K) =>
+    (value: TrunkForm[K]) =>
+      setForm(f => {
+        const next = { ...f, [key]: value }
+        return newOperatorLines(next, editing).join(',') === newOperatorLines(f, editing).join(',') ? next : { ...next, replaceConfirmed: false }
+      })
 
   const save = async (e: FormEvent) => {
     e.preventDefault()
     setNote(null)
-    const checked = checkTrunk(form, { ...(editing ? { current: editing } : {}), ids: (trunks ?? []).map(x => x.id) })
+    const checked = checkTrunk(form, {
+      ...(editing ? { current: editing } : {}),
+      ids: (trunks ?? []).map(x => x.id)
+    })
     setProblems(checked.problems)
     if (!checked.input) {
       focusLater(TRUNK_FIELDS, checked.problems, 'trunk')
@@ -342,7 +457,13 @@ export const Trunks = () => {
       // A line it no longer names whose fallback the operator did not remove yet is said so (third review 10b, n°11).
       setNote(
         saved.pending?.length
-          ? { kind: 'error', text: t('admin.trunk.savedPending', { id: saved.id, lines: saved.pending.map(r => r.line).join(', ') }) }
+          ? {
+              kind: 'error',
+              text: t('admin.trunk.savedPending', {
+                id: saved.id,
+                lines: saved.pending.map(r => r.line).join(', ')
+              })
+            }
           : { kind: 'ok', text: t('admin.trunk.saved', { id: saved.id }) }
       )
       reset()
@@ -398,12 +519,27 @@ export const Trunks = () => {
       // is said so (second review 10b, n°1), never as removed.
       setNote(
         pending.length
-          ? { kind: 'error', text: t('admin.trunk.deletedPending', { id: trunk.id, lines: pending.map(r => r.line).join(', ') }), focus: true }
-          : { kind: 'ok', text: t('admin.trunk.deleted', { id: trunk.id }), focus: true }
+          ? {
+              kind: 'error',
+              text: t('admin.trunk.deletedPending', {
+                id: trunk.id,
+                lines: pending.map(r => r.line).join(', ')
+              }),
+              focus: true
+            }
+          : {
+              kind: 'ok',
+              text: t('admin.trunk.deleted', { id: trunk.id }),
+              focus: true
+            }
       )
       if (editing?.id === trunk.id) reset()
     } catch (err) {
-      setNote({ kind: 'error', text: say(trunkRefusal(err).problem)!, focus: true })
+      setNote({
+        kind: 'error',
+        text: say(trunkRefusal(err).problem)!,
+        focus: true
+      })
     } finally {
       setBusy(false)
       load()
@@ -419,12 +555,27 @@ export const Trunks = () => {
       const { pending } = await client.removeOperatorFallback(trunk.id)
       setNote(
         pending.length
-          ? { kind: 'error', text: t('admin.operator.removedPending', { id: trunk.id, lines: pending.map(r => r.line).join(', ') }), focus: true }
-          : { kind: 'ok', text: t('admin.operator.removed', { id: trunk.id }), focus: true }
+          ? {
+              kind: 'error',
+              text: t('admin.operator.removedPending', {
+                id: trunk.id,
+                lines: pending.map(r => r.line).join(', ')
+              }),
+              focus: true
+            }
+          : {
+              kind: 'ok',
+              text: t('admin.operator.removed', { id: trunk.id }),
+              focus: true
+            }
       )
       if (editing?.id === trunk.id) reset()
     } catch (err) {
-      setNote({ kind: 'error', text: say(trunkRefusal(err).problem)!, focus: true })
+      setNote({
+        kind: 'error',
+        text: say(trunkRefusal(err).problem)!,
+        focus: true
+      })
     } finally {
       setBusy(false)
       load()
@@ -438,9 +589,17 @@ export const Trunks = () => {
     setSyncing(true)
     try {
       await client.abandonOperatorRemoval(line)
-      setOperatorNote({ kind: 'ok', text: t('admin.operator.abandoned', { line }), focus: true })
+      setOperatorNote({
+        kind: 'ok',
+        text: t('admin.operator.abandoned', { line }),
+        focus: true
+      })
     } catch (err) {
-      setOperatorNote({ kind: 'error', text: say(trunkRefusal(err).problem)!, focus: true })
+      setOperatorNote({
+        kind: 'error',
+        text: say(trunkRefusal(err).problem)!,
+        focus: true
+      })
     } finally {
       setSyncing(false)
       void readStatus()
@@ -450,7 +609,7 @@ export const Trunks = () => {
   if (unavailable)
     return (
       <Section id="trunks" title={t('admin.nav.trunks')}>
-        <p className="alert">{t('admin.trunk.unavailable')}</p>
+        <Alert severity="warning" role="status">{t('admin.trunk.unavailable')}</Alert>
       </Section>
     )
 
@@ -482,66 +641,43 @@ export const Trunks = () => {
   return (
     <>
       <Section id="trunks" title={t('admin.nav.trunks')}>
-        <p>{t('admin.trunk.help')}</p>
+        <Typography component="p" gutterBottom>
+          {t('admin.trunk.help')}
+        </Typography>
         {trunks === null ? null : trunks.length ? (
-          <ul className="list admin-list" aria-label={t('admin.trunk.list')}>
+          <List disablePadding data-testid="admin-list" aria-label={t('admin.trunk.list')}>
             {trunks.map(trunk => (
-              <li key={trunk.id}>
-                <div>
-                  <h3>
+              <ListItem key={trunk.id} divider disableGutters className="u-flex-wrap">
+                <div className="u-flex-grow-1">
+                  <Typography variant="h6" component="h3" gutterBottom>
                     {trunk.name ? `${trunk.name} (${trunk.id})` : trunk.id}
-                    {def?.id === trunk.id ? <span className="badge"> · {t('admin.trunk.isDefault')}</span> : null}
-                  </h3>
-                  <dl className="facts facts-compact">
-                    <div>
-                      <dt>{t('admin.trunk.auth')}</dt>
-                      <dd>{t(trunk.auth === 'register' ? 'admin.trunk.authRegister' : 'admin.trunk.authIp')}</dd>
-                    </div>
-                    <div>
-                      <dt>{t('admin.trunk.domain')}</dt>
-                      <dd>{trunk.domain}</dd>
-                    </div>
-                    {trunk.proxies?.length ? (
-                      <div>
-                        <dt>{t('admin.trunk.proxies')}</dt>
-                        <dd>{trunk.proxies.join(', ')}</dd>
-                      </div>
+                    {def?.id === trunk.id ? (
+                      <Typography component="span" variant="body2" color="textSecondary">
+                        {' '}
+                        · {t('admin.trunk.isDefault')}
+                      </Typography>
                     ) : null}
-                    {trunk.username ? (
-                      <div>
-                        <dt>{t('admin.trunk.username')}</dt>
-                        <dd>{trunk.username}</dd>
-                      </div>
-                    ) : null}
-                    <div>
-                      <dt>{t('admin.trunk.password')}</dt>
-                      <dd>{t(trunk.hasPassword ? 'admin.trunk.passwordKept' : 'admin.trunk.passwordNone')}</dd>
-                    </div>
-                    <div>
-                      <dt>{t('admin.trunk.defaultNumber')}</dt>
-                      <dd>{trunk.defaultNumber}</dd>
-                    </div>
-                    <div>
-                      <dt>{t('admin.trunk.allowed')}</dt>
-                      <dd>
-                        {(trunk.allowed ?? []).map(classLabel).join(', ') || t('admin.trunk.allowedDefault')}
-                        {trunk.countries?.length ? ` (${trunk.countries.map(c => `+${c}`).join(', ')})` : ''}
-                      </dd>
-                    </div>
-                    {trunk.fallbackTarget ? (
-                      <div>
-                        <dt>{t('admin.trunk.fallbackTarget')}</dt>
-                        <dd>{targetLabel(targets, trunk.fallbackTarget)}</dd>
-                      </div>
-                    ) : null}
-                  </dl>
+                  </Typography>
+                  <Facts>
+                    <Fact term={t('admin.trunk.auth')}>{t(trunk.auth === 'register' ? 'admin.trunk.authRegister' : 'admin.trunk.authIp')}</Fact>
+                    <Fact term={t('admin.trunk.domain')}>{trunk.domain}</Fact>
+                    {trunk.proxies?.length ? <Fact term={t('admin.trunk.proxies')}>{trunk.proxies.join(', ')}</Fact> : null}
+                    {trunk.username ? <Fact term={t('admin.trunk.username')}>{trunk.username}</Fact> : null}
+                    <Fact term={t('admin.trunk.password')}>{t(trunk.hasPassword ? 'admin.trunk.passwordKept' : 'admin.trunk.passwordNone')}</Fact>
+                    <Fact term={t('admin.trunk.defaultNumber')}>{trunk.defaultNumber}</Fact>
+                    <Fact term={t('admin.trunk.allowed')}>
+                      {(trunk.allowed ?? []).map(classLabel).join(', ') || t('admin.trunk.allowedDefault')}
+                      {trunk.countries?.length ? ` (${trunk.countries.map(c => `+${c}`).join(', ')})` : ''}
+                    </Fact>
+                    {trunk.fallbackTarget ? <Fact term={t('admin.trunk.fallbackTarget')}>{targetLabel(targets, trunk.fallbackTarget)}</Fact> : null}
+                  </Facts>
                   <TrunkState status={status.items.find(s => s.id === trunk.id)} available={status.available} />
                   {operator?.trunks?.find(o => o.id === trunk.id)?.lines.length ? <OperatorLines lines={operator.trunks.find(o => o.id === trunk.id)!.lines} /> : null}
                 </div>
-                <div className="actions actions-end">
-                  <button type="button" className="btn" onClick={() => edit(trunk)} disabled={busy} aria-label={t('admin.trunk.edit', { id: trunk.id })}>
+                <Stack direction="row" spacing={1} useFlexGap className="u-flex-wrap">
+                  <Button variant="outlined" onClick={() => edit(trunk)} disabled={busy} aria-label={t('admin.trunk.edit', { id: trunk.id })}>
                     {t('admin.edit')}
-                  </button>
+                  </Button>
                   {removable(trunk) ? (
                     <ConfirmDelete
                       label={t('admin.operator.removeOf', { id: trunk.id })}
@@ -559,32 +695,32 @@ export const Trunks = () => {
                     onConfirm={() => void remove(trunk)}
                     disabled={busy}
                   />
-                </div>
-              </li>
+                </Stack>
+              </ListItem>
             ))}
-          </ul>
+          </List>
         ) : (
-          <p className="muted">{t('admin.trunk.none')}</p>
+          <Typography component="p" variant="body2" color="textSecondary">
+            {t('admin.trunk.none')}
+          </Typography>
         )}
-        <p>
-          <button type="button" className="btn" onClick={() => void readStatus()}>
-            {t('admin.trunk.refresh')}
-          </button>
-        </p>
+        <Button variant="outlined" className="u-mt-1" onClick={() => void readStatus()}>
+          {t('admin.trunk.refresh')}
+        </Button>
       </Section>
       <Section id="trunk-form" title={editing ? t('admin.trunk.edit', { id: editing.id }) : t('admin.trunk.new')}>
         <form onSubmit={e => void save(e)} noValidate aria-labelledby="trunk-form">
           <ProblemSummary count={count} />
           <TextField id="trunk-id" label={t('admin.trunk.id')} hint={t('admin.slugHint')} value={form.id} onChange={set('id')} error={field('id')} required disabled={busy || !!editing} maxLength={32} />
           <TextField id="trunk-name" label={t('admin.trunk.name')} value={form.name} onChange={set('name')} error={field('name')} disabled={busy} maxLength={64} />
-          <fieldset className="field">
-            <legend>{t('admin.trunk.auth')}</legend>
-            {(['register', 'ip'] as const).map(a => (
-              <label key={a} className="check">
-                <input type="radio" name="trunk-auth" value={a} checked={form.auth === a} onChange={() => set('auth')(a)} disabled={busy} /> {t(a === 'register' ? 'admin.trunk.authRegister' : 'admin.trunk.authIp')}
-              </label>
-            ))}
-          </fieldset>
+          <FormControl component="fieldset" className="u-mb-1">
+            <FormLabel component="legend">{t('admin.trunk.auth')}</FormLabel>
+            <RadioGroup row name="trunk-auth" value={form.auth}>
+              {(['register', 'ip'] as const).map(a => (
+                <FormControlLabel key={a} value={a} label={t(a === 'register' ? 'admin.trunk.authRegister' : 'admin.trunk.authIp')} control={<Radio checked={form.auth === a} onChange={() => set('auth')(a)} disabled={busy} />} />
+              ))}
+            </RadioGroup>
+          </FormControl>
           <TextField id="trunk-domain" label={t('admin.trunk.domain')} hint={t('admin.trunk.domainHint')} value={form.domain} onChange={set('domain')} error={field('domain')} required disabled={busy} maxLength={253} />
           <TextField id="trunk-proxies" label={t('admin.trunk.proxies')} hint={t('admin.trunk.proxiesHint')} value={form.proxies} onChange={set('proxies')} error={field('proxies')} disabled={busy} />
           <TextField id="trunk-sources" label={t('admin.trunk.sources')} hint={t('admin.trunk.sourcesHint')} value={form.sources} onChange={set('sources')} error={field('sources')} disabled={busy} />
@@ -601,28 +737,45 @@ export const Trunks = () => {
             disabled={busy || form.removePassword}
             maxLength={64}
           />
-          {editing?.hasPassword ? <CheckBox id="trunk-remove-password" label={t('admin.trunk.removePassword')} checked={form.removePassword} onChange={v => setForm(f => ({ ...f, removePassword: v, ...(v ? { password: '' } : {}) }))} disabled={busy} /> : null}
+          {editing?.hasPassword ? (
+            <CheckBox
+              id="trunk-remove-password"
+              label={t('admin.trunk.removePassword')}
+              checked={form.removePassword}
+              onChange={v =>
+                setForm(f => ({
+                  ...f,
+                  removePassword: v,
+                  ...(v ? { password: '' } : {})
+                }))
+              }
+              disabled={busy}
+            />
+          ) : null}
           <TextField id="trunk-realm" label={t('admin.trunk.realm')} hint={t('admin.trunk.realmHint')} value={form.realm} onChange={set('realm')} error={field('realm')} disabled={busy} maxLength={128} />
           <TextField id="trunk-registrar" label={t('admin.trunk.registrar')} hint={t('admin.trunk.registrarHint')} value={form.registrar} onChange={set('registrar')} error={field('registrar')} disabled={busy || form.auth !== 'register'} />
           <TextField id="trunk-registerExpires" label={t('admin.trunk.registerExpires')} hint={t('admin.trunk.registerExpiresHint')} inputMode="numeric" value={form.registerExpires} onChange={set('registerExpires')} error={field('registerExpires')} disabled={busy || form.auth !== 'register'} maxLength={4} />
           <CheckGroup id="trunk-codecs" legend={t('admin.trunk.codecs')} hint={t('admin.trunk.codecsHint')} values={TRUNK_CODECS} chosen={form.codecs} label={c => c} onChange={set('codecs')} error={field('codecs')} disabled={busy} />
-          <SelectField id="trunk-numberFormat" label={t('admin.trunk.numberFormat')} value={form.numberFormat} onChange={v => set('numberFormat')(v as TrunkNumberFormat)} options={FORMATS.map(f => ({ value: f, label: t(`admin.trunk.format.${f}` as Key) }))} disabled={busy} />
+          <SelectField
+            id="trunk-numberFormat"
+            label={t('admin.trunk.numberFormat')}
+            value={form.numberFormat}
+            onChange={v => set('numberFormat')(v as TrunkNumberFormat)}
+            options={FORMATS.map(f => ({
+              value: f,
+              label: t(`admin.trunk.format.${f}` as Key)
+            }))}
+            disabled={busy}
+          />
           <CheckBox id="trunk-assertIdentity" label={t('admin.trunk.assertIdentity')} checked={form.assertIdentity} onChange={set('assertIdentity')} disabled={busy} />
           <TextField id="trunk-defaultNumber" label={t('admin.trunk.defaultNumber')} hint={t('admin.trunk.defaultNumberHint')} type="tel" inputMode="tel" value={form.defaultNumber} onChange={set('defaultNumber')} error={field('defaultNumber')} required disabled={busy} maxLength={24} />
           <CheckGroup id="trunk-allowed" legend={t('admin.trunk.allowed')} hint={t('admin.trunk.allowedHint')} values={TRUNK_OUTBOUND_CLASSES} chosen={form.allowed} label={classLabel} onChange={set('allowed')} error={field('allowed')} disabled={busy} />
           <TextField id="trunk-countries" label={t('admin.trunk.countries')} hint={t('admin.trunk.countriesHint')} inputMode="numeric" value={form.countries} onChange={set('countries')} error={field('countries')} disabled={busy} />
-          <CheckBox
-            id="trunk-default"
-            label={t('admin.trunk.default')}
-            hint={t(isCurrentDefault ? 'admin.trunk.defaultCurrentHint' : 'admin.trunk.defaultHint')}
-            checked={form.isDefault || isCurrentDefault}
-            onChange={set('isDefault')}
-            disabled={busy || isCurrentDefault}
-          />
+          <CheckBox id="trunk-default" label={t('admin.trunk.default')} hint={t(isCurrentDefault ? 'admin.trunk.defaultCurrentHint' : 'admin.trunk.defaultHint')} checked={form.isDefault || isCurrentDefault} onChange={set('isDefault')} disabled={busy || isCurrentDefault} />
           <TextField id="trunk-fallbackTarget" label={t('admin.trunk.fallbackTarget')} hint={t('admin.trunk.fallbackTargetHint')} inputMode="numeric" value={form.fallbackTarget} onChange={set('fallbackTarget')} error={field('fallbackTarget')} disabled={busy} maxLength={6} list="trunk-targets" />
           <TargetList id="trunk-targets" targets={targets} />
-          <fieldset className="field">
-            <legend>{t('admin.trunk.operator')}</legend>
+          <FormControl component="fieldset" fullWidth className="u-mb-1">
+            <FormLabel component="legend">{t('admin.trunk.operator')}</FormLabel>
             <TextField id="trunk-operatorLines" label={t('admin.trunk.operatorLines')} hint={t('admin.trunk.operatorLinesHint')} value={form.operatorLines} onChange={setLines('operatorLines')} error={field('operatorLines')} disabled={busy} />
             <CheckBox
               id="trunk-fallbackManaged"
@@ -633,26 +786,41 @@ export const Trunks = () => {
               // Without an operator the Gateway refuses it; one kept from before can still be let go.
               disabled={busy || (!operator?.configured && !form.fallbackManaged)}
             />
-            {dropped.length ? <p className="badge">{t('admin.trunk.operatorDropped', { lines: dropped.join(', ') })}</p> : null}
-            {editing?.operator?.fallback && !form.fallbackManaged && !dropped.length ? <p className="badge">{t('admin.trunk.fallbackLeft', { lines: editing.operator.lines.join(', ') })}</p> : null}
+            {dropped.length ? (
+              <Typography component="p" variant="body2" color="textSecondary">
+                {t('admin.trunk.operatorDropped', {
+                  lines: dropped.join(', ')
+                })}
+              </Typography>
+            ) : null}
+            {editing?.operator?.fallback && !form.fallbackManaged && !dropped.length ? (
+              <Typography component="p" variant="body2" color="textSecondary">
+                {t('admin.trunk.fallbackLeft', {
+                  lines: editing.operator.lines.join(', ')
+                })}
+              </Typography>
+            ) : null}
             {replaced.length ? (
-              <div className="field">
-                <p>{t(editing?.operator?.fallback ? 'admin.trunk.operatorNowNew' : 'admin.trunk.operatorNow')}</p>
+              <div className="u-mb-1">
+                <Typography component="p">{t(editing?.operator?.fallback ? 'admin.trunk.operatorNowNew' : 'admin.trunk.operatorNow')}</Typography>
                 {/* Announced once read (n°17). */}
                 <div role="status">
                   {preview ? (
-                    <ul className="plain" aria-label={t('admin.trunk.operatorNow')}>
+                    <Lines label={t('admin.trunk.operatorNow')}>
                       {preview.map(l => (
-                        <li key={l.line} className={l.error ? 'state state-error' : undefined}>
-                          {t('admin.operator.line', { line: l.line, forwards: l.error ? t(`admin.operator.err.${l.error}` as Key) : forwardsOf(l.forwards, t) })}
-                        </li>
+                        <Line key={l.line} error={!!l.error}>
+                          {t('admin.operator.line', {
+                            line: l.line,
+                            forwards: l.error ? t(`admin.operator.err.${l.error}` as Key) : forwardsOf(l.forwards, t)
+                          })}
+                        </Line>
                       ))}
-                    </ul>
+                    </Lines>
                   ) : null}
                 </div>
-                <button type="button" className="btn" onClick={() => void readAtOperator(replaced)} disabled={busy || reading} aria-busy={reading}>
+                <Button variant="outlined" onClick={() => void readAtOperator(replaced)} disabled={busy || reading} aria-busy={reading}>
                   {t('admin.trunk.readOperator')}
-                </button>
+                </Button>
                 <CheckBox id="trunk-replaceConfirmed" label={t('admin.trunk.replaceConfirmed')} hint={t('admin.trunk.replaceHint')} checked={form.replaceConfirmed} onChange={set('replaceConfirmed')} error={field('replaceConfirmed')} disabled={busy} />
               </div>
             ) : null}
@@ -664,17 +832,17 @@ export const Trunks = () => {
                 <TextField id="trunk-noAnswerAfterSec" label={t('admin.trunk.noAnswerAfterSec')} hint={t('admin.trunk.noAnswerAfterSecHint')} inputMode="numeric" value={form.noAnswerAfterSec} onChange={set('noAnswerAfterSec')} error={field('noAnswerAfterSec')} disabled={busy || !form.onNoAnswer} maxLength={3} />
               </>
             ) : null}
-          </fieldset>
-          <div className="actions actions-start">
-            <button type="submit" className="btn btn-primary" disabled={busy} aria-busy={busy}>
+          </FormControl>
+          <Stack direction="row" spacing={1} useFlexGap className="u-flex-wrap">
+            <Button type="submit" disabled={busy} aria-busy={busy}>
               {t('admin.trunk.save')}
-            </button>
+            </Button>
             {editing ? (
-              <button type="button" className="btn" onClick={reset} disabled={busy}>
+              <Button variant="outlined" onClick={reset} disabled={busy}>
                 {t('admin.cancel')}
-              </button>
+              </Button>
             ) : null}
-          </div>
+          </Stack>
         </form>
         <NoteLine note={note} />
       </Section>

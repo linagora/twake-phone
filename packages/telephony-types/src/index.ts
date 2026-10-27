@@ -25,6 +25,8 @@ export interface Contact {
   email?: string
   department?: string
   title?: string
+  /** A small JPEG or PNG as a `data:image/…;base64,…` URL (the directory's photo, list size); absent when there is none. */
+  photo?: string
 }
 
 export type EndpointType = 'browser' | 'desk-phone' | 'mobile' | 'external'

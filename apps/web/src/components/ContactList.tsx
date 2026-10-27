@@ -1,54 +1,52 @@
-import { Link } from 'react-router-dom'
+import { Avatar, Link, List, ListItem, ListItemAvatar, ListItemText, getInitials } from '@linagora/twake-mui'
+import { Link as RouterLink } from 'react-router-dom'
 import { formatNumber, type Contact } from '@twake/telephony-client'
-import type { Favorites } from '../favorites.js'
+import { HoverActions } from '../ds/HoverActions/HoverActions.js'
 import { useT } from '../i18n/useT.js'
 import { PresenceBadge } from '../presence.js'
+import { CallAction, CopyAction } from './RowActions.js'
 
-/** A toggle: one stable name ("Favourite: Jean Dupont") and aria-pressed for the state, as the ARIA pattern asks. */
-export const FavoriteButton = ({ contact, favorites }: { contact: Contact; favorites: Favorites }) => {
-  const { t } = useT()
-  const on = favorites.has(contact.id)
-  const busy = favorites.pending(contact.id)
-  return (
-    <button type="button" className={`btn star${on ? ' star-on' : ''}`} aria-pressed={on} aria-busy={busy || undefined} disabled={busy || favorites.items === null} aria-label={t('directory.favoriteToggle', { name: contact.displayName })} onClick={() => void favorites.toggle(contact)}>
-      <span aria-hidden="true">{on ? '★' : '☆'}</span>
-    </button>
-  )
-}
+/** The directory photo, or the initials when there is none (or it does not load). Decorative: the name is always next to it. */
+export const ContactAvatar = ({ contact, size, className }: { contact: Contact; size?: 's' | 'm' | 'l' | 'xl'; className?: string }) => (
+  <Avatar src={contact.photo} alt="" aria-hidden="true" size={size} className={className}>
+    {getInitials(contact.displayName, '')}
+  </Avatar>
+)
 
-export const ContactList = ({ contacts, favorites }: { contacts: Contact[]; favorites: Favorites }) => {
+/** The number a person is called on from a list: their extension, else their first number. */
+export const mainNumber = (c: Contact) => c.numbers.find(n => n.type === 'extension') ?? c.numbers[0]
+
+/** The people to call: the name opens the card, the phone (on hover, or always on a touch screen) calls. */
+export const ContactList = ({ contacts }: { contacts: Contact[] }) => {
   const { t } = useT()
-  const main = (c: Contact) => c.numbers.find(n => n.type === 'extension') ?? c.numbers[0]
   return (
-    <ul className="list contacts">
+    <List data-testid="contacts">
       {contacts.map(c => {
-        const n = main(c)
+        const n = mainNumber(c)
         return (
-          <li key={c.id}>
-            <span>
-              <Link to={`/directory/${encodeURIComponent(c.id)}`}>
-                <strong>{c.displayName}</strong>
-              </Link>
-              <br />
-              <span className="badge">{[c.department, n ? formatNumber(n.number) : t('contact.noNumber')].filter(Boolean).join(' · ')}</span>
-              {n?.type === 'extension' ? (
-                <>
-                  {' '}
-                  <PresenceBadge extension={n.number} />
-                </>
-              ) : null}
-            </span>
-            <span className="actions">
-              <FavoriteButton contact={c} favorites={favorites} />
-              {n ? (
-                <Link className="btn btn-primary" to={`/?number=${encodeURIComponent(n.number)}`} aria-label={t('contact.callName', { name: c.displayName })}>
-                  {t('contact.call')}
+          // The actions follow the row in the flow (not over it): nothing of the row is covered, on a phone either.
+          <ListItem key={c.id} divider>
+            <ListItemAvatar>
+              <ContactAvatar contact={c} />
+            </ListItemAvatar>
+            <ListItemText
+              primary={
+                <Link component={RouterLink} to={`/directory/${encodeURIComponent(c.id)}`} underline="hover" color="textPrimary">
+                  <strong>{c.displayName}</strong>
                 </Link>
-              ) : null}
-            </span>
-          </li>
+              }
+              secondary={[c.department, n ? formatNumber(n.number) : t('contact.noNumber')].filter(Boolean).join(' · ')}
+            />
+            {n?.type === 'extension' ? <PresenceBadge extension={n.number} /> : null}
+            {n ? (
+              <HoverActions>
+                <CopyAction number={n.number} label={t('actions.copyNumber', { number: formatNumber(n.number) })} />
+                <CallAction number={n.number} label={t('contact.callName', { name: c.displayName })} />
+              </HoverActions>
+            ) : null}
+          </ListItem>
         )
       })}
-    </ul>
+    </List>
   )
 }

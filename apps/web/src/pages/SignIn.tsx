@@ -1,5 +1,7 @@
+import { Alert, Button, Typography } from '@linagora/twake-mui'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useAuth } from '../auth/AuthProvider.js'
+import { CenteredPage } from '../components/CenteredPage.js'
 import { useT } from '../i18n/useT.js'
 import { calledFor } from '../push.js'
 
@@ -58,23 +60,23 @@ export const SignIn = () => {
   }, [redirect])
   if (forCall) {
     return (
-      <main id="main" className="center">
+      <CenteredPage>
         <p role="status">{t('auth.openingCall')}</p>
-      </main>
+      </CenteredPage>
     )
   }
   return (
-    <main id="main" className="center">
-      <h1>{t('app.name')}</h1>
-      <p>{t('auth.welcome')}</p>
+    <CenteredPage>
+      <Typography variant="h3" component="h1" gutterBottom>
+        {t('app.name')}
+      </Typography>
+      <Typography component="p" className="u-mb-1">{t('auth.welcome')}</Typography>
       {error ? (
-        <div className="alert alert-error" role="alert">
+        <Alert severity="error" role="alert" className="u-mb-1">
           {t('auth.error', { reason: error })}
-        </div>
+        </Alert>
       ) : null}
-      <button type="button" className="btn btn-primary" onClick={redirect}>
-        {t('auth.signin')}
-      </button>
-    </main>
+      <Button onClick={redirect}>{t('auth.signin')}</Button>
+    </CenteredPage>
   )
 }

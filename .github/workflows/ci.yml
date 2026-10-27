@@ -12,7 +12,7 @@ concurrency:
 
 jobs:
   gateway-and-packages:
-    name: Paquets et passerelle (Node 22, PostgreSQL)
+    name: Paquets et passerelle (Node 24, PostgreSQL)
     runs-on: ubuntu-latest
     timeout-minutes: 20
     services:
@@ -32,7 +32,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
           cache: yarn
       - run: yarn install --frozen-lockfile
       - id: build
@@ -108,7 +108,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
           cache: yarn
       # La stack SIP d'abord (`--wait` bloque jusqu'aux healthchecks) : OpenSIPS 3.6 (image officielle + modules
       # WSS, TLS, PostgreSQL), rtpengine en espace utilisateur, PostgreSQL avec la table `subscriber`, et Wazo 26.10 pour
@@ -211,7 +211,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
           cache: yarn
       # Le kit tel qu'un pilote le lance (docker/pilot/README.md), profil demo, avec un nom de test résolu en local
       # (OpenSIPS le résout à son démarrage) et le certificat de l'autorité interne de Caddy. Le son reste sur la boucle.

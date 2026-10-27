@@ -1,3 +1,4 @@
+import { Alert, Button, List, ListItem, ListItemText, Stack, Typography } from '@linagora/twake-mui'
 import { useCallback, useEffect, useState, type FormEvent } from 'react'
 import type { CallFlow } from '@twake/telephony-client'
 import { ConfirmDelete, NoteLine, ProblemSummary, SelectField, Section, TextField, useFocusLater, useProblem, type Note } from '../../admin/ui.js'
@@ -119,7 +120,7 @@ export const CallFlows = () => {
   if (unavailable)
     return (
       <Section id="flows" title={t('admin.flows')}>
-        <p className="alert">{t('admin.flowsUnavailable')}</p>
+        <Alert severity="info" role="status">{t('admin.flowsUnavailable')}</Alert>
       </Section>
     )
   const count = Object.keys(problems).length
@@ -127,26 +128,34 @@ export const CallFlows = () => {
   return (
     <>
       <Section id="flows" title={t('admin.flows')}>
-        <p>{t('admin.flowsHelp')}</p>
+        <Typography component="p" gutterBottom>
+          {t('admin.flowsHelp')}
+        </Typography>
         {flows === null ? null : flows.length ? (
-          <ul className="list admin-list" aria-label={t('admin.flowsList')}>
+          <List aria-label={t('admin.flowsList')}>
             {flows.map(f => (
-              <li key={f.number}>
-                <span>
-                  <strong>{f.number}</strong> {f.name} ({t(`admin.flowKind.${f.kind}` as Key)}) : {summary(f)}
-                  {f.ready === undefined ? '' : ` — ${f.ready ? t('admin.flowReady') : t('admin.flowPending')}`}
-                </span>
-                <div className="actions actions-end">
-                  <button type="button" className="btn" onClick={() => edit(f)} disabled={busy} aria-label={t('admin.flowEdit', { number: f.number })}>
+              <ListItem key={f.number} divider>
+                <ListItemText
+                  primary={
+                    <>
+                      <strong>{f.number}</strong> {f.name} ({t(`admin.flowKind.${f.kind}` as Key)}) : {summary(f)}
+                      {f.ready === undefined ? '' : ` — ${f.ready ? t('admin.flowReady') : t('admin.flowPending')}`}
+                    </>
+                  }
+                />
+                <Stack direction="row" spacing={1} useFlexGap className="u-flex-wrap">
+                  <Button variant="outlined" onClick={() => edit(f)} disabled={busy} aria-label={t('admin.flowEdit', { number: f.number })}>
                     {t('admin.flowEditShort')}
-                  </button>
+                  </Button>
                   <ConfirmDelete label={t('admin.flowDelete', { number: f.number })} question={t('admin.flowDeleteConfirm', { number: f.number })} onConfirm={() => void remove(f)} disabled={busy} />
-                </div>
-              </li>
+                </Stack>
+              </ListItem>
             ))}
-          </ul>
+          </List>
         ) : (
-          <p className="muted">{t('admin.flowsNone')}</p>
+          <Typography component="p" variant="body2" color="textSecondary">
+            {t('admin.flowsNone')}
+          </Typography>
         )}
       </Section>
       <Section id="flow-form" title={editing ? t('admin.flowEdit', { number: editing }) : t('admin.flowNew')}>
@@ -167,16 +176,16 @@ export const CallFlows = () => {
               {kind === 'queue' ? <TextField id="flow-waitSec" label={t('admin.flowWaitSec')} hint={t('admin.flowWaitSecHint')} inputMode="numeric" value={form.waitSec} onChange={set('waitSec')} error={say(problems.waitSec)} disabled={busy} maxLength={3} /> : null}
             </>
           )}
-          <div className="actions actions-start">
-            <button type="submit" className="btn btn-primary" disabled={busy} aria-busy={busy}>
+          <Stack direction="row" spacing={1} useFlexGap className="u-flex-wrap">
+            <Button type="submit" disabled={busy} aria-busy={busy}>
               {t('admin.flowSave')}
-            </button>
+            </Button>
             {editing ? (
-              <button type="button" className="btn" onClick={reset} disabled={busy}>
+              <Button variant="outlined" onClick={reset} disabled={busy}>
                 {t('admin.flowCancel')}
-              </button>
+              </Button>
             ) : null}
-          </div>
+          </Stack>
         </form>
         <NoteLine note={note} />
       </Section>

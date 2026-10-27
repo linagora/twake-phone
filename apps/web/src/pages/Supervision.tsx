@@ -1,3 +1,4 @@
+import { Alert, Button, Chip, List, ListItem, ListItemText, Stack, Table, TableBody, TableCell, TableContainer, TableHead, TableRow, Typography } from '@linagora/twake-mui'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { formatNumber, type Recording, type SupervisedCall, type SupervisionLogEntry, type SupervisionMode } from '@twake/telephony-client'
 import { useGateway } from '../gateway.js'
@@ -213,175 +214,239 @@ export const SupervisionPage = () => {
     })
 
   const heading = (
-    <h1 ref={title} tabIndex={-1}>
+    <Typography variant="h4" component="h1" gutterBottom ref={title} tabIndex={-1}>
       {t('supervision.title')}
-    </h1>
+    </Typography>
   )
-  if (!me) return <>{heading}{meError ? <p className="alert alert-error" role="alert">{t('supervision.error', { reason: meError })}</p> : <p role="status">{t('supervision.loading')}</p>}</>
-  if (!allowed) return <>{heading}<p className="alert" role="alert">{t('supervision.forbidden')}</p></>
-  if (error === 'unavailable') return <>{heading}<p className="alert">{t('supervision.unavailable')}</p></>
-  if (error === 'forbidden') return <>{heading}<p className="alert" role="alert">{t('supervision.forbidden')}</p></>
-  if (error && !calls) return <>{heading}<p className="alert alert-error" role="alert">{t('supervision.error', { reason: error })}</p></>
+  const h2 = (text: string) => (
+    <Typography variant="h5" component="h2" className="u-mt-2" gutterBottom>
+      {text}
+    </Typography>
+  )
+  const empty = (text: string) => (
+    <Typography component="p" variant="body2" color="textSecondary">
+      {text}
+    </Typography>
+  )
+  const loading = <Typography role="status">{t('supervision.loading')}</Typography>
+  if (!me)
+    return (
+      <>
+        {heading}
+        {meError ? (
+          <Alert severity="error" role="alert">
+            {t('supervision.error', { reason: meError })}
+          </Alert>
+        ) : (
+          loading
+        )}
+      </>
+    )
+  if (!allowed || error === 'forbidden')
+    return (
+      <>
+        {heading}
+        <Alert severity="warning" role="alert">
+          {t('supervision.forbidden')}
+        </Alert>
+      </>
+    )
+  if (error === 'unavailable')
+    return (
+      <>
+        {heading}
+        <Alert severity="info" role="status">{t('supervision.unavailable')}</Alert>
+      </>
+    )
+  if (error && !calls)
+    return (
+      <>
+        {heading}
+        <Alert severity="error" role="alert">
+          {t('supervision.error', { reason: error })}
+        </Alert>
+      </>
+    )
   const day = new Intl.DateTimeFormat(lang, { dateStyle: 'medium', timeStyle: 'short' })
   const time = new Intl.DateTimeFormat(lang, { timeStyle: 'medium' })
   const recordingOf = (r: Recording) => (r.displayName ? `${r.displayName} (${r.extension})` : t('auth.extension', { extension: r.extension }))
   return (
     <>
       {heading}
-      <p>{t('supervision.intro')}</p>
-      <p className="alert">{t('supervision.notice')}</p>
-      <p className="sr-only" role="status" aria-live="polite" data-testid="supervision-status">
+      <Typography component="p" gutterBottom>
+        {t('supervision.intro')}
+      </Typography>
+      <Alert severity="info" role="status" className="u-mb-1">
+        {t('supervision.notice')}
+      </Alert>
+      <p className="u-visuallyhidden" role="status" aria-live="polite" data-testid="supervision-status">
         {said.n % 2 ? said.text : said.text && `${said.text}\u00a0`}
       </p>
       {problem ? (
-        <p className="alert alert-error" role="alert">
+        <Alert severity="error" role="alert" className="u-mb-1" data-testid="supervision-problem">
           {problem}
-        </p>
+        </Alert>
       ) : null}
 
       {stale && calls ? (
-        <p className="alert" role="status">
+        <Alert severity="warning" role="status" className="u-mb-1">
           {t('supervision.stale')}
-        </p>
+        </Alert>
       ) : null}
 
-      <h2>{t('supervision.calls')}</h2>
+      {h2(t('supervision.calls'))}
       {!calls ? (
-        <p role="status">{t('supervision.loading')}</p>
+        loading
       ) : calls.length === 0 ? (
-        <p>{t('supervision.noCalls')}</p>
+        empty(t('supervision.noCalls'))
       ) : (
-        <table data-testid="supervision-calls">
-          <caption className="sr-only">{t('supervision.calls')}</caption>
-          <thead>
-            <tr>
-              <th scope="col">{t('supervision.line')}</th>
-              <th scope="col">{t('supervision.peer')}</th>
-              <th scope="col">{t('supervision.state')}</th>
-              <th scope="col">{t('supervision.since')}</th>
-              <th scope="col">{t('supervision.actions')}</th>
-            </tr>
-          </thead>
-          <tbody>
-            {calls.map(c => {
-              const who = whoOf(c)
-              return (
-                <tr key={c.id} data-testid="supervision-call" data-id={c.id}>
-                  <th scope="row">{who}</th>
-                  <td>{peerOf(c)}</td>
-                  <td>
-                    {t(c.state === 'up' ? 'supervision.stateUp' : 'supervision.stateRinging')}
-                    {c.recording ? <span className="badge missed"> · {t('supervision.recordingOn')}</span> : null}
-                  </td>
-                  <td>
-                    <time dateTime={c.startedAt}>{time.format(new Date(c.startedAt))}</time>
-                  </td>
-                  <td className="actions">
-                    {c.recording ? (
-                      <button type="button" className="btn" aria-label={t('supervision.stopFor', { who })} aria-disabled={busy.has(c.id) || undefined} onClick={() => void stop(c)}>
-                        {t('supervision.stopRecord')}
-                      </button>
-                    ) : (
-                      <button type="button" className="btn btn-primary" aria-label={t('supervision.recordFor', { who })} aria-disabled={busy.has(c.id) || undefined} onClick={() => void record(c)}>
-                        {t('supervision.record')}
-                      </button>
-                    )}
-                    {MODES.map(m => (
-                      <button key={m.mode} type="button" className="btn" aria-label={t(m.named, { who })} aria-disabled={busy.has(c.id) || undefined} onClick={() => void join(c, m.mode)}>
-                        {t(m.label)}
-                      </button>
-                    ))}
-                  </td>
-                </tr>
-              )
-            })}
-          </tbody>
-        </table>
+        <TableContainer role="region" tabIndex={0} aria-label={t('supervision.calls')}>
+          <Table size="small" data-testid="supervision-calls">
+            <caption className="u-visuallyhidden">{t('supervision.calls')}</caption>
+            <TableHead>
+              <TableRow>
+                {(['supervision.line', 'supervision.peer', 'supervision.state', 'supervision.since', 'supervision.actions'] as const).map(k => (
+                  <TableCell key={k} component="th" scope="col">
+                    {t(k)}
+                  </TableCell>
+                ))}
+              </TableRow>
+            </TableHead>
+            <TableBody>
+              {calls.map(c => {
+                const who = whoOf(c)
+                return (
+                  <TableRow key={c.id} data-testid="supervision-call" data-id={c.id}>
+                    <TableCell component="th" scope="row">
+                      {who}
+                    </TableCell>
+                    <TableCell>{peerOf(c)}</TableCell>
+                    <TableCell>
+                      {t(c.state === 'up' ? 'supervision.stateUp' : 'supervision.stateRinging')}
+                      {c.recording ? <Chip size="small" color="error" variant="outlined" className="u-ml-half" label={t('supervision.recordingOn')} /> : null}
+                    </TableCell>
+                    <TableCell>
+                      <time dateTime={c.startedAt}>{time.format(new Date(c.startedAt))}</time>
+                    </TableCell>
+                    <TableCell>
+                      <Stack direction="row" spacing={1} useFlexGap className="u-flex-wrap">
+                        {c.recording ? (
+                          <Button variant="outlined" size="small" aria-label={t('supervision.stopFor', { who })} aria-disabled={busy.has(c.id) || undefined} onClick={() => void stop(c)}>
+                            {t('supervision.stopRecord')}
+                          </Button>
+                        ) : (
+                          <Button size="small" aria-label={t('supervision.recordFor', { who })} aria-disabled={busy.has(c.id) || undefined} onClick={() => void record(c)}>
+                            {t('supervision.record')}
+                          </Button>
+                        )}
+                        {MODES.map(m => (
+                          <Button key={m.mode} variant="outlined" size="small" aria-label={t(m.named, { who })} aria-disabled={busy.has(c.id) || undefined} onClick={() => void join(c, m.mode)}>
+                            {t(m.label)}
+                          </Button>
+                        ))}
+                      </Stack>
+                    </TableCell>
+                  </TableRow>
+                )
+              })}
+            </TableBody>
+          </Table>
+        </TableContainer>
       )}
 
-      <h2>{t('supervision.recordings')}</h2>
+      {h2(t('supervision.recordings'))}
       {!recordings ? (
-        <p role="status">{t('supervision.loading')}</p>
+        loading
       ) : recordings.length === 0 ? (
-        <p>{t('supervision.noRecordings')}</p>
+        empty(t('supervision.noRecordings'))
       ) : (
-        <ul className="list" data-testid="supervision-recordings">
+        <List data-testid="supervision-recordings">
           {recordings.map(r => {
             const named = { who: recordingOf(r), when: day.format(new Date(r.startedAt)) }
             return (
-              <li key={r.id} data-testid="supervision-recording" data-id={r.id} data-state={r.state}>
-                <div>
-                  <strong>{named.who}</strong>
-                  <br />
-                  <span className="badge">
-                    <time dateTime={r.startedAt}>{named.when}</time> · {t(REC_STATE[r.state])}
-                    {r.durationSec !== undefined ? ` · ${t('supervision.recDuration')} ${clock(r.durationSec)}` : ''}
-                  </span>
-                  {playing?.id === r.id ? <div><audio controls autoPlay src={playing.url} aria-label={t('supervision.player', named)} data-testid="supervision-audio" /></div> : null}
-                </div>
-                <div className="actions actions-end">
+              <ListItem key={r.id} divider data-testid="supervision-recording" data-id={r.id} data-state={r.state} className="u-flex-wrap">
+                <ListItemText
+                  primary={named.who}
+                  secondary={
+                    <>
+                      <time dateTime={r.startedAt}>{named.when}</time> · {t(REC_STATE[r.state])}
+                      {r.durationSec !== undefined ? ` · ${t('supervision.recDuration')} ${clock(r.durationSec)}` : ''}
+                    </>
+                  }
+                />
+                <Stack direction="row" spacing={1} useFlexGap className="u-flex-wrap u-flex-items-center">
                   {r.state === 'ready' ? (
-                    <button type="button" className="btn" aria-label={t('supervision.playFor', named)} onClick={() => void play(r)}>
+                    <Button variant="outlined" size="small" aria-label={t('supervision.playFor', named)} onClick={() => void play(r)}>
                       {t('supervision.play')}
-                    </button>
+                    </Button>
                   ) : null}
                   {admin && r.state !== 'recording' && r.state !== 'purged' ? (
                     confirming === r.id ? (
-                      <span
+                      <Stack
+                        direction="row"
+                        spacing={1}
+                        useFlexGap
+                        className="u-flex-wrap u-flex-items-center"
                         onKeyDown={e => {
                           if (e.key === 'Escape') keep(r)
                         }}
                       >
-                        <span role="alert">{t('supervision.confirmDelete', named)}</span>
-                        <button type="button" className="btn btn-danger" ref={el => void (el ? confirmButtons.current.set(r.id, el) : confirmButtons.current.delete(r.id))} onClick={() => void remove(r)}>
+                        <Typography variant="body2" role="alert">
+                          {t('supervision.confirmDelete', named)}
+                        </Typography>
+                        <Button size="small" color="error" ref={el => void (el ? confirmButtons.current.set(r.id, el) : confirmButtons.current.delete(r.id))} onClick={() => void remove(r)}>
                           {t('supervision.confirm')}
-                        </button>
-                        <button type="button" className="btn" onClick={() => keep(r)}>
+                        </Button>
+                        <Button size="small" variant="outlined" onClick={() => keep(r)}>
                           {t('supervision.keep')}
-                        </button>
-                      </span>
+                        </Button>
+                      </Stack>
                     ) : (
-                      <button type="button" className="btn" ref={el => void (el ? removeButtons.current.set(r.id, el) : removeButtons.current.delete(r.id))} aria-label={t('supervision.deleteFor', named)} onClick={() => askRemove(r)}>
+                      <Button size="small" variant="outlined" ref={el => void (el ? removeButtons.current.set(r.id, el) : removeButtons.current.delete(r.id))} aria-label={t('supervision.deleteFor', named)} onClick={() => askRemove(r)}>
                         {t('supervision.delete')}
-                      </button>
+                      </Button>
                     )
                   ) : null}
-                </div>
-              </li>
+                </Stack>
+                {playing?.id === r.id ? <audio controls autoPlay src={playing.url} aria-label={t('supervision.player', named)} data-testid="supervision-audio" className="u-w-100" /> : null}
+              </ListItem>
             )
           })}
-        </ul>
+        </List>
       )}
 
-      <h2>{t('supervision.log')}</h2>
+      {h2(t('supervision.log'))}
       {!log ? (
-        <p role="status">{t('supervision.loading')}</p>
+        loading
       ) : log.length === 0 ? (
-        <p>{t('supervision.noLog')}</p>
+        empty(t('supervision.noLog'))
       ) : (
-        <table data-testid="supervision-log">
-          <caption className="sr-only">{t('supervision.log')}</caption>
-          <thead>
-            <tr>
-              <th scope="col">{t('supervision.logWhen')}</th>
-              <th scope="col">{t('supervision.logWho')}</th>
-              <th scope="col">{t('supervision.logWhat')}</th>
-              <th scope="col">{t('supervision.logLine')}</th>
-            </tr>
-          </thead>
-          <tbody>
-            {log.map((e, i) => (
-              <tr key={`${e.at}-${i}`}>
-                <td>
-                  <time dateTime={e.at}>{day.format(new Date(e.at))}</time>
-                </td>
-                <td>{e.actor === 'system' ? t('supervision.logSystem') : (e.actorName ?? e.actor)}</td>
-                <td>{t(LOG_ACTION[e.action])}</td>
-                <td>{e.extension ?? ''}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+        <TableContainer role="region" tabIndex={0} aria-label={t('supervision.log')}>
+          <Table size="small" data-testid="supervision-log">
+            <caption className="u-visuallyhidden">{t('supervision.log')}</caption>
+            <TableHead>
+              <TableRow>
+                {(['supervision.logWhen', 'supervision.logWho', 'supervision.logWhat', 'supervision.logLine'] as const).map(k => (
+                  <TableCell key={k} component="th" scope="col">
+                    {t(k)}
+                  </TableCell>
+                ))}
+              </TableRow>
+            </TableHead>
+            <TableBody>
+              {log.map((e, i) => (
+                <TableRow key={`${e.at}-${i}`}>
+                  <TableCell>
+                    <time dateTime={e.at}>{day.format(new Date(e.at))}</time>
+                  </TableCell>
+                  <TableCell>{e.actor === 'system' ? t('supervision.logSystem') : (e.actorName ?? e.actor)}</TableCell>
+                  <TableCell>{t(LOG_ACTION[e.action])}</TableCell>
+                  <TableCell>{e.extension ?? ''}</TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </TableContainer>
       )}
     </>
   )

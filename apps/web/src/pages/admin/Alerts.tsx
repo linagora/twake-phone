@@ -1,3 +1,4 @@
+import { Button, Chip, Stack, Table, TableBody, TableCell, TableContainer, TableHead, TableRow, Typography } from '@linagora/twake-mui'
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react'
 import { FRAUD_PARAMS, OUTBOUND_CAPS, TRUNK_OUTBOUND_CLASSES, type AdminAlert, type AdminUser, type AlertFilter } from '@twake/telephony-client'
 import { CheckBox, NoteLine, Section, SelectField, useLatest, useProblem, useRefresh, type Note } from '../../admin/ui.js'
@@ -7,7 +8,34 @@ import type { Key } from '../../i18n/index.js'
 import { useT } from '../../i18n/useT.js'
 
 const KINDS: NonNullable<AlertFilter['kind']>[] = ['fraud-warning', 'fraud-critical', 'limit', 'rights', 'emergency', 'meet', 'webhook', 'operator', 'voicemail']
-const PARAMS = [...FRAUD_PARAMS, ...OUTBOUND_CAPS, ...TRUNK_OUTBOUND_CLASSES, 'premium', 'burst', 'pin-tries', 'meet-calls', 'call-diverted', 'trunk-changed', 'disabled', 'unauthorized', 'forbidden', 'reconciliation', 'removal-changed', 'removal-gone', 'removal-late', 'sync-failing', 'flows-failing', 'sync-fenced', 'boxes-refused', 'hidden-calls', 'hidden-hour', 'hidden-all', 'calls-all', 'held-back', 'held-back-remove']
+const PARAMS = [
+  ...FRAUD_PARAMS,
+  ...OUTBOUND_CAPS,
+  ...TRUNK_OUTBOUND_CLASSES,
+  'premium',
+  'burst',
+  'pin-tries',
+  'meet-calls',
+  'call-diverted',
+  'trunk-changed',
+  'disabled',
+  'unauthorized',
+  'forbidden',
+  'reconciliation',
+  'removal-changed',
+  'removal-gone',
+  'removal-late',
+  'sync-failing',
+  'flows-failing',
+  'sync-fenced',
+  'boxes-refused',
+  'hidden-calls',
+  'hidden-hour',
+  'hidden-all',
+  'calls-all',
+  'held-back',
+  'held-back-remove'
+]
 const PAGE = 25
 /** How long after an answer the first page is read again while shown: a repeat counted meanwhile is seen (review 7 n°2). */
 export const ALERTS_REFRESH_MS = 30_000
@@ -80,7 +108,11 @@ export const Alerts = () => {
   const { t, lang } = useT()
   const say = useProblem()
   const { client } = useGateway()
-  const [filter, setFilter] = useState<{ kind: string; param: string; state: string }>(INITIAL)
+  const [filter, setFilter] = useState<{
+    kind: string
+    param: string
+    state: string
+  }>(INITIAL)
   const [shown, setShown] = useState(filter)
   const [items, setItems] = useState<AdminAlert[] | null>(null)
   const [next, setNext] = useState<string | undefined>()
@@ -130,7 +162,11 @@ export const Alerts = () => {
           setExtended(false)
         },
         (err: unknown) => {
-          if (mine === reads.current) setNote({ kind: 'error', text: words.current(refusalOf(err, () => undefined).problem)! })
+          if (mine === reads.current)
+            setNote({
+              kind: 'error',
+              text: words.current(refusalOf(err, () => undefined).problem)!
+            })
         }
       )
     },
@@ -190,7 +226,11 @@ export const Alerts = () => {
           setFocusAt({ at: from })
         },
         (err: unknown) => {
-          if (mine === reads.current) setNote({ kind: 'error', text: say(refusalOf(err, () => undefined).problem)! })
+          if (mine === reads.current)
+            setNote({
+              kind: 'error',
+              text: say(refusalOf(err, () => undefined).problem)!
+            })
         }
       )
     )
@@ -215,11 +255,18 @@ export const Alerts = () => {
       // Gone: removed after its retention (or never this organisation's), not a platform that cannot.
       const gone = refusalStatus(err) === 404
       if (changed || gone) await read(shown)
-      setNote({ kind: 'error', text: gone ? t('admin.alert.gone') : say(refusalOf(err, () => undefined).problem)!, focus: true })
+      setNote({
+        kind: 'error',
+        text: gone ? t('admin.alert.gone') : say(refusalOf(err, () => undefined).problem)!,
+        focus: true
+      })
     }
   }
 
-  const when = new Intl.DateTimeFormat(lang === 'fr' ? 'fr-FR' : 'en-GB', { dateStyle: 'short', timeStyle: 'medium' })
+  const when = new Intl.DateTimeFormat(lang === 'fr' ? 'fr-FR' : 'en-GB', {
+    dateStyle: 'short',
+    timeStyle: 'medium'
+  })
   const who = (a: AdminAlert) => {
     if (!a.extension) return a.scope === 'tenant' ? t('admin.alert.tenant') : '—'
     const user = users.find(u => u.extension === a.extension)
@@ -242,72 +289,131 @@ export const Alerts = () => {
   const opt = (value: string, label: string) => ({ value, label })
   return (
     <Section id="alerts" title={t('admin.nav.alerts')}>
-      <p>{t('admin.alert.help')}</p>
-      <form onSubmit={apply} className="filters">
-        <SelectField id="alerts-state" label={t('admin.alert.state')} value={filter.state} onChange={v => setFilter(f => ({ ...f, state: v }))} options={[opt('open', t('admin.alert.stateOpen')), opt('acknowledged', t('admin.alert.stateAcknowledged')), opt(ALL, t('admin.alert.all'))]} />
-        <SelectField id="alerts-kind" label={t('admin.alert.kind')} value={filter.kind} onChange={v => setFilter(f => ({ ...f, kind: v }))} options={[opt(ALL, t('admin.alert.all')), ...KINDS.map(k => opt(k, t(`admin.alert.kind.${k}` as Key)))]} />
-        <SelectField id="alerts-param" label={t('admin.alert.param')} value={filter.param} onChange={v => setFilter(f => ({ ...f, param: v }))} options={[opt(ALL, t('admin.alert.all')), ...PARAMS.map(p => opt(p, t(paramKey({ kind: 'limit', param: p })!)))]} />
-        <div className="actions actions-start">
-          <button type="submit" className="btn" disabled={busy}>
+      <Typography component="p" gutterBottom>
+        {t('admin.alert.help')}
+      </Typography>
+      <form onSubmit={apply}>
+        <SelectField
+          id="alerts-state"
+          label={t('admin.alert.state')}
+          value={filter.state}
+          onChange={v => setFilter(f => ({ ...f, state: v }))}
+          options={[opt('open', t('admin.alert.stateOpen')), opt('acknowledged', t('admin.alert.stateAcknowledged')), opt(ALL, t('admin.alert.all'))]}
+        />
+        <SelectField
+          id="alerts-kind"
+          label={t('admin.alert.kind')}
+          value={filter.kind}
+          onChange={v => setFilter(f => ({ ...f, kind: v }))}
+          options={[opt(ALL, t('admin.alert.all')), ...KINDS.map(k => opt(k, t(`admin.alert.kind.${k}` as Key)))]}
+        />
+        <SelectField
+          id="alerts-param"
+          label={t('admin.alert.param')}
+          value={filter.param}
+          onChange={v => setFilter(f => ({ ...f, param: v }))}
+          options={[opt(ALL, t('admin.alert.all')), ...PARAMS.map(p => opt(p, t(paramKey({ kind: 'limit', param: p })!)))]}
+        />
+        <Stack direction="row" spacing={1} useFlexGap className="u-flex-wrap">
+          <Button type="submit" variant="outlined" disabled={busy}>
             {t('admin.alert.filter')}
-          </button>
-        </div>
+          </Button>
+        </Stack>
       </form>
       {items === null ? null : items.length ? (
-        <div className="table-scroll" role="region" tabIndex={0} aria-label={t('admin.alert.list')} ref={list}>
-          <table className="admin-table">
-            <caption className="sr-only">{t('admin.alert.list')}</caption>
-            <thead>
-              <tr>
-                <th scope="col">{t('admin.alert.when')}</th>
-                <th scope="col">{t('admin.alert.kind')}</th>
-                <th scope="col">{t('admin.alert.param')}</th>
-                <th scope="col">{t('admin.alert.who')}</th>
-                <th scope="col">{t('admin.alert.number')}</th>
-                <th scope="col">{t('admin.alert.count')}</th>
-                <th scope="col">{t('admin.alert.state')}</th>
-              </tr>
-            </thead>
-            <tbody>
+        <TableContainer role="region" tabIndex={0} aria-label={t('admin.alert.list')} ref={list}>
+          <Table size="small">
+            <caption className="u-visuallyhidden">{t('admin.alert.list')}</caption>
+            <TableHead>
+              <TableRow>
+                <TableCell component="th" scope="col">
+                  {t('admin.alert.when')}
+                </TableCell>
+                <TableCell component="th" scope="col">
+                  {t('admin.alert.kind')}
+                </TableCell>
+                <TableCell component="th" scope="col">
+                  {t('admin.alert.param')}
+                </TableCell>
+                <TableCell component="th" scope="col">
+                  {t('admin.alert.who')}
+                </TableCell>
+                <TableCell component="th" scope="col">
+                  {t('admin.alert.number')}
+                </TableCell>
+                <TableCell component="th" scope="col">
+                  {t('admin.alert.count')}
+                </TableCell>
+                <TableCell component="th" scope="col">
+                  {t('admin.alert.state')}
+                </TableCell>
+              </TableRow>
+            </TableHead>
+            <TableBody>
               {items.map((a, i) => (
-                <tr key={a.id} ref={i === focusAt?.at ? firstNew : undefined} tabIndex={i === focusAt?.at ? -1 : undefined}>
-                  <td>
+                <TableRow key={a.id} ref={i === focusAt?.at ? firstNew : undefined} tabIndex={i === focusAt?.at ? -1 : undefined}>
+                  <TableCell>
                     <time dateTime={a.lastAt}>{when.format(new Date(a.lastAt))}</time>
-                  </td>
-                  <td>
-                    <span className={`state state-${a.kind}`}>{t(`admin.alert.kind.${a.kind}` as Key)}</span>
-                  </td>
-                  <td>{cause(a)}</td>
-                  <td>{who(a)}</td>
-                  <td>{a.number ?? '—'}</td>
-                  <td>{a.count > 1 ? t('admin.alert.repeated', { count: a.count, first: when.format(new Date(a.at)) }) : '1'}</td>
-                  <td>
+                  </TableCell>
+                  <TableCell>
+                    <Chip
+                      size="small"
+                      variant="outlined"
+                      color={a.kind === 'fraud-critical' ? 'error' : a.kind === 'fraud-warning' ? 'warning' : 'default'}
+                      label={t(`admin.alert.kind.${a.kind}` as Key)}
+                    />
+                  </TableCell>
+                  <TableCell>{cause(a)}</TableCell>
+                  <TableCell>{who(a)}</TableCell>
+                  <TableCell>{a.number ?? '—'}</TableCell>
+                  <TableCell>
+                    {a.count > 1
+                      ? t('admin.alert.repeated', {
+                          count: a.count,
+                          first: when.format(new Date(a.at))
+                        })
+                      : '1'}
+                  </TableCell>
+                  <TableCell>
                     {a.acknowledgedAt ? (
-                      t('admin.alert.acknowledgedBy', { date: when.format(new Date(a.acknowledgedAt)), by: byName(a.acknowledgedBy) })
+                      t('admin.alert.acknowledgedBy', {
+                        date: when.format(new Date(a.acknowledgedAt)),
+                        by: byName(a.acknowledgedBy)
+                      })
                     ) : (
-                      <button type="button" className="btn" onClick={() => void acknowledge(a)} disabled={busy} aria-label={t('admin.alert.acknowledgeOf', { cause: cause(a), when: when.format(new Date(a.lastAt)) })}>
+                      <Button
+                        variant="outlined"
+                        onClick={() => void acknowledge(a)}
+                        disabled={busy}
+                        aria-label={t('admin.alert.acknowledgeOf', {
+                          cause: cause(a),
+                          when: when.format(new Date(a.lastAt))
+                        })}
+                      >
                         {t('admin.alert.acknowledge')}
-                      </button>
+                      </Button>
                     )}
-                  </td>
-                </tr>
+                  </TableCell>
+                </TableRow>
               ))}
-            </tbody>
-          </table>
-        </div>
+            </TableBody>
+          </Table>
+        </TableContainer>
       ) : (
-        <p className="muted">{t('admin.alert.none')}</p>
+        <Typography component="p" variant="body2" color="textSecondary">
+          {t('admin.alert.none')}
+        </Typography>
       )}
-      <p className="actions actions-start">
+      <Stack direction="row" spacing={1} useFlexGap className="u-flex-wrap u-mb-1">
         {next ? (
-          <button type="button" className="btn" onClick={more} disabled={busy}>
+          <Button variant="outlined" onClick={more} disabled={busy}>
             {t('admin.alert.more')}
-          </button>
+          </Button>
         ) : null}
-        <button type="button" className="btn" onClick={refresh} disabled={busy}>
+        <Button variant="outlined" onClick={refresh} disabled={busy}>
           {t('admin.alert.refresh')}
-        </button>
-      </p>
+        </Button>
+      </Stack>
       <CheckBox id="alerts-auto" label={t('admin.alert.auto', { seconds: ALERTS_REFRESH_MS / 1000 })} hint={t('admin.alert.autoHint')} checked={auto} onChange={setAuto} />
       <NoteLine note={note} />
     </Section>

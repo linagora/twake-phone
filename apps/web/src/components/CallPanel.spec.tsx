@@ -269,7 +269,7 @@ describe('CallPanel, a conference (step 8b): who comes in or leaves is told in t
     // Confirmed: the question goes, the focus is the conference's title again, the add button works.
     await renderWaiting(false)
     expect(host.querySelector('[data-testid="conference-confirm"]')).toBeNull()
-    expect(document.activeElement === host.querySelector('.call-title') || document.activeElement === document.body).toBe(true)
+    expect(document.activeElement === host.querySelector('[data-testid="call-title"]') || document.activeElement === document.body).toBe(true)
     expect(button('call.addParticipant').disabled).toBe(false)
   })
 
@@ -313,7 +313,7 @@ describe('CallPanel, a conference (step 8b): who comes in or leaves is told in t
     expect(tab.opener).toBeNull()
     expect(tab.location.href).toBe('https://meet.example/abc-defg-hij')
     // Running: said, nothing asked, the buttons off with the reason; read again every 2 s.
-    expect(host.querySelector('[role="status"].badge')?.textContent).toBe('conference.visioRunning')
+    expect(host.querySelector('[data-testid="visio-running"]')?.textContent).toBe('conference.visioRunning')
     expect(button('conference.visio')!.disabled).toBe(true)
     expect(button('call.addParticipant')!.disabled).toBe(true)
     expect(host.textContent).toContain('conference.visioGoing')

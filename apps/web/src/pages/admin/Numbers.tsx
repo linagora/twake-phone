@@ -1,3 +1,4 @@
+import { Alert, Button, FormControl, FormControlLabel, FormLabel, List, ListItem, Radio, RadioGroup, Stack, Typography } from '@linagora/twake-mui'
 import { useCallback, useEffect, useState, type FormEvent } from 'react'
 import type { DidRange, Trunk } from '@twake/telephony-client'
 import { TargetList } from '../../admin/TargetList.js'
@@ -44,7 +45,10 @@ export const Numbers = () => {
   }, [client, t])
   useEffect(load, [load])
 
-  const set = <K extends keyof DidForm>(key: K) => (value: DidForm[K]) => setForm(f => ({ ...f, [key]: value }))
+  const set =
+    <K extends keyof DidForm>(key: K) =>
+    (value: DidForm[K]) =>
+      setForm(f => ({ ...f, [key]: value }))
   const reset = () => {
     setEditing(null)
     setForm(emptyDid(trunks[0]?.id ?? ''))
@@ -54,7 +58,11 @@ export const Numbers = () => {
   const save = async (e: FormEvent) => {
     e.preventDefault()
     setNote(null)
-    const checked = checkDid(form, { isNew: !editing, trunks, others: dids ?? [] })
+    const checked = checkDid(form, {
+      isNew: !editing,
+      trunks,
+      others: dids ?? []
+    })
     setProblems(checked.problems)
     if (!checked.range) {
       focusLater(DID_FIELDS, checked.problems, 'did')
@@ -95,10 +103,18 @@ export const Numbers = () => {
     try {
       await client.deleteDid(range.id)
       // The row goes, its buttons with it: the focus goes to what is said.
-      setNote({ kind: 'ok', text: t('admin.did.deleted', { id: range.id }), focus: true })
+      setNote({
+        kind: 'ok',
+        text: t('admin.did.deleted', { id: range.id }),
+        focus: true
+      })
       if (editing?.id === range.id) reset()
     } catch (err) {
-      setNote({ kind: 'error', text: say(didRefusal(err).problem)!, focus: true })
+      setNote({
+        kind: 'error',
+        text: say(didRefusal(err).problem)!,
+        focus: true
+      })
     } finally {
       setBusy(false)
       load()
@@ -108,7 +124,7 @@ export const Numbers = () => {
   if (unavailable)
     return (
       <Section id="numbers" title={t('admin.nav.numbers')}>
-        <p className="alert">{t('admin.trunk.unavailable')}</p>
+        <Alert severity="info" role="status">{t('admin.trunk.unavailable')}</Alert>
       </Section>
     )
 
@@ -122,82 +138,176 @@ export const Numbers = () => {
   return (
     <>
       <Section id="numbers" title={t('admin.nav.numbers')}>
-        <p>{t('admin.did.help')}</p>
+        <Typography component="p" gutterBottom>
+          {t('admin.did.help')}
+        </Typography>
         {dids === null ? null : dids.length ? (
-          <ul className="list admin-list" aria-label={t('admin.did.list')}>
+          <List aria-label={t('admin.did.list')}>
             {dids.map(range => (
-              <li key={range.id}>
-                <div>
-                  <h3>{numbers(range)}</h3>
-                  <dl className="facts facts-compact">
-                    <div>
-                      <dt>{t('admin.did.id')}</dt>
-                      <dd>{range.id}</dd>
-                    </div>
-                    <div>
-                      <dt>{t('admin.did.trunkId')}</dt>
-                      <dd>{trunkName(range.trunkId)}</dd>
-                    </div>
-                    <div>
-                      <dt>{t('admin.did.rings')}</dt>
-                      <dd>{range.suffixDigits ? t('admin.did.ringsSuffix', { digits: range.suffixDigits }) : targetLabel(targets, range.target ?? '')}</dd>
-                    </div>
+              <ListItem key={range.id} divider>
+                <div className="u-flex-grow-1">
+                  <Typography variant="h6" component="h3">
+                    {numbers(range)}
+                  </Typography>
+                  <Typography component="dl" className="u-m-0">
+                    <Stack direction="row" spacing={1} useFlexGap>
+                      <Typography component="dt" color="textSecondary">
+                        {t('admin.did.id')}
+                      </Typography>
+                      <Typography component="dd" className="u-m-0">
+                        {range.id}
+                      </Typography>
+                    </Stack>
+                    <Stack direction="row" spacing={1} useFlexGap>
+                      <Typography component="dt" color="textSecondary">
+                        {t('admin.did.trunkId')}
+                      </Typography>
+                      <Typography component="dd" className="u-m-0">
+                        {trunkName(range.trunkId)}
+                      </Typography>
+                    </Stack>
+                    <Stack direction="row" spacing={1} useFlexGap>
+                      <Typography component="dt" color="textSecondary">
+                        {t('admin.did.rings')}
+                      </Typography>
+                      <Typography component="dd" className="u-m-0">
+                        {range.suffixDigits
+                          ? t('admin.did.ringsSuffix', {
+                              digits: range.suffixDigits
+                            })
+                          : targetLabel(targets, range.target ?? '')}
+                      </Typography>
+                    </Stack>
                     {range.fallbackTarget ? (
-                      <div>
-                        <dt>{t('admin.did.fallbackTarget')}</dt>
-                        <dd>{targetLabel(targets, range.fallbackTarget)}</dd>
-                      </div>
+                      <Stack direction="row" spacing={1} useFlexGap>
+                        <Typography component="dt" color="textSecondary">
+                          {t('admin.did.fallbackTarget')}
+                        </Typography>
+                        <Typography component="dd" className="u-m-0">
+                          {targetLabel(targets, range.fallbackTarget)}
+                        </Typography>
+                      </Stack>
                     ) : null}
-                  </dl>
+                  </Typography>
                 </div>
-                <div className="actions actions-end">
-                  <button type="button" className="btn" onClick={() => edit(range)} disabled={busy} aria-label={t('admin.did.edit', { id: range.id })}>
+                <Stack direction="row" spacing={1} useFlexGap className="u-flex-wrap">
+                  <Button variant="outlined" onClick={() => edit(range)} disabled={busy} aria-label={t('admin.did.edit', { id: range.id })}>
                     {t('admin.edit')}
-                  </button>
+                  </Button>
                   <ConfirmDelete label={t('admin.did.delete', { id: range.id })} question={t('admin.did.deleteConfirm', { id: range.id })} onConfirm={() => void remove(range)} disabled={busy} />
-                </div>
-              </li>
+                </Stack>
+              </ListItem>
             ))}
-          </ul>
+          </List>
         ) : (
-          <p className="muted">{t('admin.did.none')}</p>
+          <Typography component="p" variant="body2" color="textSecondary">
+            {t('admin.did.none')}
+          </Typography>
         )}
       </Section>
       <Section id="did-form" title={editing ? t('admin.did.edit', { id: editing.id }) : t('admin.did.new')}>
         {dids !== null && !trunks.length ? (
-          <p className="alert">{t('admin.did.noTrunk')}</p>
+          <Alert severity="info" role="status">{t('admin.did.noTrunk')}</Alert>
         ) : (
           <form onSubmit={e => void save(e)} noValidate aria-labelledby="did-form">
             <ProblemSummary count={count} />
             <TextField id="did-id" label={t('admin.did.id')} hint={t('admin.slugHint')} value={form.id} onChange={set('id')} error={field('id')} required disabled={busy || !!editing} maxLength={32} />
-            <SelectField id="did-trunkId" label={t('admin.did.trunkId')} value={form.trunkId} onChange={set('trunkId')} options={trunks.map(x => ({ value: x.id, label: trunkName(x.id) }))} error={field('trunkId')} disabled={busy} />
-            <TextField id="did-first" label={t('admin.did.first')} hint={t('admin.did.firstHint')} type="tel" inputMode="tel" value={form.first} onChange={set('first')} error={field('first')} required disabled={busy} maxLength={24} />
-            <TextField id="did-last" label={t('admin.did.last')} hint={t('admin.did.lastHint')} type="tel" inputMode="tel" value={form.last} onChange={set('last')} error={field('last')} disabled={busy} maxLength={24} />
-            <fieldset className="field">
-              <legend>{t('admin.did.rings')}</legend>
-              {(['target', 'suffix'] as const).map(m => (
-                <label key={m} className="check">
-                  <input type="radio" name="did-mode" value={m} checked={form.mode === m} onChange={() => set('mode')(m)} disabled={busy} /> {t(m === 'target' ? 'admin.did.modeTarget' : 'admin.did.modeSuffix')}
-                </label>
-              ))}
-            </fieldset>
+            <SelectField
+              id="did-trunkId"
+              label={t('admin.did.trunkId')}
+              value={form.trunkId}
+              onChange={set('trunkId')}
+              options={trunks.map(x => ({
+                value: x.id,
+                label: trunkName(x.id)
+              }))}
+              error={field('trunkId')}
+              disabled={busy}
+            />
+            <TextField
+              id="did-first"
+              label={t('admin.did.first')}
+              hint={t('admin.did.firstHint')}
+              type="tel"
+              inputMode="tel"
+              value={form.first}
+              onChange={set('first')}
+              error={field('first')}
+              required
+              disabled={busy}
+              maxLength={24}
+            />
+            <TextField
+              id="did-last"
+              label={t('admin.did.last')}
+              hint={t('admin.did.lastHint')}
+              type="tel"
+              inputMode="tel"
+              value={form.last}
+              onChange={set('last')}
+              error={field('last')}
+              disabled={busy}
+              maxLength={24}
+            />
+            <FormControl component="fieldset" className="u-mb-1">
+              <FormLabel component="legend">{t('admin.did.rings')}</FormLabel>
+              <RadioGroup row name="did-mode" value={form.mode} onChange={(_, v) => set('mode')(v as DidForm['mode'])}>
+                {(['target', 'suffix'] as const).map(m => (
+                  <FormControlLabel key={m} value={m} control={<Radio disabled={busy} />} label={t(m === 'target' ? 'admin.did.modeTarget' : 'admin.did.modeSuffix')} />
+                ))}
+              </RadioGroup>
+            </FormControl>
             {form.mode === 'target' ? (
-              <TextField id="did-target" label={t('admin.did.target')} hint={t('admin.did.targetHint')} inputMode="numeric" value={form.target} onChange={set('target')} error={field('target')} required disabled={busy} maxLength={6} list="did-targets" />
+              <TextField
+                id="did-target"
+                label={t('admin.did.target')}
+                hint={t('admin.did.targetHint')}
+                inputMode="numeric"
+                value={form.target}
+                onChange={set('target')}
+                error={field('target')}
+                required
+                disabled={busy}
+                maxLength={6}
+                list="did-targets"
+              />
             ) : (
-              <TextField id="did-suffixDigits" label={t('admin.did.suffixDigits')} hint={t('admin.did.suffixDigitsHint')} inputMode="numeric" value={form.suffixDigits} onChange={set('suffixDigits')} error={field('suffixDigits')} required disabled={busy} maxLength={1} />
+              <TextField
+                id="did-suffixDigits"
+                label={t('admin.did.suffixDigits')}
+                hint={t('admin.did.suffixDigitsHint')}
+                inputMode="numeric"
+                value={form.suffixDigits}
+                onChange={set('suffixDigits')}
+                error={field('suffixDigits')}
+                required
+                disabled={busy}
+                maxLength={1}
+              />
             )}
-            <TextField id="did-fallbackTarget" label={t('admin.did.fallbackTarget')} hint={t('admin.did.fallbackTargetHint')} inputMode="numeric" value={form.fallbackTarget} onChange={set('fallbackTarget')} error={field('fallbackTarget')} disabled={busy} maxLength={6} list="did-targets" />
+            <TextField
+              id="did-fallbackTarget"
+              label={t('admin.did.fallbackTarget')}
+              hint={t('admin.did.fallbackTargetHint')}
+              inputMode="numeric"
+              value={form.fallbackTarget}
+              onChange={set('fallbackTarget')}
+              error={field('fallbackTarget')}
+              disabled={busy}
+              maxLength={6}
+              list="did-targets"
+            />
             <TargetList id="did-targets" targets={targets} />
-            <div className="actions actions-start">
-              <button type="submit" className="btn btn-primary" disabled={busy} aria-busy={busy}>
+            <Stack direction="row" spacing={1} useFlexGap className="u-flex-wrap">
+              <Button type="submit" disabled={busy} aria-busy={busy}>
                 {t('admin.did.save')}
-              </button>
+              </Button>
               {editing ? (
-                <button type="button" className="btn" onClick={reset} disabled={busy}>
+                <Button variant="outlined" onClick={reset} disabled={busy}>
                   {t('admin.cancel')}
-                </button>
+                </Button>
               ) : null}
-            </div>
+            </Stack>
           </form>
         )}
         <NoteLine note={note} />

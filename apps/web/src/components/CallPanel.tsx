@@ -1,4 +1,6 @@
-import { useEffect, useLayoutEffect, useRef, useState, type ReactNode, type SyntheticEvent } from 'react'
+import { Exchange, Grid as GridIcon, PersonAdd, Telephone } from '@linagora/twake-icons'
+import { Alert, Avatar, Button, Card, CardContent, Fab, Grid, List, ListItem, Stack, SvgIcon, TextField, Typography, getInitials, type FabProps } from '@linagora/twake-mui'
+import { useEffect, useLayoutEffect, useRef, useState, type ReactNode, type Ref, type SyntheticEvent } from 'react'
 import type { SoftCall } from '@twake/softphone'
 import { formatNumber, toDialTarget, type CallVisio } from '@twake/telephony-client'
 import type { ConferenceParticipant } from '@twake/telephony-types'
@@ -7,6 +9,8 @@ import type { Key } from '../i18n/index.js'
 import { useT } from '../i18n/useT.js'
 import { usePhone } from '../softphone.js'
 import { describeCallError, describeConferenceError } from './callErrors.js'
+import { CallEndIcon, MicIcon, MicOffIcon, PauseIcon } from '../ds/MediaIcons/MediaIcons.js'
+import { Appear } from '../ds/Appear/Appear.js'
 
 const TONES = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '*', '0', '#']
 
@@ -60,6 +64,40 @@ const reasonKey = (call: SoftCall): Key => {
   return REASON_KEY[call.endReason ?? 'hangup']
 }
 
+const Badge = ({ children, ...props }: { children: ReactNode; id?: string; role?: string; 'data-testid'?: string }) => (
+  <Typography component="p" variant="body2" color="textSecondary" {...props}>
+    {children}
+  </Typography>
+)
+
+const Actions = ({ children }: { children: ReactNode }) => (
+  <Stack direction="row" spacing={1} useFlexGap className="u-flex-wrap u-mb-1">
+    {children}
+  </Stack>
+)
+
+/** The far end's initials, or a phone when only a number is known. */
+const CallAvatar = ({ call }: { call: SoftCall }) => (
+  <Avatar size="xl" aria-hidden="true">
+    {call.remoteName && call.remoteName.toLowerCase() !== 'anonymous' ? getInitials(call.remoteName, '') : <SvgIcon component={Telephone} inheritViewBox />}
+  </Avatar>
+)
+
+/**
+ * A round button with its word under it, as on a phone's call screen. The word is the button's name (aria-label); a
+ * toggle says its state with aria-pressed and is filled while on.
+ */
+const RoundAction = ({ label, icon, pressed, color, buttonRef, ...props }: Omit<FabProps, 'children' | 'color' | 'ref'> & { label: string; icon: ReactNode; pressed?: boolean; color?: FabProps['color']; buttonRef?: Ref<HTMLButtonElement> }) => (
+  <Stack spacing={0.5} className="u-flex-items-center">
+    <Fab type="button" ref={buttonRef} color={color ?? (pressed ? 'primary' : 'default')} aria-label={label} {...(pressed === undefined ? {} : { 'aria-pressed': pressed })} {...props}>
+      {icon}
+    </Fab>
+    <Typography variant="caption" aria-hidden="true">
+      {label}
+    </Typography>
+  </Stack>
+)
+
 /** Elapsed time of a connected call, as m:ss, refreshed every second; outside any live region, so never read aloud each second. */
 const Timer = ({ since }: { since: Date }) => {
   const [now, setNow] = useState(() => Date.now())
@@ -69,9 +107,9 @@ const Timer = ({ since }: { since: Date }) => {
   }, [])
   const s = Math.max(0, Math.floor((now - since.getTime()) / 1000))
   return (
-    <span className="timer">
+    <Typography variant="body2" color="textSecondary" component="span">
       {Math.floor(s / 60)}:{String(s % 60).padStart(2, '0')}
-    </span>
+    </Typography>
   )
 }
 
@@ -93,26 +131,28 @@ const Incoming = ({ call }: { call: SoftCall }) => {
       }
     })()
   }
-  // A live region, not a dialog: nothing traps the focus, the person keeps typing where they were.
+  // A live region, not a dialog (roast of #40): nothing traps the focus, the person keeps typing where they were, and
+  // the call in progress keeps its controls while a second one rings.
   return (
-    <section className="call call-incoming" role="region" aria-labelledby={`call-${call.id}`} aria-live="assertive" data-testid="incoming-call">
-      <p id={`call-${call.id}`} className="call-title">
-        {t('call.incoming', { who: who(call, t) })}
-      </p>
-      <div className="actions">
-        <button type="button" className="btn btn-primary" onClick={act(() => call.answer())} disabled={busy}>
-          {t('call.answer')}
-        </button>
-        <button type="button" className="btn btn-danger" onClick={act(() => call.reject())} disabled={busy}>
-          {t('call.reject')}
-        </button>
-      </div>
-      {error ? (
-        <p className="alert alert-error" role="alert">
-          {error}
-        </p>
-      ) : null}
-    </section>
+    <Card component="section" variant="outlined" className="u-mb-1" aria-labelledby={`call-${call.id}`} aria-live="assertive" data-testid="incoming-call">
+      <CardContent>
+        <Stack spacing={2} className="u-flex-items-center u-ta-center u-pv-1">
+          <CallAvatar call={call} />
+          <Typography id={`call-${call.id}`} variant="h6" component="h2">
+            {t('call.incoming', { who: who(call, t) })}
+          </Typography>
+          <Stack direction="row" spacing={8} className="u-flex-justify-center">
+            <RoundAction label={t('call.reject')} icon={<CallEndIcon />} color="error" onClick={act(() => call.reject())} disabled={busy} />
+            <RoundAction label={t('call.answer')} icon={<SvgIcon component={Telephone} inheritViewBox />} color="success" onClick={act(() => call.answer())} disabled={busy} />
+          </Stack>
+          {error ? (
+            <Alert severity="error" role="alert">
+              {error}
+            </Alert>
+          ) : null}
+        </Stack>
+      </CardContent>
+    </Card>
   )
 }
 
@@ -137,19 +177,16 @@ const AddParticipantForm = ({ id, run, onClose, onError, making }: { id: string;
     run(dialable).catch((err: unknown) => onError(describeConferenceError(err, t, { making, who: formatNumber(dialable) })))
   }
   return (
-    <form id={id} className="transfer" onSubmit={submit} data-testid="add-participant-form">
-      <div className="field">
-        <label htmlFor={`${id}-target`}>{t('call.addParticipantTarget')}</label>
-        <input id={`${id}-target`} type="tel" inputMode="tel" autoComplete="off" value={target} onChange={e => setTarget(e.target.value)} />
-      </div>
-      <div className="actions">
-        <button type="submit" className="btn btn-primary" disabled={!dialable}>
+    <form id={id} onSubmit={submit} data-testid="add-participant-form">
+      <TextField id={`${id}-target`} label={t('call.addParticipantTarget')} type="tel" fullWidth className="u-mb-1" slotProps={{ htmlInput: { inputMode: 'tel', autoComplete: 'off' } }} value={target} onChange={e => setTarget(e.target.value)} />
+      <Actions>
+        <Button type="submit" disabled={!dialable}>
           {t('call.addParticipantSubmit')}
-        </button>
-        <button type="button" className="btn" onClick={onClose}>
+        </Button>
+        <Button type="button" variant="outlined" onClick={onClose}>
           {t('call.addParticipantClose')}
-        </button>
-      </div>
+        </Button>
+      </Actions>
     </form>
   )
 }
@@ -290,42 +327,42 @@ const Participants = ({ meetingId, manage, call, parties = [], onError, onNotice
       }
     })()
   }
-  if (!people) return <p className="badge">{t('conference.loading')}</p>
+  if (!people) return <Typography component="p" variant="body2" color="textSecondary">{t('conference.loading')}</Typography>
   const marked = people.some(p => p.you)
   return (
-    <ul ref={list} tabIndex={-1} className="list participants" aria-label={t('conference.participants')} data-testid="conference-participants">
+    <List ref={list} tabIndex={-1} aria-label={t('conference.participants')} data-testid="conference-participants">
       {people.map(p => {
         const label = participantLabel(p)
         // Ours as the Gateway marks it; by the number only when it marks none (another leg of the same extension is not us).
         const self = marked ? !!p.you : !!me?.extension && p.number === me.extension
         return (
-          <li key={p.id} data-testid="conference-participant">
-            <span>
+          <ListItem key={p.id} divider data-testid="conference-participant">
+            <span className="u-flex-grow-1">
               {label}
               {self ? ` ${t('conference.you')}` : ''}
               {p.muted ? (
                 <>
                   {' '}
-                  <span className="badge">{t('conference.muted')}</span>
+                  <Typography variant="body2" color="textSecondary" component="span">{t('conference.muted')}</Typography>
                 </>
               ) : null}
             </span>
             {manage && !self ? (
-              <span className="actions">
+              <Actions>
                 {!p.muted ? (
-                  <button type="button" className="btn" aria-label={t('conference.muteWho', { who: label })} onClick={act(() => client.muteParticipant(meetingId, p.id))}>
+                  <Button type="button" variant="outlined" aria-label={t('conference.muteWho', { who: label })} onClick={act(() => client.muteParticipant(meetingId, p.id))}>
                     {t('conference.mute')}
-                  </button>
+                  </Button>
                 ) : null}
-                <button type="button" className="btn" aria-label={t('conference.removeWho', { who: label })} onClick={act(() => client.removeParticipant(meetingId, p.id))}>
+                <Button type="button" variant="outlined" aria-label={t('conference.removeWho', { who: label })} onClick={act(() => client.removeParticipant(meetingId, p.id))}>
                   {t('conference.remove')}
-                </button>
-              </span>
+                </Button>
+              </Actions>
             ) : null}
-          </li>
+          </ListItem>
         )
       })}
-    </ul>
+    </List>
   )
 }
 
@@ -337,12 +374,14 @@ const Confirm = ({ id, question, children, alert = false }: { id: string; questi
   const text = useRef<HTMLParagraphElement>(null)
   useEffect(() => text.current?.focus(), [])
   return (
-    <div className="confirm" role="group" aria-labelledby={id} data-testid="conference-confirm">
-      <p id={id} ref={text} tabIndex={-1} {...(alert ? { role: 'alert' } : {})}>
-        {question}
-      </p>
-      <div className="actions">{children}</div>
-    </div>
+    <Card variant="outlined" className="u-mb-1" role="group" aria-labelledby={id} data-testid="conference-confirm">
+      <CardContent>
+        <Typography id={id} ref={text} component="p" tabIndex={-1} className="u-mb-1" {...(alert ? { role: 'alert' } : {})}>
+          {question}
+        </Typography>
+        <Actions>{children}</Actions>
+      </CardContent>
+    </Card>
   )
 }
 
@@ -471,41 +510,42 @@ const ConferenceCall = ({ call, tones, onError, onNotice }: { call: SoftCall; to
     if (meetingId) await client.endCallConference(meetingId)
   })
   return (
-    <section className="call call-conference" aria-labelledby={`call-${call.id}`} data-testid="conference">
-      <p id={`call-${call.id}`} ref={title} tabIndex={-1} className="call-title">
+    <Card component="section" variant="outlined" className="u-mb-1" aria-labelledby={`call-${call.id}`} data-testid="conference">
+      <CardContent>
+      <Typography id={`call-${call.id}`} ref={title} component="p" tabIndex={-1} className="u-fw-bold u-mb-1" data-testid="call-title">
         {mine ? t('conference.title') : t('conference.titleWith', { who: who(call, t) })}
-      </p>
+      </Typography>
       {connected && call.connectedAt ? <Timer since={call.connectedAt} /> : null}
-      {mine && !meetingId ? <p className="badge">{t('conference.starting')}</p> : null}
+      {mine && !meetingId ? <Badge>{t('conference.starting')}</Badge> : null}
       {inviting.map(n => (
-        <p key={n} className="badge">
+        <Badge key={n}>
           {t('conference.inviting', { who: formatNumber(n) })}
-        </p>
+        </Badge>
       ))}
-      {tones ? <p className="badge">{t('call.tonesReceived', { tones })}</p> : null}
+      {tones ? <Badge>{t('call.tonesReceived', { tones })}</Badge> : null}
       {waitingFor ? (
         // The call with the operator is kept, quiet, until the person says they hear their correspondent in the room (step
         // 8c, ADR 0025): a mailbox of the operator may have answered the number called again. The number shown is the one called.
         <Confirm id={`wait-${call.id}`} alert question={t('conference.awaiting', { who: formatNumber(waitingFor) })}>
-          <button type="button" className="btn btn-primary" disabled={deciding} onClick={decide(() => phone.confirmConference(call.conferenceOf!))}>
+          <Button type="button" disabled={deciding} onClick={decide(() => phone.confirmConference(call.conferenceOf!))}>
             {t('conference.confirm')}
-          </button>
-          <button type="button" className="btn" disabled={deciding} onClick={decide(() => phone.cancelAwaiting(call.conferenceOf!))}>
+          </Button>
+          <Button type="button" variant="outlined" disabled={deciding} onClick={decide(() => phone.cancelAwaiting(call.conferenceOf!))}>
             {t('conference.giveUp')}
-          </button>
+          </Button>
         </Confirm>
       ) : null}
       {running ? (
-        <p role="status" className="badge">
+        <Badge role="status" data-testid="visio-running">
           {t('conference.visioRunning')}
-        </p>
+        </Badge>
       ) : null}
       {asksLeave ? (
         <Confirm id={`visio-${call.id}`} alert question={[visio.state === 'halted' ? t('conference.visioHalted') : '', called.length ? t('conference.visioAwaiting', { who: called.join(', ') }) : '', failed.length ? t('conference.visioFailed', { who: failed.join(', ') }) : ''].filter(Boolean).join(' ')}>
-          {stays.length ? <p className="badge">{t('conference.visioRemaining', { who: stays.join(', ') })}</p> : null}
-          <button
+          {stays.length ? <Badge>{t('conference.visioRemaining', { who: stays.join(', ') })}</Badge> : null}
+          <Button
             type="button"
-            className="btn btn-primary"
+           
             disabled={deciding}
             onClick={decide(async () => {
               const left = await client.leaveVisio(meetingId!)
@@ -514,65 +554,66 @@ const ConferenceCall = ({ call, tones, onError, onNotice }: { call: SoftCall; to
             })}
           >
             {t('conference.visioLeave')}
-          </button>
+          </Button>
         </Confirm>
       ) : null}
       {meetingId ? <Participants key={meetingId} meetingId={meetingId} manage={mine} {...(call.sipCallId ? { call: call.sipCallId } : {})} {...(began ? { parties: began } : {})} onError={onError} onNotice={onNotice} /> : null}
-      <div className="actions">
+      <Actions>
         {connected ? (
-          <button type="button" className="btn" aria-pressed={call.muted} onClick={guard(() => call.setMuted(!call.muted))}>
+          <Button type="button" variant={call.muted ? 'contained' : 'outlined'} aria-pressed={call.muted} onClick={guard(() => call.setMuted(!call.muted))}>
             {call.muted ? t('call.unmute') : t('call.mute')}
-          </button>
+          </Button>
         ) : null}
         {mine && meetingId ? (
-          <button ref={addButton} type="button" className="btn" aria-pressed={adding} aria-controls={`add-${call.id}`} disabled={!!waitingFor || visioGoing} onClick={() => (adding ? closeAdd() : setAdding(true))}>
+          <Button ref={addButton} type="button" variant={adding ? 'contained' : 'outlined'} aria-pressed={adding} aria-controls={`add-${call.id}`} disabled={!!waitingFor || visioGoing} onClick={() => (adding ? closeAdd() : setAdding(true))}>
             {t('call.addParticipant')}
-          </button>
+          </Button>
         ) : null}
-        <button ref={leaveButton} type="button" className="btn btn-danger" aria-expanded={mine && meetingId ? asking === 'leave' : undefined} onClick={mine && meetingId ? () => setAsking('leave') : guard(() => call.hangup())}>
+        <Button ref={leaveButton} type="button" variant="outlined" color="error" aria-expanded={mine && meetingId ? asking === 'leave' : undefined} onClick={mine && meetingId ? () => setAsking('leave') : guard(() => call.hangup())}>
           {t('conference.leave')}
-        </button>
+        </Button>
         {mine && meetingId && visioOffered ? (
-          <button type="button" className="btn" disabled={!!waitingFor || openingVisio || visioGoing} aria-describedby={visioHelp ? `visio-help-${call.id}` : undefined} onClick={goVisio}>
+          <Button type="button" variant="outlined" disabled={!!waitingFor || openingVisio || visioGoing} aria-describedby={visioHelp ? `visio-help-${call.id}` : undefined} onClick={goVisio}>
             {t('conference.visio')}
-          </button>
+          </Button>
         ) : null}
         {mine && meetingId ? (
-          <button ref={endButton} type="button" className="btn btn-danger" aria-expanded={asking === 'end'} onClick={() => setAsking('end')}>
+          <Button ref={endButton} type="button" variant="outlined" color="error" aria-expanded={asking === 'end'} onClick={() => setAsking('end')}>
             {t('conference.end')}
-          </button>
+          </Button>
         ) : null}
-      </div>
+      </Actions>
       {visioHelp && visioOffered ? (
-        <p id={`visio-help-${call.id}`} className="badge">
+        <Badge id={`visio-help-${call.id}`}>
           {visioHelp}
-        </p>
+        </Badge>
       ) : null}
       {asking === 'leave' ? (
         <Confirm id={`ask-${call.id}`} question={t('conference.leaveConfirm')}>
-          <button type="button" className="btn btn-danger" onClick={endForAll}>
+          <Button type="button" variant="outlined" color="error" onClick={endForAll}>
             {t('conference.end')}
-          </button>
-          <button type="button" className="btn" onClick={guard(() => call.hangup())}>
+          </Button>
+          <Button type="button" variant="outlined" onClick={guard(() => call.hangup())}>
             {t('conference.leaveOnly')}
-          </button>
-          <button type="button" className="btn" onClick={closeAsk}>
+          </Button>
+          <Button type="button" variant="outlined" onClick={closeAsk}>
             {t('conference.cancel')}
-          </button>
+          </Button>
         </Confirm>
       ) : null}
       {asking === 'end' ? (
         <Confirm id={`ask-${call.id}`} question={t('conference.endConfirm')}>
-          <button type="button" className="btn btn-danger" onClick={endForAll}>
+          <Button type="button" variant="outlined" color="error" onClick={endForAll}>
             {t('conference.endConfirmYes')}
-          </button>
-          <button type="button" className="btn" onClick={closeAsk}>
+          </Button>
+          <Button type="button" variant="outlined" onClick={closeAsk}>
             {t('conference.cancel')}
-          </button>
+          </Button>
         </Confirm>
       ) : null}
       {adding && mine && meetingId ? <AddParticipantForm id={`add-${call.id}`} making={false} run={n => phone.inviteToConference(meetingId, n)} onClose={closeAdd} onError={onError} /> : null}
-    </section>
+      </CardContent>
+    </Card>
   )
 }
 
@@ -600,22 +641,19 @@ const TransferForm = ({ call, onClose, onError }: { call: SoftCall; onClose: () 
     })()
   }
   return (
-    <form id={`transfer-form-${call.id}`} className="transfer" onSubmit={run(to => call.transfer(to))} data-testid="transfer-form">
-      <div className="field">
-        <label htmlFor={`transfer-${call.id}`}>{t('call.transferTarget')}</label>
-        <input id={`transfer-${call.id}`} type="tel" inputMode="tel" autoComplete="off" value={target} onChange={e => setTarget(e.target.value)} disabled={busy} />
-      </div>
-      <div className="actions">
-        <button type="submit" className="btn btn-primary" disabled={busy || !dialable}>
+    <form id={`transfer-form-${call.id}`} onSubmit={run(to => call.transfer(to))} data-testid="transfer-form">
+      <TextField id={`transfer-${call.id}`} label={t('call.transferTarget')} type="tel" fullWidth className="u-mb-1" slotProps={{ htmlInput: { inputMode: 'tel', autoComplete: 'off' } }} value={target} onChange={e => setTarget(e.target.value)} disabled={busy} />
+      <Actions>
+        <Button type="submit" disabled={busy || !dialable}>
           {t('call.transferBlind')}
-        </button>
-        <button type="button" className="btn" disabled={busy || !dialable} onClick={run(to => phone.call(to))}>
+        </Button>
+        <Button type="button" variant="outlined" disabled={busy || !dialable} onClick={run(to => phone.call(to))}>
           {t('call.transferConsult')}
-        </button>
-        <button type="button" className="btn" disabled={busy} onClick={onClose}>
+        </Button>
+        <Button type="button" variant="outlined" disabled={busy} onClick={onClose}>
           {t('call.transferClose')}
-        </button>
-      </div>
+        </Button>
+      </Actions>
     </form>
   )
 }
@@ -674,76 +712,81 @@ const Active = ({ call, tones, original, hasOther, onError }: { call: SoftCall; 
   // takes over (Replaces); hanging it up first would make the transfer fail.
   const busy = call.renegotiating || call.transferring || call.conferencing || (original?.transferring ?? false)
   return (
-    <section className="call" aria-labelledby={`call-${call.id}`} data-testid={original ? 'consultation' : undefined}>
-      <p id={`call-${call.id}`} className="call-title" role="status">
-        {title}
-      </p>
-      {connected && call.connectedAt ? <Timer since={call.connectedAt} /> : null}
-      {original ? <p className="badge">{t('call.consulting', { who: who(original, t) })}</p> : null}
-      {call.remoteHold ? <p className="badge">{t('call.remoteHold')}</p> : null}
-      {original?.transferring ? <p className="badge">{t('call.transferring')}</p> : null}
-      {tones ? <p className="badge">{t('call.tonesReceived', { tones })}</p> : null}
-      <div className="actions">
-        {original && originalReady && connected ? (
-          <button type="button" className="btn btn-primary" disabled={busy} onClick={guard(() => original.transferTo(call))}>
-            {t('call.transferComplete', { from: who(original, t), to: who(call, t) })}
-          </button>
-        ) : null}
-        {original ? (
-          // Hanging the consultation up is enough: the softphone takes the person on hold back by itself.
-          <button type="button" className="btn" disabled={busy} onClick={guard(() => call.hangup())}>
+    <Card component="section" variant="outlined" className="u-mb-1" aria-labelledby={`call-${call.id}`} data-testid={original ? 'consultation' : undefined}>
+      <CardContent>
+      <Stack spacing={1} className="u-flex-items-center u-ta-center u-mb-1">
+        <CallAvatar call={call} />
+        <Typography id={`call-${call.id}`} variant="h6" component="p" role="status">
+          {title}
+        </Typography>
+        {connected && call.connectedAt ? <Timer since={call.connectedAt} /> : null}
+        {original ? <Badge>{t('call.consulting', { who: who(original, t) })}</Badge> : null}
+        {call.remoteHold ? <Badge>{t('call.remoteHold')}</Badge> : null}
+        {original?.transferring ? <Badge>{t('call.transferring')}</Badge> : null}
+        {tones ? <Badge>{t('call.tonesReceived', { tones })}</Badge> : null}
+      </Stack>
+      {original ? (
+        <Stack direction="row" spacing={1} useFlexGap className="u-flex-wrap u-flex-justify-center u-mb-1">
+          {originalReady && connected ? (
+            <Button type="button" disabled={busy} onClick={guard(() => original.transferTo(call))}>
+              {t('call.transferComplete', { from: who(original, t), to: who(call, t) })}
+            </Button>
+          ) : null}
+          {/* Hanging the consultation up is enough: the softphone takes the person on hold back by itself. */}
+          <Button type="button" variant="outlined" disabled={busy} onClick={guard(() => call.hangup())}>
             {t('call.transferCancel')}
-          </button>
-        ) : null}
-        {connected ? (
-          <>
-            {/* With two calls, hold and resume belong to the consultation (automatic): no switching between the two. */}
-            {!room ? (
-              <button type="button" className="btn" aria-pressed={call.state === 'held'} disabled={busy || hasOther} onClick={guard(() => (call.state === 'held' ? call.resume() : call.hold()))}>
-                {call.state === 'held' ? t('call.resume') : t('call.hold')}
-              </button>
-            ) : null}
-            <button type="button" className="btn" aria-pressed={call.muted} onClick={guard(() => call.setMuted(!call.muted))}>
-              {call.muted ? t('call.unmute') : t('call.mute')}
-            </button>
-            <button type="button" className="btn" aria-pressed={keypad} aria-controls={`dtmf-${call.id}`} onClick={() => setKeypad(k => !k)}>
-              {t('call.keypad')}
-            </button>
-            {!hasOther && !room ? (
-              <button ref={transferButton} type="button" className="btn" aria-pressed={transfer} aria-controls={`transfer-form-${call.id}`} disabled={busy} onClick={() => (transfer ? closeTransfer() : setTransfer(true))}>
-                {t('call.transfer')}
-              </button>
-            ) : null}
-            {canAdd ? (
-              <button ref={addButton} type="button" className="btn" aria-pressed={adding} aria-controls={`add-${call.id}`} disabled={busy} onClick={() => (adding ? closeAdd() : setAdding(true))}>
-                {t('call.addParticipant')}
-              </button>
-            ) : null}
-          </>
-        ) : null}
-        {/* Hanging up during a transfer of this call is allowed: the far end goes on to its new call without us. */}
-        <button type="button" className="btn btn-danger" disabled={original?.transferring ?? false} onClick={guard(() => call.hangup())}>
-          {t('call.hangup')}
-        </button>
-      </div>
-      {transfer && connected && !hasOther && !room ? <TransferForm call={call} onClose={closeTransfer} onError={onError} /> : null}
-      {adding && connected && canAdd ? <AddParticipantForm id={`add-${call.id}`} making run={n => phone.addParticipant(call, n)} onClose={closeAdd} onError={onError} /> : null}
+          </Button>
+        </Stack>
+      ) : null}
+      {connected ? (
+        <Stack direction="row" spacing={4} useFlexGap className="u-flex-wrap u-flex-justify-center u-mb-1">
+          <RoundAction label={call.muted ? t('call.unmute') : t('call.mute')} icon={call.muted ? <MicOffIcon /> : <MicIcon />} pressed={call.muted} onClick={guard(() => call.setMuted(!call.muted))} />
+          <RoundAction label={t('call.keypad')} icon={<SvgIcon component={GridIcon} inheritViewBox />} pressed={keypad} aria-controls={`dtmf-${call.id}`} onClick={() => setKeypad(k => !k)} />
+          {/* With two calls, hold and resume belong to the consultation (automatic): no switching between the two. */}
+          {!room ? <RoundAction label={call.state === 'held' ? t('call.resume') : t('call.hold')} icon={<PauseIcon />} pressed={call.state === 'held'} disabled={busy || hasOther} onClick={guard(() => (call.state === 'held' ? call.resume() : call.hold()))} /> : null}
+          {!hasOther && !room ? <RoundAction buttonRef={transferButton} label={t('call.transfer')} icon={<SvgIcon component={Exchange} inheritViewBox />} pressed={transfer} aria-controls={`transfer-form-${call.id}`} disabled={busy} onClick={() => (transfer ? closeTransfer() : setTransfer(true))} /> : null}
+          {canAdd ? <RoundAction buttonRef={addButton} label={t('call.addParticipant')} icon={<SvgIcon component={PersonAdd} inheritViewBox />} pressed={adding} aria-controls={`add-${call.id}`} disabled={busy} onClick={() => (adding ? closeAdd() : setAdding(true))} /> : null}
+        </Stack>
+      ) : null}
+      {/* Hanging up during a transfer of this call is allowed: the far end goes on to its new call without us. */}
+      <Stack className="u-flex-items-center u-mb-1">
+        <RoundAction label={t('call.hangup')} icon={<CallEndIcon />} color="error" disabled={original?.transferring ?? false} onClick={guard(() => call.hangup())} />
+      </Stack>
+      {transfer && connected && !hasOther && !room ? (
+        <Appear>
+          <div>
+            <TransferForm call={call} onClose={closeTransfer} onError={onError} />
+          </div>
+        </Appear>
+      ) : null}
+      {adding && connected && canAdd ? (
+        <Appear>
+          <div>
+            <AddParticipantForm id={`add-${call.id}`} making run={n => phone.addParticipant(call, n)} onClose={closeAdd} onError={onError} />
+          </div>
+        </Appear>
+      ) : null}
       {keypad && connected ? (
-        <div id={`dtmf-${call.id}`} className="dtmf">
-          <div className="keypad" role="group" aria-label={t('call.keypad')}>
+        <Appear>
+        <div id={`dtmf-${call.id}`}>
+          <Grid container spacing={1} className="u-mb-1" role="group" aria-label={t('call.keypad')}>
             {TONES.map(k => (
-              <button key={k} type="button" className="btn key" onClick={guard(() => {
+              <Grid key={k} size={4}>
+              <Button type="button" variant="outlined" fullWidth onClick={guard(() => {
                 call.sendDtmf(k)
                 setSent(s => s + k)
               })} aria-label={t('call.sendTone', { tone: k })}>
                 {k}
-              </button>
+              </Button>
+              </Grid>
             ))}
-          </div>
-          {sent ? <p className="badge">{t('call.tonesSent', { tones: sent })}</p> : null}
+          </Grid>
+          {sent ? <Badge>{t('call.tonesSent', { tones: sent })}</Badge> : null}
         </div>
+        </Appear>
       ) : null}
-    </section>
+      </CardContent>
+    </Card>
   )
 }
 
@@ -751,6 +794,9 @@ const Active = ({ call, tones, original, hasOther, onError }: { call: SoftCall; 
  * Every call of the page, above the routed content: a ringing banner, the controls of the calls in progress, how
  * the last call ended (even when another goes on: a consultation that failed says so), and the last error.
  */
+/** How long a call takes to fade in (the theme's entering duration). */
+const ENTER_MS = 225
+
 export const CallPanel = () => {
   const { t } = useT()
   const { calls, lastEnded, tones } = usePhone()
@@ -768,25 +814,45 @@ export const CallPanel = () => {
   const shown = calls.filter(c => !moved.has(c.id))
   const ours = shown.filter(c => !ringing(c))
   return (
-    <div className="calls" data-testid="calls">
+    <div data-testid="calls">
       {shown.map(call => {
         if (ringing(call)) return <Incoming key={call.id} call={call} />
-        if (call.room === 'conference') return <ConferenceCall key={call.id} call={call} tones={tones[call.id] ?? ''} onError={setError} onNotice={text => setNotice(n => ({ callId: call.id, text, seq: (n?.seq ?? 0) + 1 }))} />
+        // A call shown fades in rather than pushing the page down at once (it goes at once: hanging up is immediate).
+        if (call.room === 'conference')
+          return (
+            <Appear key={call.id} ms={ENTER_MS}>
+              <div>
+                <ConferenceCall call={call} tones={tones[call.id] ?? ''} onError={setError} onNotice={text => setNotice(n => ({ callId: call.id, text, seq: (n?.seq ?? 0) + 1 }))} />
+              </div>
+            </Appear>
+          )
         const original = call.consultationOf ? ours.find(c => c.id === call.consultationOf) : undefined
-        return <Active key={call.id} call={call} tones={tones[call.id] ?? ''} hasOther={ours.length > 1} onError={setError} {...(original ? { original } : {})} />
+        return (
+          <Appear key={call.id} ms={ENTER_MS}>
+            <div>
+              <Active call={call} tones={tones[call.id] ?? ''} hasOther={ours.length > 1} onError={setError} {...(original ? { original } : {})} />
+            </div>
+          </Appear>
+        )
       })}
-      <div role="status" className="call-status" data-testid="call-status">
-        {lastEnded ? <p className="call call-ended">{t(reasonKey(lastEnded), { who: who(lastEnded, t), message: lastEnded.endMessage ?? '' })}</p> : null}
+      <div role="status" data-testid="call-status">
+        {lastEnded ? (
+          <Appear>
+            <Typography component="p" className="u-mb-1">
+              {t(reasonKey(lastEnded), { who: who(lastEnded, t), message: lastEnded.endMessage ?? '' })}
+            </Typography>
+          </Appear>
+        ) : null}
         {shownNotice ? (
-          <p key={shownNotice.seq} className="badge">
+          <Badge key={shownNotice.seq}>
             {shownNotice.text}
-          </p>
+          </Badge>
         ) : null}
       </div>
       {error && calls.length ? (
-        <p className="alert alert-error" role="alert">
+        <Alert severity="error" role="alert">
           {error}
-        </p>
+        </Alert>
       ) : null}
     </div>
   )

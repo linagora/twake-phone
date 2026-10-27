@@ -1,3 +1,4 @@
+import { Alert, Button, Card, CardContent, Chip, FormHelperText, List, ListItem, Stack, Table, TableBody, TableCell, TableContainer, TableHead, TableRow, TextField as MuiTextField, Typography } from '@linagora/twake-mui'
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react'
 import { WEBHOOK_EVENT_TYPES, type WebhookDelivery, type WebhookSubscription } from '@twake/telephony-client'
 import { CheckBox, CheckGroup, ConfirmDelete, FieldError, NoteLine, ProblemSummary, Section, TextField, useFocusLater, useLatest, useProblem, type Note } from '../../admin/ui.js'
@@ -10,7 +11,12 @@ const PAGE = 20
 const FAILURES = ['http', 'unreachable', 'timeout', 'connection', 'dns', 'tls', 'redirect', 'destination-refused', 'domain-not-allowed', 'secret-unreadable', 'disabled', 'backlog', 'abandoned']
 
 /** A secret just made: shown this once, for the subscription it signs. */
-type Secret = { subscription: string; url: string; value: string; previousUntil?: string } | null
+type Secret = {
+  subscription: string
+  url: string
+  value: string
+  previousUntil?: string
+} | null
 
 /**
  * The webhooks of the organisation (step 10a, ADR 0020): the domains they may be sent to, the subscriptions (an
@@ -85,7 +91,10 @@ export const Webhooks = () => {
       const saved = await client.setWebhookDomains(checked.domains)
       setDomains(saved.domains)
       setDomainsText(saved.domains.join('\n'))
-      setDomainsNote({ kind: 'ok', text: t('admin.webhooks.domainsSaved', { count: saved.domains.length }) })
+      setDomainsNote({
+        kind: 'ok',
+        text: t('admin.webhooks.domainsSaved', { count: saved.domains.length })
+      })
       // What can be delivered may have changed.
       client.listWebhooks().then(
         r => setItems(r.items),
@@ -144,7 +153,12 @@ export const Webhooks = () => {
     setNote(null)
     setProblems({})
     setEditing(w.id)
-    setForm({ url: w.url, events: w.events, description: w.description ?? '', enabled: w.enabled })
+    setForm({
+      url: w.url,
+      events: w.events,
+      description: w.description ?? '',
+      enabled: w.enabled
+    })
     setTimeout(() => document.getElementById('webhook-url')?.focus(), 0)
   }
 
@@ -156,7 +170,11 @@ export const Webhooks = () => {
       await run()
     } catch (err) {
       if (refusalStatus(err) === 404) load()
-      setNote({ kind: 'error', text: say(refusalOf(err, () => undefined).problem)!, focus: true })
+      setNote({
+        kind: 'error',
+        text: say(refusalOf(err, () => undefined).problem)!,
+        focus: true
+      })
     } finally {
       setBusy(false)
     }
@@ -164,26 +182,43 @@ export const Webhooks = () => {
   const test = (w: WebhookSubscription) =>
     act(async () => {
       await client.testWebhook(w.id)
-      setNote({ kind: 'ok', text: t('admin.webhooks.testSent', { url: w.url }), focus: true })
+      setNote({
+        kind: 'ok',
+        text: t('admin.webhooks.testSent', { url: w.url }),
+        focus: true
+      })
       if (logOf?.id === w.id) void readLog(w)
     })
   const renew = (w: WebhookSubscription, revoke = false) =>
     act(async () => {
       const r = await (revoke ? client.renewWebhookSecret(w.id, { revoke: true }) : client.renewWebhookSecret(w.id))
       setCopied(false)
-      setSecret({ subscription: w.id, url: w.url, value: r.secret, previousUntil: r.previousSecretUntil })
+      setSecret({
+        subscription: w.id,
+        url: w.url,
+        value: r.secret,
+        previousUntil: r.previousSecretUntil
+      })
       load()
     })
   const resume = (w: WebhookSubscription) =>
     act(async () => {
       await client.resumeWebhook(w.id)
-      setNote({ kind: 'ok', text: t('admin.webhooks.resumed', { url: w.url }), focus: true })
+      setNote({
+        kind: 'ok',
+        text: t('admin.webhooks.resumed', { url: w.url }),
+        focus: true
+      })
       load()
     })
   const remove = (w: WebhookSubscription) =>
     act(async () => {
       await client.deleteWebhook(w.id)
-      setNote({ kind: 'ok', text: t('admin.webhooks.deleted', { url: w.url }), focus: true })
+      setNote({
+        kind: 'ok',
+        text: t('admin.webhooks.deleted', { url: w.url }),
+        focus: true
+      })
       if (editing === w.id) reset()
       if (logOf?.id === w.id) setLogOf(null)
       if (secret?.subscription === w.id) setSecret(null)
@@ -202,13 +237,18 @@ export const Webhooks = () => {
   }
 
   const readLog = (w: WebhookSubscription, before?: string) =>
-    client.listWebhookDeliveries(w.id, { limit: PAGE, ...(before ? { before } : {}) }).then(
-      r => {
-        setLog(list => (before ? [...(list ?? []), ...r.items] : r.items))
-        setNext(r.next)
-      },
-      (err: unknown) => setLogNote({ kind: 'error', text: failed(err) })
-    )
+    client
+      .listWebhookDeliveries(w.id, {
+        limit: PAGE,
+        ...(before ? { before } : {})
+      })
+      .then(
+        r => {
+          setLog(list => (before ? [...(list ?? []), ...r.items] : r.items))
+          setNext(r.next)
+        },
+        (err: unknown) => setLogNote({ kind: 'error', text: failed(err) })
+      )
   const showLog = (w: WebhookSubscription) => {
     setLogNote(null)
     setLogOf(w)
@@ -224,133 +264,210 @@ export const Webhooks = () => {
       .replayWebhookDelivery(logOf.id, d.id)
       .then(
         () => {
-          setLogNote({ kind: 'ok', text: t('admin.webhooks.replayed'), focus: true })
+          setLogNote({
+            kind: 'ok',
+            text: t('admin.webhooks.replayed'),
+            focus: true
+          })
           return readLog(logOf)
         },
-        (err: unknown) => setLogNote({ kind: 'error', text: say(refusalOf(err, () => undefined).problem)!, focus: true })
+        (err: unknown) =>
+          setLogNote({
+            kind: 'error',
+            text: say(refusalOf(err, () => undefined).problem)!,
+            focus: true
+          })
       )
       .finally(() => setBusy(false))
   }
 
-  const when = new Intl.DateTimeFormat(lang === 'fr' ? 'fr-FR' : 'en-GB', { dateStyle: 'short', timeStyle: 'medium' })
+  const when = new Intl.DateTimeFormat(lang === 'fr' ? 'fr-FR' : 'en-GB', {
+    dateStyle: 'short',
+    timeStyle: 'medium'
+  })
   const eventName = (type: string) => t(`admin.webhooks.event.${type}` as Key)
   const outcome = (d: WebhookDelivery) => {
     const parts: string[] = []
     if (d.lastStatus !== undefined) parts.push(t('admin.webhooks.httpStatus', { status: d.lastStatus }))
     if (d.lastError && d.lastError !== 'http') parts.push(FAILURES.includes(d.lastError) ? t(`admin.webhooks.failure.${d.lastError}` as Key) : d.lastError)
-    if (d.status === 'pending' && d.nextAttemptAt && d.attempts > 0) parts.push(t('admin.webhooks.nextAttempt', { date: when.format(new Date(d.nextAttemptAt)) }))
+    if (d.status === 'pending' && d.nextAttemptAt && d.attempts > 0)
+      parts.push(
+        t('admin.webhooks.nextAttempt', {
+          date: when.format(new Date(d.nextAttemptAt))
+        })
+      )
     return parts.join(' · ') || '—'
   }
 
   if (unavailable)
     return (
       <Section id="webhooks" title={t('admin.webhooks')}>
-        <p className="alert">{t('admin.webhooks.unavailable')}</p>
+        <Alert severity="warning" role="status">{t('admin.webhooks.unavailable')}</Alert>
       </Section>
     )
   const count = Object.keys(problems).length
   return (
     <>
       <Section id="webhooks" title={t('admin.webhooks')}>
-        <p>{t('admin.webhooks.help')}</p>
+        <Typography component="p" gutterBottom>
+          {t('admin.webhooks.help')}
+        </Typography>
         <form onSubmit={e => void saveDomains(e)} noValidate aria-labelledby="webhooks-domains-title">
-          <h3 id="webhooks-domains-title">{t('admin.webhooks.domains')}</h3>
-          <div className="field">
-            <label htmlFor="webhook-domains">{t('admin.webhooks.domainsLabel')}</label>
-            <textarea
+          <Typography variant="h6" component="h3" id="webhooks-domains-title" gutterBottom>
+            {t('admin.webhooks.domains')}
+          </Typography>
+          <div className="u-mb-1">
+            <MuiTextField
               id="webhook-domains"
+              label={t('admin.webhooks.domainsLabel')}
+              multiline
               rows={4}
+              fullWidth
               value={domainsText}
               onChange={e => setDomainsText(e.target.value)}
               disabled={busy || domains === null}
-              spellCheck={false}
-              aria-invalid={domainsProblem ? true : undefined}
-              aria-describedby={['webhook-domains-hint', domainsProblem ? 'webhook-domains-error' : ''].filter(Boolean).join(' ')}
+              error={Boolean(domainsProblem)}
+              slotProps={{
+                htmlInput: {
+                  spellCheck: false,
+                  'aria-invalid': domainsProblem ? true : undefined,
+                  'aria-describedby': ['webhook-domains-hint', domainsProblem ? 'webhook-domains-error' : ''].filter(Boolean).join(' ')
+                }
+              }}
             />
-            <span id="webhook-domains-hint" className="badge">
+            <FormHelperText id="webhook-domains-hint" component="span">
               {t('admin.webhooks.domainsHint')}
-            </span>
+            </FormHelperText>
             <FieldError id="webhook-domains" error={say(domainsProblem)} />
           </div>
-          <div className="actions actions-start">
-            <button type="submit" className="btn" disabled={busy || domains === null}>
+          <Stack direction="row" spacing={1} useFlexGap className="u-flex-wrap u-mb-1">
+            <Button type="submit" variant="outlined" disabled={busy || domains === null}>
               {t('admin.webhooks.domainsSave')}
-            </button>
-          </div>
+            </Button>
+          </Stack>
         </form>
         <NoteLine note={domainsNote} />
       </Section>
 
       {secret ? (
         <Section id="webhook-secret" title={t('admin.webhooks.secret')}>
-          <p className="alert">{t('admin.webhooks.secretOnce', { url: secret.url })}</p>
-          {secret.previousUntil ? <p>{t('admin.webhooks.secretGrace', { date: when.format(new Date(secret.previousUntil)) })}</p> : null}
-          <div className="field">
-            <label htmlFor="webhook-secret-value">{t('admin.webhooks.secretLabel')}</label>
-            <input ref={secretRef} id="webhook-secret-value" className="secret" readOnly value={secret.value} onFocus={e => e.currentTarget.select()} aria-describedby="webhook-secret-hint" />
-            <span id="webhook-secret-hint" className="badge">
+          <Alert severity="warning" role="status" className="u-mb-1">
+            {t('admin.webhooks.secretOnce', { url: secret.url })}
+          </Alert>
+          {secret.previousUntil ? (
+            <Typography component="p" gutterBottom>
+              {t('admin.webhooks.secretGrace', {
+                date: when.format(new Date(secret.previousUntil))
+              })}
+            </Typography>
+          ) : null}
+          <div className="u-mb-1">
+            <MuiTextField
+              id="webhook-secret-value"
+              label={t('admin.webhooks.secretLabel')}
+              fullWidth
+              value={secret.value}
+              inputRef={secretRef}
+              onFocus={e => (e.target as HTMLInputElement).select()}
+              slotProps={{
+                htmlInput: {
+                  readOnly: true,
+                  'aria-describedby': 'webhook-secret-hint'
+                }
+              }}
+            />
+            <FormHelperText id="webhook-secret-hint" component="span">
               {t('admin.webhooks.secretHint')}
-            </span>
+            </FormHelperText>
           </div>
-          <div className="actions actions-start">
-            <button type="button" className="btn" onClick={() => void copy()}>
+          <Stack direction="row" spacing={1} useFlexGap className="u-flex-wrap u-mb-1">
+            <Button variant="outlined" onClick={() => void copy()}>
               {t('admin.webhooks.secretCopy')}
-            </button>
-            <button type="button" className="btn btn-primary" onClick={() => setSecret(null)}>
-              {t('admin.webhooks.secretDone')}
-            </button>
-          </div>
-          <p className="badge" role="status">
+            </Button>
+            <Button onClick={() => setSecret(null)}>{t('admin.webhooks.secretDone')}</Button>
+          </Stack>
+          <Typography component="p" variant="body2" color="textSecondary" role="status">
             {copied ? t('admin.webhooks.secretCopied') : ''}
-          </p>
+          </Typography>
         </Section>
       ) : null}
 
       <Section id="webhook-list" title={t('admin.webhooks.list')}>
         {items === null ? null : items.length ? (
-          <ul className="list admin-list" aria-label={t('admin.webhooks.list')}>
+          <List disablePadding data-testid="admin-list" aria-label={t('admin.webhooks.list')}>
             {items.map(w => (
-              <li key={w.id}>
-                <span>
+              <ListItem key={w.id} divider disableGutters className="u-flex-wrap">
+                <div className="u-flex-grow-1">
                   <strong>{w.url}</strong>
                   {w.description ? ` (${w.description})` : ''}
-                  {t('admin.webhooks.itemEvents', { events: w.events.map(eventName).join(', ') })}{' '}
+                  {t('admin.webhooks.itemEvents', {
+                    events: w.events.map(eventName).join(', ')
+                  })}{' '}
                   {!w.enabled ? (
-                    <span className="state state-disabled">{t(w.disabledReason === 'failing' ? 'admin.webhooks.disabledFailing' : 'admin.webhooks.disabled')}</span>
+                    <Chip component="span" size="small" variant="outlined" color="error" label={t(w.disabledReason === 'failing' ? 'admin.webhooks.disabledFailing' : 'admin.webhooks.disabled')} />
                   ) : !w.deliverable ? (
-                    <span className="state state-failed">{t('admin.webhooks.notDeliverable')}</span>
+                    <Chip component="span" size="small" variant="outlined" color="error" label={t('admin.webhooks.notDeliverable')} />
                   ) : w.pausedUntil ? (
-                    <span className="state state-failed">{t('admin.webhooks.paused', { count: w.failures ?? 0, date: when.format(new Date(w.pausedUntil)) })}</span>
+                    <Chip
+                      component="span"
+                      size="small"
+                      variant="outlined"
+                      color="error"
+                      label={t('admin.webhooks.paused', {
+                        count: w.failures ?? 0,
+                        date: when.format(new Date(w.pausedUntil))
+                      })}
+                    />
                   ) : w.failures ? (
-                    <span className="state state-failed">{t('admin.webhooks.failing', { count: w.failures })}</span>
+                    <Chip component="span" size="small" variant="outlined" color="error" label={t('admin.webhooks.failing', { count: w.failures })} />
                   ) : null}
-                  {w.backlog ? <span className="state state-failed"> {t('admin.webhooks.backlog', { count: w.backlog, date: w.backlogAt ? when.format(new Date(w.backlogAt)) : '—' })}</span> : null}
-                  {w.previousSecretUntil ? <span className="muted"> {t('admin.webhooks.previousSecret', { date: when.format(new Date(w.previousSecretUntil)) })}</span> : null}
-                </span>
-                <div className="actions actions-end">
-                  <button type="button" className="btn" onClick={() => edit(w)} disabled={busy} aria-label={t('admin.webhooks.editOf', { url: w.url })}>
+                  {w.backlog ? (
+                    <Chip
+                      component="span"
+                      size="small"
+                      variant="outlined"
+                      color="error"
+                      label={t('admin.webhooks.backlog', {
+                        count: w.backlog,
+                        date: w.backlogAt ? when.format(new Date(w.backlogAt)) : '—'
+                      })}
+                    />
+                  ) : null}
+                  {w.previousSecretUntil ? (
+                    <Typography component="span" variant="body2" color="textSecondary">
+                      {' '}
+                      {t('admin.webhooks.previousSecret', {
+                        date: when.format(new Date(w.previousSecretUntil))
+                      })}
+                    </Typography>
+                  ) : null}
+                </div>
+                <Stack direction="row" spacing={1} useFlexGap className="u-flex-wrap">
+                  <Button variant="outlined" onClick={() => edit(w)} disabled={busy} aria-label={t('admin.webhooks.editOf', { url: w.url })}>
                     {t('admin.webhooks.edit')}
-                  </button>
-                  <button type="button" className="btn" onClick={() => void test(w)} disabled={busy || !w.enabled} aria-label={t('admin.webhooks.testOf', { url: w.url })}>
+                  </Button>
+                  <Button variant="outlined" onClick={() => void test(w)} disabled={busy || !w.enabled} aria-label={t('admin.webhooks.testOf', { url: w.url })}>
                     {t('admin.webhooks.test')}
-                  </button>
-                  <button type="button" className="btn" onClick={() => showLog(w)} disabled={busy} aria-label={t('admin.webhooks.logOf', { url: w.url })}>
+                  </Button>
+                  <Button variant="outlined" onClick={() => showLog(w)} disabled={busy} aria-label={t('admin.webhooks.logOf', { url: w.url })}>
                     {t('admin.webhooks.log')}
-                  </button>
+                  </Button>
                   {w.enabled && (w.pausedUntil || w.failures || w.backlog) ? (
-                    <button type="button" className="btn" onClick={() => void resume(w)} disabled={busy} aria-label={t('admin.webhooks.resumeOf', { url: w.url })}>
+                    <Button variant="outlined" onClick={() => void resume(w)} disabled={busy} aria-label={t('admin.webhooks.resumeOf', { url: w.url })}>
                       {t('admin.webhooks.resume')}
-                    </button>
+                    </Button>
                   ) : null}
                   <ConfirmDelete action="admin.webhooks.renew" tone="plain" yes="admin.webhooks.renewYes" label={t('admin.webhooks.renewOf', { url: w.url })} question={t('admin.webhooks.renewConfirm', { url: w.url })} onConfirm={() => void renew(w)} disabled={busy} />
                   <ConfirmDelete action="admin.webhooks.revoke" yes="admin.webhooks.revokeYes" label={t('admin.webhooks.revokeOf', { url: w.url })} question={t('admin.webhooks.revokeConfirm', { url: w.url })} onConfirm={() => void renew(w, true)} disabled={busy} />
                   <ConfirmDelete label={t('admin.webhooks.deleteOf', { url: w.url })} question={t('admin.webhooks.deleteConfirm', { url: w.url })} onConfirm={() => void remove(w)} disabled={busy} />
-                </div>
-              </li>
+                </Stack>
+              </ListItem>
             ))}
-          </ul>
+          </List>
         ) : (
-          <p className="muted">{t('admin.webhooks.none')}</p>
+          <Typography component="p" variant="body2" color="textSecondary">
+            {t('admin.webhooks.none')}
+          </Typography>
         )}
         <NoteLine note={note} />
       </Section>
@@ -362,81 +479,96 @@ export const Webhooks = () => {
           <CheckGroup id="webhook-events" legend={t('admin.webhooks.events')} values={WEBHOOK_EVENT_TYPES} chosen={form.events} label={eventName} onChange={events => setForm(f => ({ ...f, events }))} error={say(problems.events)} disabled={busy} />
           <TextField id="webhook-description" label={t('admin.webhooks.description')} value={form.description} onChange={v => setForm(f => ({ ...f, description: v }))} error={say(problems.description)} disabled={busy} maxLength={200} />
           <CheckBox id="webhook-enabled" label={t('admin.webhooks.enabled')} hint={t('admin.webhooks.enabledHint')} checked={form.enabled} onChange={enabled => setForm(f => ({ ...f, enabled }))} disabled={busy} />
-          <div className="actions actions-start">
-            <button type="submit" className="btn btn-primary" disabled={busy} aria-busy={busy}>
+          <Stack direction="row" spacing={1} useFlexGap className="u-flex-wrap">
+            <Button type="submit" disabled={busy} aria-busy={busy}>
               {t('admin.webhooks.save')}
-            </button>
+            </Button>
             {editing ? (
-              <button type="button" className="btn" onClick={reset} disabled={busy}>
+              <Button variant="outlined" onClick={reset} disabled={busy}>
                 {t('admin.webhooks.cancel')}
-              </button>
+              </Button>
             ) : null}
-          </div>
+          </Stack>
         </form>
       </Section>
 
       {logOf ? (
-        <section className="card" aria-labelledby="webhook-log">
-          <h2 id="webhook-log" ref={logHeading} tabIndex={-1}>
-            {t('admin.webhooks.logTitle', { url: logOf.url })}
-          </h2>
-          {log === null ? null : log.length ? (
-            <div className="table-scroll" role="region" tabIndex={0} aria-label={t('admin.webhooks.logTitle', { url: logOf.url })}>
-              <table className="admin-table">
-                <caption className="sr-only">{t('admin.webhooks.logTitle', { url: logOf.url })}</caption>
-                <thead>
-                  <tr>
-                    <th scope="col">{t('admin.webhooks.logWhen')}</th>
-                    <th scope="col">{t('admin.webhooks.logEvent')}</th>
-                    <th scope="col">{t('admin.webhooks.logStatus')}</th>
-                    <th scope="col">{t('admin.webhooks.logAttempts')}</th>
-                    <th scope="col">{t('admin.webhooks.logOutcome')}</th>
-                    <th scope="col">{t('admin.webhooks.logAction')}</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {log.map(d => (
-                    <tr key={d.id}>
-                      <td>
-                        <time dateTime={d.createdAt}>{when.format(new Date(d.createdAt))}</time>
-                      </td>
-                      <td>
-                        {eventName(d.eventType)} <span className="muted">{d.eventId}</span>
-                      </td>
-                      <td>
-                        <span className={`state state-${d.status}`}>{t(`admin.webhooks.status.${d.status}` as Key)}</span>
-                      </td>
-                      <td>{d.attempts}</td>
-                      <td>{outcome(d)}</td>
-                      <td>
-                        {d.status === 'pending' ? (
-                          '—'
-                        ) : (
-                          <button type="button" className="btn" onClick={() => replay(d)} disabled={busy} aria-label={t('admin.webhooks.replayOf', { event: eventName(d.eventType), date: when.format(new Date(d.createdAt)) })}>
-                            {t('admin.webhooks.replay')}
-                          </button>
-                        )}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          ) : (
-            <p className="muted">{t('admin.webhooks.logNone')}</p>
-          )}
-          <p className="actions actions-start">
-            {next ? (
-              <button type="button" className="btn" onClick={() => void readLog(logOf, next)} disabled={busy}>
-                {t('admin.webhooks.logMore')}
-              </button>
-            ) : null}
-            <button type="button" className="btn" onClick={() => void readLog(logOf)} disabled={busy}>
-              {t('admin.webhooks.logRefresh')}
-            </button>
-          </p>
-          <NoteLine note={logNote} />
-        </section>
+        <Card component="section" variant="outlined" aria-labelledby="webhook-log" className="u-mb-1">
+          <CardContent>
+            <Typography variant="h5" component="h2" id="webhook-log" ref={logHeading} tabIndex={-1} gutterBottom>
+              {t('admin.webhooks.logTitle', { url: logOf.url })}
+            </Typography>
+            {log === null ? null : log.length ? (
+              <TableContainer role="region" tabIndex={0} aria-label={t('admin.webhooks.logTitle', { url: logOf.url })}>
+                <Table size="small">
+                  <caption className="u-visuallyhidden">{t('admin.webhooks.logTitle', { url: logOf.url })}</caption>
+                  <TableHead>
+                    <TableRow>
+                      <TableCell scope="col">{t('admin.webhooks.logWhen')}</TableCell>
+                      <TableCell scope="col">{t('admin.webhooks.logEvent')}</TableCell>
+                      <TableCell scope="col">{t('admin.webhooks.logStatus')}</TableCell>
+                      <TableCell scope="col">{t('admin.webhooks.logAttempts')}</TableCell>
+                      <TableCell scope="col">{t('admin.webhooks.logOutcome')}</TableCell>
+                      <TableCell scope="col">{t('admin.webhooks.logAction')}</TableCell>
+                    </TableRow>
+                  </TableHead>
+                  <TableBody>
+                    {log.map(d => (
+                      <TableRow key={d.id}>
+                        <TableCell>
+                          <time dateTime={d.createdAt}>{when.format(new Date(d.createdAt))}</time>
+                        </TableCell>
+                        <TableCell>
+                          {eventName(d.eventType)}{' '}
+                          <Typography component="span" variant="body2" color="textSecondary">
+                            {d.eventId}
+                          </Typography>
+                        </TableCell>
+                        <TableCell>
+                          <Chip component="span" size="small" variant="outlined" color={d.status === 'failed' ? 'error' : d.status === 'delivered' ? 'success' : 'default'} label={t(`admin.webhooks.status.${d.status}` as Key)} />
+                        </TableCell>
+                        <TableCell>{d.attempts}</TableCell>
+                        <TableCell>{outcome(d)}</TableCell>
+                        <TableCell>
+                          {d.status === 'pending' ? (
+                            '—'
+                          ) : (
+                            <Button
+                              variant="outlined"
+                              onClick={() => replay(d)}
+                              disabled={busy}
+                              aria-label={t('admin.webhooks.replayOf', {
+                                event: eventName(d.eventType),
+                                date: when.format(new Date(d.createdAt))
+                              })}
+                            >
+                              {t('admin.webhooks.replay')}
+                            </Button>
+                          )}
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </TableContainer>
+            ) : (
+              <Typography component="p" variant="body2" color="textSecondary">
+                {t('admin.webhooks.logNone')}
+              </Typography>
+            )}
+            <Stack direction="row" spacing={1} useFlexGap className="u-flex-wrap u-mt-1 u-mb-1">
+              {next ? (
+                <Button variant="outlined" onClick={() => void readLog(logOf, next)} disabled={busy}>
+                  {t('admin.webhooks.logMore')}
+                </Button>
+              ) : null}
+              <Button variant="outlined" onClick={() => void readLog(logOf)} disabled={busy}>
+                {t('admin.webhooks.logRefresh')}
+              </Button>
+            </Stack>
+            <NoteLine note={logNote} />
+          </CardContent>
+        </Card>
       ) : null}
     </>
   )

@@ -1,8 +1,9 @@
+import { Alert, Card, CardContent, List, ListItem, ListItemText, Link, Stack, Typography } from '@linagora/twake-mui'
 import { useEffect, useState } from 'react'
-import { Link, useParams } from 'react-router-dom'
+import { Link as RouterLink, useParams } from 'react-router-dom'
 import { formatNumber, type Contact } from '@twake/telephony-client'
-import { FavoriteButton } from '../components/ContactList.js'
-import { useFavorites } from '../favorites.js'
+import { ContactAvatar } from '../components/ContactList.js'
+import { CallAction, CopyAction } from '../components/RowActions.js'
 import { useGateway } from '../gateway.js'
 import { useT } from '../i18n/useT.js'
 import { PresenceBadge } from '../presence.js'
@@ -12,7 +13,6 @@ export const ContactPage = () => {
   const { t } = useT()
   const { id = '' } = useParams()
   const { client } = useGateway()
-  const favorites = useFavorites()
   const [contact, setContact] = useState<Contact | null | undefined>(undefined)
 
   useEffect(() => {
@@ -32,57 +32,80 @@ export const ContactPage = () => {
   }, [contact, t])
 
   const extension = contact?.numbers.find(n => n.type === 'extension')
-  if (contact === undefined) return <h1>{t('directory.title')}</h1>
+  const heading = (text: string) => (
+    <Typography variant="h4" component="h1" gutterBottom>
+      {text}
+    </Typography>
+  )
+  if (contact === undefined) return heading(t('directory.title'))
   if (contact === null) {
     return (
       <>
-        <h1>{t('directory.title')}</h1>
-        <p className="alert alert-error" role="alert">{t('directory.notFound')}</p>
-        <Link to="/directory">{t('directory.back')}</Link>
+        {heading(t('directory.title'))}
+        <Alert severity="error" role="alert" className="u-mb-1">
+          {t('directory.notFound')}
+        </Alert>
+        <Link component={RouterLink} to="/">
+          {t('directory.back')}
+        </Link>
       </>
     )
   }
   return (
     <>
-      <p>
-        <Link to="/directory">{t('directory.back')}</Link>
-      </p>
-      <h1>{contact.displayName}</h1>
-      {contact.title || contact.department ? <p className="muted">{[contact.title, contact.department].filter(Boolean).join(' · ')}</p> : null}
-      {extension ? (
-        <p>
-          <PresenceBadge extension={extension.number} />
-        </p>
+      <Typography component="p">
+        <Link component={RouterLink} to="/">
+          {t('directory.back')}
+        </Link>
+      </Typography>
+      <ContactAvatar contact={contact} size="xl" />
+      {heading(contact.displayName)}
+      {contact.title || contact.department ? (
+        <Typography variant="body2" color="textSecondary" component="p">
+          {[contact.title, contact.department].filter(Boolean).join(' · ')}
+        </Typography>
       ) : null}
-      <FavoriteButton contact={contact} favorites={favorites} />
-      <section className="card" aria-labelledby="numbers">
-        <h2 id="numbers">{t('contact.numbers')}</h2>
-        {contact.numbers.length === 0 ? (
-          <p>{t('contact.noNumber')}</p>
-        ) : (
-          <ul className="list">
-            {contact.numbers.map(n => (
-              <li key={`${n.type}-${n.number}`}>
-                <span>
-                  <strong>{formatNumber(n.number)}</strong>
-                  <br />
-                  <span className="badge">{t(`contact.${n.type}`)}</span>
-                </span>
-                <Link className="btn btn-primary" to={`/?number=${encodeURIComponent(n.number)}`} aria-label={t('contact.callNumber', { number: formatNumber(n.number) })}>
-                  {t('contact.call')}
-                </Link>
-              </li>
-            ))}
-          </ul>
-        )}
-      </section>
+      {extension ? (
+        <Typography component="p">
+          <PresenceBadge extension={extension.number} />
+        </Typography>
+      ) : null}
+      <Card component="section" variant="outlined" aria-labelledby="numbers" className="u-mb-1">
+        <CardContent>
+          <Typography variant="h5" component="h2" id="numbers" gutterBottom>
+            {t('contact.numbers')}
+          </Typography>
+          {contact.numbers.length === 0 ? (
+            <Typography component="p">{t('contact.noNumber')}</Typography>
+          ) : (
+            <List disablePadding>
+              {contact.numbers.map(n => (
+                <ListItem
+                  key={`${n.type}-${n.number}`}
+                  divider
+>
+                  <ListItemText primary={<strong>{formatNumber(n.number)}</strong>} secondary={t(`contact.${n.type}`)} />
+                  <Stack direction="row" spacing={0.5}>
+                    <CopyAction number={n.number} label={t('actions.copyNumber', { number: formatNumber(n.number) })} />
+                    <CallAction number={n.number} label={t('contact.callNumber', { number: formatNumber(n.number) })} />
+                  </Stack>
+                </ListItem>
+              ))}
+            </List>
+          )}
+        </CardContent>
+      </Card>
       {contact.email ? (
-        <section className="card" aria-labelledby="email">
-          <h2 id="email">{t('contact.email')}</h2>
-          <p>
-            <a href={`mailto:${contact.email}`}>{contact.email}</a>
-          </p>
-        </section>
+        <Card component="section" variant="outlined" aria-labelledby="email" className="u-mb-1">
+          <CardContent>
+            <Typography variant="h5" component="h2" id="email" gutterBottom>
+              {t('contact.email')}
+            </Typography>
+            <Typography component="p">
+              <Link href={`mailto:${contact.email}`}>{contact.email}</Link>
+            </Typography>
+          </CardContent>
+        </Card>
       ) : null}
     </>
   )

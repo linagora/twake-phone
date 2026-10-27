@@ -45,7 +45,7 @@ describe('the supervision page', () => {
     await flush()
   }
   const said = () => host.querySelector('[data-testid="supervision-status"]')!.textContent
-  const problem = () => host.querySelector('[role="alert"].alert-error')?.textContent
+  const problem = () => host.querySelector('[data-testid="supervision-problem"]')?.textContent
 
   beforeEach(() => {
     actEnvironment = (globalThis as { IS_REACT_ACT_ENVIRONMENT?: unknown }).IS_REACT_ACT_ENVIRONMENT
@@ -101,7 +101,7 @@ describe('the supervision page', () => {
     const log = [...host.querySelectorAll('[data-testid="supervision-log"] tbody tr')].map(tr => [...tr.querySelectorAll('td')].map(td => td.textContent))
     expect(log[0]!.slice(1)).toEqual(['Alice Martin', 'supervision.action.record-start', '103'])
     expect(log[1]!.slice(1)).toEqual(['supervision.logSystem', 'supervision.action.purge', ''])
-    expect(host.querySelector('[data-testid="supervision-recording"] .badge')!.textContent).toContain('supervision.rec.ready · supervision.recDuration 1:05')
+    expect(host.querySelector('[data-testid="supervision-recording"] .MuiListItemText-secondary')!.textContent).toContain('supervision.rec.ready · supervision.recDuration 1:05')
   })
 
   it('records a call, says so, then offers to stop it once the call is read again as recorded', async () => {

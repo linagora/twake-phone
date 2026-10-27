@@ -1,3 +1,4 @@
+import { Alert, Button, Card, CardContent, Stack, Typography } from '@linagora/twake-mui'
 import { useEffect, useMemo, useState } from 'react'
 import { useGateway } from '../gateway.js'
 import type { Key } from '../i18n/index.js'
@@ -45,31 +46,41 @@ export const NotificationSettings = ({ userId }: { userId: string }) => {
     }
   }
   return (
-    <section className="card" aria-labelledby="notifications">
-      <h2 id="notifications">{t('settings.notifications')}</h2>
-      <p>{t('settings.notificationsHint')}</p>
-      <p className={status === 'denied' ? 'alert alert-error' : 'badge'} role="status">
-        {t(SAYS[status])}
-      </p>
-      {status === 'off' || status === 'denied' ? (
-        <div className="actions">
-          <button type="button" className="btn btn-primary" onClick={() => void change(true)} disabled={busy} aria-busy={busy}>
-            {t('settings.notificationsEnable')}
-          </button>
-        </div>
-      ) : null}
-      {status === 'on' ? (
-        <div className="actions">
-          <button type="button" className="btn" onClick={() => void change(false)} disabled={busy} aria-busy={busy}>
-            {t('settings.notificationsDisable')}
-          </button>
-        </div>
-      ) : null}
-      {error ? (
-        <p className="alert alert-error" role="alert">
-          {t('settings.notificationsError')}
-        </p>
-      ) : null}
-    </section>
+    <Card component="section" variant="outlined" aria-labelledby="notifications" className="u-mb-1">
+      <CardContent>
+        <Typography variant="h5" component="h2" id="notifications" gutterBottom>
+          {t('settings.notifications')}
+        </Typography>
+        <Typography component="p">{t('settings.notificationsHint')}</Typography>
+        {status === 'denied' ? (
+          <Alert severity="error" role="status" className="u-mb-1">
+            {t(SAYS[status])}
+          </Alert>
+        ) : (
+          <Typography variant="body2" color="textSecondary" component="p" role="status" className="u-mb-1">
+            {t(SAYS[status])}
+          </Typography>
+        )}
+        {status === 'off' || status === 'denied' ? (
+          <Stack direction="row" spacing={1} useFlexGap className="u-flex-wrap">
+            <Button onClick={() => void change(true)} disabled={busy} aria-busy={busy}>
+              {t('settings.notificationsEnable')}
+            </Button>
+          </Stack>
+        ) : null}
+        {status === 'on' ? (
+          <Stack direction="row" spacing={1} useFlexGap className="u-flex-wrap">
+            <Button variant="outlined" onClick={() => void change(false)} disabled={busy} aria-busy={busy}>
+              {t('settings.notificationsDisable')}
+            </Button>
+          </Stack>
+        ) : null}
+        {error ? (
+          <Alert severity="error" role="alert" className="u-mt-1">
+            {t('settings.notificationsError')}
+          </Alert>
+        ) : null}
+      </CardContent>
+    </Card>
   )
 }

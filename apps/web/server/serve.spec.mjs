@@ -8,7 +8,7 @@ describe('serveApp', () => {
   let web
   beforeAll(async () => {
     const dir = await mkdtemp(join(tmpdir(), 'twakephone-web-'))
-    await writeFile(join(dir, 'index.html'), '<!doctype html><title>TwakePhone</title>')
+    await writeFile(join(dir, 'index.html'), '<!doctype html><head><title>TwakePhone</title></head>')
     await mkdir(join(dir, 'static'))
     await writeFile(join(dir, 'static', 'app.abc123.js'), 'console.log(1)')
     await writeFile(join(dir, 'public.json'), '{"dev":true}')
@@ -63,7 +63,18 @@ describe('serveApp', () => {
     }
     const head = await get('/', { method: 'HEAD' })
     expect(head.status).toBe(200)
-    expect(head.headers.get('content-length')).toBe(String(Buffer.byteLength('<!doctype html><title>TwakePhone</title>')))
+    expect(Number(head.headers.get('content-length'))).toBeGreaterThan(Buffer.byteLength('<!doctype html><head><title>TwakePhone</title></head>'))
     expect(await head.text()).toBe('')
+  })
+
+  it('gives each page a nonce of its own for the styles of the design system, in its CSP and its <meta>', async () => {
+    const nonceOf = async () => {
+      const res = await get('/directory/jdupont')
+      const meta = /<meta name="csp-nonce" content="([^"]+)">/.exec(await res.text())?.[1]
+      expect(res.headers.get('content-security-policy')).toContain(`'nonce-${meta}'`)
+      return meta
+    }
+    expect(await nonceOf()).not.toBe(await nonceOf())
+    expect((await get('/static/app.abc123.js')).headers.get('content-security-policy')).not.toContain("'nonce-")
   })
 })

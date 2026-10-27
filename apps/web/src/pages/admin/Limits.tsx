@@ -1,8 +1,25 @@
+import { Alert, Button, FormControl, FormHelperText, FormLabel, Grid, Stack, TextField, Typography } from '@linagora/twake-mui'
 import { useCallback, useEffect, useState, type FormEvent } from 'react'
 import { FRAUD_PARAMS, OUTBOUND_CAPS, type FraudRule, type OutboundSettings } from '@twake/telephony-client'
 import { CapFields } from '../../admin/CapFields.js'
 import { FieldError, NoteLine, useLatest, ProblemSummary, Section, useFocusLater, useProblem, type Note } from '../../admin/ui.js'
-import { LIMITS_FIELDS, capsForm, checkCaps, checkFraud, fraudForm, limitsRefusal, refusalCode, sameValue, type CapForm, type CapsForm, type FraudForm, type FraudParam, type LimitsField, type Problem, type ThresholdForm } from '../../admin/validate.js'
+import {
+  LIMITS_FIELDS,
+  capsForm,
+  checkCaps,
+  checkFraud,
+  fraudForm,
+  limitsRefusal,
+  refusalCode,
+  sameValue,
+  type CapForm,
+  type CapsForm,
+  type FraudForm,
+  type FraudParam,
+  type LimitsField,
+  type Problem,
+  type ThresholdForm
+} from '../../admin/validate.js'
 import { useGateway } from '../../gateway.js'
 import type { Key } from '../../i18n/index.js'
 import { useT } from '../../i18n/useT.js'
@@ -16,7 +33,12 @@ interface LimitsForm {
   national: FraudForm
   international: FraudForm
 }
-const limitsForm = (s: OutboundSettings): LimitsForm => ({ tenant: capsForm(s.policy.caps), user: capsForm(s.policy.userCaps), national: fraudForm(s.policy.fraud?.national), international: fraudForm(s.policy.fraud?.international) })
+const limitsForm = (s: OutboundSettings): LimitsForm => ({
+  tenant: capsForm(s.policy.caps),
+  user: capsForm(s.policy.userCaps),
+  national: fraudForm(s.policy.fraud?.national),
+  international: fraudForm(s.policy.fraud?.international)
+})
 
 const PARTS = [
   ['tenant', 'admin.limits.tenant'],
@@ -29,8 +51,16 @@ type Typed = { legend: Key; name: Key } & ({ cap: CapForm } | { threshold: Thres
 const typedOf = (read: LimitsForm, typed: LimitsForm): Typed[] =>
   PARTS.flatMap(([part, legend]): Typed[] =>
     part === 'tenant' || part === 'user'
-      ? OUTBOUND_CAPS.filter(k => !sameValue(read[part][k], typed[part][k])).map(k => ({ legend, name: `admin.cap.${k}` as Key, cap: typed[part][k] }))
-      : FRAUD_PARAMS.filter(k => !sameValue(read[part][k], typed[part][k])).map(k => ({ legend, name: `admin.fraud.${k}` as Key, threshold: typed[part][k] }))
+      ? OUTBOUND_CAPS.filter(k => !sameValue(read[part][k], typed[part][k])).map(k => ({
+          legend,
+          name: `admin.cap.${k}` as Key,
+          cap: typed[part][k]
+        }))
+      : FRAUD_PARAMS.filter(k => !sameValue(read[part][k], typed[part][k])).map(k => ({
+          legend,
+          name: `admin.fraud.${k}` as Key,
+          threshold: typed[part][k]
+        }))
   )
 
 /** The problems of one part of the form (`tenant`, `national`…), by cap or threshold. */
@@ -42,65 +72,96 @@ const partOf = (problems: Partial<Record<LimitsField, Problem>>, part: string) =
   ) as Partial<Record<string, Problem>>
 
 /** The thresholds of one zone, one row each: the default (said with its values) or set (an empty level: none). */
-const FraudFields = ({ zone, form, defaults, problems, onChange, disabled }: { zone: Zone; form: FraudForm; defaults: FraudRule; problems: Partial<Record<string, Problem>>; onChange: (next: FraudForm) => void; disabled?: boolean }) => {
+const FraudFields = ({
+  zone,
+  form,
+  defaults,
+  problems,
+  onChange,
+  disabled
+}: {
+  zone: Zone
+  form: FraudForm
+  defaults: FraudRule
+  problems: Partial<Record<string, Problem>>
+  onChange: (next: FraudForm) => void
+  disabled?: boolean
+}) => {
   const { t } = useT()
   const say = useProblem()
   const set = (k: FraudParam, next: Partial<ThresholdForm>) => onChange({ ...form, [k]: { ...form[k], ...next } })
   const level = (v: number | undefined) => (v ? String(v) : t('admin.fraud.noLevel'))
   return (
-    <fieldset className="field caps" aria-describedby={`limits-${zone}-hint`}>
-      <legend>{t(zone === 'national' ? 'admin.fraud.national' : 'admin.fraud.international')}</legend>
-      <span id={`limits-${zone}-hint`} className="badge">
+    <FormControl component="fieldset" fullWidth className="u-mb-1" aria-describedby={`limits-${zone}-hint`}>
+      <FormLabel component="legend">{t(zone === 'national' ? 'admin.fraud.national' : 'admin.fraud.international')}</FormLabel>
+      <FormHelperText id={`limits-${zone}-hint`} component="span">
         {t(zone === 'national' ? 'admin.fraud.nationalHint' : 'admin.fraud.internationalHint')}
-      </span>
+      </FormHelperText>
       {FRAUD_PARAMS.map(k => {
         const f = form[k]
         const id = `limits-${zone}-${k}`
         const error = say(problems[k])
         const name = t(`admin.fraud.${k}` as Key)
         const def = defaults[k]
+        const input = (key: 'warning' | 'critical', fieldId: string, label: Key, placeholder: Key) => (
+          <TextField
+            id={fieldId}
+            value={f[key]}
+            onChange={e => set(k, { [key]: e.target.value })}
+            disabled={disabled}
+            error={Boolean(error)}
+            placeholder={t(placeholder)}
+            fullWidth
+            slotProps={{
+              htmlInput: {
+                inputMode: 'numeric',
+                autoComplete: 'off',
+                maxLength: 7,
+                'aria-label': t(label, { name }),
+                'aria-invalid': error ? true : undefined,
+                'aria-describedby': error ? `${id}-error` : undefined
+              }
+            }}
+          />
+        )
         return (
-          <div key={k} className="cap-row">
-            <label htmlFor={`${id}-mode`}>{name}</label>
-            <select id={`${id}-mode`} value={f.mode} onChange={e => set(k, { mode: e.target.value as ThresholdForm['mode'] })} disabled={disabled}>
-              <option value="default">{t('admin.fraud.default', { warning: level(def?.warning), critical: level(def?.critical) })}</option>
-              <option value="custom">{t('admin.fraud.custom')}</option>
-            </select>
-            {f.mode === 'custom' ? (
-              <span className="levels">
-                <input
-                  id={id}
-                  inputMode="numeric"
-                  autoComplete="off"
-                  maxLength={7}
-                  value={f.warning}
-                  onChange={e => set(k, { warning: e.target.value })}
+          <div key={k} className="u-mt-1">
+            <Grid container spacing={1}>
+              <Grid size={{ xs: 12, sm: 6 }}>
+                <TextField
+                  select
+                  id={`${id}-mode`}
+                  label={name}
+                  value={f.mode}
+                  onChange={e => set(k, { mode: e.target.value as ThresholdForm['mode'] })}
                   disabled={disabled}
-                  aria-label={t('admin.fraud.warningOf', { name })}
-                  placeholder={t('admin.fraud.warning')}
-                  aria-invalid={error ? true : undefined}
-                  aria-describedby={error ? `${id}-error` : undefined}
-                />
-                <input
-                  id={`${id}-critical`}
-                  inputMode="numeric"
-                  autoComplete="off"
-                  maxLength={7}
-                  value={f.critical}
-                  onChange={e => set(k, { critical: e.target.value })}
-                  disabled={disabled}
-                  aria-label={t('admin.fraud.criticalOf', { name })}
-                  placeholder={t('admin.fraud.critical')}
-                  aria-invalid={error ? true : undefined}
-                  aria-describedby={error ? `${id}-error` : undefined}
-                />
-              </span>
-            ) : null}
+                  fullWidth
+                  slotProps={{
+                    select: { native: true },
+                    inputLabel: { shrink: true }
+                  }}
+                >
+                  <option value="default">
+                    {t('admin.fraud.default', {
+                      warning: level(def?.warning),
+                      critical: level(def?.critical)
+                    })}
+                  </option>
+                  <option value="custom">{t('admin.fraud.custom')}</option>
+                </TextField>
+              </Grid>
+              {f.mode === 'custom' ? (
+                <Grid container size={{ xs: 12, sm: 6 }} spacing={1}>
+                  <Grid size={6}>{input('warning', id, 'admin.fraud.warningOf', 'admin.fraud.warning')}</Grid>
+                  <Grid size={6}>{input('critical', `${id}-critical`, 'admin.fraud.criticalOf', 'admin.fraud.critical')}</Grid>
+                </Grid>
+              ) : null}
+            </Grid>
             <FieldError id={id} error={error} />
           </div>
         )
       })}
-    </fieldset>
+    </FormControl>
   )
 }
 
@@ -134,7 +195,8 @@ export const Limits = () => {
   useEffect(read, [read])
   /** What was typed for a cap, or for a threshold, in words. */
   const capText = (c: CapForm) => (c.mode === 'value' ? c.value : t(c.mode === 'none' ? 'admin.cap.none' : 'admin.limits.typedDefault'))
-  const thresholdText = (x: ThresholdForm) => (x.mode === 'custom' ? `${t('admin.fraud.warning')} ${x.warning || '—'}, ${t('admin.fraud.critical')} ${x.critical || '—'}` : t('admin.limits.typedDefault'))
+  const thresholdText = (x: ThresholdForm) =>
+    x.mode === 'custom' ? `${t('admin.fraud.warning')} ${x.warning || '—'}, ${t('admin.fraud.critical')} ${x.critical || '—'}` : t('admin.limits.typedDefault')
 
   const save = async (e: FormEvent) => {
     e.preventDefault()
@@ -162,12 +224,26 @@ export const Limits = () => {
       ...rest,
       ...(tenant.caps ? { caps: tenant.caps } : {}),
       ...(user.caps ? { userCaps: user.caps } : {}),
-      ...(national.rule || international.rule ? { fraud: { ...(national.rule ? { national: national.rule } : {}), ...(international.rule ? { international: international.rule } : {}) } } : {})
+      ...(national.rule || international.rule
+        ? {
+            fraud: {
+              ...(national.rule ? { national: national.rule } : {}),
+              ...(international.rule ? { international: international.rule } : {})
+            }
+          }
+        : {})
     }
     setBusy(true)
     try {
       // With the version read: refused when another administrator changed the setting since (review 7 n°1).
-      show(await client.setOutbound({ policy, profiles: settings.profiles, assignments: settings.assignments, version: settings.version }))
+      show(
+        await client.setOutbound({
+          policy,
+          profiles: settings.profiles,
+          assignments: settings.assignments,
+          version: settings.version
+        })
+      )
       setNote({ kind: 'ok', text: t('admin.limits.saved') })
     } catch (err) {
       // Changed meanwhile: the form shows the setting as it is now (the next save made from it, nothing typed before
@@ -177,7 +253,10 @@ export const Limits = () => {
         const typed = typedOf(limitsForm(settings), form)
         read()
         const said = typed.map(x => `${t(x.legend)} : ${t(x.name)} = ${'cap' in x ? capText(x.cap) : thresholdText(x.threshold)}`).join(' ; ')
-        setNote({ kind: 'error', text: said ? t('admin.limits.stale', { typed: said }) : say(limitsRefusal(err).problem)! })
+        setNote({
+          kind: 'error',
+          text: said ? t('admin.limits.stale', { typed: said }) : say(limitsRefusal(err).problem)!
+        })
         return
       }
       const refusal = limitsRefusal(err)
@@ -195,7 +274,7 @@ export const Limits = () => {
   if (unavailable)
     return (
       <Section id="limits" title={t('admin.nav.limits')}>
-        <p className="alert">{t('admin.rights.unavailable')}</p>
+        <Alert severity="info" role="status">{t('admin.rights.unavailable')}</Alert>
       </Section>
     )
   if (!settings || !form)
@@ -206,18 +285,52 @@ export const Limits = () => {
     )
   return (
     <Section id="limits" title={t('admin.nav.limits')}>
-      <p>{t('admin.limits.help')}</p>
+      <Typography component="p" gutterBottom>
+        {t('admin.limits.help')}
+      </Typography>
       <form onSubmit={e => void save(e)} noValidate aria-labelledby="limits">
         <ProblemSummary count={Object.keys(problems).length} />
-        <CapFields prefix="limits-tenant" legend={t('admin.limits.tenant')} hint={t('admin.limits.tenantHint')} caps={form.tenant} defaults={settings.defaults.caps.tenant} problems={partOf(problems, 'tenant')} onChange={tenant => setForm(f => f && { ...f, tenant })} disabled={busy} />
-        <CapFields prefix="limits-user" legend={t('admin.limits.user')} hint={t('admin.limits.userHint')} caps={form.user} defaults={settings.defaults.caps.user} problems={partOf(problems, 'user')} onChange={user => setForm(f => f && { ...f, user })} disabled={busy} />
-        <FraudFields zone="national" form={form.national} defaults={settings.defaults.fraud.national} problems={partOf(problems, 'national')} onChange={national => setForm(f => f && { ...f, national })} disabled={busy} />
-        <FraudFields zone="international" form={form.international} defaults={settings.defaults.fraud.international} problems={partOf(problems, 'international')} onChange={international => setForm(f => f && { ...f, international })} disabled={busy} />
-        <div className="actions actions-start">
-          <button type="submit" className="btn btn-primary" disabled={busy} aria-busy={busy}>
+        <CapFields
+          prefix="limits-tenant"
+          legend={t('admin.limits.tenant')}
+          hint={t('admin.limits.tenantHint')}
+          caps={form.tenant}
+          defaults={settings.defaults.caps.tenant}
+          problems={partOf(problems, 'tenant')}
+          onChange={tenant => setForm(f => f && { ...f, tenant })}
+          disabled={busy}
+        />
+        <CapFields
+          prefix="limits-user"
+          legend={t('admin.limits.user')}
+          hint={t('admin.limits.userHint')}
+          caps={form.user}
+          defaults={settings.defaults.caps.user}
+          problems={partOf(problems, 'user')}
+          onChange={user => setForm(f => f && { ...f, user })}
+          disabled={busy}
+        />
+        <FraudFields
+          zone="national"
+          form={form.national}
+          defaults={settings.defaults.fraud.national}
+          problems={partOf(problems, 'national')}
+          onChange={national => setForm(f => f && { ...f, national })}
+          disabled={busy}
+        />
+        <FraudFields
+          zone="international"
+          form={form.international}
+          defaults={settings.defaults.fraud.international}
+          problems={partOf(problems, 'international')}
+          onChange={international => setForm(f => f && { ...f, international })}
+          disabled={busy}
+        />
+        <Stack direction="row" spacing={1} useFlexGap className="u-flex-wrap">
+          <Button type="submit" disabled={busy} aria-busy={busy}>
             {t('admin.limits.save')}
-          </button>
-        </div>
+          </Button>
+        </Stack>
       </form>
       <NoteLine note={note} />
     </Section>

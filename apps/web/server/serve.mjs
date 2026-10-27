@@ -1,5 +1,6 @@
 // Serves the built app: static files, SPA fallback, the runtime config.json, and the security headers of policy.mjs.
 // No dependency: this is what runs in the app's container, and what the browser e2e runs against.
+import { randomBytes } from 'node:crypto'
 import { createServer } from 'node:http'
 import { readFile, stat } from 'node:fs/promises'
 import { extname, join, normalize, resolve, sep } from 'node:path'
@@ -34,7 +35,8 @@ const TYPES = {
  */
 export const serveApp = ({ dir, port, host = '127.0.0.1', config, policy = {} }) => {
   const root = resolve(dir)
-  const csp = contentSecurityPolicy({ gatewayUrl: config.gatewayUrl, oidcAuthority: config.oidc.authority, ...policy })
+  const cspWith = styleNonce => contentSecurityPolicy({ gatewayUrl: config.gatewayUrl, oidcAuthority: config.oidc.authority, ...policy, styleNonce })
+  const csp = cspWith()
   const headers = securityHeaders({ csp, ...policy })
   const configBody = JSON.stringify(config)
   const index = join(root, 'index.html')
@@ -76,6 +78,12 @@ export const serveApp = ({ dir, port, host = '127.0.0.1', config, policy = {} })
       }
       file = index
       body = await readFile(file)
+    }
+    if (file === index) {
+      // The page gets a nonce of its own, in its CSP and in a <meta> the app hands to Emotion for its <style> tags.
+      const nonce = randomBytes(16).toString('base64')
+      res.setHeader('content-security-policy', cspWith(nonce))
+      body = Buffer.from(body.toString('utf8').replace(/<head>/i, `<head><meta name="csp-nonce" content="${nonce}">`))
     }
     const type = TYPES[extname(file)] ?? 'application/octet-stream'
     // Hashed assets live under /static/ and never change; the page and anything else may change at each deploy.

@@ -20,7 +20,7 @@ export interface SearchResult {
 export interface ContactDirectory {
   /** Whether this directory holds the people of that tenant. Absent: every tenant. */
   servesTenant?(tenantId: TenantId): boolean
-  /** Contacts matching the words of `query` (name, number, department...), at most `limit`. */
+  /** Contacts matching the words of `query` (name, number, department...), at most `limit`; an empty query, anyone. */
   search(tenantId: TenantId, query: string, limit: number): Promise<SearchResult>
   /** The contacts with these ids, in the order given; unknown ids are left out. */
   getMany(tenantId: TenantId, ids: string[]): Promise<Contact[]>

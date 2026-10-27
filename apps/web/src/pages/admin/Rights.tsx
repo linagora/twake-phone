@@ -1,3 +1,4 @@
+import { Alert, Button, List, ListItem, NativeSelect, Stack, Table, TableBody, TableCell, TableContainer, TableHead, TableRow, Typography } from '@linagora/twake-mui'
 import { useCallback, useEffect, useState, type FormEvent } from 'react'
 import { OUTBOUND_CAPS, TRUNK_OUTBOUND_CLASSES, type AdminUser, type OutboundProfile, type OutboundSettings } from '@twake/telephony-client'
 import { CapFields } from '../../admin/CapFields.js'
@@ -54,12 +55,20 @@ export const Rights = () => {
       setEditing(null)
       setForm(emptyProfile())
       // Deleted by another administrator: said, never "saved" (review 7 ter, n°6).
-      if (editing.id !== deleting) setNote({ kind: 'error', text: t('admin.rights.editedGone', { id: editing.id }) })
+      if (editing.id !== deleting)
+        setNote({
+          kind: 'error',
+          text: t('admin.rights.editedGone', { id: editing.id })
+        })
       return
     }
     setEditing(now)
     setForm(profileForm(now))
-    if (dirty) setNote({ kind: 'error', text: t('admin.rights.editReread', { id: now.id }) })
+    if (dirty)
+      setNote({
+        kind: 'error',
+        text: t('admin.rights.editReread', { id: now.id })
+      })
   }
   const latestShow = useLatest(show)
   const load = useCallback(() => {
@@ -95,7 +104,12 @@ export const Rights = () => {
    */
   const send = async (change: (s: OutboundSettings) => Pick<OutboundSettings, 'policy' | 'profiles' | 'assignments'>, deleting?: string) => {
     const { policy, profiles, assignments } = change(settings!)
-    const next = await client.setOutbound({ policy, profiles, assignments, version: settings!.version })
+    const next = await client.setOutbound({
+      policy,
+      profiles,
+      assignments,
+      version: settings!.version
+    })
     show(next, deleting)
     return next
   }
@@ -110,10 +124,16 @@ export const Rights = () => {
     if (!settings) return
     if (editing && !settings.profiles.some(x => x.id === editing.id)) {
       reset()
-      setNote({ kind: 'error', text: t('admin.rights.editedGone', { id: editing.id }) })
+      setNote({
+        kind: 'error',
+        text: t('admin.rights.editedGone', { id: editing.id })
+      })
       return
     }
-    const checked = checkProfile(form, { isNew: !editing, ids: settings.profiles.map(x => x.id) })
+    const checked = checkProfile(form, {
+      isNew: !editing,
+      ids: settings.profiles.map(x => x.id)
+    })
     setProblems(checked.problems)
     if (!checked.profile) {
       // One profile too many is no field's problem: said for the form.
@@ -124,8 +144,14 @@ export const Rights = () => {
     const profile = checked.profile
     setBusy(true)
     try {
-      await send(s => ({ ...s, profiles: editing ? s.profiles.map(x => (x.id === profile.id ? profile : x)) : [...s.profiles, profile] }))
-      setNote({ kind: 'ok', text: t('admin.rights.saved', { id: profile.id }) })
+      await send(s => ({
+        ...s,
+        profiles: editing ? s.profiles.map(x => (x.id === profile.id ? profile : x)) : [...s.profiles, profile]
+      }))
+      setNote({
+        kind: 'ok',
+        text: t('admin.rights.saved', { id: profile.id })
+      })
       reset()
     } catch (err) {
       stale(err)
@@ -157,13 +183,25 @@ export const Rights = () => {
     try {
       await send(s => {
         const { defaultProfile: def, ...policy } = s.policy
-        return { policy: def === profile.id ? policy : s.policy, profiles: s.profiles.filter(x => x.id !== profile.id), assignments: s.assignments.filter(a => a.profileId !== profile.id) }
+        return {
+          policy: def === profile.id ? policy : s.policy,
+          profiles: s.profiles.filter(x => x.id !== profile.id),
+          assignments: s.assignments.filter(a => a.profileId !== profile.id)
+        }
       }, profile.id)
       // The row goes, its buttons with it: the focus goes to what is said.
-      setNote({ kind: 'ok', text: t('admin.rights.deleted', { id: profile.id }), focus: true })
+      setNote({
+        kind: 'ok',
+        text: t('admin.rights.deleted', { id: profile.id }),
+        focus: true
+      })
     } catch (err) {
       stale(err)
-      setNote({ kind: 'error', text: say(refusalOf(err, () => undefined).problem)!, focus: true })
+      setNote({
+        kind: 'error',
+        text: say(refusalOf(err, () => undefined).problem)!,
+        focus: true
+      })
     } finally {
       setBusy(false)
     }
@@ -176,12 +214,18 @@ export const Rights = () => {
     try {
       await send(s => {
         const { defaultProfile: _old, ...policy } = s.policy
-        return { ...s, policy: defaultProfile ? { ...policy, defaultProfile } : policy }
+        return {
+          ...s,
+          policy: defaultProfile ? { ...policy, defaultProfile } : policy
+        }
       })
       setNote({ kind: 'ok', text: t('admin.rights.defaultSaved') })
     } catch (err) {
       stale(err)
-      setNote({ kind: 'error', text: say(refusalOf(err, () => undefined).problem)! })
+      setNote({
+        kind: 'error',
+        text: say(refusalOf(err, () => undefined).problem)!
+      })
     } finally {
       setBusy(false)
     }
@@ -197,10 +241,18 @@ export const Rights = () => {
     try {
       const { userId: _user, profileId: _profile, ...now } = await client.setUserProfile(user.userId, profileId, settings.version)
       show(now)
-      setPeopleNote({ kind: 'ok', text: t('admin.rights.assigned', { name: user.displayName ?? user.userId }) })
+      setPeopleNote({
+        kind: 'ok',
+        text: t('admin.rights.assigned', {
+          name: user.displayName ?? user.userId
+        })
+      })
     } catch (err) {
       stale(err)
-      setPeopleNote({ kind: 'error', text: say(refusalOf(err, () => undefined).problem)! })
+      setPeopleNote({
+        kind: 'error',
+        text: say(refusalOf(err, () => undefined).problem)!
+      })
     } finally {
       setBusy(false)
     }
@@ -209,7 +261,7 @@ export const Rights = () => {
   if (unavailable)
     return (
       <Section id="rights" title={t('admin.nav.rights')}>
-        <p className="alert">{t('admin.rights.unavailable')}</p>
+        <Alert severity="info" role="status">{t('admin.rights.unavailable')}</Alert>
       </Section>
     )
   if (!settings)
@@ -221,7 +273,10 @@ export const Rights = () => {
 
   const classLabel = (c: string) => t(`admin.class.${c}` as Key)
   const profileName = (pr: OutboundProfile) => (pr.name ? `${pr.name} (${pr.id})` : pr.id)
-  const profileOptions = settings.profiles.map(pr => ({ value: pr.id, label: profileName(pr) }))
+  const profileOptions = settings.profiles.map(pr => ({
+    value: pr.id,
+    label: profileName(pr)
+  }))
   // A person without a profile has the default one; the default one, when none, is what the trunks allow.
   const options = [{ value: NONE, label: t('admin.rights.noProfile') }, ...profileOptions]
   const defaultOptions = [{ value: NONE, label: t('admin.rights.defaultNone') }, ...profileOptions]
@@ -234,116 +289,198 @@ export const Rights = () => {
   return (
     <>
       <Section id="rights" title={t('admin.nav.rights')}>
-        <p>{t('admin.rights.help')}</p>
+        <Typography component="p" gutterBottom>
+          {t('admin.rights.help')}
+        </Typography>
         {settings.profiles.length ? (
-          <ul className="list admin-list" aria-label={t('admin.rights.list')}>
+          <List aria-label={t('admin.rights.list')}>
             {settings.profiles.map(pr => (
-              <li key={pr.id}>
-                <div>
-                  <h3>
+              <ListItem key={pr.id} divider>
+                <div className="u-flex-grow-1">
+                  <Typography variant="h6" component="h3">
                     {profileName(pr)}
-                    {settings.policy.defaultProfile === pr.id ? <span className="badge"> · {t('admin.rights.isDefault')}</span> : null}
-                  </h3>
-                  <dl className="facts facts-compact">
-                    <div>
-                      <dt>{t('admin.rights.allowed')}</dt>
-                      <dd>{pr.allowed.length ? pr.allowed.map(classLabel).join(', ') : t('admin.rights.internalOnly')}</dd>
-                    </div>
-                    <div>
-                      <dt>{t('admin.rights.caps')}</dt>
-                      <dd>{capsText(pr) || t('admin.rights.capsDefault')}</dd>
-                    </div>
-                    <div>
-                      <dt>{t('admin.rights.holders')}</dt>
-                      <dd>{settings.assignments.filter(a => a.profileId === pr.id).length}</dd>
-                    </div>
-                  </dl>
+                    {settings.policy.defaultProfile === pr.id ? (
+                      <Typography component="span" variant="body2" color="textSecondary">
+                        {' '}
+                        · {t('admin.rights.isDefault')}
+                      </Typography>
+                    ) : null}
+                  </Typography>
+                  <Typography component="dl" className="u-m-0">
+                    <Stack direction="row" spacing={1} useFlexGap>
+                      <Typography component="dt" color="textSecondary">
+                        {t('admin.rights.allowed')}
+                      </Typography>
+                      <Typography component="dd" className="u-m-0">
+                        {pr.allowed.length ? pr.allowed.map(classLabel).join(', ') : t('admin.rights.internalOnly')}
+                      </Typography>
+                    </Stack>
+                    <Stack direction="row" spacing={1} useFlexGap>
+                      <Typography component="dt" color="textSecondary">
+                        {t('admin.rights.caps')}
+                      </Typography>
+                      <Typography component="dd" className="u-m-0">
+                        {capsText(pr) || t('admin.rights.capsDefault')}
+                      </Typography>
+                    </Stack>
+                    <Stack direction="row" spacing={1} useFlexGap>
+                      <Typography component="dt" color="textSecondary">
+                        {t('admin.rights.holders')}
+                      </Typography>
+                      <Typography component="dd" className="u-m-0">
+                        {settings.assignments.filter(a => a.profileId === pr.id).length}
+                      </Typography>
+                    </Stack>
+                  </Typography>
                 </div>
-                <div className="actions actions-end">
-                  <button type="button" className="btn" onClick={() => edit(pr)} disabled={busy} aria-label={t('admin.rights.edit', { id: pr.id })}>
+                <Stack direction="row" spacing={1} useFlexGap className="u-flex-wrap">
+                  <Button variant="outlined" onClick={() => edit(pr)} disabled={busy} aria-label={t('admin.rights.edit', { id: pr.id })}>
                     {t('admin.edit')}
-                  </button>
+                  </Button>
                   <ConfirmDelete label={t('admin.rights.delete', { id: pr.id })} question={t('admin.rights.deleteConfirm', { id: pr.id })} onConfirm={() => void remove(pr)} disabled={busy} />
-                </div>
-              </li>
+                </Stack>
+              </ListItem>
             ))}
-          </ul>
+          </List>
         ) : (
-          <p className="muted">{t('admin.rights.none')}</p>
+          <Typography component="p" variant="body2" color="textSecondary">
+            {t('admin.rights.none')}
+          </Typography>
         )}
-        <form onSubmit={e => void saveDefault(e)} className="inline-form">
-          <SelectField id="rights-default" label={t('admin.rights.default')} hint={t('admin.rights.defaultHint')} value={defaultProfile} onChange={setDefaultProfile} options={defaultOptions} disabled={busy} />
-          <button type="submit" className="btn" disabled={busy}>
+        <form onSubmit={e => void saveDefault(e)}>
+          <SelectField
+            id="rights-default"
+            label={t('admin.rights.default')}
+            hint={t('admin.rights.defaultHint')}
+            value={defaultProfile}
+            onChange={setDefaultProfile}
+            options={defaultOptions}
+            disabled={busy}
+          />
+          <Button type="submit" variant="outlined" disabled={busy}>
             {t('admin.rights.defaultSave')}
-          </button>
+          </Button>
         </form>
       </Section>
       <Section id="profile-form" title={editing ? t('admin.rights.edit', { id: editing.id }) : t('admin.rights.new')}>
         <form onSubmit={e => void save(e)} noValidate aria-labelledby="profile-form">
           <ProblemSummary count={count} />
-          <TextField id="profile-id" label={t('admin.rights.id')} hint={t('admin.slugHint')} value={form.id} onChange={v => change(f => ({ ...f, id: v }))} error={say(problems.id)} required disabled={busy || !!editing} maxLength={32} />
+          <TextField
+            id="profile-id"
+            label={t('admin.rights.id')}
+            hint={t('admin.slugHint')}
+            value={form.id}
+            onChange={v => change(f => ({ ...f, id: v }))}
+            error={say(problems.id)}
+            required
+            disabled={busy || !!editing}
+            maxLength={32}
+          />
           <TextField id="profile-name" label={t('admin.rights.name')} value={form.name} onChange={v => change(f => ({ ...f, name: v }))} error={say(problems.name)} disabled={busy} maxLength={64} />
-          <CheckGroup id="profile-allowed" legend={t('admin.rights.allowed')} hint={t('admin.rights.allowedHint')} values={TRUNK_OUTBOUND_CLASSES} chosen={form.allowed} label={classLabel} onChange={v => change(f => ({ ...f, allowed: v }))} error={say(problems.allowed)} disabled={busy} />
-          <CapFields prefix="profile" legend={t('admin.rights.caps')} hint={t('admin.rights.capsHint')} caps={form.caps} defaults={settings.defaults.caps.user} problems={problems} onChange={caps => change(f => ({ ...f, caps }))} disabled={busy} />
-          <div className="actions actions-start">
-            <button type="submit" className="btn btn-primary" disabled={busy} aria-busy={busy}>
+          <CheckGroup
+            id="profile-allowed"
+            legend={t('admin.rights.allowed')}
+            hint={t('admin.rights.allowedHint')}
+            values={TRUNK_OUTBOUND_CLASSES}
+            chosen={form.allowed}
+            label={classLabel}
+            onChange={v => change(f => ({ ...f, allowed: v }))}
+            error={say(problems.allowed)}
+            disabled={busy}
+          />
+          <CapFields
+            prefix="profile"
+            legend={t('admin.rights.caps')}
+            hint={t('admin.rights.capsHint')}
+            caps={form.caps}
+            defaults={settings.defaults.caps.user}
+            problems={problems}
+            onChange={caps => change(f => ({ ...f, caps }))}
+            disabled={busy}
+          />
+          <Stack direction="row" spacing={1} useFlexGap className="u-flex-wrap">
+            <Button type="submit" disabled={busy} aria-busy={busy}>
               {t('admin.rights.save')}
-            </button>
+            </Button>
             {editing ? (
-              <button type="button" className="btn" onClick={reset} disabled={busy}>
+              <Button variant="outlined" onClick={reset} disabled={busy}>
                 {t('admin.cancel')}
-              </button>
+              </Button>
             ) : null}
-          </div>
+          </Stack>
         </form>
         <NoteLine note={note} />
       </Section>
       <Section id="rights-people" title={t('admin.rights.people')}>
-        <p>{t('admin.rights.peopleHelp')}</p>
+        <Typography component="p" gutterBottom>
+          {t('admin.rights.peopleHelp')}
+        </Typography>
         {users.length ? (
-          <div className="table-scroll" role="region" tabIndex={0} aria-label={t('admin.rights.people')}>
-            <table className="admin-table">
-              <caption className="sr-only">{t('admin.rights.people')}</caption>
-              <thead>
-                <tr>
-                  <th scope="col">{t('admin.rights.person')}</th>
-                  <th scope="col">{t('admin.rights.extension')}</th>
-                  <th scope="col">{t('admin.rights.profile')}</th>
-                  <th scope="col">
-                    <span className="sr-only">{t('admin.rights.apply')}</span>
-                  </th>
-                </tr>
-              </thead>
-              <tbody>
+          <TableContainer role="region" tabIndex={0} aria-label={t('admin.rights.people')}>
+            <Table size="small">
+              <caption className="u-visuallyhidden">{t('admin.rights.people')}</caption>
+              <TableHead>
+                <TableRow>
+                  <TableCell component="th" scope="col">
+                    {t('admin.rights.person')}
+                  </TableCell>
+                  <TableCell component="th" scope="col">
+                    {t('admin.rights.extension')}
+                  </TableCell>
+                  <TableCell component="th" scope="col">
+                    {t('admin.rights.profile')}
+                  </TableCell>
+                  <TableCell component="th" scope="col">
+                    <span className="u-visuallyhidden">{t('admin.rights.apply')}</span>
+                  </TableCell>
+                </TableRow>
+              </TableHead>
+              <TableBody>
                 {users.map(u => {
                   const name = u.displayName ?? u.userId
                   const value = chosen[u.userId] ?? NONE
                   return (
-                    <tr key={u.userId}>
-                      <th scope="row">{name}</th>
-                      <td>{u.extension}</td>
-                      <td>
-                        <select aria-label={t('admin.rights.profileOf', { name })} value={value} onChange={e => setChosen(c => ({ ...c, [u.userId]: e.target.value }))} disabled={busy}>
+                    <TableRow key={u.userId}>
+                      <TableCell component="th" scope="row">
+                        {name}
+                      </TableCell>
+                      <TableCell>{u.extension}</TableCell>
+                      <TableCell>
+                        <NativeSelect
+                          inputProps={{
+                            'aria-label': t('admin.rights.profileOf', { name })
+                          }}
+                          value={value}
+                          onChange={e =>
+                            setChosen(c => ({
+                              ...c,
+                              [u.userId]: e.target.value
+                            }))
+                          }
+                          disabled={busy}
+                        >
                           {options.map(o => (
                             <option key={o.value} value={o.value}>
                               {o.label}
                             </option>
                           ))}
-                        </select>
-                      </td>
-                      <td>
-                        <button type="button" className="btn" onClick={() => void assign(u)} disabled={busy || value === assigned(u.userId)} aria-label={t('admin.rights.applyFor', { name })}>
+                        </NativeSelect>
+                      </TableCell>
+                      <TableCell>
+                        <Button variant="outlined" onClick={() => void assign(u)} disabled={busy || value === assigned(u.userId)} aria-label={t('admin.rights.applyFor', { name })}>
                           {t('admin.rights.apply')}
-                        </button>
-                      </td>
-                    </tr>
+                        </Button>
+                      </TableCell>
+                    </TableRow>
                   )
                 })}
-              </tbody>
-            </table>
-          </div>
+              </TableBody>
+            </Table>
+          </TableContainer>
         ) : (
-          <p className="muted">{t('admin.rights.nobody')}</p>
+          <Typography component="p" variant="body2" color="textSecondary">
+            {t('admin.rights.nobody')}
+          </Typography>
         )}
         <NoteLine note={peopleNote} />
       </Section>

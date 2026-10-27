@@ -70,7 +70,7 @@ const open = async (login, name) => {
   return { page, context, name }
 }
 const presenceIs = async (page, query, extension, status) => {
-  await page.getByRole('link', { name: 'Annuaire' }).click()
+  await page.getByRole('link', { name: 'Clavier' }).click()
   await page.getByLabel('Rechercher').fill(query)
   await page.getByTestId(`presence-${extension}`).filter({ hasText: status }).waitFor({ timeout: 10_000 })
 }
@@ -91,7 +91,7 @@ try {
   await step('Alice calls Bob, who answers: audio flows both ways through rtpengine, presence shows the call', async () => {
     await alice.page.getByRole('link', { name: 'Clavier' }).click()
     await alice.page.getByLabel('Numéro à appeler').fill('102')
-    await alice.page.getByRole('button', { name: 'Appeler' }).click()
+    await alice.page.getByRole('button', { name: 'Appeler', exact: true }).click()
     await bob.page.getByTestId('incoming-call').getByText('Alice Martin (101)').waitFor({ timeout: 20_000 })
     await bob.page.getByTestId('incoming-call').getByRole('button', { name: 'Répondre' }).click()
     await bob.page.getByText('En communication avec Alice Martin (101)').waitFor()
@@ -107,7 +107,7 @@ try {
     await alice.page.getByRole('button', { name: 'Raccrocher' }).click()
     await presenceIs(bob.page, 'Alice', '101', 'Disponible')
     await bob.page.getByRole('link', { name: 'Récents' }).click()
-    await until('the call in Bob\'s history', async () => (await bob.page.locator('main ul.list li').filter({ hasText: '101' }).count()) > 0)
+    await until('the call in Bob\'s history', async () => (await bob.page.locator('[data-testid=recents] li').filter({ hasText: '101' }).count()) > 0)
   })
   await step('the identity provider\'s administration and account console are not served on the Internet', async () => {
     for (const path of ['/auth/admin/', '/auth/realms/master/', '/auth/realms/twakephone/account']) {

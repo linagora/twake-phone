@@ -1,3 +1,4 @@
+import { Alert, Button, Card, CardContent, List, ListItem, Stack, Typography } from '@linagora/twake-mui'
 import { useCallback, useEffect, useState } from 'react'
 import type { DirectoryAdmin, SyncReport } from '@twake/telephony-client'
 import { useGateway } from '../../gateway.js'
@@ -6,7 +7,12 @@ import { useT } from '../../i18n/useT.js'
 
 type T = (key: Key, params?: Record<string, string | number>) => string
 
-const describeInterval = (t: T, ms: number) => (ms >= 7_200_000 && ms % 3_600_000 === 0 ? t('admin.interval.hours', { hours: ms / 3_600_000 }) : t('admin.interval.minutes', { minutes: Math.max(1, Math.round(ms / 60_000)) }))
+const describeInterval = (t: T, ms: number) =>
+  ms >= 7_200_000 && ms % 3_600_000 === 0
+    ? t('admin.interval.hours', { hours: ms / 3_600_000 })
+    : t('admin.interval.minutes', {
+        minutes: Math.max(1, Math.round(ms / 60_000))
+      })
 const describeDuration = (t: T, ms: number) => (ms < 1000 ? t('admin.duration.ms', { ms }) : t('admin.duration.seconds', { seconds: Math.round(ms / 1000) }))
 /** While a run is in progress, the status is read again this often. */
 const POLL_MS = 1500
@@ -25,25 +31,39 @@ const Report = ({ report }: { report: SyncReport }) => {
   ]
   return (
     <>
-      {report.error ? <p className="alert alert-error">{t('admin.syncFailed', { reason: report.error })}</p> : null}
-      <dl className="facts">
+      {report.error ? <Alert severity="error">{t('admin.syncFailed', { reason: report.error })}</Alert> : null}
+      <Typography component="dl" className="u-m-0">
         {rows.map(([key, value]) => (
-          <div key={key}>
-            <dt>{t(key)}</dt>
-            <dd>{value}</dd>
-          </div>
+          <Stack key={key} direction="row" spacing={1} useFlexGap>
+            <Typography component="dt" color="textSecondary">
+              {t(key)}
+            </Typography>
+            <Typography component="dd" className="u-m-0">
+              {value}
+            </Typography>
+          </Stack>
         ))}
-        <div>
-          <dt>{t('admin.reportConflicts')}</dt>
-          <dd>{report.conflicts.length}</dd>
-        </div>
-      </dl>
+        <Stack direction="row" spacing={1} useFlexGap>
+          <Typography component="dt" color="textSecondary">
+            {t('admin.reportConflicts')}
+          </Typography>
+          <Typography component="dd" className="u-m-0">
+            {report.conflicts.length}
+          </Typography>
+        </Stack>
+      </Typography>
       {report.conflicts.length ? (
-        <ul className="list">
+        <List>
           {report.conflicts.map(c => (
-            <li key={`${c.userId}:${c.extension}`}>{t(c.reserved ? 'admin.conflictReserved' : c.invalid ? 'admin.conflictInvalid' : c.group ? 'admin.conflictGroup' : 'admin.conflict', { userId: c.userId, extension: c.extension, heldBy: c.heldBy })}</li>
+            <ListItem key={`${c.userId}:${c.extension}`} divider>
+              {t(c.reserved ? 'admin.conflictReserved' : c.invalid ? 'admin.conflictInvalid' : c.group ? 'admin.conflictGroup' : 'admin.conflict', {
+                userId: c.userId,
+                extension: c.extension,
+                heldBy: c.heldBy
+              })}
+            </ListItem>
           ))}
-        </ul>
+        </List>
       ) : null}
     </>
   )
@@ -55,7 +75,10 @@ export const Accounts = () => {
   const { client, me, refreshMe } = useGateway()
   const admin = me?.features?.admin === true
   const [data, setData] = useState<DirectoryAdmin | null>(null)
-  const [error, setError] = useState<{ status?: string; reason: string } | null>(null)
+  const [error, setError] = useState<{
+    status?: string
+    reason: string
+  } | null>(null)
   // The run this screen started: its outcome is announced once it is over.
   const [started, setStarted] = useState(false)
   const [outcome, setOutcome] = useState<{ ok: true } | { ok: false; reason: Key; detail: string } | null>(null)
@@ -69,7 +92,12 @@ export const Accounts = () => {
         setData(d)
         setError(null)
       })
-      .catch((err: unknown) => setError({ status: gatewayStatus(err), reason: err instanceof Error ? err.message : String(err) }))
+      .catch((err: unknown) =>
+        setError({
+          status: gatewayStatus(err),
+          reason: err instanceof Error ? err.message : String(err)
+        })
+      )
   }, [admin, client])
   useEffect(load, [load])
   // A run in progress (this screen's, another administrator's, or the scheduled one) is followed until it ends.
@@ -94,7 +122,11 @@ export const Accounts = () => {
       setStarted(true)
       setData(d => (d ? { ...d, sync: status } : d))
     } catch (err) {
-      setOutcome({ ok: false, reason: gatewayStatus(err) === '409' ? 'admin.syncBusy' : 'admin.syncFailed', detail: err instanceof Error ? err.message : String(err) })
+      setOutcome({
+        ok: false,
+        reason: gatewayStatus(err) === '409' ? 'admin.syncBusy' : 'admin.syncFailed',
+        detail: err instanceof Error ? err.message : String(err)
+      })
       load()
     }
   }
@@ -105,81 +137,134 @@ export const Accounts = () => {
   const formatDate = (iso: string) => new Date(iso).toLocaleString(lang === 'fr' ? 'fr-FR' : 'en-GB')
   return (
     <>
-      {error ? <p className="alert alert-error" role="alert">{error.status === '501' ? t('admin.noDirectory') : t('admin.error', { reason: error.reason })}</p> : null}
+      {error ? (
+        <Alert severity="error" role="alert">
+          {error.status === '501' ? t('admin.noDirectory') : t('admin.error', { reason: error.reason })}
+        </Alert>
+      ) : null}
       {source ? (
-        <section className="card" aria-labelledby="source">
-          <h2 id="source">{t('admin.source')}</h2>
-          <dl className="facts">
-            <div>
-              <dt>{t('admin.sourceType')}</dt>
-              <dd>{source.type.toUpperCase()}</dd>
-            </div>
-            {source.url ? (
-              <div>
-                <dt>{t('admin.sourceUrl')}</dt>
-                <dd>
-                  <code>{source.url}</code>
-                </dd>
-              </div>
+        <Card component="section" variant="outlined" aria-labelledby="source" className="u-mb-1">
+          <CardContent>
+            <Typography variant="h5" component="h2" id="source" gutterBottom>
+              {t('admin.source')}
+            </Typography>
+            <Typography component="dl" className="u-m-0">
+              <Stack direction="row" spacing={1} useFlexGap>
+                <Typography component="dt" color="textSecondary">
+                  {t('admin.sourceType')}
+                </Typography>
+                <Typography component="dd" className="u-m-0">
+                  {source.type.toUpperCase()}
+                </Typography>
+              </Stack>
+              {source.url ? (
+                <Stack direction="row" spacing={1} useFlexGap>
+                  <Typography component="dt" color="textSecondary">
+                    {t('admin.sourceUrl')}
+                  </Typography>
+                  <Typography component="dd" className="u-m-0">
+                    <code>{source.url}</code>
+                  </Typography>
+                </Stack>
+              ) : null}
+              {source.tenantId ? (
+                <Stack direction="row" spacing={1} useFlexGap>
+                  <Typography component="dt" color="textSecondary">
+                    {t('admin.sourceTenant')}
+                  </Typography>
+                  <Typography component="dd" className="u-m-0">
+                    {source.tenantId}
+                  </Typography>
+                </Stack>
+              ) : null}
+              {source.baseDn ? (
+                <Stack direction="row" spacing={1} useFlexGap>
+                  <Typography component="dt" color="textSecondary">
+                    {t('admin.sourceBase')}
+                  </Typography>
+                  <Typography component="dd" className="u-m-0">
+                    <code>{source.baseDn}</code>
+                  </Typography>
+                </Stack>
+              ) : null}
+              {source.userFilter ? (
+                <Stack direction="row" spacing={1} useFlexGap>
+                  <Typography component="dt" color="textSecondary">
+                    {t('admin.sourceFilter')}
+                  </Typography>
+                  <Typography component="dd" className="u-m-0">
+                    <code>{source.userFilter}</code>
+                  </Typography>
+                </Stack>
+              ) : null}
+            </Typography>
+            {attributes.length ? (
+              <>
+                <Typography variant="h6" component="h3">
+                  {t('admin.sourceAttributes')}
+                </Typography>
+                <Typography component="dl" className="u-m-0">
+                  {attributes.map(([name, attr]) => (
+                    <Stack key={name} direction="row" spacing={1} useFlexGap>
+                      <Typography component="dt" color="textSecondary">
+                        {name}
+                      </Typography>
+                      <Typography component="dd" className="u-m-0">
+                        {attr ? (
+                          <code>{attr}</code>
+                        ) : (
+                          <Typography component="span" variant="body2" color="textSecondary">
+                            {t('admin.sourceAttributeNone')}
+                          </Typography>
+                        )}
+                      </Typography>
+                    </Stack>
+                  ))}
+                </Typography>
+              </>
             ) : null}
-            {source.tenantId ? (
-              <div>
-                <dt>{t('admin.sourceTenant')}</dt>
-                <dd>{source.tenantId}</dd>
-              </div>
-            ) : null}
-            {source.baseDn ? (
-              <div>
-                <dt>{t('admin.sourceBase')}</dt>
-                <dd>
-                  <code>{source.baseDn}</code>
-                </dd>
-              </div>
-            ) : null}
-            {source.userFilter ? (
-              <div>
-                <dt>{t('admin.sourceFilter')}</dt>
-                <dd>
-                  <code>{source.userFilter}</code>
-                </dd>
-              </div>
-            ) : null}
-          </dl>
-          {attributes.length ? (
-            <>
-              <h3>{t('admin.sourceAttributes')}</h3>
-              <dl className="facts facts-compact">
-                {attributes.map(([name, attr]) => (
-                  <div key={name}>
-                    <dt>{name}</dt>
-                    <dd>{attr ? <code>{attr}</code> : <span className="muted">{t('admin.sourceAttributeNone')}</span>}</dd>
-                  </div>
-                ))}
-              </dl>
-            </>
-          ) : null}
-        </section>
+          </CardContent>
+        </Card>
       ) : null}
       {data ? (
-        <section className="card" aria-labelledby="sync">
-          <h2 id="sync">{t('admin.sync')}</h2>
-          <p>{t('admin.syncHelp')}</p>
-          {data.sync.available ? (
-            <>
-              <p>{data.sync.intervalMs ? t('admin.syncSchedule', { interval: describeInterval(t, data.sync.intervalMs) }) : t('admin.syncNoSchedule')}</p>
-              <p>{last ? t('admin.syncLast', { date: formatDate(last.finishedAt), duration: describeDuration(t, last.durationMs) }) : t('admin.syncNever')}</p>
-              <p>
-                <button type="button" className="btn btn-primary" onClick={() => void sync()} disabled={running} aria-busy={running}>
+        <Card component="section" variant="outlined" aria-labelledby="sync" className="u-mb-1">
+          <CardContent>
+            <Typography variant="h5" component="h2" id="sync" gutterBottom>
+              {t('admin.sync')}
+            </Typography>
+            <Typography component="p" gutterBottom>
+              {t('admin.syncHelp')}
+            </Typography>
+            {data.sync.available ? (
+              <>
+                <Typography component="p" gutterBottom>
+                  {data.sync.intervalMs
+                    ? t('admin.syncSchedule', {
+                        interval: describeInterval(t, data.sync.intervalMs)
+                      })
+                    : t('admin.syncNoSchedule')}
+                </Typography>
+                <Typography component="p" gutterBottom>
+                  {last
+                    ? t('admin.syncLast', {
+                        date: formatDate(last.finishedAt),
+                        duration: describeDuration(t, last.durationMs)
+                      })
+                    : t('admin.syncNever')}
+                </Typography>
+                <Button onClick={() => void sync()} disabled={running} aria-busy={running}>
                   {t('admin.syncNow')}
-                </button>
-              </p>
-              <div role="status">{running ? t('admin.syncRunning') : outcome ? (outcome.ok ? t('admin.syncDone') : t(outcome.reason, { reason: outcome.detail })) : ''}</div>
-              {last ? <Report report={last} /> : null}
-            </>
-          ) : (
-            <p className="alert">{t('admin.syncUnavailable')}</p>
-          )}
-        </section>
+                </Button>
+                <Typography component="div" role="status" className="u-mt-1 u-mb-1">
+                  {running ? t('admin.syncRunning') : outcome ? (outcome.ok ? t('admin.syncDone') : t(outcome.reason, { reason: outcome.detail })) : ''}
+                </Typography>
+                {last ? <Report report={last} /> : null}
+              </>
+            ) : (
+              <Alert severity="info" role="status">{t('admin.syncUnavailable')}</Alert>
+            )}
+          </CardContent>
+        </Card>
       ) : null}
     </>
   )

@@ -719,7 +719,7 @@ const signOut = async who => {
 const dial = async (page, number) => {
   if (!(await page.getByLabel('Numéro à appeler').isVisible())) await page.getByRole('link', { name: 'Clavier' }).click()
   await page.getByLabel('Numéro à appeler').fill(number)
-  await page.getByRole('button', { name: 'Appeler' }).click()
+  await page.getByRole('button', { name: 'Appeler', exact: true }).click()
 }
 /** RTP flows both ways on each side; `last` picks the newest call of the page (a consultation) instead of the oldest. */
 const bothHearEachOther = async (a, b, { last = false } = {}) => {
@@ -734,16 +734,19 @@ const bothHearEachOther = async (a, b, { last = false } = {}) => {
 }
 /** Opens the directory, searches `query` (one person) and waits for the presence next to that extension to read `status`. */
 const presenceIs = async (page, query, extension, status, timeout = 10_000) => {
-  await page.getByRole('link', { name: 'Annuaire' }).click()
+  await page.getByRole('link', { name: 'Clavier' }).click()
   await page.getByLabel('Rechercher').fill(query)
-  await page.getByTestId(`presence-${extension}`).filter({ hasText: status }).waitFor({ timeout })
+  // Two people may share an extension (Bob Durand and Marc Petit, 103): each of their chips reads the same presence.
+  const chips = page.getByTestId(`presence-${extension}`)
+  await chips.filter({ hasText: status }).first().waitFor({ timeout })
+  await until(`every chip of ${extension} reads ${status}`, async () => ((await chips.filter({ hasText: status }).count()) === (await chips.count()) ? true : null))
 }
 /** Opens Récents and reads its lines as "number: label" (newest first), once at least `atLeast` are shown. */
 const recents = async (page, atLeast) => {
   await page.getByRole('link', { name: 'Récents' }).click()
   await page.getByRole('heading', { level: 1, name: 'Récents' }).waitFor()
   return until(`${atLeast} recent calls`, async () => {
-    const lines = await page.locator('main ul.list li').evaluateAll(items => items.map(li => `${li.querySelector('strong')?.textContent}: ${li.querySelector('.badge')?.textContent}`))
+    const lines = await page.locator('[data-testid=recents] > li').evaluateAll(items => items.map(li => `${li.querySelector('[data-testid=recent-number]')?.textContent}: ${li.querySelector('[data-testid=recent-label]')?.textContent}`))
     return lines.length >= atLeast ? lines : null
   })
 }
@@ -4185,7 +4188,7 @@ try {
     expectEqual((await bobApi('GET', '/voicemails')).json().items.some(i => i.id === item.id), false, "Jean's message in Bob's list")
     expectEqual((await jeanMailbox('GET', '/voicemails')).json().items.map(i => `${i.id} ${i.unread}`), [`${item.id} true`], "Jean's message after Bob's requests")
   })
-  await step('step 11a: Jean listens to it in the page (the recording, from Wazo), marks it read, then calls Bob back from it: Bob\'s browser rings, they talk', async () => {
+  await step('step 11a: Jean listens to it in the page (the recording, from Wazo), which marks it read, then calls Bob back from it: Bob\'s browser rings, they talk', async () => {
     await setStatus(jean, 'Disponible')
     await jean.page.getByRole('link', { name: /^Messagerie vocale/ }).click()
     const message = jean.page.getByTestId('voicemail')
@@ -4195,12 +4198,24 @@ try {
       const a = document.querySelector('[data-testid=voicemail-audio]')
       return !!a && a.readyState >= 2 && a.duration >= 2 && a.currentTime > 0
     }, null, { timeout: 15_000 })
-    await message.getByRole('button', { name: /^Marquer comme lu le message de / }).click()
     await jean.page.locator('[data-testid=voicemail][data-unread="0"]').waitFor()
     await jean.page.getByText('Tous les messages sont lus.').waitFor()
     await jean.page.getByRole('link', { name: 'Messagerie vocale', exact: true }).waitFor()
     expectEqual((await jeanMailbox('GET', '/voicemails')).json().items.map(i => i.unread), [false], 'the message read, as Wazo keeps it')
     await message.getByRole('button', { name: /^Rappeler / }).click()
+    const ringing = bob.page.getByTestId('incoming-call')
+    await ringing.getByText('Appel entrant de Jean Dupont (102)').waitFor({ timeout: 20_000 })
+    await ringing.getByRole('button', { name: 'Répondre' }).click()
+    await jean.page.getByText('En communication avec Bob Durand (103)').waitFor()
+    await bothHearEachOther(jean, bob)
+    await bob.page.getByRole('button', { name: 'Raccrocher' }).click()
+    await jean.page.getByText('Appel avec Bob Durand (103) terminé.').waitFor()
+  })
+  await step('Jean calls Bob back from his Récents (the row): Bob\'s browser rings, they talk', async () => {
+    const lines = await recents(jean.page, 1)
+    if (!lines.some(l => l.startsWith('103: '))) throw new Error(`Jean's Récents: ${JSON.stringify(lines)}`)
+    // Named by the directory when one person has 103 there (Bob Durand and Marc Petit share it in the test's).
+    await jean.page.getByRole('button', { name: /^Rappeler (Bob Durand \()?103\)? \(/ }).first().click()
     const ringing = bob.page.getByTestId('incoming-call')
     await ringing.getByText('Appel entrant de Jean Dupont (102)').waitFor({ timeout: 20_000 })
     await ringing.getByRole('button', { name: 'Répondre' }).click()

@@ -1,4 +1,5 @@
-import { useEffect, useState, type FormEvent } from 'react'
+import { Alert, Button, Card, CardContent, FormControl, FormLabel, Stack, TextField, Typography } from '@linagora/twake-mui'
+import { useEffect, useState, type FormEvent, type ReactNode } from 'react'
 import type { MyPresence } from '@twake/telephony-client'
 import { chosenStatus, DEFAULT_DELAY_SEC, DELAY_SEC, delayValid, formFromRules, fromLocalInput, refusalKey, rulesFromForm, statusOptions, timedStatus, toLocalInput, type ChosenStatus, type ForwardingForm } from '../callRules.js'
 import { formatNumber } from '../format.js'
@@ -13,14 +14,20 @@ const absent = (err: unknown) => (err as { status?: unknown } | null)?.status ==
 /** What the save said: a short confirmation (polite), or why it failed (an alert). */
 const Outcome = ({ note }: { note: Note }) =>
   note?.kind === 'error' ? (
-    <p className="alert alert-error" role="alert">
+    <Alert severity="error" role="alert">
       {note.text}
-    </p>
+    </Alert>
   ) : (
-    <p className="badge" role="status">
+    <Typography variant="body2" color="textSecondary" component="p" role="status">
       {note?.text ?? ''}
-    </p>
+    </Typography>
   )
+
+const Hint = ({ id, children }: { id: string; children: ReactNode }) => (
+  <Typography id={id} variant="body2" color="textSecondary" component="span" className="u-db u-mb-1">
+    {children}
+  </Typography>
+)
 
 /**
  * The person's own availability: available, absent or "do not disturb", the last two until a date if they want, with
@@ -83,52 +90,75 @@ export const PresenceSettings = () => {
       : t('presence.available')
   const form = (
     <form onSubmit={e => void save(e)}>
-      <div className="field">
-        <label htmlFor="presence-status">{t('settings.presenceStatus')}</label>
-        <select id="presence-status" value={status} onChange={e => setStatus(e.target.value as ChosenStatus)} disabled={busy}>
-          {statusOptions(chosenStatus(current?.choice)).map(s => (
-            <option key={s} value={s}>
-              {t(`presence.${s}`)}
-            </option>
-          ))}
-        </select>
-      </div>
+      <TextField
+        select
+        id="presence-status"
+        label={t('settings.presenceStatus')}
+        value={status}
+        onChange={e => setStatus(e.target.value as ChosenStatus)}
+        disabled={busy}
+        fullWidth
+        className="u-mb-1"
+        slotProps={{ select: { native: true }, inputLabel: { shrink: true } }}
+      >
+        {statusOptions(chosenStatus(current?.choice)).map(s => (
+          <option key={s} value={s}>
+            {t(`presence.${s}`)}
+          </option>
+        ))}
+      </TextField>
       {timed ? (
         <>
-          <div className="field">
-            <label htmlFor="presence-until">{t('settings.presenceUntilLabel')}</label>
-            <input id="presence-until" type="datetime-local" value={until} onChange={e => setUntil(e.target.value)} disabled={busy} aria-describedby="presence-until-hint" />
-            <span id="presence-until-hint" className="badge">
-              {t('settings.presenceUntilHint')}
-            </span>
-          </div>
-          <div className="field">
-            <label htmlFor="presence-message">{t('settings.presenceMessage')}</label>
-            <input id="presence-message" type="text" maxLength={140} value={message} onChange={e => setMessage(e.target.value)} disabled={busy} aria-describedby="presence-message-hint" />
-            <span id="presence-message-hint" className="badge">
-              {t('settings.presenceMessageHint')} {status === 'dnd' ? t('settings.presenceMessageHintDnd') : null}
-            </span>
-          </div>
+          <TextField
+            id="presence-until"
+            type="datetime-local"
+            label={t('settings.presenceUntilLabel')}
+            value={until}
+            onChange={e => setUntil(e.target.value)}
+            disabled={busy}
+            fullWidth
+            slotProps={{ inputLabel: { shrink: true }, htmlInput: { 'aria-describedby': 'presence-until-hint' } }}
+          />
+          <Hint id="presence-until-hint">{t('settings.presenceUntilHint')}</Hint>
+          <TextField
+            id="presence-message"
+            type="text"
+            label={t('settings.presenceMessage')}
+            value={message}
+            onChange={e => setMessage(e.target.value)}
+            disabled={busy}
+            fullWidth
+            slotProps={{ htmlInput: { maxLength: 140, 'aria-describedby': 'presence-message-hint' } }}
+          />
+          <Hint id="presence-message-hint">
+            {t('settings.presenceMessageHint')} {status === 'dnd' ? t('settings.presenceMessageHintDnd') : null}
+          </Hint>
         </>
       ) : null}
-      <div className="actions">
-        <button type="submit" className="btn btn-primary" disabled={busy} aria-busy={busy}>
+      <Stack direction="row" spacing={1} useFlexGap className="u-flex-wrap u-mb-1">
+        <Button type="submit" disabled={busy} aria-busy={busy}>
           {t('settings.presenceSave')}
-        </button>
-      </div>
+        </Button>
+      </Stack>
     </form>
   )
   return (
-    <section className="card" aria-labelledby="availability">
-      <h2 id="availability">{t('settings.availability')}</h2>
-      {current ? (
-        <>
-          <p data-testid="my-presence">{t('settings.presenceNow', { summary })}</p>
-          {form}
-        </>
-      ) : null}
-      <Outcome note={note} />
-    </section>
+    <Card component="section" variant="outlined" aria-labelledby="availability" className="u-mb-1">
+      <CardContent>
+        <Typography variant="h5" component="h2" id="availability" gutterBottom>
+          {t('settings.availability')}
+        </Typography>
+        {current ? (
+          <>
+            <Typography component="p" data-testid="my-presence" className="u-mb-1">
+              {t('settings.presenceNow', { summary })}
+            </Typography>
+            {form}
+          </>
+        ) : null}
+        <Outcome note={note} />
+      </CardContent>
+    </Card>
   )
 }
 
@@ -190,41 +220,56 @@ export const ForwardingSettings = () => {
     }
   }
   const field = (key: 'always' | 'busy' | 'noAnswer', label: 'settings.forwardAlways' | 'settings.forwardBusy' | 'settings.forwardNoAnswer') => (
-    <div className="field">
-      <label htmlFor={`forward-${key}`}>{t(label)}</label>
-      <input id={`forward-${key}`} type="text" inputMode="tel" autoComplete="off" maxLength={64} value={form[key]} onChange={set(key)} disabled={busy} aria-describedby="forward-hint" />
-    </div>
+    <TextField
+      id={`forward-${key}`}
+      type="text"
+      label={t(label)}
+      value={form[key]}
+      onChange={set(key)}
+      disabled={busy}
+      fullWidth
+      className="u-mb-1"
+      slotProps={{ htmlInput: { inputMode: 'tel', autoComplete: 'off', maxLength: 64, 'aria-describedby': 'forward-hint' } }}
+    />
   )
   return (
-    <section className="card" aria-labelledby="forwarding">
-      <h2 id="forwarding">{t('settings.forwarding')}</h2>
-      <p id="forward-hint" className="badge">
+    <Card component="section" variant="outlined" aria-labelledby="forwarding" className="u-mb-1">
+      <CardContent>
+      <Typography variant="h5" component="h2" id="forwarding" gutterBottom>
+        {t('settings.forwarding')}
+      </Typography>
+      <Typography id="forward-hint" variant="body2" color="textSecondary" component="p" className="u-mb-1">
         {t('settings.forwardingHint')}
-      </p>
+      </Typography>
       {loaded ? (
         <form onSubmit={e => void save(e)}>
           {field('always', 'settings.forwardAlways')}
           {field('busy', 'settings.forwardBusy')}
-          <fieldset className="field">
-            <legend>{t('settings.forwardNoAnswerGroup')}</legend>
+          <FormControl component="fieldset" className="u-mb-1 u-w-100">
+            <FormLabel component="legend">{t('settings.forwardNoAnswerGroup')}</FormLabel>
             {field('noAnswer', 'settings.forwardNoAnswer')}
-            <div className="field">
-              <label htmlFor="forward-delay">{t('settings.forwardDelay')}</label>
-              <input id="forward-delay" type="number" inputMode="numeric" min={DELAY_SEC.min} max={DELAY_SEC.max} step={1} value={form.delaySec} onChange={set('delaySec')} disabled={busy} aria-describedby="forward-delay-hint" />
-              <span id="forward-delay-hint" className="badge">
-                {t('settings.forwardDelayHint')}
-              </span>
-            </div>
-          </fieldset>
-          <div className="actions">
-            <button type="submit" className="btn btn-primary" disabled={busy} aria-busy={busy}>
+            <TextField
+              id="forward-delay"
+              type="number"
+              label={t('settings.forwardDelay')}
+              value={form.delaySec}
+              onChange={set('delaySec')}
+              disabled={busy}
+              fullWidth
+              slotProps={{ htmlInput: { inputMode: 'numeric', min: DELAY_SEC.min, max: DELAY_SEC.max, step: 1, 'aria-describedby': 'forward-delay-hint' } }}
+            />
+            <Hint id="forward-delay-hint">{t('settings.forwardDelayHint')}</Hint>
+          </FormControl>
+          <Stack direction="row" spacing={1} useFlexGap className="u-flex-wrap u-mb-1">
+            <Button type="submit" disabled={busy} aria-busy={busy}>
               {t('settings.forwardingSave')}
-            </button>
-          </div>
+            </Button>
+          </Stack>
         </form>
       ) : null}
       <Outcome note={note} />
-    </section>
+      </CardContent>
+    </Card>
   )
 }
 
@@ -248,15 +293,19 @@ export const EmergencySiteSettings = () => {
   }, [client])
   if (state === null || (state !== 'error' && !state.enabled)) return null
   return (
-    <section className="card" aria-labelledby="emergency">
-      <h2 id="emergency">{t('settings.emergency.title')}</h2>
-      {state === 'error' ? (
-        <p className="alert alert-error" role="alert">
-          {t('settings.emergency.error')}
-        </p>
-      ) : (
-        <p>{state.site ? t('settings.emergency.site', { ...state.site, number: formatNumber(state.site.number) }) : t('settings.emergency.none')}</p>
-      )}
-    </section>
+    <Card component="section" variant="outlined" aria-labelledby="emergency" className="u-mb-1">
+      <CardContent>
+        <Typography variant="h5" component="h2" id="emergency" gutterBottom>
+          {t('settings.emergency.title')}
+        </Typography>
+        {state === 'error' ? (
+          <Alert severity="error" role="alert">
+            {t('settings.emergency.error')}
+          </Alert>
+        ) : (
+          <Typography component="p">{state.site ? t('settings.emergency.site', { ...state.site, number: formatNumber(state.site.number) }) : t('settings.emergency.none')}</Typography>
+        )}
+      </CardContent>
+    </Card>
   )
 }
