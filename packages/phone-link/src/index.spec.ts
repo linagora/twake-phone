@@ -84,6 +84,19 @@ describe('requestCall', () => {
     expect(openPhone).toHaveBeenCalledWith(expect.stringContaining(encodeURIComponent('+33612345678')))
   })
 
+  it('opens the app when the intent does not answer in time', async () => {
+    const { Intents, start } = fakeIntents({ handled: true })
+    start.mockImplementationOnce(() => new Promise(() => undefined))
+    const openPhone = vi.fn()
+    expect(await requestCall({ client, Intents, number: '102', openPhone, intentTimeoutMs: 10 })).toEqual({ handled: true, via: 'app' })
+    expect(openPhone).toHaveBeenCalledOnce()
+  })
+
+  it('reports a blocked tab as not handled, not as opened', async () => {
+    const { Intents } = fakeIntents({ handled: false })
+    expect(await requestCall({ client, Intents, number: '102', openPhone: () => false })).toEqual({ handled: false, reason: 'phone-unavailable' })
+  })
+
   it('reports it when not even the app can be opened', async () => {
     const { Intents } = fakeIntents({ handled: false })
     const openPhone = vi.fn(() => { throw new Error('blocked') })

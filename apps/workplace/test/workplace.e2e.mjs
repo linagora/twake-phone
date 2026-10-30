@@ -117,7 +117,7 @@ const host = createServer(async (req, res) => {
     return res.end(await readFile(HOST_BUNDLE))
   }
   res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
-  res.end(`<!doctype html><title>Drive</title><h1>Drive</h1><script>window.STACK = ${JSON.stringify(stackOrigin)}</script><script src="/host.js"></script>`)
+  res.end(`<!doctype html><title>Drive</title><h1>Drive</h1><button id="call" data-number="06 12 34 56 07">06 12 34 56 07</button><script>window.STACK = ${JSON.stringify(stackOrigin)}</script><script src="/host.js"></script>`)
 })
 hostOrigin = await listen(host)
 
@@ -175,19 +175,42 @@ try {
   drive.on('request', r => process.env.DEBUG_E2E && console.log('drive request:', r.method(), r.url()))
   await drive.goto(`${hostOrigin}/`)
   await drive.waitForFunction(() => typeof window.callFromHost === 'function')
-  await step('another app calls a number: the CALL intent hands it to the Twake Phone window on screen, without a new tab', async () => {
+  await step('another app calls a number: the CALL intent hands it to the Twake Phone window on screen, without a new tab, and nothing is dialled', async () => {
+    const calls = []
+    const onRequest = req => (req.method() === 'POST' && new URL(req.url()).pathname.endsWith('/calls') ? calls.push(req.url()) : undefined)
+    workplace.on('request', onRequest)
     const result = await drive.evaluate(() => window.callFromHost('06 12 34 56 09'))
     expectEqual(result.handled, true, 'handled')
     expectEqual(result.via, 'phone', 'handled by')
     expectEqual(result.opened.length, 0, 'tabs opened')
     await until(async () => (await phoneFrame().getByLabel('Numéro à appeler').inputValue()) === '+33612345609', 'number in the framed dialer')
+    workplace.off('request', onRequest)
+    expectEqual(calls.length, 0, 'calls placed')
   })
-  await step('with no Twake Phone window, the app is opened on the number', async () => {
+  await step('a Twake Phone window whose frame is not signed in does not swallow the number: the app is opened on it', async () => {
     await workplace.close()
+    // A new tab of the Workplace app: its frame's session is the tab's (sessionStorage), so it is not signed in.
+    const fresh = await context.newPage()
+    await fresh.goto(`${stackOrigin}/`)
+    await fresh.frameLocator('#embeddedApp').getByRole('button', { name: 'Se connecter' }).waitFor()
     const result = await drive.evaluate(() => window.callFromHost('06 12 34 56 08'))
     expectEqual(result.via, 'app', 'handled by')
     expectEqual(result.opened.length, 1, 'tabs opened')
     if (!result.opened[0].endsWith(`#/bridge/?dial=${encodeURIComponent('+33612345608')}`)) throw new Error(`opened ${result.opened[0]}`)
+    await fresh.close()
+  })
+  await step('with no Twake Phone window, a click in the other app opens Twake Phone in a new tab on the number', async () => {
+    const tabComing = context.waitForEvent('page')
+    await drive.getByRole('button', { name: '06 12 34 56 07' }).click()
+    const tab = await tabComing.catch(async err => {
+      throw new Error(`no tab (${err.message}); the click gave ${JSON.stringify(await drive.evaluate(() => window.lastResult))}`)
+    })
+    // The instance's Phone app (<instance>-phone.<domain>; on an IP, the stack's own origin, as here).
+    await tab.waitForURL(url => url.hash.startsWith('#/bridge/?dial='))
+    if (!tab.url().endsWith(`#/bridge/?dial=${encodeURIComponent('+33612345607')}`)) throw new Error(`opened ${tab.url()}`)
+    expectEqual(JSON.stringify(await drive.evaluate(() => window.lastResult)), JSON.stringify({ handled: true, via: 'app' }), 'result')
+    expectEqual(await tab.evaluate(() => window.opener), null, 'the tab is cut from the page that opened it')
+    await tab.close()
   })
   await step('text that is not a number is never handed to anyone', async () => {
     const result = await drive.evaluate(() => window.callFromHost('appelle-moi'))
