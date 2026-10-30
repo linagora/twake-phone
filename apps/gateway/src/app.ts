@@ -1943,7 +1943,9 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
               await clickToCall.server.clickToCall!({ extension: clickToCall.extension }, target, grant)
             } catch (err) {
               const code = (err as { code?: string }).code
+              const status = (err as { statusCode?: number }).statusCode
               req.log.warn({ err }, 'click-to-call not placed')
+              if (status === 400 || status === 501) throw err
               throw Object.assign(new Error(code === 'refused' ? 'The telephony server refused to call your phone' : 'The telephony server cannot be reached'), { statusCode: code === 'refused' ? 409 : 503 })
             }
             // Not a call of this Gateway (it has no channel of it): its id names nothing to act on, the phone has the call.
