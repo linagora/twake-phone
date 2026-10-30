@@ -124,9 +124,9 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(ctc).toContain('if (is_method("REFER") && $dlg_val(wline) == "1" && $var(from_wline) == 1 && $hdrcnt(Refer-To) == 1 && $dlg_val(wline_caller) != NULL && $dlg_val(wline_caller) != "anonymous" && $dlg_val(wline_callee) != NULL) {')
     expect(ctc).toContain('$var(refer_to) = "sip:" + $dlg_val(wline_caller) + "@127.0.0.1";')
     expect(ctc).toContain('$var(refer_to_named) = "<" + $var(refer_to) + ">";')
-    expect(ctc).toContain('if ($hdr(Refer-To) == $var(refer_to) || $hdr(Refer-To) == $var(refer_to_named))')
+    expect(ctc).toContain('if (($hdr(Refer-To) == $var(refer_to) || $hdr(Refer-To) == $var(refer_to_named)) && $ci =~ "^[A-Za-z0-9._~!%*+@:-]{1,200}$") {')
     // ...and only with the grant the Gateway wrote for that line and that number, taken once.
-    expect(ctc).toContain(`$var(ctc_query) = "UPDATE dial_out_grants g SET used_by = 'click-to-call' WHERE g.room = 'click-to-call' AND g.used_by IS NULL AND g.extension = '" + $dlg_val(wline_callee) + "' AND g.number = '" + $dlg_val(wline_caller) + "' AND g.expires_at > now() RETURNING 1";`)
+    expect(ctc).toContain(`$var(ctc_query) = "UPDATE dial_out_grants g SET used_by = 'click-to-call', used_call = '" + $ci + "' WHERE g.room = 'click-to-call' AND (g.used_by IS NULL OR g.used_call = '" + $ci + "') AND g.extension = '" + $dlg_val(wline_callee) + "' AND g.number = '" + $dlg_val(wline_caller) + "' AND g.expires_at > now() RETURNING 1";`)
     expect(ctc).toContain('if (sql_query_one("$var(ctc_query)", "$var(ctc_granted)"))\n\t\t\t\t\t$var(click_to_call) = 1;')
     expect(ctc.match(/\$var\(click_to_call\) = 1;/g)).toHaveLength(1)
   })
