@@ -246,7 +246,8 @@ try {
     await withWidget.evaluate(() => window.mountWidget())
     const widget = withWidget.frameLocator('#twake-phone-widget iframe')
     await tell([{ id: 'c1', direction: 'inbound', state: 'ringing', remoteNumber: '+33612345678', remoteName: 'Camille Martin' }])
-    await widget.getByRole('alertdialog', { name: 'Appel entrant' }).getByText('Camille Martin (+33612345678)').waitFor()
+    await widget.getByRole('alert').getByText('Camille Martin (+33612345678)').waitFor()
+    await widget.getByRole('alert').getByText('Appel entrant').waitFor()
     await until(async () => (await withWidget.locator('#twake-phone-widget').evaluate(e => e.getBoundingClientRect().height)) > 40, 'the widget grown to its card')
     await widget.getByRole('button', { name: 'Répondre' }).click()
     await until(async () => (await frame.evaluate(() => window.orders.length)) === 1, 'the order in the frame')
@@ -260,7 +261,7 @@ try {
     // A message that is not the frame's (another window of the page) moves nothing.
     await phoneWindow.evaluate(() => window.postMessage({ type: 'twakephone.calls', calls: [{ id: 'x', direction: 'inbound', state: 'ringing', remoteNumber: '+33600000000' }] }, '*'))
     await new Promise(r => setTimeout(r, 500))
-    expectEqual(await widget.getByRole('alertdialog').count(), 0, 'cards from a message that is not the frame\'s')
+    expectEqual(await widget.getByRole('alert').count(), 0, 'cards from a message that is not the frame\'s')
     // phone-link in a page that carries the widget talks to it (never a second intent): the visible window's frame is not
     // signed in and does not take the number, so the app is opened on it.
     const viaWidget = await withWidget.evaluate(() => window.callFromHost('06 12 34 56 05'))

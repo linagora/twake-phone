@@ -1,6 +1,6 @@
 # ADR 0034 : le widget des autres apps est une télécommande de la fenêtre Twake Phone, pas un téléphone
 
-Date : 2026-10-30. État : proposée. Décidée dans le fil de discussion du projet (« fais le reste », après les ADR 0032 et 0033) ; s'appuie sur l'ADR 0032 (la coquille, le relais `CALL`) ; remplacé par : aucun.
+Date : 2026-10-30. État : proposée (en revue, PR #46), dans le fil de discussion du projet (« fais le reste », après les ADR 0032 et 0033) ; s'appuie sur l'ADR 0032 (la coquille, le relais `CALL`) ; remplacé par : aucun.
 
 **Ce n'est pas le widget du POC.** Celui du POC portait un softphone dans un cadre caché de chaque app : la page d'intent recevait de cozy-stack un jeton (`data-cozy`) qui suffisait à la passerelle (mode `cozy`). Aujourd'hui TwakePhone se connecte en OIDC : sa session vit dans l'onglet (`sessionStorage`), et encadré il ne se connecte que sur un clic, dans une fenêtre (ADR 0032). Un cadre caché de taille zéro dans Drive n'aurait jamais de session.
 
@@ -25,6 +25,9 @@ Le cadre de TwakePhone (`apps/web`, `embedded.ts`, `ParentCalls`) dit à son par
 La page `/intents` de la coquille sert ce type sans jamais se terminer (`widget.js`, du DOM sans React) : elle demande les appels des fenêtres ouvertes (`calls-request`), montre l'appel qui sonne d'abord, sinon celui en cours, avec ses boutons, et règle sa taille (`resizeClient` ; 0 sans appel). Les numéros que `phone-link` lui confie (`twake-phone:dial`, par un `MessagePort`) suivent le chemin du relais `CALL` (ADR 0032) : une fenêtre visible les prend, sinon l'app s'ouvre dessus.
 
 ## Conséquences
+
+- La confiance s'arrête à l'origine de la coquille : toute page de cette origine (la coquille, ses pages d'intent) peut lire les appels sur le canal et y donner un ordre ; les apps hôtes (autres origines) ne voient ni le canal ni les ordres. Le cadre ne prend d'ordre que de son parent, à l'origine que le pont a donnée ; `FRAME_ANCESTORS` ne doit nommer que les instances (ADR 0032).
+- Une fenêtre qui a des appels les redit toutes les 10 s, et le widget oublie une fenêtre muette depuis 25 s (un onglet tué) ; une seule carte : un second appel qui sonne en même temps attend le premier. La carte est annoncée (`role="alert"`), jamais focalisée : la personne travaille dans l'app hôte.
 
 - Aucune session, aucun micro, aucun contact SIP de plus : la fenêtre Twake Phone reste celle qui sonne et parle ; sans fenêtre Twake Phone ouverte, le widget ne montre rien (les notifications Web Push de l'étape 5 restent le moyen d'être prévenu).
 - Les limites du cloisonnement du relais `CALL` (ADR 0032) valent ici : un domaine d'instances dans la liste des suffixes publics sépare Drive de Twake Phone, le widget n'entend alors aucune fenêtre.
