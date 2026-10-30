@@ -298,7 +298,7 @@ describe('clickToCall', () => {
     const { sup, ami } = await supervision((a, reply) => reply({ Response: 'Success', ActionID: a.ActionID!, Message: 'Originate successfully queued' }))
     await sup.clickToCall({ extension: '103' }, '+33612345678', 'twake.local')
     expect(ami.state.actions).toEqual([
-      expect.objectContaining({ Action: 'Originate', Async: 'true', Channel: 'PJSIP/103', Application: 'Transfer', Data: 'PJSIP/sip:+33612345678@twake.local', CallerID: '"Twake Phone" <+33612345678>', Timeout: '30000', Variable: 'TIMEOUT(absolute)=45' })
+      expect.objectContaining({ Action: 'Originate', Async: 'true', Channel: 'PJSIP/103', Application: 'Transfer', Data: 'PJSIP/sip:+33612345678@twake.local', CallerID: '"Twake Phone" <+33612345678>', Timeout: '30000', Variable: 'TIMEOUT(absolute)=35' })
     ])
   })
 
@@ -315,7 +315,7 @@ describe('clickToCall', () => {
       if (a.Action === 'CoreShowChannels') {
         polls++
         const transfer = (e: Frame) => channel({ Application: 'Transfer', ...e })
-        const list = polls < 2 ? [] : [transfer({ Channel: 'PJSIP/104-00000001', ApplicationData: 'PJSIP/sip:102@twake.local' }), transfer({ Channel: 'PJSIP/103-00000002', ApplicationData: 'PJSIP/sip:105@twake.local' }), transfer({ Channel: 'PJSIP/103-00000003', ApplicationData: 'PJSIP/sip:102@twake.local' })]
+        const list = polls < 2 ? [] : [transfer({ Channel: 'PJSIP/104-00000001', ApplicationData: 'PJSIP/sip:102@twake.local' }), transfer({ Channel: 'PJSIP/103-00000002', ApplicationData: 'PJSIP/sip:105@twake.local' }), transfer({ Channel: 'PJSIP/103-00000003', Uniqueid: '1792479546.33', ApplicationData: 'PJSIP/sip:102@twake.local' })]
         return channelsOf(list)(a, reply)
       }
       reply({ Response: 'Success', ActionID: a.ActionID!, Message: 'ok' })
@@ -325,7 +325,7 @@ describe('clickToCall', () => {
     const sup = new WazoSupervision({ ami: account, originate: account, recordingsUrl: 'http://x', recordingsToken: 't', clickToCallPollMs: 10, clickToCallGraceMs: 10, clickToCallWatchMs: 2000 })
     await sup.clickToCall({ extension: '103' }, '102', 'twake.local')
     for (let i = 0; i < 100 && !ami.state.actions.some(a => a.Action === 'Hangup'); i++) await new Promise(r => setTimeout(r, 20))
-    expect(ami.state.actions.filter(a => a.Action === 'Hangup')).toEqual([expect.objectContaining({ Channel: 'PJSIP/103-00000003', Cause: '16' })])
+    expect(ami.state.actions.filter(a => a.Action === 'Hangup')).toEqual([expect.objectContaining({ Channel: '1792479546.33', Cause: '16' })])
   })
 
   it('says it when Asterisk refuses the call', async () => {
