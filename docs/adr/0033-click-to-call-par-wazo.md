@@ -18,7 +18,7 @@ Le POC savait lancer un appel depuis le serveur (`POST /calls`, Asterisk par ARI
 
 `POST /calls`, quand le serveur SIP ne place pas d'appel (`calling.outbound` faux) et que la personne a une ligne chez Wazo (`listWazoLines`) :
 - la passerelle écrit une autorisation dans `dial_out_grants` (la table des appels des salles de Meet) : `room = 'click-to-call'`, cette extension, ce numéro, une minute, un jeton tiré ;
-- puis demande au compte AMI `originate` (ADR 0029) un `Originate` : canal `PJSIP/<extension>`, appelant `"Appel vers <cible>" <click-to-call>` (le numéro de personne : les Récents de la personne ne disent jamais que la cible l'a appelée), contexte `twake-click-to-call` (`docker/wazo/asterisk/extensions.conf`, à installer avec Wazo comme `twake-opensips`), variables `TWAKE_LINE`, `TWAKE_TARGET`, `TWAKE_GRANT`.
+- puis demande au compte AMI `originate` (ADR 0029) un `Originate` : canal `PJSIP/<extension>`, appelant `"Appel vers <cible>" <clicktocall>` (le numéro de personne ; Asterisk ne garde pas de tiret : les Récents de la personne ne disent jamais que la cible l'a appelée), contexte `twake-click-to-call` (`docker/wazo/asterisk/extensions.conf`, à installer avec Wazo comme `twake-opensips`), variables `TWAKE_LINE`, `TWAKE_TARGET`, `TWAKE_GRANT`.
 
 La ligne décrochée, le contexte vérifie ces trois valeurs, prend l'adresse du socket de lignes d'OpenSIPS dans le contact de la ligne (`PJSIP_DIAL_CONTACTS`), et compose la cible par l'endpoint de la ligne (une ligne n'a qu'un contact, `max_contacts=1`), 60 s au plus, avec l'extension pour appelant et le jeton dans `X-Twake-Grant` (un pre-dial handler). Asterisk ponte les deux appels : quand l'un raccroche, l'autre finit.
 
@@ -33,7 +33,7 @@ Sur le socket de lignes, un INVITE hors dialogue qui porte `X-Twake-Grant` (et u
 ## Conséquences
 
 - Le média passe par Asterisk (pont), comme pour une file ou un standard de Wazo.
-- Le CDR montre deux appels : celui de Wazo vers la ligne (`click-to-call` vers la ligne, `via wazo`) et celui de Wazo vers la cible au nom de la personne (`via click-to-call`).
+- Le CDR montre deux appels : celui de Wazo vers la ligne (`clicktocall` vers la ligne, `via wazo`) et celui de Wazo vers la cible au nom de la personne (`via click-to-call`).
 - Pas de limite de débit côté passerelle : chaque `POST /calls` fait sonner la ligne de la personne (la sienne seulement).
 - La passerelle ne suit pas ces appels (pas de canal à elle) : le 202 dit seulement qu'Asterisk a pris l'appel à placer ; une ligne qui ne répond pas en 30 s ne se voit que sur le téléphone et dans les Récents.
 - `wazo_lines` peut avoir un peu de retard sur Wazo : une ligne retirée à l'instant reste proposée, et rien ne sonne.

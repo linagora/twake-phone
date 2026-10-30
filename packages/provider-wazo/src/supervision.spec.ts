@@ -122,7 +122,7 @@ describe('listCalls', () => {
         // A supervisor's line still ringing: no application yet, but the number of the supervision.
         channel({ Channel: 'PJSIP/102-0000000e', Uniqueid: '1792479546.17', ChannelStateDesc: 'Ring', CallerIDNum: '0199', CallerIDName: 'Supervision', Application: '' }),
         // A click-to-call still ringing the person's line (ADR 0033): no call yet.
-        channel({ Channel: 'PJSIP/106-0000000f', Uniqueid: '1792479546.18', ChannelStateDesc: 'Ring', CallerIDNum: 'click-to-call', CallerIDName: 'Appel vers +33612345678', Application: '' }),
+        channel({ Channel: 'PJSIP/106-0000000f', Uniqueid: '1792479546.18', ChannelStateDesc: 'Ring', CallerIDNum: 'clicktocall', CallerIDName: 'Appel vers +33612345678', Application: '' }),
         channel({ Channel: 'PJSIP/105-0000000d', Uniqueid: 'not-an-id' })
       ])
     )
@@ -298,7 +298,7 @@ describe('clickToCall', () => {
     const { sup, ami } = await supervision((a, reply) => reply({ Response: 'Success', ActionID: a.ActionID!, Message: 'Originate successfully queued' }))
     await sup.clickToCall({ extension: '103' }, '+33612345678', 'a'.repeat(32))
     expect(ami.state.actions).toEqual([
-      expect.objectContaining({ Action: 'Originate', Async: 'true', Channel: 'PJSIP/103', Context: 'twake-click-to-call', Exten: 's', Priority: '1', CallerID: '"Appel vers +33612345678" <click-to-call>', Timeout: '30000' })
+      expect.objectContaining({ Action: 'Originate', Async: 'true', Channel: 'PJSIP/103', Context: 'twake-click-to-call', Exten: 's', Priority: '1', CallerID: '"Appel vers +33612345678" <clicktocall>', Timeout: '30000' })
     ])
     // The variables of the context, as several headers (the fake keeps the last one it read).
     expect(ami.state.actions[0]!.Variable).toBe(`TWAKE_GRANT=${'a'.repeat(32)}`)
