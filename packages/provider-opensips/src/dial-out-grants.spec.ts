@@ -98,7 +98,7 @@ describe('the grants of a click-to-call (ADR 0033)', () => {
   it('writes one for a line and a number, in the room of the click-to-calls, with a token nobody is told; never for anything else', async () => {
     const db = recorder()
     const grants = new DialOutGrants({ pool: db.pool, tenantId: 'acme' })
-    await grants.grantClickToCall('103', '+33612345678')
+    expect(await grants.grantClickToCall('103', '+33612345678')).toMatch(/^[0-9a-f]{32}$/)
     expect(db.queries.map(q => q.text)).toEqual([
       'DELETE FROM dial_out_grants WHERE tenant_id = $1 AND expires_at < now()',
       'INSERT INTO dial_out_grants (token, tenant_id, extension, number, expires_at, room) VALUES ($1, $2, $3, $4, now() + make_interval(secs => $5), $6)'
@@ -179,28 +179,13 @@ if (process.env.TEST_DATABASE_URL) {
       expect(await grants.taken(token)).toBeUndefined()
     })
 
-    const ctcLine = tpl.split('\n').find(l => l.includes('$var(ctc_query) = "UPDATE dial_out_grants'))!
-    /** The REFER's query of a click-to-call (ADR 0033): the call Wazo placed to `line`, showing `number`. */
-    const takeClickToCall = async (line: string, number: string, callId = 'wazo-call-1') =>
-      (await pool.query(ctcLine.slice(ctcLine.indexOf('"') + 1, ctcLine.lastIndexOf('"')).replace(`'" + $dlg_val(wline_callee) + "'`, `'${line}'`).replace(`'" + $dlg_val(wline_caller) + "'`, `'${number}'`).replaceAll(`'" + $ci + "'`, `'${callId}'`))).rowCount
-
-    it('lets OpenSIPS take a click-to-call grant once, for its line and its number, before its expiry; never a grant of a room', async () => {
+    it('takes a click-to-call grant (room click-to-call) by its token, as a room\'s, once, for its person and its number (ADR 0033)', async () => {
       const grants = new DialOutGrants({ pool, ready, tenantId: 'spec' })
-      await grants.grantClickToCall('9101', '+33612345678')
-      expect(await takeClickToCall('9102', '+33612345678')).toBe(0)
-      expect(await takeClickToCall('9101', '+33612345679')).toBe(0)
-      expect(await takeClickToCall('9101', '+33612345678')).toBe(1)
-      // A copy of that REFER, in the same call: found again. Another call: nothing.
-      expect(await takeClickToCall('9101', '+33612345678')).toBe(1)
-      expect(await takeClickToCall('9101', '+33612345678', 'wazo-call-2')).toBe(0)
-      // A room's grant for the same person and number is no click-to-call's (and its token no REFER carries).
-      const room = await grants.grant('9101', '102')
-      expect(await takeClickToCall('9101', '102')).toBe(0)
-      expect(await take(room, '9101', '102')).toBe(1)
-      // Past its time.
-      await grants.grantClickToCall('9101', '103', 1)
-      await pool.query("UPDATE dial_out_grants SET expires_at = now() - interval '1 second' WHERE room = 'click-to-call' AND number = '103'")
-      expect(await takeClickToCall('9101', '103')).toBe(0)
+      const token = await grants.grantClickToCall('9101', '+33612345678')
+      expect(await taken(token, '9102', '+33612345678')).toEqual([])
+      expect(await taken(token, '9101', '+33612345679')).toEqual([])
+      expect(await taken(token, '9101', '+33612345678')).toEqual([[1, '', '', 'click-to-call']])
+      expect(await taken(token, '9101', '+33612345678')).toEqual([])
     })
 
     it('takes a grant once, before its expiry, for its person and its number only', async () => {

@@ -1,49 +1,46 @@
-# ADR 0033 : click-to-call, Wazo fait sonner le téléphone de la personne puis le lui fait appeler
+# ADR 0033 : click-to-call, Wazo fait sonner le téléphone de la personne puis appelle le numéro à son nom
 
-Date : 2026-10-30. État : proposée (en revue, PR #45). Décidée dans le fil de discussion du projet (« faire ce qu'il manque pour arriver au niveau du POC ») ; s'appuie sur l'ADR 0027 (les lignes de Wazo, l'appel que Wazo place) et l'ADR 0029 (le compte AMI réservé à `Originate`) ; remplacé par : aucun.
+Date : 2026-10-30. État : proposée (en revue, PR #45). Décidée dans le fil de discussion du projet (« faire ce qu'il manque pour arriver au niveau du POC ») ; s'appuie sur l'ADR 0027 (les lignes de Wazo), l'ADR 0029 (le compte AMI réservé à `Originate`) et l'ADR 0018 (les autorisations `dial_out_grants` des salles de Meet) ; remplacé par : aucun.
 
 ## Contexte
 
-Le POC savait lancer un appel depuis le serveur (`POST /calls`, Asterisk par ARI) : le téléphone de la personne sonnait, elle décrochait, l'appel partait. C'est ce qu'il faut à qui garde un téléphone de bureau ou Linphone (la réponse au CCTP CANUT §7.4.6.2 et l'ADR 0002 les laissent utilisables). Depuis le retrait d'Asterisk (PR 4c), `provider-opensips` répond 501 : OpenSIPS est un proxy, il ne place pas d'appel. Wazo, depuis l'étape 11c-1, place des appels vers les lignes des personnes (AMI `Originate`, ADR 0027), mais OpenSIPS refuse tout transfert (REFER) dans un tel appel, comme avec l'opérateur : un transfert y ferait composer n'importe quoi, hors de `route[outbound_policy]`.
+Le POC savait lancer un appel depuis le serveur (`POST /calls`, Asterisk par ARI) : le téléphone de la personne sonnait, elle décrochait, l'appel partait. C'est ce qu'il faut à qui garde un téléphone de bureau ou Linphone (ADR 0002). Depuis le retrait d'Asterisk (PR 4c), `provider-opensips` répond 501 : OpenSIPS est un proxy, il ne place pas d'appel. Wazo place des appels vers les lignes des personnes (AMI `Originate`, ADR 0027), mais son socket de lignes ne servait qu'à faire sonner les fenêtres d'une extension.
 
 ## Scénario de démo (écrit avant le code)
 
 1. Bob a une ligne chez Wazo (son téléphone de bureau, Linphone, ou ses fenêtres). Dans le clavier, il tape 102 et choisit « Appeler depuis mon téléphone » (ou « Appeler » quand le navigateur n'a pas de softphone).
 2. Son téléphone sonne : « Twake Phone (102) ». Il décroche.
-3. Son téléphone appelle 102, avec son compte : Jean sonne et voit « Bob Durand ». Ils se parlent ; la passerelle n'a lancé aucun appel vers 102.
+3. Jean sonne et voit « Bob Durand » ; ils se parlent. Bob raccroche : tout se termine.
 
 ## Décisions
 
-### 1. Wazo sonne la ligne, puis transfère ; le téléphone compose lui-même
+### 1. Wazo sonne la ligne, puis appelle le numéro au nom de la personne, à travers OpenSIPS
 
-`POST /calls`, quand le serveur SIP ne place pas d'appel (`calling.outbound` faux) et que la personne a une ligne chez Wazo (`listWazoLines`), demande au compte AMI `originate` de la passerelle (ADR 0029) un `Originate` : canal `PJSIP/<extension>`, appelant `"Twake Phone" <cible>`, puis, la ligne décrochée, le contexte `twake-click-to-call` du dialplan de Wazo (`docker/wazo/asterisk/extensions.conf`, à installer avec Wazo comme `twake-opensips`) : il vérifie la cible et le domaine (`TWAKE_TARGET`, `TWAKE_DOMAIN`), pose `TIMEOUT(absolute)=5` et lance `Transfer(PJSIP/sip:<cible>@<domaine SIP>)`. Le téléphone qui décroche reçoit un REFER vers la cible et l'appelle comme tout appel : ses droits, ses plafonds, l'anti-fraude et le trunk s'appliquent sans exception, puisque c'est son appel. La passerelle répond 202 dès qu'Asterisk a pris l'appel à placer (la personne a 30 s pour décrocher) ; elle n'a pas de canal à piloter ensuite.
+`POST /calls`, quand le serveur SIP ne place pas d'appel (`calling.outbound` faux) et que la personne a une ligne chez Wazo (`listWazoLines`) :
+- la passerelle écrit une autorisation dans `dial_out_grants` (la table des appels des salles de Meet) : `room = 'click-to-call'`, cette extension, ce numéro, une minute, un jeton tiré ;
+- puis demande au compte AMI `originate` (ADR 0029) un `Originate` : canal `PJSIP/<extension>`, appelant `"Twake Phone" <cible>`, contexte `twake-click-to-call` (`docker/wazo/asterisk/extensions.conf`, à installer avec Wazo comme `twake-opensips`), variables `TWAKE_LINE`, `TWAKE_TARGET`, `TWAKE_GRANT`.
 
-### 2. Une seule exception au refus du REFER dans un appel de Wazo, sur une autorisation de la passerelle
+La ligne décrochée, le contexte vérifie ces trois valeurs, prend l'adresse du socket de lignes d'OpenSIPS dans le contact de la ligne (`PJSIP_DIAL_CONTACTS`), et compose la cible par l'endpoint de la ligne, avec l'extension pour appelant et le jeton dans `X-Twake-Grant` (un pre-dial handler). Asterisk ponte les deux appels : quand l'un raccroche, l'autre finit.
 
-Avant de faire sonner la ligne, la passerelle écrit une autorisation dans `dial_out_grants` (la table des appels des salles de Meet, ADR 0018) : `room = 'click-to-call'`, cette extension, ce numéro, une minute, un jeton tiré et jamais transmis (aucune salle ne peut donc la présenter). OpenSIPS garde, à l'INVITE de Wazo sur le socket de lignes, la ligne appelée (`wline_callee`) et le numéro montré comme appelant (`wline_caller`). Dans ce dialogue, un REFER passe seulement s'il vient du côté de Wazo (le socket de lignes), s'il n'a qu'un `Refer-To`, si ce `Refer-To` est exactement `sip:<ce numéro>@<SIP_DOMAIN>` (avec ou sans chevrons, sans `Replaces` ni autre hôte), et si OpenSIPS prend, une fois, l'autorisation de cette ligne pour ce numéro (`UPDATE … RETURNING`, `used_by = 'click-to-call'`). Un appel que Wazo place pour une autre raison (une file, un standard, un appel de l'extérieur dont le numéro peut être n'importe quoi) n'en a pas : tout autre REFER y reste refusé (`Twake-Call-Refused: transfer-external`).
+### 2. OpenSIPS prend l'autorisation comme celle d'une salle
+
+Sur le socket de lignes, un INVITE hors dialogue qui porte `X-Twake-Grant` n'est pas un appel vers les fenêtres d'une extension : il suit le chemin des appels d'une personne. L'en-tête est lu puis retiré ; l'autorisation tient lieu de mot de passe et se prend une fois la transaction créée, par `route[meet_source]` (jeton, cette personne en `From`, ce numéro, pas encore prise, pas expirée, un compte existant ; en asynchrone, comme toute requête d'un appel). Ensuite l'appel est celui de la personne : ses droits, ses plafonds, l'anti-fraude, le trunk. Le côté de Wazo de cet appel ne parle que depuis le socket de lignes (`wline`), rien n'y est transféré, et son CDR dit `click-to-call`. Une autorisation de salle ne sert pas à un click-to-call, ni l'inverse : le jeton de l'une n'est jamais donné à l'autre, et la salle `click-to-call` n'ajoute aucun en-tête de Meet.
 
 ### 3. Le choix dans le clavier
 
-`/capabilities` dit `clickToCall` (et `calling.outbound`) pour qui a une ligne. Sans softphone dans le navigateur (`off`), « Appeler » passe par là ; sinon (connecté, en connexion, en échec), un second bouton « Appeler depuis mon téléphone » le propose, une demande à la fois. Jamais depuis un lien seul (ADR 0031).
+`/capabilities` dit `clickToCall` (et `calling.outbound`) pour qui a une ligne. Sans softphone dans le navigateur (`off`), « Appeler » passe par là ; sinon, un second bouton « Appeler depuis mon téléphone » le propose, une demande à la fois. Jamais depuis un lien seul (ADR 0031).
 
 ## Conséquences
 
-- Mesuré en CI : Asterisk reste dans `Transfer` après que le téléphone a pris le REFER (ni son NOTIFY ni son BYE ne l'en sortent ; un `TIMEOUT(absolute)` posé par la variable d'un `Originate` n'a pas d'effet, un `Hangup` de l'AMI répond « No such channel »). Le contexte pose donc `TIMEOUT(absolute)=5` lui-même, juste avant `Transfer` : le côté de Wazo finit 5 s après le décroché, l'appel du téléphone vers la cible est le sien et continue. La fenêtre, de son côté, raccroche son appel avec Wazo dès que la cible décroche, quand ce REFER la renvoie vers le numéro même qui l'appelait (un transfert ordinaire n'est pas touché).
-- Les lignes de Wazo sont créées avec `refer_blind_progress = no` (le 202 du REFER suffit à Asterisk) ; le délai du contexte vaut aussi pour une ligne plus ancienne.
-
-- L'`Originate` fait sonner tous les contacts de la ligne, fenêtres comprises : une fenêtre qui décroche suit le REFER (le softphone suit déjà un transfert vers son domaine) et compose depuis le navigateur.
-- Le CDR montre deux appels : celui de Wazo vers la ligne (`via wazo`, l'appelant est la cible) et celui du téléphone vers la cible.
-- Prouvé : `config.spec.ts` (l'exception et ses conditions), la requête de l'autorisation lue dans le gabarit et jouée contre PostgreSQL (`dial-out-grants.spec.ts` : une fois, sa ligne, son numéro, avant son heure, jamais une autorisation de salle), `provider-wazo` (l'`Originate` exact, refus de toute valeur qui dirait plus qu'un numéro), la passerelle (offert à qui a une ligne seulement, autorisation écrite avant la sonnerie, 400, 409, 503), le gabarit lu par le vrai OpenSIPS de la pile. L'e2e SIP (Bob décroche sur sa seconde fenêtre, sa fenêtre appelle Jean, son et CDR) tourne en CI.
-
-## Ce qui reste
-
-- Un téléphone qui ne suit pas les REFER (rare ; Linphone et les postes SIP courants le font) décroche sur un appel qui ne mène nulle part : Asterisk raccroche après l'échec du transfert.
-- Pas de suivi de l'appel par la passerelle (pas de canal) : le 202 dit seulement qu'Asterisk a pris l'appel à placer ; une ligne morte, 30 s sans réponse ou un transfert refusé ne se voient pas dans l'app (« votre téléphone sonne »), seulement sur le téléphone et dans les Récents.
+- Le média passe par Asterisk (pont), comme pour une file ou un standard de Wazo.
+- Le CDR montre deux appels : celui de Wazo vers la ligne (`via wazo`, l'appelant est la cible) et celui de Wazo vers la cible au nom de la personne (`via click-to-call`).
+- La passerelle ne suit pas ces appels (pas de canal à elle) : le 202 dit seulement qu'Asterisk a pris l'appel à placer ; une ligne qui ne répond pas en 30 s ne se voit que sur le téléphone et dans les Récents.
 - `wazo_lines` peut avoir un peu de retard sur Wazo : une ligne retirée à l'instant reste proposée, et rien ne sonne.
-- Le domaine que la passerelle donne (`domain` du provider OpenSIPS) doit être le `SIP_DOMAIN` d'OpenSIPS : sinon chaque transfert est refusé (même valeur dans la stack et le kit pilote).
 - La clé d'idempotence de `POST /calls` n'est pas lue pour un click-to-call : le clavier n'envoie qu'une demande à la fois.
-- Non vérifié contre un vrai Linphone ni un poste de bureau ; l'e2e joue des fenêtres du navigateur.
+- Prouvé : `config.spec.ts` (le chemin du socket de lignes, la prise par `meet_source`, rien sans les lignes), l'autorisation prise contre PostgreSQL avec la requête du gabarit (`dial-out-grants.spec.ts`), `provider-wazo` (l'`Originate` exact, refus de toute valeur qui dirait plus qu'une ligne, un numéro, un jeton), la passerelle (offert à qui a une ligne seulement, autorisation écrite avant la sonnerie et donnée à Wazo, 400, 409, 503), le contexte chargé par l'Asterisk de Wazo 26.10 et le gabarit par l'OpenSIPS de la pile ; l'e2e SIP (Bob, Jean, son, fin, CDR, autorisation prise) en CI.
 
 ## Alternatives écartées
 
-Que Wazo appelle la cible lui-même et ponte les deux appels : son socket de lignes deviendrait une sortie vers l'opérateur, hors des droits et plafonds de la personne (ADR 0016, 0017). Un B2BUA dans OpenSIPS (`b2b_logic`) : un module de plus pour ce que Wazo fait déjà. Marquer l'appel par un en-tête posé par Asterisk : un `Originate` ne pose pas d'en-tête PJSIP sans dialplan à nous. Se fier au seul numéro montré : il vient de l'appelant pour un appel de l'extérieur que Wazo transmet, donc n'importe quoi (première revue de la PR #45) ; l'autorisation de la passerelle le borne à ce que la personne a demandé.
+- **Le transfert par REFER** (`Transfer()` d'Asterisk sur la ligne décrochée, le téléphone appelant lui-même la cible) : essayé, puis mesuré localement contre l'Asterisk 22 de Wazo 26.10 avec un téléphone de test, sans OpenSIPS. Le canal de Wazo ne se termine jamais : ni le BYE du téléphone, ni `TIMEOUT(absolute)`, ni un `Hangup` de l'AMI ne le libèrent (le même canal sans `Transfer` se termine normalement). Il demandait aussi une exception au refus des REFER dans OpenSIPS.
+- **Wazo qui sortirait vers l'opérateur sans OpenSIPS** : hors des droits et plafonds de la personne (ADR 0016, 0017).
+- **Un B2BUA dans OpenSIPS** (`b2b_logic`) : un module de plus pour ce que Wazo fait déjà, et plus de routes que le plafond de 99 n'en laisse.

@@ -144,13 +144,11 @@ export interface TelephonyProvider {
   setWazoLines?(extensions: string[]): Promise<void>
   /** The extensions the SIP server has a line for now: what the last writes left. */
   listWazoLines?(): Promise<string[]>
-  /** The SIP domain of the accounts (`sip:<extension>@<domain>`): where a click-to-call hands a call (ADR 0033). */
-  readonly sipDomain?: string
   /**
-   * Click-to-call (ADR 0033): lets the call the telephony server is about to place to `extension`'s line be handed to
-   * `number`, once, within a minute. Without it, the SIP server refuses that transfer.
+   * Click-to-call (ADR 0033): lets the telephony server call `number` at the name of `extension`, once, within a minute;
+   * returns the token its call carries. Without it, the SIP server refuses that call.
    */
-  grantClickToCall?(extension: string, number: string): Promise<void>
+  grantClickToCall?(extension: string, number: string): Promise<string>
   /**
    * The call flows the voicemail and telephony server runs now (step 11c-2, ADR 0028; VoicemailProvider's syncFlows):
    * replaces the list. A call to one of these numbers goes to that server with `route`, which it understands; a number
@@ -425,10 +423,10 @@ export interface SupervisionProvider {
   spy(call: { id: string }, supervisor: { extension: string }, mode: SupervisionMode): Promise<void>
   /**
    * Click-to-call (ADR 0033): rings `line` (an extension with a line at the server: its desk phone, Linphone, its
-   * windows), showing `target` as the caller; once answered, hands the call to `target` (`sip:<target>@<domain>`), which
-   * the phone then calls itself, with its own account. Resolves once the server took the call to place.
+   * windows), showing `target` as the caller; once answered, calls `target` at the line's name through the SIP server,
+   * carrying `grant` (TelephonyProvider's grantClickToCall), and bridges the two. Resolves once the server took the call.
    */
-  clickToCall?(line: { extension: string }, target: string, domain: string): Promise<void>
+  clickToCall?(line: { extension: string }, target: string, grant: string): Promise<void>
   /** The audio of a recording (WAV) as a stream read once, undefined when the server has no such file. */
   getRecording(file: { tenant: string; name: string }): Promise<{ contentType: string; size?: number; body: AsyncIterable<Uint8Array> } | undefined>
   /** What the server has of a recording's file: its size and when it was last written (the end of the recording), undefined when it has none. */

@@ -161,10 +161,6 @@ const notYet = (what: string) => Object.assign(new Error(`${what} through the Ga
  */
 export class OpensipsProvider implements TelephonyProvider, MediaProvider {
   readonly id = 'opensips'
-
-  get sipDomain() {
-    return this.config.domain
-  }
   /** The presence of users without an extension: nothing but what they set themselves. */
   private readonly unmapped = new Map<string, Presence>()
   /** The extensions whose "do not disturb" this provider wrote in `call_rules` (even past its end): leaving it lifts it there. */
@@ -487,11 +483,11 @@ export class OpensipsProvider implements TelephonyProvider, MediaProvider {
    * in the place of a call of `number` (`replaces`), or to the window of `extension` that waits for `join` (step 8b),
    * a call of the conference `room`. `taken`: the call that took it, as OpenSIPS wrote it (review 8b, n°3).
    */
-  /** Click-to-call (ADR 0033): `extension`'s line may be handed to `number` once, within a minute (route of the REFER). */
-  async grantClickToCall(extension: string, number: string): Promise<void> {
+  /** Click-to-call (ADR 0033): Wazo may call `number` at the name of `extension` once, within a minute. Returns the grant's token. */
+  async grantClickToCall(extension: string, number: string): Promise<string> {
     const grants = this.config.dialOutGrants
-    if (!grants) throw Object.assign(new Error('The SIP server cannot hand a call'), { statusCode: 501 })
-    await grants.grantClickToCall(extension, number)
+    if (!grants) throw Object.assign(new Error('The SIP server cannot let a click-to-call through'), { statusCode: 501 })
+    return grants.grantClickToCall(extension, number)
   }
 
   async grantRoomCall(grant: RoomCallGrant): Promise<RoomCallGrantToken> {

@@ -110,25 +110,32 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(cfg).toContain('if ($shv(wazo_lines_on) != 1 || $si != "127.0.0.1") {')
     expect(cfg).toContain('if ($dlg_val(wline) == "1" && is_direction("downstream"))')
     expect(cfg).toContain('if ($var(from_wline) != $var(wline)) {')
-    const call = cfg.slice(cfg.indexOf('if ($var(wline) == 1) {\n\t\tif (is_method("ACK"))'))
+    const call = cfg.slice(cfg.indexOf('if ($var(wline) == 1 && $var(ctc_call) == 0) {\n\t\tif (is_method("ACK"))'))
     expect(call.slice(0, call.indexOf('route(rules_step);'))).toContain('if (is_present_hf("Replaces") || !($rU =~ "^[A-Za-z0-9._+-]{1,64}$")) {')
     expect(call.slice(0, 2500)).not.toContain('route(voicemail')
-    // A transfer of such a call is refused as one with the operator (REFER), save the click-to-call (ADR 0033): from Wazo's
-    // side only, once, to the number it showed as the caller, at our domain, nothing else (no Replaces, no other host).
-    expect(cfg).toContain('$dlg_val(meet) != NULL || ($dlg_val(wline) == "1" && $var(click_to_call) == 0))) {')
-    expect(call.slice(0, call.indexOf('route(rules_step);'))).toContain('$dlg_val(wline_caller) = $avp(caller);\n\t\t$dlg_val(wline_callee) = $rU;')
-    const ctc = cfg.slice(cfg.indexOf('$var(click_to_call) = 0;'), cfg.indexOf('if (is_method("REFER") && ($dlg_val(trunk) != NULL'))
-    // Its retransmissions absorbed before the grant is looked for (taken by the first one, the copy would be refused).
-    expect(ctc.indexOf('$var(from_wline) == 1 && t_check_trans())\n\t\t\texit;')).toBeGreaterThan(0)
-    expect(ctc.indexOf('t_check_trans()')).toBeLessThan(ctc.indexOf('sql_query_one'))
-    expect(ctc).toContain('if (is_method("REFER") && $dlg_val(wline) == "1" && $var(from_wline) == 1 && $hdrcnt(Refer-To) == 1 && $dlg_val(wline_caller) != NULL && $dlg_val(wline_caller) != "anonymous" && $dlg_val(wline_callee) != NULL) {')
-    expect(ctc).toContain('$var(refer_to) = "sip:" + $dlg_val(wline_caller) + "@127.0.0.1";')
-    expect(ctc).toContain('$var(refer_to_named) = "<" + $var(refer_to) + ">";')
-    expect(ctc).toContain('if (($hdr(Refer-To) == $var(refer_to) || $hdr(Refer-To) == $var(refer_to_named)) && $ci =~ "^[A-Za-z0-9._~!%*+@:-]{1,200}$") {')
-    // ...and only with the grant the Gateway wrote for that line and that number, taken once.
-    expect(ctc).toContain(`$var(ctc_query) = "UPDATE dial_out_grants g SET used_by = 'click-to-call', used_call = '" + $ci + "' WHERE g.room = 'click-to-call' AND (g.used_by IS NULL OR g.used_call = '" + $ci + "') AND g.extension = '" + $dlg_val(wline_callee) + "' AND g.number = '" + $dlg_val(wline_caller) + "' AND g.expires_at > now() RETURNING 1";`)
-    expect(ctc).toContain('if (sql_query_one("$var(ctc_query)", "$var(ctc_granted)"))\n\t\t\t\t\t$var(click_to_call) = 1;')
-    expect(ctc.match(/\$var\(click_to_call\) = 1;/g)).toHaveLength(1)
+    // A transfer of such a call is refused as one with the operator (REFER).
+    expect(cfg).toContain('$dlg_val(meet) != NULL || $dlg_val(wline) == "1")) {')
+    // Click-to-call (ADR 0033): Wazo's INVITE on the lines socket that carries the Gateway's grant leaves the calls to a
+    // person's windows for the way of a person's own calls; the grant is read, removed, and stands for the credentials,
+    // taken once for this person (From) and this number, in the room of the click-to-calls; Wazo's side of it speaks from
+    // the lines socket only (wline), and its CDR says so.
+    expect(cfg).toContain('if ($var(wline) == 1 && is_method("INVITE") && !has_totag() && is_present_hf("X-Twake-Grant")) {\n\t\t$var(ctc_call) = 1;\n\t\t$avp(ctc_grant) = $hdr(X-Twake-Grant);\n\t\tremove_hf("X-Twake-Grant");')
+    const start = cfg.indexOf('} else if ($var(ctc_call) == 1) {')
+    const auth = cfg.slice(start, cfg.indexOf('consume_credentials();', start))
+    expect(auth).toContain('if (!($fU =~ "^[0-9]{1,40}$") || is_present_hf("Replaces")) {')
+    expect(auth).toContain('$avp(meet_grant) = $avp(ctc_grant);')
+    expect(auth).not.toContain('sql_query')
+    // Taken once the transaction exists, as a room's grant is: by its token, this person, this number, once.
+    expect(cfg).toContain('if ($var(meet) == 1 || $var(ctc_call) == 1) {\n\t\troute(meet_source);')
+    expect(cfg).toContain('} else if ($avp(meet_room) != "click-to-call")\n\t\tappend_hf("Twake-Room: meet\\r\\n");')
+    expect(cfg).toContain('if ($var(ctc_call) == 1) {\n\t\t$dlg_val(wline) = "1";\n\t\t$acc_extra(via) = "click-to-call";')
+  })
+
+  it('without the lines, nothing of a click-to-call: no grant read, no call of Wazo (ADR 0033)', () => {
+    const { cfg } = render({ WAZO_SIP: '127.0.0.1:5100' })
+    expect(cfg).not.toContain('X-Twake-Grant")) {\n\t\t$var(ctc_call) = 1;')
+    // The variable stays 0: the branch of the credentials is the accounts' (proxy_authorize).
+    expect(cfg).toContain('$var(ctc_call) = 0;')
   })
 
   it('sends the call to a number of `call_flows` to Wazo as it sends one to a mailbox, only with the lines on, before any ring group, and refuses what cannot go there as unreachable, never as a number that does not exist (step 11c-2, ADR 0028)', () => {
@@ -574,7 +581,7 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(at('append_hf("Twake-Room: meet\\r\\n");')).toBeLessThan(at('route(rules_next);'))
     // A call of a conference's room to a third participant says so, and which room (review 8b, n°2).
     // A call of the conference as the others' are (second review 8b, n°8): its CDR and its events say conference.
-    expect(loaded).toContain('if ($avp(meet_room) =~ "^twake-call-[0-9a-f]{16}$") {\n\t\tappend_hf("Twake-Room: conference\\r\\n");\n\t\tappend_hf("Twake-Conference: $avp(meet_room)\\r\\n");\n\t\t$avp(conference) = 1;\n\t\t$acc_extra(via) = "conference";\n\t} else\n\t\tappend_hf("Twake-Room: meet\\r\\n");')
+    expect(loaded).toContain('if ($avp(meet_room) =~ "^twake-call-[0-9a-f]{16}$") {\n\t\tappend_hf("Twake-Room: conference\\r\\n");\n\t\tappend_hf("Twake-Conference: $avp(meet_room)\\r\\n");\n\t\t$avp(conference) = 1;\n\t\t$acc_extra(via) = "conference";\n\t} else if ($avp(meet_room) != "click-to-call")\n\t\tappend_hf("Twake-Room: meet\\r\\n");')
     const leg = section('route[conference_leg]', 'route[meet_call]')
     // Never the public network; the header of its grant, written by this script; then the phones of the extension.
     expect(at('t_reply(403, "Not Granted");', leg)).toBeLessThan(at('append_hf("Replaces: $avp(meet_replaces)\\r\\n");', leg))
@@ -1527,7 +1534,7 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     const { cfg } = render()
     const main = cfg.slice(cfg.indexOf('\nroute {'), cfg.indexOf('\nroute[outbound_policy] {'))
     const inDialog = main.slice(main.indexOf('if (has_totag()) {'), main.indexOf('if (is_method("CANCEL")) {'))
-    const refer = inDialog.indexOf('if (is_method("REFER") && ($dlg_val(trunk) != NULL || $dlg_val(meet) != NULL || ($dlg_val(wline) == "1" && $var(click_to_call) == 0))) {')
+    const refer = inDialog.indexOf('if (is_method("REFER") && ($dlg_val(trunk) != NULL || $dlg_val(meet) != NULL || $dlg_val(wline) == "1")) {')
     expect(refer).toBeGreaterThan(inDialog.indexOf('if (!match_dialog()) {'))
     expect(refer).toBeLessThan(inDialog.indexOf('route(relay);'))
     expect(inDialog.slice(refer)).toMatch(/^[^]*?send_reply\(403, "Transfer Not Allowed"\);\n\t\t\texit;/)
