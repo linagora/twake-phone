@@ -4146,9 +4146,13 @@ try {
   await step('step 11a: the dialplan Asterisk runs for OpenSIPS is docker/wazo/asterisk/extensions.conf, priority by priority (dialplan show), its refusal of a mailbox Wazo does not have included, the greeting a person recorded read at their mailbox\'s number; its trace goes to a file of its own for the steps that follow', async () => {
     const expected = {}
     let exten
+    // The context twake-opensips only: the file has others (the click-to-call's, ADR 0033).
+    let context
     for (const line of readFileSync(new URL('../../../docker/wazo/asterisk/extensions.conf', import.meta.url), 'utf8').split('\n')) {
+      const section = /^\[([^\]]+)\]/.exec(line)
+      if (section) context = section[1]
       const m = /^\s*(exten|same)\s*=\s*(.*?)\s*$/.exec(line)
-      if (!m) continue
+      if (!m || context !== 'twake-opensips') continue
       const [, name, priority, app] = m[1] === 'exten' ? /^([^,]+),([^,]+),(.*)$/.exec(m[2]) : [null, exten, ...(/^([^,]+),(.*)$/.exec(m[2]) ?? []).slice(1)]
       if (m[1] === 'exten') {
         exten = name
