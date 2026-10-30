@@ -8,6 +8,7 @@ import { Reloader } from '../reload.js'
 import { ContactAvatar } from '../components/ContactList.js'
 import { CallAction, CopyAction, OpenCardAction } from '../components/RowActions.js'
 import { useContactsByNumber } from '../contactsByNumber.js'
+import { isWorkplaceContact } from '../workplaceContacts.js'
 import { HoverActions } from '../ds/HoverActions/HoverActions.js'
 import { useCallNumber } from '../useCallNumber.js'
 
@@ -166,7 +167,7 @@ export const Recents = () => {
                     </Typography>
                   </>
                 )
-                const actions = [contact ? <OpenCardAction key="card" id={contact.id} label={t('actions.openCard', { name: contact.displayName })} /> : null, !mine && !hidden ? <CopyAction key="copy" number={it.remoteNumber} label={t('actions.copyNumberWhen', { number, when: when.format(new Date(it.startedAt)) })} /> : null,
+                const actions = [contact && !isWorkplaceContact(contact) ? <OpenCardAction key="card" id={contact.id} label={t('actions.openCard', { name: contact.displayName })} /> : null, !mine && !hidden ? <CopyAction key="copy" number={it.remoteNumber} label={t('actions.copyNumberWhen', { number, when: when.format(new Date(it.startedAt)) })} /> : null,
                   // The same phone as everywhere else (the row calls too); none for a hidden number or one's own conference.
                   callable ? <CallAction key="call" number={it.remoteNumber} label={t('actions.callNumberWhen', { number, when: when.format(new Date(it.startedAt)) })} /> : null].filter(Boolean)
                 return (

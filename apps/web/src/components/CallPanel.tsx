@@ -1,6 +1,6 @@
 import { Exchange, Grid as GridIcon, PersonAdd, Telephone } from '@linagora/twake-icons'
 import { Alert, Avatar, Button, Card, CardContent, Fab, Grid, List, ListItem, Stack, SvgIcon, TextField, Typography, getInitials, type FabProps } from '@linagora/twake-mui'
-import { useEffect, useLayoutEffect, useRef, useState, type ReactNode, type Ref, type SyntheticEvent } from 'react'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode, type Ref, type SyntheticEvent } from 'react'
 import type { SoftCall } from '@twake/softphone'
 import { formatNumber, toDialTarget, type CallVisio } from '@twake/telephony-client'
 import type { ConferenceParticipant } from '@twake/telephony-types'
@@ -8,6 +8,7 @@ import { useGateway } from '../gateway.js'
 import type { Key } from '../i18n/index.js'
 import { useT } from '../i18n/useT.js'
 import { usePhone } from '../softphone.js'
+import { namedByWorkplace, useWorkplaceContacts } from '../workplaceContacts.js'
 import { describeCallError, describeConferenceError } from './callErrors.js'
 import { CallEndIcon, MicIcon, MicOffIcon, PauseIcon } from '../ds/MediaIcons/MediaIcons.js'
 import { Appear } from '../ds/Appear/Appear.js'
@@ -799,7 +800,12 @@ const ENTER_MS = 225
 
 export const CallPanel = () => {
   const { t } = useT()
-  const { calls, lastEnded, tones } = usePhone()
+  const phone = usePhone()
+  const { tones } = phone
+  // A number the SIP server does not name (an outside caller), named by the person's Workplace contacts (ADR 0032).
+  const workplace = useWorkplaceContacts()
+  const calls = useMemo(() => phone.calls.map(c => namedByWorkplace(c, workplace)), [phone.calls, workplace])
+  const lastEnded = useMemo(() => phone.lastEnded && namedByWorkplace(phone.lastEnded, workplace), [phone.lastEnded, workplace])
   const [error, setError] = useState<string | null>(null)
   // Who came into or left a conference (review 8b, n°2 and n°11): written in a region always there, so it is read out.
   // Shown while the conference call it came from goes on only: never read again at the next one (second review 8b, n°7).
