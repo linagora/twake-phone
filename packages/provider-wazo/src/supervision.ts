@@ -53,8 +53,12 @@ const EXTENSION = /^[0-9]{1,40}$/
 /** What a click-to-call may call: a number in E.164, or an extension (ADR 0033). */
 const CLICK_TO_CALL_TARGET = /^\+?[0-9]{2,20}$/
 const GRANT = /^[0-9a-f]{32}$/
-/** The name the line shows while it rings for a click-to-call: the number it will call comes with it. */
-export const CLICK_TO_CALL_NAME = 'Twake Phone'
+/**
+ * What the line shows while it rings for a click-to-call: the number it will call in the name, and a caller that is no
+ * one's number (the Récents of the person never say the target called them).
+ */
+export const CLICK_TO_CALL_CALLER = 'click-to-call'
+export const clickToCallName = (target: string) => `Appel vers ${target}`
 /** The context of Wazo's dialplan that calls the target for the answered line (docker/wazo/asterisk/extensions.conf). */
 export const CLICK_TO_CALL_CONTEXT = 'twake-click-to-call'
 /** The options of ChanSpy: by unique id (u), quiet (q), until the call ends (E); then whisper (w) or barge (B). */
@@ -64,7 +68,7 @@ const known = (v: string | undefined) => (v && v !== '<unknown>' ? v : undefined
 /** The line of a supervisor while it rings with the call of the supervision (it runs ChanSpy only once answered). */
 const ringingSupervisor = (e: AmiMessage) => e.ChannelStateDesc !== 'Up' && known(e.CallerIDNum) === SUPERVISION_CALLER && known(e.CallerIDName) === SUPERVISION_NAME
 /** A click-to-call ringing the person's line (ADR 0033): no call yet, nothing to supervise. */
-const ringingClickToCall = (e: AmiMessage) => e.ChannelStateDesc !== 'Up' && known(e.CallerIDName) === CLICK_TO_CALL_NAME
+const ringingClickToCall = (e: AmiMessage) => e.ChannelStateDesc !== 'Up' && known(e.CallerIDNum) === CLICK_TO_CALL_CALLER
 const clock = (v: string | undefined) => {
   const m = /^(\d+):(\d{2}):(\d{2})$/.exec(v ?? '')
   return m ? Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]) : 0
@@ -195,7 +199,7 @@ export class WazoSupervision implements SupervisionProvider {
         Exten: 's',
         Priority: '1',
         Variable: [`TWAKE_LINE=${line.extension}`, `TWAKE_TARGET=${target}`, `TWAKE_GRANT=${grant}`],
-        CallerID: `"${CLICK_TO_CALL_NAME}" <${target}>`,
+        CallerID: `"${clickToCallName(target)}" <${CLICK_TO_CALL_CALLER}>`,
         Timeout: '30000'
       },
       undefined,

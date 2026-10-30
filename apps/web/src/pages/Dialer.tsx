@@ -47,9 +47,10 @@ export const Dialer = () => {
   // One click-to-call at a time: a second click would ring the phone twice.
   const [ringing, setRinging] = useState(false)
   // The dialer places the first call; a second one (a consultation before a transfer) is placed from the call panel.
-  // The Gateway places the call (click-to-call, ADR 0033) when this browser has no phone at all; a browser whose phone is
-  // connecting or failed waits for it (its own button rings the person's phone instead).
-  const canCall = (phone.state === 'registered' && !phone.calls.length) || (phone.state === 'off' && !!gatewayCalls)
+  // The Gateway places the call when the browser cannot. A click-to-call (ADR 0033) rings the person's own phone: only
+  // when this browser has no phone at all; one whose phone is connecting or failed has its own button for it.
+  const gatewayCallsNow = !!gatewayCalls && (!onPhone || phone.state === 'off')
+  const canCall = (phone.state === 'registered' && !phone.calls.length) || (phone.state !== 'registered' && gatewayCallsNow && !ringing)
   const [status, setStatus] = useState<{ kind: 'info' | 'error'; text: string } | null>(null)
   const callButton = useRef<HTMLButtonElement>(null)
   useEffect(() => {
@@ -128,8 +129,10 @@ export const Dialer = () => {
         await phone.call(target)
         setStatus(null)
         setNumber('')
-      } else if (phone.state === 'off' && gatewayCalls) {
-        await callOnPhone(target)
+      } else if (gatewayCallsNow) {
+        if (ringing) return
+        setRinging(true)
+        await callOnPhone(target).finally(() => setRinging(false))
       } else {
         setStatus({ kind: 'error', text: t('dialer.notRegistered') })
       }

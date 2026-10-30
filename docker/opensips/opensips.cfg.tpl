@@ -758,9 +758,19 @@ route {
 	# where an account's credentials would be checked). That call goes the way the person's own calls go: their rights,
 	# caps, fraud checks and trunk. The grant is read here and never passed on.
 	if ($var(wline) == 1 && is_method("INVITE") && !has_totag() && is_present_hf("X-Twake-Grant")) {
+		if (!has_body_part("application/sdp")) {
+			xlog("L_NOTICE", "wazo: click-to-call $ci refused on the lines socket, no offer\n");
+			send_reply(488, "Not Acceptable Here");
+			exit;
+		}
 		$var(ctc_call) = 1;
 		$avp(ctc_grant) = $hdr(X-Twake-Grant);
-		remove_hf("X-Twake-Grant");
+		# Who calls is told by this script and the grant: nothing else Wazo's INVITE writes passes on.
+		remove_hf_glob("X-Twake-*");
+		remove_hf_glob("Twake-*");
+		remove_hf("P-Asserted-Identity");
+		remove_hf("P-Preferred-Identity");
+		remove_hf("Remote-Party-ID");
 		$ru = "sip:" + $rU + "@${SIP_DOMAIN}";
 	}
 	# The socket of the lines of Wazo (step 11c-1): its keepalives, and its INVITE to a person's windows.
@@ -1181,13 +1191,17 @@ route {
 # ADR 0019): the call it takes the place of (`replaces`), the window it is for (`join_token`), its room (`room`).
 route[meet_source] {
 	$avp(meet_pstn) = $var(pstn);
+	# A room's grant for a room's call, a click-to-call's for Wazo's (ADR 0033): never the one for the other.
+	$var(grant_ctc) = "false";
+	if ($var(ctc_call) == 1)
+		$var(grant_ctc) = "true";
 	if (!($avp(meet_grant) =~ "^[0-9a-f]{32}$") || !($rU =~ "^[+]?[0-9*#]{2,20}$") || !($ft =~ "^[A-Za-z0-9._~!%*+-]{1,64}$") || !($ci =~ "^[A-Za-z0-9._~!%*+@:-]{1,200}$")) {
 		xlog("L_NOTICE", "meet: call $ci from $avp(caller) to $rU refused, without a grant\n");
 		append_to_reply("Twake-Call-Refused: not-granted\r\n");
 		t_reply(403, "Not Granted");
 		exit;
 	}
-	$var(meet_query) = "UPDATE dial_out_grants g SET used_by = '" + $ft + "', used_call = '" + $ci + "', expires_at = now() + interval '10 minutes' WHERE g.token = '" + $avp(meet_grant) + "' AND g.used_by IS NULL AND g.extension = '" + $fU + "' AND g.number = '" + $rU + "' AND g.expires_at > now() AND EXISTS (SELECT 1 FROM subscriber s WHERE s.username = g.extension) RETURNING 1, coalesce(g.replaces, ''), coalesce(g.join_token, ''), coalesce(g.room, '')";
+	$var(meet_query) = "UPDATE dial_out_grants g SET used_by = '" + $ft + "', used_call = '" + $ci + "', expires_at = now() + interval '10 minutes' WHERE g.token = '" + $avp(meet_grant) + "' AND g.used_by IS NULL AND g.extension = '" + $fU + "' AND g.number = '" + $rU + "' AND g.expires_at > now() AND (coalesce(g.room, '') = 'click-to-call') = " + $var(grant_ctc) + " AND EXISTS (SELECT 1 FROM subscriber s WHERE s.username = g.extension) RETURNING 1, coalesce(g.replaces, ''), coalesce(g.join_token, ''), coalesce(g.room, '')";
 	async(sql_query_one("$var(meet_query)", "$avp(meet_known);$avp(meet_replaces);$avp(meet_join);$avp(meet_room)"), meet_source_loaded);
 }
 

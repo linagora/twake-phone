@@ -134,8 +134,8 @@ if (process.env.TEST_DATABASE_URL) {
 
     const tpl = readFileSync(fileURLToPath(new URL('../../../docker/opensips/opensips.cfg.tpl', import.meta.url)), 'utf8')
     const line = tpl.split('\n').find(l => l.includes('$var(meet_query) = "UPDATE dial_out_grants'))!
-    /** route[meet_source]'s query for an INVITE carrying `grant`, From `from` (its tag `tag`), to `to`, of Call-ID `callId`. */
-    const query = (grant: string, from: string, to: string, tag = 'SCL_tag', callId = 'call-1') =>
+    /** route[meet_source]'s query for an INVITE carrying `grant`, From `from` (its tag `tag`), to `to`, of Call-ID `callId`; a room's call, or Wazo's click-to-call (`ctc`). */
+    const query = (grant: string, from: string, to: string, tag = 'SCL_tag', callId = 'call-1', ctc = false) =>
       line
         .slice(line.indexOf('"') + 1, line.lastIndexOf('"'))
         .replace(`'" + $ft + "'`, `'${tag}'`)
@@ -143,9 +143,10 @@ if (process.env.TEST_DATABASE_URL) {
         .replace(`'" + $avp(meet_grant) + "'`, `'${grant}'`)
         .replace(`'" + $fU + "'`, `'${from}'`)
         .replace(`'" + $rU + "'`, `'${to}'`)
+        .replace(`" + $var(grant_ctc) + "`, String(ctc))
     const take = async (grant: string, from: string, to: string) => (await pool.query(query(grant, from, to))).rowCount
     /** The same query's row, as OpenSIPS reads it into its AVPs (meet_known, meet_replaces, meet_join, meet_room). */
-    const taken = async (grant: string, from: string, to: string, tag?: string, callId?: string) => (await pool.query({ text: query(grant, from, to, tag, callId), rowMode: 'array' })).rows
+    const taken = async (grant: string, from: string, to: string, tag?: string, callId?: string, ctc = false) => (await pool.query({ text: query(grant, from, to, tag, callId, ctc), rowMode: 'array' })).rows
 
     it("hands OpenSIPS what a conference's grant says, once (step 8b); a grant of step 8 says none of it", async () => {
       const grants = new DialOutGrants({ pool, ready, tenantId: 'spec' })
@@ -179,13 +180,19 @@ if (process.env.TEST_DATABASE_URL) {
       expect(await grants.taken(token)).toBeUndefined()
     })
 
-    it('takes a click-to-call grant (room click-to-call) by its token, as a room\'s, once, for its person and its number (ADR 0033)', async () => {
+    it('takes a click-to-call grant (room click-to-call) by its token for Wazo\'s call only, once, for its person and its number; never a room\'s grant there, nor the other way round (ADR 0033)', async () => {
       const grants = new DialOutGrants({ pool, ready, tenantId: 'spec' })
       const token = await grants.grantClickToCall('9101', '+33612345678')
-      expect(await taken(token, '9102', '+33612345678')).toEqual([])
-      expect(await taken(token, '9101', '+33612345679')).toEqual([])
-      expect(await taken(token, '9101', '+33612345678')).toEqual([[1, '', '', 'click-to-call']])
+      expect(await taken(token, '9102', '+33612345678', undefined, undefined, true)).toEqual([])
+      expect(await taken(token, '9101', '+33612345679', undefined, undefined, true)).toEqual([])
+      // Not by a room's call, even with its token.
       expect(await taken(token, '9101', '+33612345678')).toEqual([])
+      expect(await taken(token, '9101', '+33612345678', undefined, undefined, true)).toEqual([[1, '', '', 'click-to-call']])
+      expect(await taken(token, '9101', '+33612345678', undefined, undefined, true)).toEqual([])
+      // A room's grant is not Wazo's.
+      const room = await grants.grant('9101', '102')
+      expect(await taken(room, '9101', '102', undefined, undefined, true)).toEqual([])
+      expect(await taken(room, '9101', '102')).toEqual([[1, '', '', '']])
     })
 
     it('takes a grant once, before its expiry, for its person and its number only', async () => {

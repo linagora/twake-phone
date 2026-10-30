@@ -3829,7 +3829,7 @@ try {
         wazoSide.close()
       }
     })
-    await step('step 11c-1, click-to-call (ADR 0033): Bob asks the Gateway to call 102 from his phone: his windows ring with "Twake Phone (102)", the second answers; Wazo calls 102 at Bob\'s name through OpenSIPS on the Gateway\'s grant: Jean sees Bob, answers, they hear each other; Bob hangs up and everything ends', async () => {
+    await step('step 11c-1, click-to-call (ADR 0033): Bob asks the Gateway to call 102 from his phone: his windows ring with "Appel vers 102", the second answers; Wazo calls 102 at Bob\'s name through OpenSIPS on the Gateway\'s grant: Jean sees Bob, answers, they hear each other; Bob hangs up and everything ends', async () => {
       const after = await lastId('acc')
       const jeanC = await open('jdupont', 'Jean Dupont')
       try {
@@ -3839,7 +3839,7 @@ try {
         expectEqual(caps.clickToCall, true, 'click-to-call offered to Bob, who has a line at Wazo')
         expectEqual((await (await asPerson(jeanC))('POST', '/calls', { target: 'sip:102@evil' })).statusCode, 400, 'a target that is no number')
         expectEqual((await api('POST', '/calls', { target: '102' })).statusCode, 202, 'the answer of the Gateway to Bob')
-        for (const who of [bob, bob2]) await who.page.getByTestId('incoming-call').getByText(/(Twake Phone|Jean Dupont) \(102\)/).waitFor({ timeout: 20_000 })
+        for (const who of [bob, bob2]) await who.page.getByTestId('incoming-call').getByText(/Appel vers 102/).waitFor({ timeout: 20_000 })
         await bob2.page.getByTestId('incoming-call').getByRole('button', { name: 'Répondre' }).click()
         // Wazo calls 102 at Bob's name: Jean sees Bob.
         await jeanC.page.getByTestId('incoming-call').getByText(/Bob Durand/).waitFor({ timeout: 20_000 }).catch(async err => {
@@ -3853,12 +3853,12 @@ try {
         await bob2.page.getByRole('button', { name: 'Raccrocher' }).click()
         await until('no call left for Jean', async () => ((await calls(jeanC.page)).length === 0 ? true : null), { timeout: 20_000 })
         await until('the channels of Wazo ended', async () => (asteriskCli('core show channels concise').includes('PJSIP/103-') ? null : true), { timeout: 20_000 })
-        // Wazo's call to Bob's line (showing 102), then its call to Jean at Bob's name, granted.
+        // Wazo's call to Bob's line (from no one's number: Bob's Récents never say Jean called him), then its call to Jean at Bob's name, granted.
         const cdrs = await until('both CDRs', async () => {
           const rows = await cdrsViaSince(after)
           return rows.length >= 2 ? rows : null
         })
-        expectEqual(cdrs.includes('102>103 200 wazo'), true, `the CDR of Wazo's call to Bob's line: ${cdrs}`)
+        expectEqual(cdrs.includes('click-to-call>103 200 wazo'), true, `the CDR of Wazo's call to Bob's line: ${cdrs}`)
         expectEqual(cdrs.includes('103>102 200 click-to-call'), true, `the CDR of the call to Jean at Bob's name: ${cdrs}`)
         // The grant is taken: Wazo cannot call again with it.
         expectEqual((await db.query("SELECT count(*)::int AS n FROM dial_out_grants WHERE room = 'click-to-call' AND extension = '103' AND number = '102' AND used_by IS NULL AND expires_at > now()")).rows[0].n, 0, 'grants of Bob for 102 left')
