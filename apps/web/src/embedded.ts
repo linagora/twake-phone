@@ -116,9 +116,14 @@ export const ParentCalls = () => {
   useEffect(() => {
     if (!isFramed()) return
     let cancelled = false
-    void parentOrigin(1_000).then(found => {
-      if (!cancelled && found) setOrigin(found)
-    })
+    // The parent's bridge may be late (the shell still starting): asked again, five times at most.
+    const ask = async () => {
+      for (let tries = 0; tries < 5 && !cancelled; tries++) {
+        const found = await parentOrigin(1_000)
+        if (found) return !cancelled && setOrigin(found)
+      }
+    }
+    void ask()
     return () => {
       cancelled = true
     }

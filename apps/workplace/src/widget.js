@@ -5,16 +5,19 @@ import { DIAL_CHANNEL, requestDial } from '@/dialRelay'
 /** What @twake/phone-widget posts to its frame for a number (a MessagePort for the answer). */
 const DIAL_MESSAGE = 'twake-phone:dial'
 const WIDTH = 360
+/** A window that said nothing for this long is gone (a tab killed without pagehide): its calls go with it. */
+const SILENT_MS = 25_000
 
 const TEXT = {
-  fr: { region: 'Twake Phone', incoming: 'Appel entrant', connected: 'En communication', held: 'En attente', answer: 'Répondre', reject: 'Refuser', hangup: 'Raccrocher' },
-  en: { region: 'Twake Phone', incoming: 'Incoming call', connected: 'In a call', held: 'On hold', answer: 'Answer', reject: 'Decline', hangup: 'Hang up' }
+  fr: { region: 'Twake Phone', incoming: 'Appel entrant', new: 'Appel en cours…', connected: 'En communication', held: 'En attente', answer: 'Répondre', reject: 'Refuser', hangup: 'Raccrocher' },
+  en: { region: 'Twake Phone', incoming: 'Incoming call', new: 'Calling…', connected: 'In a call', held: 'On hold', answer: 'Answer', reject: 'Decline', hangup: 'Hang up' }
 }
 
 /** The call to show: one that rings first, else one under way; with the window that has it. */
 export const callToShow = windows => {
   const all = [...windows.entries()].flatMap(([window, calls]) => calls.map(call => ({ ...call, window })))
-  return all.find(c => c.direction === 'inbound' && c.state === 'ringing') ?? all.find(c => c.state === 'connected' || c.state === 'held') ?? null
+  // ponytail: one card; a second call ringing at once waits for the first to be answered or declined.
+  return all.find(c => c.direction === 'inbound' && c.state === 'ringing') ?? all.find(c => c.state === 'connected' || c.state === 'held' || c.state === 'new') ?? null
 }
 
 /**
@@ -24,8 +27,9 @@ export const callToShow = windows => {
  * CALL intent does. The intent stays open as long as the host app.
  */
 export const serveWidget = ({ service, root, lang }) => {
-  const text = TEXT[lang] ?? TEXT.en
+  const text = TEXT[String(lang ?? '').slice(0, 2)] ?? TEXT.en
   const windows = new Map()
+  const heard = new Map()
   const channel = new BroadcastChannel(DIAL_CHANNEL)
   root.setAttribute('role', 'region')
   root.setAttribute('aria-label', text.region)
@@ -42,21 +46,21 @@ export const serveWidget = ({ service, root, lang }) => {
 
   const render = () => {
     const call = callToShow(windows)
-    const key = call && `${call.window}/${call.id}/${call.state}`
+    const key = call && `${call.window}/${call.id}/${call.state}/${call.remoteNumber}/${call.remoteName ?? ''}`
     if (key === shown) return
     shown = key
     root.replaceChildren()
     if (!call) return service.resizeClient({ width: 0, height: 0 })
     const card = document.createElement('div')
     card.className = 'tpw-card'
-    if (call.state === 'ringing') card.setAttribute('role', 'alertdialog')
-    card.setAttribute('aria-label', call.state === 'ringing' ? text.incoming : text[call.state] ?? text.connected)
+    // Announced, never focused: the person is working in the host app, a ring must not take their keyboard.
+    if (call.state === 'ringing') card.setAttribute('role', 'alert')
     const who = document.createElement('div')
     who.className = 'tpw-who'
     const name = document.createElement('strong')
     name.textContent = call.remoteName ? `${call.remoteName} (${call.remoteNumber})` : call.remoteNumber
     const state = document.createElement('span')
-    state.textContent = call.state === 'ringing' ? text.incoming : text[call.state] ?? text.connected
+    state.textContent = call.state === 'ringing' ? text.incoming : text[call.state]
     who.append(name, state)
     const actions = document.createElement('div')
     actions.className = 'tpw-actions'
@@ -69,10 +73,23 @@ export const serveWidget = ({ service, root, lang }) => {
 
   channel.onmessage = ({ data }) => {
     if (data?.type !== 'calls' || typeof data.window !== 'string' || !Array.isArray(data.calls)) return
-    if (data.calls.length) windows.set(data.window, data.calls)
-    else windows.delete(data.window)
+    if (data.calls.length) {
+      windows.set(data.window, data.calls)
+      heard.set(data.window, Date.now())
+    } else {
+      windows.delete(data.window)
+      heard.delete(data.window)
+    }
     render()
   }
+  // The windows with calls say them again every 10 s (callsRelay): one silent for longer is gone.
+  setInterval(() => {
+    for (const [w, at] of heard) if (Date.now() - at > SILENT_MS) {
+      windows.delete(w)
+      heard.delete(w)
+    }
+    render()
+  }, 5_000)
   // What the windows open now have (they say it again at each change).
   channel.postMessage({ type: 'calls-request' })
 

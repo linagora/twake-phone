@@ -11,6 +11,8 @@ export const CALLS_MESSAGE = 'twakephone.calls'
 export const COMMAND_MESSAGE = 'twakephone.command'
 const ACTIONS = ['answer', 'reject', 'hangup']
 
+// The channel is the origin's: any page of the shell's origin (the shell, its intent pages) is trusted alike; the frame
+// takes orders from its parent only, and the host apps never see the channel (another origin).
 export const useCallsRelay = ({ enabled, frameOrigin }) => {
   useEffect(() => {
     if (!enabled || typeof BroadcastChannel === 'undefined') return undefined
@@ -29,14 +31,19 @@ export const useCallsRelay = ({ enabled, frameOrigin }) => {
       if (data?.type !== 'command' || data.window !== me || typeof data.callId !== 'string' || !ACTIONS.includes(data.action)) return
       frame()?.postMessage({ type: COMMAND_MESSAGE, callId: data.callId, action: data.action }, frameOrigin)
     }
-    // A window that goes away takes its calls with it: the widget forgets them.
+    // A window that goes away takes its calls with it: the widget forgets them; back from the cache, it says them again.
+    // While it has calls, it says them every 10 s: the widget forgets a window it no longer hears (a tab killed).
     const leave = () => channel.postMessage({ type: 'calls', window: me, calls: [] })
+    const beat = setInterval(() => calls.length && say(), 10_000)
     window.addEventListener('message', onFrame)
     window.addEventListener('pagehide', leave)
+    window.addEventListener('pageshow', say)
     return () => {
       leave()
+      clearInterval(beat)
       window.removeEventListener('message', onFrame)
       window.removeEventListener('pagehide', leave)
+      window.removeEventListener('pageshow', say)
       channel.close()
     }
   }, [enabled, frameOrigin])
