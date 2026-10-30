@@ -44,8 +44,12 @@ export const Dialer = () => {
   const [gatewayCalls, setGatewayCalls] = useState<boolean | null>(null)
   // Click-to-call (ADR 0033): the Gateway can also ring the person's own phone (desk phone, Linphone) and have it call.
   const [onPhone, setOnPhone] = useState(false)
+  // One click-to-call at a time: a second click would ring the phone twice.
+  const [ringing, setRinging] = useState(false)
   // The dialer places the first call; a second one (a consultation before a transfer) is placed from the call panel.
-  const canCall = (phone.state === 'registered' && !phone.calls.length) || (phone.state !== 'registered' && !!gatewayCalls)
+  // The Gateway places the call (click-to-call, ADR 0033) when this browser has no phone at all; a browser whose phone is
+  // connecting or failed waits for it (its own button rings the person's phone instead).
+  const canCall = (phone.state === 'registered' && !phone.calls.length) || (phone.state === 'off' && !!gatewayCalls)
   const [status, setStatus] = useState<{ kind: 'info' | 'error'; text: string } | null>(null)
   const callButton = useRef<HTMLButtonElement>(null)
   useEffect(() => {
@@ -102,12 +106,15 @@ export const Dialer = () => {
   }
   const submitOnPhone = async () => {
     const target = toDialTarget(number)
-    if (!target) return
+    if (!target || ringing) return
+    setRinging(true)
     setStatus({ kind: 'info', text: t('dialer.placing', { number: formatNumber(number) }) })
     try {
       await callOnPhone(target)
     } catch (err) {
       setStatus({ kind: 'error', text: t('dialer.failed', { reason: describeCallError(err, t) }) })
+    } finally {
+      setRinging(false)
     }
   }
   const submit = async (e: FormEvent) => {
@@ -121,7 +128,7 @@ export const Dialer = () => {
         await phone.call(target)
         setStatus(null)
         setNumber('')
-      } else if (gatewayCalls) {
+      } else if (phone.state === 'off' && gatewayCalls) {
         await callOnPhone(target)
       } else {
         setStatus({ kind: 'error', text: t('dialer.notRegistered') })
@@ -168,9 +175,9 @@ export const Dialer = () => {
           <Button ref={callButton} type="submit" disabled={!canCall || !toDialTarget(number)}>
             {t('dialer.call')}
           </Button>
-          {/* The browser calls by itself: the person may still ring their own phone instead. Never from a link alone (ADR 0031). */}
-          {onPhone && phone.state === 'registered' ? (
-            <Button type="button" variant="outlined" onClick={() => void submitOnPhone()} disabled={!toDialTarget(number)}>
+          {/* This browser has a phone: the person may still ring their own phone instead. Never from a link alone (ADR 0031). */}
+          {onPhone && phone.state !== 'off' ? (
+            <Button type="button" variant="outlined" onClick={() => void submitOnPhone()} disabled={ringing || !toDialTarget(number)}>
               {t('dialer.callOnPhone')}
             </Button>
           ) : null}

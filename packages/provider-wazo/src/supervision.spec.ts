@@ -304,7 +304,7 @@ describe('clickToCall', () => {
 
   it('refuses a line, a number or a domain that would say more than one (no Asterisk argument, header or URI can be slipped in)', async () => {
     const { sup, ami } = await supervision((a, reply) => reply({ Response: 'Success', ActionID: a.ActionID!, Message: 'queued' }))
-    for (const [line, target, domain] of [['103,Hangup', '102', 'twake.local'], ['103', '102,Hangup', 'twake.local'], ['103', 'sip:102', 'twake.local'], ['103', '+3361234567890123456789', 'twake.local'], ['103', '102', 'twake.local;transport=tcp'], ['103', '102', 'evil.test>\r\nX: y']] as const)
+    for (const [line, target, domain] of [['103,Hangup', '102', 'twake.local'], ['103', '102,Hangup', 'twake.local'], ['103', 'sip:102', 'twake.local'], ['103', '+3361234567890123456789', 'twake.local'], ['103', '102', 'twake.local;transport=tcp'], ['103', '102', 'twake.local:5060'], ['103', '102', 'evil.test>\r\nX: y']] as const)
       await expect(sup.clickToCall({ extension: line }, target, domain)).rejects.toMatchObject({ code: 'refused' })
     expect(ami.state.actions).toEqual([])
   })

@@ -116,12 +116,15 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     // A transfer of such a call is refused as one with the operator (REFER), save the click-to-call (ADR 0033): from Wazo's
     // side only, once, to the number it showed as the caller, at our domain, nothing else (no Replaces, no other host).
     expect(cfg).toContain('$dlg_val(meet) != NULL || ($dlg_val(wline) == "1" && $var(click_to_call) == 0))) {')
-    expect(call.slice(0, call.indexOf('route(rules_step);'))).toContain('$dlg_val(wline_caller) = $avp(caller);')
+    expect(call.slice(0, call.indexOf('route(rules_step);'))).toContain('$dlg_val(wline_caller) = $avp(caller);\n\t\t$dlg_val(wline_callee) = $rU;')
     const ctc = cfg.slice(cfg.indexOf('$var(click_to_call) = 0;'), cfg.indexOf('if (is_method("REFER") && ($dlg_val(trunk) != NULL'))
-    expect(ctc).toContain('if (is_method("REFER") && $dlg_val(wline) == "1" && $var(from_wline) == 1 && $hdrcnt(Refer-To) == 1 && $dlg_val(wline_caller) != NULL && $dlg_val(wline_caller) != "anonymous") {')
+    expect(ctc).toContain('if (is_method("REFER") && $dlg_val(wline) == "1" && $var(from_wline) == 1 && $hdrcnt(Refer-To) == 1 && $dlg_val(wline_caller) != NULL && $dlg_val(wline_caller) != "anonymous" && $dlg_val(wline_callee) != NULL) {')
     expect(ctc).toContain('$var(refer_to) = "sip:" + $dlg_val(wline_caller) + "@127.0.0.1";')
     expect(ctc).toContain('$var(refer_to_named) = "<" + $var(refer_to) + ">";')
     expect(ctc).toContain('if ($hdr(Refer-To) == $var(refer_to) || $hdr(Refer-To) == $var(refer_to_named))')
+    // ...and only with the grant the Gateway wrote for that line and that number, taken once.
+    expect(ctc).toContain(`$var(ctc_query) = "UPDATE dial_out_grants g SET used_by = 'click-to-call' WHERE g.room = 'click-to-call' AND g.used_by IS NULL AND g.extension = '" + $dlg_val(wline_callee) + "' AND g.number = '" + $dlg_val(wline_caller) + "' AND g.expires_at > now() RETURNING 1";`)
+    expect(ctc).toContain('if (sql_query_one("$var(ctc_query)", "$var(ctc_granted)"))\n\t\t\t\t\t$var(click_to_call) = 1;')
     expect(ctc.match(/\$var\(click_to_call\) = 1;/g)).toHaveLength(1)
   })
 

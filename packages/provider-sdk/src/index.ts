@@ -147,6 +147,11 @@ export interface TelephonyProvider {
   /** The SIP domain of the accounts (`sip:<extension>@<domain>`): where a click-to-call hands a call (ADR 0033). */
   readonly sipDomain?: string
   /**
+   * Click-to-call (ADR 0033): lets the call the telephony server is about to place to `extension`'s line be handed to
+   * `number`, once, within a minute. Without it, the SIP server refuses that transfer.
+   */
+  grantClickToCall?(extension: string, number: string): Promise<void>
+  /**
    * The call flows the voicemail and telephony server runs now (step 11c-2, ADR 0028; VoicemailProvider's syncFlows):
    * replaces the list. A call to one of these numbers goes to that server with `route`, which it understands; a number
    * not in it is no flow.

@@ -659,14 +659,21 @@ route {
 		$var(click_to_call) = 0;
 		# wazo-lines: begin
 		# Click-to-call (ADR 0033): the Gateway has Wazo ring a person's line, then hand the call, once answered, to the
-		# number it showed as the caller (Transfer: a REFER from Wazo's side, to sip:<that number>@our domain, nothing
-		# else). The phone then calls that number itself, with its own account: its rights, caps and fraud checks apply
-		# as to any call it makes. Any other REFER in such a call stays refused below.
-		if (is_method("REFER") && $dlg_val(wline) == "1" && $var(from_wline) == 1 && $hdrcnt(Refer-To) == 1 && $dlg_val(wline_caller) != NULL && $dlg_val(wline_caller) != "anonymous") {
+		# number it showed as the caller (Transfer: a REFER from Wazo's side, to sip:<that number>@our domain). It passes
+		# only with a grant the Gateway wrote just before for that line and that number (dial_out_grants, room
+		# click-to-call), taken once here: a call Wazo places for another reason (a queue, a voice menu, an outside caller
+		# whose number is anything) has none. The phone then calls that number itself, with its own account: its rights,
+		# caps and fraud checks apply as to any call it makes. Any other REFER in such a call stays refused below.
+		if (is_method("REFER") && $dlg_val(wline) == "1" && $var(from_wline) == 1 && $hdrcnt(Refer-To) == 1 && $dlg_val(wline_caller) != NULL && $dlg_val(wline_caller) != "anonymous" && $dlg_val(wline_callee) != NULL) {
 			$var(refer_to) = "sip:" + $dlg_val(wline_caller) + "@${SIP_DOMAIN}";
 			$var(refer_to_named) = "<" + $var(refer_to) + ">";
-			if ($hdr(Refer-To) == $var(refer_to) || $hdr(Refer-To) == $var(refer_to_named))
-				$var(click_to_call) = 1;
+			if ($hdr(Refer-To) == $var(refer_to) || $hdr(Refer-To) == $var(refer_to_named)) {
+				$var(ctc_query) = "UPDATE dial_out_grants g SET used_by = 'click-to-call' WHERE g.room = 'click-to-call' AND g.used_by IS NULL AND g.extension = '" + $dlg_val(wline_callee) + "' AND g.number = '" + $dlg_val(wline_caller) + "' AND g.expires_at > now() RETURNING 1";
+				if (sql_query_one("$var(ctc_query)", "$var(ctc_granted)"))
+					$var(click_to_call) = 1;
+				else
+					xlog("L_NOTICE", "call $ci: REFER of Wazo to $dlg_val(wline_caller) refused, no grant of the Gateway for line $dlg_val(wline_callee)\n");
+			}
 		}
 		# wazo-lines: end
 		if (is_method("REFER") && ($dlg_val(trunk) != NULL || $dlg_val(meet) != NULL || ($dlg_val(wline) == "1" && $var(click_to_call) == 0))) {
@@ -809,8 +816,10 @@ route {
 		$avp(caller) = "anonymous";
 		if ($fU =~ "^[A-Za-z0-9._+-]{1,64}$")
 			$avp(caller) = $fU;
-		# The one number Wazo may later hand this call to (click-to-call, ADR 0033): the one it shows as the caller.
+		# Click-to-call (ADR 0033): the line called and the number shown, which a grant of the Gateway may let Wazo hand
+		# this call to (the REFER, below). Both of an extension's characters: they go into that query as they are.
 		$dlg_val(wline_caller) = $avp(caller);
+		$dlg_val(wline_callee) = $rU;
 		$avp(callee) = $rU;
 		$avp(dialled) = $rU;
 		$avp(domain) = "${SIP_DOMAIN}";

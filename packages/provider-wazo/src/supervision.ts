@@ -52,7 +52,8 @@ const SOUND = /^[A-Za-z0-9_-]+(\/[A-Za-z0-9_-]+)*$/
 const EXTENSION = /^[0-9]{1,40}$/
 /** What a click-to-call may call: a number in E.164, or an extension (ADR 0033). */
 const CLICK_TO_CALL_TARGET = /^\+?[0-9]{2,20}$/
-const DOMAIN = /^[A-Za-z0-9.-]{1,253}(:[0-9]{1,5})?$/
+/** The SIP domain as OpenSIPS compares it (SIP_DOMAIN): a host, no port. */
+const DOMAIN = /^[A-Za-z0-9.-]{1,253}$/
 /** The name the line shows while it rings for a click-to-call: the number it will call comes with it. */
 export const CLICK_TO_CALL_NAME = 'Twake Phone'
 /** The options of ChanSpy: by unique id (u), quiet (q), until the call ends (E); then whisper (w) or barge (B). */

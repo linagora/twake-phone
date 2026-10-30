@@ -20,7 +20,7 @@ export { CallTracker, alertOf, userOf, isExternalParty, EMERGENCY_BURST, EMERGEN
 export { CallRules, CALL_RULES_SCHEMA, DND_MESSAGE_MAX, NOANSWER_DELAY, type CallRulesOptions, type DndRule, type ExtensionHolder } from './call-rules.js'
 export { CallGroups, CALL_GROUPS_SCHEMA, DISPLAY_NAMES_SCHEMA, GROUP_MEMBERS_MAX, NAME_MAX, sipDisplayName, type CallGroupsOptions } from './call-groups.js'
 export { PushTargets, PUSH_TARGETS_SCHEMA, type PushTargetsOptions } from './push-targets.js'
-export { DialOutGrants, DIAL_OUT_GRANTS_SCHEMA, GRANT_HEADER, GRANT_TTL_SEC, JOIN_HEADER, JOIN_TOKEN, REPLACES, type DialOutGrantsOptions } from './dial-out-grants.js'
+export { CLICK_TO_CALL_ROOM, DialOutGrants, DIAL_OUT_GRANTS_SCHEMA, GRANT_HEADER, GRANT_TTL_SEC, JOIN_HEADER, JOIN_TOKEN, REPLACES, type DialOutGrantsOptions } from './dial-out-grants.js'
 export { AsyncQueue } from './queue.js'
 export { WazoLines, WAZO_LINES_SCHEMA, type WazoLinesOptions } from './wazo-lines.js'
 export { CallFlows, CALL_FLOWS_SCHEMA, type CallFlowsOptions } from './call-flows.js'
@@ -487,6 +487,13 @@ export class OpensipsProvider implements TelephonyProvider, MediaProvider {
    * in the place of a call of `number` (`replaces`), or to the window of `extension` that waits for `join` (step 8b),
    * a call of the conference `room`. `taken`: the call that took it, as OpenSIPS wrote it (review 8b, n°3).
    */
+  /** Click-to-call (ADR 0033): `extension`'s line may be handed to `number` once, within a minute (route of the REFER). */
+  async grantClickToCall(extension: string, number: string): Promise<void> {
+    const grants = this.config.dialOutGrants
+    if (!grants) throw Object.assign(new Error('The SIP server cannot hand a call'), { statusCode: 501 })
+    await grants.grantClickToCall(extension, number)
+  }
+
   async grantRoomCall(grant: RoomCallGrant): Promise<RoomCallGrantToken> {
     const grants = this.config.dialOutGrants
     if (!grants) throw Object.assign(new Error('The SIP server cannot let a room call'), { statusCode: 501 })
