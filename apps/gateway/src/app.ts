@@ -1784,13 +1784,13 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         return said
       }
       // Click-to-call (ADR 0033): the SIP server cannot place a call itself; the voicemail and telephony server rings the
-      // person's line (an extension with a line there) and hands the answered call to the number, which their phone then
-      // calls with its own account. Undefined when that is not on for this person.
+      // person's line (an extension with a line there), then calls the number at their name through the SIP server, on a
+      // grant of the Gateway (their rights and caps apply). Undefined when that is not on for this person.
       const clickToCallFor = async (user: User, provider: TelephonyProvider) => {
         const server = options.supervision?.(user.tenantId)
-        if (!server?.clickToCall || !user.extension || !provider.sipDomain || !provider.listWazoLines || !provider.grantClickToCall) return undefined
+        if (!server?.clickToCall || !user.extension || !provider.listWazoLines || !provider.grantClickToCall) return undefined
         if (!(await provider.listWazoLines()).includes(user.extension)) return undefined
-        return { server, extension: user.extension, domain: provider.sipDomain }
+        return { server, extension: user.extension }
       }
 
       v1.get('/capabilities', async req => {
@@ -1938,9 +1938,9 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
             const target = typeof req.body?.target === 'string' ? req.body.target : ''
             if (!/^\+?[0-9]{2,20}$/.test(target)) throw Object.assign(new Error('target must be an extension or a phone number (digits, + first)'), { statusCode: 400 })
             try {
-              // The SIP server lets this one transfer through, and no other (ADR 0033): granted first, by the Gateway.
-              await provider.grantClickToCall!(clickToCall.extension, target)
-              await clickToCall.server.clickToCall!({ extension: clickToCall.extension }, target, clickToCall.domain)
+              // The SIP server lets this call through at the person's name on this grant only (ADR 0033).
+              const grant = await provider.grantClickToCall!(clickToCall.extension, target)
+              await clickToCall.server.clickToCall!({ extension: clickToCall.extension }, target, grant)
             } catch (err) {
               const code = (err as { code?: string }).code
               req.log.warn({ err }, 'click-to-call not placed')

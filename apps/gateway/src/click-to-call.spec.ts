@@ -18,14 +18,13 @@ const setup = async (opts: { clickToCall?: boolean; refuse?: 'refused' | 'unavai
   const store = new MemoryStore()
   await store.upsertMapping({ tenantId: 'dev', userId: 'bdurand', extension: '103', displayName: 'Bob Durand' })
   await store.upsertMapping({ tenantId: 'dev', userId: 'amartin', extension: '101', displayName: 'Alice Martin' })
-  const placed: { extension: string; target: string; domain: string }[] = []
+  const placed: { extension: string; target: string; grant: string }[] = []
   const order: string[] = []
   const calling = { outbound: opts.outbound ?? false, inbound: true, answer: false, hangup: false, hold: false, transfer: false, dtmf: false }
   const telephony: ProviderFactory<unknown> = {
     type: 'fake',
     create: () =>
       ({
-        sipDomain: 'twake.local',
         getStatus: () => 'CONNECTED',
         getCapabilities: async () => ({ calling, media: { browserAudio: true } }),
         // Only Bob's extension has a line at Wazo.
@@ -35,6 +34,7 @@ const setup = async (opts: { clickToCall?: boolean; refuse?: 'refused' | 'unavai
           : {
               grantClickToCall: async (extension: string, number: string) => {
                 order.push(`grant ${extension} ${number}`)
+                return 'f'.repeat(32)
               }
             }),
         originate: async () => {
@@ -49,9 +49,9 @@ const setup = async (opts: { clickToCall?: boolean; refuse?: 'refused' | 'unavai
     ...(opts.clickToCall === false
       ? {}
       : {
-          async clickToCall(line: { extension: string }, target: string, domain: string) {
+          async clickToCall(line: { extension: string }, target: string, grant: string) {
             if (opts.refuse) throw new SupervisionError('no', opts.refuse)
-            placed.push({ extension: line.extension, target, domain })
+            placed.push({ extension: line.extension, target, grant })
             order.push(`ring ${line.extension}`)
           }
         })
@@ -72,8 +72,8 @@ describe('click-to-call', () => {
     const res = await call('bdurand', '+33612345678')
     expect(res.statusCode).toBe(202)
     expect(res.json()).toMatchObject({ direction: 'outbound', state: 'new', remoteNumber: '+33612345678' })
-    expect(placed).toEqual([{ extension: '103', target: '+33612345678', domain: 'twake.local' }])
-    // The SIP server lets this transfer through only with the Gateway's grant, written before the line rings.
+    expect(placed).toEqual([{ extension: '103', target: '+33612345678', grant: 'f'.repeat(32) }])
+    // The SIP server lets Wazo's call through only with the Gateway's grant, written before the line rings and handed to Wazo.
     expect(order).toEqual(['grant 103 +33612345678', 'ring 103'])
   })
 

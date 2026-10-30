@@ -541,6 +541,8 @@ route {
 		$var(wazo) = 1;
 	}
 
+	# A click-to-call (ADR 0033): Wazo's call to a number at the name of a person, on the Gateway's grant (below).
+	$var(ctc_call) = 0;
 	# wazo-lines: begin
 	# The socket of the lines of Wazo (step 11c-1, ADR 0027) hears Wazo's Asterisk only (WAZO_SIP), any port, and nothing
 	# when the lines are off. Its INVITE to a person's windows (route[wazo_line_call]) and, in that call, its side's
@@ -656,36 +658,8 @@ route {
 		# have it call whatever the Refer-To says, on our account and past route[outbound_policy]. Refused whichever
 		# side sends it: a transfer with an external party waits for one the platform makes itself. Likewise in a call
 		# with LiveKit SIP (step 8): a room calls through the Gateway only, at the name of whoever asked.
-		$var(click_to_call) = 0;
-		# wazo-lines: begin
-		# Click-to-call (ADR 0033): the Gateway has Wazo ring a person's line, then hand the call, once answered, to the
-		# number it showed as the caller (Transfer: a REFER from Wazo's side, to sip:<that number>@our domain). It passes
-		# only with a grant the Gateway wrote just before for that line and that number (dial_out_grants, room
-		# click-to-call), taken once here: a call Wazo places for another reason (a queue, a voice menu, an outside caller
-		# whose number is anything) has none. The phone then calls that number itself, with its own account: its rights,
-		# caps and fraud checks apply as to any call it makes. Any other REFER in such a call stays refused below.
-		# A retransmission of a REFER already relayed (Asterisk resends it while the phone's 202 is on its way) is absorbed:
-		# its grant is taken, and a 403 to the copy would undo the transfer.
-		if (is_method("REFER") && $dlg_val(wline) == "1" && $var(from_wline) == 1 && t_check_trans())
-			exit;
-		if (is_method("REFER") && $dlg_val(wline) == "1" && $var(from_wline) == 1 && $hdrcnt(Refer-To) == 1 && $dlg_val(wline_caller) != NULL && $dlg_val(wline_caller) != "anonymous" && $dlg_val(wline_callee) != NULL) {
-			$var(refer_to) = "sip:" + $dlg_val(wline_caller) + "@${SIP_DOMAIN}";
-			$var(refer_to_named) = "<" + $var(refer_to) + ">";
-			# Taken by this call (its Call-ID, of the characters route[meet_source] lets in): a copy of the REFER that two
-			# processes read at once, before its transaction existed, finds it again rather than a 403 that would undo it.
-			if (($hdr(Refer-To) == $var(refer_to) || $hdr(Refer-To) == $var(refer_to_named)) && $ci =~ "^[A-Za-z0-9._~!%*+@:-]{1,200}$") {
-				$var(ctc_query) = "UPDATE dial_out_grants g SET used_by = 'click-to-call', used_call = '" + $ci + "' WHERE g.room = 'click-to-call' AND (g.used_by IS NULL OR g.used_call = '" + $ci + "') AND g.extension = '" + $dlg_val(wline_callee) + "' AND g.number = '" + $dlg_val(wline_caller) + "' AND g.expires_at > now() RETURNING 1";
-				if (sql_query_one("$var(ctc_query)", "$var(ctc_granted)"))
-					$var(click_to_call) = 1;
-				else
-					xlog("L_NOTICE", "call $ci: REFER of Wazo to $dlg_val(wline_caller) refused, no grant of the Gateway for line $dlg_val(wline_callee)\n");
-			}
-		}
-		# wazo-lines: end
-		if (is_method("REFER") && ($dlg_val(trunk) != NULL || $dlg_val(meet) != NULL || ($dlg_val(wline) == "1" && $var(click_to_call) == 0))) {
+		if (is_method("REFER") && ($dlg_val(trunk) != NULL || $dlg_val(meet) != NULL || $dlg_val(wline) == "1")) {
 			xlog("L_NOTICE", "call $ci: REFER in a call with the operator, LiveKit SIP or Wazo's lines refused\n");
-			if ($dlg_val(wline) == "1")
-				xlog("L_NOTICE", "call $ci: that REFER came from $si:$sp (Wazo's side: $var(from_wline)), to $hdr(Refer-To), the line $dlg_val(wline_callee) showing $dlg_val(wline_caller)\n");
 			if (route(to_trunk) || route(to_meet) || $dlg_val(wline) == "1")
 				append_to_reply("Twake-Call-Refused: transfer-external\r\n");
 			send_reply(403, "Transfer Not Allowed");
@@ -779,8 +753,18 @@ route {
 	}
 
 	# wazo-lines: begin
+	# A click-to-call (ADR 0033): the line of a person answered the call Wazo placed to it, and Wazo now calls the
+	# number they asked for, at their name (the From), with the Gateway's grant for it (X-Twake-Grant, taken once below,
+	# where an account's credentials would be checked). That call goes the way the person's own calls go: their rights,
+	# caps, fraud checks and trunk. The grant is read here and never passed on.
+	if ($var(wline) == 1 && is_method("INVITE") && !has_totag() && is_present_hf("X-Twake-Grant")) {
+		$var(ctc_call) = 1;
+		$avp(ctc_grant) = $hdr(X-Twake-Grant);
+		remove_hf("X-Twake-Grant");
+		$ru = "sip:" + $rU + "@${SIP_DOMAIN}";
+	}
 	# The socket of the lines of Wazo (step 11c-1): its keepalives, and its INVITE to a person's windows.
-	if ($var(wline) == 1) {
+	if ($var(wline) == 1 && $var(ctc_call) == 0) {
 		if (is_method("ACK"))
 			exit;
 		if (is_method("OPTIONS")) {
@@ -824,10 +808,6 @@ route {
 		$avp(caller) = "anonymous";
 		if ($fU =~ "^[A-Za-z0-9._+-]{1,64}$")
 			$avp(caller) = $fU;
-		# Click-to-call (ADR 0033): the line called and the number shown, which a grant of the Gateway may let Wazo hand
-		# this call to (the REFER, below). Both of an extension's characters: they go into that query as they are.
-		$dlg_val(wline_caller) = $avp(caller);
-		$dlg_val(wline_callee) = $rU;
 		$avp(callee) = $rU;
 		$avp(dialled) = $rU;
 		$avp(domain) = "${SIP_DOMAIN}";
@@ -986,6 +966,15 @@ route {
 		if (is_present_hf("X-Twake-Grant"))
 			$avp(meet_grant) = $hdr(X-Twake-Grant);
 		remove_hf("X-Twake-Grant");
+	} else if ($var(ctc_call) == 1) {
+		# A click-to-call (ADR 0033): no credentials; the Gateway's grant stands for them, taken once the transaction exists,
+		# as a room's is (route[meet_source]: this person, this number, once, its room `click-to-call`).
+		if (!($fU =~ "^[0-9]{1,40}$") || is_present_hf("Replaces")) {
+			xlog("L_NOTICE", "wazo: click-to-call $ci from $fU refused\n");
+			send_reply(403, "Forbidden");
+			exit;
+		}
+		$avp(meet_grant) = $avp(ctc_grant);
 	} else {
 		if (!proxy_authorize("", "subscriber")) {
 			proxy_challenge("", "auth");
@@ -1073,6 +1062,12 @@ route {
 		$dlg_val(meet) = "caller";
 		$acc_extra(via) = "meet";
 	}
+	# A click-to-call (ADR 0033): Wazo is the caller, from the lines socket; its side speaks from there only, as in the
+	# calls it places to a person's windows (and nothing in it transfers).
+	if ($var(ctc_call) == 1) {
+		$dlg_val(wline) = "1";
+		$acc_extra(via) = "click-to-call";
+	}
 
 	# Who calls whom, as dialled (the Request-URI changes with the lookup): for the CDR and the events. `callee` is
 	# where the call goes now (the callee's rules may move it), `dialled` stays what the caller dialled.
@@ -1107,8 +1102,9 @@ route {
 		exit;
 	}
 
-	# A room's call (step 8): whoever its From names must be one of our accounts (route[meet_source]).
-	if ($var(meet) == 1) {
+	# A room's call (step 8): whoever its From names must be one of our accounts (route[meet_source]). A click-to-call
+	# (ADR 0033) is granted the same way.
+	if ($var(meet) == 1 || $var(ctc_call) == 1) {
 		route(meet_source);
 		exit;
 	}
@@ -1229,7 +1225,7 @@ route[meet_source_loaded] {
 		append_hf("Twake-Conference: $avp(meet_room)\r\n");
 		$avp(conference) = 1;
 		$acc_extra(via) = "conference";
-	} else
+	} else if ($avp(meet_room) != "click-to-call")
 		append_hf("Twake-Room: meet\r\n");
 	route(rules_next);
 	exit;

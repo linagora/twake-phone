@@ -1113,8 +1113,6 @@ describe('WazoVoicemail, the lines (step 11c-1)', () => {
       ['max_contacts', '1'],
       ['remove_existing', 'yes']
     ])
-    // Click-to-call (ADR 0033): Wazo hangs up once the phone took the transfer, never waiting for its last NOTIFY.
-    expect(wazo.state.endpoints[0]!.endpoint_section_options).toEqual([['refer_blind_progress', 'no']])
     expect(wazo.state.lines.map(l => l.context)).toEqual([CONTEXT, CONTEXT])
     expect(wazo.state.users).toEqual([])
     // Again: nothing is written.

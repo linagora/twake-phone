@@ -52,11 +52,10 @@ const SOUND = /^[A-Za-z0-9_-]+(\/[A-Za-z0-9_-]+)*$/
 const EXTENSION = /^[0-9]{1,40}$/
 /** What a click-to-call may call: a number in E.164, or an extension (ADR 0033). */
 const CLICK_TO_CALL_TARGET = /^\+?[0-9]{2,20}$/
-/** The SIP domain as OpenSIPS compares it (SIP_DOMAIN): a host, no port. */
-const DOMAIN = /^[A-Za-z0-9.-]{1,253}$/
+const GRANT = /^[0-9a-f]{32}$/
 /** The name the line shows while it rings for a click-to-call: the number it will call comes with it. */
 export const CLICK_TO_CALL_NAME = 'Twake Phone'
-/** The context of Wazo's dialplan that hands the answered line to the target (docker/wazo/asterisk/extensions.conf). */
+/** The context of Wazo's dialplan that calls the target for the answered line (docker/wazo/asterisk/extensions.conf). */
 export const CLICK_TO_CALL_CONTEXT = 'twake-click-to-call'
 /** The options of ChanSpy: by unique id (u), quiet (q), until the call ends (E); then whisper (w) or barge (B). */
 const SPY_OPTIONS: Record<SupervisionMode, string> = { listen: 'uqE', whisper: 'uqEw', barge: 'uqEB' }
@@ -181,22 +180,21 @@ export class WazoSupervision implements SupervisionProvider {
     )
   }
 
-  async clickToCall(line: { extension: string }, target: string, domain: string): Promise<void> {
+  async clickToCall(line: { extension: string }, target: string, grant: string): Promise<void> {
     if (!EXTENSION.test(line.extension)) throw new SupervisionError('not a line', 'refused')
-    if (!CLICK_TO_CALL_TARGET.test(target) || !DOMAIN.test(domain)) throw new SupervisionError('not a number to call', 'refused')
-    // The line rings with the number it is about to call; answered, Transfer sends it a REFER to that number, which
-    // the SIP server lets through only to the number shown (ADR 0033), and the phone calls it with its own account.
-    // Async: the person may take 30 s to answer; the Gateway answers once Asterisk queued the call.
+    if (!CLICK_TO_CALL_TARGET.test(target) || !GRANT.test(grant)) throw new SupervisionError('not a number to call', 'refused')
+    // The line rings with the number it is about to call; answered, the context of docker/wazo/asterisk/extensions.conf
+    // calls that number at the line's name through OpenSIPS, with the grant, and bridges the two. Async: the person may
+    // take 30 s to answer; the Gateway answers once Asterisk queued the call.
     await this.ami(
       {
         Action: 'Originate',
         Async: 'true',
         Channel: `PJSIP/${line.extension}`,
-        // docker/wazo/asterisk/extensions.conf: Transfer to the target, and this side ended 5 s after the answer.
         Context: CLICK_TO_CALL_CONTEXT,
         Exten: 's',
         Priority: '1',
-        Variable: [`TWAKE_TARGET=${target}`, `TWAKE_DOMAIN=${domain}`],
+        Variable: [`TWAKE_LINE=${line.extension}`, `TWAKE_TARGET=${target}`, `TWAKE_GRANT=${grant}`],
         CallerID: `"${CLICK_TO_CALL_NAME}" <${target}>`,
         Timeout: '30000'
       },

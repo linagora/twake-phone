@@ -294,26 +294,27 @@ describe('spy', () => {
 })
 
 describe('clickToCall', () => {
-  it('rings the line with the number it will call, and hands the answered call to that number at our domain (ADR 0033), by the Originate account', async () => {
+  it('rings the line with the number it will call, then has the context of Wazo call it with the grant (ADR 0033), by the Originate account', async () => {
     const { sup, ami } = await supervision((a, reply) => reply({ Response: 'Success', ActionID: a.ActionID!, Message: 'Originate successfully queued' }))
-    await sup.clickToCall({ extension: '103' }, '+33612345678', 'twake.local')
+    await sup.clickToCall({ extension: '103' }, '+33612345678', 'a'.repeat(32))
     expect(ami.state.actions).toEqual([
       expect.objectContaining({ Action: 'Originate', Async: 'true', Channel: 'PJSIP/103', Context: 'twake-click-to-call', Exten: 's', Priority: '1', CallerID: '"Twake Phone" <+33612345678>', Timeout: '30000' })
     ])
-    // Both variables of the context, as two headers (the fake keeps the last one it read).
-    expect(ami.state.actions[0]!.Variable).toBe('TWAKE_DOMAIN=twake.local')
+    // The variables of the context, as several headers (the fake keeps the last one it read).
+    expect(ami.state.actions[0]!.Variable).toBe(`TWAKE_GRANT=${'a'.repeat(32)}`)
   })
 
-  it('refuses a line, a number or a domain that would say more than one (no Asterisk argument, header or URI can be slipped in)', async () => {
+  it('refuses a line, a number or a grant that would say more than one (no Asterisk argument, variable or URI can be slipped in)', async () => {
     const { sup, ami } = await supervision((a, reply) => reply({ Response: 'Success', ActionID: a.ActionID!, Message: 'queued' }))
-    for (const [line, target, domain] of [['103,Hangup', '102', 'twake.local'], ['103', '102,Hangup', 'twake.local'], ['103', 'sip:102', 'twake.local'], ['103', '+3361234567890123456789', 'twake.local'], ['103', '102', 'twake.local;transport=tcp'], ['103', '102', 'twake.local:5060'], ['103', '102', 'evil.test>\r\nX: y']] as const)
-      await expect(sup.clickToCall({ extension: line }, target, domain)).rejects.toMatchObject({ code: 'refused' })
+    const g = 'a'.repeat(32)
+    for (const [line, target, grant] of [['103,Hangup', '102', g], ['103', '102,Hangup', g], ['103', 'sip:102', g], ['103', '+3361234567890123456789', g], ['103', '102', 'x'.repeat(32)], ['103', '102', `${g}\r\nVariable: X=1`]] as const)
+      await expect(sup.clickToCall({ extension: line }, target, grant)).rejects.toMatchObject({ code: 'refused' })
     expect(ami.state.actions).toEqual([])
   })
 
   it('says it when Asterisk refuses the call', async () => {
     const { sup } = await supervision((a, reply) => reply({ Response: 'Error', ActionID: a.ActionID!, Message: 'Permission denied' }))
-    await expect(sup.clickToCall({ extension: '103' }, '102', 'twake.local')).rejects.toBeInstanceOf(SupervisionError)
+    await expect(sup.clickToCall({ extension: '103' }, '102', 'a'.repeat(32))).rejects.toBeInstanceOf(SupervisionError)
   })
 })
 

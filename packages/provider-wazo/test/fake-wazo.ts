@@ -38,7 +38,7 @@ export const fakeWazo = (numberOf: (userId: string) => string) => {
     contexts: [] as { id: number; name: string; label: string; type: string }[],
     users: [] as { uuid: string; firstname: string; userfield: string | null; voicemail: { id: number } | null }[],
     /** The SIP endpoints and lines (step 11c-1): an endpoint's `line` is the id of the line it is associated with. */
-    endpoints: [] as { uuid: string; name: string; label: string; auth_section_options: [string, string][]; aor_section_options: [string, string][]; endpoint_section_options?: [string, string][]; line: { id: number } | null }[],
+    endpoints: [] as { uuid: string; name: string; label: string; auth_section_options: [string, string][]; aor_section_options: [string, string][]; line: { id: number } | null }[],
     lines: [] as { id: number; context: string }[],
     /** The groups (step 11c-2): a sequential group or a queue each; `name` is what wazo-confd makes of the label. */
     groups: [] as { id: number; uuid: string; name: string; label: string; ring_strategy: string; timeout: number | null; user_timeout: number | null; retry_delay: number | null; ring_in_use: boolean; members: { extensions: { exten: string; context: string; priority: number }[] } }[],
@@ -135,7 +135,7 @@ export const fakeWazo = (numberOf: (userId: string) => string) => {
     if (path === '/1.1/endpoints/sip' && init.method === 'GET') return page(state.endpoints)
     if (path === '/1.1/endpoints/sip' && init.method === 'POST') {
       if (state.endpoints.some(e => e.name === body.name)) return json(400, ['Resource Error - SIPEndpoint already exists'])
-      const endpoint = { uuid: `00000000-0000-4000-9000-${String(next++).padStart(12, '0')}`, name: body.name, label: body.label, auth_section_options: body.auth_section_options ?? [], aor_section_options: body.aor_section_options ?? [], endpoint_section_options: body.endpoint_section_options ?? [], line: null }
+      const endpoint = { uuid: `00000000-0000-4000-9000-${String(next++).padStart(12, '0')}`, name: body.name, label: body.label, auth_section_options: body.auth_section_options ?? [], aor_section_options: body.aor_section_options ?? [], line: null }
       state.endpoints.push(endpoint)
       return json(201, endpoint)
     }
