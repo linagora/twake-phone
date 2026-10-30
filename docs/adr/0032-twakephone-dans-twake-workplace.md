@@ -30,6 +30,10 @@ Un fournisseur d'identité refuse en général d'être encadré (LemonLDAP::NG a
 
 Toute app de l'instance peut ainsi remplir le clavier : c'est le rôle de l'intent, et rien ne part sans « Appeler ».
 
+### 4. Les contacts de la personne dans Workplace nomment les numéros que l'annuaire ne connaît pas
+
+Le POC nommait les numéros par `io.cozy.contacts`. Encadrée, l'app demande au pont de la coquille son origine (`requestParentOrigin`) puis ses contacts (`getContacts`, par `comlink`, comme la bibliothèque `cozy-external-bridge`), une fois par page, 3 s au plus. Ils nomment, après l'annuaire de l'organisation, les numéros des Récents, de la messagerie et du panneau d'appel (un numéro que le serveur SIP ne nomme pas) ; un numéro que deux contacts partagent ne nomme personne. Ils restent dans la page : la passerelle ne les voit jamais. Un tel contact n'a pas de fiche dans l'annuaire : aucun écran ne propose de l'ouvrir. La coquille demande `io.cozy.contacts` en lecture.
+
 ## Ce qui reste
 
 - **Le widget** (`@twake/phone-widget`, carte d'appel et appel entrant dans l'app hôte) : son service n'existe pas. La notification Web Push de l'étape 5 montre déjà un appel entrant quand on est dans Drive ; contrôler un appel en cours sans quitter Drive demande le widget, une PR à part.
@@ -41,7 +45,7 @@ Toute app de l'instance peut ainsi remplir le clavier : c'est le rôle de l'inte
 ## Conséquences
 
 - `phone-link` ouvre `#/bridge/?dial=` au lieu de `#/dialer?dial=` (l'app du POC).
-- `yarn e2e:web` reste l'e2e de l'app ; `apps/workplace/test/workplace.e2e.mjs` joue la coquille (faux cozy-stack, app web servie par son serveur de production, connexion par la fenêtre, lien `#/bridge/?dial=`, intent `CALL` avec et sans fenêtre visible, texte refusé), dans un job CI à part.
+- `yarn e2e:web` reste l'e2e de l'app ; `apps/workplace/test/workplace.e2e.mjs` joue la coquille (faux cozy-stack, app web servie par son serveur de production, connexion par la fenêtre, lien `#/bridge/?dial=`, Récents nommés par un contact Workplace, intent `CALL` avec et sans fenêtre visible, texte refusé), dans un job CI à part.
 - `FRAME_ANCESTORS` de TwakePhone doit nommer les origines de l'app `phone` des instances.
 
 ## Alternatives écartées

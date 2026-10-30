@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { toDialTarget, type Contact, type TelephonyClient } from '@twake/telephony-client'
 import { useGateway } from './gateway.js'
+import { workplaceContactOf, workplaceContacts } from './workplaceContacts.js'
 
 /**
  * The Gateway allows 30 directory searches every 10 s per person, all screens together: the lookups of names take at
@@ -68,12 +69,15 @@ export const useContactsByNumber = (numbers: readonly string[]) => {
     })
     .join('\n')
   useEffect(() => {
-    if (noDirectory || !wanted) return
+    if (!wanted) return
     let cancelled = false
     for (const number of wanted.split('\n'))
-      void contactOfNumber(client, number).then(c => {
-        if (c && !cancelled) setContacts(m => (m.get(toDialTarget(number)!) === c ? m : new Map(m).set(toDialTarget(number)!, c)))
-      })
+      // The directory first; a number it does not name, by the person's own contacts in Twake Workplace (framed only).
+      void (noDirectory ? Promise.resolve(null) : contactOfNumber(client, number))
+        .then(async c => c ?? workplaceContactOf(await workplaceContacts(), number))
+        .then(c => {
+          if (c && !cancelled) setContacts(m => (m.get(toDialTarget(number)!) === c ? m : new Map(m).set(toDialTarget(number)!, c)))
+        })
     return () => {
       cancelled = true
     }
