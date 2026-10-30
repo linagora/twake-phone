@@ -3829,6 +3829,37 @@ try {
         wazoSide.close()
       }
     })
+    await step('step 11c-1, click-to-call (ADR 0033): Bob asks the Gateway to call 102 from his phone: his windows ring with "Twake Phone (102)", the second answers; Wazo hands the call (REFER) to 102 only, which that window then calls with Bob\'s own account: Jean answers, they hear each other; Wazo\'s side ends', async () => {
+      const after = await lastId('acc')
+      const jeanC = await open('jdupont', 'Jean Dupont')
+      try {
+        await phoneState(jeanC.page).getByText('En ligne').waitFor({ timeout: 20_000 })
+        const api = await asPerson(bob)
+        const caps = (await api('GET', '/capabilities')).json()
+        expectEqual(caps.clickToCall, true, 'click-to-call offered to Bob, who has a line at Wazo')
+        expectEqual((await (await asPerson(jeanC))('POST', '/calls', { target: 'sip:102@evil' })).statusCode, 400, 'a target that is no number')
+        expectEqual((await api('POST', '/calls', { target: '102' })).statusCode, 202, 'the answer of the Gateway to Bob')
+        for (const who of [bob, bob2]) await who.page.getByTestId('incoming-call').getByText(/(Twake Phone|Jean Dupont) \(102\)/).waitFor({ timeout: 20_000 })
+        await bob2.page.getByTestId('incoming-call').getByRole('button', { name: 'Répondre' }).click()
+        // Wazo transfers: Bob's window calls 102 itself, as Bob (the name Jean sees is his).
+        await jeanC.page.getByTestId('incoming-call').getByText(/Bob Durand/).waitFor({ timeout: 20_000 })
+        await jeanC.page.getByTestId('incoming-call').getByRole('button', { name: 'Répondre' }).click()
+        await rtpBothWays(bob2)
+        await rtpBothWays(jeanC)
+        await until('the channel of Wazo ended', async () => (asteriskCli('core show channels concise').includes('PJSIP/103-') ? null : true), { timeout: 20_000 })
+        await bob2.page.getByRole('button', { name: 'Raccrocher' }).click()
+        await until('no call left for Jean', async () => ((await calls(jeanC.page)).length === 0 ? true : null), { timeout: 20_000 })
+        // Wazo's call to Bob's line (shown as from 102), then Bob's own call to Jean: never one Wazo made to 102.
+        const cdrs = await until('both CDRs', async () => {
+          const rows = await cdrsViaSince(after)
+          return rows.length >= 2 ? rows : null
+        })
+        expectEqual(cdrs.includes('102>103 200 wazo'), true, `the CDR of Wazo's call to Bob's line: ${cdrs}`)
+        expectEqual(cdrs.includes('103>102 200 -'), true, `the CDR of Bob's call to Jean: ${cdrs}`)
+      } finally {
+        await signOut(jeanC)
+      }
+    })
     await step('step 11c-1: nothing else of a call Wazo placed: a transfer of it (REFER) is refused as one with the operator, and its requests come from the lines socket only (a window cannot be reached through it as any other)', async () => {
       const cfg = readFileSync(new URL('../../../docker/opensips/opensips.cfg.tpl', import.meta.url), 'utf8')
       if (!cfg.includes('$dlg_val(wline) == "1"')) throw new Error('the configuration does not know the calls Wazo placed')

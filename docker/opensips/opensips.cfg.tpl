@@ -656,7 +656,19 @@ route {
 		# have it call whatever the Refer-To says, on our account and past route[outbound_policy]. Refused whichever
 		# side sends it: a transfer with an external party waits for one the platform makes itself. Likewise in a call
 		# with LiveKit SIP (step 8): a room calls through the Gateway only, at the name of whoever asked.
-		if (is_method("REFER") && ($dlg_val(trunk) != NULL || $dlg_val(meet) != NULL || $dlg_val(wline) == "1")) {
+		$var(click_to_call) = 0;
+		# wazo-lines: begin
+		# Click-to-call (ADR 0033): the Gateway has Wazo ring a person's line, then hand the call, once answered, to the
+		# number it showed as the caller (Transfer: a REFER from Wazo's side, to sip:<that number>@our domain, nothing
+		# else). The phone then calls that number itself, with its own account: its rights, caps and fraud checks apply
+		# as to any call it makes. Any other REFER in such a call stays refused below.
+		if (is_method("REFER") && $dlg_val(wline) == "1" && $var(from_wline) == 1 && $hdr_cnt(Refer-To) == 1 && $dlg_val(wline_caller) != NULL && $dlg_val(wline_caller) != "anonymous") {
+			$var(refer_to) = "sip:" + $dlg_val(wline_caller) + "@${SIP_DOMAIN}";
+			if ($hdr(Refer-To) == $var(refer_to) || $hdr(Refer-To) == "<" + $var(refer_to) + ">")
+				$var(click_to_call) = 1;
+		}
+		# wazo-lines: end
+		if (is_method("REFER") && ($dlg_val(trunk) != NULL || $dlg_val(meet) != NULL || ($dlg_val(wline) == "1" && $var(click_to_call) == 0))) {
 			xlog("L_NOTICE", "call $ci: REFER in a call with the operator, LiveKit SIP or Wazo's lines refused\n");
 			if (route(to_trunk) || route(to_meet) || $dlg_val(wline) == "1")
 				append_to_reply("Twake-Call-Refused: transfer-external\r\n");
@@ -796,6 +808,8 @@ route {
 		$avp(caller) = "anonymous";
 		if ($fU =~ "^[A-Za-z0-9._+-]{1,64}$")
 			$avp(caller) = $fU;
+		# The one number Wazo may later hand this call to (click-to-call, ADR 0033): the one it shows as the caller.
+		$dlg_val(wline_caller) = $avp(caller);
 		$avp(callee) = $rU;
 		$avp(dialled) = $rU;
 		$avp(domain) = "${SIP_DOMAIN}";

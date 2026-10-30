@@ -42,6 +42,8 @@ export const Dialer = () => {
   }, [params, setParams])
   // The Gateway can place the call for us (click-to-call) or the browser does it itself (softphone registered).
   const [gatewayCalls, setGatewayCalls] = useState<boolean | null>(null)
+  // Click-to-call (ADR 0033): the Gateway can also ring the person's own phone (desk phone, Linphone) and have it call.
+  const [onPhone, setOnPhone] = useState(false)
   // The dialer places the first call; a second one (a consultation before a transfer) is placed from the call panel.
   const canCall = (phone.state === 'registered' && !phone.calls.length) || (phone.state !== 'registered' && !!gatewayCalls)
   const [status, setStatus] = useState<{ kind: 'info' | 'error'; text: string } | null>(null)
@@ -58,7 +60,11 @@ export const Dialer = () => {
     setStatus(null)
     client
       .getCapabilities()
-      .then(caps => !cancelled && setGatewayCalls(!!caps.calling?.outbound))
+      .then(caps => {
+        if (cancelled) return
+        setGatewayCalls(!!caps.calling?.outbound)
+        setOnPhone(!!caps.clickToCall)
+      })
       .catch((err: unknown) => {
         if (cancelled) return
         // 404 is the Gateway saying "no telephony provider on this platform": calling is not configured, which is not an error.
@@ -90,6 +96,20 @@ export const Dialer = () => {
     if (k === '0' && hold.current.plus) hold.current.plus = false
     else press(k)
   }
+  const callOnPhone = async (target: string) => {
+    await client.originate(target, crypto.randomUUID())
+    setStatus({ kind: 'info', text: t('dialer.placed', { number: formatNumber(number) }) })
+  }
+  const submitOnPhone = async () => {
+    const target = toDialTarget(number)
+    if (!target) return
+    setStatus({ kind: 'info', text: t('dialer.placing', { number: formatNumber(number) }) })
+    try {
+      await callOnPhone(target)
+    } catch (err) {
+      setStatus({ kind: 'error', text: t('dialer.failed', { reason: describeCallError(err, t) }) })
+    }
+  }
   const submit = async (e: FormEvent) => {
     e.preventDefault()
     const target = toDialTarget(number)
@@ -102,8 +122,7 @@ export const Dialer = () => {
         setStatus(null)
         setNumber('')
       } else if (gatewayCalls) {
-        await client.originate(target, crypto.randomUUID())
-        setStatus({ kind: 'info', text: t('dialer.placed', { number: formatNumber(number) }) })
+        await callOnPhone(target)
       } else {
         setStatus({ kind: 'error', text: t('dialer.notRegistered') })
       }
@@ -149,6 +168,12 @@ export const Dialer = () => {
           <Button ref={callButton} type="submit" disabled={!canCall || !toDialTarget(number)}>
             {t('dialer.call')}
           </Button>
+          {/* The browser calls by itself: the person may still ring their own phone instead. Never from a link alone (ADR 0031). */}
+          {onPhone && phone.state === 'registered' ? (
+            <Button type="button" variant="outlined" onClick={() => void submitOnPhone()} disabled={!toDialTarget(number)}>
+              {t('dialer.callOnPhone')}
+            </Button>
+          ) : null}
         </Stack>
       </form>
       {status ? (

@@ -291,6 +291,28 @@ describe('spy', () => {
   })
 })
 
+describe('clickToCall', () => {
+  it('rings the line with the number it will call, and hands the answered call to that number at our domain (ADR 0033), by the Originate account', async () => {
+    const { sup, ami } = await supervision((a, reply) => reply({ Response: 'Success', ActionID: a.ActionID!, Message: 'Originate successfully queued' }))
+    await sup.clickToCall({ extension: '103' }, '+33612345678', 'twake.local')
+    expect(ami.state.actions).toEqual([
+      expect.objectContaining({ Action: 'Originate', Async: 'true', Channel: 'PJSIP/103', Application: 'Transfer', Data: 'PJSIP/sip:+33612345678@twake.local', CallerID: '"Twake Phone" <+33612345678>', Timeout: '30000' })
+    ])
+  })
+
+  it('refuses a line, a number or a domain that would say more than one (no Asterisk argument, header or URI can be slipped in)', async () => {
+    const { sup, ami } = await supervision((a, reply) => reply({ Response: 'Success', ActionID: a.ActionID!, Message: 'queued' }))
+    for (const [line, target, domain] of [['103,Hangup', '102', 'twake.local'], ['103', '102,Hangup', 'twake.local'], ['103', 'sip:102', 'twake.local'], ['103', '+3361234567890123456789', 'twake.local'], ['103', '102', 'twake.local;transport=tcp'], ['103', '102', 'evil.test>\r\nX: y']] as const)
+      await expect(sup.clickToCall({ extension: line }, target, domain)).rejects.toMatchObject({ code: 'refused' })
+    expect(ami.state.actions).toEqual([])
+  })
+
+  it('says it when Asterisk refuses the call', async () => {
+    const { sup } = await supervision((a, reply) => reply({ Response: 'Error', ActionID: a.ActionID!, Message: 'Permission denied' }))
+    await expect(sup.clickToCall({ extension: '103' }, '102', 'twake.local')).rejects.toBeInstanceOf(SupervisionError)
+  })
+})
+
 describe('the recordings server', () => {
   const file = { tenant: TENANT, name: NAME }
   const server = (handler: (url: string, init: RequestInit) => Response | Promise<Response>) => {
