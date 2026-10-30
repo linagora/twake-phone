@@ -1,6 +1,6 @@
 import { Exchange, Grid as GridIcon, PersonAdd, Telephone } from '@linagora/twake-icons'
 import { Alert, Avatar, Button, Card, CardContent, Fab, Grid, List, ListItem, Stack, SvgIcon, TextField, Typography, getInitials, type FabProps } from '@linagora/twake-mui'
-import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode, type Ref, type SyntheticEvent } from 'react'
+import { createContext, useContext, useEffect, useLayoutEffect, useRef, useState, type ReactNode, type Ref, type SyntheticEvent } from 'react'
 import type { SoftCall } from '@twake/softphone'
 import { formatNumber, toDialTarget, type CallVisio } from '@twake/telephony-client'
 import type { ConferenceParticipant } from '@twake/telephony-types'
@@ -8,7 +8,8 @@ import { useGateway } from '../gateway.js'
 import type { Key } from '../i18n/index.js'
 import { useT } from '../i18n/useT.js'
 import { usePhone } from '../softphone.js'
-import { namedByWorkplace, useWorkplaceContacts } from '../workplaceContacts.js'
+import type { Contact } from '@twake/telephony-client'
+import { nameOf, useWorkplaceContacts } from '../workplaceContacts.js'
 import { describeCallError, describeConferenceError } from './callErrors.js'
 import { CallEndIcon, MicIcon, MicOffIcon, PauseIcon } from '../ds/MediaIcons/MediaIcons.js'
 import { Appear } from '../ds/Appear/Appear.js'
@@ -45,10 +46,14 @@ const REFUSAL_KEY: Record<NonNullable<SoftCall['endRefusal']>, Key> = {
   'not-allowed': 'call.endedRefusedNotAllowed'
 }
 
+/** The person's Workplace contacts (ADR 0032), which name a number the SIP server leaves unnamed. */
+const WorkplaceNames = createContext<readonly Contact[]>([])
+
 /** The far end, by name and number; a caller from the public network who hides their number (step 6) said so. */
-const who = (call: SoftCall, t: (key: Key) => string) => {
+const who = (call: SoftCall, t: (key: Key) => string, contacts: readonly Contact[]) => {
   const number = call.remoteNumber === 'anonymous' ? t('call.hiddenNumber') : formatNumber(call.remoteNumber)
-  return call.remoteName && call.remoteName.toLowerCase() !== 'anonymous' ? `${call.remoteName} (${number})` : number
+  const name = nameOf(call, contacts)
+  return name ? `${name} (${number})` : number
 }
 
 /**
@@ -78,11 +83,14 @@ const Actions = ({ children }: { children: ReactNode }) => (
 )
 
 /** The far end's initials, or a phone when only a number is known. */
-const CallAvatar = ({ call }: { call: SoftCall }) => (
-  <Avatar size="xl" aria-hidden="true">
-    {call.remoteName && call.remoteName.toLowerCase() !== 'anonymous' ? getInitials(call.remoteName, '') : <SvgIcon component={Telephone} inheritViewBox />}
-  </Avatar>
-)
+const CallAvatar = ({ call }: { call: SoftCall }) => {
+  const name = nameOf(call, useContext(WorkplaceNames))
+  return (
+    <Avatar size="xl" aria-hidden="true">
+      {name ? getInitials(name, '') : <SvgIcon component={Telephone} inheritViewBox />}
+    </Avatar>
+  )
+}
 
 /**
  * A round button with its word under it, as on a phone's call screen. The word is the button's name (aria-label); a
@@ -115,6 +123,7 @@ const Timer = ({ since }: { since: Date }) => {
 }
 
 const Incoming = ({ call }: { call: SoftCall }) => {
+  const contacts = useContext(WorkplaceNames)
   const { t } = useT()
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -140,7 +149,7 @@ const Incoming = ({ call }: { call: SoftCall }) => {
         <Stack spacing={2} className="u-flex-items-center u-ta-center u-pv-1">
           <CallAvatar call={call} />
           <Typography id={`call-${call.id}`} variant="h6" component="h2">
-            {t('call.incoming', { who: who(call, t) })}
+            {t('call.incoming', { who: who(call, t, contacts) })}
           </Typography>
           <Stack direction="row" spacing={8} className="u-flex-justify-center">
             <RoundAction label={t('call.reject')} icon={<CallEndIcon />} color="error" onClick={act(() => call.reject())} disabled={busy} />
@@ -394,6 +403,7 @@ const Confirm = ({ id, question, children, alert = false }: { id: string; questi
  * conference shows in place of the call (the call panel changed under the person), the focus goes to its title.
  */
 const ConferenceCall = ({ call, tones, onError, onNotice }: { call: SoftCall; tones: string; onError: (message: string | null) => void; onNotice: (message: string) => void }) => {
+  const contacts = useContext(WorkplaceNames)
   const { t } = useT()
   const phone = usePhone()
   const { client } = useGateway()
@@ -514,7 +524,7 @@ const ConferenceCall = ({ call, tones, onError, onNotice }: { call: SoftCall; to
     <Card component="section" variant="outlined" className="u-mb-1" aria-labelledby={`call-${call.id}`} data-testid="conference">
       <CardContent>
       <Typography id={`call-${call.id}`} ref={title} component="p" tabIndex={-1} className="u-fw-bold u-mb-1" data-testid="call-title">
-        {mine ? t('conference.title') : t('conference.titleWith', { who: who(call, t) })}
+        {mine ? t('conference.title') : t('conference.titleWith', { who: who(call, t, contacts) })}
       </Typography>
       {connected && call.connectedAt ? <Timer since={call.connectedAt} /> : null}
       {mine && !meetingId ? <Badge>{t('conference.starting')}</Badge> : null}
@@ -665,6 +675,7 @@ const TransferForm = ({ call, onClose, onError }: { call: SoftCall; onClose: () 
  * call: the one that ends (a consultation hung up) does not take the explanation with it.
  */
 const Active = ({ call, tones, original, hasOther, onError }: { call: SoftCall; tones: string; original?: SoftCall; hasOther: boolean; onError: (message: string | null) => void }) => {
+  const contacts = useContext(WorkplaceNames)
   const { t } = useT()
   const phone = usePhone()
   const [keypad, setKeypad] = useState(false)
@@ -700,14 +711,14 @@ const Active = ({ call, tones, original, hasOther, onError }: { call: SoftCall; 
   const room = !!call.room
   const canAdd = phone.conferenceAvailable && !room && !hasOther && !original && (call.conferencing || (call.state === 'connected' && !call.remoteHold))
   const title = call.transferring
-    ? t('call.transferringWho', { who: who(call, t) })
+    ? t('call.transferringWho', { who: who(call, t, contacts) })
     : !connected
-      ? t('call.dialing', { who: who(call, t) })
+      ? t('call.dialing', { who: who(call, t, contacts) })
       : call.state === 'held'
-        ? t('call.held', { who: who(call, t) })
+        ? t('call.held', { who: who(call, t, contacts) })
         : call.voicemail
-          ? t('call.voicemailOf', { who: who(call, t) })
-          : t('call.inProgress', { who: who(call, t) })
+          ? t('call.voicemailOf', { who: who(call, t, contacts) })
+          : t('call.inProgress', { who: who(call, t, contacts) })
   const originalReady = original && (original.state === 'connected' || original.state === 'held')
   // While the transfer of the original is on its way, the consultation must stay: its dialog is what the far end
   // takes over (Replaces); hanging it up first would make the transfer fail.
@@ -721,7 +732,7 @@ const Active = ({ call, tones, original, hasOther, onError }: { call: SoftCall; 
           {title}
         </Typography>
         {connected && call.connectedAt ? <Timer since={call.connectedAt} /> : null}
-        {original ? <Badge>{t('call.consulting', { who: who(original, t) })}</Badge> : null}
+        {original ? <Badge>{t('call.consulting', { who: who(original, t, contacts) })}</Badge> : null}
         {call.remoteHold ? <Badge>{t('call.remoteHold')}</Badge> : null}
         {original?.transferring ? <Badge>{t('call.transferring')}</Badge> : null}
         {tones ? <Badge>{t('call.tonesReceived', { tones })}</Badge> : null}
@@ -730,7 +741,7 @@ const Active = ({ call, tones, original, hasOther, onError }: { call: SoftCall; 
         <Stack direction="row" spacing={1} useFlexGap className="u-flex-wrap u-flex-justify-center u-mb-1">
           {originalReady && connected ? (
             <Button type="button" disabled={busy} onClick={guard(() => original.transferTo(call))}>
-              {t('call.transferComplete', { from: who(original, t), to: who(call, t) })}
+              {t('call.transferComplete', { from: who(original, t, contacts), to: who(call, t, contacts) })}
             </Button>
           ) : null}
           {/* Hanging the consultation up is enough: the softphone takes the person on hold back by itself. */}
@@ -800,12 +811,9 @@ const ENTER_MS = 225
 
 export const CallPanel = () => {
   const { t } = useT()
-  const phone = usePhone()
-  const { tones } = phone
+  const { calls, lastEnded, tones } = usePhone()
   // A number the SIP server does not name (an outside caller), named by the person's Workplace contacts (ADR 0032).
-  const workplace = useWorkplaceContacts()
-  const calls = useMemo(() => phone.calls.map(c => namedByWorkplace(c, workplace)), [phone.calls, workplace])
-  const lastEnded = useMemo(() => phone.lastEnded && namedByWorkplace(phone.lastEnded, workplace), [phone.lastEnded, workplace])
+  const contacts = useWorkplaceContacts()
   const [error, setError] = useState<string | null>(null)
   // Who came into or left a conference (review 8b, n°2 and n°11): written in a region always there, so it is read out.
   // Shown while the conference call it came from goes on only: never read again at the next one (second review 8b, n°7).
@@ -820,6 +828,7 @@ export const CallPanel = () => {
   const shown = calls.filter(c => !moved.has(c.id))
   const ours = shown.filter(c => !ringing(c))
   return (
+    <WorkplaceNames.Provider value={contacts}>
     <div data-testid="calls">
       {shown.map(call => {
         if (ringing(call)) return <Incoming key={call.id} call={call} />
@@ -845,7 +854,7 @@ export const CallPanel = () => {
         {lastEnded ? (
           <Appear>
             <Typography component="p" className="u-mb-1">
-              {t(reasonKey(lastEnded), { who: who(lastEnded, t), message: lastEnded.endMessage ?? '' })}
+              {t(reasonKey(lastEnded), { who: who(lastEnded, t, contacts), message: lastEnded.endMessage ?? '' })}
             </Typography>
           </Appear>
         ) : null}
@@ -861,5 +870,6 @@ export const CallPanel = () => {
         </Alert>
       ) : null}
     </div>
+    </WorkplaceNames.Provider>
   )
 }
