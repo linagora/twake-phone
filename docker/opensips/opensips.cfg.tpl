@@ -684,6 +684,8 @@ route {
 		# wazo-lines: end
 		if (is_method("REFER") && ($dlg_val(trunk) != NULL || $dlg_val(meet) != NULL || ($dlg_val(wline) == "1" && $var(click_to_call) == 0))) {
 			xlog("L_NOTICE", "call $ci: REFER in a call with the operator, LiveKit SIP or Wazo's lines refused\n");
+			if ($dlg_val(wline) == "1")
+				xlog("L_NOTICE", "call $ci: that REFER came from $si:$sp (Wazo's side: $var(from_wline)), to $hdr(Refer-To), the line $dlg_val(wline_callee) showing $dlg_val(wline_caller)\n");
 			if (route(to_trunk) || route(to_meet) || $dlg_val(wline) == "1")
 				append_to_reply("Twake-Call-Refused: transfer-external\r\n");
 			send_reply(403, "Transfer Not Allowed");

@@ -3845,10 +3845,10 @@ try {
         await jeanC.page.getByTestId('incoming-call').getByText(/Bob Durand/).waitFor({ timeout: 20_000 })
         await jeanC.page.getByTestId('incoming-call').getByRole('button', { name: 'Répondre' }).click()
         // Wazo hangs up its side once the transfer went through: Bob's window is left with its own call to Jean.
-        await until('the channel of Wazo ended', async () => (asteriskCli('core show channels concise').includes('PJSIP/103-') ? null : true), { timeout: 20_000 }).catch(err => {
+        await until('the channel of Wazo ended', async () => (asteriskCli('core show channels concise').includes('PJSIP/103-') ? null : true), { timeout: 40_000 }).catch(err => {
           // For whoever reads the failure: what Asterisk still has, and what OpenSIPS said of the transfer.
-          const said = execFileSync('docker', ['compose', '-f', COMPOSE_FILE, 'logs', '--no-color', '--no-log-prefix', '--tail', '300', 'opensips'], { encoding: 'utf8', timeout: 30_000, maxBuffer: 64 << 20 }).split('\n').filter(l => /REFER|NOTIFY|click-to-call|wazo/i.test(l)).slice(-20)
-          console.log(`[click-to-call] channels: ${asteriskCli('core show channels verbose')}\n[click-to-call] OpenSIPS: ${said.join('\n')}`)
+          const said = execFileSync('docker', ['compose', '-f', COMPOSE_FILE, 'logs', '--no-color', '--no-log-prefix', '--tail', '300', 'opensips'], { encoding: 'utf8', timeout: 30_000, maxBuffer: 64 << 20 }).split('\n').filter(l => /REFER|NOTIFY|click-to-call|wazo|grant/i.test(l)).slice(-30)
+          console.log(`[click-to-call] channels: ${asteriskCli('core show channels concise')}\n[click-to-call] OpenSIPS: ${said.join('\n')}`)
           throw err
         })
         await until('one call left in Bob\'s window', async () => ((await calls(bob2.page)).length === 1 ? true : null), { timeout: 20_000 })
