@@ -118,6 +118,9 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(cfg).toContain('$dlg_val(meet) != NULL || ($dlg_val(wline) == "1" && $var(click_to_call) == 0))) {')
     expect(call.slice(0, call.indexOf('route(rules_step);'))).toContain('$dlg_val(wline_caller) = $avp(caller);\n\t\t$dlg_val(wline_callee) = $rU;')
     const ctc = cfg.slice(cfg.indexOf('$var(click_to_call) = 0;'), cfg.indexOf('if (is_method("REFER") && ($dlg_val(trunk) != NULL'))
+    // Its retransmissions absorbed before the grant is looked for (taken by the first one, the copy would be refused).
+    expect(ctc.indexOf('$var(from_wline) == 1 && t_check_trans())\n\t\t\texit;')).toBeGreaterThan(0)
+    expect(ctc.indexOf('t_check_trans()')).toBeLessThan(ctc.indexOf('sql_query_one'))
     expect(ctc).toContain('if (is_method("REFER") && $dlg_val(wline) == "1" && $var(from_wline) == 1 && $hdrcnt(Refer-To) == 1 && $dlg_val(wline_caller) != NULL && $dlg_val(wline_caller) != "anonymous" && $dlg_val(wline_callee) != NULL) {')
     expect(ctc).toContain('$var(refer_to) = "sip:" + $dlg_val(wline_caller) + "@127.0.0.1";')
     expect(ctc).toContain('$var(refer_to_named) = "<" + $var(refer_to) + ">";')

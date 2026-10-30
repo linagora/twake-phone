@@ -664,6 +664,10 @@ route {
 		# click-to-call), taken once here: a call Wazo places for another reason (a queue, a voice menu, an outside caller
 		# whose number is anything) has none. The phone then calls that number itself, with its own account: its rights,
 		# caps and fraud checks apply as to any call it makes. Any other REFER in such a call stays refused below.
+		# A retransmission of a REFER already relayed (Asterisk resends it while the phone's 202 is on its way) is absorbed:
+		# its grant is taken, and a 403 to the copy would undo the transfer.
+		if (is_method("REFER") && $dlg_val(wline) == "1" && $var(from_wline) == 1 && t_check_trans())
+			exit;
 		if (is_method("REFER") && $dlg_val(wline) == "1" && $var(from_wline) == 1 && $hdrcnt(Refer-To) == 1 && $dlg_val(wline_caller) != NULL && $dlg_val(wline_caller) != "anonymous" && $dlg_val(wline_callee) != NULL) {
 			$var(refer_to) = "sip:" + $dlg_val(wline_caller) + "@${SIP_DOMAIN}";
 			$var(refer_to_named) = "<" + $var(refer_to) + ">";
