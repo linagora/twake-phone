@@ -20,8 +20,10 @@ export const Dialer = () => {
   // bar is cleaned.
   const [params, setParams] = useSearchParams()
   // Twake Chat sends a number to call as ?dial= (ADR 0031): validated and normalised here, never dialled from the link
-  // itself (a page cannot make the app place a call), only put in the field with the Call button focused.
+  // itself (a page cannot make the app place a call), only put in the field with the Call button focused once calling is possible.
   const [dialed, setDialed] = useState(() => (params.has('dial') ? toDialTarget(params.get('dial') ?? '') : undefined))
+  // Set when a link brings a number, cleared once Call got the focus: a later change of state does not move the focus.
+  const focusCall = useRef(!!dialed)
   const [number, setNumber] = useState(() => dialed ?? (params.get('number') ?? '').slice(0, 32))
   useEffect(() => {
     const sent = params.get('number')
@@ -29,7 +31,10 @@ export const Dialer = () => {
       const target = toDialTarget(params.get('dial') ?? '')
       // eslint-disable-next-line react-hooks/set-state-in-effect -- the keypad may already be on screen when a link sends a number
       setDialed(target)
-      if (target) setNumber(target)
+      if (target) {
+        setNumber(target)
+        focusCall.current = true
+      }
     } else if (sent !== null) {
       setNumber(sent.slice(0, 32))
     } else return
@@ -42,8 +47,10 @@ export const Dialer = () => {
   const [status, setStatus] = useState<{ kind: 'info' | 'error'; text: string } | null>(null)
   const callButton = useRef<HTMLButtonElement>(null)
   useEffect(() => {
-    if (dialed && canCall) callButton.current?.focus()
-  }, [dialed, canCall])
+    if (!focusCall.current || !canCall) return
+    focusCall.current = false
+    callButton.current?.focus()
+  }, [number, canCall])
 
   useEffect(() => {
     let cancelled = false
@@ -111,7 +118,7 @@ export const Dialer = () => {
         {t('dialer.title')}
       </Typography>
       {gatewayCalls === false && phone.state === 'off' ? <Alert severity="info" role="status" className="u-mb-1">{t('dialer.unavailable')}</Alert> : null}
-      {dialed === null ? <Alert severity="error" role="alert" className="u-mb-1">{t('dialer.invalidDial')}</Alert> : null}
+      {dialed === null && !number ? <Alert severity="error" role="alert" className="u-mb-1">{t('dialer.invalidDial')}</Alert> : null}
       {phone.state === 'failed' || phone.state === 'unregistered' ? <Alert severity="info" role="status" className="u-mb-1">{t('dialer.notRegistered')}</Alert> : null}
       <form onSubmit={e => void submit(e)}>
         <TextField id="number" label={t('dialer.number')} type="tel" fullWidth className="u-mb-1" slotProps={{ htmlInput: { inputMode: 'tel', autoComplete: 'off' } }} value={number} onChange={e => setNumber(e.target.value)} />

@@ -9,7 +9,7 @@ La démo de l'étape 9 est : « un numéro cliqué dans Chat lance l'appel ». C
 ## Scénario de démo (écrit avant le code)
 
 1. Chat est configuré avec `TWAKE_PHONE_URL` (l'adresse de TwakePhone). Alice écrit à Bob « appelle-moi au 06 12 34 56 02 ».
-2. Bob clique le numéro dans Chat : TwakePhone s'ouvre dans un nouvel onglet, connecté par son SSO, sur le clavier. Le champ contient `+33612345602`, le bouton « Appeler » a le focus.
+2. Bob clique le numéro dans Chat : TwakePhone s'ouvre dans un nouvel onglet, connecté par son SSO, sur le clavier. Le champ contient `+33612345602`, le bouton « Appeler » prend le focus dès qu'un appel est possible (softphone enregistré, ou appel par la passerelle), une seule fois.
 3. Bob appuie sur « Appeler » : l'appel part (softphone du navigateur, ou la passerelle fait sonner son poste).
 4. Un texte qui n'est pas un numéro dans le lien (`/?dial=FR123456789`) ne remplit rien et le dit ; sans `TWAKE_PHONE_URL`, Chat garde ses liens `tel:`.
 
@@ -17,7 +17,7 @@ La démo de l'étape 9 est : « un numéro cliqué dans Chat lance l'appel ». C
 
 ### 1. Le contrat : `GET <TwakePhone>/?dial=<numéro>`
 
-Le numéro est validé et normalisé par TwakePhone seul (`toDialTarget` : un poste interne, ou un numéro en E.164, la France par défaut) ; Chat ne fait que nettoyer ce qu'il envoie (chiffres et `+`). Un numéro invalide ne compose rien. Le paramètre est retiré de la barre d'adresse (comme `?number=` de l'annuaire).
+Le numéro est validé et normalisé par TwakePhone seul (`toDialTarget` : un poste interne de 2 à 6 chiffres, ou un numéro en E.164, la France par défaut ; « appelle le 102 » dans Chat vaut un poste, et un numéro tronqué de 2 à 6 chiffres aussi : rien ne part sans le clic) ; Chat ne fait que nettoyer ce qu'il envoie (chiffres et `+`). Un numéro invalide ne compose rien. Le paramètre est retiré de la barre d'adresse (comme `?number=` de l'annuaire) ; un second lien reçu par un clavier déjà affiché le remplace. Le numéro passe dans la requête : le serveur de TwakePhone (`apps/web/server`) ne journalise pas les requêtes, mais un proxy devant lui peut le faire ; c'est une donnée personnelle à traiter comme le reste de ses journaux.
 
 ### 2. Le lien ne compose pas à lui seul
 
@@ -40,7 +40,7 @@ Avec `TWAKE_PHONE_URL`, la grille de la barre locale de Chat propose « TwakePho
 ## Conséquences
 
 - Aucune dépendance de TwakePhone envers Chat, aucune de Chat envers SIP (ADR 0006 tenue).
-- Le contrat `?dial=` est testé de bout en bout par `yarn e2e:web`, et côté Chat par son e2e.
+- Le contrat `?dial=` est testé côté TwakePhone par `yarn e2e:web` (lien à froid, second lien sans rechargement, refus, aucun appel lancé) ; le côté Chat l'est dans son dépôt.
 
 ## Alternatives écartées
 
