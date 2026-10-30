@@ -60,6 +60,8 @@ const CLICK_TO_CALL_TARGET = /^\+?[0-9]{2,20}$/
 const DOMAIN = /^[A-Za-z0-9.-]{1,253}$/
 /** The name the line shows while it rings for a click-to-call: the number it will call comes with it. */
 export const CLICK_TO_CALL_NAME = 'Twake Phone'
+/** How long Wazo's side of a click-to-call lives at most, in seconds (ringing included). */
+export const CLICK_TO_CALL_MAX_SEC = 45
 /** The options of ChanSpy: by unique id (u), quiet (q), until the call ends (E); then whisper (w) or barge (B). */
 const SPY_OPTIONS: Record<SupervisionMode, string> = { listen: 'uqE', whisper: 'uqEw', barge: 'uqEB' }
 
@@ -197,7 +199,10 @@ export class WazoSupervision implements SupervisionProvider {
         Application: 'Transfer',
         Data: `PJSIP/sip:${target}@${domain}`,
         CallerID: `"${CLICK_TO_CALL_NAME}" <${target}>`,
-        Timeout: '30000'
+        Timeout: '30000',
+        // Asterisk ends this channel itself 45 s after making it, whatever Transfer waits for (30 s to answer, then the
+        // REFER): Wazo's side never outlives the click-to-call, even where the Gateway may not hang it up.
+        Variable: `TIMEOUT(absolute)=${CLICK_TO_CALL_MAX_SEC}`
       },
       undefined,
       this.config.originate
@@ -205,7 +210,7 @@ export class WazoSupervision implements SupervisionProvider {
     // Asterisk stays in Transfer after the phone took the REFER (measured: neither its NOTIFY nor its BYE releases it):
     // once the line's channel runs it, Wazo's side has done its part, and is hung up a moment later (the phone's call
     // to the target is its own). Watched in the background: the Gateway has answered already.
-    void this.endTransferred(line.extension, target).catch(() => undefined)
+    void this.endTransferred(line.extension, target).catch((err: unknown) => console.warn(`click-to-call: Wazo's side of line ${line.extension} not hung up by the Gateway (it ends by itself within ${CLICK_TO_CALL_MAX_SEC} s): ${err instanceof Error ? err.message : String(err)}`))
   }
 
   /** Hangs up the line's channel of a click-to-call once it is in Transfer to `target` (60 s to get there at most). */
