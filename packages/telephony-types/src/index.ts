@@ -683,6 +683,11 @@ export interface Capabilities {
   voicemailTranscription?: boolean
   /** Supervisors list the calls in progress at the voicemail server, record them and join them (step 11d, ADR 0029). */
   supervision?: boolean
+  /**
+   * Click-to-call (ADR 0033): `POST /calls` rings the person's own phone (a desk phone, Linphone, their windows) and,
+   * once they answer, has it call the number. `calling.outbound` says the same when the browser cannot call itself.
+   */
+  clickToCall?: boolean
 }
 
 /** Media plane description handed to the client; opaque to the Gateway. */

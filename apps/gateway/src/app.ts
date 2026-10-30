@@ -1783,9 +1783,21 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         voicemailAccess.set(tenantId, { at: Date.now(), on: said })
         return said
       }
+      // Click-to-call (ADR 0033): the SIP server cannot place a call itself; the voicemail and telephony server rings the
+      // person's line (an extension with a line there) and hands the answered call to the number, which their phone then
+      // calls with its own account. Undefined when that is not on for this person.
+      const clickToCallFor = async (user: User, provider: TelephonyProvider) => {
+        const server = options.supervision?.(user.tenantId)
+        if (!server?.clickToCall || !user.extension || !provider.sipDomain || !provider.listWazoLines) return undefined
+        if (!(await provider.listWazoLines()).includes(user.extension)) return undefined
+        return { server, extension: user.extension, domain: provider.sipDomain }
+      }
+
       v1.get('/capabilities', async req => {
         const { user, provider } = await who(req)
-        const caps = await provider.getCapabilities()
+        const own = await provider.getCapabilities()
+        const clickToCall = !own.calling?.outbound && !!(await clickToCallFor(user, provider).catch(() => undefined))
+        const caps = clickToCall ? { ...own, calling: { ...own.calling, outbound: true }, clickToCall: true } : own
         const identity = await auth.authenticate(req)
         const supervising = !!options.supervision?.(user.tenantId) && isSupervisor(identity, supervisorPolicy, isAdmin(identity, admin))
         const enabled = !!options.conference?.bridge(user.tenantId)
@@ -1915,6 +1927,24 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
 
       v1.post<{ Body: { target: string } }>('/calls', async (req, reply) => {
         const { user, provider } = await who(req)
+        if (!(await provider.getCapabilities()).calling?.outbound) {
+          const clickToCall = await clickToCallFor(user, provider)
+          if (clickToCall) {
+            // The number as the app dials it: an extension, or E.164. The SIP server applies the person's rights and caps
+            // when their phone calls it, as for any call of theirs.
+            const target = typeof req.body?.target === 'string' ? req.body.target : ''
+            if (!/^\+?[0-9]{2,20}$/.test(target)) throw Object.assign(new Error('target must be an extension or a number in E.164'), { statusCode: 400 })
+            try {
+              await clickToCall.server.clickToCall!({ extension: clickToCall.extension }, target, clickToCall.domain)
+            } catch (err) {
+              const code = (err as { code?: string }).code
+              req.log.warn({ err }, 'click-to-call not placed')
+              throw Object.assign(new Error(code === 'refused' ? 'The telephony server refused to call your phone' : 'The telephony server cannot be reached'), { statusCode: code === 'refused' ? 409 : 503 })
+            }
+            // Not a call of this Gateway (it has no channel of it): its id names nothing to act on, the phone has the call.
+            return reply.code(202).send({ id: `click-to-call-${randomBytes(8).toString('hex')}`, direction: 'outbound', state: 'new', remoteNumber: target, startedAt: new Date().toISOString() })
+          }
+        }
         // TODO: E.164 validation, dialing policies, audit log.
         const call = await provider.originate({ user, target: req.body.target, idempotencyKey: req.headers['idempotency-key'] as string | undefined })
         const owners = callOwners.get(call.id) ?? new Set<string>()

@@ -50,6 +50,11 @@ const TENANT_FOLDER = /^[A-Za-z0-9_-]{1,64}$/
 const RECORDING_NAME = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 const SOUND = /^[A-Za-z0-9_-]+(\/[A-Za-z0-9_-]+)*$/
 const EXTENSION = /^[0-9]{1,40}$/
+/** What a click-to-call may call: a number in E.164, or an extension (ADR 0033). */
+const CLICK_TO_CALL_TARGET = /^\+?[0-9]{2,20}$/
+const DOMAIN = /^[A-Za-z0-9.-]{1,253}(:[0-9]{1,5})?$/
+/** The name the line shows while it rings for a click-to-call: the number it will call comes with it. */
+export const CLICK_TO_CALL_NAME = 'Twake Phone'
 /** The options of ChanSpy: by unique id (u), quiet (q), until the call ends (E); then whisper (w) or barge (B). */
 const SPY_OPTIONS: Record<SupervisionMode, string> = { listen: 'uqE', whisper: 'uqEw', barge: 'uqEB' }
 
@@ -168,6 +173,27 @@ export class WazoSupervision implements SupervisionProvider {
         Timeout: '30000'
       },
       40_000
+    )
+  }
+
+  async clickToCall(line: { extension: string }, target: string, domain: string): Promise<void> {
+    if (!EXTENSION.test(line.extension)) throw new SupervisionError('not a line', 'refused')
+    if (!CLICK_TO_CALL_TARGET.test(target) || !DOMAIN.test(domain)) throw new SupervisionError('not a number to call', 'refused')
+    // The line rings with the number it is about to call; answered, Transfer sends it a REFER to that number, which
+    // the SIP server lets through only to the number shown (ADR 0033), and the phone calls it with its own account.
+    // Async: the person may take 30 s to answer; the Gateway answers once Asterisk queued the call.
+    await this.ami(
+      {
+        Action: 'Originate',
+        Async: 'true',
+        Channel: `PJSIP/${line.extension}`,
+        Application: 'Transfer',
+        Data: `PJSIP/sip:${target}@${domain}`,
+        CallerID: `"${CLICK_TO_CALL_NAME}" <${target}>`,
+        Timeout: '30000'
+      },
+      undefined,
+      this.config.originate
     )
   }
 

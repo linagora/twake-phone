@@ -161,6 +161,10 @@ const notYet = (what: string) => Object.assign(new Error(`${what} through the Ga
  */
 export class OpensipsProvider implements TelephonyProvider, MediaProvider {
   readonly id = 'opensips'
+
+  get sipDomain() {
+    return this.config.domain
+  }
   /** The presence of users without an extension: nothing but what they set themselves. */
   private readonly unmapped = new Map<string, Presence>()
   /** The extensions whose "do not disturb" this provider wrote in `call_rules` (even past its end): leaving it lifts it there. */

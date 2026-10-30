@@ -113,8 +113,15 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     const call = cfg.slice(cfg.indexOf('if ($var(wline) == 1) {\n\t\tif (is_method("ACK"))'))
     expect(call.slice(0, call.indexOf('route(rules_step);'))).toContain('if (is_present_hf("Replaces") || !($rU =~ "^[A-Za-z0-9._+-]{1,64}$")) {')
     expect(call.slice(0, 2500)).not.toContain('route(voicemail')
-    // A transfer of such a call is refused as one with the operator (REFER).
-    expect(cfg).toContain('$dlg_val(meet) != NULL || $dlg_val(wline) == "1")) {')
+    // A transfer of such a call is refused as one with the operator (REFER), save the click-to-call (ADR 0033): from Wazo's
+    // side only, once, to the number it showed as the caller, at our domain, nothing else (no Replaces, no other host).
+    expect(cfg).toContain('$dlg_val(meet) != NULL || ($dlg_val(wline) == "1" && $var(click_to_call) == 0))) {')
+    expect(call.slice(0, call.indexOf('route(rules_step);'))).toContain('$dlg_val(wline_caller) = $avp(caller);')
+    const ctc = cfg.slice(cfg.indexOf('$var(click_to_call) = 0;'), cfg.indexOf('if (is_method("REFER") && ($dlg_val(trunk) != NULL'))
+    expect(ctc).toContain('if (is_method("REFER") && $dlg_val(wline) == "1" && $var(from_wline) == 1 && $hdr_cnt(Refer-To) == 1 && $dlg_val(wline_caller) != NULL && $dlg_val(wline_caller) != "anonymous") {')
+    expect(ctc).toContain('$var(refer_to) = "sip:" + $dlg_val(wline_caller) + "@127.0.0.1";')
+    expect(ctc).toContain('if ($hdr(Refer-To) == $var(refer_to) || $hdr(Refer-To) == "<" + $var(refer_to) + ">")')
+    expect(ctc.match(/\$var\(click_to_call\) = 1;/g)).toHaveLength(1)
   })
 
   it('sends the call to a number of `call_flows` to Wazo as it sends one to a mailbox, only with the lines on, before any ring group, and refuses what cannot go there as unreachable, never as a number that does not exist (step 11c-2, ADR 0028)', () => {
@@ -1513,7 +1520,7 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     const { cfg } = render()
     const main = cfg.slice(cfg.indexOf('\nroute {'), cfg.indexOf('\nroute[outbound_policy] {'))
     const inDialog = main.slice(main.indexOf('if (has_totag()) {'), main.indexOf('if (is_method("CANCEL")) {'))
-    const refer = inDialog.indexOf('if (is_method("REFER") && ($dlg_val(trunk) != NULL || $dlg_val(meet) != NULL || $dlg_val(wline) == "1")) {')
+    const refer = inDialog.indexOf('if (is_method("REFER") && ($dlg_val(trunk) != NULL || $dlg_val(meet) != NULL || ($dlg_val(wline) == "1" && $var(click_to_call) == 0))) {')
     expect(refer).toBeGreaterThan(inDialog.indexOf('if (!match_dialog()) {'))
     expect(refer).toBeLessThan(inDialog.indexOf('route(relay);'))
     expect(inDialog.slice(refer)).toMatch(/^[^]*?send_reply\(403, "Transfer Not Allowed"\);\n\t\t\texit;/)
