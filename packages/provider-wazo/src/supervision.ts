@@ -61,6 +61,8 @@ const SPY_OPTIONS: Record<SupervisionMode, string> = { listen: 'uqE', whisper: '
 const known = (v: string | undefined) => (v && v !== '<unknown>' ? v : undefined)
 /** The line of a supervisor while it rings with the call of the supervision (it runs ChanSpy only once answered). */
 const ringingSupervisor = (e: AmiMessage) => e.ChannelStateDesc !== 'Up' && known(e.CallerIDNum) === SUPERVISION_CALLER && known(e.CallerIDName) === SUPERVISION_NAME
+/** A click-to-call ringing the person's line (ADR 0033): no call yet, nothing to supervise. */
+const ringingClickToCall = (e: AmiMessage) => e.ChannelStateDesc !== 'Up' && known(e.CallerIDName) === CLICK_TO_CALL_NAME
 const clock = (v: string | undefined) => {
   const m = /^(\d+):(\d{2}):(\d{2})$/.exec(v ?? '')
   return m ? Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]) : 0
@@ -97,7 +99,7 @@ export class WazoSupervision implements SupervisionProvider {
       if (e.Event !== 'CoreShowChannel') continue
       const line = LINE_CHANNEL.exec(e.Channel ?? '')
       // The call of a supervisor is no call to supervise: it runs ChanSpy once answered, and before that it is the line ringing with its number.
-      if (!line || !CALL_ID.test(e.Uniqueid ?? '') || e.Application === 'ChanSpy' || ringingSupervisor(e)) continue
+      if (!line || !CALL_ID.test(e.Uniqueid ?? '') || e.Application === 'ChanSpy' || ringingSupervisor(e) || ringingClickToCall(e)) continue
       const extension = line[1] as string
       // The number of the other party: the caller of a call Wazo placed (its caller id), else who the line is connected to.
       const peer = [known(e.CallerIDNum), known(e.ConnectedLineNum)].find(n => n && n !== extension)

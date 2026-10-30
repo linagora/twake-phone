@@ -121,6 +121,8 @@ describe('listCalls', () => {
         channel({ Channel: 'PJSIP/101-0000000c', Uniqueid: '1792479546.16', Application: 'ChanSpy' }),
         // A supervisor's line still ringing: no application yet, but the number of the supervision.
         channel({ Channel: 'PJSIP/102-0000000e', Uniqueid: '1792479546.17', ChannelStateDesc: 'Ring', CallerIDNum: '0199', CallerIDName: 'Supervision', Application: '' }),
+        // A click-to-call still ringing the person's line (ADR 0033): no call yet.
+        channel({ Channel: 'PJSIP/106-0000000f', Uniqueid: '1792479546.18', ChannelStateDesc: 'Ring', CallerIDNum: '+33612345678', CallerIDName: 'Twake Phone', Application: '' }),
         channel({ Channel: 'PJSIP/105-0000000d', Uniqueid: 'not-an-id' })
       ])
     )
