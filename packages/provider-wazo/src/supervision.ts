@@ -14,10 +14,6 @@ export interface WazoSupervisionConfig {
   ami: AmiConfig
   /** Its other account, for Originate only (the recording notice, a supervisor's call): `originate`, read `call`; no `system`. */
   originate: AmiConfig
-  /** Click-to-call (ADR 0033): how long the line's channel may take to reach Transfer, how often it is looked for, and how long it is left there before Wazo's side is hung up (tests). */
-  clickToCallWatchMs?: number
-  clickToCallPollMs?: number
-  clickToCallGraceMs?: number
   /** The recordings server (`http://127.0.0.1:8670`): GET, HEAD and DELETE `/<tenant>/<name>`, with the bearer token. */
   recordingsUrl: string
   recordingsToken: string
@@ -60,8 +56,8 @@ const CLICK_TO_CALL_TARGET = /^\+?[0-9]{2,20}$/
 const DOMAIN = /^[A-Za-z0-9.-]{1,253}$/
 /** The name the line shows while it rings for a click-to-call: the number it will call comes with it. */
 export const CLICK_TO_CALL_NAME = 'Twake Phone'
-/** How long Wazo's side of a click-to-call lives at most, in seconds (ringing included). */
-export const CLICK_TO_CALL_MAX_SEC = 35
+/** The context of Wazo's dialplan that hands the answered line to the target (docker/wazo/asterisk/extensions.conf). */
+export const CLICK_TO_CALL_CONTEXT = 'twake-click-to-call'
 /** The options of ChanSpy: by unique id (u), quiet (q), until the call ends (E); then whisper (w) or barge (B). */
 const SPY_OPTIONS: Record<SupervisionMode, string> = { listen: 'uqE', whisper: 'uqEw', barge: 'uqEB' }
 
@@ -196,37 +192,17 @@ export class WazoSupervision implements SupervisionProvider {
         Action: 'Originate',
         Async: 'true',
         Channel: `PJSIP/${line.extension}`,
-        Application: 'Transfer',
-        Data: `PJSIP/sip:${target}@${domain}`,
+        // docker/wazo/asterisk/extensions.conf: Transfer to the target, and this side ended 5 s after the answer.
+        Context: CLICK_TO_CALL_CONTEXT,
+        Exten: 's',
+        Priority: '1',
+        Variable: [`TWAKE_TARGET=${target}`, `TWAKE_DOMAIN=${domain}`],
         CallerID: `"${CLICK_TO_CALL_NAME}" <${target}>`,
-        Timeout: '30000',
-        // Asterisk ends this channel itself 35 s after making it, whatever Transfer waits for (30 s to answer, then the
-        // REFER): Wazo's side never outlives the click-to-call, even where the Gateway may not hang it up.
-        Variable: `TIMEOUT(absolute)=${CLICK_TO_CALL_MAX_SEC}`
+        Timeout: '30000'
       },
       undefined,
       this.config.originate
     )
-    // Asterisk stays in Transfer after the phone took the REFER (measured: neither its NOTIFY nor its BYE releases it):
-    // once the line's channel runs it, Wazo's side has done its part, and is hung up a moment later (the phone's call
-    // to the target is its own). Watched in the background: the Gateway has answered already.
-    void this.endTransferred(line.extension, target).catch((err: unknown) => console.warn(`click-to-call: Wazo's side of line ${line.extension} not hung up by the Gateway (it ends by itself within ${CLICK_TO_CALL_MAX_SEC} s): ${err instanceof Error ? err.message : String(err)}`))
-  }
-
-  /** Hangs up the line's channel of a click-to-call once it is in Transfer to `target` (60 s to get there at most). */
-  private async endTransferred(extension: string, target: string) {
-    const deadline = Date.now() + (this.config.clickToCallWatchMs ?? 60_000)
-    const pause = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
-    while (Date.now() < deadline) {
-      await pause(this.config.clickToCallPollMs ?? 1_000)
-      const { events } = await this.ami({ Action: 'CoreShowChannels' }, { wait: 'list' })
-      const channel = events.find(e => e.Event === 'CoreShowChannel' && LINE_CHANNEL.exec(e.Channel ?? '')?.[1] === extension && e.Application === 'Transfer' && (e.ApplicationData ?? '').includes(`sip:${target}@`))
-      if (!channel?.Uniqueid || !CALL_ID.test(channel.Uniqueid)) continue
-      await pause(this.config.clickToCallGraceMs ?? 3_000)
-      // By its unique id: Asterisk answered "No such channel" to its name.
-      await this.ami({ Action: 'Hangup', Channel: channel.Uniqueid, Cause: '16' })
-      return
-    }
   }
 
   private checkFile(file: { tenant: string; name: string }) {

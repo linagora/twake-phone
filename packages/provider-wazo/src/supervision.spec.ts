@@ -298,8 +298,10 @@ describe('clickToCall', () => {
     const { sup, ami } = await supervision((a, reply) => reply({ Response: 'Success', ActionID: a.ActionID!, Message: 'Originate successfully queued' }))
     await sup.clickToCall({ extension: '103' }, '+33612345678', 'twake.local')
     expect(ami.state.actions).toEqual([
-      expect.objectContaining({ Action: 'Originate', Async: 'true', Channel: 'PJSIP/103', Application: 'Transfer', Data: 'PJSIP/sip:+33612345678@twake.local', CallerID: '"Twake Phone" <+33612345678>', Timeout: '30000', Variable: 'TIMEOUT(absolute)=35' })
+      expect.objectContaining({ Action: 'Originate', Async: 'true', Channel: 'PJSIP/103', Context: 'twake-click-to-call', Exten: 's', Priority: '1', CallerID: '"Twake Phone" <+33612345678>', Timeout: '30000' })
     ])
+    // Both variables of the context, as two headers (the fake keeps the last one it read).
+    expect(ami.state.actions[0]!.Variable).toBe('TWAKE_DOMAIN=twake.local')
   })
 
   it('refuses a line, a number or a domain that would say more than one (no Asterisk argument, header or URI can be slipped in)', async () => {
@@ -307,25 +309,6 @@ describe('clickToCall', () => {
     for (const [line, target, domain] of [['103,Hangup', '102', 'twake.local'], ['103', '102,Hangup', 'twake.local'], ['103', 'sip:102', 'twake.local'], ['103', '+3361234567890123456789', 'twake.local'], ['103', '102', 'twake.local;transport=tcp'], ['103', '102', 'twake.local:5060'], ['103', '102', 'evil.test>\r\nX: y']] as const)
       await expect(sup.clickToCall({ extension: line }, target, domain)).rejects.toMatchObject({ code: 'refused' })
     expect(ami.state.actions).toEqual([])
-  })
-
-  it('hangs up the line\'s channel once it runs Transfer to the target, not another line\'s nor another target\'s', async () => {
-    let polls = 0
-    const ami = await fakeAmi((a, reply) => {
-      if (a.Action === 'CoreShowChannels') {
-        polls++
-        const transfer = (e: Frame) => channel({ Application: 'Transfer', ...e })
-        const list = polls < 2 ? [] : [transfer({ Channel: 'PJSIP/104-00000001', ApplicationData: 'PJSIP/sip:102@twake.local' }), transfer({ Channel: 'PJSIP/103-00000002', ApplicationData: 'PJSIP/sip:105@twake.local' }), transfer({ Channel: 'PJSIP/103-00000003', Uniqueid: '1792479546.33', ApplicationData: 'PJSIP/sip:102@twake.local' })]
-        return channelsOf(list)(a, reply)
-      }
-      reply({ Response: 'Success', ActionID: a.ActionID!, Message: 'ok' })
-    })
-    opened.push(ami)
-    const account = { host: '127.0.0.1', port: ami.port, username: 'twake', password: 'ami-secret', timeoutMs: 2000 }
-    const sup = new WazoSupervision({ ami: account, originate: account, recordingsUrl: 'http://x', recordingsToken: 't', clickToCallPollMs: 10, clickToCallGraceMs: 10, clickToCallWatchMs: 2000 })
-    await sup.clickToCall({ extension: '103' }, '102', 'twake.local')
-    for (let i = 0; i < 100 && !ami.state.actions.some(a => a.Action === 'Hangup'); i++) await new Promise(r => setTimeout(r, 20))
-    expect(ami.state.actions.filter(a => a.Action === 'Hangup')).toEqual([expect.objectContaining({ Channel: '1792479546.33', Cause: '16' })])
   })
 
   it('says it when Asterisk refuses the call', async () => {
