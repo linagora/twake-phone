@@ -70,11 +70,11 @@ describe('requestCall', () => {
     await requestCall({ client, Intents, number: '102', openPhone: vi.fn() })
   })
 
-  it('opens the Phone app on the dialer when no Phone window could place the call', async () => {
+  it('opens the Phone app on the dialer (its frame at ?dial=) when no Phone window took the number', async () => {
     const { Intents } = fakeIntents({ handled: false })
     const openPhone = vi.fn()
     expect(await requestCall({ client, Intents, number: '102', openPhone })).toEqual({ handled: true, via: 'app' })
-    expect(openPhone).toHaveBeenCalledWith(expect.stringContaining('/dialer?dial=102'))
+    expect(openPhone).toHaveBeenCalledWith(expect.stringContaining('#/bridge/?dial=102'))
   })
 
   it('falls back to the app when the intent itself fails (Phone not installed)', async () => {

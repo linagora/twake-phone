@@ -43,14 +43,17 @@ export interface RequestCallOptions {
   openPhone?: (url: string) => void
 }
 
-/** The Phone app, opened on the dialer with the number; it dials as soon as it is ready. */
+/**
+ * The Twake Workplace app of Twake Phone, opened on the dialer with the number (ADR 0032): its frame loads TwakePhone at
+ * `/?dial=` (ADR 0031), which fills the dialer and waits for the person to press Call.
+ */
 export const phoneAppUrl = (client: CozyClientLike, target: string): string =>
   generateWebLink({
     cozyUrl: client.getStackClient().uri,
     slug: 'phone',
     subDomainType: client.getInstanceOptions().subdomain,
     pathname: '/',
-    hash: `/dialer?dial=${encodeURIComponent(target)}`
+    hash: `/bridge/?dial=${encodeURIComponent(target)}`
   })
 
 /**
