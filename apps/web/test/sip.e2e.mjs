@@ -3858,7 +3858,7 @@ try {
           const rows = await cdrsViaSince(after)
           return rows.length >= 2 ? rows : null
         })
-        expectEqual(cdrs.includes('click-to-call>103 200 wazo'), true, `the CDR of Wazo's call to Bob's line: ${cdrs}`)
+        expectEqual(cdrs.includes('clicktocall>103 200 wazo'), true, `the CDR of Wazo's call to Bob's line: ${cdrs}`)
         expectEqual(cdrs.includes('103>102 200 click-to-call'), true, `the CDR of the call to Jean at Bob's name: ${cdrs}`)
         // The grant is taken: Wazo cannot call again with it.
         expectEqual((await db.query("SELECT count(*)::int AS n FROM dial_out_grants WHERE room = 'click-to-call' AND extension = '103' AND number = '102' AND used_by IS NULL AND expires_at > now()")).rows[0].n, 0, 'grants of Bob for 102 left')

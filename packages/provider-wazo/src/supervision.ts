@@ -57,7 +57,7 @@ const GRANT = /^[0-9a-f]{32}$/
  * What the line shows while it rings for a click-to-call: the number it will call in the name, and a caller that is no
  * one's number (the Récents of the person never say the target called them).
  */
-export const CLICK_TO_CALL_CALLER = 'click-to-call'
+export const CLICK_TO_CALL_CALLER = 'clicktocall'
 export const clickToCallName = (target: string) => `Appel vers ${target}`
 /** The context of Wazo's dialplan that calls the target for the answered line (docker/wazo/asterisk/extensions.conf). */
 export const CLICK_TO_CALL_CONTEXT = 'twake-click-to-call'
