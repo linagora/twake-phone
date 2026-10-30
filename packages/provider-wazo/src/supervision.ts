@@ -61,7 +61,7 @@ const DOMAIN = /^[A-Za-z0-9.-]{1,253}$/
 /** The name the line shows while it rings for a click-to-call: the number it will call comes with it. */
 export const CLICK_TO_CALL_NAME = 'Twake Phone'
 /** How long Wazo's side of a click-to-call lives at most, in seconds (ringing included). */
-export const CLICK_TO_CALL_MAX_SEC = 45
+export const CLICK_TO_CALL_MAX_SEC = 35
 /** The options of ChanSpy: by unique id (u), quiet (q), until the call ends (E); then whisper (w) or barge (B). */
 const SPY_OPTIONS: Record<SupervisionMode, string> = { listen: 'uqE', whisper: 'uqEw', barge: 'uqEB' }
 
@@ -200,7 +200,7 @@ export class WazoSupervision implements SupervisionProvider {
         Data: `PJSIP/sip:${target}@${domain}`,
         CallerID: `"${CLICK_TO_CALL_NAME}" <${target}>`,
         Timeout: '30000',
-        // Asterisk ends this channel itself 45 s after making it, whatever Transfer waits for (30 s to answer, then the
+        // Asterisk ends this channel itself 35 s after making it, whatever Transfer waits for (30 s to answer, then the
         // REFER): Wazo's side never outlives the click-to-call, even where the Gateway may not hang it up.
         Variable: `TIMEOUT(absolute)=${CLICK_TO_CALL_MAX_SEC}`
       },
@@ -221,9 +221,10 @@ export class WazoSupervision implements SupervisionProvider {
       await pause(this.config.clickToCallPollMs ?? 1_000)
       const { events } = await this.ami({ Action: 'CoreShowChannels' }, { wait: 'list' })
       const channel = events.find(e => e.Event === 'CoreShowChannel' && LINE_CHANNEL.exec(e.Channel ?? '')?.[1] === extension && e.Application === 'Transfer' && (e.ApplicationData ?? '').includes(`sip:${target}@`))
-      if (!channel?.Channel) continue
+      if (!channel?.Uniqueid || !CALL_ID.test(channel.Uniqueid)) continue
       await pause(this.config.clickToCallGraceMs ?? 3_000)
-      await this.ami({ Action: 'Hangup', Channel: channel.Channel, Cause: '16' })
+      // By its unique id: Asterisk answered "No such channel" to its name.
+      await this.ami({ Action: 'Hangup', Channel: channel.Uniqueid, Cause: '16' })
       return
     }
   }
