@@ -14,6 +14,10 @@ export interface WazoSupervisionConfig {
   ami: AmiConfig
   /** Its other account, for Originate only (the recording notice, a supervisor's call): `originate`, read `call`; no `system`. */
   originate: AmiConfig
+  /** Click-to-call (ADR 0033): how long the line's channel may take to reach Transfer, how often it is looked for, and how long it is left there before Wazo's side is hung up (tests). */
+  clickToCallWatchMs?: number
+  clickToCallPollMs?: number
+  clickToCallGraceMs?: number
   /** The recordings server (`http://127.0.0.1:8670`): GET, HEAD and DELETE `/<tenant>/<name>`, with the bearer token. */
   recordingsUrl: string
   recordingsToken: string
@@ -198,6 +202,25 @@ export class WazoSupervision implements SupervisionProvider {
       undefined,
       this.config.originate
     )
+    // Asterisk stays in Transfer after the phone took the REFER (measured: neither its NOTIFY nor its BYE releases it):
+    // once the line's channel runs it, Wazo's side has done its part, and is hung up a moment later (the phone's call
+    // to the target is its own). Watched in the background: the Gateway has answered already.
+    void this.endTransferred(line.extension, target).catch(() => undefined)
+  }
+
+  /** Hangs up the line's channel of a click-to-call once it is in Transfer to `target` (60 s to get there at most). */
+  private async endTransferred(extension: string, target: string) {
+    const deadline = Date.now() + (this.config.clickToCallWatchMs ?? 60_000)
+    const pause = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
+    while (Date.now() < deadline) {
+      await pause(this.config.clickToCallPollMs ?? 1_000)
+      const { events } = await this.ami({ Action: 'CoreShowChannels' }, { wait: 'list' })
+      const channel = events.find(e => e.Event === 'CoreShowChannel' && LINE_CHANNEL.exec(e.Channel ?? '')?.[1] === extension && e.Application === 'Transfer' && (e.ApplicationData ?? '').includes(`sip:${target}@`))
+      if (!channel?.Channel) continue
+      await pause(this.config.clickToCallGraceMs ?? 3_000)
+      await this.ami({ Action: 'Hangup', Channel: channel.Channel, Cause: '16' })
+      return
+    }
   }
 
   private checkFile(file: { tenant: string; name: string }) {

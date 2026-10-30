@@ -309,6 +309,25 @@ describe('clickToCall', () => {
     expect(ami.state.actions).toEqual([])
   })
 
+  it('hangs up the line\'s channel once it runs Transfer to the target, not another line\'s nor another target\'s', async () => {
+    let polls = 0
+    const ami = await fakeAmi((a, reply) => {
+      if (a.Action === 'CoreShowChannels') {
+        polls++
+        const transfer = (e: Frame) => channel({ Application: 'Transfer', ...e })
+        const list = polls < 2 ? [] : [transfer({ Channel: 'PJSIP/104-00000001', ApplicationData: 'PJSIP/sip:102@twake.local' }), transfer({ Channel: 'PJSIP/103-00000002', ApplicationData: 'PJSIP/sip:105@twake.local' }), transfer({ Channel: 'PJSIP/103-00000003', ApplicationData: 'PJSIP/sip:102@twake.local' })]
+        return channelsOf(list)(a, reply)
+      }
+      reply({ Response: 'Success', ActionID: a.ActionID!, Message: 'ok' })
+    })
+    opened.push(ami)
+    const account = { host: '127.0.0.1', port: ami.port, username: 'twake', password: 'ami-secret', timeoutMs: 2000 }
+    const sup = new WazoSupervision({ ami: account, originate: account, recordingsUrl: 'http://x', recordingsToken: 't', clickToCallPollMs: 10, clickToCallGraceMs: 10, clickToCallWatchMs: 2000 })
+    await sup.clickToCall({ extension: '103' }, '102', 'twake.local')
+    for (let i = 0; i < 100 && !ami.state.actions.some(a => a.Action === 'Hangup'); i++) await new Promise(r => setTimeout(r, 20))
+    expect(ami.state.actions.filter(a => a.Action === 'Hangup')).toEqual([expect.objectContaining({ Channel: 'PJSIP/103-00000003', Cause: '16' })])
+  })
+
   it('says it when Asterisk refuses the call', async () => {
     const { sup } = await supervision((a, reply) => reply({ Response: 'Error', ActionID: a.ActionID!, Message: 'Permission denied' }))
     await expect(sup.clickToCall({ extension: '103' }, '102', 'twake.local')).rejects.toBeInstanceOf(SupervisionError)
