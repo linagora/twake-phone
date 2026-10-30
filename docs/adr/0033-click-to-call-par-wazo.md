@@ -28,6 +28,7 @@ Avant de faire sonner la ligne, la passerelle écrit une autorisation dans `dial
 
 ## Conséquences
 
+- Mesuré en CI : Asterisk reste dans `Transfer` après que la fenêtre a appelé la cible (il n'en apprend pas l'issue). La fenêtre (le softphone) raccroche donc elle-même son appel avec Wazo dès que l'appel vers la cible est décroché, quand ce REFER la renvoie vers le numéro même qui l'appelait (le click-to-call ; un transfert ordinaire n'est pas touché). Un téléphone de bureau qui ne le fait pas laisse le côté de Wazo ouvert jusqu'à ce qu'il raccroche.
 - Les lignes de Wazo n'attendent pas le dernier NOTIFY du téléphone (`refer_blind_progress = no`, posé à leur création) : le 202 du REFER suffit, Wazo raccroche son côté, le téléphone continue seul son appel vers la cible. Une ligne créée avant ce changement le garde à `yes` (Wazo attend alors ce NOTIFY).
 
 - L'`Originate` fait sonner tous les contacts de la ligne, fenêtres comprises : une fenêtre qui décroche suit le REFER (le softphone suit déjà un transfert vers son domaine) et compose depuis le navigateur.

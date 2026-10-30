@@ -1282,10 +1282,23 @@ export class Softphone {
       if (this.activeCalls().length >= MAX_CALLS || !target?.user || !DIALABLE.test(target.user) || (target.host ?? '').toLowerCase() !== this.domain.toLowerCase()) return e.reject()
       // Who asked for the call goes along with it (RFC 3892): the target sees the transfer for what it is.
       const referredBy = request.getHeader?.('Referred-By')
+      // A click-to-call (ADR 0033): the telephony server rang us showing a number, then hands us to that very number.
+      // Once that call is answered, ours with the server has nothing left to carry: we end it, as not every server does.
+      const handedToCaller = target.user === call.remoteNumber
+      const placed = (s: RTCSession) => {
+        if (handedToCaller) s.once('accepted', () => void (call.state === 'ended' ? undefined : call.hangup().catch(() => undefined)))
+      }
       // JsSIP has already said 202: the new call is placed once our microphone is open.
       void this.acquireMicrophone().then(
-        microphone => (e.accept as AcceptReferred)((s: RTCSession) => this.calls.get(s.id)?.adopt(microphone), { ...mediaOptions(iceServers, microphone), ...(referredBy ? { extraHeaders: [`Referred-By: ${referredBy}`] } : {}) }),
-        () => (e.accept as AcceptReferred)(() => undefined, { ...mediaOptions(iceServers), ...(referredBy ? { extraHeaders: [`Referred-By: ${referredBy}`] } : {}) })
+        microphone =>
+          (e.accept as AcceptReferred)(
+            (s: RTCSession) => {
+              this.calls.get(s.id)?.adopt(microphone)
+              placed(s)
+            },
+            { ...mediaOptions(iceServers, microphone), ...(referredBy ? { extraHeaders: [`Referred-By: ${referredBy}`] } : {}) }
+          ),
+        () => (e.accept as AcceptReferred)(placed, { ...mediaOptions(iceServers), ...(referredBy ? { extraHeaders: [`Referred-By: ${referredBy}`] } : {}) })
       )
     })
     // The far end of an attended transfer replaces the person who consulted us (INVITE with Replaces).
