@@ -1000,7 +1000,10 @@ export class WazoVoicemail implements VoicemailProvider {
               aor_section_options: [
                 ['max_contacts', '1'],
                 ['remove_existing', 'yes']
-              ]
+              ],
+              // Click-to-call (ADR 0033): once the phone took the REFER (202), Wazo is done and hangs up its side; it does not
+              // wait for the phone's last NOTIFY, which not every phone sends.
+              endpoint_section_options: [['refer_blind_progress', 'no']]
             },
             guard
           )

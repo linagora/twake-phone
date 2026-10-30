@@ -28,6 +28,8 @@ Avant de faire sonner la ligne, la passerelle écrit une autorisation dans `dial
 
 ## Conséquences
 
+- Les lignes de Wazo n'attendent pas le dernier NOTIFY du téléphone (`refer_blind_progress = no`, posé à leur création) : le 202 du REFER suffit, Wazo raccroche son côté, le téléphone continue seul son appel vers la cible. Une ligne créée avant ce changement le garde à `yes` (Wazo attend alors ce NOTIFY).
+
 - L'`Originate` fait sonner tous les contacts de la ligne, fenêtres comprises : une fenêtre qui décroche suit le REFER (le softphone suit déjà un transfert vers son domaine) et compose depuis le navigateur.
 - Le CDR montre deux appels : celui de Wazo vers la ligne (`via wazo`, l'appelant est la cible) et celui du téléphone vers la cible.
 - Prouvé : `config.spec.ts` (l'exception et ses conditions), la requête de l'autorisation lue dans le gabarit et jouée contre PostgreSQL (`dial-out-grants.spec.ts` : une fois, sa ligne, son numéro, avant son heure, jamais une autorisation de salle), `provider-wazo` (l'`Originate` exact, refus de toute valeur qui dirait plus qu'un numéro), la passerelle (offert à qui a une ligne seulement, autorisation écrite avant la sonnerie, 400, 409, 503), le gabarit lu par le vrai OpenSIPS de la pile. L'e2e SIP (Bob décroche sur sa seconde fenêtre, sa fenêtre appelle Jean, son et CDR) tourne en CI.
