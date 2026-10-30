@@ -39,8 +39,21 @@ export interface RequestCallOptions {
   number: string
   /** Override of the cozy-interapp class (tests). */
   Intents?: IntentsConstructor
-  /** Opens the Phone app when no Phone window could place the call. Defaults to window.open. */
-  openPhone?: (url: string) => void
+  /**
+   * Opens the Phone app when no Phone window took the number; false when it could not (a blocked popup). Defaults to a
+   * new tab, cut from this page (no opener).
+   */
+  openPhone?: (url: string) => boolean | void
+  /** How long the intent may take before the app is opened instead (a service that never answers). */
+  intentTimeoutMs?: number
+}
+
+const openTab = (url: string): boolean => {
+  // Not 'noopener': window.open would then return null whether or not it opened, and a blocked tab would read as handled.
+  const tab = window.open(url, '_blank')
+  if (!tab) return false
+  tab.opener = null
+  return true
 }
 
 /**
@@ -62,7 +75,7 @@ export const phoneAppUrl = (client: CozyClientLike, target: string): string =>
  *
  * The number is validated and normalised first: text that is not a phone number is never dialled.
  */
-export const requestCall = async ({ client, number, Intents: IntentsOverride, openPhone = url => void window.open(url, '_blank', 'noopener') }: RequestCallOptions): Promise<CallResult> => {
+export const requestCall = async ({ client, number, Intents: IntentsOverride, openPhone = openTab, intentTimeoutMs = 5_000 }: RequestCallOptions): Promise<CallResult> => {
   const target = toDialTarget(number)
   if (!target) return { handled: false, reason: 'invalid-number' }
 
@@ -83,7 +96,9 @@ export const requestCall = async ({ client, number, Intents: IntentsOverride, op
   let answer: { handled?: boolean } | undefined
   try {
     const Intents = IntentsOverride ?? resolveIntents()
-    answer = (await new Intents({ client }).create(CALL_ACTION, CALL_TYPE, { number: target }).start(container)) as { handled?: boolean } | undefined
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const late = new Promise<undefined>(resolve => (timer = setTimeout(() => resolve(undefined), intentTimeoutMs)))
+    answer = (await Promise.race([new Intents({ client }).create(CALL_ACTION, CALL_TYPE, { number: target }).start(container), late]).finally(() => clearTimeout(timer))) as { handled?: boolean } | undefined
   } catch {
     answer = undefined // Phone not installed or intent refused: fall through to the app
   } finally {
@@ -93,9 +108,9 @@ export const requestCall = async ({ client, number, Intents: IntentsOverride, op
   return openApp(client as CozyClientLike, target, openPhone)
 }
 
-const openApp = (client: CozyClientLike, target: string, openPhone: (url: string) => void): CallResult => {
+const openApp = (client: CozyClientLike, target: string, openPhone: (url: string) => boolean | void): CallResult => {
   try {
-    openPhone(phoneAppUrl(client, target))
+    if (openPhone(phoneAppUrl(client, target)) === false) return { handled: false, reason: 'phone-unavailable' }
     return { handled: true, via: 'app' }
   } catch {
     return { handled: false, reason: 'phone-unavailable' }

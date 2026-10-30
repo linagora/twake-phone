@@ -1,20 +1,21 @@
 import { describe, expect, it } from 'vitest'
-import { DIAL_MESSAGE, dialPathOf, isFramed } from './embedded.js'
+import { DIAL_MESSAGE, dialRequestOf, isFramed } from './embedded.js'
 
-describe('dialPathOf', () => {
+describe('dialRequestOf', () => {
   const parent = {}
 
-  it('turns a number posted by the parent into the ?dial= path, encoded', () => {
-    expect(dialPathOf({ source: parent as MessageEventSource, data: { type: DIAL_MESSAGE, number: '+33 6 12' } }, parent)).toBe('/?dial=%2B33%206%2012')
+  it('turns a number posted by the parent into the ?dial= path, encoded, with the id to answer', () => {
+    expect(dialRequestOf({ source: parent as MessageEventSource, data: { type: DIAL_MESSAGE, number: '+33 6 12', id: 'r1' } }, parent)).toEqual({ path: '/?dial=%2B33%206%2012', id: 'r1' })
   })
 
   it('ignores another sender, another type, a number that is not text, empty or too long', () => {
-    expect(dialPathOf({ source: {} as MessageEventSource, data: { type: DIAL_MESSAGE, number: '102' } }, parent)).toBeNull()
-    expect(dialPathOf({ source: parent as MessageEventSource, data: { type: 'other', number: '102' } }, parent)).toBeNull()
-    expect(dialPathOf({ source: parent as MessageEventSource, data: { type: DIAL_MESSAGE, number: 102 } }, parent)).toBeNull()
-    expect(dialPathOf({ source: parent as MessageEventSource, data: { type: DIAL_MESSAGE, number: '' } }, parent)).toBeNull()
-    expect(dialPathOf({ source: parent as MessageEventSource, data: { type: DIAL_MESSAGE, number: '1'.repeat(41) } }, parent)).toBeNull()
-    expect(dialPathOf({ source: parent as MessageEventSource, data: null }, parent)).toBeNull()
+    expect(dialRequestOf({ source: {} as MessageEventSource, data: { type: DIAL_MESSAGE, number: '102', id: 'r' } }, parent)).toBeNull()
+    expect(dialRequestOf({ source: parent as MessageEventSource, data: { type: DIAL_MESSAGE, number: '102' } }, parent)).toBeNull()
+    expect(dialRequestOf({ source: parent as MessageEventSource, data: { type: 'other', number: '102' } }, parent)).toBeNull()
+    expect(dialRequestOf({ source: parent as MessageEventSource, data: { type: DIAL_MESSAGE, number: 102 } }, parent)).toBeNull()
+    expect(dialRequestOf({ source: parent as MessageEventSource, data: { type: DIAL_MESSAGE, number: '' } }, parent)).toBeNull()
+    expect(dialRequestOf({ source: parent as MessageEventSource, data: { type: DIAL_MESSAGE, number: '1'.repeat(41) } }, parent)).toBeNull()
+    expect(dialRequestOf({ source: parent as MessageEventSource, data: null }, parent)).toBeNull()
   })
 })
 

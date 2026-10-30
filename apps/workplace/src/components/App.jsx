@@ -6,18 +6,36 @@ import { useI18n } from 'twake-i18n'
 
 import { useDialRelay } from '@/dialRelay'
 
-/** What TwakePhone (apps/web, src/embedded.ts) reads from its parent: a number to put in its dialer. */
+/** What TwakePhone (apps/web, src/embedded.ts) reads from its parent: a number to put in its dialer, and its answer. */
 const DIAL_MESSAGE = 'twakephone.dial'
+const DIAL_ACK = 'twakephone.dial-ack'
+/** How long the frame has to answer: a frame not signed in never does, and the number goes to a new tab. */
+const ACK_MS = 1_500
+
+/** Posts `number` to the frame and resolves whether it took it (its answer, from its origin, within ACK_MS). */
+const postToFrame = (frame, origin, number) =>
+  new Promise(resolve => {
+    const id = crypto.randomUUID()
+    const done = ok => {
+      clearTimeout(timer)
+      window.removeEventListener('message', onMessage)
+      resolve(ok)
+    }
+    const onMessage = event => {
+      if (event.source === frame && event.origin === origin && event.data?.type === DIAL_ACK && event.data.id === id) done(true)
+    }
+    window.addEventListener('message', onMessage)
+    const timer = setTimeout(() => done(false), ACK_MS)
+    frame.postMessage({ type: DIAL_MESSAGE, number, id }, origin)
+  })
 
 const Phone = ({ url }) => {
   const { isReady, urlToLoad } = useExternalBridge(url)
   // The CALL intent of another app reaches the dialer of this frame (never dialled: TwakePhone waits for the click).
   const dial = useCallback(
-    number => {
+    async number => {
       const frame = document.getElementById('embeddedApp')?.contentWindow
-      if (!frame) return false
-      frame.postMessage({ type: DIAL_MESSAGE, number }, new URL(url).origin)
-      return true
+      return frame ? postToFrame(frame, new URL(url).origin, number) : false
     },
     [url]
   )
