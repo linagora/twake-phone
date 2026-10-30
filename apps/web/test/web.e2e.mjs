@@ -337,6 +337,31 @@ try {
     expectEqual(typed.replace(/\s/g, ''), '+33612345601', 'number sent to the dialer')
     expectEqual(new URL(page.url()).search, '', 'address bar cleaned')
   })
+  await step('a link from Twake Chat (/?dial=) fills the dialer with the normalised number and dials nothing', async () => {
+    const calls = []
+    const onRequest = req => (req.method() === 'POST' && new URL(req.url()).pathname.endsWith('/calls') ? calls.push(req.url()) : undefined)
+    page.on('request', onRequest)
+    await page.goto(`${appOrigin}/?dial=${encodeURIComponent('06 12 34 56 02')}`)
+    await page.getByRole('heading', { level: 1, name: 'Téléphone' }).waitFor()
+    await page.waitForFunction(() => document.querySelector('#number')?.value === '+33612345602')
+    expectEqual(new URL(page.url()).search, '', 'address bar cleaned')
+    // A second link while the dialer is on screen (no reload): the field follows it.
+    await page.evaluate(() => {
+      window.history.pushState(null, '', '/?dial=0612345603')
+      window.dispatchEvent(new PopStateEvent('popstate'))
+    })
+    await page.waitForFunction(() => document.querySelector('#number')?.value === '+33612345603')
+    expectEqual(new URL(page.url()).search, '', 'address bar cleaned again')
+    // Text that is not a number is refused out loud and never reaches the field
+    await page.goto(`${appOrigin}/?dial=${encodeURIComponent('FR123456789')}`)
+    await page.getByRole('alert').getByText('ne contient pas un numéro valide').waitFor()
+    expectEqual(await page.getByLabel('Numéro à appeler').inputValue(), '', 'field after a refused ?dial=')
+    // Typing a number by hand takes the error away.
+    await page.getByRole('button', { name: '5', exact: true }).click()
+    await page.getByRole('alert').getByText('ne contient pas un numéro valide').waitFor({ state: 'detached' })
+    page.off('request', onRequest)
+    expectEqual(calls.length, 0, 'calls placed by the links')
+  })
   await step('switching the language to English changes the UI, the title and the document language', async () => {
     await page.getByRole('link', { name: 'Réglages' }).click()
     // The audio devices live here too; without a phone on this platform the ringtone cannot be tested.

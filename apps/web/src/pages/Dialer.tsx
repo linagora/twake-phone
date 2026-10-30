@@ -19,12 +19,25 @@ export const Dialer = () => {
   // The directory (beside the keypad, or a contact card) sends a number to call as ?number=: taken, then the address
   // bar is cleaned.
   const [params, setParams] = useSearchParams()
-  const [number, setNumber] = useState(() => (params.get('number') ?? '').slice(0, 32))
+  // Twake Chat sends a number to call as ?dial= (ADR 0031): validated and normalised here, never dialled from the link
+  // itself (a page cannot make the app place a call), only put in the field with the Call button focused once calling is possible.
+  const [dialed, setDialed] = useState(() => (params.has('dial') ? toDialTarget(params.get('dial') ?? '') : undefined))
+  // Set when a link brings a number, cleared once Call got the focus: a later change of state does not move the focus.
+  const focusCall = useRef(!!dialed)
+  const [number, setNumber] = useState(() => dialed ?? (params.get('number') ?? '').slice(0, 32))
   useEffect(() => {
     const sent = params.get('number')
-    if (sent === null) return
-    // eslint-disable-next-line react-hooks/set-state-in-effect -- the keypad is already on screen when the list beside it sends a number
-    setNumber(sent.slice(0, 32))
+    if (params.has('dial')) {
+      const target = toDialTarget(params.get('dial') ?? '')
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- the keypad may already be on screen when a link sends a number
+      setDialed(target)
+      if (target) {
+        setNumber(target)
+        focusCall.current = true
+      }
+    } else if (sent !== null) {
+      setNumber(sent.slice(0, 32))
+    } else return
     setParams({}, { replace: true })
   }, [params, setParams])
   // The Gateway can place the call for us (click-to-call) or the browser does it itself (softphone registered).
@@ -32,6 +45,12 @@ export const Dialer = () => {
   // The dialer places the first call; a second one (a consultation before a transfer) is placed from the call panel.
   const canCall = (phone.state === 'registered' && !phone.calls.length) || (phone.state !== 'registered' && !!gatewayCalls)
   const [status, setStatus] = useState<{ kind: 'info' | 'error'; text: string } | null>(null)
+  const callButton = useRef<HTMLButtonElement>(null)
+  useEffect(() => {
+    if (!focusCall.current || !canCall) return
+    focusCall.current = false
+    callButton.current?.focus()
+  }, [number, canCall])
 
   useEffect(() => {
     let cancelled = false
@@ -99,6 +118,7 @@ export const Dialer = () => {
         {t('dialer.title')}
       </Typography>
       {gatewayCalls === false && phone.state === 'off' ? <Alert severity="info" role="status" className="u-mb-1">{t('dialer.unavailable')}</Alert> : null}
+      {dialed === null && !number ? <Alert severity="error" role="alert" className="u-mb-1">{t('dialer.invalidDial')}</Alert> : null}
       {phone.state === 'failed' || phone.state === 'unregistered' ? <Alert severity="info" role="status" className="u-mb-1">{t('dialer.notRegistered')}</Alert> : null}
       <form onSubmit={e => void submit(e)}>
         <TextField id="number" label={t('dialer.number')} type="tel" fullWidth className="u-mb-1" slotProps={{ htmlInput: { inputMode: 'tel', autoComplete: 'off' } }} value={number} onChange={e => setNumber(e.target.value)} />
@@ -126,7 +146,7 @@ export const Dialer = () => {
           <Button type="button" variant="outlined" onClick={() => setNumber(n => n.slice(0, -1))} aria-label={t('dialer.backspace')} disabled={!number}>
             ⌫
           </Button>
-          <Button type="submit" disabled={!canCall || !toDialTarget(number)}>
+          <Button ref={callButton} type="submit" disabled={!canCall || !toDialTarget(number)}>
             {t('dialer.call')}
           </Button>
         </Stack>
