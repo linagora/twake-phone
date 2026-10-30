@@ -662,9 +662,10 @@ route {
 		# number it showed as the caller (Transfer: a REFER from Wazo's side, to sip:<that number>@our domain, nothing
 		# else). The phone then calls that number itself, with its own account: its rights, caps and fraud checks apply
 		# as to any call it makes. Any other REFER in such a call stays refused below.
-		if (is_method("REFER") && $dlg_val(wline) == "1" && $var(from_wline) == 1 && $hdr_cnt(Refer-To) == 1 && $dlg_val(wline_caller) != NULL && $dlg_val(wline_caller) != "anonymous") {
+		if (is_method("REFER") && $dlg_val(wline) == "1" && $var(from_wline) == 1 && $hdrcnt(Refer-To) == 1 && $dlg_val(wline_caller) != NULL && $dlg_val(wline_caller) != "anonymous") {
 			$var(refer_to) = "sip:" + $dlg_val(wline_caller) + "@${SIP_DOMAIN}";
-			if ($hdr(Refer-To) == $var(refer_to) || $hdr(Refer-To) == "<" + $var(refer_to) + ">")
+			$var(refer_to_named) = "<" + $var(refer_to) + ">";
+			if ($hdr(Refer-To) == $var(refer_to) || $hdr(Refer-To) == $var(refer_to_named))
 				$var(click_to_call) = 1;
 		}
 		# wazo-lines: end

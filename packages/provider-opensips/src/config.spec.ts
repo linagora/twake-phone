@@ -118,9 +118,10 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(cfg).toContain('$dlg_val(meet) != NULL || ($dlg_val(wline) == "1" && $var(click_to_call) == 0))) {')
     expect(call.slice(0, call.indexOf('route(rules_step);'))).toContain('$dlg_val(wline_caller) = $avp(caller);')
     const ctc = cfg.slice(cfg.indexOf('$var(click_to_call) = 0;'), cfg.indexOf('if (is_method("REFER") && ($dlg_val(trunk) != NULL'))
-    expect(ctc).toContain('if (is_method("REFER") && $dlg_val(wline) == "1" && $var(from_wline) == 1 && $hdr_cnt(Refer-To) == 1 && $dlg_val(wline_caller) != NULL && $dlg_val(wline_caller) != "anonymous") {')
+    expect(ctc).toContain('if (is_method("REFER") && $dlg_val(wline) == "1" && $var(from_wline) == 1 && $hdrcnt(Refer-To) == 1 && $dlg_val(wline_caller) != NULL && $dlg_val(wline_caller) != "anonymous") {')
     expect(ctc).toContain('$var(refer_to) = "sip:" + $dlg_val(wline_caller) + "@127.0.0.1";')
-    expect(ctc).toContain('if ($hdr(Refer-To) == $var(refer_to) || $hdr(Refer-To) == "<" + $var(refer_to) + ">")')
+    expect(ctc).toContain('$var(refer_to_named) = "<" + $var(refer_to) + ">";')
+    expect(ctc).toContain('if ($hdr(Refer-To) == $var(refer_to) || $hdr(Refer-To) == $var(refer_to_named))')
     expect(ctc.match(/\$var\(click_to_call\) = 1;/g)).toHaveLength(1)
   })
 
