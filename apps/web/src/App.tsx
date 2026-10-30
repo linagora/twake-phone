@@ -4,7 +4,7 @@ import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom'
 import { AuthProvider, useAuth } from './auth/AuthProvider.js'
 import { createUserManager } from './auth/oidc.js'
 import { loadConfig, type AppConfig } from './config.js'
-import { ParentDial } from './embedded.js'
+import { ParentCalls, ParentDial } from './embedded.js'
 import { GatewayProvider } from './gateway.js'
 import { I18nProvider, useT } from './i18n/useT.js'
 import { CenteredPage } from './components/CenteredPage.js'
@@ -42,6 +42,7 @@ const Gate = ({ config }: { config: AppConfig }) => {
           <PresenceProvider>
           <BrowserRouter>
             <ParentDial />
+            <ParentCalls />
             <Routes>
               <Route element={<Layout />}>
                 <Route index element={<Phone />} />
