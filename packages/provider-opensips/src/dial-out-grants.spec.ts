@@ -181,8 +181,8 @@ if (process.env.TEST_DATABASE_URL) {
 
     const ctcLine = tpl.split('\n').find(l => l.includes('$var(ctc_query) = "UPDATE dial_out_grants'))!
     /** The REFER's query of a click-to-call (ADR 0033): the call Wazo placed to `line`, showing `number`. */
-    const takeClickToCall = async (line: string, number: string) =>
-      (await pool.query(ctcLine.slice(ctcLine.indexOf('"') + 1, ctcLine.lastIndexOf('"')).replace(`'" + $dlg_val(wline_callee) + "'`, `'${line}'`).replace(`'" + $dlg_val(wline_caller) + "'`, `'${number}'`))).rowCount
+    const takeClickToCall = async (line: string, number: string, callId = 'wazo-call-1') =>
+      (await pool.query(ctcLine.slice(ctcLine.indexOf('"') + 1, ctcLine.lastIndexOf('"')).replace(`'" + $dlg_val(wline_callee) + "'`, `'${line}'`).replace(`'" + $dlg_val(wline_caller) + "'`, `'${number}'`).replaceAll(`'" + $ci + "'`, `'${callId}'`))).rowCount
 
     it('lets OpenSIPS take a click-to-call grant once, for its line and its number, before its expiry; never a grant of a room', async () => {
       const grants = new DialOutGrants({ pool, ready, tenantId: 'spec' })
@@ -190,7 +190,9 @@ if (process.env.TEST_DATABASE_URL) {
       expect(await takeClickToCall('9102', '+33612345678')).toBe(0)
       expect(await takeClickToCall('9101', '+33612345679')).toBe(0)
       expect(await takeClickToCall('9101', '+33612345678')).toBe(1)
-      expect(await takeClickToCall('9101', '+33612345678')).toBe(0)
+      // A copy of that REFER, in the same call: found again. Another call: nothing.
+      expect(await takeClickToCall('9101', '+33612345678')).toBe(1)
+      expect(await takeClickToCall('9101', '+33612345678', 'wazo-call-2')).toBe(0)
       // A room's grant for the same person and number is no click-to-call's (and its token no REFER carries).
       const room = await grants.grant('9101', '102')
       expect(await takeClickToCall('9101', '102')).toBe(0)

@@ -671,8 +671,10 @@ route {
 		if (is_method("REFER") && $dlg_val(wline) == "1" && $var(from_wline) == 1 && $hdrcnt(Refer-To) == 1 && $dlg_val(wline_caller) != NULL && $dlg_val(wline_caller) != "anonymous" && $dlg_val(wline_callee) != NULL) {
 			$var(refer_to) = "sip:" + $dlg_val(wline_caller) + "@${SIP_DOMAIN}";
 			$var(refer_to_named) = "<" + $var(refer_to) + ">";
-			if ($hdr(Refer-To) == $var(refer_to) || $hdr(Refer-To) == $var(refer_to_named)) {
-				$var(ctc_query) = "UPDATE dial_out_grants g SET used_by = 'click-to-call' WHERE g.room = 'click-to-call' AND g.used_by IS NULL AND g.extension = '" + $dlg_val(wline_callee) + "' AND g.number = '" + $dlg_val(wline_caller) + "' AND g.expires_at > now() RETURNING 1";
+			# Taken by this call (its Call-ID, of the characters route[meet_source] lets in): a copy of the REFER that two
+			# processes read at once, before its transaction existed, finds it again rather than a 403 that would undo it.
+			if (($hdr(Refer-To) == $var(refer_to) || $hdr(Refer-To) == $var(refer_to_named)) && $ci =~ "^[A-Za-z0-9._~!%*+@:-]{1,200}$") {
+				$var(ctc_query) = "UPDATE dial_out_grants g SET used_by = 'click-to-call', used_call = '" + $ci + "' WHERE g.room = 'click-to-call' AND (g.used_by IS NULL OR g.used_call = '" + $ci + "') AND g.extension = '" + $dlg_val(wline_callee) + "' AND g.number = '" + $dlg_val(wline_caller) + "' AND g.expires_at > now() RETURNING 1";
 				if (sql_query_one("$var(ctc_query)", "$var(ctc_granted)"))
 					$var(click_to_call) = 1;
 				else
