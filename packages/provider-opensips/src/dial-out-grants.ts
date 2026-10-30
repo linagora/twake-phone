@@ -38,6 +38,15 @@ ALTER TABLE dial_out_grants ADD COLUMN IF NOT EXISTS used_call VARCHAR(200);
 
 /** The header LiveKit SIP carries the grant in (CreateSIPParticipant's `headers`), and OpenSIPS reads. */
 export const GRANT_HEADER = 'X-Twake-Grant'
+/**
+ * A click-to-call's grant (ADR 0033), in the same table: `extension`'s line may be handed (REFER, from Wazo's side of a
+ * call Wazo placed to it) to `number`, once, before `expires_at`. Its token is drawn and never told anyone (no room
+ * ever presents it); OpenSIPS takes it by extension and number, marking it used.
+ */
+export const CLICK_TO_CALL_ROOM = 'click-to-call'
+/** How long a click-to-call's grant waits for its REFER: the line rings 30 s at most, the transfer follows the answer. */
+export const CLICK_TO_CALL_TTL_SEC = 60
+
 /** How long a grant waits for its INVITE by default, in seconds: LiveKit SIP sends it at once, its retry with credentials just after. */
 export const GRANT_TTL_SEC = 30
 
@@ -106,6 +115,23 @@ export class DialOutGrants {
         room ?? null
       ])
     return token
+  }
+
+  /** The grant of a click-to-call (see CLICK_TO_CALL_ROOM): `extension`'s line may be handed to `number`, once. */
+  async grantClickToCall(extension: string, number: string, ttlSec = CLICK_TO_CALL_TTL_SEC): Promise<void> {
+    if (!SIP_USER.test(extension)) throw Object.assign(new Error('Extension is not a valid SIP user'), { statusCode: 400 })
+    if (!NUMBER.test(number)) throw Object.assign(new Error('Invalid phone number'), { statusCode: 400 })
+    if (!(Number.isInteger(ttlSec) && ttlSec >= 1 && ttlSec <= 300)) throw new Error('A grant lives 1 to 300 seconds')
+    await this.opts.ready?.()
+    await this.opts.pool.query('DELETE FROM dial_out_grants WHERE tenant_id = $1 AND expires_at < now()', [this.tenantId])
+    await this.opts.pool.query('INSERT INTO dial_out_grants (token, tenant_id, extension, number, expires_at, room) VALUES ($1, $2, $3, $4, now() + make_interval(secs => $5), $6)', [
+      this.opts.token?.() ?? randomBytes(16).toString('hex'),
+      this.tenantId,
+      extension,
+      number,
+      ttlSec,
+      CLICK_TO_CALL_ROOM
+    ])
   }
 
   /**

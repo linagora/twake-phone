@@ -13,12 +13,13 @@ afterEach(async () => {
   for (const a of apps.splice(0)) await a.close()
 })
 
-const setup = async (opts: { clickToCall?: boolean; refuse?: 'refused' | 'unavailable'; outbound?: boolean } = {}) => {
+const setup = async (opts: { clickToCall?: boolean; refuse?: 'refused' | 'unavailable'; outbound?: boolean; grants?: boolean } = {}) => {
   process.env.AUTH_MODE = 'dev'
   const store = new MemoryStore()
   await store.upsertMapping({ tenantId: 'dev', userId: 'bdurand', extension: '103', displayName: 'Bob Durand' })
   await store.upsertMapping({ tenantId: 'dev', userId: 'amartin', extension: '101', displayName: 'Alice Martin' })
   const placed: { extension: string; target: string; domain: string }[] = []
+  const order: string[] = []
   const calling = { outbound: opts.outbound ?? false, inbound: true, answer: false, hangup: false, hold: false, transfer: false, dtmf: false }
   const telephony: ProviderFactory<unknown> = {
     type: 'fake',
@@ -29,6 +30,13 @@ const setup = async (opts: { clickToCall?: boolean; refuse?: 'refused' | 'unavai
         getCapabilities: async () => ({ calling, media: { browserAudio: true } }),
         // Only Bob's extension has a line at Wazo.
         listWazoLines: async () => ['103'],
+        ...(opts.grants === false
+          ? {}
+          : {
+              grantClickToCall: async (extension: string, number: string) => {
+                order.push(`grant ${extension} ${number}`)
+              }
+            }),
         originate: async () => {
           throw Object.assign(new Error('Click-to-call is not available yet'), { statusCode: 501 })
         },
@@ -44,6 +52,7 @@ const setup = async (opts: { clickToCall?: boolean; refuse?: 'refused' | 'unavai
           async clickToCall(line: { extension: string }, target: string, domain: string) {
             if (opts.refuse) throw new SupervisionError('no', opts.refuse)
             placed.push({ extension: line.extension, target, domain })
+            order.push(`ring ${line.extension}`)
           }
         })
   } as unknown as SupervisionProvider
@@ -51,12 +60,12 @@ const setup = async (opts: { clickToCall?: boolean; refuse?: 'refused' | 'unavai
   apps.push(app)
   const capabilities = async (user: string) => (await app.inject({ url: '/api/v1/capabilities', headers: as(user) })).json()
   const call = (user: string, target: unknown) => app.inject({ method: 'POST', url: '/api/v1/calls', payload: { target } as object, headers: as(user) })
-  return { placed, capabilities, call }
+  return { placed, order, capabilities, call }
 }
 
 describe('click-to-call', () => {
   it('is offered to whoever has a line at the telephony server, and calling then rings their phone with the number', async () => {
-    const { placed, capabilities, call } = await setup()
+    const { placed, order, capabilities, call } = await setup()
     const bob = await capabilities('bdurand')
     expect(bob.clickToCall).toBe(true)
     expect(bob.calling.outbound).toBe(true)
@@ -64,6 +73,8 @@ describe('click-to-call', () => {
     expect(res.statusCode).toBe(202)
     expect(res.json()).toMatchObject({ direction: 'outbound', state: 'new', remoteNumber: '+33612345678' })
     expect(placed).toEqual([{ extension: '103', target: '+33612345678', domain: 'twake.local' }])
+    // The SIP server lets this transfer through only with the Gateway's grant, written before the line rings.
+    expect(order).toEqual(['grant 103 +33612345678', 'ring 103'])
   })
 
   it('is not offered to someone without a line, nor without a server that can, nor when the SIP server places calls itself', async () => {
@@ -75,6 +86,7 @@ describe('click-to-call', () => {
     expect(placed).toEqual([])
     expect((await (await setup({ clickToCall: false })).capabilities('bdurand')).clickToCall).toBeUndefined()
     expect((await (await setup({ outbound: true })).capabilities('bdurand')).clickToCall).toBeUndefined()
+    expect((await (await setup({ grants: false })).capabilities('bdurand')).clickToCall).toBeUndefined()
   })
 
   it('refuses what is not an extension or a number in E.164, and says when the server refused or cannot be reached', async () => {

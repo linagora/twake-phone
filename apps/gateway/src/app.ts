@@ -1788,7 +1788,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
       // calls with its own account. Undefined when that is not on for this person.
       const clickToCallFor = async (user: User, provider: TelephonyProvider) => {
         const server = options.supervision?.(user.tenantId)
-        if (!server?.clickToCall || !user.extension || !provider.sipDomain || !provider.listWazoLines) return undefined
+        if (!server?.clickToCall || !user.extension || !provider.sipDomain || !provider.listWazoLines || !provider.grantClickToCall) return undefined
         if (!(await provider.listWazoLines()).includes(user.extension)) return undefined
         return { server, extension: user.extension, domain: provider.sipDomain }
       }
@@ -1928,13 +1928,18 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
       v1.post<{ Body: { target: string } }>('/calls', async (req, reply) => {
         const { user, provider } = await who(req)
         if (!(await provider.getCapabilities()).calling?.outbound) {
-          const clickToCall = await clickToCallFor(user, provider)
+          const clickToCall = await clickToCallFor(user, provider).catch(err => {
+            req.log.warn({ err }, 'click-to-call not available')
+            throw Object.assign(new Error('The telephony server cannot be reached'), { statusCode: 503 })
+          })
           if (clickToCall) {
             // The number as the app dials it: an extension, or E.164. The SIP server applies the person's rights and caps
             // when their phone calls it, as for any call of theirs.
             const target = typeof req.body?.target === 'string' ? req.body.target : ''
-            if (!/^\+?[0-9]{2,20}$/.test(target)) throw Object.assign(new Error('target must be an extension or a number in E.164'), { statusCode: 400 })
+            if (!/^\+?[0-9]{2,20}$/.test(target)) throw Object.assign(new Error('target must be an extension or a phone number (digits, + first)'), { statusCode: 400 })
             try {
+              // The SIP server lets this one transfer through, and no other (ADR 0033): granted first, by the Gateway.
+              await provider.grantClickToCall!(clickToCall.extension, target)
               await clickToCall.server.clickToCall!({ extension: clickToCall.extension }, target, clickToCall.domain)
             } catch (err) {
               const code = (err as { code?: string }).code
