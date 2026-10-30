@@ -1,0 +1,19 @@
+@require 'settings/breakpoints.styl'
+
+// Disable vertical overscroll behavior (bouncing) because it is too aggressive when scrolling with the trackpad on MacOS
+:root
+    overscroll-behavior-y none
+    overflow-y hidden
+
+// We need !important to override default style added by cozy-ui.
+
+html
+    height 100% !important // @stylint ignore
+
+body
+    height 100% !important // @stylint ignore
+
+iframe
+    +medium-screen()
+        height calc(100% - 3rem)
+        padding-top 3rem

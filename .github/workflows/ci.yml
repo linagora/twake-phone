@@ -77,6 +77,38 @@ jobs:
           path: apps/web/dist/e2e-failure.png
           if-no-files-found: ignore
 
+  workplace:
+    name: App Twake Workplace (coquille, intent CALL)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: yarn
+          cache-dependency-path: |
+            yarn.lock
+            apps/workplace/yarn.lock
+      - run: yarn install --frozen-lockfile
+      # Les paquets et l'app web (le cadre de la coquille), puis l'app Cozy, qui a son propre lockfile (ADR 0032).
+      - run: yarn build
+      - run: yarn install --frozen-lockfile
+        working-directory: apps/workplace
+      - run: yarn build
+        working-directory: apps/workplace
+      - name: Chromium
+        run: npx playwright-core install --with-deps chromium
+      - name: e2e coquille (faux cozy-stack, app web encadrée, connexion en popup, intent CALL)
+        run: node apps/workplace/test/workplace.e2e.mjs
+      - name: Capture d'écran de l'e2e en cas d'échec
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-workplace-failure
+          path: apps/workplace/e2e-failure.png
+          if-no-files-found: ignore
+
   sip-e2e:
     name: SIP (OpenSIPS, rtpengine, ${{ matrix.browser }})
     runs-on: ubuntu-latest
