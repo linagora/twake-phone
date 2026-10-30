@@ -298,7 +298,7 @@ describe('clickToCall', () => {
     const { sup, ami } = await supervision((a, reply) => reply({ Response: 'Success', ActionID: a.ActionID!, Message: 'Originate successfully queued' }))
     await sup.clickToCall({ extension: '103' }, '+33612345678', 'twake.local')
     expect(ami.state.actions).toEqual([
-      expect.objectContaining({ Action: 'Originate', Async: 'true', Channel: 'PJSIP/103', Application: 'Transfer', Data: 'PJSIP/sip:+33612345678@twake.local', CallerID: '"Twake Phone" <+33612345678>', Timeout: '30000' })
+      expect.objectContaining({ Action: 'Originate', Async: 'true', Channel: 'PJSIP/103', Application: 'Transfer', Data: 'PJSIP/sip:+33612345678@twake.local', CallerID: '"Twake Phone" <+33612345678>', Timeout: '30000', Variable: 'TIMEOUT(absolute)=45' })
     ])
   })
 
