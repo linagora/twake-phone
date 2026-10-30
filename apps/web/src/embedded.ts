@@ -1,5 +1,7 @@
-import { useEffect } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
+import type { SoftCall } from '@twake/softphone'
+import { usePhone } from './softphone.js'
 
 /**
  * TwakePhone shown in the frame of its Twake Workplace app (`apps/workplace`, ADR 0032). The identity provider refuses
@@ -48,5 +50,91 @@ export const ParentDial = () => {
     window.addEventListener('message', onMessage)
     return () => window.removeEventListener('message', onMessage)
   }, [navigate])
+  return null
+}
+
+/** The origin of the parent page, as the Workplace app's bridge answers it (`requestParentOrigin`), or undefined. */
+export const parentOrigin = (timeoutMs: number) =>
+  new Promise<string | undefined>(resolve => {
+    const onMessage = (event: MessageEvent) => {
+      if (event.data !== 'answerParentOrigin' || event.source !== window.parent || !event.origin) return
+      done(event.origin)
+    }
+    const done = (origin?: string) => {
+      clearTimeout(timer)
+      window.removeEventListener('message', onMessage)
+      resolve(origin)
+    }
+    window.addEventListener('message', onMessage)
+    const timer = setTimeout(done, timeoutMs)
+    window.parent.postMessage('requestParentOrigin', '*')
+  })
+
+
+/**
+ * What the frame tells its parent of its calls, and what the parent may ask of one (ADR 0034): the Workplace app's
+ * widget shows a ringing or running call in the other apps and answers, declines or hangs up there. The frame stays
+ * the only phone; it takes these orders from its parent only, at the origin that answered `requestParentOrigin`.
+ */
+export const CALLS_MESSAGE = 'twakephone.calls'
+export const COMMAND_MESSAGE = 'twakephone.command'
+export type CallCommand = 'answer' | 'reject' | 'hangup'
+export interface CallSummary {
+  id: string
+  direction: 'inbound' | 'outbound'
+  state: 'new' | 'ringing' | 'connected' | 'held'
+  remoteNumber: string
+  remoteName?: string
+}
+
+/** The calls under way, as the parent sees them: no media, no SIP, nothing to act on but their id. */
+export const summaryOf = (calls: readonly SoftCall[]): CallSummary[] =>
+  calls.flatMap(c =>
+    c.state === 'ended'
+      ? []
+      : [{ id: c.id, direction: c.direction, state: c.state, remoteNumber: c.remoteNumber, ...(c.remoteName && c.remoteName.toLowerCase() !== 'anonymous' ? { remoteName: c.remoteName } : {}) }]
+  )
+
+const COMMANDS: readonly CallCommand[] = ['answer', 'reject', 'hangup']
+
+/** The order a message from the parent gives, or null (another sender or origin, another type, an unknown order). */
+export const commandOf = (event: Pick<MessageEvent, 'source' | 'origin' | 'data'>, parent: unknown, origin: string): { callId: string; action: CallCommand } | null => {
+  if (event.source !== parent || event.origin !== origin) return null
+  const data = event.data as { type?: unknown; callId?: unknown; action?: unknown } | null
+  if (data?.type !== COMMAND_MESSAGE || typeof data.callId !== 'string' || !COMMANDS.includes(data.action as CallCommand)) return null
+  return { callId: data.callId, action: data.action as CallCommand }
+}
+
+/** Tells the parent the calls as they change, and carries out its orders on them, when framed. */
+export const ParentCalls = () => {
+  const { calls } = usePhone()
+  const [origin, setOrigin] = useState<string>()
+  const current = useRef(calls)
+  useEffect(() => {
+    current.current = calls
+  }, [calls])
+  useEffect(() => {
+    if (!isFramed()) return
+    let cancelled = false
+    void parentOrigin(1_000).then(found => {
+      if (!cancelled && found) setOrigin(found)
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [])
+  useEffect(() => {
+    if (origin) window.parent.postMessage({ type: CALLS_MESSAGE, calls: summaryOf(calls) }, origin)
+  }, [origin, calls])
+  useEffect(() => {
+    if (!origin) return
+    const onMessage = (event: MessageEvent) => {
+      const order = commandOf(event, window.parent, origin)
+      const call = order && current.current.find(c => c.id === order.callId)
+      if (order && call) void call[order.action]().catch(() => undefined)
+    }
+    window.addEventListener('message', onMessage)
+    return () => window.removeEventListener('message', onMessage)
+  }, [origin])
   return null
 }

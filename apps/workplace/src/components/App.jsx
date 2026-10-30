@@ -4,6 +4,7 @@ import { useExternalBridge } from 'cozy-external-bridge-container'
 import flag from 'cozy-flags'
 import { useI18n } from 'twake-i18n'
 
+import { useCallsRelay } from '@/callsRelay'
 import { useDialRelay } from '@/dialRelay'
 
 /** What TwakePhone (apps/web, src/embedded.ts) reads from its parent: a number to put in its dialer, and its answer. */
@@ -40,6 +41,7 @@ const Phone = ({ url }) => {
     [url]
   )
   useDialRelay({ enabled: isReady, dial })
+  useCallsRelay({ enabled: isReady, frameOrigin: new URL(url).origin })
 
   // The bridge needs the iframe element before it is ready: it is there from the start, without a source.
   return (

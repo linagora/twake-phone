@@ -5,7 +5,12 @@ import { toDialTarget } from '@twake/telephony-client'
 
 import manifest from '../../../manifest.webapp'
 
+import '@/styles/widget.css'
+
 import { requestDial } from '@/dialRelay'
+import { serveWidget } from '@/widget'
+
+const WIDGET_TYPE = 'io.twake.phone.widget'
 
 /**
  * The CALL intent of @twake/phone-link (ADR 0032): validates the number, hands it to a Twake Phone window the person
@@ -20,6 +25,8 @@ const serve = async () => {
     appMetadata: { slug: manifest.slug, version: manifest.version }
   })
   const service = await new Intents({ client }).createService(new URLSearchParams(window.location.search).get('intent'), window)
+  // The widget of the other apps (ADR 0034): kept open, never terminated.
+  if (service.getIntent().attributes.type === WIDGET_TYPE) return serveWidget({ service, root: container, lang: data.locale })
   try {
     const { number } = service.getData() || {}
     const target = typeof number === 'string' && number.length <= 40 ? toDialTarget(number) : null

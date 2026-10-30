@@ -35,6 +35,13 @@
         "io.twake.phone.number"
       ],
       "href": "/intents"
+    },
+    {
+      "action": "OPEN",
+      "type": [
+        "io.twake.phone.widget"
+      ],
+      "href": "/intents"
     }
   ],
   "permissions": {
