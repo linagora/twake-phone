@@ -3844,9 +3844,11 @@ try {
         // Wazo transfers: Bob's window calls 102 itself, as Bob (the name Jean sees is his).
         await jeanC.page.getByTestId('incoming-call').getByText(/Bob Durand/).waitFor({ timeout: 20_000 })
         await jeanC.page.getByTestId('incoming-call').getByRole('button', { name: 'Répondre' }).click()
+        // Wazo hangs up its side once the transfer went through: Bob's window is left with its own call to Jean.
+        await until('the channel of Wazo ended', async () => (asteriskCli('core show channels concise').includes('PJSIP/103-') ? null : true), { timeout: 20_000 })
+        await until('one call left in Bob\'s window', async () => ((await calls(bob2.page)).length === 1 ? true : null), { timeout: 20_000 })
         await rtpBothWays(bob2)
         await rtpBothWays(jeanC)
-        await until('the channel of Wazo ended', async () => (asteriskCli('core show channels concise').includes('PJSIP/103-') ? null : true), { timeout: 20_000 })
         await bob2.page.getByRole('button', { name: 'Raccrocher' }).click()
         await until('no call left for Jean', async () => ((await calls(jeanC.page)).length === 0 ? true : null), { timeout: 20_000 })
         // Wazo's call to Bob's line (shown as from 102), then Bob's own call to Jean: never one Wazo made to 102.
