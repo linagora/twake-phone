@@ -1,5 +1,6 @@
 import { toDialTarget } from '@twake/telephony-client'
 
+import { callToShow, isIncoming } from '@/callToShow'
 import { DIAL_CHANNEL, requestDial } from '@/dialRelay'
 
 /** What @twake/phone-widget posts to its frame for a number (a MessagePort for the answer). */
@@ -11,13 +12,6 @@ const SILENT_MS = 25_000
 const TEXT = {
   fr: { region: 'Twake Phone', incoming: 'Appel entrant', new: 'Appel en cours…', connected: 'En communication', held: 'En attente', answer: 'Répondre', reject: 'Refuser', hangup: 'Raccrocher' },
   en: { region: 'Twake Phone', incoming: 'Incoming call', new: 'Calling…', connected: 'In a call', held: 'On hold', answer: 'Answer', reject: 'Decline', hangup: 'Hang up' }
-}
-
-/** The call to show: one that rings first, else one under way; with the window that has it. */
-export const callToShow = windows => {
-  const all = [...windows.entries()].flatMap(([window, calls]) => calls.map(call => ({ ...call, window })))
-  // ponytail: one card; a second call ringing at once waits for the first to be answered or declined.
-  return all.find(c => c.direction === 'inbound' && c.state === 'ringing') ?? all.find(c => c.state === 'connected' || c.state === 'held' || c.state === 'new') ?? null
 }
 
 /**
@@ -49,25 +43,30 @@ export const serveWidget = ({ service, root, lang }) => {
     const key = call && `${call.window}/${call.id}/${call.state}/${call.remoteNumber}/${call.remoteName ?? ''}`
     if (key === shown) return
     shown = key
+    // The card is rebuilt: the keyboard of someone using it (Answer pressed) stays in it.
+    const hadFocus = root.contains(document.activeElement)
     root.replaceChildren()
     if (!call) return service.resizeClient({ width: 0, height: 0 })
     const card = document.createElement('div')
     card.className = 'tpw-card'
     // Announced, never focused: the person is working in the host app, a ring must not take their keyboard.
-    if (call.state === 'ringing') card.setAttribute('role', 'alert')
+    const incoming = isIncoming(call)
+    if (incoming) card.setAttribute('role', 'alert')
     const who = document.createElement('div')
     who.className = 'tpw-who'
     const name = document.createElement('strong')
     name.textContent = call.remoteName ? `${call.remoteName} (${call.remoteNumber})` : call.remoteNumber
     const state = document.createElement('span')
-    state.textContent = call.state === 'ringing' ? text.incoming : text[call.state]
+    // An outbound call that rings at the other end is still "calling".
+    state.textContent = incoming ? text.incoming : call.state === 'ringing' ? text.new : text[call.state]
     who.append(name, state)
     const actions = document.createElement('div')
     actions.className = 'tpw-actions'
-    if (call.state === 'ringing') actions.append(button(text.reject, 'tpw-danger', 'reject', call), button(text.answer, 'tpw-accept', 'answer', call))
+    if (incoming) actions.append(button(text.reject, 'tpw-danger', 'reject', call), button(text.answer, 'tpw-accept', 'answer', call))
     else actions.append(button(text.hangup, 'tpw-danger', 'hangup', call))
     card.append(who, actions)
     root.append(card)
+    if (hadFocus) actions.querySelector('button')?.focus()
     service.resizeClient({ width: WIDTH, height: Math.ceil(card.getBoundingClientRect().height) + 16 })
   }
 
@@ -75,14 +74,15 @@ export const serveWidget = ({ service, root, lang }) => {
     if (data?.type !== 'calls' || typeof data.window !== 'string' || !Array.isArray(data.calls)) return
     if (data.calls.length) {
       windows.set(data.window, data.calls)
-      heard.set(data.window, Date.now())
+      // When its frame last said them (a window answering calls-request says old calls again: they stay old).
+      heard.set(data.window, typeof data.at === 'number' ? data.at : Date.now())
     } else {
       windows.delete(data.window)
       heard.delete(data.window)
     }
     render()
   }
-  // The windows with calls say them again every 10 s (callsRelay): one silent for longer is gone.
+  // The frames with calls say them again every 10 s (ParentCalls): a window silent for longer is gone (its frame too).
   setInterval(() => {
     for (const [w, at] of heard) if (Date.now() - at > SILENT_MS) {
       windows.delete(w)
