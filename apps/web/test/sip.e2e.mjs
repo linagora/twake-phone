@@ -3487,27 +3487,33 @@ try {
   const stopTrace = () => {
     try {
       asteriskCli(`logger remove channel ${TRACE}`)
-      asteriskCli('pjsip set history off')
       inAsterisk('rm', '-f', `/var/log/asterisk/${TRACE}`)
     } catch {
       // Not there: nothing to stop.
     }
   }
   // Now and then Asterisk leaves a request of OpenSIPS unanswered in the steps 11a (a BYE, OpenSIPS answers 408 for it):
-  // what it did with it, kept in its history of SIP messages (on with the trace) and its queues of work.
-  const asteriskStalled = what => {
+  // what it did with it, kept in its history of SIP messages (on from the first of them to the end) and its queues of
+  // work; and what OpenSIPS said of that call.
+  const asteriskStalled = (what, callId) => {
     for (const command of ['pjsip show history', 'core show taskprocessors', 'core show channels concise']) {
       try {
-        console.log(`[${what}] ${command}:\n${asteriskCli(command).trim().split('\n').slice(-80).join('\n')}`)
+        console.log(`[${what}] ${command}:\n${asteriskCli(command).trim().split('\n').slice(-150).join('\n')}`)
       } catch (err) {
         console.log(`[${what}] ${command}: ${err.message}`)
       }
+    }
+    try {
+      const said = execFileSync('docker', ['compose', '-f', COMPOSE_FILE, 'logs', '--no-color', '--no-log-prefix', '--tail', '3000', 'opensips'], { encoding: 'utf8', timeout: 30_000, maxBuffer: 64 << 20 })
+      console.log(`[${what}] OpenSIPS on ${callId}:\n${said.split('\n').filter(l => l.includes(callId)).join('\n')}`)
+    } catch (err) {
+      console.log(`[${what}] OpenSIPS: ${err.message}`)
     }
   }
   /** The operator hangs up `placed`: Wazo answers 200, else what Asterisk shows of it is printed first. */
   const byeAnswered = async (placed, what = 'answer to the operator BYE') => {
     const answer = await placed.hangup()
-    if (answer.status !== 200) asteriskStalled(what)
+    if (answer.status !== 200) asteriskStalled(what, placed.callId)
     expectEqual(answer.status, 200, what)
   }
   /** docker/wazo/check-loopback.py, now (with the sockets a call opened); root reads them. */
