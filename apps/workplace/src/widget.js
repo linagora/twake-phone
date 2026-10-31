@@ -34,6 +34,7 @@ export const serveWidget = ({ service, root, lang }) => {
     b.type = 'button'
     b.className = `tpw-btn ${tone}`
     b.textContent = label
+    b.dataset.action = action
     b.addEventListener('click', () => channel.postMessage({ type: 'command', window: call.window, callId: call.id, action }))
     return b
   }
@@ -43,8 +44,8 @@ export const serveWidget = ({ service, root, lang }) => {
     const key = call && `${call.window}/${call.id}/${call.state}/${call.remoteNumber}/${call.remoteName ?? ''}`
     if (key === shown) return
     shown = key
-    // The card is rebuilt: the keyboard of someone using it (Answer pressed) stays in it.
-    const hadFocus = root.contains(document.activeElement)
+    // The card is rebuilt: the keyboard of someone using it stays on the same action (never moved from Answer to Decline).
+    const focused = root.contains(document.activeElement) ? (document.activeElement?.dataset.action ?? '') : null
     root.replaceChildren()
     if (!call) return service.resizeClient({ width: 0, height: 0 })
     const card = document.createElement('div')
@@ -66,7 +67,7 @@ export const serveWidget = ({ service, root, lang }) => {
     else actions.append(button(text.hangup, 'tpw-danger', 'hangup', call))
     card.append(who, actions)
     root.append(card)
-    if (hadFocus) actions.querySelector('button')?.focus()
+    if (focused !== null) (actions.querySelector(`[data-action="${focused}"]`) ?? actions.querySelector('button'))?.focus()
     service.resizeClient({ width: WIDTH, height: Math.ceil(card.getBoundingClientRect().height) + 16 })
   }
 
