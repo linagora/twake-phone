@@ -1796,7 +1796,12 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
       v1.get('/capabilities', async req => {
         const { user, provider } = await who(req)
         const own = await provider.getCapabilities()
-        const clickToCall = !own.calling?.outbound && !!(await clickToCallFor(user, provider).catch(() => undefined))
+        const clickToCall =
+          !own.calling?.outbound &&
+          !!(await clickToCallFor(user, provider).catch(err => {
+            req.log.warn({ err }, 'click-to-call not available')
+            return undefined
+          }))
         const caps = clickToCall ? { ...own, calling: { ...own.calling, outbound: true }, clickToCall: true } : own
         const identity = await auth.authenticate(req)
         const supervising = !!options.supervision?.(user.tenantId) && isSupervisor(identity, supervisorPolicy, isAdmin(identity, admin))
@@ -1937,16 +1942,19 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
             // when their phone calls it, as for any call of theirs.
             const target = typeof req.body?.target === 'string' ? req.body.target : ''
             if (!/^\+?[0-9]{2,20}$/.test(target)) throw Object.assign(new Error('target must be an extension or a phone number (digits, + first)'), { statusCode: 400 })
+            // The SIP server lets this call through at the person's name on this grant only (ADR 0033). The answer waits for
+            // the line to answer (30 s at most): unanswered or offline, the grant is withdrawn and the person told.
+            let grant: Awaited<ReturnType<NonNullable<TelephonyProvider['grantClickToCall']>>> | undefined
             try {
-              // The SIP server lets this call through at the person's name on this grant only (ADR 0033).
-              const grant = await provider.grantClickToCall!(clickToCall.extension, target)
-              await clickToCall.server.clickToCall!({ extension: clickToCall.extension }, target, grant)
+              grant = await provider.grantClickToCall!(clickToCall.extension, target)
+              await clickToCall.server.clickToCall!({ extension: clickToCall.extension }, target, grant.token)
             } catch (err) {
+              await grant?.revoke().catch((e: unknown) => req.log.warn({ err: e }, 'the grant of a click-to-call not withdrawn'))
               const code = (err as { code?: string }).code
               const status = (err as { statusCode?: number }).statusCode
               req.log.warn({ err }, 'click-to-call not placed')
               if (status === 400 || status === 501) throw err
-              throw Object.assign(new Error(code === 'refused' ? 'The telephony server refused to call your phone' : 'The telephony server cannot be reached'), { statusCode: code === 'refused' ? 409 : 503 })
+              throw Object.assign(new Error(code === 'refused' ? 'Your phone did not answer, or the telephony server refused to call it' : 'The telephony server cannot be reached'), { statusCode: code === 'refused' ? 409 : 503 })
             }
             // Not a call of this Gateway (it has no channel of it): its id names nothing to act on, the phone has the call.
             return reply.code(202).send({ id: `click-to-call-${randomBytes(8).toString('hex')}`, direction: 'outbound', state: 'new', remoteNumber: target, startedAt: new Date().toISOString() })

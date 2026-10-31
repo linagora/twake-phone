@@ -483,11 +483,12 @@ export class OpensipsProvider implements TelephonyProvider, MediaProvider {
    * in the place of a call of `number` (`replaces`), or to the window of `extension` that waits for `join` (step 8b),
    * a call of the conference `room`. `taken`: the call that took it, as OpenSIPS wrote it (review 8b, n°3).
    */
-  /** Click-to-call (ADR 0033): Wazo may call `number` at the name of `extension` once, within a minute. Returns the grant's token. */
-  async grantClickToCall(extension: string, number: string): Promise<string> {
+  /** Click-to-call (ADR 0033): Wazo may call `number` at the name of `extension` once, within 40 s. */
+  async grantClickToCall(extension: string, number: string) {
     const grants = this.config.dialOutGrants
     if (!grants) throw Object.assign(new Error('The SIP server cannot let a click-to-call through'), { statusCode: 501 })
-    return grants.grantClickToCall(extension, number)
+    const token = await grants.grantClickToCall(extension, number)
+    return { token, revoke: () => grants.revoke(token) }
   }
 
   async grantRoomCall(grant: RoomCallGrant): Promise<RoomCallGrantToken> {

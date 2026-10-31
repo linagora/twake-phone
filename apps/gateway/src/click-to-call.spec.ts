@@ -34,7 +34,7 @@ const setup = async (opts: { clickToCall?: boolean; refuse?: 'refused' | 'unavai
           : {
               grantClickToCall: async (extension: string, number: string) => {
                 order.push(`grant ${extension} ${number}`)
-                return 'f'.repeat(32)
+                return { token: 'f'.repeat(32), revoke: async () => void order.push('revoke') }
               }
             }),
         originate: async () => {
@@ -93,7 +93,10 @@ describe('click-to-call', () => {
     const { placed, call } = await setup()
     for (const target of ['', 'sip:102@evil', '102,Hangup', '+3361234567890123456789', 102, null]) expect((await call('bdurand', target)).statusCode, String(target)).toBe(400)
     expect(placed).toEqual([])
-    expect((await (await setup({ refuse: 'refused' })).call('bdurand', '102')).statusCode).toBe(409)
+    const refused = await setup({ refuse: 'refused' })
+    expect((await refused.call('bdurand', '102')).statusCode).toBe(409)
+    // The line did not answer: its grant is withdrawn, nothing else can take it.
+    expect(refused.order).toEqual(['grant 103 102', 'revoke'])
     expect((await (await setup({ refuse: 'unavailable' })).call('bdurand', '102')).statusCode).toBe(503)
   })
 })
