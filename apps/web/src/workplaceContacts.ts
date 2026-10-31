@@ -1,7 +1,7 @@
 import * as Comlink from 'comlink'
 import { useEffect, useState } from 'react'
 import { toDialTarget, type Contact, type ContactNumber } from '@twake/telephony-client'
-import { isFramed } from './embedded.js'
+import { isFramed, parentOrigin } from './embedded.js'
 
 /**
  * The person's own contacts in Twake Workplace (`io.cozy.contacts`), when TwakePhone is framed by its Workplace app
@@ -58,23 +58,6 @@ const indexOf = (contacts: readonly Contact[]) => {
   indexes.set(contacts, index)
   return index
 }
-
-/** The origin of the parent page, as the Workplace app's bridge answers it (`requestParentOrigin`), or undefined. */
-const parentOrigin = (timeoutMs: number) =>
-  new Promise<string | undefined>(resolve => {
-    const onMessage = (event: MessageEvent) => {
-      if (event.data !== 'answerParentOrigin' || event.source !== window.parent || !event.origin) return
-      done(event.origin)
-    }
-    const done = (origin?: string) => {
-      clearTimeout(timer)
-      window.removeEventListener('message', onMessage)
-      resolve(origin)
-    }
-    window.addEventListener('message', onMessage)
-    const timer = setTimeout(done, timeoutMs)
-    window.parent.postMessage('requestParentOrigin', '*')
-  })
 
 /**
  * The bridge's channel to the parent: comlink's window endpoint, but hearing only the parent, from its origin (the

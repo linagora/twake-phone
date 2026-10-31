@@ -1,0 +1,10 @@
+body { margin: 0; background: transparent; font-family: Inter, system-ui, sans-serif; }
+.tpw-card { margin: 8px; padding: 12px 16px; border-radius: 16px; background: #fff; color: #1c1b1f; box-shadow: 0 4px 16px rgb(0 0 0 / 20%); display: flex; align-items: center; gap: 12px; }
+.tpw-who { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+.tpw-who strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tpw-who span { font-size: 0.85em; color: #5f6368; }
+.tpw-actions { display: flex; gap: 8px; }
+.tpw-btn { border: 0; border-radius: 999px; padding: 8px 14px; font: inherit; color: #fff; cursor: pointer; }
+.tpw-btn:focus-visible { outline: 3px solid #1a73e8; outline-offset: 2px; }
+.tpw-danger { background: #c5221f; }
+.tpw-accept { background: #188038; }
