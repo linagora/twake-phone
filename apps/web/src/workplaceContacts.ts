@@ -5,7 +5,7 @@ import { isFramed } from './embedded.js'
 
 /**
  * The person's own contacts in Twake Workplace (`io.cozy.contacts`), when TwakePhone is framed by its Workplace app
- * (ADR 0032): the app hands them over its bridge (`cozy-external-bridge-container`, `getContacts`). They name the
+ * (ADR 0032): read through the app's bridge (`cozy-external-bridge-container`, `fetchJSON`, all pages). They name the
  * numbers the organisation's directory does not know. The Gateway never sees them: they stay in this page.
  */
 
@@ -41,8 +41,22 @@ export const toContact = (c: WorkplaceContact): Contact | null => {
 export const workplaceContactOf = (contacts: readonly Contact[], number: string): Contact | null => {
   const key = toDialTarget(number)
   if (!key?.startsWith('+')) return null
-  const owners = contacts.filter(c => c.numbers.some(n => toDialTarget(n.number) === key))
-  return owners.length === 1 ? owners[0]! : null
+  return indexOf(contacts).get(key) ?? null
+}
+
+/** Each full number to its one contact (null: several share it), built once per list: a render reads it, never scans. */
+const indexes = new WeakMap<readonly Contact[], Map<string, Contact | null>>()
+const indexOf = (contacts: readonly Contact[]) => {
+  let index = indexes.get(contacts)
+  if (index) return index
+  index = new Map()
+  for (const c of contacts)
+    for (const key of new Set(c.numbers.map(n => toDialTarget(n.number)))) {
+      if (!key?.startsWith('+')) continue
+      index.set(key, index.has(key) && index.get(key) !== c ? null : c)
+    }
+  indexes.set(contacts, index)
+  return index
 }
 
 /** The origin of the parent page, as the Workplace app's bridge answers it (`requestParentOrigin`), or undefined. */
@@ -88,14 +102,38 @@ const parentEndpoint = (origin: string): Comlink.Endpoint => {
   }
 }
 
+/** What cozy-stack answers for a page of a doctype's documents (`_normal_docs`). */
+interface DocsPage {
+  rows?: WorkplaceContact[]
+  bookmark?: string
+}
+const PAGE = 1_000
+// ponytail: 20 pages (20 000 contacts) at most; a bigger address book would want a search by number instead.
+const MAX_PAGES = 20
+
+/** All the contacts, page by page (the bridge's getContacts reads the first 100 only). */
+export const allContacts = async (bridge: { fetchJSON(r: { method: string; path: string }): Promise<DocsPage> }) => {
+  const all: WorkplaceContact[] = []
+  let bookmark: string | undefined
+  for (let page = 0; page < MAX_PAGES; page++) {
+    const res = await bridge.fetchJSON({ method: 'GET', path: `/data/io.cozy.contacts/_normal_docs?limit=${PAGE}${bookmark ? `&bookmark=${encodeURIComponent(bookmark)}` : ''}` })
+    const rows = Array.isArray(res?.rows) ? res.rows : []
+    all.push(...rows)
+    if (rows.length < PAGE || !res.bookmark) break
+    bookmark = res.bookmark
+  }
+  return all
+}
+
+/** The contacts; [] for a parent that is no Workplace app (it never answers), null for one that failed this time. */
 const ask = async (timeoutMs: number): Promise<Contact[] | null> => {
   const origin = await parentOrigin(1_000)
-  if (!origin) return null
-  const bridge = Comlink.wrap<{ getContacts(): Promise<WorkplaceContact[]> }>(parentEndpoint(origin))
+  if (!origin) return []
+  const bridge = Comlink.wrap<{ fetchJSON(r: { method: string; path: string }): Promise<DocsPage> }>(parentEndpoint(origin))
   let timer: ReturnType<typeof setTimeout> | undefined
   try {
     const late = new Promise<null>(resolve => (timer = setTimeout(() => resolve(null), timeoutMs)))
-    const list = await Promise.race([bridge.getContacts(), late]).catch(() => null)
+    const list = await Promise.race([allContacts(bridge), late]).catch(() => null)
     return Array.isArray(list) ? list.flatMap(c => toContact(c) ?? []) : null
   } finally {
     clearTimeout(timer)
@@ -106,10 +144,11 @@ const ask = async (timeoutMs: number): Promise<Contact[] | null> => {
 let loaded: Promise<Contact[]> | null = null
 
 /**
- * The person's Workplace contacts, asked once per page; none outside a frame. A parent that did not answer in time is
- * asked again by the next screen that needs them (an empty list meanwhile: the directory still names who it knows).
+ * The person's Workplace contacts, asked once per page; none outside a frame, nor in a frame that is no Workplace app.
+ * A Workplace app that did not answer in time is asked again by the next screen that needs them (an empty list
+ * meanwhile: the directory still names who it knows).
  */
-export const workplaceContacts = (timeoutMs = 3_000): Promise<Contact[]> => {
+export const workplaceContacts = (timeoutMs = 5_000): Promise<Contact[]> => {
   if (!isFramed()) return Promise.resolve([])
   loaded ??= ask(timeoutMs).then(list => {
     if (!list) loaded = null

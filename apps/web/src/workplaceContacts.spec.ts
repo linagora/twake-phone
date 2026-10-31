@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { isWorkplaceContact, nameOf, toContact, workplaceContactOf } from './workplaceContacts.js'
+import { allContacts, isWorkplaceContact, nameOf, toContact, workplaceContactOf } from './workplaceContacts.js'
 
 describe('Workplace contacts', () => {
   const camille = toContact({ _id: 'c1', displayName: 'Camille Martin', company: 'Acme', phone: [{ number: '06 12 34 56 78', type: 'cell' }, { number: '01 23 45 67 89' }], email: [{ address: 'c@acme.test', primary: true }] })!
@@ -17,6 +17,22 @@ describe('Workplace contacts', () => {
     expect(workplaceContactOf([camille], '0699999999')).toBeNull()
     const twin = toContact({ _id: 'c2', displayName: 'Standard', phone: [{ number: '+33612345678' }] })!
     expect(workplaceContactOf([camille, twin], '0612345678')).toBeNull()
+    // One contact with the same number twice is still that contact.
+    const twice = toContact({ _id: 'c4', displayName: 'Deux Fois', phone: [{ number: '+33698765432' }, { number: '06 98 76 54 32' }] })!
+    expect(workplaceContactOf([twice], '0698765432')).toBe(twice)
+  })
+
+  it('reads every page of the address book, not the first 100 the bridge would give', async () => {
+    const asked: string[] = []
+    const page = (n: number, from: number) => Array.from({ length: n }, (_, i) => ({ _id: `c${from + i}` }))
+    const bridge = {
+      fetchJSON: async ({ path }: { method: string; path: string }) => {
+        asked.push(path)
+        return path.includes('bookmark=') ? { rows: page(5, 1000) } : { rows: page(1000, 0), bookmark: 'b 1' }
+      }
+    }
+    expect(await allContacts(bridge)).toHaveLength(1005)
+    expect(asked).toEqual(['/data/io.cozy.contacts/_normal_docs?limit=1000', '/data/io.cozy.contacts/_normal_docs?limit=1000&bookmark=b%201'])
   })
 
   it('never names an extension, even from a contact saved with a short number', () => {
