@@ -13,7 +13,7 @@ afterEach(async () => {
   for (const a of apps.splice(0)) await a.close()
 })
 
-const setup = async (opts: { clickToCall?: boolean; refuse?: 'refused' | 'unavailable'; outbound?: boolean; grants?: boolean } = {}) => {
+const setup = async (opts: { clickToCall?: boolean; refuse?: 'refused' | 'unavailable'; outbound?: boolean; grants?: boolean; slow?: Promise<void> } = {}) => {
   process.env.AUTH_MODE = 'dev'
   const store = new MemoryStore()
   await store.upsertMapping({ tenantId: 'dev', userId: 'bdurand', extension: '103', displayName: 'Bob Durand' })
@@ -51,6 +51,7 @@ const setup = async (opts: { clickToCall?: boolean; refuse?: 'refused' | 'unavai
       : {
           async clickToCall(line: { extension: string }, target: string, grant: string) {
             if (opts.refuse) throw new SupervisionError('no', opts.refuse)
+            if (opts.slow) await opts.slow
             placed.push({ extension: line.extension, target, grant })
             order.push(`ring ${line.extension}`)
           }
@@ -64,6 +65,17 @@ const setup = async (opts: { clickToCall?: boolean; refuse?: 'refused' | 'unavai
 }
 
 describe('click-to-call', () => {
+  it('rings a line once at a time: a second click-to-call while it rings is refused', async () => {
+    let answer!: () => void
+    const { call } = await setup({ slow: new Promise<void>(resolve => (answer = resolve)) })
+    const first = call('bdurand', '102')
+    await new Promise(resolve => setTimeout(resolve, 20))
+    expect((await call('bdurand', '104')).statusCode).toBe(409)
+    answer()
+    expect((await first).statusCode).toBe(202)
+    expect((await call('bdurand', '104')).statusCode).toBe(202)
+  })
+
   it('is offered to whoever has a line at the telephony server, and calling then rings their phone with the number', async () => {
     const { placed, order, capabilities, call } = await setup()
     const bob = await capabilities('bdurand')

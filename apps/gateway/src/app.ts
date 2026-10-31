@@ -1786,6 +1786,9 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
       // Click-to-call (ADR 0033): the SIP server cannot place a call itself; the voicemail and telephony server rings the
       // person's line (an extension with a line there), then calls the number at their name through the SIP server, on a
       // grant of the Gateway (their rights and caps apply). Undefined when that is not on for this person.
+      // The lines ringing for a click-to-call now (tenant/extension): one at a time per line, whatever the tab or screen.
+      // ponytail: per Gateway process; several Gateways would want it in PostgreSQL (a grant of that line not yet taken).
+      const clickToCallRinging = new Set<string>()
       const clickToCallFor = async (user: User, provider: TelephonyProvider) => {
         const server = options.supervision?.(user.tenantId)
         if (!server?.clickToCall || !user.extension || !provider.listWazoLines || !provider.grantClickToCall) return undefined
@@ -1944,6 +1947,9 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
             if (!/^\+?[0-9]{2,20}$/.test(target)) throw Object.assign(new Error('target must be an extension or a phone number (digits, + first)'), { statusCode: 400 })
             // The SIP server lets this call through at the person's name on this grant only (ADR 0033). The answer waits for
             // the line to answer (30 s at most): unanswered or offline, the grant is withdrawn and the person told.
+            const line = `${user.tenantId}/${clickToCall.extension}`
+            if (clickToCallRinging.has(line)) throw Object.assign(new Error('Your phone is already ringing for a call'), { statusCode: 409 })
+            clickToCallRinging.add(line)
             let grant: Awaited<ReturnType<NonNullable<TelephonyProvider['grantClickToCall']>>> | undefined
             try {
               grant = await provider.grantClickToCall!(clickToCall.extension, target)
@@ -1955,6 +1961,8 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
               req.log.warn({ err }, 'click-to-call not placed')
               if (status === 400 || status === 501) throw err
               throw Object.assign(new Error(code === 'refused' ? 'Your phone did not answer, or the telephony server refused to call it' : 'The telephony server cannot be reached'), { statusCode: code === 'refused' ? 409 : 503 })
+            } finally {
+              clickToCallRinging.delete(line)
             }
             // Not a call of this Gateway (it has no channel of it): its id names nothing to act on, the phone has the call.
             return reply.code(202).send({ id: `click-to-call-${randomBytes(8).toString('hex')}`, direction: 'outbound', state: 'new', remoteNumber: target, startedAt: new Date().toISOString() })
