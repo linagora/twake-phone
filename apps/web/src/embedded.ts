@@ -88,15 +88,18 @@ export interface CallSummary {
 }
 
 /**
- * The calls under way, as the parent sees them: no media, no SIP, nothing to act on but their id. The calls the phone
- * makes for itself (the one that replaces another in a transfer, the room of a conference) never ring there either.
+ * The calls under way, as the parent sees them: no media, no SIP, nothing to act on but their id. As the call panel
+ * shows them: a call that takes the place of one of ours (a transfer, the conference we make) never rings, and the one
+ * it replaces is no longer shown.
  */
-export const summaryOf = (calls: readonly SoftCall[]): CallSummary[] =>
-  calls.flatMap(c =>
-    c.state === 'ended' || c.replacedCallId || c.conferenceOf
+export const summaryOf = (calls: readonly SoftCall[]): CallSummary[] => {
+  const moved = new Set(calls.flatMap(c => (c.conferenceOf ? [c.conferenceOf] : c.room === 'conference' && c.replacedCallId ? [c.replacedCallId] : [])))
+  return calls.flatMap(c =>
+    c.state === 'ended' || moved.has(c.id) || ((c.replacedCallId || c.conferenceOf) && c.state === 'ringing')
       ? []
       : [{ id: c.id, direction: c.direction, state: c.state, remoteNumber: c.remoteNumber, ...(c.remoteName && c.remoteName.toLowerCase() !== 'anonymous' ? { remoteName: c.remoteName } : {}) }]
   )
+}
 
 const COMMANDS: readonly CallCommand[] = ['answer', 'reject', 'hangup']
 

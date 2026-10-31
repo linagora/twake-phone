@@ -34,10 +34,15 @@ describe('the calls the frame tells its parent (ADR 0034)', () => {
   const call = (c: Partial<SoftCall>) => ({ id: 'c1', direction: 'inbound', state: 'ringing', remoteNumber: '+33612345678', remoteName: '', ...c }) as SoftCall
 
   it('says the calls under way, by id, number and name, and nothing of an ended one or a hidden name', () => {
-    expect(summaryOf([call({ remoteName: 'Camille' }), call({ id: 'c2', state: 'ended' }), call({ id: 'c3', direction: 'outbound', state: 'connected', remoteName: 'anonymous' }), call({ id: 'c4', replacedCallId: 'c3' }), call({ id: 'c5', conferenceOf: 'c3' })])).toEqual([
+    expect(summaryOf([call({ remoteName: 'Camille' }), call({ id: 'c2', state: 'ended' }), call({ id: 'c3', direction: 'outbound', state: 'connected', remoteName: 'anonymous' }), call({ id: 'c4', replacedCallId: 'c9' }), call({ id: 'c5', conferenceOf: 'c9' })])).toEqual([
       { id: 'c1', direction: 'inbound', state: 'ringing', remoteNumber: '+33612345678', remoteName: 'Camille' },
       { id: 'c3', direction: 'outbound', state: 'connected', remoteNumber: '+33612345678' }
     ])
+  })
+
+  it('shows the call that took the place of one of ours, not the one it replaced, as the call panel does', () => {
+    const conference = call({ id: 'c6', direction: 'outbound', state: 'connected', conferenceOf: 'c3' })
+    expect(summaryOf([call({ id: 'c3', state: 'connected' }), conference]).map(c => c.id)).toEqual(['c6'])
   })
 
   it('takes an order from the parent, at its origin, among answer, reject and hangup only', () => {
