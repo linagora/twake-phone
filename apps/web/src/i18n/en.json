@@ -19,7 +19,7 @@
   "dialer.unavailable": "Calling is not available on this platform yet.",
   "dialer.placing": "Calling {number}…",
   "dialer.failed": "The call could not be placed: {reason}",
-  "dialer.placed": "Call to {number} placed. The ringing phone is yours: pick it up.",
+  "dialer.placed": "Call to {number} placed on your phone.",
   "dialer.capabilitiesFailed": "The telephony gateway could not be reached: {reason}",
   "recents.title": "Recents",
   "recents.empty": "No calls yet.",
@@ -1103,5 +1103,6 @@
   "actions.openCard": "{name}'s card",
   "actions.copyNumberWhen": "Copy {number} ({when})",
   "actions.callNumberWhen": "Call {number} ({when})",
+  "dialer.ringPhone": "Your phone is about to ring: pick it up to call {number}…",
   "dialer.callOnPhone": "Call from my phone"
 }
