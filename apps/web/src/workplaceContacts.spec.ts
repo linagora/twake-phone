@@ -35,6 +35,12 @@ describe('Workplace contacts', () => {
     expect(asked).toEqual(['/data/io.cozy.contacts/_normal_docs?limit=1000', '/data/io.cozy.contacts/_normal_docs?limit=1000&bookmark=b%201'])
   })
 
+  it('reads an address book with no contact yet as empty (404), and fails on a page that does not come', async () => {
+    expect(await allContacts({ fetchJSON: () => Promise.reject(new Error('{"errors":[{"status":"404"}]}')) })).toEqual([])
+    await expect(allContacts({ fetchJSON: () => new Promise<never>(() => undefined) }, 20)).rejects.toThrow('late')
+    await expect(allContacts({ fetchJSON: () => Promise.reject(new Error('Internal Server Error')) })).rejects.toThrow()
+  })
+
   it('never names an extension, even from a contact saved with a short number', () => {
     const desk = toContact({ _id: 'c3', displayName: 'Bureau', phone: [{ number: '102' }] })!
     expect(workplaceContactOf([desk], '102')).toBeNull()
