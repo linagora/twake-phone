@@ -3487,10 +3487,28 @@ try {
   const stopTrace = () => {
     try {
       asteriskCli(`logger remove channel ${TRACE}`)
+      asteriskCli('pjsip set history off')
       inAsterisk('rm', '-f', `/var/log/asterisk/${TRACE}`)
     } catch {
       // Not there: nothing to stop.
     }
+  }
+  // Now and then Asterisk leaves a request of OpenSIPS unanswered in the steps 11a (a BYE, OpenSIPS answers 408 for it):
+  // what it did with it, kept in its history of SIP messages (on with the trace) and its queues of work.
+  const asteriskStalled = what => {
+    for (const command of ['pjsip show history', 'core show taskprocessors', 'core show channels concise']) {
+      try {
+        console.log(`[${what}] ${command}:\n${asteriskCli(command).trim().split('\n').slice(-80).join('\n')}`)
+      } catch (err) {
+        console.log(`[${what}] ${command}: ${err.message}`)
+      }
+    }
+  }
+  /** The operator hangs up `placed`: Wazo answers 200, else what Asterisk shows of it is printed first. */
+  const byeAnswered = async (placed, what = 'answer to the operator BYE') => {
+    const answer = await placed.hangup()
+    if (answer.status !== 200) asteriskStalled(what)
+    expectEqual(answer.status, 200, what)
   }
   /** docker/wazo/check-loopback.py, now (with the sockets a call opened); root reads them. */
   const checkLoopback = () => {
@@ -4134,6 +4152,7 @@ try {
     if (!expected['_[0-9]!']?.includes('Set(TWAKE_SPOOL=/var/spool/asterisk/voicemail/${CUT(TWAKE_MAILBOX,@,2)}/${CUT(TWAKE_MAILBOX,@,1)})')) throw new Error("the greeting a person recorded is not read at their mailbox's number")
     stopTrace()
     asteriskCli(`logger add channel ${TRACE} verbose(3)`)
+    asteriskCli('pjsip set history on')
   })
   await step('step 11a, the demo: Jean does not want to be disturbed and looks at his Messagerie vocale; Bob calls 102: Jean\'s mailbox answers, Bob\'s panel says so, Bob speaks and hangs up; the message arrives in Jean\'s Messagerie vocale as he looks at it, new, from Bob, told with its time and the unread count; Bob\'s Récents say « Messagerie vocale », Jean\'s a missed call', async () => {
     await setStatus(jean, 'Ne pas déranger')
@@ -4400,7 +4419,7 @@ try {
       // Wazo still listens on the loopback only, with the media of this call open.
       console.log(checkLoopback().trim().replace(/^/gm, '     '))
       await sleep(Math.max(0, answeredAt + greetingMs() + 4_000 - Date.now()))
-      expectEqual((await placed.hangup()).status, 200, 'answer to the operator BYE')
+      await byeAnswered(placed)
     } finally {
       expectEqual((await api('PUT', '/admin/outbound', { policy: { fraud: FRAUD } })).statusCode, 200, 'PUT /admin/outbound (no cap)')
       await setStatus(jean, 'Disponible')
@@ -4451,7 +4470,7 @@ try {
       await sleep(Math.max(0, answeredAt + greetingMs() + 500 - Date.now()))
       await placed.media.say(CALLER_MESSAGE)
       await sleep(1_000)
-      expectEqual((await placed.hangup()).status, 200, 'answer to the operator BYE')
+      await byeAnswered(placed)
     } catch (err) {
       await setStatus(jean, 'Disponible')
       throw err
@@ -4561,7 +4580,7 @@ try {
       await sleep(Math.max(0, answeredAt + greetingMs() + 500 - Date.now()))
       await placed.media.say(CALLER_MESSAGE)
       await sleep(1_000)
-      expectEqual((await placed.hangup()).status, 200, 'answer to the operator BYE (the second message)')
+      await byeAnswered(placed, 'answer to the operator BYE (the second message)')
     } catch (err) {
       events.open()
       await setStatus(jean, 'Disponible')
@@ -4618,7 +4637,7 @@ try {
       expectEqual(answer.status, 200, "the answer of the desk's mailbox to the operator")
       await until('the greeting at the operator', () => (placed.media.stats.voiced > 20 ? true : null))
       await sleep(Math.max(0, answeredAt + greetingMs() + 3_000 - Date.now()))
-      expectEqual((await placed.hangup()).status, 200, 'answer to the operator BYE')
+      await byeAnswered(placed)
     } finally {
       await api('PUT', '/admin/dids/staff', staff)
       await api('DELETE', '/admin/groups/210')
@@ -4705,7 +4724,7 @@ try {
       return { placed, status: answer.status }
     }
     const hangUp = async placed => {
-      expectEqual((await placed.hangup()).status, 200, 'answer to the operator BYE')
+      await byeAnswered(placed)
       open.splice(open.indexOf(placed), 1)
       await until('the end of the call at OpenSIPS', async () => (((await mi('dlg_list')).result?.Dialogs ?? []).some(d => d.callid === placed.callId) ? null : true))
     }
@@ -4855,7 +4874,7 @@ try {
       expectEqual(answer.status, 200, `the answer of the mailbox of ${number} to the operator`)
       await until('the greeting at the operator', () => (placed.media.stats.voiced > 20 ? true : null))
       await sleep(Math.max(0, answeredAt + greetingMs() + 3_000 - Date.now()))
-      expectEqual((await placed.hangup()).status, 200, 'answer to the operator BYE')
+      await byeAnswered(placed)
     }
     try {
       await leave('+33199000101', '+33639980041')

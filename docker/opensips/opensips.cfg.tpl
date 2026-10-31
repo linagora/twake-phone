@@ -713,6 +713,9 @@ route {
 			$avp(reply_to_trunk) = 1;
 			t_on_reply("rtp");
 		}
+		# Where a hang-up goes: the e2e reads it when the other side leaves it unanswered (OpenSIPS' 408).
+		if (is_method("BYE"))
+			xlog("L_INFO", "call $ci: BYE from $si:$sp to $du ($ru)\n");
 		# LiveKit SIP's requests in a call it answered name our sockets in reverse order (the route set a caller would
 		# have, step 8): loose_route would send them from the socket they came to. They leave from the socket the call
 		# came from (route[meet_call]).
