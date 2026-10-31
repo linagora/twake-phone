@@ -3838,9 +3838,11 @@ try {
         const caps = (await api('GET', '/capabilities')).json()
         expectEqual(caps.clickToCall, true, 'click-to-call offered to Bob, who has a line at Wazo')
         expectEqual((await (await asPerson(jeanC))('POST', '/calls', { target: 'sip:102@evil' })).statusCode, 400, 'a target that is no number')
-        expectEqual((await api('POST', '/calls', { target: '102' })).statusCode, 202, 'the answer of the Gateway to Bob')
+        // The Gateway answers once the line answered.
+        const placed = api('POST', '/calls', { target: '102' })
         for (const who of [bob, bob2]) await who.page.getByTestId('incoming-call').getByText(/Appel vers 102/).waitFor({ timeout: 20_000 })
         await bob2.page.getByTestId('incoming-call').getByRole('button', { name: 'Répondre' }).click()
+        expectEqual((await placed).statusCode, 202, 'the answer of the Gateway to Bob, once his line answered')
         // Wazo calls 102 at Bob's name: Jean sees Bob.
         await jeanC.page.getByTestId('incoming-call').getByText(/Bob Durand/).waitFor({ timeout: 20_000 }).catch(async err => {
           const said = execFileSync('docker', ['compose', '-f', COMPOSE_FILE, 'logs', '--no-color', '--no-log-prefix', '--tail', '300', 'opensips'], { encoding: 'utf8', timeout: 30_000, maxBuffer: 64 << 20 }).split('\n').filter(l => /click-to-call|grant|wazo|102|103/i.test(l)).slice(-30)

@@ -101,7 +101,9 @@ export const Dialer = () => {
     if (k === '0' && hold.current.plus) hold.current.plus = false
     else press(k)
   }
+  // The Gateway answers once the person's phone answered (click-to-call, ADR 0033): meanwhile, it rings.
   const callOnPhone = async (target: string) => {
+    setStatus({ kind: 'info', text: t('dialer.ringPhone', { number: formatNumber(number) }) })
     await client.originate(target, crypto.randomUUID())
     setStatus({ kind: 'info', text: t('dialer.placed', { number: formatNumber(number) }) })
   }
@@ -109,7 +111,6 @@ export const Dialer = () => {
     const target = toDialTarget(number)
     if (!target || ringing) return
     setRinging(true)
-    setStatus({ kind: 'info', text: t('dialer.placing', { number: formatNumber(number) }) })
     try {
       await callOnPhone(target)
     } catch (err) {
