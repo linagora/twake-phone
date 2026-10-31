@@ -107,6 +107,9 @@ export class WazoSupervision implements SupervisionProvider {
       // The call of a supervisor is no call to supervise: it runs ChanSpy once answered, and before that it is the line ringing with its number.
       if (!line || !CALL_ID.test(e.Uniqueid ?? '') || e.Application === 'ChanSpy' || ringingSupervisor(e) || ringingClickToCall(e)) continue
       const extension = line[1] as string
+      // A click-to-call has two channels of the same line once answered (the line, and its Dial to the target): one call.
+      // ponytail: a scan per channel, a map by Linkedid if lines ever have thousands of channels.
+      if (e.Linkedid && e.Linkedid !== e.Uniqueid && events.some(o => o.Event === 'CoreShowChannel' && o.Uniqueid === e.Linkedid && LINE_CHANNEL.exec(o.Channel ?? '')?.[1] === extension)) continue
       // The number of the other party: the caller of a call Wazo placed (its caller id), else who the line is connected to.
       const peer = [known(e.CallerIDNum), known(e.ConnectedLineNum)].find(n => n && n !== extension)
       const peerName = known(peer === known(e.CallerIDNum) ? e.CallerIDName : e.ConnectedLineName)
@@ -188,12 +191,10 @@ export class WazoSupervision implements SupervisionProvider {
     if (!EXTENSION.test(line.extension)) throw new SupervisionError('not a line', 'refused')
     if (!CLICK_TO_CALL_TARGET.test(target) || !GRANT.test(grant)) throw new SupervisionError('not a number to call', 'refused')
     // The line rings with the number it is about to call; answered, the context of docker/wazo/asterisk/extensions.conf
-    // calls that number at the line's name through OpenSIPS, with the grant, and bridges the two. Async: the person may
-    // take 30 s to answer; the Gateway answers once Asterisk queued the call.
-    await this.ami(
+    // calls that number at the line's name through OpenSIPS, with the grant, and bridges the two. Resolves once the line
+    // answered (30 s to do so); a line offline or unanswered is refused, so the person is told and the grant withdrawn.
+    await this.originate(
       {
-        Action: 'Originate',
-        Async: 'true',
         Channel: `PJSIP/${line.extension}`,
         Context: CLICK_TO_CALL_CONTEXT,
         Exten: 's',
@@ -202,8 +203,7 @@ export class WazoSupervision implements SupervisionProvider {
         CallerID: `"${clickToCallName(target)}" <${CLICK_TO_CALL_CALLER}>`,
         Timeout: '30000'
       },
-      undefined,
-      this.config.originate
+      35_000
     )
   }
 

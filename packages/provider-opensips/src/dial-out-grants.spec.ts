@@ -103,7 +103,7 @@ describe('the grants of a click-to-call (ADR 0033)', () => {
       'DELETE FROM dial_out_grants WHERE tenant_id = $1 AND expires_at < now()',
       'INSERT INTO dial_out_grants (token, tenant_id, extension, number, expires_at, room) VALUES ($1, $2, $3, $4, now() + make_interval(secs => $5), $6)'
     ])
-    expect(db.queries[1]!.values).toEqual([expect.stringMatching(/^[0-9a-f]{32}$/), 'acme', '103', '+33612345678', 60, CLICK_TO_CALL_ROOM])
+    expect(db.queries[1]!.values).toEqual([expect.stringMatching(/^[0-9a-f]{32}$/), 'acme', '103', '+33612345678', 40, CLICK_TO_CALL_ROOM])
     db.queries.splice(0)
     for (const [line, number] of [["103' OR '1'='1", '102'], ['103', "102' --"], ['103', 'sip:102'], ['103', '1']] as const)
       await expect(grants.grantClickToCall(line, number)).rejects.toMatchObject({ statusCode: 400 })

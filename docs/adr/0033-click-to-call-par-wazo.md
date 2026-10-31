@@ -17,7 +17,7 @@ Le POC savait lancer un appel depuis le serveur (`POST /calls`, Asterisk par ARI
 ### 1. Wazo sonne la ligne, puis appelle le numéro au nom de la personne, à travers OpenSIPS
 
 `POST /calls`, quand le serveur SIP ne place pas d'appel (`calling.outbound` faux) et que la personne a une ligne chez Wazo (`listWazoLines`) :
-- la passerelle écrit une autorisation dans `dial_out_grants` (la table des appels des salles de Meet) : `room = 'click-to-call'`, cette extension, ce numéro, une minute, un jeton tiré ;
+- la passerelle écrit une autorisation dans `dial_out_grants` (la table des appels des salles de Meet) : `room = 'click-to-call'`, cette extension, ce numéro, 40 s, un jeton tiré ;
 - puis demande au compte AMI `originate` (ADR 0029) un `Originate` : canal `PJSIP/<extension>`, appelant `"Appel vers <cible>" <clicktocall>` (le numéro de personne ; Asterisk ne garde pas de tiret : les Récents de la personne ne disent jamais que la cible l'a appelée), contexte `twake-click-to-call` (`docker/wazo/asterisk/extensions.conf`, à installer avec Wazo comme `twake-opensips`), variables `TWAKE_LINE`, `TWAKE_TARGET`, `TWAKE_GRANT`.
 
 La ligne décrochée, le contexte vérifie ces trois valeurs, prend l'adresse du socket de lignes d'OpenSIPS dans le contact de la ligne (`PJSIP_DIAL_CONTACTS`), et compose la cible par l'endpoint de la ligne (une ligne n'a qu'un contact, `max_contacts=1`), 60 s au plus, avec l'extension pour appelant et le jeton dans `X-Twake-Grant` (un pre-dial handler). Asterisk ponte les deux appels : quand l'un raccroche, l'autre finit.
@@ -35,9 +35,11 @@ Sur le socket de lignes, un INVITE hors dialogue qui porte `X-Twake-Grant` (et u
 - Le média passe par Asterisk (pont), comme pour une file ou un standard de Wazo.
 - Le CDR montre deux appels : celui de Wazo vers la ligne (`clicktocall` vers la ligne, `via wazo`) et celui de Wazo vers la cible au nom de la personne (`via click-to-call`).
 - Pas de limite de débit côté passerelle : chaque `POST /calls` fait sonner la ligne de la personne (la sienne seulement).
-- La passerelle ne suit pas ces appels (pas de canal à elle) : le 202 dit seulement qu'Asterisk a pris l'appel à placer ; une ligne qui ne répond pas en 30 s ne se voit que sur le téléphone et dans les Récents.
+- La réponse de `POST /calls` attend que la ligne décroche (30 s au plus) : 202 une fois décrochée ; une ligne hors ligne ou sans réponse donne 409, et l'autorisation est retirée. Le clavier n'envoie pas d'autre demande tant que la première sonne.
+- Décroché, l'appel a deux canaux de la même ligne chez Asterisk (la ligne et son `Dial`) : la supervision n'en montre qu'un.
 - `wazo_lines` peut avoir un peu de retard sur Wazo : une ligne retirée à l'instant reste proposée, et rien ne sonne.
-- La clé d'idempotence de `POST /calls` n'est pas lue pour un click-to-call : le clavier n'envoie qu'une demande à la fois.
+- La clé d'idempotence de `POST /calls` n'est pas lue pour un click-to-call.
+- Le jeton passe dans les variables du canal : les comptes AMI qui lisent le dialplan le voient. Il ne sert qu'une fois, pour cette personne et ce numéro, depuis l'adresse de Wazo, 40 s au plus.
 - Prouvé : `config.spec.ts` (le chemin du socket de lignes, la prise par `meet_source`, rien sans les lignes), l'autorisation prise contre PostgreSQL avec la requête du gabarit (`dial-out-grants.spec.ts`), `provider-wazo` (l'`Originate` exact, refus de toute valeur qui dirait plus qu'une ligne, un numéro, un jeton), la passerelle (offert à qui a une ligne seulement, autorisation écrite avant la sonnerie et donnée à Wazo, 400, 409, 503), le contexte chargé par l'Asterisk de Wazo 26.10 et le gabarit par l'OpenSIPS de la pile ; l'e2e SIP (Bob, Jean, son, fin, CDR, autorisation prise) en CI.
 
 ## Alternatives écartées

@@ -45,7 +45,7 @@ export const GRANT_HEADER = 'X-Twake-Grant'
  */
 export const CLICK_TO_CALL_ROOM = 'click-to-call'
 /** How long a click-to-call's grant waits for Wazo's call: the line rings 30 s at most, the call follows the answer. */
-export const CLICK_TO_CALL_TTL_SEC = 60
+export const CLICK_TO_CALL_TTL_SEC = 40
 
 /** How long a grant waits for its INVITE by default, in seconds: LiveKit SIP sends it at once, its retry with credentials just after. */
 export const GRANT_TTL_SEC = 30
