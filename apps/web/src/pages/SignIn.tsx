@@ -1,6 +1,7 @@
 import { Alert, Button, Typography } from '@linagora/twake-mui'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useAuth } from '../auth/AuthProvider.js'
+import { isFramed } from '../embedded.js'
 import { CenteredPage } from '../components/CenteredPage.js'
 import { useT } from '../i18n/useT.js'
 import { calledFor } from '../push.js'
@@ -30,7 +31,8 @@ export const SignIn = () => {
   // Opened by the notification of a call (step 5): signs in at once, the person already clicked for it; once per call
   // in this tab (back from the identity provider, they sign in themselves), and not after a failure (they read why).
   const call = calledFor(window.location.search)
-  const [forCall, setForCall] = useState(() => call !== null && !error && triedFor() !== call)
+  // Framed (Twake Workplace, ADR 0032), sign-in is a popup, which a browser opens only on a click: no sign-in by itself.
+  const [forCall, setForCall] = useState(() => call !== null && !error && triedFor() !== call && !isFramed())
   const tried = useRef(false)
   const redirect = useCallback(() => {
     setFailed(undefined)
@@ -53,7 +55,7 @@ export const SignIn = () => {
       const path = (e.data as { type?: unknown; path?: unknown } | null)?.type === 'twakephone.open' ? (e.data as { path?: unknown }).path : null
       if (typeof path !== 'string' || !path.startsWith('/') || path.startsWith('//')) return
       window.history.replaceState(null, '', path)
-      redirect()
+      if (!isFramed()) redirect()
     }
     navigator.serviceWorker.addEventListener('message', onMessage)
     return () => navigator.serviceWorker.removeEventListener('message', onMessage)

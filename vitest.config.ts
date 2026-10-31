@@ -12,6 +12,6 @@ export default defineConfig({
     env: { LOG_LEVEL: 'silent', AUTH_MODE: 'dev' },
     // twake-mui's build imports its own files without extensions, which Node's ESM loader refuses: Vite resolves them.
     server: { deps: { inline: [/@linagora\/twake-mui/] } },
-    include: ['packages/*/src/**/*.spec.ts', 'apps/gateway/src/**/*.spec.ts', 'apps/web/src/**/*.spec.{ts,tsx}', 'apps/web/server/**/*.spec.mjs']
+    include: ['packages/*/src/**/*.spec.ts', 'apps/gateway/src/**/*.spec.ts', 'apps/web/src/**/*.spec.{ts,tsx}', 'apps/web/server/**/*.spec.mjs', 'apps/workplace/src/**/*.spec.mjs']
   }
 })

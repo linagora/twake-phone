@@ -80,5 +80,20 @@ export default defineConfig(
   {
     files: ['apps/web/public/sw.js'],
     languageOptions: { sourceType: 'script', globals: { ...globals.serviceworker } }
+  },
+  {
+    // The Twake Workplace app (ADR 0032): plain JavaScript and JSX like the Cozy apps, bundled by rsbuild.
+    files: ['apps/workplace/src/**/*.{js,jsx}'],
+    extends: [reactHooks.configs.flat.recommended],
+    languageOptions: { parserOptions: { ecmaFeatures: { jsx: true } }, globals: { ...globals.browser } },
+    rules: { 'react-hooks/exhaustive-deps': 'error' }
+  },
+  {
+    files: ['apps/workplace/*.mjs', 'apps/workplace/test/**'],
+    languageOptions: { globals: { ...globals.node } }
+  },
+  {
+    files: ['apps/workplace/test/**'],
+    languageOptions: { globals: { ...globals.browser } }
   }
 )
