@@ -1,6 +1,10 @@
 import { useEffect } from 'react'
 
 export const DIAL_CHANNEL = 'twake-phone-calls'
+const CLAIM_MS = 400
+const ACK_MS = 2_000
+/** Longer than requestDial waits: once it gave up, its id is never asked again. */
+const HOLD_MS = CLAIM_MS + ACK_MS + 1_000
 
 /**
  * Lets the CALL intent hand a number to a Twake Phone window the person is looking at (ADR 0032): that window puts it
@@ -8,8 +12,9 @@ export const DIAL_CHANNEL = 'twake-phone-calls'
  * a dialer nobody sees: only a visible window takes it; with none, the caller opens the app.
  *
  * Several windows may be visible: the one that gets the Web Lock named after the request takes it, and holds the lock
- * until its frame answered, so no other one takes it meanwhile. It says so at once (`dial-claim`), then how it went
- * (`dial-ack`). A browser without Web Locks takes nothing (it could not keep it to one window).
+ * for as long as the request may wait (HOLD_MS), so that a window that hears it late finds it taken. It says so at once
+ * (`dial-claim`), then how it went (`dial-ack`). A browser without Web Locks takes nothing (it could not keep it to one
+ * window).
  */
 export const useDialRelay = ({ enabled, dial }) => {
   useEffect(() => {
@@ -23,6 +28,7 @@ export const useDialRelay = ({ enabled, dial }) => {
         channel.postMessage({ type: 'dial-claim', id: data.id })
         const ok = await dial(data.number).catch(() => false)
         channel.postMessage({ type: 'dial-ack', id: data.id, ok })
+        await new Promise(resolve => setTimeout(resolve, HOLD_MS))
       })
     }
     return () => channel.close()
@@ -34,7 +40,7 @@ export const useDialRelay = ({ enabled, dial }) => {
  * none claimed it within `claimMs`, or the one that did could not (its frame not signed in). Short: the caller may still
  * have to open a tab, which the browser allows only shortly after the click.
  */
-export const requestDial = (number, { claimMs = 400, ackMs = 2_000 } = {}) =>
+export const requestDial = (number, { claimMs = CLAIM_MS, ackMs = ACK_MS } = {}) =>
   new Promise(resolve => {
     if (typeof BroadcastChannel === 'undefined') return resolve({ handled: false })
     const channel = new BroadcastChannel(DIAL_CHANNEL)

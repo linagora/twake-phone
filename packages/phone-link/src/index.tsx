@@ -44,7 +44,10 @@ export interface RequestCallOptions {
    * new tab, cut from this page (no opener).
    */
   openPhone?: (url: string) => boolean | void
-  /** How long the intent may take before the app is opened instead (a service that never answers). */
+  /**
+   * How long the intent may take before the app is opened instead (a service that never answers). Under 5 s: a browser
+   * lets a page open a tab only within 5 s of the click (Chrome, Firefox).
+   */
   intentTimeoutMs?: number
 }
 
@@ -75,7 +78,7 @@ export const phoneAppUrl = (client: CozyClientLike, target: string): string =>
  *
  * The number is validated and normalised first: text that is not a phone number is never dialled.
  */
-export const requestCall = async ({ client, number, Intents: IntentsOverride, openPhone = openTab, intentTimeoutMs = 5_000 }: RequestCallOptions): Promise<CallResult> => {
+export const requestCall = async ({ client, number, Intents: IntentsOverride, openPhone = openTab, intentTimeoutMs = 4_000 }: RequestCallOptions): Promise<CallResult> => {
   const target = toDialTarget(number)
   if (!target) return { handled: false, reason: 'invalid-number' }
 
