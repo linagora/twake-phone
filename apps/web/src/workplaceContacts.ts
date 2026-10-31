@@ -111,12 +111,29 @@ const PAGE = 1_000
 // ponytail: 20 pages (20 000 contacts) at most; a bigger address book would want a search by number instead.
 const MAX_PAGES = 20
 
-/** All the contacts, page by page (the bridge's getContacts reads the first 100 only). */
-export const allContacts = async (bridge: { fetchJSON(r: { method: string; path: string }): Promise<DocsPage> }) => {
+/** A page that did not come in time: the list is asked again later. */
+const late = <T>(p: Promise<T>, ms: number) => {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  return Promise.race([p, new Promise<never>((_, reject) => (timer = setTimeout(() => reject(new Error('late')), ms)))]).finally(() => clearTimeout(timer))
+}
+
+/**
+ * All the contacts, page by page (the bridge's getContacts reads the first 100 only), each page in `pageMs`. No contact
+ * at all is no error: cozy-stack answers 404 for a doctype that has no document yet.
+ */
+export const allContacts = async (bridge: { fetchJSON(r: { method: string; path: string }): Promise<DocsPage> }, pageMs = 5_000) => {
   const all: WorkplaceContact[] = []
   let bookmark: string | undefined
   for (let page = 0; page < MAX_PAGES; page++) {
-    const res = await bridge.fetchJSON({ method: 'GET', path: `/data/io.cozy.contacts/_normal_docs?limit=${PAGE}${bookmark ? `&bookmark=${encodeURIComponent(bookmark)}` : ''}` })
+    const path = `/data/io.cozy.contacts/_normal_docs?limit=${PAGE}${bookmark ? `&bookmark=${encodeURIComponent(bookmark)}` : ''}`
+    let res: DocsPage
+    try {
+      res = await late(bridge.fetchJSON({ method: 'GET', path }), pageMs)
+    } catch (err) {
+      // ponytail: the bridge passes the error's message only (comlink), the stack's 404 is read in it.
+      if (page === 0 && /404|not.?found/i.test(String((err as Error)?.message))) return all
+      throw err
+    }
     const rows = Array.isArray(res?.rows) ? res.rows : []
     all.push(...rows)
     if (rows.length < PAGE || !res.bookmark) break
@@ -130,13 +147,10 @@ const ask = async (timeoutMs: number): Promise<Contact[] | null> => {
   const origin = await parentOrigin(1_000)
   if (!origin) return []
   const bridge = Comlink.wrap<{ fetchJSON(r: { method: string; path: string }): Promise<DocsPage> }>(parentEndpoint(origin))
-  let timer: ReturnType<typeof setTimeout> | undefined
   try {
-    const late = new Promise<null>(resolve => (timer = setTimeout(() => resolve(null), timeoutMs)))
-    const list = await Promise.race([allContacts(bridge), late]).catch(() => null)
-    return Array.isArray(list) ? list.flatMap(c => toContact(c) ?? []) : null
+    const list = await allContacts(bridge, timeoutMs).catch(() => null)
+    return list ? list.flatMap(c => toContact(c) ?? []) : null
   } finally {
-    clearTimeout(timer)
     bridge[Comlink.releaseProxy]()
   }
 }
