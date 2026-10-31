@@ -6,6 +6,7 @@ import type { TelephonyEvent } from '@twake/telephony-types'
 import { ContactAvatar } from '../components/ContactList.js'
 import { CallAction, CopyAction, OpenCardAction } from '../components/RowActions.js'
 import { useContactsByNumber } from '../contactsByNumber.js'
+import { isWorkplaceContact } from '../workplaceContacts.js'
 import { Appear } from '../ds/Appear/Appear.js'
 import { HoverActions } from '../ds/HoverActions/HoverActions.js'
 import { useGateway } from '../gateway.js'
@@ -404,7 +405,7 @@ export const VoicemailPage = () => {
                     </Stack>
                   ) : (
                     <HoverActions>
-                      {contact ? <OpenCardAction id={contact.id} label={t('actions.openCard', { name: contact.displayName })} /> : null}
+                      {contact && !isWorkplaceContact(contact) ? <OpenCardAction id={contact.id} label={t('actions.openCard', { name: contact.displayName })} /> : null}
                       {v.from ? <CopyAction number={v.from} label={t('actions.copyNumberWhen', { number: formatNumber(v.from), when: at })} /> : null}
                       <Tooltip title={t('voicemail.deleteWho', named)}>
                         <IconButton
