@@ -35,7 +35,7 @@ Sur le socket de lignes, un INVITE hors dialogue qui porte `X-Twake-Grant` (et u
 - Le média passe par Asterisk (pont), comme pour une file ou un standard de Wazo.
 - Le CDR montre deux appels : celui de Wazo vers la ligne (`clicktocall` vers la ligne, `via wazo`) et celui de Wazo vers la cible au nom de la personne (`via click-to-call`).
 - Pas de limite de débit côté passerelle : chaque `POST /calls` fait sonner la ligne de la personne (la sienne seulement).
-- La réponse de `POST /calls` attend que la ligne décroche (30 s au plus) : 202 une fois décrochée ; une ligne hors ligne ou sans réponse donne 409, et l'autorisation est retirée. Le clavier n'envoie pas d'autre demande tant que la première sonne.
+- La réponse de `POST /calls` attend que la ligne décroche (30 s au plus) : 202 une fois décrochée ; une ligne hors ligne ou sans réponse donne 409, et l'autorisation est retirée. Une seule à la fois par ligne : une seconde demande pendant que la ligne sonne reçoit 409, quel que soit l'onglet.
 - Décroché, l'appel a deux canaux de la même ligne chez Asterisk (la ligne et son `Dial`) : la supervision n'en montre qu'un.
 - `wazo_lines` peut avoir un peu de retard sur Wazo : une ligne retirée à l'instant reste proposée, et rien ne sonne.
 - La clé d'idempotence de `POST /calls` n'est pas lue pour un click-to-call.
