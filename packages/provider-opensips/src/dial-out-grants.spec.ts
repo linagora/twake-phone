@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import pg from 'pg'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { DIAL_OUT_GRANTS_SCHEMA, DialOutGrants, GRANT_HEADER, JOIN_HEADER } from './dial-out-grants.js'
+import { CLICK_TO_CALL_ROOM, DIAL_OUT_GRANTS_SCHEMA, DialOutGrants, GRANT_HEADER, JOIN_HEADER } from './dial-out-grants.js'
 import { SUBSCRIBER_SCHEMA, SUBSCRIBER_SQL, SubscriberProvisioner } from './subscriber.js'
 import { TRUNK_SQL } from './trunks.js'
 
@@ -94,6 +94,23 @@ describe('DialOutGrants', () => {
   })
 })
 
+describe('the grants of a click-to-call (ADR 0033)', () => {
+  it('writes one for a line and a number, in the room of the click-to-calls, with a token nobody is told; never for anything else', async () => {
+    const db = recorder()
+    const grants = new DialOutGrants({ pool: db.pool, tenantId: 'acme' })
+    expect(await grants.grantClickToCall('103', '+33612345678')).toMatch(/^[0-9a-f]{32}$/)
+    expect(db.queries.map(q => q.text)).toEqual([
+      'DELETE FROM dial_out_grants WHERE tenant_id = $1 AND expires_at < now()',
+      'INSERT INTO dial_out_grants (token, tenant_id, extension, number, expires_at, room) VALUES ($1, $2, $3, $4, now() + make_interval(secs => $5), $6)'
+    ])
+    expect(db.queries[1]!.values).toEqual([expect.stringMatching(/^[0-9a-f]{32}$/), 'acme', '103', '+33612345678', 40, CLICK_TO_CALL_ROOM])
+    db.queries.splice(0)
+    for (const [line, number] of [["103' OR '1'='1", '102'], ['103', "102' --"], ['103', 'sip:102'], ['103', '1']] as const)
+      await expect(grants.grantClickToCall(line, number)).rejects.toMatchObject({ statusCode: 400 })
+    expect(db.queries).toEqual([])
+  })
+})
+
 // Against a real PostgreSQL (TEST_DATABASE_URL): the grants as OpenSIPS takes them, with the very query of
 // route[meet_source] read from docker/opensips/opensips.cfg.tpl.
 if (process.env.TEST_DATABASE_URL) {
@@ -117,8 +134,8 @@ if (process.env.TEST_DATABASE_URL) {
 
     const tpl = readFileSync(fileURLToPath(new URL('../../../docker/opensips/opensips.cfg.tpl', import.meta.url)), 'utf8')
     const line = tpl.split('\n').find(l => l.includes('$var(meet_query) = "UPDATE dial_out_grants'))!
-    /** route[meet_source]'s query for an INVITE carrying `grant`, From `from` (its tag `tag`), to `to`, of Call-ID `callId`. */
-    const query = (grant: string, from: string, to: string, tag = 'SCL_tag', callId = 'call-1') =>
+    /** route[meet_source]'s query for an INVITE carrying `grant`, From `from` (its tag `tag`), to `to`, of Call-ID `callId`; a room's call, or Wazo's click-to-call (`ctc`). */
+    const query = (grant: string, from: string, to: string, tag = 'SCL_tag', callId = 'call-1', ctc = false) =>
       line
         .slice(line.indexOf('"') + 1, line.lastIndexOf('"'))
         .replace(`'" + $ft + "'`, `'${tag}'`)
@@ -126,9 +143,10 @@ if (process.env.TEST_DATABASE_URL) {
         .replace(`'" + $avp(meet_grant) + "'`, `'${grant}'`)
         .replace(`'" + $fU + "'`, `'${from}'`)
         .replace(`'" + $rU + "'`, `'${to}'`)
+        .replace(`" + $var(grant_ctc) + "`, String(ctc))
     const take = async (grant: string, from: string, to: string) => (await pool.query(query(grant, from, to))).rowCount
     /** The same query's row, as OpenSIPS reads it into its AVPs (meet_known, meet_replaces, meet_join, meet_room). */
-    const taken = async (grant: string, from: string, to: string, tag?: string, callId?: string) => (await pool.query({ text: query(grant, from, to, tag, callId), rowMode: 'array' })).rows
+    const taken = async (grant: string, from: string, to: string, tag?: string, callId?: string, ctc = false) => (await pool.query({ text: query(grant, from, to, tag, callId, ctc), rowMode: 'array' })).rows
 
     it("hands OpenSIPS what a conference's grant says, once (step 8b); a grant of step 8 says none of it", async () => {
       const grants = new DialOutGrants({ pool, ready, tenantId: 'spec' })
@@ -160,6 +178,21 @@ if (process.env.TEST_DATABASE_URL) {
       await pool.query("UPDATE dial_out_grants SET expires_at = now() - interval '1 second' WHERE token = $1", [token])
       await grants.grant('9101', '103')
       expect(await grants.taken(token)).toBeUndefined()
+    })
+
+    it('takes a click-to-call grant (room click-to-call) by its token for Wazo\'s call only, once, for its person and its number; never a room\'s grant there, nor the other way round (ADR 0033)', async () => {
+      const grants = new DialOutGrants({ pool, ready, tenantId: 'spec' })
+      const token = await grants.grantClickToCall('9101', '+33612345678')
+      expect(await taken(token, '9102', '+33612345678', undefined, undefined, true)).toEqual([])
+      expect(await taken(token, '9101', '+33612345679', undefined, undefined, true)).toEqual([])
+      // Not by a room's call, even with its token.
+      expect(await taken(token, '9101', '+33612345678')).toEqual([])
+      expect(await taken(token, '9101', '+33612345678', undefined, undefined, true)).toEqual([[1, '', '', 'click-to-call']])
+      expect(await taken(token, '9101', '+33612345678', undefined, undefined, true)).toEqual([])
+      // A room's grant is not Wazo's.
+      const room = await grants.grant('9101', '102')
+      expect(await taken(room, '9101', '102', undefined, undefined, true)).toEqual([])
+      expect(await taken(room, '9101', '102')).toEqual([[1, '', '', '']])
     })
 
     it('takes a grant once, before its expiry, for its person and its number only', async () => {

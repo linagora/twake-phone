@@ -196,10 +196,10 @@ export const sipPhone = async ({ proxy, ws, domain, user, password, from = user,
   }
 
   /** A request of ours in the dialog of `call`: to its remote target, through its route set; resolves with the answer. */
-  const inDialog = async (call, method, { body = '', extra = [], cseq } = {}) => {
+  const inDialog = async (call, method, { body = '', extra = [], cseq, type } = {}) => {
     const n = cseq ?? ++call.cseq
     const lines = [`${method} ${call.target} SIP/2.0`, `Via: ${via()};branch=z9hG4bK${token()};rport`, 'Max-Forwards: 70', `From: ${call.local}`, `To: ${call.remote}`, `Call-ID: ${call.callId}`, `CSeq: ${n} ${method}`, `Contact: ${contact}`, ...call.route.map(r => `Route: ${r}`), ...extra]
-    await send(withBody(lines, body))
+    await send(withBody(lines, body, type))
     if (method === 'ACK') return undefined
     return response(call.callId, `${n} ${method}`, final, `the answer to our ${method}`)
   }

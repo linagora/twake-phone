@@ -121,14 +121,20 @@ describe('listCalls', () => {
         channel({ Channel: 'PJSIP/101-0000000c', Uniqueid: '1792479546.16', Application: 'ChanSpy' }),
         // A supervisor's line still ringing: no application yet, but the number of the supervision.
         channel({ Channel: 'PJSIP/102-0000000e', Uniqueid: '1792479546.17', ChannelStateDesc: 'Ring', CallerIDNum: '0199', CallerIDName: 'Supervision', Application: '' }),
-        channel({ Channel: 'PJSIP/105-0000000d', Uniqueid: 'not-an-id' })
+        // A click-to-call still ringing the person's line (ADR 0033): no call yet.
+        channel({ Channel: 'PJSIP/106-0000000f', Uniqueid: '1792479546.18', ChannelStateDesc: 'Ring', CallerIDNum: 'clicktocall', CallerIDName: 'Appel vers +33612345678', Application: '' }),
+        channel({ Channel: 'PJSIP/105-0000000d', Uniqueid: 'not-an-id' }),
+        // An answered click-to-call: the line (107) and its Dial to the target, a second channel of 107 linked to it.
+        channel({ Channel: 'PJSIP/107-00000010', Uniqueid: '1792479546.19', Linkedid: '1792479546.19', CallerIDNum: '107', ConnectedLineNum: '102', Application: 'Dial' }),
+        channel({ Channel: 'PJSIP/107-00000011', Uniqueid: '1792479546.20', Linkedid: '1792479546.19', CallerIDNum: '107', ConnectedLineNum: '102', Application: 'AppDial' })
       ])
     )
     const before = Date.now()
     const calls = await sup.listCalls()
     expect(calls.map(c => [c.id, c.extension, c.peer, c.peerName, c.state])).toEqual([
       ['1792479546.12', '103', '0100', 'Standard', 'up'],
-      ['1792479546.13', '104', '0102', 'Jean', 'ringing']
+      ['1792479546.13', '104', '0102', 'Jean', 'ringing'],
+      ['1792479546.19', '107', '102', undefined, 'up']
     ])
     expect(Date.parse(calls[0]!.startedAt)).toBeLessThanOrEqual(before - 64_000)
   })
@@ -288,6 +294,35 @@ describe('spy', () => {
     await expect(sup.spy({ id: '1792479546.12' }, { extension: '101,Hangup' }, 'listen')).rejects.toBeInstanceOf(SupervisionError)
     await expect(sup.spy({ id: '1792479546.99' }, { extension: '101' }, 'listen')).rejects.toMatchObject({ code: 'gone' })
     expect(ami.state.actions.filter(a => a.Action === 'Originate')).toEqual([])
+  })
+})
+
+describe('clickToCall', () => {
+  it('rings the line with the number it will call, then has the context of Wazo call it with the grant (ADR 0033), by the Originate account', async () => {
+    const { sup, ami } = await supervision((a, reply) =>
+      reply({ Response: 'Success', ActionID: a.ActionID!, Message: 'Originate successfully queued' }, { Event: 'OriginateResponse', Response: 'Success', ActionID: a.ActionID!, Reason: '4' })
+    )
+    await sup.clickToCall({ extension: '103' }, '+33612345678', 'a'.repeat(32))
+    expect(ami.state.actions).toEqual([
+      expect.objectContaining({ Action: 'Originate', Async: 'true', Channel: 'PJSIP/103', Context: 'twake-click-to-call', Exten: 's', Priority: '1', CallerID: '"Appel vers +33612345678" <clicktocall>', Timeout: '30000' })
+    ])
+    // The variables of the context, as several headers (the fake keeps the last one it read).
+    expect(ami.state.actions[0]!.Variable).toBe(`TWAKE_GRANT=${'a'.repeat(32)}`)
+  })
+
+  it('refuses a line, a number or a grant that would say more than one (no Asterisk argument, variable or URI can be slipped in)', async () => {
+    const { sup, ami } = await supervision((a, reply) => reply({ Response: 'Success', ActionID: a.ActionID!, Message: 'queued' }))
+    const g = 'a'.repeat(32)
+    for (const [line, target, grant] of [['103,Hangup', '102', g], ['103', '102,Hangup', g], ['103', 'sip:102', g], ['103', '+3361234567890123456789', g], ['103', '102', 'x'.repeat(32)], ['103', '102', `${g}\r\nVariable: X=1`]] as const)
+      await expect(sup.clickToCall({ extension: line }, target, grant)).rejects.toMatchObject({ code: 'refused' })
+    expect(ami.state.actions).toEqual([])
+  })
+
+  it('says it when Asterisk refuses the call, and when the line does not answer (or is offline)', async () => {
+    const { sup } = await supervision((a, reply) => reply({ Response: 'Error', ActionID: a.ActionID!, Message: 'Permission denied' }))
+    await expect(sup.clickToCall({ extension: '103' }, '102', 'a'.repeat(32))).rejects.toBeInstanceOf(SupervisionError)
+    const unanswered = await supervision((a, reply) => reply({ Response: 'Success', ActionID: a.ActionID!, Message: 'queued' }, { Event: 'OriginateResponse', Response: 'Failure', ActionID: a.ActionID!, Reason: '3' }))
+    await expect(unanswered.sup.clickToCall({ extension: '103' }, '102', 'a'.repeat(32))).rejects.toMatchObject({ code: 'refused' })
   })
 })
 

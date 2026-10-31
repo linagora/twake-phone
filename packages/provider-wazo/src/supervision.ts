@@ -50,12 +50,25 @@ const TENANT_FOLDER = /^[A-Za-z0-9_-]{1,64}$/
 const RECORDING_NAME = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 const SOUND = /^[A-Za-z0-9_-]+(\/[A-Za-z0-9_-]+)*$/
 const EXTENSION = /^[0-9]{1,40}$/
+/** What a click-to-call may call: a number in E.164, or an extension (ADR 0033). */
+const CLICK_TO_CALL_TARGET = /^\+?[0-9]{2,20}$/
+const GRANT = /^[0-9a-f]{32}$/
+/**
+ * What the line shows while it rings for a click-to-call: the number it will call in the name, and a caller that is no
+ * one's number (the Récents of the person never say the target called them).
+ */
+export const CLICK_TO_CALL_CALLER = 'clicktocall'
+export const clickToCallName = (target: string) => `Appel vers ${target}`
+/** The context of Wazo's dialplan that calls the target for the answered line (docker/wazo/asterisk/extensions.conf). */
+export const CLICK_TO_CALL_CONTEXT = 'twake-click-to-call'
 /** The options of ChanSpy: by unique id (u), quiet (q), until the call ends (E); then whisper (w) or barge (B). */
 const SPY_OPTIONS: Record<SupervisionMode, string> = { listen: 'uqE', whisper: 'uqEw', barge: 'uqEB' }
 
 const known = (v: string | undefined) => (v && v !== '<unknown>' ? v : undefined)
 /** The line of a supervisor while it rings with the call of the supervision (it runs ChanSpy only once answered). */
 const ringingSupervisor = (e: AmiMessage) => e.ChannelStateDesc !== 'Up' && known(e.CallerIDNum) === SUPERVISION_CALLER && known(e.CallerIDName) === SUPERVISION_NAME
+/** A click-to-call ringing the person's line (ADR 0033): no call yet, nothing to supervise. */
+const ringingClickToCall = (e: AmiMessage) => e.ChannelStateDesc !== 'Up' && known(e.CallerIDNum) === CLICK_TO_CALL_CALLER
 const clock = (v: string | undefined) => {
   const m = /^(\d+):(\d{2}):(\d{2})$/.exec(v ?? '')
   return m ? Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]) : 0
@@ -92,8 +105,11 @@ export class WazoSupervision implements SupervisionProvider {
       if (e.Event !== 'CoreShowChannel') continue
       const line = LINE_CHANNEL.exec(e.Channel ?? '')
       // The call of a supervisor is no call to supervise: it runs ChanSpy once answered, and before that it is the line ringing with its number.
-      if (!line || !CALL_ID.test(e.Uniqueid ?? '') || e.Application === 'ChanSpy' || ringingSupervisor(e)) continue
+      if (!line || !CALL_ID.test(e.Uniqueid ?? '') || e.Application === 'ChanSpy' || ringingSupervisor(e) || ringingClickToCall(e)) continue
       const extension = line[1] as string
+      // A click-to-call has two channels of the same line once answered (the line, and its Dial to the target): one call.
+      // ponytail: a scan per channel, a map by Linkedid if lines ever have thousands of channels.
+      if (e.Linkedid && e.Linkedid !== e.Uniqueid && events.some(o => o.Event === 'CoreShowChannel' && o.Uniqueid === e.Linkedid && LINE_CHANNEL.exec(o.Channel ?? '')?.[1] === extension)) continue
       // The number of the other party: the caller of a call Wazo placed (its caller id), else who the line is connected to.
       const peer = [known(e.CallerIDNum), known(e.ConnectedLineNum)].find(n => n && n !== extension)
       const peerName = known(peer === known(e.CallerIDNum) ? e.CallerIDName : e.ConnectedLineName)
@@ -168,6 +184,26 @@ export class WazoSupervision implements SupervisionProvider {
         Timeout: '30000'
       },
       40_000
+    )
+  }
+
+  async clickToCall(line: { extension: string }, target: string, grant: string): Promise<void> {
+    if (!EXTENSION.test(line.extension)) throw new SupervisionError('not a line', 'refused')
+    if (!CLICK_TO_CALL_TARGET.test(target) || !GRANT.test(grant)) throw new SupervisionError('not a number to call', 'refused')
+    // The line rings with the number it is about to call; answered, the context of docker/wazo/asterisk/extensions.conf
+    // calls that number at the line's name through OpenSIPS, with the grant, and bridges the two. Resolves once the line
+    // answered (30 s to do so); a line offline or unanswered is refused, so the person is told and the grant withdrawn.
+    await this.originate(
+      {
+        Channel: `PJSIP/${line.extension}`,
+        Context: CLICK_TO_CALL_CONTEXT,
+        Exten: 's',
+        Priority: '1',
+        Variable: [`TWAKE_LINE=${line.extension}`, `TWAKE_TARGET=${target}`, `TWAKE_GRANT=${grant}`],
+        CallerID: `"${clickToCallName(target)}" <${CLICK_TO_CALL_CALLER}>`,
+        Timeout: '30000'
+      },
+      35_000
     )
   }
 

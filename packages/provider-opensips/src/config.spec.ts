@@ -110,11 +110,38 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(cfg).toContain('if ($shv(wazo_lines_on) != 1 || $si != "127.0.0.1") {')
     expect(cfg).toContain('if ($dlg_val(wline) == "1" && is_direction("downstream"))')
     expect(cfg).toContain('if ($var(from_wline) != $var(wline)) {')
-    const call = cfg.slice(cfg.indexOf('if ($var(wline) == 1) {\n\t\tif (is_method("ACK"))'))
+    const call = cfg.slice(cfg.indexOf('if ($var(wline) == 1 && $var(ctc_call) == 0) {\n\t\tif (is_method("ACK"))'))
     expect(call.slice(0, call.indexOf('route(rules_step);'))).toContain('if (is_present_hf("Replaces") || !($rU =~ "^[A-Za-z0-9._+-]{1,64}$")) {')
     expect(call.slice(0, 2500)).not.toContain('route(voicemail')
     // A transfer of such a call is refused as one with the operator (REFER).
     expect(cfg).toContain('$dlg_val(meet) != NULL || $dlg_val(wline) == "1")) {')
+    // Click-to-call (ADR 0033): Wazo's INVITE on the lines socket that carries the Gateway's grant leaves the calls to a
+    // person's windows for the way of a person's own calls; the grant is read, removed, and stands for the credentials,
+    // taken once for this person (From) and this number, in the room of the click-to-calls; Wazo's side of it speaks from
+    // the lines socket only (wline), and its CDR says so.
+    expect(cfg).toContain('if ($var(wline) == 1 && is_method("INVITE") && !has_totag() && is_present_hf("X-Twake-Grant")) {\n\t\tif (!has_body_part("application/sdp")) {')
+    expect(cfg).toContain('$var(ctc_call) = 1;\n\t\t$avp(ctc_grant) = $hdr(X-Twake-Grant);')
+    const start = cfg.indexOf('} else if ($var(ctc_call) == 1) {')
+    const auth = cfg.slice(start, cfg.indexOf('consume_credentials();', start))
+    expect(auth).toContain('if (!($fU =~ "^[0-9]{1,40}$") || is_present_hf("Replaces")) {')
+    expect(auth).toContain('$avp(meet_grant) = $avp(ctc_grant);')
+    expect(auth).not.toContain('sql_query')
+    // Taken once the transaction exists, as a room's grant is: by its token, this person, this number, once.
+    expect(cfg).toContain('if ($var(meet) == 1 || $var(ctc_call) == 1) {\n\t\troute(meet_source);')
+    expect(cfg).toContain('} else if ($avp(meet_room) != "click-to-call")\n\t\tappend_hf("Twake-Room: meet\\r\\n");')
+    // Never a room's grant for Wazo's call, nor a click-to-call's for a room's.
+    expect(cfg).toContain('$var(grant_ctc) = "false";\n\tif ($var(ctc_call) == 1)\n\t\t$var(grant_ctc) = "true";')
+    expect(cfg).toContain(`AND (coalesce(g.room, '') = 'click-to-call') = " + $var(grant_ctc) + " AND EXISTS`)
+    // An offer, and nothing of what Wazo's INVITE writes passes on.
+    expect(cfg).toContain('remove_hf_glob("X-Twake-*");\n\t\tremove_hf_glob("Twake-*");')
+    expect(cfg).toContain('if ($var(ctc_call) == 1) {\n\t\t$dlg_val(wline) = "1";\n\t\t$acc_extra(via) = "click-to-call";')
+  })
+
+  it('without the lines, nothing of a click-to-call: no grant read, no call of Wazo (ADR 0033)', () => {
+    const { cfg } = render({ WAZO_SIP: '127.0.0.1:5100' })
+    expect(cfg).not.toContain('X-Twake-Grant")) {\n\t\t$var(ctc_call) = 1;')
+    // The variable stays 0: the branch of the credentials is the accounts' (proxy_authorize).
+    expect(cfg).toContain('$var(ctc_call) = 0;')
   })
 
   it('sends the call to a number of `call_flows` to Wazo as it sends one to a mailbox, only with the lines on, before any ring group, and refuses what cannot go there as unreachable, never as a number that does not exist (step 11c-2, ADR 0028)', () => {
@@ -475,7 +502,7 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(source.indexOf('t_reply(403, "Not Granted");')).toBeLessThan(source.indexOf('async(sql_query_one('))
     // Marked with the call that takes it as it is read (review 8b, n°3: its From tag and Call-ID, for the Gateway to
     // compare with its own), kept 10 minutes for that: used once, before its expiry, for this person and number only.
-    expect(source).toContain(`"UPDATE dial_out_grants g SET used_by = '" + $ft + "', used_call = '" + $ci + "', expires_at = now() + interval '10 minutes' WHERE g.token = '" + $avp(meet_grant) + "' AND g.used_by IS NULL AND g.extension = '" + $fU + "' AND g.number = '" + $rU + "' AND g.expires_at > now() AND EXISTS (SELECT 1 FROM subscriber s WHERE s.username = g.extension) RETURNING 1, coalesce(g.replaces, ''), coalesce(g.join_token, ''), coalesce(g.room, '')"`)
+    expect(source).toContain(`"UPDATE dial_out_grants g SET used_by = '" + $ft + "', used_call = '" + $ci + "', expires_at = now() + interval '10 minutes' WHERE g.token = '" + $avp(meet_grant) + "' AND g.used_by IS NULL AND g.extension = '" + $fU + "' AND g.number = '" + $rU + "' AND g.expires_at > now() AND (coalesce(g.room, '') = 'click-to-call') = " + $var(grant_ctc) + " AND EXISTS (SELECT 1 FROM subscriber s WHERE s.username = g.extension) RETURNING 1, coalesce(g.replaces, ''), coalesce(g.join_token, ''), coalesce(g.room, '')"`)
     expect(cfg).not.toContain('DELETE FROM dial_out_grants')
     const loaded = section('route[meet_source_loaded]', 'route[meet_call]')
     expect(loaded).toContain('if ($var(meet_rc) == -2) {')
@@ -560,7 +587,7 @@ describe.skipIf(!hasEnvsubst)('docker/opensips', () => {
     expect(at('append_hf("Twake-Room: meet\\r\\n");')).toBeLessThan(at('route(rules_next);'))
     // A call of a conference's room to a third participant says so, and which room (review 8b, n°2).
     // A call of the conference as the others' are (second review 8b, n°8): its CDR and its events say conference.
-    expect(loaded).toContain('if ($avp(meet_room) =~ "^twake-call-[0-9a-f]{16}$") {\n\t\tappend_hf("Twake-Room: conference\\r\\n");\n\t\tappend_hf("Twake-Conference: $avp(meet_room)\\r\\n");\n\t\t$avp(conference) = 1;\n\t\t$acc_extra(via) = "conference";\n\t} else\n\t\tappend_hf("Twake-Room: meet\\r\\n");')
+    expect(loaded).toContain('if ($avp(meet_room) =~ "^twake-call-[0-9a-f]{16}$") {\n\t\tappend_hf("Twake-Room: conference\\r\\n");\n\t\tappend_hf("Twake-Conference: $avp(meet_room)\\r\\n");\n\t\t$avp(conference) = 1;\n\t\t$acc_extra(via) = "conference";\n\t} else if ($avp(meet_room) != "click-to-call")\n\t\tappend_hf("Twake-Room: meet\\r\\n");')
     const leg = section('route[conference_leg]', 'route[meet_call]')
     // Never the public network; the header of its grant, written by this script; then the phones of the extension.
     expect(at('t_reply(403, "Not Granted");', leg)).toBeLessThan(at('append_hf("Replaces: $avp(meet_replaces)\\r\\n");', leg))

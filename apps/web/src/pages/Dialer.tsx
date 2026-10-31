@@ -42,8 +42,15 @@ export const Dialer = () => {
   }, [params, setParams])
   // The Gateway can place the call for us (click-to-call) or the browser does it itself (softphone registered).
   const [gatewayCalls, setGatewayCalls] = useState<boolean | null>(null)
+  // Click-to-call (ADR 0033): the Gateway can also ring the person's own phone (desk phone, Linphone) and have it call.
+  const [onPhone, setOnPhone] = useState(false)
+  // One click-to-call at a time: a second click would ring the phone twice.
+  const [ringing, setRinging] = useState(false)
   // The dialer places the first call; a second one (a consultation before a transfer) is placed from the call panel.
-  const canCall = (phone.state === 'registered' && !phone.calls.length) || (phone.state !== 'registered' && !!gatewayCalls)
+  // The Gateway places the call when the browser cannot. A click-to-call (ADR 0033) rings the person's own phone: only
+  // when this browser has no phone at all; one whose phone is connecting or failed has its own button for it.
+  const gatewayCallsNow = !!gatewayCalls && (!onPhone || phone.state === 'off')
+  const canCall = (phone.state === 'registered' && !phone.calls.length) || (phone.state !== 'registered' && gatewayCallsNow && !ringing)
   const [status, setStatus] = useState<{ kind: 'info' | 'error'; text: string } | null>(null)
   const callButton = useRef<HTMLButtonElement>(null)
   useEffect(() => {
@@ -58,7 +65,11 @@ export const Dialer = () => {
     setStatus(null)
     client
       .getCapabilities()
-      .then(caps => !cancelled && setGatewayCalls(!!caps.calling?.outbound))
+      .then(caps => {
+        if (cancelled) return
+        setGatewayCalls(!!caps.calling?.outbound)
+        setOnPhone(!!caps.clickToCall)
+      })
       .catch((err: unknown) => {
         if (cancelled) return
         // 404 is the Gateway saying "no telephony provider on this platform": calling is not configured, which is not an error.
@@ -90,6 +101,24 @@ export const Dialer = () => {
     if (k === '0' && hold.current.plus) hold.current.plus = false
     else press(k)
   }
+  // The Gateway answers once the person's phone answered (click-to-call, ADR 0033): meanwhile, it rings.
+  const callOnPhone = async (target: string) => {
+    setStatus({ kind: 'info', text: t('dialer.ringPhone', { number: formatNumber(number) }) })
+    await client.originate(target, crypto.randomUUID())
+    setStatus({ kind: 'info', text: t('dialer.placed', { number: formatNumber(number) }) })
+  }
+  const submitOnPhone = async () => {
+    const target = toDialTarget(number)
+    if (!target || ringing) return
+    setRinging(true)
+    try {
+      await callOnPhone(target)
+    } catch (err) {
+      setStatus({ kind: 'error', text: t('dialer.failed', { reason: describeCallError(err, t) }) })
+    } finally {
+      setRinging(false)
+    }
+  }
   const submit = async (e: FormEvent) => {
     e.preventDefault()
     const target = toDialTarget(number)
@@ -101,9 +130,10 @@ export const Dialer = () => {
         await phone.call(target)
         setStatus(null)
         setNumber('')
-      } else if (gatewayCalls) {
-        await client.originate(target, crypto.randomUUID())
-        setStatus({ kind: 'info', text: t('dialer.placed', { number: formatNumber(number) }) })
+      } else if (gatewayCallsNow) {
+        if (ringing) return
+        setRinging(true)
+        await callOnPhone(target).finally(() => setRinging(false))
       } else {
         setStatus({ kind: 'error', text: t('dialer.notRegistered') })
       }
@@ -149,6 +179,12 @@ export const Dialer = () => {
           <Button ref={callButton} type="submit" disabled={!canCall || !toDialTarget(number)}>
             {t('dialer.call')}
           </Button>
+          {/* This browser has a phone: the person may still ring their own phone instead. Never from a link alone (ADR 0031). */}
+          {onPhone && phone.state !== 'off' ? (
+            <Button type="button" variant="outlined" onClick={() => void submitOnPhone()} disabled={ringing || !toDialTarget(number)}>
+              {t('dialer.callOnPhone')}
+            </Button>
+          ) : null}
         </Stack>
       </form>
       {status ? (

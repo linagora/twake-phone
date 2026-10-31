@@ -541,6 +541,8 @@ route {
 		$var(wazo) = 1;
 	}
 
+	# A click-to-call (ADR 0033): Wazo's call to a number at the name of a person, on the Gateway's grant (below).
+	$var(ctc_call) = 0;
 	# wazo-lines: begin
 	# The socket of the lines of Wazo (step 11c-1, ADR 0027) hears Wazo's Asterisk only (WAZO_SIP), any port, and nothing
 	# when the lines are off. Its INVITE to a person's windows (route[wazo_line_call]) and, in that call, its side's
@@ -751,8 +753,28 @@ route {
 	}
 
 	# wazo-lines: begin
+	# A click-to-call (ADR 0033): the line of a person answered the call Wazo placed to it, and Wazo now calls the
+	# number they asked for, at their name (the From), with the Gateway's grant for it (X-Twake-Grant, taken once below,
+	# where an account's credentials would be checked). That call goes the way the person's own calls go: their rights,
+	# caps, fraud checks and trunk. The grant is read here and never passed on.
+	if ($var(wline) == 1 && is_method("INVITE") && !has_totag() && is_present_hf("X-Twake-Grant")) {
+		if (!has_body_part("application/sdp")) {
+			xlog("L_NOTICE", "wazo: click-to-call $ci refused on the lines socket, no offer\n");
+			send_reply(488, "Not Acceptable Here");
+			exit;
+		}
+		$var(ctc_call) = 1;
+		$avp(ctc_grant) = $hdr(X-Twake-Grant);
+		# Who calls is told by this script and the grant: nothing else Wazo's INVITE writes passes on.
+		remove_hf_glob("X-Twake-*");
+		remove_hf_glob("Twake-*");
+		remove_hf("P-Asserted-Identity");
+		remove_hf("P-Preferred-Identity");
+		remove_hf("Remote-Party-ID");
+		$ru = "sip:" + $rU + "@${SIP_DOMAIN}";
+	}
 	# The socket of the lines of Wazo (step 11c-1): its keepalives, and its INVITE to a person's windows.
-	if ($var(wline) == 1) {
+	if ($var(wline) == 1 && $var(ctc_call) == 0) {
 		if (is_method("ACK"))
 			exit;
 		if (is_method("OPTIONS")) {
@@ -954,6 +976,15 @@ route {
 		if (is_present_hf("X-Twake-Grant"))
 			$avp(meet_grant) = $hdr(X-Twake-Grant);
 		remove_hf("X-Twake-Grant");
+	} else if ($var(ctc_call) == 1) {
+		# A click-to-call (ADR 0033): no credentials; the Gateway's grant stands for them, taken once the transaction exists,
+		# as a room's is (route[meet_source]: this person, this number, once, its room `click-to-call`).
+		if (!($fU =~ "^[0-9]{1,40}$") || is_present_hf("Replaces")) {
+			xlog("L_NOTICE", "wazo: click-to-call $ci from $fU refused\n");
+			send_reply(403, "Forbidden");
+			exit;
+		}
+		$avp(meet_grant) = $avp(ctc_grant);
 	} else {
 		if (!proxy_authorize("", "subscriber")) {
 			proxy_challenge("", "auth");
@@ -1041,6 +1072,12 @@ route {
 		$dlg_val(meet) = "caller";
 		$acc_extra(via) = "meet";
 	}
+	# A click-to-call (ADR 0033): Wazo is the caller, from the lines socket; its side speaks from there only, as in the
+	# calls it places to a person's windows (and nothing in it transfers).
+	if ($var(ctc_call) == 1) {
+		$dlg_val(wline) = "1";
+		$acc_extra(via) = "click-to-call";
+	}
 
 	# Who calls whom, as dialled (the Request-URI changes with the lookup): for the CDR and the events. `callee` is
 	# where the call goes now (the callee's rules may move it), `dialled` stays what the caller dialled.
@@ -1075,8 +1112,9 @@ route {
 		exit;
 	}
 
-	# A room's call (step 8): whoever its From names must be one of our accounts (route[meet_source]).
-	if ($var(meet) == 1) {
+	# A room's call (step 8): whoever its From names must be one of our accounts (route[meet_source]). A click-to-call
+	# (ADR 0033) is granted the same way.
+	if ($var(meet) == 1 || $var(ctc_call) == 1) {
 		route(meet_source);
 		exit;
 	}
@@ -1153,13 +1191,17 @@ route {
 # ADR 0019): the call it takes the place of (`replaces`), the window it is for (`join_token`), its room (`room`).
 route[meet_source] {
 	$avp(meet_pstn) = $var(pstn);
+	# A room's grant for a room's call, a click-to-call's for Wazo's (ADR 0033): never the one for the other.
+	$var(grant_ctc) = "false";
+	if ($var(ctc_call) == 1)
+		$var(grant_ctc) = "true";
 	if (!($avp(meet_grant) =~ "^[0-9a-f]{32}$") || !($rU =~ "^[+]?[0-9*#]{2,20}$") || !($ft =~ "^[A-Za-z0-9._~!%*+-]{1,64}$") || !($ci =~ "^[A-Za-z0-9._~!%*+@:-]{1,200}$")) {
 		xlog("L_NOTICE", "meet: call $ci from $avp(caller) to $rU refused, without a grant\n");
 		append_to_reply("Twake-Call-Refused: not-granted\r\n");
 		t_reply(403, "Not Granted");
 		exit;
 	}
-	$var(meet_query) = "UPDATE dial_out_grants g SET used_by = '" + $ft + "', used_call = '" + $ci + "', expires_at = now() + interval '10 minutes' WHERE g.token = '" + $avp(meet_grant) + "' AND g.used_by IS NULL AND g.extension = '" + $fU + "' AND g.number = '" + $rU + "' AND g.expires_at > now() AND EXISTS (SELECT 1 FROM subscriber s WHERE s.username = g.extension) RETURNING 1, coalesce(g.replaces, ''), coalesce(g.join_token, ''), coalesce(g.room, '')";
+	$var(meet_query) = "UPDATE dial_out_grants g SET used_by = '" + $ft + "', used_call = '" + $ci + "', expires_at = now() + interval '10 minutes' WHERE g.token = '" + $avp(meet_grant) + "' AND g.used_by IS NULL AND g.extension = '" + $fU + "' AND g.number = '" + $rU + "' AND g.expires_at > now() AND (coalesce(g.room, '') = 'click-to-call') = " + $var(grant_ctc) + " AND EXISTS (SELECT 1 FROM subscriber s WHERE s.username = g.extension) RETURNING 1, coalesce(g.replaces, ''), coalesce(g.join_token, ''), coalesce(g.room, '')";
 	async(sql_query_one("$var(meet_query)", "$avp(meet_known);$avp(meet_replaces);$avp(meet_join);$avp(meet_room)"), meet_source_loaded);
 }
 
@@ -1197,7 +1239,7 @@ route[meet_source_loaded] {
 		append_hf("Twake-Conference: $avp(meet_room)\r\n");
 		$avp(conference) = 1;
 		$acc_extra(via) = "conference";
-	} else
+	} else if ($avp(meet_room) != "click-to-call")
 		append_hf("Twake-Room: meet\r\n");
 	route(rules_next);
 	exit;

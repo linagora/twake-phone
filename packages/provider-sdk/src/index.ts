@@ -145,6 +145,12 @@ export interface TelephonyProvider {
   /** The extensions the SIP server has a line for now: what the last writes left. */
   listWazoLines?(): Promise<string[]>
   /**
+   * Click-to-call (ADR 0033): lets the telephony server call `number` at the name of `extension`, once, within 40 s;
+   * the token its call carries, and `revoke` to withdraw it when the line did not answer. Without it, the SIP server
+   * refuses that call.
+   */
+  grantClickToCall?(extension: string, number: string): Promise<Pick<RoomCallGrantToken, 'token' | 'revoke'>>
+  /**
    * The call flows the voicemail and telephony server runs now (step 11c-2, ADR 0028; VoicemailProvider's syncFlows):
    * replaces the list. A call to one of these numbers goes to that server with `route`, which it understands; a number
    * not in it is no flow.
@@ -416,6 +422,13 @@ export interface SupervisionProvider {
    * rejects when the call did not come up (unanswered, refused, the call ended meanwhile).
    */
   spy(call: { id: string }, supervisor: { extension: string }, mode: SupervisionMode): Promise<void>
+  /**
+   * Click-to-call (ADR 0033): rings `line` (an extension with a line at the server: its desk phone, Linphone, its
+   * windows), showing `target` as the caller; once answered, calls `target` at the line's name through the SIP server,
+   * carrying `grant` (TelephonyProvider's grantClickToCall), and bridges the two. Resolves once the line answered, and
+   * rejects (`refused`) when it did not.
+   */
+  clickToCall?(line: { extension: string }, target: string, grant: string): Promise<void>
   /** The audio of a recording (WAV) as a stream read once, undefined when the server has no such file. */
   getRecording(file: { tenant: string; name: string }): Promise<{ contentType: string; size?: number; body: AsyncIterable<Uint8Array> } | undefined>
   /** What the server has of a recording's file: its size and when it was last written (the end of the recording), undefined when it has none. */
