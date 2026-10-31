@@ -2,7 +2,8 @@ import { useEffect } from 'react'
 
 export const DIAL_CHANNEL = 'twake-phone-calls'
 const CLAIM_MS = 400
-const ACK_MS = 2_000
+// Longer than the frame is given to answer (App.jsx, 1 s); with CLAIM_MS, well under the intent's 4 s in phone-link.
+const ACK_MS = 1_500
 /** Longer than requestDial waits: once it gave up, its id is never asked again. */
 const HOLD_MS = CLAIM_MS + ACK_MS + 1_000
 

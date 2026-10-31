@@ -10,7 +10,7 @@ import { useDialRelay } from '@/dialRelay'
 const DIAL_MESSAGE = 'twakephone.dial'
 const DIAL_ACK = 'twakephone.dial-ack'
 /** How long the frame has to answer: a frame not signed in never does, and the number goes to a new tab. */
-const ACK_MS = 1_500
+const ACK_MS = 1_000
 
 /** Posts `number` to the frame and resolves whether it took it (its answer, from its origin, within ACK_MS). */
 const postToFrame = (frame, origin, number) =>
