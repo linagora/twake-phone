@@ -87,10 +87,13 @@ export interface CallSummary {
   remoteName?: string
 }
 
-/** The calls under way, as the parent sees them: no media, no SIP, nothing to act on but their id. */
+/**
+ * The calls under way, as the parent sees them: no media, no SIP, nothing to act on but their id. The calls the phone
+ * makes for itself (the one that replaces another in a transfer, the room of a conference) never ring there either.
+ */
 export const summaryOf = (calls: readonly SoftCall[]): CallSummary[] =>
   calls.flatMap(c =>
-    c.state === 'ended'
+    c.state === 'ended' || c.replacedCallId || c.conferenceOf
       ? []
       : [{ id: c.id, direction: c.direction, state: c.state, remoteNumber: c.remoteNumber, ...(c.remoteName && c.remoteName.toLowerCase() !== 'anonymous' ? { remoteName: c.remoteName } : {}) }]
   )
@@ -128,15 +131,27 @@ export const ParentCalls = () => {
       cancelled = true
     }
   }, [])
+  // Said at each change, and again every 10 s while there are calls: a parent that no longer hears it (this frame
+  // crashed) forgets them. Signed out or gone: no call.
   useEffect(() => {
-    if (origin) window.parent.postMessage({ type: CALLS_MESSAGE, calls: summaryOf(calls) }, origin)
+    if (!origin) return undefined
+    const say = () => window.parent.postMessage({ type: CALLS_MESSAGE, calls: summaryOf(calls) }, origin)
+    say()
+    const beat = calls.length ? setInterval(say, 10_000) : undefined
+    return () => clearInterval(beat)
   }, [origin, calls])
+  useEffect(() => {
+    if (!origin) return undefined
+    return () => window.parent.postMessage({ type: CALLS_MESSAGE, calls: [] }, origin)
+  }, [origin])
   useEffect(() => {
     if (!origin) return
     const onMessage = (event: MessageEvent) => {
       const order = commandOf(event, window.parent, origin)
       const call = order && current.current.find(c => c.id === order.callId)
-      if (order && call) void call[order.action]().catch(() => undefined)
+      // Answer and decline act on a call that still rings here: a late Decline never hangs up a call just answered.
+      if (!order || !call || (order.action !== 'hangup' && call.state !== 'ringing')) return
+      void call[order.action]().catch(() => undefined)
     }
     window.addEventListener('message', onMessage)
     return () => window.removeEventListener('message', onMessage)
