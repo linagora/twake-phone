@@ -71,7 +71,7 @@ const stack = createServer(async (req, res) => {
   }
   res.setHeader('access-control-allow-headers', 'authorization, content-type, accept')
   if (req.method === 'OPTIONS') return res.end()
-  // Alice's own contacts in Twake Workplace: what the bridge hands TwakePhone (getContacts).
+  // Alice's own contacts in Twake Workplace: what TwakePhone reads through the bridge (fetchJSON).
   if (path === '/data/io.cozy.contacts/_normal_docs') return json(res, { total_rows: 1, rows: CONTACTS, next: false })
   if (path === '/settings/flags') return json(res, { data: { attributes: { 'phone.embedded-app-url': `${webOrigin}/` } } })
   if (path === '/intents' && req.method === 'POST') {
