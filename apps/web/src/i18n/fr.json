@@ -19,7 +19,7 @@
   "dialer.unavailable": "L'appel n'est pas encore disponible sur cette plateforme.",
   "dialer.placing": "Appel de {number}…",
   "dialer.failed": "L'appel n'a pas pu être passé : {reason}",
-  "dialer.placed": "Appel vers {number} lancé. Votre téléphone sonne : décrochez.",
+  "dialer.placed": "Appel vers {number} lancé sur votre téléphone.",
   "dialer.capabilitiesFailed": "La passerelle de téléphonie n'a pas répondu : {reason}",
   "recents.title": "Récents",
   "recents.empty": "Aucun appel pour l'instant.",
@@ -1102,5 +1102,7 @@
   "actions.copyFailed": "Le navigateur n'a pas permis de copier le numéro.",
   "actions.openCard": "Fiche de {name}",
   "actions.copyNumberWhen": "Copier le {number} ({when})",
-  "actions.callNumberWhen": "Appeler le {number} ({when})"
+  "actions.callNumberWhen": "Appeler le {number} ({when})",
+  "dialer.ringPhone": "Votre téléphone va sonner : décrochez pour appeler {number}…",
+  "dialer.callOnPhone": "Appeler depuis mon téléphone"
 }

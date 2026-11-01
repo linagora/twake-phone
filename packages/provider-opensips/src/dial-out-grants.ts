@@ -38,6 +38,15 @@ ALTER TABLE dial_out_grants ADD COLUMN IF NOT EXISTS used_call VARCHAR(200);
 
 /** The header LiveKit SIP carries the grant in (CreateSIPParticipant's `headers`), and OpenSIPS reads. */
 export const GRANT_HEADER = 'X-Twake-Grant'
+/**
+ * A click-to-call's grant (ADR 0033), in the same table: Wazo may call `number` at the name of `extension`, once,
+ * before `expires_at`, carrying the token (X-Twake-Grant) on the lines socket; OpenSIPS takes it as it takes a room's
+ * (route[meet_source]), in place of the person's credentials. Its room tells it apart: no room's call takes it.
+ */
+export const CLICK_TO_CALL_ROOM = 'click-to-call'
+/** How long a click-to-call's grant waits for Wazo's call: the line rings 30 s at most, the call follows the answer. */
+export const CLICK_TO_CALL_TTL_SEC = 40
+
 /** How long a grant waits for its INVITE by default, in seconds: LiveKit SIP sends it at once, its retry with credentials just after. */
 export const GRANT_TTL_SEC = 30
 
@@ -105,6 +114,25 @@ export class DialOutGrants {
         join ?? null,
         room ?? null
       ])
+    return token
+  }
+
+  /** The grant of a click-to-call (see CLICK_TO_CALL_ROOM): Wazo may call `number` at the name of `extension`, once. Returns its token. */
+  async grantClickToCall(extension: string, number: string, ttlSec = CLICK_TO_CALL_TTL_SEC): Promise<string> {
+    if (!SIP_USER.test(extension)) throw Object.assign(new Error('Extension is not a valid SIP user'), { statusCode: 400 })
+    if (!NUMBER.test(number)) throw Object.assign(new Error('Invalid phone number'), { statusCode: 400 })
+    if (!(Number.isInteger(ttlSec) && ttlSec >= 1 && ttlSec <= 300)) throw new Error('A grant lives 1 to 300 seconds')
+    await this.opts.ready?.()
+    await this.opts.pool.query('DELETE FROM dial_out_grants WHERE tenant_id = $1 AND expires_at < now()', [this.tenantId])
+    const token = this.opts.token?.() ?? randomBytes(16).toString('hex')
+    await this.opts.pool.query('INSERT INTO dial_out_grants (token, tenant_id, extension, number, expires_at, room) VALUES ($1, $2, $3, $4, now() + make_interval(secs => $5), $6)', [
+      token,
+      this.tenantId,
+      extension,
+      number,
+      ttlSec,
+      CLICK_TO_CALL_ROOM
+    ])
     return token
   }
 
