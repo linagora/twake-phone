@@ -3,6 +3,7 @@
 import CozyClient from 'cozy-client'
 
 import { requestCall } from '../../../packages/phone-link/dist/index.js'
+import { mountPhoneWidget } from '../../../packages/phone-widget/dist/index.js'
 
 window.callFromHost = async number => {
   const client = new CozyClient({ uri: window.STACK, token: 'host-app-token' })
@@ -19,3 +20,10 @@ document.addEventListener('click', event => {
   client.instanceOptions = { subdomain: 'flat' }
   void requestCall({ client, number: event.target.dataset.number }).then(result => (window.lastResult = result))
 })
+
+// The widget of Twake Phone in this app's corner (ADR 0034), as an app mounts it.
+window.mountWidget = () => {
+  const client = new CozyClient({ uri: window.STACK, token: 'host-app-token' })
+  client.instanceOptions = { subdomain: 'flat' }
+  window.unmountWidget = mountPhoneWidget({ client })
+}
