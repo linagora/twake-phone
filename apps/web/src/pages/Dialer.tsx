@@ -36,6 +36,7 @@ export const Dialer = () => {
         focusCall.current = true
       }
     } else if (sent !== null) {
+      setDialed(undefined)
       setNumber(sent.slice(0, 32))
     } else return
     setParams({}, { replace: true })
@@ -50,7 +51,8 @@ export const Dialer = () => {
     if (!focusCall.current || !canCall) return
     focusCall.current = false
     callButton.current?.focus()
-  }, [number, canCall])
+    // params: the same link twice on a keypad already shown changes neither the number nor canCall.
+  }, [number, canCall, params])
 
   useEffect(() => {
     let cancelled = false
@@ -71,7 +73,15 @@ export const Dialer = () => {
     }
   }, [client, t])
 
-  const press = (k: string) => setNumber(n => (n.length < 32 ? n + k : n))
+  // Typing takes away the refusal of a link (dialed null): the field is the person's again.
+  const typed = (value: string) => {
+    setDialed(undefined)
+    setNumber(value)
+  }
+  const press = (k: string) => {
+    setDialed(undefined)
+    setNumber(n => (n.length < 32 ? n + k : n))
+  }
   // 0 held down types + (a number abroad: + then the country code; 00 works too).
   const hold = useRef<{ timer?: ReturnType<typeof setTimeout>; plus: boolean }>({ plus: false })
   const startHold = (k: string) => {
@@ -118,10 +128,10 @@ export const Dialer = () => {
         {t('dialer.title')}
       </Typography>
       {gatewayCalls === false && phone.state === 'off' ? <Alert severity="info" role="status" className="u-mb-1">{t('dialer.unavailable')}</Alert> : null}
-      {dialed === null && !number ? <Alert severity="error" role="alert" className="u-mb-1">{t('dialer.invalidDial')}</Alert> : null}
+      {dialed === null ? <Alert severity="error" role="alert" className="u-mb-1">{t('dialer.invalidDial')}</Alert> : null}
       {phone.state === 'failed' || phone.state === 'unregistered' ? <Alert severity="info" role="status" className="u-mb-1">{t('dialer.notRegistered')}</Alert> : null}
       <form onSubmit={e => void submit(e)}>
-        <TextField id="number" label={t('dialer.number')} type="tel" fullWidth className="u-mb-1" slotProps={{ htmlInput: { inputMode: 'tel', autoComplete: 'off' } }} value={number} onChange={e => setNumber(e.target.value)} />
+        <TextField id="number" label={t('dialer.number')} type="tel" fullWidth className="u-mb-1" slotProps={{ htmlInput: { inputMode: 'tel', autoComplete: 'off' } }} value={number} onChange={e => typed(e.target.value)} />
         <Grid container spacing={1} className="u-mb-1" role="group" aria-label={t('dialer.title')}>
           {KEYS.map(([k, letters]) => (
             <Grid key={k} size={4}>
