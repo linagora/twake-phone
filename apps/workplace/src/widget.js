@@ -28,8 +28,8 @@ export const serveWidget = ({ service, root, lang }) => {
   root.setAttribute('role', 'region')
   root.setAttribute('aria-label', text.region)
   let shown = null
-  // The card an order was sent from: its buttons do nothing more until the call changes (an answer waiting for the
-  // microphone in the other window must not be asked twice), or for 10 s if it never does.
+  // The order sent from this card: its button does nothing more until the call changes (an answer waiting for the
+  // microphone in the other window must not be asked twice), or for 10 s if it never does; the other buttons still act.
   let sent = null
   const SENT_MS = 10_000
 
@@ -40,15 +40,15 @@ export const serveWidget = ({ service, root, lang }) => {
     b.textContent = label
     b.dataset.action = action
     b.addEventListener('click', () => {
-      if (sent === shown) return
-      const card = shown
-      sent = card
-      for (const other of root.querySelectorAll('button')) other.setAttribute('aria-disabled', 'true')
+      const order = `${shown}#${action}`
+      if (sent === order) return
+      sent = order
+      b.setAttribute('aria-disabled', 'true')
       channel.postMessage({ type: 'command', window: call.window, callId: call.id, action })
       setTimeout(() => {
-        if (sent !== card) return
+        if (sent !== order) return
         sent = null
-        for (const other of root.querySelectorAll('button')) other.removeAttribute('aria-disabled')
+        b.removeAttribute('aria-disabled')
       }, SENT_MS)
     })
     return b

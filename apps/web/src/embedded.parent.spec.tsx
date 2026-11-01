@@ -14,6 +14,7 @@ const from = (data: unknown) => window.dispatchEvent(new MessageEvent('message',
 
 describe('ParentCalls, the orders of the Workplace widget (ADR 0034)', () => {
   afterEach(() => {
+    Object.assign(window, { self: window })
     vi.restoreAllMocks()
     calls = []
   })
@@ -22,7 +23,7 @@ describe('ParentCalls, the orders of the Workplace widget (ADR 0034)', () => {
     Object.assign(window, { self: {} })
     const post = vi.spyOn(window, 'postMessage').mockImplementation(message => message === 'requestParentOrigin' && setTimeout(() => from('answerParentOrigin')))
     // An answer that waits (the microphone asked in the background).
-    const ringing = { id: 'r1', direction: 'inbound', state: 'ringing', remoteNumber: '102', answer: vi.fn(() => new Promise(() => undefined)) }
+    const ringing = { id: 'r1', direction: 'inbound', state: 'ringing', remoteNumber: '102', answer: vi.fn(() => new Promise(() => undefined)), reject: vi.fn(async () => undefined) }
     const connected = { id: 'c1', direction: 'inbound', state: 'connected', remoteNumber: '103', answer: vi.fn(async () => undefined), reject: vi.fn(async () => undefined) }
     calls = [ringing, connected] as unknown as SoftCall[]
     const root = createRoot(document.createElement('div'))
@@ -34,10 +35,12 @@ describe('ParentCalls, the orders of the Workplace widget (ADR 0034)', () => {
     from({ type: COMMAND_MESSAGE, callId: 'c1', action: 'answer' })
     from({ type: COMMAND_MESSAGE, callId: 'c1', action: 'reject' })
     expect(ringing.answer).toHaveBeenCalledTimes(1)
+    // Declining while the answer waits still goes.
+    from({ type: COMMAND_MESSAGE, callId: 'r1', action: 'reject' })
+    expect(ringing.reject).toHaveBeenCalledTimes(1)
     expect(connected.answer).not.toHaveBeenCalled()
     expect(connected.reject).not.toHaveBeenCalled()
     act(() => root.unmount())
     expect(post).toHaveBeenLastCalledWith({ type: CALLS_MESSAGE, calls: [] }, ORIGIN)
-    Object.assign(window, { self: window })
   })
 })

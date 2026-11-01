@@ -149,16 +149,17 @@ export const ParentCalls = () => {
   }, [origin])
   useEffect(() => {
     if (!origin) return
-    // The calls an order is under way for: an answer waiting for the microphone is not asked a second time.
+    // The orders under way, per call: an answer waiting for the microphone is not asked a second time (a Decline still goes).
     const acting = new Set<string>()
     const onMessage = (event: MessageEvent) => {
       const order = commandOf(event, window.parent, origin)
       const call = order && current.current.find(c => c.id === order.callId)
       // Answer and decline act on a call that still rings here: a late Decline never hangs up a call just answered.
-      if (!order || !call || acting.has(call.id) || (order.action !== 'hangup' && call.state !== 'ringing')) return
-      acting.add(call.id)
+      const key = order && `${order.callId}/${order.action}`
+      if (!order || !call || acting.has(key!) || (order.action !== 'hangup' && call.state !== 'ringing')) return
+      acting.add(key!)
       // ponytail: a failure is not told to the widget; it shows the call as it stays (still ringing), the panel says why.
-      void call[order.action]().catch(() => undefined).finally(() => acting.delete(call.id))
+      void call[order.action]().catch(() => undefined).finally(() => acting.delete(key!))
     }
     window.addEventListener('message', onMessage)
     return () => window.removeEventListener('message', onMessage)
