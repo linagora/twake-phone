@@ -36,12 +36,14 @@ Toute app de l'instance peut ainsi remplir le clavier : c'est le rôle de l'inte
 - **Les apps hôtes** : Drive, Contacts et Mail n'utilisent pas encore `phone-link` ; c'est hors de ce dépôt.
 - **Essai réel** : la popup sur LemonLDAP::NG (un `Cross-Origin-Opener-Policy` qui couperait le lien entre la popup et le cadre), et la publication sur le registre Cozy (`cozyPublish`, jeton d'éditeur), ne sont pas faites. L'e2e joue un faux cozy-stack et un fournisseur d'identité de test.
 - **Le cloisonnement des navigateurs** : un `BroadcastChannel` et un verrou Web Lock sont cloisonnés par site de premier niveau. Si le domaine des instances est dans la liste des suffixes publics (`mycozy.cloud` l'est), Drive et Twake Phone sont deux sites : l'intent ne joint aucune fenêtre et l'app s'ouvre dans un onglet. Le délai pour ouvrir un onglet après le clic varie selon le navigateur (court dans Safari) : l'aller-retour de l'intent peut le dépasser, l'onglet est alors bloqué et dit « non traité ». L'e2e tourne sur un seul site, dans Chromium.
+- **Le relais à une fenêtre** : la première fenêtre visible qui a le verrou prend le numéro, même si son cadre n'est pas connecté (un onglet s'ouvre alors, une autre fenêtre connectée l'aurait pris) ; un cadre qui répond après 1 s remplit son clavier alors qu'un onglet s'ouvre aussi (deux claviers, rien de composé). L'e2e ne joue ni fenêtre en arrière-plan ni deux fenêtres pour un verrou.
+- **Le cadre en vrai** : cozy-stack envoie avec la page de l'app un `Content-Security-Policy` ; son `frame-src` doit admettre l'origine de TwakePhone (`csp_allowlist` de la pile). Le faux cozy-stack de l'e2e n'en envoie pas.
 - **Notifications dans un cadre** : un navigateur qui isole le stockage des cadres tiers abonne le cadre à part de l'onglet autonome ; les notifications d'appel s'activent dans l'app ouverte seule (Réglages).
 
 ## Conséquences
 
 - `phone-link` ouvre `#/bridge/?dial=` au lieu de `#/dialer?dial=` (l'app du POC).
-- `yarn e2e:web` reste l'e2e de l'app ; `apps/workplace/test/workplace.e2e.mjs` joue la coquille (faux cozy-stack, app web servie par son serveur de production, connexion par la fenêtre, lien `#/bridge/?dial=`, intent `CALL` avec et sans fenêtre visible, texte refusé), dans un job CI à part.
+- `yarn e2e:web` reste l'e2e de l'app ; `apps/workplace/test/workplace.e2e.mjs` joue la coquille (faux cozy-stack, app web servie par son serveur de production, connexion par la fenêtre, lien `#/bridge/?dial=`, intent `CALL` avec et sans fenêtre, texte refusé), dans un job CI à part.
 - `FRAME_ANCESTORS` de TwakePhone doit nommer les origines de l'app `phone` des instances.
 
 ## Alternatives écartées

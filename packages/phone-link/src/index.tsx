@@ -74,7 +74,7 @@ export const phoneAppUrl = (client: CozyClientLike, target: string): string =>
 
 /**
  * Asks Twake Phone to call `number`, without changing application when a Phone window is already open
- * (the Phone app, or the widget mounted in this page). When none is, opens the Phone app, which dials on load.
+ * (the Phone app, or the widget mounted in this page). When none is, opens the Phone app, which puts the number in its dialer.
  *
  * The number is validated and normalised first: text that is not a phone number is never dialled.
  */
