@@ -1,5 +1,10 @@
-import { describe, expect, it } from 'vitest'
-import { allContacts, isWorkplaceContact, nameOf, toContact, workplaceContactOf } from './workplaceContacts.js'
+// @vitest-environment jsdom
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import * as Comlink from 'comlink'
+import { allContacts, forgetWorkplaceContacts, isWorkplaceContact, nameOf, toContact, workplaceContactOf, workplaceContacts } from './workplaceContacts.js'
+
+vi.mock('./embedded.js', () => ({ isFramed: () => true }))
+vi.mock('comlink', async real => ({ ...(await real<typeof Comlink>()), wrap: vi.fn() }))
 
 describe('Workplace contacts', () => {
   const camille = toContact({ _id: 'c1', displayName: 'Camille Martin', company: 'Acme', phone: [{ number: '06 12 34 56 78', type: 'cell' }, { number: '01 23 45 67 89' }], email: [{ address: 'c@acme.test', primary: true }] })!
@@ -10,6 +15,8 @@ describe('Workplace contacts', () => {
     expect(isWorkplaceContact({ id: 'jdupont' })).toBe(false)
     expect(toContact({ fullname: 'Sans Numéro', phone: [] })).toBeNull()
     expect(toContact({ phone: [{ number: '0612' }] })).toBeNull()
+    // In the bin: no longer a contact (nor a second owner of its number).
+    expect(toContact({ displayName: 'Ancien', trashed: true, phone: [{ number: '0612345678' }] })).toBeNull()
   })
 
   it('finds the one contact of a number as dialled (0… and +33… alike), and nobody for a number two contacts share', () => {
@@ -20,6 +27,9 @@ describe('Workplace contacts', () => {
     // One contact with the same number twice is still that contact.
     const twice = toContact({ _id: 'c4', displayName: 'Deux Fois', phone: [{ number: '+33698765432' }, { number: '06 98 76 54 32' }] })!
     expect(workplaceContactOf([twice], '0698765432')).toBe(twice)
+    // The same person twice (synced, then typed again) still names the number.
+    const again = toContact({ _id: 'c5', displayName: 'Camille Martin', phone: [{ number: '+33612345678' }] })!
+    expect(workplaceContactOf([camille, again], '0612345678')?.displayName).toBe('Camille Martin')
   })
 
   it('reads every page of the address book, not the first 100 the bridge would give', async () => {
@@ -61,5 +71,26 @@ describe('Workplace contacts', () => {
     expect(nameOf(new Call('+33123456789', 'Jean Dupont'), [camille])).toBe('Jean Dupont')
     expect(nameOf(new Call('+33123456789', 'anonymous'), [camille])).toBe('Camille Martin')
     expect(nameOf(call, [])).toBeUndefined()
+  })
+
+  describe('asked of the Workplace app', () => {
+    afterEach(() => {
+      forgetWorkplaceContacts()
+      vi.mocked(Comlink.wrap).mockReset()
+    })
+
+    it('asks again through the same bridge after a failure, and never releases it (the app exposes it once)', async () => {
+      // jsdom: the parent of the page is the page itself; the Workplace app answers its origin.
+      const answer = () => window.dispatchEvent(new MessageEvent('message', { data: 'answerParentOrigin', origin: 'https://wp.test', source: window }))
+      const post = vi.spyOn(window, 'postMessage').mockImplementation(message => message === 'requestParentOrigin' && setTimeout(answer))
+      const release = vi.fn()
+      const fetchJSON = vi.fn().mockRejectedValueOnce(new Error('late')).mockResolvedValue({ rows: [{ _id: 'c1', displayName: 'Camille Martin', phone: [{ number: '0612345678' }] }] })
+      vi.mocked(Comlink.wrap).mockReturnValue({ fetchJSON, [Comlink.releaseProxy]: release } as never)
+      expect(await workplaceContacts(50)).toEqual([])
+      expect((await workplaceContacts(50)).map(c => c.displayName)).toEqual(['Camille Martin'])
+      expect(Comlink.wrap).toHaveBeenCalledTimes(1)
+      expect(release).not.toHaveBeenCalled()
+      post.mockRestore()
+    })
   })
 })

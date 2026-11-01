@@ -15,6 +15,8 @@ export interface WorkplaceContact {
   displayName?: string
   fullname?: string
   company?: string
+  /** In the bin of Twake Workplace's Contacts: no longer one of the person's contacts. */
+  trashed?: boolean
   phone?: { number?: string; type?: string }[]
   email?: { address?: string; primary?: boolean }[]
 }
@@ -27,6 +29,7 @@ const kindOf = (type?: string): ContactNumber['type'] => (type === 'cell' || typ
 
 /** The contact as the app shows a person, or null when it has no name or no number. */
 export const toContact = (c: WorkplaceContact): Contact | null => {
+  if (c.trashed) return null
   const displayName = (c.displayName ?? c.fullname ?? '').trim()
   const numbers = (c.phone ?? []).flatMap(p => (typeof p.number === 'string' && p.number ? [{ type: kindOf(p.type), number: p.number }] : []))
   if (!displayName || !numbers.length) return null
@@ -44,7 +47,10 @@ export const workplaceContactOf = (contacts: readonly Contact[], number: string)
   return indexOf(contacts).get(key) ?? null
 }
 
-/** Each full number to its one contact (null: several share it), built once per list: a render reads it, never scans. */
+/**
+ * Each full number to its one contact (null: contacts of different names share it), built once per list: a render
+ * reads it, never scans. The same name twice (a contact synced, then typed again) is still that person.
+ */
 const indexes = new WeakMap<readonly Contact[], Map<string, Contact | null>>()
 const indexOf = (contacts: readonly Contact[]) => {
   let index = indexes.get(contacts)
@@ -53,7 +59,8 @@ const indexOf = (contacts: readonly Contact[]) => {
   for (const c of contacts)
     for (const key of new Set(c.numbers.map(n => toDialTarget(n.number)))) {
       if (!key?.startsWith('+')) continue
-      index.set(key, index.has(key) && index.get(key) !== c ? null : c)
+      const seen = index.get(key)
+      index.set(key, seen === undefined ? c : seen && seen.displayName === c.displayName ? seen : null)
     }
   indexes.set(contacts, index)
   return index
@@ -107,6 +114,7 @@ interface DocsPage {
   rows?: WorkplaceContact[]
   bookmark?: string
 }
+type Bridge = { fetchJSON(r: { method: string; path: string }): Promise<DocsPage> }
 const PAGE = 1_000
 // ponytail: 20 pages (20 000 contacts) at most; a bigger address book would want a search by number instead.
 const MAX_PAGES = 20
@@ -121,7 +129,7 @@ const late = <T>(p: Promise<T>, ms: number) => {
  * All the contacts, page by page (the bridge's getContacts reads the first 100 only), each page in `pageMs`. No contact
  * at all is no error: cozy-stack answers 404 for a doctype that has no document yet.
  */
-export const allContacts = async (bridge: { fetchJSON(r: { method: string; path: string }): Promise<DocsPage> }, pageMs = 5_000) => {
+export const allContacts = async (bridge: Bridge, pageMs = 5_000) => {
   const all: WorkplaceContact[] = []
   let bookmark: string | undefined
   for (let page = 0; page < MAX_PAGES; page++) {
@@ -142,17 +150,21 @@ export const allContacts = async (bridge: { fetchJSON(r: { method: string; path:
   return all
 }
 
+/**
+ * The parent's bridge, wrapped once and kept for the page: the Workplace app exposes it once, and releasing the proxy
+ * (comlink's RELEASE) would make it stop listening for good, so a list asked again would never come.
+ */
+let bridge: Comlink.Remote<Bridge> | null = null
+
 /** The contacts; [] for a parent that is no Workplace app (it never answers), null for one that failed this time. */
 const ask = async (timeoutMs: number): Promise<Contact[] | null> => {
-  const origin = await parentOrigin(1_000)
-  if (!origin) return []
-  const bridge = Comlink.wrap<{ fetchJSON(r: { method: string; path: string }): Promise<DocsPage> }>(parentEndpoint(origin))
-  try {
-    const list = await allContacts(bridge, timeoutMs).catch(() => null)
-    return list ? list.flatMap(c => toContact(c) ?? []) : null
-  } finally {
-    bridge[Comlink.releaseProxy]()
+  if (!bridge) {
+    const origin = await parentOrigin(1_000)
+    if (!origin) return []
+    bridge = Comlink.wrap<Bridge>(parentEndpoint(origin))
   }
+  const list = await allContacts(bridge, timeoutMs).catch(() => null)
+  return list ? list.flatMap(c => toContact(c) ?? []) : null
 }
 
 let loaded: Promise<Contact[]> | null = null
@@ -171,9 +183,10 @@ export const workplaceContacts = (timeoutMs = 5_000): Promise<Contact[]> => {
   return loaded
 }
 
-/** For tests: forget the contacts asked. */
+/** For tests: forget the contacts asked, and the bridge. */
 export const forgetWorkplaceContacts = () => {
   loaded = null
+  bridge = null
 }
 
 /** The person's Workplace contacts for a screen: empty until they come (and outside a frame). */
