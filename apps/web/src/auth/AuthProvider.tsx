@@ -1,5 +1,6 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react'
 import type { User, UserManager } from 'oidc-client-ts'
+import { isFramed, SIGNIN_POPUP } from '../embedded.js'
 import { CALLBACK_PATH, bearerOf } from './oidc.js'
 
 export type AuthState = { status: 'loading' } | { status: 'anonymous'; error?: string } | { status: 'signed-in'; user: User }
@@ -18,7 +19,8 @@ const describe = (err: unknown) => (err instanceof Error ? err.message : String(
 
 /**
  * Drives the OIDC session: completes the code flow on /callback, restores the session from storage,
- * and exposes a token getter the Gateway client uses. The redirect is the only sign-in path (no popup).
+ * and exposes a token getter the Gateway client uses. Sign-in is a redirect, or a popup when the app is framed by its
+ * Twake Workplace app (ADR 0032): the identity provider refuses to be framed.
  */
 export const AuthProvider = ({ manager, children }: { manager: UserManager; children: ReactNode }) => {
   const [state, setState] = useState<AuthState>({ status: 'loading' })
@@ -29,6 +31,14 @@ export const AuthProvider = ({ manager, children }: { manager: UserManager; chil
       if (!cancelled) setState(s)
     }
     const run = async () => {
+      if (window.location.pathname === CALLBACK_PATH && window.name === SIGNIN_POPUP) {
+        // The sign-in popup of a framed app: hands the answer to the frame that opened it (by its opener, else by a
+        // BroadcastChannel), which completes it, and closes. Not by the request kept in storage: a browser that partitions
+        // the frame's storage keeps it out of this window's. A popup whose name a browsing context switch cleared lands
+        // below, where signinCallback finds the request when the storage is shared, and hands it over the same way.
+        await manager.signinPopupCallback()
+        return
+      }
       if (window.location.pathname === CALLBACK_PATH) {
         try {
           const user = await manager.signinCallback()
@@ -70,7 +80,12 @@ export const AuthProvider = ({ manager, children }: { manager: UserManager; chil
     }
   }, [manager])
 
-  const signIn = useCallback(() => manager.signinRedirect({ state: { returnTo: window.location.pathname + window.location.search } }), [manager])
+  const signIn = useCallback(async () => {
+    if (!isFramed()) return manager.signinRedirect({ state: { returnTo: window.location.pathname + window.location.search } })
+    // The popup's user lands through userLoaded, as a silent renewal does. Closed by the person: the promise fails, and
+    // the sign-in page says so (rather than waiting for good).
+    await manager.signinPopup({ popupWindowTarget: SIGNIN_POPUP, popupAbortOnClose: true })
+  }, [manager])
   const signOut = useCallback(async () => {
     await manager.signoutRedirect()
   }, [manager])
