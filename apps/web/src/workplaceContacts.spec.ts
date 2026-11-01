@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import * as Comlink from 'comlink'
 import { allContacts, forgetWorkplaceContacts, isWorkplaceContact, nameOf, toContact, workplaceContactOf, workplaceContacts } from './workplaceContacts.js'
 
-vi.mock('./embedded.js', () => ({ isFramed: () => true }))
+vi.mock('./embedded.js', async real => ({ ...(await real<typeof import('./embedded.js')>()), isFramed: () => true }))
 vi.mock('comlink', async real => ({ ...(await real<typeof Comlink>()), wrap: vi.fn() }))
 
 describe('Workplace contacts', () => {
