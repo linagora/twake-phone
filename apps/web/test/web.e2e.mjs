@@ -337,6 +337,52 @@ try {
     expectEqual(typed.replace(/\s/g, ''), '+33612345601', 'number sent to the dialer')
     expectEqual(new URL(page.url()).search, '', 'address bar cleaned')
   })
+  await step('a link from Twake Chat (/?dial=) fills the dialer with the normalised number and dials nothing', async () => {
+    const calls = []
+    const onRequest = req => (req.method() === 'POST' && new URL(req.url()).pathname.endsWith('/calls') ? calls.push(req.url()) : undefined)
+    page.on('request', onRequest)
+    // Calling possible (the Gateway says it places calls): the link could dial, it only puts the number and the focus on Call.
+    const caps = route => route.fulfill({ json: { calling: { outbound: true } } })
+    await page.route('**/v1/capabilities', caps)
+    await page.goto(`${appOrigin}/?dial=${encodeURIComponent('06 12 34 56 02')}`)
+    await page.getByRole('heading', { level: 1, name: 'Téléphone' }).waitFor()
+    await page.waitForFunction(() => document.querySelector('#number')?.value === '+33612345602')
+    expectEqual(new URL(page.url()).search, '', 'address bar cleaned')
+    const call = page.getByRole('button', { name: 'Appeler', exact: true })
+    await page.waitForFunction(() => document.activeElement?.textContent === 'Appeler')
+    expectEqual(await call.isEnabled(), true, 'Call enabled')
+    // A second link while the dialer is on screen (no reload): the field follows it.
+    await page.evaluate(() => {
+      window.history.pushState(null, '', '/?dial=0612345603')
+      window.dispatchEvent(new PopStateEvent('popstate'))
+    })
+    await page.waitForFunction(() => document.querySelector('#number')?.value === '+33612345603')
+    expectEqual(new URL(page.url()).search, '', 'address bar cleaned again')
+    // The same link again, the focus elsewhere: it comes back on Call.
+    await page.getByLabel('Numéro à appeler').focus()
+    await page.evaluate(() => {
+      window.history.pushState(null, '', '/?dial=0612345603')
+      window.dispatchEvent(new PopStateEvent('popstate'))
+    })
+    await page.waitForFunction(() => document.activeElement?.textContent === 'Appeler')
+    // A refused link while the field holds a number says it too, and leaves the number.
+    await page.evaluate(() => {
+      window.history.pushState(null, '', '/?dial=FR123')
+      window.dispatchEvent(new PopStateEvent('popstate'))
+    })
+    await page.getByRole('alert').getByText('ne contient pas un numéro valide').waitFor()
+    expectEqual((await page.getByLabel('Numéro à appeler').inputValue()).replace(/\s/g, ''), '+33612345603', 'field after a refused second link')
+    await page.unroute('**/v1/capabilities', caps)
+    // Text that is not a number is refused out loud and never reaches the field
+    await page.goto(`${appOrigin}/?dial=${encodeURIComponent('FR123456789')}`)
+    await page.getByRole('alert').getByText('ne contient pas un numéro valide').waitFor()
+    expectEqual(await page.getByLabel('Numéro à appeler').inputValue(), '', 'field after a refused ?dial=')
+    // Typing a number by hand takes the error away.
+    await page.getByRole('button', { name: '5', exact: true }).click()
+    await page.getByRole('alert').getByText('ne contient pas un numéro valide').waitFor({ state: 'detached' })
+    page.off('request', onRequest)
+    expectEqual(calls.length, 0, 'calls placed by the links')
+  })
   await step('switching the language to English changes the UI, the title and the document language', async () => {
     await page.getByRole('link', { name: 'Réglages' }).click()
     // The audio devices live here too; without a phone on this platform the ringtone cannot be tested.

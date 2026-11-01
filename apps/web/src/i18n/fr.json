@@ -310,6 +310,7 @@
   "settings.notificationsError": "Les notifications n'ont pas pu être réglées.",
   "auth.openingCall": "Connexion pour prendre l'appel…",
   "dialer.zeroPlus": "0 (maintenir pour +)",
+  "dialer.invalidDial": "Ce lien ne contient pas un numéro valide : rien n'a été composé.",
   "call.endedRefusedEmergency": "L'appel vers {who} n'a pas pu passer par Twake Phone : appelez {who} depuis un autre téléphone (mobile ou ligne fixe).",
   "call.endedRefusedPremium": "Les numéros surtaxés ne sont pas autorisés : {who} n'a pas été appelé.",
   "call.endedRefusedInternational": "Les appels vers l'étranger ne sont pas autorisés : {who} n'a pas été appelé.",
