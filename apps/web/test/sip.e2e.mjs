@@ -3886,8 +3886,10 @@ try {
         })
         expectEqual(cdrs.includes('clicktocall>103 200 wazo'), true, `the CDR of Wazo's call to Bob's line: ${cdrs}`)
         expectEqual(cdrs.includes('103>102 200 click-to-call'), true, `the CDR of the call to Jean at Bob's name: ${cdrs}`)
-        // The grant is taken: Wazo cannot call again with it.
-        expectEqual((await db.query("SELECT count(*)::int AS n FROM dial_out_grants WHERE room = 'click-to-call' AND extension = '103' AND number = '102' AND used_by IS NULL AND expires_at > now()")).rows[0].n, 0, 'grants of Bob for 102 left')
+        // The grant is taken (not withdrawn, not expired): Wazo cannot call again with it.
+        const grants = (await db.query("SELECT count(*) FILTER (WHERE used_by IS NULL AND expires_at > now())::int AS free, count(*) FILTER (WHERE used_by IS NOT NULL)::int AS used FROM dial_out_grants WHERE room = 'click-to-call' AND extension = '103' AND number = '102'")).rows[0]
+        expectEqual(grants.free, 0, 'grants of Bob for 102 left')
+        expectEqual(grants.used >= 1, true, `grants of Bob for 102 taken: ${grants.used}`)
       } finally {
         await signOut(jeanC)
       }

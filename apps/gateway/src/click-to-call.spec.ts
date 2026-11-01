@@ -13,7 +13,7 @@ afterEach(async () => {
   for (const a of apps.splice(0)) await a.close()
 })
 
-const setup = async (opts: { clickToCall?: boolean; refuse?: 'refused' | 'unavailable'; outbound?: boolean; grants?: boolean; slow?: Promise<void> } = {}) => {
+const setup = async (opts: { clickToCall?: boolean; refuse?: 'refused' | 'unavailable' | 'timeout'; outbound?: boolean; grants?: boolean; slow?: Promise<void> } = {}) => {
   process.env.AUTH_MODE = 'dev'
   const store = new MemoryStore()
   await store.upsertMapping({ tenantId: 'dev', userId: 'bdurand', extension: '103', displayName: 'Bob Durand' })
@@ -109,6 +109,12 @@ describe('click-to-call', () => {
     expect((await refused.call('bdurand', '102')).statusCode).toBe(409)
     // The line did not answer: its grant is withdrawn, nothing else can take it.
     expect(refused.order).toEqual(['grant 103 102', 'revoke'])
-    expect((await (await setup({ refuse: 'unavailable' })).call('bdurand', '102')).statusCode).toBe(503)
+    const unreachable = await setup({ refuse: 'unavailable' })
+    expect((await unreachable.call('bdurand', '102')).statusCode).toBe(503)
+    expect(unreachable.order).toEqual(['grant 103 102', 'revoke'])
+    // No word in time: the phone may have answered, its grant is left to expire.
+    const late = await setup({ refuse: 'timeout' })
+    expect((await late.call('bdurand', '102')).statusCode).toBe(504)
+    expect(late.order).toEqual(['grant 103 102'])
   })
 })

@@ -22,7 +22,11 @@ const fakeAmi = (behave: (action: Frame, reply: (...blocks: Frame[]) => void, so
         const end = buf.indexOf('\r\n\r\n')
         if (end < 0) return
         const frame: Frame = {}
-        for (const line of buf.slice(0, end).split('\r\n')) frame[line.slice(0, line.indexOf(': '))] = line.slice(line.indexOf(': ') + 2)
+        // A header said several times (Variable) is kept as its values, one per line.
+        for (const line of buf.slice(0, end).split('\r\n')) {
+          const [key, value] = [line.slice(0, line.indexOf(': ')), line.slice(line.indexOf(': ') + 2)]
+          frame[key] = key in frame ? `${frame[key]}\n${value}` : value
+        }
         buf = buf.slice(end + 4)
         const reply = (...blocks: Frame[]) => blocks.forEach(b => socket.write(text(b)))
         if (frame.Action === 'Login') {
@@ -306,8 +310,8 @@ describe('clickToCall', () => {
     expect(ami.state.actions).toEqual([
       expect.objectContaining({ Action: 'Originate', Async: 'true', Channel: 'PJSIP/103', Context: 'twake-click-to-call', Exten: 's', Priority: '1', CallerID: '"Appel vers +33612345678" <clicktocall>', Timeout: '30000' })
     ])
-    // The variables of the context, as several headers (the fake keeps the last one it read).
-    expect(ami.state.actions[0]!.Variable).toBe(`TWAKE_GRANT=${'a'.repeat(32)}`)
+    // The variables of the context, as several headers.
+    expect(ami.state.actions[0]!.Variable).toBe(`TWAKE_LINE=103\nTWAKE_TARGET=+33612345678\nTWAKE_GRANT=${'a'.repeat(32)}`)
   })
 
   it('refuses a line, a number or a grant that would say more than one (no Asterisk argument, variable or URI can be slipped in)', async () => {

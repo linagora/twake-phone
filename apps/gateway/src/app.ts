@@ -1955,10 +1955,12 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
               grant = await provider.grantClickToCall!(clickToCall.extension, target)
               await clickToCall.server.clickToCall!({ extension: clickToCall.extension }, target, grant.token)
             } catch (err) {
-              await grant?.revoke().catch((e: unknown) => req.log.warn({ err: e }, 'the grant of a click-to-call not withdrawn'))
               const code = (err as { code?: string }).code
               const status = (err as { statusCode?: number }).statusCode
               req.log.warn({ err }, 'click-to-call not placed')
+              // No word in time: the phone may have answered, its call may still need the grant (it expires on its own).
+              if (code === 'timeout') throw Object.assign(new Error('The telephony server did not say in time whether your phone answered'), { statusCode: 504 })
+              await grant?.revoke().catch((e: unknown) => req.log.warn({ err: e }, 'the grant of a click-to-call not withdrawn'))
               if (status === 400 || status === 501) throw err
               throw Object.assign(new Error(code === 'refused' ? 'Your phone did not answer, or the telephony server refused to call it' : 'The telephony server cannot be reached'), { statusCode: code === 'refused' ? 409 : 503 })
             } finally {

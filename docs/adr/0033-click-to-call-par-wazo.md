@@ -20,7 +20,7 @@ Le POC savait lancer un appel depuis le serveur (`POST /calls`, Asterisk par ARI
 - la passerelle écrit une autorisation dans `dial_out_grants` (la table des appels des salles de Meet) : `room = 'click-to-call'`, cette extension, ce numéro, 40 s, un jeton tiré ;
 - puis demande au compte AMI `originate` (ADR 0029) un `Originate` : canal `PJSIP/<extension>`, appelant `"Appel vers <cible>" <clicktocall>` (le numéro de personne ; Asterisk ne garde pas de tiret : les Récents de la personne ne disent jamais que la cible l'a appelée), contexte `twake-click-to-call` (`docker/wazo/asterisk/extensions.conf`, à installer avec Wazo comme `twake-opensips`), variables `TWAKE_LINE`, `TWAKE_TARGET`, `TWAKE_GRANT`.
 
-La ligne décrochée, le contexte vérifie ces trois valeurs, prend l'adresse du socket de lignes d'OpenSIPS dans le contact de la ligne (`PJSIP_DIAL_CONTACTS`), et compose la cible par l'endpoint de la ligne (une ligne n'a qu'un contact, `max_contacts=1`), 60 s au plus, avec l'extension pour appelant et le jeton dans `X-Twake-Grant` (un pre-dial handler). Asterisk ponte les deux appels : quand l'un raccroche, l'autre finit.
+La ligne décrochée, le contexte vérifie ces trois valeurs, prend l'adresse du socket de lignes d'OpenSIPS dans le contact de la ligne (`PJSIP_DIAL_CONTACTS`), et compose la cible par l'endpoint de la ligne (une ligne n'a qu'un contact, `max_contacts=1`), 60 s au plus, avec l'extension pour appelant et le jeton dans `X-Twake-Grant` (un pre-dial handler) ; une cible occupée, sans réponse ou refusée par OpenSIPS fait entendre occupé ou encombré 5 s, jamais un silence. Asterisk ponte les deux appels : quand l'un raccroche, l'autre finit.
 
 ### 2. OpenSIPS prend l'autorisation comme celle d'une salle
 
@@ -35,7 +35,7 @@ Sur le socket de lignes, un INVITE hors dialogue qui porte `X-Twake-Grant` (et u
 - Le média passe par Asterisk (pont), comme pour une file ou un standard de Wazo.
 - Le CDR montre deux appels : celui de Wazo vers la ligne (`clicktocall` vers la ligne, `via wazo`) et celui de Wazo vers la cible au nom de la personne (`via click-to-call`).
 - Pas de limite de débit côté passerelle : chaque `POST /calls` fait sonner la ligne de la personne (la sienne seulement).
-- La réponse de `POST /calls` attend que la ligne décroche (30 s au plus) : 202 une fois décrochée ; une ligne hors ligne ou sans réponse donne 409, et l'autorisation est retirée. Une seule à la fois par ligne : une seconde demande pendant que la ligne sonne reçoit 409, quel que soit l'onglet.
+- La réponse de `POST /calls` attend que la ligne décroche (30 s au plus) : 202 une fois décrochée ; une ligne hors ligne ou sans réponse donne 409, et l'autorisation est retirée ; un AMI muet 35 s donne 504 et laisse l'autorisation expirer seule (la ligne a peut-être décroché). Une seule à la fois par ligne : une seconde demande pendant que la ligne sonne reçoit 409, quel que soit l'onglet.
 - Décroché, l'appel a deux canaux de la même ligne chez Asterisk (la ligne et son `Dial`) : la supervision n'en montre qu'un.
 - `wazo_lines` peut avoir un peu de retard sur Wazo : une ligne retirée à l'instant reste proposée, et rien ne sonne.
 - La clé d'idempotence de `POST /calls` n'est pas lue pour un click-to-call.

@@ -32,9 +32,9 @@ export interface WazoSupervisionConfig {
   id?: string
 }
 
-/** Why an operation did not happen: the call is gone, Asterisk refused it, or nothing answered. */
+/** Why an operation did not happen: the call is gone, Asterisk refused it, nothing answered, or no answer came in time. */
 export class SupervisionError extends Error {
-  constructor(message: string, readonly code: 'gone' | 'refused' | 'unavailable' | 'notice') {
+  constructor(message: string, readonly code: 'gone' | 'refused' | 'unavailable' | 'timeout' | 'notice') {
     super(message)
     this.name = 'SupervisionError'
   }
@@ -92,7 +92,7 @@ export class WazoSupervision implements SupervisionProvider {
     try {
       return await amiAction(account, action, options)
     } catch (err) {
-      if (err instanceof AmiError) throw new SupervisionError(err.message, err.reason === 'refused' ? 'refused' : 'unavailable')
+      if (err instanceof AmiError) throw new SupervisionError(err.message, err.reason === 'refused' || err.reason === 'timeout' ? err.reason : 'unavailable')
       throw err
     }
   }
