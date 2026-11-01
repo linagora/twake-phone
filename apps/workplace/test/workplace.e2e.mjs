@@ -55,6 +55,7 @@ const [WEB_PORT, OIDC_PORT, GATEWAY_PORT] = [await free(), await free(), await f
 const webOrigin = `http://127.0.0.1:${WEB_PORT}`
 const gatewayUrl = `http://127.0.0.1:${GATEWAY_PORT}`
 
+const CONTACTS = [{ _id: 'c1', _type: 'io.cozy.contacts', displayName: 'Camille Martin', company: 'Acme', phone: [{ number: '06 12 34 56 78', type: 'cell' }] }]
 const intents = new Map()
 let stackOrigin = ''
 let hostOrigin = ''
@@ -70,6 +71,8 @@ const stack = createServer(async (req, res) => {
   }
   res.setHeader('access-control-allow-headers', 'authorization, content-type, accept')
   if (req.method === 'OPTIONS') return res.end()
+  // Alice's own contacts in Twake Workplace: what TwakePhone reads through the bridge (fetchJSON).
+  if (path === '/data/io.cozy.contacts/_normal_docs') return json(res, { total_rows: 1, rows: CONTACTS, next: false })
   if (path === '/settings/flags') return json(res, { data: { attributes: { 'phone.embedded-app-url': `${webOrigin}/` } } })
   if (path === '/intents' && req.method === 'POST') {
     const { action, type, data } = JSON.parse(await readBody(req)).data.attributes
@@ -125,7 +128,10 @@ process.env.LOG_LEVEL ??= 'warn'
 process.env.CORS_ORIGINS = webOrigin
 const oidc = await startOidcMock({ port: OIDC_PORT, appOrigin: webOrigin, audience: AUDIENCE })
 const auth = new JwtAuthenticator({ jwksUrl: oidc.jwksUrl, issuer: oidc.issuer, audience: AUDIENCE, defaultTenant: 'e2e' })
-const gateway = await buildApp(new ProviderRegistry([], []), { auth, store: new MemoryStore() })
+const store = new MemoryStore()
+// A call Alice missed from a number the organisation's directory does not know: her Workplace contacts name it.
+await store.addHistory({ tenantId: 'e2e', userId: 'amartin', callId: 'missed-1', direction: 'inbound', remoteNumber: '+33612345678', startedAt: new Date(Date.now() - 60_000).toISOString(), endedAt: new Date().toISOString(), durationSec: 0, state: 'ended', answered: false })
+const gateway = await buildApp(new ProviderRegistry([], []), { auth, store })
 await gateway.listen({ host: '127.0.0.1', port: GATEWAY_PORT })
 // TwakePhone lets the Workplace app frame it, and nobody else.
 const web = await serveApp({
@@ -160,6 +166,11 @@ try {
     await popup.getByRole('button', { name: 'Continue' }).click()
     await popup.waitForEvent('close')
     await phoneFrame().getByTestId('who').getByText('Alice Martin').waitFor()
+  })
+  await step('the Recents name a number with the person\'s Workplace contact, and offer no directory card for it', async () => {
+    await phoneFrame().getByRole('link', { name: 'Récents' }).click()
+    await phoneFrame().getByText('Camille Martin').waitFor()
+    expectEqual(await phoneFrame().getByLabel('Fiche de Camille Martin').count(), 0, 'directory card actions')
   })
   await step('a Workplace link to a number opens the dialer of the frame on it (ADR 0031: filled, not dialled)', async () => {
     // Opened as a link opens it: a new page load (a change of the hash alone would not reload the app).
