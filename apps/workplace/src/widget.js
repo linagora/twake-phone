@@ -28,6 +28,10 @@ export const serveWidget = ({ service, root, lang }) => {
   root.setAttribute('role', 'region')
   root.setAttribute('aria-label', text.region)
   let shown = null
+  // The card an order was sent from: its buttons do nothing more until the call changes (an answer waiting for the
+  // microphone in the other window must not be asked twice), or for 10 s if it never does.
+  let sent = null
+  const SENT_MS = 10_000
 
   const button = (label, tone, action, call) => {
     const b = document.createElement('button')
@@ -35,7 +39,18 @@ export const serveWidget = ({ service, root, lang }) => {
     b.className = `tpw-btn ${tone}`
     b.textContent = label
     b.dataset.action = action
-    b.addEventListener('click', () => channel.postMessage({ type: 'command', window: call.window, callId: call.id, action }))
+    b.addEventListener('click', () => {
+      if (sent === shown) return
+      const card = shown
+      sent = card
+      for (const other of root.querySelectorAll('button')) other.setAttribute('aria-disabled', 'true')
+      channel.postMessage({ type: 'command', window: call.window, callId: call.id, action })
+      setTimeout(() => {
+        if (sent !== card) return
+        sent = null
+        for (const other of root.querySelectorAll('button')) other.removeAttribute('aria-disabled')
+      }, SENT_MS)
+    })
     return b
   }
 
@@ -44,12 +59,15 @@ export const serveWidget = ({ service, root, lang }) => {
     const key = call && `${call.window}/${call.id}/${call.state}/${call.remoteNumber}/${call.remoteName ?? ''}`
     if (key === shown) return
     shown = key
-    // The card is rebuilt: the keyboard of someone using it stays on the same action (never moved from Answer to Decline).
+    sent = null
+    // The card is rebuilt: the keyboard of someone using it stays on the same action, or on the card when that action is
+    // gone (never moved from Answer to Decline, nor from Hang up to Decline when another call rings).
     const focused = root.contains(document.activeElement) ? (document.activeElement?.dataset.action ?? '') : null
     root.replaceChildren()
     if (!call) return service.resizeClient({ width: 0, height: 0 })
     const card = document.createElement('div')
     card.className = 'tpw-card'
+    card.tabIndex = -1
     // Announced, never focused: the person is working in the host app, a ring must not take their keyboard.
     const incoming = isIncoming(call)
     if (incoming) card.setAttribute('role', 'alert')
@@ -67,7 +85,7 @@ export const serveWidget = ({ service, root, lang }) => {
     else actions.append(button(text.hangup, 'tpw-danger', 'hangup', call))
     card.append(who, actions)
     root.append(card)
-    if (focused !== null) (actions.querySelector(`[data-action="${focused}"]`) ?? actions.querySelector('button'))?.focus()
+    if (focused !== null) (actions.querySelector(`[data-action="${focused}"]`) ?? card).focus()
     service.resizeClient({ width: WIDTH, height: Math.ceil(card.getBoundingClientRect().height) + 16 })
   }
 

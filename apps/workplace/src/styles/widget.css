@@ -6,5 +6,6 @@ body { margin: 0; background: transparent; font-family: Inter, system-ui, sans-s
 .tpw-actions { display: flex; gap: 8px; }
 .tpw-btn { border: 0; border-radius: 999px; padding: 8px 14px; font: inherit; color: #fff; cursor: pointer; }
 .tpw-btn:focus-visible { outline: 3px solid #1a73e8; outline-offset: 2px; }
+.tpw-btn[aria-disabled="true"] { opacity: .6; cursor: progress; }
 .tpw-danger { background: #c5221f; }
 .tpw-accept { background: #188038; }
