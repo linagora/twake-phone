@@ -314,6 +314,23 @@ jobs:
           PILOT_URL: https://twakephone.test
           PILOT_RESOLVE: 127.0.0.1
           PILOT_INSECURE: '1'
+      # Les images que l'e2e vient de jouer, telles quelles, pour le cluster de dev (ADR 0035) : sur main et à la demande,
+      # jamais sur une PR. Le tag est le commit ; latest suit main.
+      - name: Publication des images testées sur Harbor
+        if: github.event_name != 'pull_request'
+        env:
+          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+          HARBOR_TOKEN: ${{ secrets.HARBOR_TOKEN }}
+        run: |
+          echo "$HARBOR_TOKEN" | docker login harbor.linagora.com -u "$HARBOR_USERNAME" --password-stdin
+          tag=$(git rev-parse --short=7 HEAD)
+          for name in web gateway opensips rtpengine; do
+            image=harbor.linagora.com/twake-workplace/twake-phone-$name
+            docker tag "twakephone-$name:local" "$image:$tag"
+            docker push -q "$image:$tag"
+            if [ "$GITHUB_REF" = refs/heads/main ]; then docker tag "$image:$tag" "$image:latest" && docker push -q "$image:latest"; fi
+            echo "- \`$image:$tag@$(docker inspect --format '{{index .RepoDigests 0}}' "$image:$tag" | sed 's/.*@//')\`" >> "$GITHUB_STEP_SUMMARY"
+          done
       - name: Journaux du kit en cas d'échec
         if: failure()
         working-directory: docker/pilot
