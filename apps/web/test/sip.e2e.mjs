@@ -3509,6 +3509,13 @@ try {
     } catch (err) {
       console.log(`[${what}] OpenSIPS: ${err.message}`)
     }
+    // When Asterisk reloaded what, against the time of the call: the AMI answers a reload before PJSIP is through with it.
+    try {
+      const said = execFileSync('docker', ['compose', '-f', COMPOSE_FILE, 'logs', '--no-color', '--timestamps', '--since', '5m', 'wazo-sysconfd', 'wazo-asterisk'], { encoding: 'utf8', timeout: 30_000, maxBuffer: 64 << 20 })
+      console.log(`[${what}] reloads, with their times:\n${said.split('\n').filter(l => /sysconfd: (busy|idle|ran)|[Rr]eload/.test(l)).join('\n')}\n[${what}] now: ${new Date().toISOString()}`)
+    } catch (err) {
+      console.log(`[${what}] reloads: ${err.message}`)
+    }
   }
   /** The operator hangs up `placed`: Wazo answers 200, else what Asterisk shows of it is printed first. */
   const byeAnswered = async (placed, what = 'answer to the operator BYE') => {
@@ -4922,12 +4929,15 @@ try {
       const placed = await operator.call(number, { from, ruri: TRUNK_LOGIN })
       const answer = await placed.final
       const answeredAt = Date.now()
+      if (answer.status !== 200) asteriskStalled(`the answer of the mailbox of ${number}`, placed.callId)
       expectEqual(answer.status, 200, `the answer of the mailbox of ${number} to the operator`)
       await until('the greeting at the operator', () => (placed.media.stats.voiced > 20 ? true : null))
       await sleep(Math.max(0, answeredAt + greetingMs() + 3_000 - Date.now()))
       await byeAnswered(placed)
     }
     try {
+      // The steps before changed Wazo (flows, mailboxes): Asterisk's reloads for them are over before a call reaches a mailbox.
+      await sysconfdSettled()
       await leave('+33199000101', '+33639980041')
       await theirs('amartin', '101', '+33639980041')
       expectEqual(await boxAt('101'), `${alices}@${context}`, "the mailbox of 101: Alice's, at her number")
