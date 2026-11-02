@@ -1104,5 +1104,9 @@
   "actions.copyNumberWhen": "Copy {number} ({when})",
   "actions.callNumberWhen": "Call {number} ({when})",
   "dialer.ringPhone": "Your phone is about to ring: pick it up to call {number}…",
+  "dialer.errorPhoneRinging": "your phone is already ringing for another call.",
+  "dialer.errorPhoneNoAnswer": "your phone did not answer, or the telephony server refused to call it.",
+  "dialer.errorServerUnreachable": "the telephony server cannot be reached.",
+  "dialer.errorServerLate": "the telephony server did not say in time whether your phone answered; look at your phone.",
   "dialer.callOnPhone": "Call from my phone"
 }

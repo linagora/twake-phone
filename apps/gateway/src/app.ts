@@ -1938,7 +1938,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
         if (!(await provider.getCapabilities()).calling?.outbound) {
           const clickToCall = await clickToCallFor(user, provider).catch(err => {
             req.log.warn({ err }, 'click-to-call not available')
-            throw Object.assign(new Error('The telephony server cannot be reached'), { statusCode: 503 })
+            throw Object.assign(new Error('The telephony server cannot be reached'), { statusCode: 503, code: 'CLICK_TO_CALL_UNREACHABLE' })
           })
           if (clickToCall) {
             // The number as the app dials it: an extension, or E.164. The SIP server applies the person's rights and caps
@@ -1948,7 +1948,7 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
             // The SIP server lets this call through at the person's name on this grant only (ADR 0033). The answer waits for
             // the line to answer (30 s at most): unanswered or offline, the grant is withdrawn and the person told.
             const line = `${user.tenantId}/${clickToCall.extension}`
-            if (clickToCallRinging.has(line)) throw Object.assign(new Error('Your phone is already ringing for a call'), { statusCode: 409 })
+            if (clickToCallRinging.has(line)) throw Object.assign(new Error('Your phone is already ringing for a call'), { statusCode: 409, code: 'CLICK_TO_CALL_RINGING' })
             clickToCallRinging.add(line)
             let grant: Awaited<ReturnType<NonNullable<TelephonyProvider['grantClickToCall']>>> | undefined
             try {
@@ -1959,10 +1959,12 @@ export const buildApp = async (registry: ProviderRegistry, options: BuildOptions
               const status = (err as { statusCode?: number }).statusCode
               req.log.warn({ err }, 'click-to-call not placed')
               // No word in time: the phone may have answered, its call may still need the grant (it expires on its own).
-              if (code === 'timeout') throw Object.assign(new Error('The telephony server did not say in time whether your phone answered'), { statusCode: 504 })
+              if (code === 'timeout') throw Object.assign(new Error('The telephony server did not say in time whether your phone answered'), { statusCode: 504, code: 'CLICK_TO_CALL_TIMEOUT' })
               await grant?.revoke().catch((e: unknown) => req.log.warn({ err: e }, 'the grant of a click-to-call not withdrawn'))
               if (status === 400 || status === 501) throw err
-              throw Object.assign(new Error(code === 'refused' ? 'Your phone did not answer, or the telephony server refused to call it' : 'The telephony server cannot be reached'), { statusCode: code === 'refused' ? 409 : 503 })
+              throw code === 'refused'
+                ? Object.assign(new Error('Your phone did not answer, or the telephony server refused to call it'), { statusCode: 409, code: 'CLICK_TO_CALL_NO_ANSWER' })
+                : Object.assign(new Error('The telephony server cannot be reached'), { statusCode: 503, code: 'CLICK_TO_CALL_UNREACHABLE' })
             } finally {
               clickToCallRinging.delete(line)
             }

@@ -1,6 +1,6 @@
 # ADR 0033 : click-to-call, Wazo fait sonner le téléphone de la personne puis appelle le numéro à son nom
 
-Date : 2026-10-30. État : proposée (en revue, PR #45). Décidée dans le fil de discussion du projet (« faire ce qu'il manque pour arriver au niveau du POC ») ; s'appuie sur l'ADR 0027 (les lignes de Wazo), l'ADR 0029 (le compte AMI réservé à `Originate`) et l'ADR 0018 (les autorisations `dial_out_grants` des salles de Meet) ; remplacé par : aucun.
+Date : 2026-10-30. État : proposée. Décidée dans le fil de discussion du projet (« faire ce qu'il manque pour arriver au niveau du POC ») ; s'appuie sur l'ADR 0027 (les lignes de Wazo), l'ADR 0029 (le compte AMI réservé à `Originate`) et l'ADR 0018 (les autorisations `dial_out_grants` des salles de Meet) ; remplacé par : aucun.
 
 ## Contexte
 
@@ -35,7 +35,7 @@ Sur le socket de lignes, un INVITE hors dialogue qui porte `X-Twake-Grant` (et u
 - Le média passe par Asterisk (pont), comme pour une file ou un standard de Wazo.
 - Le CDR montre deux appels : celui de Wazo vers la ligne (`clicktocall` vers la ligne, `via wazo`) et celui de Wazo vers la cible au nom de la personne (`via click-to-call`).
 - Pas de limite de débit côté passerelle : chaque `POST /calls` fait sonner la ligne de la personne (la sienne seulement).
-- La réponse de `POST /calls` attend que la ligne décroche (30 s au plus) : 202 une fois décrochée ; une ligne hors ligne ou sans réponse donne 409, et l'autorisation est retirée ; un AMI muet 35 s donne 504 et laisse l'autorisation expirer seule (la ligne a peut-être décroché). Une seule à la fois par ligne : une seconde demande pendant que la ligne sonne reçoit 409, quel que soit l'onglet.
+- La réponse de `POST /calls` attend que la ligne décroche (30 s au plus) : 202 une fois décrochée ; une ligne hors ligne ou sans réponse donne 409, et l'autorisation est retirée ; un AMI muet 35 s donne 504 et laisse l'autorisation expirer seule (la ligne a peut-être décroché). Une seule à la fois par ligne : une seconde demande pendant que la ligne sonne reçoit 409, quel que soit l'onglet. Chaque refus porte un code (`CLICK_TO_CALL_RINGING`, `CLICK_TO_CALL_NO_ANSWER`, `CLICK_TO_CALL_UNREACHABLE`, `CLICK_TO_CALL_TIMEOUT`) que le clavier dit en mots.
 - Décroché, l'appel a deux canaux de la même ligne chez Asterisk (la ligne et son `Dial`) : la supervision n'en montre qu'un.
 - `wazo_lines` peut avoir un peu de retard sur Wazo : une ligne retirée à l'instant reste proposée, et rien ne sonne.
 - La clé d'idempotence de `POST /calls` n'est pas lue pour un click-to-call.

@@ -1104,5 +1104,9 @@
   "actions.copyNumberWhen": "Copier le {number} ({when})",
   "actions.callNumberWhen": "Appeler le {number} ({when})",
   "dialer.ringPhone": "Votre téléphone va sonner : décrochez pour appeler {number}…",
+  "dialer.errorPhoneRinging": "votre téléphone sonne déjà pour un autre appel.",
+  "dialer.errorPhoneNoAnswer": "votre téléphone n'a pas décroché, ou le serveur de téléphonie a refusé de l'appeler.",
+  "dialer.errorServerUnreachable": "le serveur de téléphonie est injoignable.",
+  "dialer.errorServerLate": "le serveur de téléphonie n'a pas dit à temps si votre téléphone a décroché ; regardez votre téléphone.",
   "dialer.callOnPhone": "Appeler depuis mon téléphone"
 }

@@ -1,6 +1,6 @@
 # ADR 0034 : le widget des autres apps est une télécommande de la fenêtre Twake Phone, pas un téléphone
 
-Date : 2026-10-30. État : proposée (en revue, PR #46), dans le fil de discussion du projet (« fais le reste », après les ADR 0032 et 0033) ; s'appuie sur l'ADR 0032 (la coquille, le relais `CALL`) ; remplacé par : aucun.
+Date : 2026-10-30. État : proposée, dans le fil de discussion du projet (« fais le reste », après les ADR 0032 et 0033) ; s'appuie sur l'ADR 0032 (la coquille, le relais `CALL`) ; remplacé par : aucun.
 
 **Ce n'est pas le widget du POC.** Celui du POC portait un softphone dans un cadre caché de chaque app : la page d'intent recevait de cozy-stack un jeton (`data-cozy`) qui suffisait à la passerelle (mode `cozy`). Aujourd'hui TwakePhone se connecte en OIDC : sa session vit dans l'onglet (`sessionStorage`), et encadré il ne se connecte que sur un clic, dans une fenêtre (ADR 0032). Un cadre caché de taille zéro dans Drive n'aurait jamais de session.
 

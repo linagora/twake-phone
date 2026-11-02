@@ -1,6 +1,6 @@
 import { CallError } from '@twake/softphone'
 import { describe, expect, it } from 'vitest'
-import { describeConferenceError } from './callErrors.js'
+import { describeCallError, describeConferenceError } from './callErrors.js'
 
 // The key and its parameters, as the person would read them once translated.
 const t = (key: string, params?: Record<string, string | number>) => (params ? `${key} ${JSON.stringify(params)}` : key)
@@ -33,5 +33,13 @@ describe('describeConferenceError', () => {
   it('says why the window did not ask for it: a call on hold, a conference already being made (review 8b, n°1, n°6)', () => {
     expect(describeConferenceError(new CallError('call-held', 'held'), t)).toBe('conference.errorHeld {"status":""}')
     expect(describeConferenceError(new CallError('conference-pending', 'pending'), t)).toBe('conference.errorInProgress {"status":""}')
+  })
+
+  it('says why the Gateway did not ring the phone of a click-to-call (ADR 0033), not its status', () => {
+    expect(describeCallError(gateway('CLICK_TO_CALL_RINGING'), t)).toBe('dialer.errorPhoneRinging')
+    expect(describeCallError(gateway('CLICK_TO_CALL_NO_ANSWER'), t)).toBe('dialer.errorPhoneNoAnswer')
+    expect(describeCallError(gateway('CLICK_TO_CALL_UNREACHABLE'), t)).toBe('dialer.errorServerUnreachable')
+    expect(describeCallError(gateway('CLICK_TO_CALL_TIMEOUT'), t)).toBe('dialer.errorServerLate')
+    expect(describeCallError(new Error('Gateway 500 on /calls'), t)).toBe('Gateway 500 on /calls')
   })
 })
