@@ -13,5 +13,8 @@ RUN apt-get -y update -qq && apt-get -y install --no-install-recommends \
     && for m in $(sed -n 's/^loadmodule "\(.*\)\.so"/\1/p' /etc/opensips/opensips.cfg.tpl | grep -v '^proto_\(udp\|tcp\)$'); do \
          test -f "/usr/lib/x86_64-linux-gnu/opensips/modules/$m.so" || { echo "module $m missing" >&2; exit 1; }; \
        done
+# The schema of the tables OpenSIPS and the Gateway share, safe to replay: where PostgreSQL is not the stack's own (a
+# cluster), the deployment applies it before the start (`psql -f`); the compose stacks mount it as an init script.
+COPY subscriber.sql /etc/opensips/subscriber.sql
 COPY entrypoint.sh /usr/local/bin/twakephone-opensips
 ENTRYPOINT ["/usr/local/bin/twakephone-opensips"]
