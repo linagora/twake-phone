@@ -4740,6 +4740,10 @@ try {
       await setStatus(jean, 'Disponible')
     }
     expectEqual(await cdrsViaSince(accFrom), ['135>102 200 voicemail'], 'CDRs of the call')
+    // 135 holds an extension now: the Gateway's background synchronisation gives it a mailbox and a line, and Asterisk reloads PJSIP for
+    // them (about 30 s on a CI runner, its calls' BYEs unanswered meanwhile). Over before the next steps call the mailboxes.
+    await until('the line of 135', async () => ((await lineRows()).includes('135') ? true : null), { timeout: 60_000 })
+    await sysconfdSettled()
   })
   await step('step 11a: Asterisk\'s trace of the calls to the mailboxes since: the extension was said (SayDigits) to the callers of the platform who heard the greeting, never to a caller from outside', async () => {
     let trace
