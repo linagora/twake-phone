@@ -4725,6 +4725,9 @@ try {
   })
   await step('step 11a: a phone of the platform (an agent of this process, 135) calls Jean, who does not want to be disturbed, with an X-Twake-Mailbox of its own (Bob\'s mailbox) and an X-Twake-Voicemail: Jean\'s mailbox answers all the same (OpenSIPS removes those a caller sends before it writes its own): those headers never reached it', async () => {
     await store.upsertMapping({ tenantId: TENANT, userId: 'ua-135', extension: '135', displayName: 'Fenêtre 135' })
+    // Marked as a Gateway marks a change of holders: the one that writes the mailboxes synchronises at its next look (2 s), not at a
+    // later round of its own, during the calls of the next steps.
+    await store.putOperatorState(TENANT, 'voicemail:changed', { at: new Date().toISOString() })
     const { credential } = await registry.forTenant(TENANT).getSession({ id: 'ua-135', tenantId: TENANT, displayName: 'Fenêtre 135', extension: '135' }, { id: 'ua', type: 'browser', label: 'UA' })
     const bobsBox = (await mailboxRows()).find(r => r.extension === '103').mailbox
     await setStatus(jean, 'Ne pas déranger')
@@ -4740,8 +4743,8 @@ try {
       await setStatus(jean, 'Disponible')
     }
     expectEqual(await cdrsViaSince(accFrom), ['135>102 200 voicemail'], 'CDRs of the call')
-    // 135 holds an extension now: the Gateway's background synchronisation gives it a mailbox and a line, and Asterisk reloads PJSIP for
-    // them (about 30 s on a CI runner, its calls' BYEs unanswered meanwhile). Over before the next steps call the mailboxes.
+    // 135 holds an extension now: that synchronisation gives it a mailbox and a line, and Asterisk reloads PJSIP for them (about 30 s on
+    // a CI runner, the BYEs of its calls unanswered meanwhile). Over before the next steps call the mailboxes.
     await until('the line of 135', async () => ((await lineRows()).includes('135') ? true : null), { timeout: 60_000 })
     await sysconfdSettled()
   })
