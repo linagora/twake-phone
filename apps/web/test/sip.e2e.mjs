@@ -3509,6 +3509,13 @@ try {
     } catch (err) {
       console.log(`[${what}] OpenSIPS: ${err.message}`)
     }
+    // When Asterisk reloaded what, against the time of the call: the AMI answers a reload before PJSIP is through with it.
+    try {
+      const said = execFileSync('docker', ['compose', '-f', COMPOSE_FILE, 'logs', '--no-color', '--timestamps', '--since', '5m', 'wazo-sysconfd', 'wazo-asterisk'], { encoding: 'utf8', timeout: 30_000, maxBuffer: 64 << 20 })
+      console.log(`[${what}] reloads, with their times:\n${said.split('\n').filter(l => /sysconfd: (busy|idle|ran)|[Rr]eload/.test(l)).join('\n')}\n[${what}] now: ${new Date().toISOString()}`)
+    } catch (err) {
+      console.log(`[${what}] reloads: ${err.message}`)
+    }
   }
   /** The operator hangs up `placed`: Wazo answers 200, else what Asterisk shows of it is printed first. */
   const byeAnswered = async (placed, what = 'answer to the operator BYE') => {
@@ -4718,6 +4725,9 @@ try {
   })
   await step('step 11a: a phone of the platform (an agent of this process, 135) calls Jean, who does not want to be disturbed, with an X-Twake-Mailbox of its own (Bob\'s mailbox) and an X-Twake-Voicemail: Jean\'s mailbox answers all the same (OpenSIPS removes those a caller sends before it writes its own): those headers never reached it', async () => {
     await store.upsertMapping({ tenantId: TENANT, userId: 'ua-135', extension: '135', displayName: 'Fenêtre 135' })
+    // Marked as a Gateway marks a change of holders: the one that writes the mailboxes synchronises at its next look (2 s), not at a
+    // later round of its own, during the calls of the next steps.
+    await store.putOperatorState(TENANT, 'voicemail:changed', { at: new Date().toISOString() })
     const { credential } = await registry.forTenant(TENANT).getSession({ id: 'ua-135', tenantId: TENANT, displayName: 'Fenêtre 135', extension: '135' }, { id: 'ua', type: 'browser', label: 'UA' })
     const bobsBox = (await mailboxRows()).find(r => r.extension === '103').mailbox
     await setStatus(jean, 'Ne pas déranger')
@@ -4733,6 +4743,10 @@ try {
       await setStatus(jean, 'Disponible')
     }
     expectEqual(await cdrsViaSince(accFrom), ['135>102 200 voicemail'], 'CDRs of the call')
+    // 135 holds an extension now: that synchronisation gives it a mailbox and a line, and Asterisk reloads PJSIP for them (about 30 s on
+    // a CI runner, the BYEs of its calls unanswered meanwhile). Over before the next steps call the mailboxes.
+    await until('the line of 135', async () => ((await lineRows()).includes('135') ? true : null), { timeout: 60_000 })
+    await sysconfdSettled()
   })
   await step('step 11a: Asterisk\'s trace of the calls to the mailboxes since: the extension was said (SayDigits) to the callers of the platform who heard the greeting, never to a caller from outside', async () => {
     let trace
@@ -4922,12 +4936,15 @@ try {
       const placed = await operator.call(number, { from, ruri: TRUNK_LOGIN })
       const answer = await placed.final
       const answeredAt = Date.now()
+      if (answer.status !== 200) asteriskStalled(`the answer of the mailbox of ${number}`, placed.callId)
       expectEqual(answer.status, 200, `the answer of the mailbox of ${number} to the operator`)
       await until('the greeting at the operator', () => (placed.media.stats.voiced > 20 ? true : null))
       await sleep(Math.max(0, answeredAt + greetingMs() + 3_000 - Date.now()))
       await byeAnswered(placed)
     }
     try {
+      // The steps before changed Wazo (flows, mailboxes): Asterisk's reloads for them are over before a call reaches a mailbox.
+      await sysconfdSettled()
       await leave('+33199000101', '+33639980041')
       await theirs('amartin', '101', '+33639980041')
       expectEqual(await boxAt('101'), `${alices}@${context}`, "the mailbox of 101: Alice's, at her number")
