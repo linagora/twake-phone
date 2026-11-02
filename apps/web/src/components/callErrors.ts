@@ -85,8 +85,18 @@ export const describeConferenceError = (err: unknown, t: T, { making = false, wh
   return t('conference.errorAction', { reason: err instanceof Error ? err.message : String(err) })
 }
 
-/** A softphone error in the person's language (the SIP status stays, for whoever reports it); anything else as it came. */
+/** Why the Gateway did not ring the person's phone (click-to-call, ADR 0033). */
+const GATEWAY_CODE_KEY: Record<string, Key> = {
+  CLICK_TO_CALL_RINGING: 'dialer.errorPhoneRinging',
+  CLICK_TO_CALL_NO_ANSWER: 'dialer.errorPhoneNoAnswer',
+  CLICK_TO_CALL_UNREACHABLE: 'dialer.errorServerUnreachable',
+  CLICK_TO_CALL_TIMEOUT: 'dialer.errorServerLate'
+}
+
+/** A softphone or Gateway error in the person's language (the SIP status stays, for whoever reports it); anything else as it came. */
 export const describeCallError = (err: unknown, t: T): string => {
+  const gateway = GATEWAY_CODE_KEY[(err as { code?: unknown } | null)?.code as string]
+  if (gateway) return t(gateway)
   if (!(err instanceof CallError)) return err instanceof Error ? err.message : String(err)
   const status = err.status === undefined ? '' : ` (${err.status})`
   if (err.code === 'transfer-failed' || err.code === 'transfer-no-answer') return t(TRANSFER_REASON_KEY[err.reason ?? 'failed'], { status })
