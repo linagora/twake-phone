@@ -1,6 +1,6 @@
 # ADR 0004 : OpenSIPS 3.6 et rtpengine tiennent les appels, devant l'IPBX
 
-Date : 2026-10-13. Révisé : 2026-11-14. État : acceptée. Remplacé par : aucun.
+Date : 2026-10-13. Révisé : 2026-11-14. État : acceptée. Remplacé par : aucun. Décidé dans le fil de discussion du projet du 13 octobre 2026.
 
 ## Contexte
 
@@ -41,21 +41,22 @@ sequenceDiagram
   Note over A,B: média A <-> rtpengine <-> B
 ```
 
-Appel entre deux navigateurs, sans IPBX ni Wazo (`opensips.cfg.tpl`: `www_authorize` 865, `lookup` 3580, `rtpengine_offer` 431, `rtpengine_answer` 454).
+Appel entre deux navigateurs, sans IPBX ni Wazo (`opensips.cfg.tpl`: `www_authorize` 865, `proxy_authorize` 992, `lookup` 3580, `rtpengine_offer` 431, `rtpengine_answer` 454).
 
 ## Compromis
 
 - Gagné : les appels internes ne touchent ni Asterisk ni Wazo, donc un redémarrage ou une panne de Wazo ne les coupe pas ; les refus se font avant l'opérateur ; l'appel survit à un redémarrage d'OpenSIPS.
 - Perdu / coût : un serveur de plus à exploiter, un langage de script à apprendre, une compétence rare.
 - Limite connue : pour une seule organisation de quelques centaines de postes, Wazo seul aurait suffi pour les fonctions de base (appels, renvois, groupes, trunk). Ce qu'OpenSIPS ajoute vraiment : le réveil par Web Push avec l'appel retenu, la politique avant l'opérateur, l'indépendance vis-à-vis de Wazo, les dialogues en base. Le refaire autour de Wazo demanderait d'écrire à la main, entre le navigateur et Asterisk, le réveil par push avec appel retenu et les refus avant l'opérateur (non essayé). Les atouts « opérateur » (multi-domaine, anti-flood, traçage HEP) ne sont pas en service. Aucun chiffre de capacité : rien n'est mesuré.
+- Ce que Wazo seul aurait apporté : le multi-tenant d'origine, une seule brique SIP, une compétence plus courante, et pas de script OpenSIPS de 4 662 lignes à maintenir.
 - Compétence OpenSIPS à acquérir ; Kamailio reste le repli.
 
 ## Alternatives écartées
 
-- Asterisk seul : pas de réveil par push avec appel retenu, pas de refus avant l'opérateur, et un redémarrage coupe tous les appels.
-- Wazo seul : même limite (Wazo est Asterisk plus des API) ; il suffirait pour une organisation sans réveil par push.
-- Kamailio : même famille, mais pas d'interface d'administration des trunks maintenue ; repli si l'équipe n'adopte pas OpenSIPS.
-- FreeSWITCH : un serveur média de plus, aucun gain sur le chemin SIP.
+- Asterisk seul : le réveil d'un navigateur par Web Push et les refus avant l'opérateur seraient à écrire dans le dialplan ou en AGI ; un redémarrage d'Asterisk coupe les appels en cours (non vérifié ici).
+- Wazo seul : Wazo est Asterisk plus des API ; il a un push pour son app mobile, pas vérifié pour le Web Push d'un navigateur avec l'appel retenu (non vérifié). Il suffirait pour une organisation sans ce besoin.
+- Kamailio : même famille, même rôle ; écarté pour l'outillage d'administration (non vérifié ici) ; repli si l'équipe n'adopte pas OpenSIPS.
+- FreeSWITCH : un serveur média de plus, aucun gain sur le chemin SIP (non vérifié ici).
 - Flexisip + IPBX : un serveur SIP de plus pour rien dès que Linphone sort du jeu (ADR 0002).
 
 ## Code

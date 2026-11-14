@@ -1,6 +1,6 @@
 # ADR 0031 : Twake Chat ouvre TwakePhone sur un numéro (`/?dial=`), le reste de l'intégration attend
 
-Date : 2026-10-20. Révisé : 2026-11-14. État : proposée. Remplacé par : aucun. Suit l'ADR 0006.
+Date : 2026-10-20. Révisé : 2026-11-14. État : proposée. Remplacé par : aucun. Suit l'ADR 0006. Décidée à l'étape 9 du plan (« Intégration Twake Chat », secondaire), avec la PR jumelle de Twake Chat (`feat/twake-phone-integration`).
 
 ## Contexte
 

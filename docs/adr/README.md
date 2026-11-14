@@ -41,14 +41,14 @@ Limites communes aujourd'hui : un seul tenant dans le chemin d'appel (`use_domai
 | [0016](0016-trunk-dispatcher-dialplan.md) | Le trunk passe par OpenSIPS, tout numéro non permis est refusé avant l'opérateur ; trunk vers le PABX d'un client possible, jamais essayé | acceptée |
 | [0017](0017-droits-plafonds-fraude-repli.md) | Droits, plafonds et seuils de fraude décidés par OpenSIPS avant l'opérateur ; le repli d'un numéro direct sonne à l'intérieur | acceptée |
 | [0018](0018-meet-livekit-sip-derriere-opensips.md) | Meet entre par la téléphonie de Meet upstream (décision du 2026-11-13) ; code pas encore aligné | acceptée, code pas encore aligné |
-| [0019](0019-appel-devient-conference.md) | « Ajouter un participant » : la salle LiveKit appelle la fenêtre puis l'autre poste (`Replaces`), sous l'autorisation de la passerelle ; code Meet pas encore aligné | proposée |
+| [0019](0019-appel-devient-conference.md) | « Ajouter un participant » : la salle LiveKit appelle la fenêtre puis l'autre poste (`Replaces`), sous l'autorisation de la passerelle ; repose sur le dial-out, absent de Meet upstream | proposée |
 | [0020](0020-hub-webhooks-signes.md) | Hub de webhooks signés HMAC, livrés au moins une fois depuis une file PostgreSQL, vers les seuls domaines autorisés ; `trunk.degraded` | proposée |
 | [0021](0021-provider-ovh.md) | `provider-ovh` tient le renvoi de repli des lignes et relève les CDR pour les rapprocher de l'historique ; non vérifié contre OVH | proposée |
 | [0022](0022-messagerie-wazo-derriere-opensips.md) | Messagerie vocale Wazo derrière OpenSIPS : boîte de l'extension composée, une boîte par titulaire, un seul écrivain sous bail | proposée |
 | [0023](0023-transcription-linto-bot-matrix.md) | Transcription par LinTO STT et avis par un bot Matrix ; texte lu par le seul titulaire | proposée |
 | [0024](0024-sites-localisation-urgences.md) | Un appel d'urgence présente le numéro du site de l'appelant, lu par OpenSIPS, avec repli en mémoire ; aucun `Geolocation` | proposée |
-| [0025](0025-conference-avec-l-operateur.md) | Un appel avec l'opérateur devient une conférence en rappelant son numéro ; l'appel d'origine est gardé jusqu'à la confirmation de la personne | proposée |
-| [0026](0026-conference-en-visio.md) | « Passer en visio » : salle Meet restreinte, chaque participant rappelé, aucun appel déplacé | proposée |
+| [0025](0025-conference-avec-l-operateur.md) | Un appel avec l'opérateur devient une conférence en rappelant son numéro ; l'appel d'origine est gardé jusqu'à la confirmation de la personne ; repose sur le dial-out, absent de Meet upstream | proposée |
+| [0026](0026-conference-en-visio.md) | « Passer en visio » : salle Meet restreinte, chaque participant rappelé, aucun appel déplacé ; repose sur le dial-out, absent de Meet upstream | proposée |
 | [0027](0027-wazo-fait-sonner-les-navigateurs.md) | Wazo fait sonner les navigateurs par `mid_registrar` et un socket de lignes à part ; aucun appel interne par Wazo | proposée |
 | [0028](0028-svi-files-groupes-sequentiels.md) | Parcours d'appel (groupe séquentiel, file, SVI) réglés dans la passerelle, exécutés par Wazo, atteints par OpenSIPS (`call_flows`) | proposée |
 | [0029](0029-enregistrement-supervision-wazo.md) | Enregistrement et supervision des appels qui ont un canal Wazo, par l'AMI (`MixMonitor`, `ChanSpy`) | proposée |

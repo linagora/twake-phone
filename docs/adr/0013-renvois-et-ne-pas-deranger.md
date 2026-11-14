@@ -1,6 +1,6 @@
 # ADR 0013 : renvois et « ne pas déranger » dans `call_rules`, écrite par la passerelle, lue par OpenSIPS à chaque appel
 
-Date : 2026-10-15. Révisé : 2026-11-14. État : acceptée. Remplacé par : aucun.
+Date : 2026-10-15. Révisé : 2026-11-14. État : acceptée. Remplacé par : aucun. Décidée à la PR de l'étape 4b, dans le fil de discussion du projet, qui traite aussi le constat n°15 de la revue de la PR 10 (présence choisie rangée par poste, en mémoire) et les constats de la revue de la PR 13.
 
 ## Contexte
 

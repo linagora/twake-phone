@@ -1,6 +1,6 @@
 # ADR 0026 : « Passer en visio » : une salle de Meet restreinte, d'où chaque participant est rappelé
 
-Date : 2026-10-19. Révisé : 2026-11-14. État : proposée. Remplacé par : aucun.
+Date : 2026-10-19. Révisé : 2026-11-14. État : proposée. Remplacé par : aucun. Décidée à la PR de l'étape 8d, dans le fil de discussion du projet.
 
 ## Contexte
 

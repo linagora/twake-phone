@@ -1,6 +1,6 @@
 # ADR 0030 : deux interfaces rtpengine, interne et externe, choisies par côté d'appel
 
-Date : 2026-10-20. Révisé : 2026-11-14. État : proposée. Remplacé par : aucun. Précise l'ADR 0016 (trunk) et l'ADR 0018 (média vers LiveKit SIP).
+Date : 2026-10-20. Révisé : 2026-11-14. État : proposée. Remplacé par : aucun. Précise l'ADR 0016 (trunk) et l'ADR 0018 (média vers LiveKit SIP). Décidée à la PR `fix/rtpengine-interfaces`, après un appel réel sur un trunk OVHcloud (2026-10-20).
 
 ## Contexte
 

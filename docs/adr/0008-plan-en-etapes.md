@@ -1,6 +1,6 @@
 # ADR 0008 : plan en étapes avec porte de sortie, PR par fonctionnalité, revue indépendante
 
-Date : 2026-10-13. Révisé : 2026-11-14. État : acceptée. Remplacé par : aucun.
+Date : 2026-10-13. Révisé : 2026-11-14. État : acceptée. Remplacé par : aucun. Décidé dans le fil de discussion du projet du 13 octobre 2026.
 
 ## Contexte
 

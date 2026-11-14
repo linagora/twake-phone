@@ -1,6 +1,6 @@
 # ADR 0023 : transcription des messages par LinTO STT, avis dans Twake Chat par un bot Matrix, faits par la passerelle qui écrit les boîtes
 
-Date : 2026-10-18. Révisé : 2026-11-14. État : proposée. Remplacé par : aucun. Suit l'ADR 0022.
+Date : 2026-10-18. Révisé : 2026-11-14. État : proposée. Remplacé par : aucun. Suit l'ADR 0022. Décidée à la PR de l'étape 11b, dans le fil de discussion du projet.
 
 ## Contexte
 

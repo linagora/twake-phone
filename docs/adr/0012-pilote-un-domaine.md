@@ -1,6 +1,6 @@
 # ADR 0012 : un pilote sur une machine, un domaine derrière Caddy, SIP sur WebSocket par le port 443
 
-Date : 2026-10-14. Révisé : 2026-11-14. État : acceptée. Remplacé par : aucun.
+Date : 2026-10-14. Révisé : 2026-11-14. État : acceptée. Remplacé par : aucun. Décidée à la PR du kit pilote, dans le fil de discussion du projet, quand le test réel a été demandé avant l'étape 4b.
 
 ## Contexte
 

@@ -1,6 +1,6 @@
 # ADR 0021 : `provider-ovh` : l'API d'OVH tient le renvoi de repli des lignes du trunk et fournit les CDR rapprochés de l'historique
 
-Date : 2026-10-17. Révisé : 2026-11-14. État : proposée. Remplacé par : aucun.
+Date : 2026-10-17. Révisé : 2026-11-14. État : proposée. Remplacé par : aucun. Décidée à la PR de l'étape 10b, dans le fil de discussion du projet.
 
 **Rien n'est vérifié contre le vrai OVHcloud.** Le client est écrit d'après la documentation publique de l'API et joué contre un faux serveur (`packages/provider-ovh/test/fake-ovh.mjs`).
 

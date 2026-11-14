@@ -1,6 +1,6 @@
 # ADR 0015 : sans fenêtre ouverte, OpenSIPS retient l'appel pendant que la passerelle réveille le navigateur par Web Push
 
-Date : 2026-10-15. Révisé : 2026-11-14. État : acceptée. Remplacé par : aucun.
+Date : 2026-10-15. Révisé : 2026-11-14. État : acceptée. Remplacé par : aucun. Décidée à la PR de l'étape 5, dans le fil de discussion du projet.
 
 ## Contexte
 

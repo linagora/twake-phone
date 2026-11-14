@@ -1,6 +1,6 @@
 # ADR 0024 : un appel d'urgence présente le numéro du site de l'appelant, lu par OpenSIPS seul ; aucun `Geolocation`
 
-Date : 2026-10-19. Révisé : 2026-11-14. État : proposée. Remplacé par : aucun. Complète les ADR 0016 (urgences) et 0017 (FR-C9).
+Date : 2026-10-19. Révisé : 2026-11-14. État : proposée. Remplacé par : aucun. Complète les ADR 0016 (urgences) et 0017 (FR-C9). Décidée à la PR de l'étape 6c, dans le fil de discussion du projet.
 
 ## Contexte
 

@@ -1,6 +1,6 @@
 # ADR 0014 : groupes d'appel dans `call_groups`, lue par OpenSIPS ; le nom de chaque partie vient de l'annuaire
 
-Date : 2026-10-15. Révisé : 2026-11-14. État : acceptée. Remplacé par : aucun.
+Date : 2026-10-15. Révisé : 2026-11-14. État : acceptée. Remplacé par : aucun. Décidée à la PR de l'étape 4c, dans le fil de discussion du projet.
 
 ## Contexte
 

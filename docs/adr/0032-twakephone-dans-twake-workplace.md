@@ -1,6 +1,6 @@
 # ADR 0032 : TwakePhone dans Twake Workplace, par une coquille Cozy qui l'encadre
 
-Date : 2026-10-30. Révisé : 2026-11-14. État : proposée. Remplacé par : aucun. Précise 0006 ; s'appuie sur 0031.
+Date : 2026-10-30. Révisé : 2026-11-14. État : proposée. Remplacé par : aucun. Précise 0006 ; s'appuie sur 0031. Décidée à l'étape 9 du plan, dans le fil de discussion du projet (« faire ce qu'il manque pour arriver au niveau du POC »).
 
 ## Contexte
 

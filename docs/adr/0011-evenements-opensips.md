@@ -1,6 +1,6 @@
 # ADR 0011 : OpenSIPS pousse ses événements à la passerelle, qui l'interroge par MI ; le CDR fait foi
 
-Date : 2026-10-14. Révisé : 2026-11-14. État : acceptée. Remplacé par : aucun.
+Date : 2026-10-14. Révisé : 2026-11-14. État : acceptée. Remplacé par : aucun. Décidée à la PR 4a (étape 4), dans le fil de discussion du projet, après une sonde sur la stack locale.
 
 ## Contexte
 

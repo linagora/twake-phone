@@ -1,6 +1,6 @@
 # ADR 0005 : Wazo Platform derrière OpenSIPS, pour la messagerie, le SVI, les files et l'enregistrement
 
-Date : 2026-10-13. Révisé : 2026-11-14. État : acceptée. Remplacé par : aucun. Précisé par : ADR 0022 (messagerie, 11a), ADR 0027 (`mid_registrar` et lignes, 11c-1), ADR 0028 (parcours), ADR 0029 (enregistrement).
+Date : 2026-10-13. Révisé : 2026-11-14. État : acceptée. Remplacé par : aucun. Précisé par : ADR 0022 (messagerie, 11a), ADR 0027 (`mid_registrar` et lignes, 11c-1), ADR 0028 (parcours), ADR 0029 (enregistrement). Décidé dans le fil de discussion du projet du 13 octobre 2026.
 
 ## Contexte
 

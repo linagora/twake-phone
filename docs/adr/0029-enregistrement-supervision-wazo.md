@@ -1,6 +1,6 @@
 # ADR 0029 : enregistrement et supervision des appels qui passent par Wazo, par l'AMI d'Asterisk
 
-Date : 2026-10-20. Révisé : 2026-11-14. État : proposée. Remplacé par : aucun. Précise 0005 ; s'appuie sur 0022 et 0027.
+Date : 2026-10-20. Révisé : 2026-11-14. État : proposée. Remplacé par : aucun. Précise 0005 ; s'appuie sur 0022 et 0027. Décidée à la PR de l'étape 11d, dans le fil de discussion du projet.
 
 ## Contexte
 

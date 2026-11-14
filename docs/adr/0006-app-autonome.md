@@ -1,6 +1,6 @@
 # ADR 0006 : application web autonome, Twake Chat l'affiche sans pile SIP
 
-Date : 2026-10-13. Révisé : 2026-11-14. État : acceptée. Remplacé par : aucun.
+Date : 2026-10-13. Révisé : 2026-11-14. État : acceptée. Remplacé par : aucun. Décidé dans le fil de discussion du projet du 13 octobre 2026.
 
 ## Contexte
 

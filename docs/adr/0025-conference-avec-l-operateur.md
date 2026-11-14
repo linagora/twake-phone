@@ -1,6 +1,6 @@
 # ADR 0025 : un appel avec l'opérateur devient une conférence en rappelant son numéro depuis la salle
 
-Date : 2026-10-19. Révisé : 2026-11-14. État : proposée. Remplacé par : aucun.
+Date : 2026-10-19. Révisé : 2026-11-14. État : proposée. Remplacé par : aucun. Décidée à la PR de l'étape 8c, dans le fil de discussion du projet.
 
 ## Contexte
 

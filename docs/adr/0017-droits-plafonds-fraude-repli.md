@@ -1,6 +1,6 @@
 # ADR 0017 : droits, plafonds et seuils décidés par OpenSIPS avant l'opérateur ; le repli d'un numéro direct sonne à l'intérieur
 
-Date : 2026-10-15. Révisé : 2026-11-14 (première révision le 2026-10-16). État : acceptée. Remplacé par : aucun.
+Date : 2026-10-15. Révisé : 2026-11-14 (première révision le 2026-10-16). État : acceptée. Remplacé par : aucun. Décidée à la PR de l'étape 6b, dans le fil de discussion du projet.
 
 ## Contexte
 

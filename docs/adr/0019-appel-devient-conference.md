@@ -1,6 +1,6 @@
 # ADR 0019 : « Ajouter un participant » : un appel entre deux postes devient une conférence dans une salle LiveKit
 
-Date : 2026-10-16. Révisé : 2026-11-14. État : proposée. Remplacé par : aucun.
+Date : 2026-10-16. Révisé : 2026-11-14. État : proposée. Remplacé par : aucun. Décidée à la PR de l'étape 8b, dans le fil de discussion du projet.
 
 ## Contexte
 

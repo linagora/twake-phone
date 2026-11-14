@@ -1,6 +1,6 @@
 # ADR 0010 : les softphones transfèrent par REFER et Replaces, OpenSIPS reste un proxy
 
-Date : 2026-10-14. Révisé : 2026-11-14. État : acceptée. Remplacé par : aucun.
+Date : 2026-10-14. Révisé : 2026-11-14. État : acceptée. Remplacé par : aucun. Décidée à la PR 3b (étape 3), dans le fil de discussion du projet, après le e2e à trois navigateurs.
 
 ## Contexte
 

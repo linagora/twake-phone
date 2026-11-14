@@ -1,6 +1,6 @@
 # ADR 0022 : la messagerie vocale sur Wazo derrière OpenSIPS : socket dédié, boîte de l'extension composée, une boîte par titulaire
 
-Date : 2026-10-18. Révisé : 2026-11-14. État : proposée. Remplacé par : aucun. Précisée par les ADR 0027 (lignes Wazo) et 0028 (parcours d'appel) ; précise l'ADR 0005.
+Date : 2026-10-18. Révisé : 2026-11-14. État : proposée. Remplacé par : aucun. Précisée par les ADR 0027 (lignes Wazo) et 0028 (parcours d'appel) ; précise l'ADR 0005. Décidée à la PR de l'étape 11a, dans le fil de discussion du projet.
 
 ## Contexte
 

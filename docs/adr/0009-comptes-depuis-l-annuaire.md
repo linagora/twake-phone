@@ -1,6 +1,6 @@
 # ADR 0009 : les postes viennent de l'annuaire LDAP, qui fait foi
 
-Date : 2026-10-14. Révisé : 2026-11-14. État : acceptée. Remplacé par : aucun.
+Date : 2026-10-14. Révisé : 2026-11-14. État : acceptée. Remplacé par : aucun. Décidée à l'ouverture de la PR 2c (étape 2), dans le fil de discussion du projet.
 
 ## Contexte
 

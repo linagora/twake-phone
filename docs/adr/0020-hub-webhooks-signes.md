@@ -1,6 +1,6 @@
 # ADR 0020 : un hub de webhooks signés dans la passerelle, livrés au moins une fois depuis une file PostgreSQL
 
-Date : 2026-10-16. Révisé : 2026-11-14. État : proposée. Remplacé par : aucun.
+Date : 2026-10-16. Révisé : 2026-11-14. État : proposée. Remplacé par : aucun. Décidée à la PR de l'étape 10a, dans le fil de discussion du projet.
 
 ## Contexte
 

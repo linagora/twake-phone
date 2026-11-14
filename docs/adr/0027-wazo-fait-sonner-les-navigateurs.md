@@ -1,6 +1,6 @@
 # ADR 0027 : Wazo fait sonner les navigateurs par `mid_registrar`, sur un socket de lignes à part
 
-Date : 2026-10-19. Révisé : 2026-11-14. État : proposée. Remplacé par : aucun. Précise 0005 et 0022 ; 0028 s'y appuie.
+Date : 2026-10-19. Révisé : 2026-11-14. État : proposée. Remplacé par : aucun. Précise 0005 et 0022 ; 0028 s'y appuie. Décidée à la PR de l'étape 11c-1, dans le fil de discussion du projet.
 
 ## Contexte
 

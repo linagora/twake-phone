@@ -1,6 +1,6 @@
 # ADR 0028 : SVI, files et groupes séquentiels : des parcours d'appel réglés dans la passerelle, exécutés par Wazo
 
-Date : 2026-10-20. Révisé : 2026-11-14. État : proposée. Remplacé par : aucun. S'appuie sur 0027 et 0022 ; complète 0014 (les groupes simultanés restent à OpenSIPS).
+Date : 2026-10-20. Révisé : 2026-11-14. État : proposée. Remplacé par : aucun. S'appuie sur 0027 et 0022 ; complète 0014 (les groupes simultanés restent à OpenSIPS). Décidée à la PR de l'étape 11c-2, dans le fil de discussion du projet.
 
 ## Contexte
 

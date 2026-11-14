@@ -1,6 +1,6 @@
 # ADR 0016 : le trunk passe par OpenSIPS, tout numéro non permis est refusé avant l'opérateur
 
-Date : 2026-10-15. Révisé : 2026-11-14. État : acceptée. Remplacé par : aucun.
+Date : 2026-10-15. Révisé : 2026-11-14. État : acceptée. Remplacé par : aucun. Décidée à la PR de l'étape 6a, dans le fil de discussion du projet.
 
 ## Contexte
 
