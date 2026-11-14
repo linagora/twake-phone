@@ -15,6 +15,29 @@ L'étape 8a avait fait entrer les appels dans Meet par LiveKit SIP, avec un trun
 - Code pas encore aligné : `packages/conference-livekit` fait encore l'ancien modèle, décrit ci-dessous, jusqu'à son remplacement.
 - Dépendants à revoir : ADR 0019, 0025 et 0026 reposent sur le dial-out (la salle appelle une personne ou un numéro) ; le rappel depuis la salle n'existe pas dans Meet upstream.
 
+## Séquence
+
+```mermaid
+sequenceDiagram
+  participant T as Téléphone
+  participant O as OpenSIPS
+  participant S as LiveKit SIP
+  participant M as Backend Meet
+  participant L as LiveKit
+  L-->>M: webhook room_started
+  M->>S: crée la règle de dispatch (PIN de la salle)
+  T->>O: INVITE MEET_NUMBER
+  O->>S: INVITE (socket MEET_SIP)
+  S-->>T: demande le PIN (DTMF)
+  T->>S: PIN
+  S->>S: règle trouvée pour le PIN et le trunk
+  S->>L: le téléphone rejoint la salle
+  L-->>M: webhook room_ended
+  M->>S: efface la règle
+```
+
+Modèle cible, tiré de la doc de Meet upstream (https://github.com/suitenumerique/meet/blob/main/docs/features/telephony.md). Le passage par OpenSIPS est à confirmer avec Meet upstream.
+
 ## Code actuel, ancien modèle
 
 - Stack de dev : `livekit/livekit-server` v1.13.7, `livekit/sip` v1.17.0 et Redis 7.4.2, versions figées (`docker/docker-compose.sip.yml`).
