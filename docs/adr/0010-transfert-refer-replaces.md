@@ -1,33 +1,56 @@
-# ADR 0010 : transferts par REFER et Replaces de bout en bout, OpenSIPS reste un proxy
+# ADR 0010 : les softphones transfèrent par REFER et Replaces, OpenSIPS reste un proxy
 
-Date : 2026-10-14. État : acceptée. Décidée à la PR 3b (étape 3), dans le fil de discussion du projet, après le e2e à trois navigateurs ; remplacé par : aucun.
+Date : 2026-10-14. Révisé : 2026-11-14. État : acceptée. Remplacé par : aucun.
 
 ## Contexte
 
-Le plan tenait le transfert supervisé en WebRTC pour le risque technique de l'étape 3 : un REFER avec `Replaces` doit traverser OpenSIPS (module `dialog`) et rtpengine, et le navigateur qui reçoit l'INVITE avec `Replaces` doit le rattacher au bon dialogue. Le repli envisagé était un transfert piloté par la passerelle (interface MI d'OpenSIPS, ou un B2BUA).
+Le transfert supervisé était le risque technique de l'étape 3 : un REFER avec `Replaces` doit traverser OpenSIPS et rtpengine, et le navigateur visé doit rattacher l'INVITE au bon dialogue. Le repli était un transfert piloté par la passerelle (MI ou B2BUA).
 
 ## Décision
 
-Les transferts sont faits par les softphones eux-mêmes, en SIP standard, et OpenSIPS les relaie sans les comprendre :
+- Les transferts sont faits par les softphones (JsSIP, `packages/softphone`) en SIP standard ; OpenSIPS les relaie sans les comprendre.
+- Transfert direct : le transférant met son correspondant en attente et lui envoie un REFER (RFC 3515) vers le poste visé. Le correspondant appelle ce poste, rend compte par NOTIFY (100, 180, 200 ou l'échec), le transférant raccroche à l'appel passé ou reprend son correspondant.
+- Transfert supervisé : le transférant consulte le poste visé (second appel, le premier est mis en attente), puis envoie un REFER dont le `Refer-To` porte `Replaces` avec le dialogue de la consultation (RFC 3891, RFC 5589). Le poste visé répond sans sonner et raccroche la consultation.
+- OpenSIPS : REFER et NOTIFY sont des requêtes en dialogue admises par `match_dialog()` ; l'INVITE avec `Replaces` est un appel initial ordinaire (authentification, `lookup("location")`, rtpengine). Aucune logique de transfert dans la configuration.
+- Le navigateur suit un REFER seulement si le `Refer-To` est un poste ou numéro composable de son domaine SIP et s'il a moins de deux appels (`MAX_CALLS`) ; sinon il refuse (603). Il recopie `Referred-By` (RFC 3892).
+- Un transfert attend 30 s au plus le NOTIFY final (`TRANSFER_TIMEOUT_MS`), puis le transférant reprend son appel. Une consultation sans transfert rend l'appel en attente au transférant.
+- Pas de transfert aveugle sans attente, pas de transfert d'un appel qui sonne encore, pas de va-et-vient entre deux appels.
 
-- transfert direct : le transférant met son correspondant en attente, lui envoie un REFER (RFC 3515) vers le poste visé ; le correspondant appelle ce poste comme un appel à lui, rend compte par NOTIFY (100, 180, 200 ou l'échec), et le transférant raccroche quand l'appel est passé, ou reprend son correspondant si le poste visé n'a pas répondu ;
-- transfert supervisé : le transférant consulte le poste visé par un second appel (le premier est mis en attente automatiquement), puis envoie à son premier correspondant un REFER dont le `Refer-To` porte `Replaces` avec le dialogue de la consultation (RFC 3891, RFC 5589). Le correspondant appelle le poste visé avec cet en-tête ; le navigateur visé reconnaît le dialogue à remplacer, répond sans sonner et raccroche la consultation.
+## Séquence
 
-Côté OpenSIPS : REFER et NOTIFY sont des requêtes en dialogue (`match_dialog()` les admet ; elles atteignent le bon WebSocket par le `Route` posé à l'INVITE et la cible distante du dialogue, `fix_nated_contact` ne corrigeant que le `Contact` qu'elles porteraient), l'INVITE avec `Replaces` est un appel initial comme un autre (authentifié, `lookup("location")`, rtpengine) : aucune logique de transfert dans la configuration. rtpengine ne voit que des appels ordinaires qui naissent et meurent.
+```mermaid
+sequenceDiagram
+  participant J as Jean (transférant)
+  participant O as OpenSIPS
+  participant A as Alice (transférée)
+  participant B as Bob (visé)
+  J->>O: INVITE Bob (consultation)
+  O->>B: INVITE
+  B-->>J: 200 (Alice en attente)
+  J->>O: REFER Alice, Refer-To Bob + Replaces
+  O->>A: REFER (match_dialog)
+  A-->>J: 202, NOTIFY 100
+  A->>O: INVITE Bob + Replaces + Referred-By
+  O->>B: INVITE (appel initial)
+  B-->>A: 200, BYE de la consultation
+  A-->>J: NOTIFY 200
+  J->>O: BYE Alice
+```
 
-Le e2e à trois navigateurs (`apps/web/test/sip.e2e.mjs`) joue les deux transferts, l'abandon d'une consultation (par le transférant, par le collègue, et vers un poste absent) et un transfert vers un poste absent (404 rendu au transférant, en français), avec des paquets RTP comptés des deux côtés après chaque transfert.
+Transfert supervisé de bout en bout ; tracé depuis `opensips.cfg.tpl:583` (`match_dialog`), `:1038` (INVITE `Replaces`) et `packages/softphone/src/index.ts:735,1279`.
 
-## Conséquences
+## Compromis
 
-- Un flux audio par appel dans le softphone (deux appels au plus : celui en cours et celui en attente) ; l'attente automatique à la consultation.
-- Le navigateur qui reçoit un REFER le suit sans demander, à deux conditions qu'il vérifie lui-même : le `Refer-To` nomme un poste ou un numéro composable (mêmes caractères qu'au clavier) de son propre domaine SIP, et il n'a pas déjà deux appels ; sinon il refuse (NOTIFY 603). Il recopie le `Referred-By` reçu dans l'INVITE qu'il passe (RFC 3892), pour que le poste visé sache qui a demandé l'appel. Seul le correspondant d'un appel établi peut lui envoyer un REFER, et OpenSIPS ne relaie en dialogue que les dialogues qu'il a créés (Call-ID et les deux tags, aléatoires). À l'étape 6 (trunk), un `Refer-To` vers un numéro externe devra passer par la politique d'appel sortant de la passerelle (anti-fraude) avant d'être suivi : le domaine local seul ne suffira plus à le borner.
-- Un transfert attend au plus 30 s le rapport du correspondant (NOTIFY final) ; passé ce délai, ou si le correspondant raccroche avant, le transférant reprend son appel et lit pourquoi. Raccrocher pendant un transfert reste possible (le correspondant poursuit vers le poste visé) ; raccrocher la consultation pendant un transfert supervisé ne l'est pas (c'est son dialogue que le poste visé remplace).
-- Une consultation qui finit sans transfert (poste absent, refus, collègue qui raccroche, abandon) rend automatiquement l'appel mis en attente au transférant.
-- Avec deux appels, pas de va-et-vient entre les deux (reprendre l'un pendant que l'autre est en communication) : la consultation est une parenthèse courte, on la termine ou on transfère. À revoir si le besoin remonte du pilote.
-- Un transfert vers l'extérieur (trunk, étape 6) ou depuis un poste non SIP-standard (Wazo, étape 11) passera par le même REFER tant que l'autre bout le comprend ; un trunk qui ne l'accepte pas obligera OpenSIPS à le prendre en charge lui-même (B2BUA ou `uac_replace`), ce qui sera tranché à ce moment-là.
-- Pas de « transfert aveugle sans attente » ni de transfert d'un appel qui sonne encore : la personne décroche d'abord.
+- Gagné : aucune pièce de plus, aucun état d'appel côté serveur ; rtpengine ne voit que des appels ordinaires.
+- Perdu / coût : un REFER n'est suivi que par un softphone qui le comprend.
+- Limite connue : seul le correspondant d'un appel établi peut envoyer un REFER (dialogue créé par OpenSIPS : Call-ID et deux tags aléatoires). Raccrocher la consultation pendant un transfert supervisé est impossible (le poste visé remplace son dialogue).
+- Écart : l'ADR disait qu'un transfert vers l'extérieur ou depuis Wazo passerait par le même REFER ; le code refuse tout REFER dans un appel avec l'opérateur, LiveKit SIP ou une ligne Wazo (403, `Twake-Call-Refused: transfer-external`, `opensips.cfg.tpl:661`, ADR 0016).
 
 ## Alternatives écartées
 
-- Transfert piloté par la passerelle (MI, B2BUA) : une pièce de plus, un état d'appel à maintenir côté serveur, pour un besoin que les navigateurs couvrent déjà en SIP standard ; gardé comme repli pour les trunks.
-- Faire porter `Replaces` par OpenSIPS (`dialog` + `topology_hiding`) : masque les identités de dialogue aux navigateurs, sans intérêt sur une plateforme où tous les postes sont les siens.
+- Transfert piloté par la passerelle (MI, B2BUA) : une pièce de plus et un état serveur, pour un besoin que les navigateurs couvrent ; gardé comme repli pour les trunks.
+- `Replaces` porté par OpenSIPS (`dialog` + `topology_hiding`) : masque les identités de dialogue aux navigateurs, sans intérêt ici.
+
+## Code
+
+`docker/opensips/opensips.cfg.tpl`, `packages/softphone/src/index.ts`, `apps/web/test/sip.e2e.mjs` (trois navigateurs, RTP compté après chaque transfert).

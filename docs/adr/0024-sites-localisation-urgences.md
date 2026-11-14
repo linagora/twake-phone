@@ -1,38 +1,59 @@
-# ADR 0024 : la localisation des appels d'urgence passe par des sites : un appel d'urgence présente le numéro du site de l'appelant, lu par OpenSIPS seul ; aucun `Geolocation`
+# ADR 0024 : un appel d'urgence présente le numéro du site de l'appelant, lu par OpenSIPS seul ; aucun `Geolocation`
 
-Date : 2026-10-19. État : proposée. Décidée à la PR de l'étape 6c, dans le fil de discussion du projet (ligne « 6. Trunk OVH et anti-fraude » du plan, reste de 6b : « la localisation des urgences ») ; complète l'ADR 0016 (ligne « Urgences ») et l'ADR 0017 (FR-C9) ; remplacé par : aucun.
+Date : 2026-10-19. Révisé : 2026-11-14. État : proposée. Remplacé par : aucun. Complète les ADR 0016 (urgences) et 0017 (FR-C9).
 
 ## Contexte
 
-Un appel d'urgence part vers le trunk en présentant le numéro direct de l'appelant, sinon le numéro par défaut du trunk (ADR 0016). L'opérateur rattache ce numéro à l'adresse déclarée de la ligne, et c'est cette adresse que les secours reçoivent. Une organisation à plusieurs sites envoie donc les secours à l'adresse du numéro de l'appelant, ou, sans numéro direct, à celle du numéro par défaut : une seule. Les PR 17 et 18 l'ont laissé en limite assumée (« sans `Geolocation` »). En France, le moyen qui tient est celui-là : le numéro présenté est celui d'une ligne dont l'opérateur connaît l'adresse. Il manque de pouvoir dire, par site, quel numéro présenter, et à quel site chaque personne appartient. Les contraintes de l'ADR 0017 restent : OpenSIPS décide seul, une urgence ne dépend ni de la passerelle ni d'une requête lente, et ne fait jamais la requête des droits.
+Un appel d'urgence présente le numéro direct de l'appelant, sinon le numéro par défaut du trunk. L'opérateur rattache ce numéro à l'adresse déclarée de la ligne, et les secours reçoivent cette adresse : une organisation à plusieurs sites n'en a qu'une. Il faut dire, par site, quel numéro présenter. OpenSIPS décide seul : une urgence ne dépend ni de la passerelle ni d'une requête lente (ADR 0017).
 
 ## Décision
 
-**Un site** : un identifiant, un nom, une adresse postale (texte libre, pour les administrateurs et la personne), le trunk et le numéro E.164 qu'il présente pour les urgences, et ses membres (des personnes, par leur identifiant d'annuaire). Une personne est dans un site au plus. Les administrateurs les règlent dans la passerelle (`/v1/admin/sites`, tables `sites` et `site_members`) ; elles sont remises au fournisseur avec les trunks et les numéros directs (`setTrunks`, troisième argument) et écrites dans les tables d'OpenSIPS `emergency_sites` et `emergency_site_users`, que le script lit directement, comme `dids` : aucun rechargement.
+- Un site (`sites`, `site_members`, `/v1/admin/sites`) a un nom, une adresse postale (texte), un trunk, un numéro E.164 présenté et des membres. Une personne est dans un site au plus. Les sites sont écrits dans les tables d'OpenSIPS `emergency_sites` et `emergency_site_users`, lues directement par le script, comme `dids` : aucun rechargement.
+- Le numéro d'un site est un numéro direct du trunk qui sonne un poste ou un groupe : l'opérateur n'accepte comme appelant qu'un numéro de sa ligne, et les secours le rappellent. Il doit sonner une réception, pas une personne seule. L'exploitant le déclare chez l'opérateur avec l'adresse.
+- `route[trunk_out]` : pour un appel d'urgence, la requête du trunk (une jointure de plus, aucune requête à part) prend le trunk du site de l'appelant et présente, dans l'ordre, le numéro du site, le numéro direct, le numéro par défaut. Les autres appels sont inchangés. Les reprises de l'ADR 0016 restent.
+- Base muette : `timer_route[default_trunk]` garde en mémoire (`cachedb_local`, clés `dn:` et `es:`) les numéros directs et ceux des sites, chaque lecture avec sa génération ; `route[default_trunk]` les lit d'abord. Un site sur un autre trunk que le trunk par défaut n'a pas de repli.
+- Le lien d'une personne à son site est son identifiant, joint par `subscriber.holder`. Une personne sans compte ne présente rien ; une personne partie de l'annuaire sort du site à l'enregistrement suivant.
+- Si l'opérateur refuse le numéro du site avant toute sonnerie, l'appel repart une fois sur le même trunk avec le numéro direct, sinon celui du trunk (`route[emergency_fallback]`). Jamais après une sonnerie ou une erreur de serveur : les secours seraient appelés deux fois.
+- La passerelle garde un site valide : elle refuse de changer ou retirer un numéro qu'un site présente (`SITE_NUMBER_IN_USE`) et de supprimer un trunk qui porte des sites (`TRUNK_HAS_SITES`).
+- L'app dit la vérité : `GET /v1/me/emergency-site` ne donne le site que si OpenSIPS a le compte écrit pour la personne (`holdsAccount`) ; sinon les réglages disent que son numéro direct ou celui de l'organisation est présenté.
+- Pas de `Geolocation` ni de PIDF-LO (RFC 6442) : par valeur, un corps multipart que l'ADR 0016 refuse vers l'opérateur ; par référence, une URI que les centres français ne lisent pas ; un opérateur qui ne lit pas l'en-tête risque de refuser l'appel.
 
-**Le numéro doit être celui du trunk.** Le numéro d'un site est un numéro direct du trunk du site (une plage de `dids`) qui mène à un poste ou à un groupe : l'opérateur n'accepte comme appelant qu'un numéro de sa ligne, et les secours rappellent ce numéro. Le numéro par défaut du trunk n'en est un que s'il est aussi une plage qui sonne quelqu'un (400 `SITE_NUMBER_RINGS_NOBODY` sinon). L'exploitant le déclare chez l'opérateur avec l'adresse du site (un numéro par site, que l'opérateur rattache à l'adresse). La passerelle refuse (400) un numéro qui n'est ni l'un ni l'autre, un trunk inconnu, une personne qui n'est pas dans l'annuaire ; une personne déjà dans un autre site passe dans celui-ci. Supprimer un trunk supprime ses sites, comme ses numéros directs ; le lien d'une personne à son site est son identifiant, que la base d'OpenSIPS joint à `subscriber.holder` comme `outbound_users` : une personne qui n'a plus de compte ne présente plus rien, et le poste qu'elle laisse à un autre n'a pas son site.
+## Séquence
 
-**Ce que l'appel d'urgence présente.** Dans la requête du trunk qu'il fait déjà (`route[trunk_out]`, tables minuscules, aucune requête de plus), un appel d'urgence prend d'abord le trunk du site de l'appelant, présente le numéro du site, puis, à défaut, son numéro direct, puis le numéro par défaut du trunk. Les autres appels ne changent pas d'un octet : ni leur trunk, ni leur numéro. Toutes les reprises de l'ADR 0016 restent (trunk qui refuse ou ne répond pas : repli par le trunk par défaut ; aucun serveur : 503 `emergency`). Quand la base ne répond pas, le numéro du site est relu comme celui du numéro direct : `timer_route[default_trunk]` garde en mémoire (`cachedb_local`, clé `es:<poste>`, avec sa génération et le trunk par défaut pour lequel il a été lu) le numéro des sites du trunk par défaut, et `route[default_trunk]` le lit d'abord ; ce qu'une lecture réussie n'a plus ne se présente plus. Un site sur un autre trunk que le trunk par défaut n'a pas de repli en mémoire : si la base ne répond pas, l'appel part par le trunk par défaut avec son numéro (limite assumée : le numéro d'un autre trunk ne s'y présente pas).
+```mermaid
+sequenceDiagram
+  participant N as Navigateur
+  participant O as OpenSIPS
+  participant P as PostgreSQL
+  participant Op as Opérateur
+  N->>O: INVITE 112
+  O->>P: trunk + numéro du site
+  alt base muette
+    O->>O: es:<poste> en mémoire
+  end
+  O->>Op: INVITE (numéro du site)
+  alt refus avant sonnerie
+    O->>Op: INVITE (numéro direct, même trunk)
+  end
+  Op-->>O: 180, 200
+  O-->>N: 200
+```
 
-**Le numéro du site est celui que les secours rappellent.** Un appel d'urgence d'un membre ne présente donc plus son numéro direct : il présente celui du site, qui doit faire sonner quelqu'un du site (une réception, un poste de garde), pas une personne seule ; l'écran « Sites » le dit sous le champ. C'est le prix de l'adresse juste : le numéro direct d'une personne est rattaché par l'opérateur à une adresse que le site corrige. Un administrateur qui préfère le rappel direct ne met pas la personne dans un site.
+Il vient de `docker/opensips/opensips.cfg.tpl:1461` (`route[trunk_out]`), `:1492` (`route[default_trunk]`) et `:2106` (`route[emergency_fallback]`).
 
-**Les lectures en mémoire sont deux, chacune avec sa génération.** `dn:` (numéros directs) et `es:` (numéros de site) sont lues par `timer_route[default_trunk]` chacune pour elle-même : une lecture sans ligne (`-2`, plus aucun numéro direct, plus aucun site) compte comme réussie et fait avancer sa génération, donc rien d'ancien n'est plus présenté ; une lecture qui échoue ne change ni l'autre ni la sienne.
+## Compromis
 
-**L'app ne dit que ce qu'OpenSIPS appliquera.** Les personnes d'un site sont jointes aux comptes par `subscriber.holder`, que la passerelle écrit à chaque ouverture de session ; un compte plus ancien n'en a pas tant que son titulaire n'a pas ouvert de session. `GET /v1/me/emergency-site` interroge le fournisseur (`holdsAccount`) et ne donne le site que si le compte est écrit pour la personne ; sinon elle lit que son numéro direct est présenté, ce qu'OpenSIPS fait alors.
-
-**Une personne partie de l'annuaire** sort d'un site à l'enregistrement suivant de ce site (la liste d'un site ne la propose plus, et la passerelle ne la refuse plus si elle y était déjà).
-
-**L'app le dit.** `GET /v1/me/emergency-site` donne le site de la personne (nom, adresse, numéro) ; l'écran des réglages dit « Vos appels d'urgence partent du site X (adresse), avec le numéro Y », ou, sans site, qu'ils présentent son numéro direct ou celui de l'organisation, et d'en parler à un administrateur. Des textes en français et en anglais.
-
-**Pas de `Geolocation` ni de PIDF-LO (RFC 6442).** Par valeur, il faudrait un corps multipart : l'ADR 0016 les refuse vers l'opérateur (SDP seulement, 415) pour qu'aucune partie ISUP ne passe ; par référence, il faudrait une URI que le centre d'appels d'urgence sait lire, ce que les centres français n'ont pas ; et un opérateur qui ne lit pas cet en-tête risque de refuser l'appel, ce qu'une urgence ne doit pas risquer. La localisation transmise reste celle que l'opérateur tient pour le numéro présenté, que cet ADR rend juste par site.
-
-## Conséquences
-
-- Un site « Télétravail » (l'adresse du domicile, un numéro déclaré chez l'opérateur pour elle) est possible, mais l'app ne sait pas où est la personne : l'affectation reste celle d'un administrateur. Une personne qui change de site change de numéro d'urgence quand un administrateur le dit, pas avant.
-- La passerelle garde le numéro d'un site valide : elle refuse (409 `SITE_NUMBER_IN_USE`) de changer le numéro par défaut d'un trunk, ou de retirer ou raccourcir une plage de numéros directs, tant qu'un site présente un numéro qui n'en serait plus un ; l'administrateur change d'abord le numéro du site. La passerelle refuse aussi de supprimer un trunk qui porte des sites (409 `TRUNK_HAS_SITES`) : leurs personnes présenteraient un numéro déclaré ailleurs. Si l'opérateur refuse tout de même le numéro d'un site (déclaration manquante chez lui) avant toute sonnerie (403, 404, 484, 488, 603), et si le trunk du site est déjà le trunk par défaut, l'appel d'urgence repart une fois sur ce même trunk avec le numéro direct de l'appelant, sinon celui du trunk, quand c'est un autre numéro que celui refusé. Jamais après une sonnerie, un délai dépassé ou une erreur de serveur : les secours seraient appelés deux fois ou l'attente doublée.
-- Il reste à l'exploitant : déclarer chez l'opérateur l'adresse de chaque numéro de site, et vérifier avec lui que ses urgences sont acceptées sur ce trunk. Les obligations légales de localisation (code des postes et des communications électroniques) ne sont pas validées pour un usage au-delà d'un pilote ; `docker/pilot/README.md` le dit.
-- Prouvé contre l'opérateur simulé (`apps/web/test/trunk.sip.mjs`, sites réglés par les routes de la passerelle) : le 112 d'un membre présente le numéro de son site et prend le trunk du site, celui d'un autre sans site garde son numéro direct, un autre appel du même membre garde le sien, base verrouillée le numéro du site tient (même sans aucun numéro direct vers un compte, et un site retiré ne tient plus), un numéro de site refusé par l'opérateur repart sur le même trunk avec le numéro direct. Rien n'est vérifié contre un vrai opérateur.
+- Gagné : l'adresse juste par site ; l'urgence ne dépend jamais de la passerelle.
+- Perdu / coût : un membre d'un site ne présente plus son numéro direct ; le rappel va à la réception. Qui veut le rappel direct n'est pas mis dans un site.
+- Limite connue : l'app ne sait pas où est la personne (un site « Télétravail » reste une affectation manuelle). L'exploitant déclare l'adresse de chaque numéro chez l'opérateur ; les obligations légales de localisation ne sont pas validées au-delà d'un pilote (`docker/pilot/README.md`). Rien n'est vérifié contre un vrai opérateur.
 
 ## Alternatives écartées
 
-`Geolocation` ou PIDF-LO (voir plus haut). Un site par numéro direct (plage) : un site a plusieurs personnes, de plusieurs plages ou sans numéro direct, et c'est le site que l'opérateur rattache à une adresse. Lire le site dans une requête à part comme les droits (ADR 0017) : une requête lente retarderait une urgence. Garder les sites dans la passerelle seulement et leur demander le numéro à l'appel : l'urgence ne dépend jamais d'elle. Rattacher le site au poste (extension) : une extension qui change de main garderait l'adresse de l'ancien titulaire.
+- `Geolocation` ou PIDF-LO : voir plus haut.
+- Un site par plage de numéros directs : un site a plusieurs personnes et plages.
+- Lire le site dans une requête à part : une requête lente retarderait une urgence.
+- Rattacher le site au poste : un poste qui change de main garderait l'adresse de l'ancien titulaire.
+
+## Code
+
+`docker/opensips/opensips.cfg.tpl`, `packages/provider-opensips/src/trunks.ts`, `apps/gateway/src/app.ts` (`/admin/sites`, `/me/emergency-site`), `apps/gateway/migrations/020_sites.sql`.
