@@ -19,7 +19,7 @@ Une décision, un fichier, numéroté dans l'ordre où elle a été prise. Un AD
 | API OVH | renvoi de repli des lignes, relevé des CDR | l'opérateur du pilote | non vérifié contre le vrai OVH | service commercial, sans objet | [0021](0021-provider-ovh.md) |
 | Coquille Cozy | TwakePhone dans Twake Workplace | l'app tourne dans Workplace sans second écran | encadrée dans un cadre, connexion par fenêtre | AGPL-3.0 du dépôt ; cozy-stack non vérifié | [0032](0032-twakephone-dans-twake-workplace.md) |
 
-Limites communes aujourd'hui : un seul tenant dans le chemin d'appel (`use_domain 0` d'`auth_db`, un seul tenant de trunks par base OpenSIPS, un seul tenant créé chez Wazo). Pas de redondance : un OpenSIPS, un rtpengine, une passerelle, une base ; les enregistrements `usrloc` sont en mémoire. Pas de mesure de charge : aucune capacité n'est annoncée. Un modèle multi-tenant est en discussion (une pile par client, ou une pile partagée) ; rien n'est décidé.
+Limites communes aujourd'hui : un seul tenant dans le chemin d'appel (`use_domain 0` d'`auth_db`, un seul tenant de trunks par base OpenSIPS, un seul tenant créé chez Wazo). Pas de redondance : un OpenSIPS, un rtpengine, une passerelle, une base ; les enregistrements `usrloc` sont en mémoire. Pas de mesure de charge : aucune capacité n'est annoncée. Le SaaS se fera sur une pile partagée, un domaine SIP et un tenant Wazo par organisation (ADR 0036) ; pas encore codé.
 
 | ADR | Décision | État |
 |---|---|---|

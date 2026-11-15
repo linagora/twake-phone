@@ -1,6 +1,6 @@
 # ADR 0036 : SaaS multi-tenant sur une pile partagée, un domaine SIP par client
 
-Date : 2026-11-15. État : acceptée, code pas encore aligné. Remplacé par : aucun. Précise : ADR 0004, 0005, 0016. Décidée dans le fil de discussion du projet le 2026-11-15, après une consultation de l'équipe par messages directs (2026-11-14).
+Date : 2026-11-15. État : acceptée, code pas encore aligné. Remplacé par : aucun. Précise : ADR 0004, 0005, 0016. Décidée dans le fil de discussion du projet le 2026-11-15, après une consultation par messages directs le 2026-11-14 : trois personnes consultées, une réponse (contre une pile par client, sans avis sur Wazo).
 
 ## Contexte
 
@@ -9,12 +9,18 @@ TwakePhone sera vendu en SaaS dans Twake Workplace, à plusieurs organisations. 
 ## Décision
 
 - Une seule pile (OpenSIPS, rtpengine, PostgreSQL, Wazo, passerelle) sert toutes les organisations. Pas de pile par client.
-- Chaque organisation a son domaine SIP. OpenSIPS passe en multi-domaine : `use_domain 1` pour `auth_db`, `usrloc` et `registrar`, et le module `domain` relie le domaine au `tenant_id`.
-- Les postes, les contacts, les règles d'appel, les groupes et les numéros directs sont indexés par `(tenant, poste)`. Le poste 101 de deux clients sont deux postes distincts.
-- Chaque organisation a son tenant Wazo. La passerelle choisit le tenant Wazo d'après le `tenant_id`, au lieu de `WAZO_TWAKEPHONE_TENANT`.
-- `DEFAULT_TENANT` ne reste qu'en mode dev et pour une installation à un seul client. En SaaS, le tenant vient du jeton OIDC.
-- Les plafonds par poste et par organisation existent déjà (ADR 0017, `opensips.cfg.tpl:1881`) ; sur la pile commune, ceux de l'organisation empêchent un client de prendre toute la capacité.
-- Trunk : chaque organisation a ses trunks, dont un trunk vers son propre PABX (ADR 0016).
+- Chaque organisation a son domaine SIP. OpenSIPS passe en multi-domaine (`use_domain 1`).
+- Les postes, les contacts, les règles d'appel, les groupes et les numéros directs sont indexés par `(tenant, poste)`. Le poste 101 de deux clients désigne deux postes distincts.
+- Chaque organisation a son tenant Wazo, au lieu du seul tenant `WAZO_TWAKEPHONE_TENANT`.
+
+## À préciser
+
+Propositions, pas encore décidées :
+
+- Modules OpenSIPS touchés : `use_domain` sur `auth_db` et `usrloc`, et le module `domain` pour relier un domaine au `tenant_id` (non vérifié dans la doc d'OpenSIPS 3.6).
+- Source du tenant d'une session : le jeton OIDC de LemonLDAP (attend les faits sur LemonLDAP). `DEFAULT_TENANT` resterait pour le mode dev et une installation à un seul client.
+- Trunks par organisation : la table `trunks` a déjà un `tenant_id` (`packages/provider-opensips/src/trunks.ts:82`), mais une base OpenSIPS ne sert qu'un tenant de trunks.
+- Partage de la capacité : les plafonds par organisation ne bornent que les appels sortants (`route[outbound_limit]`, `opensips.cfg.tpl:1883`). Rien n'empêche encore une organisation de prendre toute la capacité de la pile en appels internes.
 
 ## Séquence
 
@@ -30,7 +36,7 @@ sequenceDiagram
   N->>O: INVITE sip:102@acme.phone…
   O->>P: call_rules, droits de (102, acme)
   O->>O: lookup location (102, acme)
-  O-->>N: 200 OK (poste 102 d'acme, jamais celui de beta)
+  O->>N: INVITE vers le poste 102 d'acme, jamais celui de beta
   N->>O: INVITE vers la messagerie
   O->>W: INVITE vers le tenant acme
 ```
@@ -39,7 +45,7 @@ Modèle cible. Aujourd'hui, `save` et `lookup` n'utilisent que le numéro (`dock
 
 ## Code actuel, à aligner
 
-- OpenSIPS : `modparam("auth_db", "use_domain", 0)` (`opensips.cfg.tpl:133`) ; `usrloc` en `single-instance-no-db` (`:144`) ; les requêtes SQL du script filtrent par `username` sans tenant (par exemple `:1476`).
+- OpenSIPS : `modparam("auth_db", "use_domain", 0)` (`opensips.cfg.tpl:133`) ; `usrloc` en `single-instance-no-db` (`:144`) ; les requêtes SQL du script filtrent par `username` sans tenant (par exemple `subscriber s WHERE s.username = $rU` à `:3385`).
 - Wazo : un seul tenant, `TWAKE_TENANT = os.environ.get('WAZO_TWAKEPHONE_TENANT','twakephone')` (`docker/wazo/bootstrap.py:25`).
 - Passerelle : `DEFAULT_TENANT` fixe le tenant de l'authentification (`apps/gateway/src/auth.ts:210`), de l'annuaire (`ldap-directory.ts:267`), du trunk OVH (`main.ts:186`) et des boîtes vocales (`main.ts:193`).
 
@@ -47,12 +53,11 @@ Modèle cible. Aujourd'hui, `save` et `lookup` n'utilisent que le numéro (`dock
 
 - Gagné : une seule pile à exploiter, à surveiller et à faire monter en charge ; un nouveau client se crée par des lignes en base, sans déploiement.
 - Perdu / coût : gros chantier sur le script OpenSIPS (4 662 lignes) et sur la passerelle ; une panne de la pile touche tous les clients.
-- Limite connue : une erreur de filtre (une requête sans tenant) mélange deux clients ; chaque requête du script devra être testée avec deux tenants. Capacité de la pile commune non mesurée (banc de charge à venir).
+- Limite connue : une erreur de filtre (une requête sans tenant) mélange deux clients ; chaque requête du script devra être testée avec deux tenants. Capacité de la pile commune non mesurée (banc de charge à venir). Découper Wazo autrement (une instance par client, par exemple) n'a pas été étudié.
 
 ## Alternatives écartées
 
-- Une pile par client, créée par le chart : isolation forte et peu de code à changer, mais le coût et l'exploitation montent avec chaque client ; écartée à la consultation.
-- Une pile par client pour la seule partie Wazo : non étudiée ; le découpage de Wazo reste à mesurer au banc de charge.
+- Une pile par client, créée par le chart : isolation forte et peu de code à changer, mais le coût et l'exploitation montent avec chaque client .
 
 ## Code
 
