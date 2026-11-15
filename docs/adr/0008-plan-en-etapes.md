@@ -1,6 +1,6 @@
 # ADR 0008 : plan en étapes avec porte de sortie, PR par fonctionnalité, revue indépendante
 
-Date : 2026-10-13. État : acceptée. Décidé dans le fil de discussion du projet du 13 octobre 2026 ; remplacé par : aucun.
+Date : 2026-10-13. Révisé : 2026-11-14. État : acceptée. Remplacé par : aucun. Décidé dans le fil de discussion du projet du 13 octobre 2026.
 
 ## Contexte
 
@@ -12,12 +12,20 @@ L'équipe développe en vibecoding : la vitesse vient de l'IA, le contrôle doit
 - Chaque fonctionnalité ou correctif est une branche et une PR vers `main`. Rien n'est poussé sur `main` directement.
 - Chaque PR reçoit une revue indépendante, menée par un relecteur sans contexte de l'auteur, avec consigne de chercher ce qui casse (« roast »). Les constats réels sont corrigés avant fusion ; ceux rejetés sont justifiés dans la PR.
 - Les e2e sont la preuve : unitaires et contrat de stockage en CI sur chaque PR ; `yarn e2e:*` et `platform.e2e.mjs` sur la stack Docker à chaque porte de sortie.
-
-## Conséquences
-
-- `.github/workflows/ci.yml` et `.github/pull_request_template.md` portent ces règles.
 - Un test n'est jamais désactivé ni mis en quarantaine pour passer.
+- `.github/workflows/ci.yml` et `.github/pull_request_template.md` portent ces règles.
+
+## Compromis
+
+- Gagné : chaque changement est relu et prouvé par un test qui tourne.
+- Perdu / coût : des e2e longs sur la stack Docker ; une revue de plus par PR.
+- Limite connue : aucun banc de charge, donc aucune porte de sortie ne dit combien d'appels la stack tient.
 
 ## Alternatives écartées
 
-Planning en semaines : faux dès la deuxième semaine. Fusion directe sur `main` : pas de relecture.
+- Planning en semaines : faux dès la deuxième semaine.
+- Fusion directe sur `main` : pas de relecture.
+
+## Code
+
+`.github/workflows/ci.yml`, `.github/pull_request_template.md`.

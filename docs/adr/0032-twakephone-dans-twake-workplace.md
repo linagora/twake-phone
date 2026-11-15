@@ -1,55 +1,48 @@
 # ADR 0032 : TwakePhone dans Twake Workplace, par une coquille Cozy qui l'encadre
 
-Date : 2026-10-30. État : proposée. Décidée à l'étape 9 du plan, dans le fil de discussion du projet (« faire ce qu'il manque pour arriver au niveau du POC ») ; précise l'ADR 0006 (app autonome) et s'appuie sur l'ADR 0031 (`/?dial=`) ; remplacé par : aucun.
+Date : 2026-10-30. Révisé : 2026-11-14. État : proposée. Remplacé par : aucun. Précise 0006 ; s'appuie sur 0031. Décidée à l'étape 9 du plan, dans le fil de discussion du projet (« faire ce qu'il manque pour arriver au niveau du POC »).
 
 ## Contexte
 
-Le POC était une app Cozy dans Twake Workplace : TwakePhone dans la grille d'apps et sous la barre Twake, l'intent `CALL` qui rendait cliquable un numéro de Drive, Contacts ou Mail (`@twake/phone-link`). L'ADR 0006 a remplacé l'app Cozy par une app web autonome (OIDC) et l'a retirée à la PR 3c : depuis, TwakePhone n'est plus dans Workplace, et `phone-link` ouvre une app qui n'existe plus. La fiche produit « Integrated Softphone » (TWP-633) et la réponse au CCTP CANUT §7.4.6.2 demandent pourtant les deux : un écran « Softphonie » dans Workplace, et le click-to-call sur tout numéro affiché.
+Le POC était une app Cozy ; 0006 l'a remplacée par une app web autonome (OIDC), donc TwakePhone n'est plus dans Workplace et `phone-link` ouvre une app absente. La fiche TWP-633 et le CCTP CANUT §7.4.6.2 demandent un écran « Softphonie » et le click-to-call sur tout numéro. Workplace a une forme pour cela : la coquille (`cozy-twakechat`, `cozy-twakemail`).
 
-Twake Workplace a une forme pour les apps qui ont leur propre service : la **coquille** (`cozy-twakechat`, `cozy-twakemail`), une vraie app Cozy qui affiche la barre Twake et encadre le service à l'adresse d'un drapeau (`client_url_flag`, `<slug>.embedded-app-url`), avec `cozy-external-bridge-container` pour lui transmettre le chemin.
+## Décision
 
-## Scénario de démo (écrit avant le code)
+- `apps/workplace` : une app Cozy (slug `phone`, drapeau `phone.embedded-app-url`), barre Twake, `apps/web` dans une iframe `allow="microphone; autoplay; clipboard-write"`. Aucune dépendance Cozy dans `apps/web`. `FRAME_ANCESTORS` nomme les instances.
+- Encadrée, la connexion s'ouvre dans une fenêtre (`signinPopup`, `twakephone-signin`), au clic seulement : le fournisseur d'identité refuse d'être encadré (LemonLDAP::NG : non vérifié). Session renouvelée par `offline_access`.
+- L'intent `CALL` (`io.twake.phone.number`) : le service `/intents` valide (`toDialTarget`) et confie le numéro par `BroadcastChannel` à une fenêtre visible qui prend un Web Lock (`dial-claim`, `twakephone.dial`, accusé `twakephone.dial-ack` 1 s). Sans fenêtre en 400 ms : `phone-link` ouvre `#/bridge/?dial=<numéro>`. Rien n'est composé.
+- Les contacts `io.cozy.contacts` de la personne nomment, après l'annuaire, les numéros E.164 inconnus, jamais un poste interne ; un numéro partagé par deux noms ne nomme personne. Demandés par le pont (`requestParentOrigin`), 1 000 par page ; la passerelle ne les voit jamais.
 
-1. L'administrateur installe l'app `phone` et règle le drapeau `phone.embedded-app-url` sur l'adresse de TwakePhone ; TwakePhone autorise l'instance à l'encadrer (`FRAME_ANCESTORS`).
-2. Alice ouvre « Twake Phone » dans la grille : la barre Twake, et TwakePhone dessous. Elle clique « Se connecter » : une fenêtre du fournisseur d'identité s'ouvre et se ferme (SSO), TwakePhone est connecté dans le cadre.
-3. Dans Drive, Alice clique un numéro (`phone-link`) : TwakePhone, ouvert à côté, a ce numéro dans son clavier ; rien n'est composé tant qu'elle n'appuie pas sur « Appeler ». Sans TwakePhone à l'écran, un onglet Twake Phone s'ouvre sur le numéro.
+## Séquence
 
-## Décisions
+```mermaid
+sequenceDiagram
+  participant D as Drive (phone-link)
+  participant C as Coquille (/intents)
+  participant F as Fenêtre Twake Phone
+  participant T as TwakePhone (cadre)
+  D->>C: intent CALL (numéro)
+  C->>F: BroadcastChannel, dial-claim (Web Lock)
+  F->>T: postMessage twakephone.dial
+  T-->>F: twakephone.dial-ack (/?dial=, rempli)
+  Note over C: sans fenêtre : onglet #/bridge/?dial=
+```
 
-### 1. Une coquille, pas une seconde application
+Source : `apps/workplace/src/dialRelay.js`, `apps/web/src/embedded.ts:27`.
 
-`apps/workplace` reprend `cozy-twakechat` (même licence) : `manifest.webapp` (slug `phone`, `client_url_flag: phone.embedded-app-url`), barre Twake (`cozy-bar`), et TwakePhone (`apps/web`) dans une iframe `allow="microphone; autoplay; clipboard-write"`. Aucune dépendance Cozy n'entre dans `apps/web` ; l'ADR 0006 tient (app autonome, OIDC). Comme les apps Cozy, la coquille a son propre lockfile, hors des workspaces ; elle prend `toDialTarget` dans `packages/telephony-client` construit, par alias. Elle attend les drapeaux avant son premier rendu (sans quoi elle dirait « non configuré »).
+## Compromis
 
-### 2. Encadré, TwakePhone se connecte dans une fenêtre
-
-Un fournisseur d'identité refuse en général d'être encadré (LemonLDAP::NG a une protection contre l'encadrement ; non vérifié sur une instance réelle). Encadrée (`window.self !== window.top`), l'app ouvre la connexion dans une fenêtre nommée `twakephone-signin` (`signinPopup`, `popupAbortOnClose` : fermée par la personne, la page le dit), au clic seulement : un navigateur bloque une fenêtre ouverte sans clic, donc l'app encadrée ne se connecte jamais d'elle-même (ouverte par la notification d'un appel, elle attend le clic). La page de retour dans cette fenêtre rend la réponse au cadre (`signinPopupCallback` : par `window.opener`, sinon par un `BroadcastChannel` d'oidc-client-ts) et se ferme ; le cadre termine l'échange. Hors cadre, rien ne change (redirection). La session encadrée se renouvelle par le jeton de rafraîchissement (`offline_access`, le défaut) : sans lui, oidc-client-ts essaierait un cadre caché chez le fournisseur, qui le refuse.
-
-### 3. Click-to-call : l'intent `CALL` passe le numéro à une fenêtre visible, sinon l'app s'ouvre dessus
-
-`phone-link` crée l'intent `CALL` (`io.twake.phone.number`). Le service de la coquille (`/intents`) valide le numéro (`toDialTarget`) et le confie, par un `BroadcastChannel` de son origine, à une fenêtre Twake Phone **visible**. La fenêtre qui obtient le verrou Web Lock de la demande le garde plus longtemps que la demande n'attend (une fenêtre qui l'entend en retard le trouve pris), le dit tout de suite (`dial-claim`), poste le numéro à son cadre (`twakephone.dial`, vers l'origine de TwakePhone) et attend sa réponse (`twakephone.dial-ack`, 1 s) : le cadre ne l'accepte que de son parent, ouvre `/?dial=` (ADR 0031 : rempli, jamais composé) et ne répond que s'il est connecté. Un navigateur sans Web Locks ne prend rien (il ne saurait le limiter à une fenêtre). Une fenêtre en arrière-plan ne le prend pas : elle remplirait un clavier que personne ne voit. Personne en 400 ms, ou un cadre qui ne répond pas : `phone-link` ouvre la coquille sur `#/bridge/?dial=<numéro>`, que le pont transmet au cadre comme `/?dial=`, dans un nouvel onglet coupé de la page (sans `opener`) ; un onglet bloqué par le navigateur est dit « non traité », jamais « ouvert ». Un intent qui ne répond pas en 4 s ouvre l'app de même (un navigateur n'ouvre un onglet que dans les 5 s qui suivent le clic).
-
-Toute app de l'instance peut ainsi remplir le clavier : c'est le rôle de l'intent, et rien ne part sans « Appeler ».
-
-### 4. Les contacts de la personne dans Workplace nomment les numéros que l'annuaire ne connaît pas
-
-Le POC nommait les numéros par `io.cozy.contacts`. Encadrée, l'app demande au pont de la coquille son origine (`requestParentOrigin`, 1 s) puis tous ses contacts, page par page (`fetchJSON` sur `_normal_docs`, 1 000 par page : `getContacts` n’en lit que 100 ; 5 s), une fois par page ; un parent qui ne répond pas n’est pas Workplace et n’est plus demandé, par le même échange que la bibliothèque `cozy-external-bridge` (`comlink`), sur un canal qui n'écoute que la fenêtre parente et son origine ; un parent qui n'a pas répondu est redemandé par l'écran suivant, par le même pont (jamais libéré : la coquille ne l'expose qu'une fois). Ils nomment, après l'annuaire de l'organisation, les numéros complets (E.164) des Récents, de la messagerie et du panneau d'appel (un numéro que le serveur SIP ne nomme pas) : jamais un poste interne, même enregistré tel quel dans un contact ; un numéro que deux contacts de noms différents partagent ne nomme personne ; un contact de la corbeille ne compte pas. Le nom est lu à l'affichage : l'appel du softphone n'est jamais copié. La coquille demande `io.cozy.contacts` en lecture ; son pont envoie les documents entiers au cadre, qui n'en garde en mémoire que le nom, les numéros, le courriel et la société ; la passerelle ne les voit jamais. Un tel contact n'a pas de fiche dans l'annuaire : aucun écran ne propose de l'ouvrir. Toute page que `FRAME_ANCESTORS` autorise à encadrer TwakePhone pourrait lui donner des noms : la liste ne doit nommer que les instances.
-
-## Ce qui reste
-
-- **Le widget** (`@twake/phone-widget`, carte d'appel et appel entrant dans l'app hôte) : son service n'existe pas. La notification Web Push de l'étape 5 montre déjà un appel entrant quand on est dans Drive ; contrôler un appel en cours sans quitter Drive demande le widget, une PR à part.
-- **Les apps hôtes** : Drive, Contacts et Mail n'utilisent pas encore `phone-link` ; c'est hors de ce dépôt.
-- **Essai réel** : la popup sur LemonLDAP::NG (un `Cross-Origin-Opener-Policy` qui couperait le lien entre la popup et le cadre), et la publication sur le registre Cozy (`cozyPublish`, jeton d'éditeur), ne sont pas faites. L'e2e joue un faux cozy-stack et un fournisseur d'identité de test.
-- **Le cloisonnement des navigateurs** : un `BroadcastChannel` et un verrou Web Lock sont cloisonnés par site de premier niveau. Si le domaine des instances est dans la liste des suffixes publics (`mycozy.cloud` l'est), Drive et Twake Phone sont deux sites : l'intent ne joint aucune fenêtre et l'app s'ouvre dans un onglet. Le délai pour ouvrir un onglet après le clic varie selon le navigateur (court dans Safari) : l'aller-retour de l'intent peut le dépasser, l'onglet est alors bloqué et dit « non traité ». L'e2e tourne sur un seul site, dans Chromium.
-- **Le relais à une fenêtre** : la première fenêtre visible qui a le verrou prend le numéro, même si son cadre n'est pas connecté (un onglet s'ouvre alors, une autre fenêtre connectée l'aurait pris) ; un cadre qui répond après 1 s remplit son clavier alors qu'un onglet s'ouvre aussi (deux claviers, rien de composé). L'e2e ne joue ni fenêtre en arrière-plan ni deux fenêtres pour un verrou.
-- **Le cadre en vrai** : cozy-stack envoie avec la page de l'app un `Content-Security-Policy` ; son `frame-src` doit admettre l'origine de TwakePhone (`csp_allowlist` de la pile). Le faux cozy-stack de l'e2e n'en envoie pas.
-- **Notifications dans un cadre** : un navigateur qui isole le stockage des cadres tiers abonne le cadre à part de l'onglet autonome ; les notifications d'appel s'activent dans l'app ouverte seule (Réglages).
-
-## Conséquences
-
-- `phone-link` ouvre `#/bridge/?dial=` au lieu de `#/dialer?dial=` (l'app du POC).
-- `yarn e2e:web` reste l'e2e de l'app ; `apps/workplace/test/workplace.e2e.mjs` joue la coquille (faux cozy-stack, app web servie par son serveur de production, connexion par la fenêtre, lien `#/bridge/?dial=`, Récents nommés par un contact Workplace, intent `CALL` avec et sans fenêtre, texte refusé), dans un job CI à part.
-- `FRAME_ANCESTORS` de TwakePhone doit nommer les origines de l'app `phone` des instances.
+- Gagné : TwakePhone dans la grille d'apps sans seconde application ; un lien ne compose jamais (0031).
+- Coût : un cadre tiers, une connexion par fenêtre.
+- Limite connue : `BroadcastChannel` et Web Lock sont cloisonnés par site (un domaine de la liste des suffixes publics sépare Drive de Twake Phone : l'app s'ouvre dans un onglet). La première fenêtre visible prend le numéro même si son cadre est déconnecté. Le `frame-src` de cozy-stack doit admettre l'origine de TwakePhone. Non fait : le widget (0034), l'essai sur LemonLDAP::NG, la publication au registre Cozy, l'usage de `phone-link` par Drive, Contacts et Mail. L'e2e joue un faux cozy-stack, un seul site, Chromium.
 
 ## Alternatives écartées
 
-Remettre l'app Cozy du POC (deux applications à tenir, ADR 0006). Un intent qui compose (le POC le faisait en mode CTI ; ici un lien ne compose jamais, ADR 0031). Relayer à une fenêtre en arrière-plan (un clavier rempli que personne ne voit). La connexion dans le cadre par redirection (refusée par le fournisseur d'identité).
+- Remettre l'app Cozy du POC : deux applications (0006).
+- Un intent qui compose : un lien ne compose jamais.
+- Relayer à une fenêtre en arrière-plan : un clavier que personne ne voit.
+- Connexion dans le cadre par redirection : refusée par le fournisseur d'identité.
+
+## Code
+
+`apps/workplace/` (`manifest.webapp`, `src/dialRelay.js`, `test/workplace.e2e.mjs`), `apps/web/src/embedded.ts`, `apps/web/src/auth/AuthProvider.tsx`, `packages/phone-link/src/index.tsx`.
