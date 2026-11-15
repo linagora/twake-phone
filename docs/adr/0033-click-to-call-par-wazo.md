@@ -1,6 +1,6 @@
 # ADR 0033 : click-to-call, Wazo fait sonner le téléphone de la personne puis appelle le numéro à son nom
 
-Date : 2026-10-30. Révisé : 2026-11-14. État : proposée. Remplacé par : aucun. S'appuie sur 0027, 0029 et 0018. Décidée dans le fil de discussion du projet (« faire ce qu'il manque pour arriver au niveau du POC »).
+Date : 2026-10-30. Révisé : 2026-11-14. État : acceptée. Remplacé par : aucun. S'appuie sur 0027, 0029 et 0018. Décidée dans le fil de discussion du projet (« faire ce qu'il manque pour arriver au niveau du POC »).
 
 ## Contexte
 

@@ -1,6 +1,6 @@
 # ADR 0034 : le widget des autres apps est une télécommande de la fenêtre Twake Phone, pas un téléphone
 
-Date : 2026-10-30. Révisé : 2026-11-14. État : proposée. Remplacé par : aucun. S'appuie sur 0032.
+Date : 2026-10-30. Révisé : 2026-11-14. État : acceptée. Remplacé par : aucun. S'appuie sur 0032.
 
 ## Contexte
 

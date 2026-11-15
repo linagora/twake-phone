@@ -27,7 +27,7 @@ Limites communes aujourd'hui : un seul tenant dans le chemin d'appel (`use_domai
 | [0002](0002-softphone-navigateur.md) | Softphone WebRTC dans le navigateur ; Linphone desktop retiré | acceptée |
 | [0003](0003-jssip.md) | JsSIP remplace SIP.js ; même sémantique SIP que `sip_ua` pour le mobile | acceptée |
 | [0004](0004-opensips-seul.md) | OpenSIPS 3.6 et rtpengine tiennent les appels devant l'IPBX : pourquoi pas Asterisk ou Wazo seul ; `pike`, `ratelimit` et HEP pas en service | acceptée |
-| [0005](0005-wazo-etape-11.md) | Wazo Platform derrière OpenSIPS pour messagerie, SVI, files, enregistrement ; un seul tenant Wazo | acceptée |
+| [0005](0005-wazo-etape-11.md) | Wazo Platform derrière OpenSIPS pour messagerie, SVI, files, enregistrement ; un seul tenant Wazo aujourd'hui, un par organisation en SaaS (0036) | acceptée |
 | [0006](0006-app-autonome.md) | Application web autonome sur OIDC ; Twake Chat l'intègre sans pile SIP | acceptée |
 | [0007](0007-fastify-postgresql.md) | Passerelle Fastify/TypeScript et PostgreSQL, seul stockage | acceptée |
 | [0008](0008-plan-en-etapes.md) | Plan en étapes avec porte de sortie, une PR par changement, revue indépendante | acceptée |
@@ -55,8 +55,9 @@ Limites communes aujourd'hui : un seul tenant dans le chemin d'appel (`use_domai
 | [0030](0030-deux-interfaces-rtpengine.md) | Deux interfaces rtpengine, `internal` et `external`, choisies à chaque offre | proposée |
 | [0031](0031-integration-twake-chat-liens-tel.md) | Twake Chat ouvre TwakePhone sur `/?dial=` : numéro rempli, jamais composé par le lien seul | proposée |
 | [0032](0032-twakephone-dans-twake-workplace.md) | TwakePhone dans Workplace par une coquille Cozy ; intent `CALL` qui remplit le clavier ; contacts de Workplace | proposée |
-| [0033](0033-click-to-call-par-wazo.md) | Click-to-call : Wazo sonne la ligne (`Originate`), puis `Dial` vers la cible sous l'autorisation d'OpenSIPS | proposée |
-| [0034](0034-widget-telecommande.md) | Le widget est une télécommande de la fenêtre Twake Phone, relayée par la coquille ; pas de softphone | proposée |
+| [0033](0033-click-to-call-par-wazo.md) | Click-to-call : Wazo sonne la ligne (`Originate`), puis `Dial` vers la cible sous l'autorisation d'OpenSIPS | acceptée |
+| [0034](0034-widget-telecommande.md) | Le widget est une télécommande de la fenêtre Twake Phone, relayée par la coquille ; pas de softphone | acceptée |
 | [0035](0035-cluster-de-dev.md) | Cluster de dev : images publiées sur Harbor par la CI ; pod en réseau de l'hôte refusé par l'infra, chemin du son à décider | proposée |
+| [0036](0036-saas-pile-partagee.md) | SaaS : une pile partagée, un domaine SIP et un tenant Wazo par organisation, clés `(tenant, poste)` ; code pas encore aligné | acceptée, code pas encore aligné |
 
 Gabarit : date, révision, état et « remplacé par » ; contexte (2 à 4 phrases) ; décision (3 à 8 puces) ; séquence Mermaid quand un flux est la décision ; compromis (gagné, perdu, limite) ; alternatives écartées ; code. Un écart entre l'ADR et le code s'écrit « Écart : … » avec le fichier et la ligne. Une décision cite le fil ou le compte rendu où elle a été prise, pas une personne.

@@ -17,7 +17,7 @@ Le POC branchait le navigateur directement sur le PBX et déclarait le trunk dan
 - Wazo vient derrière OpenSIPS pour ce qu'OpenSIPS ne fait pas : messagerie, SVI, files, enregistrement (ADR 0005).
 - Écart : l'ADR annonçait `pike`, `ratelimit`, HEP vers Homer, renvois et NPD par `dialplan`/`drouting`. Le code n'a aucun `loadmodule` de `pike`, `ratelimit` ni `proto_hep`/`siptrace` ; `dialplan` ne sert qu'à la numérotation ; `drouting` est chargé pour le seul arbre de préfixes de `fraud_detection`, aucun appel n'est routé par lui (`opensips.cfg.tpl:325-328`). Pas de limite de débit sur les REGISTER (`docker/README.md:49`).
 - Écart : `usrloc` est en `single-instance-no-db` (`opensips.cfg.tpl:144`) : les enregistrements sont en mémoire, les fenêtres se réenregistrent après un redémarrage.
-- Écart : `auth_db` `use_domain 0` (`opensips.cfg.tpl:133`) : un seul domaine SIP, pas de multi-domaine.
+- Écart : `auth_db` `use_domain 0` (`opensips.cfg.tpl:133`) : un seul domaine SIP, pas de multi-domaine ; le SaaS le demande (ADR 0036).
 
 ## Séquence
 
