@@ -1,6 +1,6 @@
 # ADR 0036 : SaaS multi-tenant sur une pile partagée, un domaine SIP par client
 
-Date : 2026-11-15. État : acceptée, code pas encore aligné. Remplacé par : aucun. Précise : ADR 0004, 0005, 0016. Décidée par Clément le 2026-11-15, après l'avis de Quentin Valmori (« pas question d'avoir une pile par client ») ; Thibaud Delobelle et Romain Valmori consultés, sans réponse.
+Date : 2026-11-15. État : acceptée, code pas encore aligné. Remplacé par : aucun. Précise : ADR 0004, 0005, 0016. Décidée dans le fil de discussion du projet le 2026-11-15, après une consultation de l'équipe par messages directs (2026-11-14).
 
 ## Contexte
 
@@ -51,7 +51,7 @@ Modèle cible. Aujourd'hui, `save` et `lookup` n'utilisent que le numéro (`dock
 
 ## Alternatives écartées
 
-- Une pile par client, créée par le chart : isolation forte et peu de code à changer, mais le coût et l'exploitation montent avec chaque client ; refusée par Quentin et Clément.
+- Une pile par client, créée par le chart : isolation forte et peu de code à changer, mais le coût et l'exploitation montent avec chaque client ; écartée à la consultation.
 - Une pile par client pour la seule partie Wazo : non étudiée ; le découpage de Wazo reste à mesurer au banc de charge.
 
 ## Code
