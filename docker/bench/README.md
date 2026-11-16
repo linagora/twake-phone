@@ -4,11 +4,11 @@ A tool, not a test: it measures how much of the SIP stack (`docker/docker-compos
 strain first. Phase 1 has two scenarios. Calls with sound (phase 2) are not here.
 
 1. **Registrations held**, over a WebSocket (primary, as browsers) and over UDP. Steps of phones (250, 500, 1000, 2000,
-   4000, 8000), `Expires: 60`, refresh every 30 s, held 75 s after the last phone registered (two refreshes at least).
+   4000, 8000, 16000; UDP stops there, the host's ephemeral ports being about 28000), `Expires: 60`, refresh every 30 s, held 75 s after the last phone registered (two refreshes at least).
    What OpenSIPS holds is read from its MI (`usrloc` statistic `location-contacts`, the minimum of the samples taken
    during the hold), not from the 200 answers.
 2. **Calls per second**, extension to extension: INVITE with an SDP (plain RTP to a silent port), the callee answers 200
-   at once, 2 s held, BYE. Steps of 5, 10, 20, 40, 80, 160 calls/s for 30 s. After each step, rtpengine's sessions are
+   at once, 2 s held, BYE. Steps of 40, 80, 120, 160, 240, 320 calls/s for 30 s. After each step, rtpengine's sessions are
    counted 5 s and 40 s after the last BYE.
 
 A step passes when at least 99 % of the phones are held (or calls set up) and p95 is under 1 s (REGISTER to 200 with the
@@ -17,8 +17,11 @@ A step passes when at least 99 % of the phones are held (or calls set up) and p9
 ## What runs
 
 Only PostgreSQL, rtpengine and OpenSIPS (no Gateway, Wazo, LiveKit, Meet). Everything is at the compose defaults except
-rtpengine's port range (`docker-compose.bench.yml`: 36000-60000 instead of 30000-30400, which holds about a hundred
-calls). The CI's reduced caps (`MEET_CALLS_ALL` and others of the `sip-e2e` job) are not used. The effective settings
+three sizes (`docker-compose.bench.yml`, `opensips-bench.sh`): rtpengine's port range (23000-65000 instead of
+30000-30400, about a hundred calls), OpenSIPS's shared memory (`-m 1024`; not set by default) and `tcp_max_connections`
+(16384; not set in the script, the OpenSIPS default is 2048, which held exactly 2048 WebSocket phones in the first run).
+The stack (rtpengine, OpenSIPS) is restarted before each run; a run that starts on a stack that does not answer is
+marked INVALID, not failed. The CI's reduced caps (`MEET_CALLS_ALL` and others of the `sip-e2e` job) are not used. The effective settings
 (OpenSIPS environment and rendered `udp_workers`/`tcp_workers`, rtpengine ports, PostgreSQL `max_connections`,
 `ulimit -n` of the containers and of the generator) are printed in the result. A step that fails on one of them (for
 example OpenSIPS's `tcp_max_connections`, not set by the script) is a setting, not a capacity: say it so.

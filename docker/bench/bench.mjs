@@ -25,12 +25,12 @@ const OUT = env('BENCH_JSON', 'bench-result.json')
 const REPEATS = Number(env('BENCH_REPEATS', 3))
 const WORKERS = Number(env('BENCH_WORKERS', 2))
 const SCENARIOS = env('BENCH_SCENARIOS', 'reg-ws,reg-udp,calls').split(',')
-const REG_STEPS = list(env('BENCH_REG_STEPS', '250,500,1000,2000,4000,8000'))
+const REG_STEPS = list(env('BENCH_REG_STEPS', '250,500,1000,2000,4000,8000,16000'))
 const REG_EXPIRES = 60 // seconds: short, so that the refreshes happen inside each step
 const REG_REFRESH = 30 // seconds between a phone's refreshes (half the Expires: a browser renews a little before it ends)
 const REG_HOLD = Number(env('BENCH_REG_HOLD_SEC', 75)) // seconds held after the last phone registered: two refreshes at least
 const REG_RATE = Number(env('BENCH_REG_RATE', 400)) // phones started a second, all threads together
-const CALL_RATES = list(env('BENCH_CALL_RATES', '5,10,20,40,80,160'))
+const CALL_RATES = list(env('BENCH_CALL_RATES', '40,80,120,160,240,320'))
 const CALL_SECONDS = Number(env('BENCH_CALL_SECONDS', 30))
 const CALL_HOLD_MS = 2000
 const PASSWORD = 'bench-secret'
@@ -144,7 +144,9 @@ const procs = () => {
       const stat = readFileSync(`/proc/${pid}/stat`, 'utf8')
       const close = stat.lastIndexOf(')')
       const fields = stat.slice(close + 2).split(' ')
-      const family = out[stat.slice(stat.indexOf('(') + 1, close)]
+      // Node renames its threads: this process is told by its pid (all its threads count), the others by their name.
+      const name = stat.slice(stat.indexOf('(') + 1, close)
+      const family = pid === String(process.pid) ? out.node : name === 'node' ? undefined : out[name]
       if (!family) continue
       family.cpu += (Number(fields[11]) + Number(fields[12])) / TICKS
       family.rss += Number(fields[21]) * 4096
@@ -301,7 +303,21 @@ const gaveOut = (step, kind) => {
   const [name, busiest] = Object.entries(step.stack.process).sort((a, b) => b[1].cores - a[1].cores)[0]
   const drops = step.stack.udpDrops.InErrors + step.stack.udpDrops.RcvbufErrors
   const bound = step.generator.bound ? ` GENERATOR-BOUND (event loop ${step.generator.elu * 100} % busy, lag p99 ${step.generator.lagP99Ms} ms): the stack's limit is not shown, at least the step before.` : ''
-  return `${what}; busiest process ${name} (${busiest.cores} cores); UDP drops on this host ${drops}; first log error: ${step.stack.logErrors[0] ?? 'none'}.${bound}`
+  const dead = step.stackAliveAfter ? '' : ' OpenSIPS no longer answers its MI after this step (dead).'
+  return `${what}${dead}; busiest process ${name} (${busiest.cores} cores); UDP drops on this host ${drops}; first log error: ${step.stack.logErrors[0] ?? 'none'}.${bound}`
+}
+
+/**
+ * A stack that answers: OpenSIPS gives its MI statistic. Restarted between runs (and after a step that failed, the next
+ * run starts on a fresh one): a run that starts on a dead stack is invalid, not failed.
+ */
+const restartStack = async () => {
+  trySh(`${COMPOSE} restart rtpengine opensips && ${COMPOSE} up -d --wait --wait-timeout 180 opensips`)
+  for (let i = 0; i < 24; i++) {
+    if ((await contacts()) !== undefined) return true
+    await sleep(5000)
+  }
+  return false
 }
 
 /** Runs the steps of `name` into `result` (saved after each). */
@@ -309,6 +325,7 @@ const runScenario = async (name, result, save) => {
   const kind = name === 'calls' ? 'calls' : 'registrations'
   const steps = result.steps
   let prepared
+  if (!(await restartStack())) return Object.assign(result, { invalid: 'the stack did not answer after its restart', gaveOutFirst: 'INVALID run: the stack did not answer after its restart' })
   if (kind === 'calls') {
     const pairsCount = Math.max(...CALL_RATES) * 12 // calls last about 2 s: a pair is free again long before its turn
     await ensureAccounts(pairsCount * 2)
@@ -317,15 +334,20 @@ const runScenario = async (name, result, save) => {
     console.log(`  callees registered: ${sum(prepared.map(r => r.registered))} of ${pairsCount}`)
   }
   for (const size of kind === 'calls' ? CALL_RATES : REG_STEPS) {
+    if ((await contacts()) === undefined) {
+      Object.assign(result, { invalid: `OpenSIPS did not answer before the step ${size}` })
+      break
+    }
     const step = kind === 'calls' ? await callStep(size) : await registrationStep(size, name === 'reg-ws' ? 'ws' : 'udp')
+    step.stackAliveAfter = (await contacts()) !== undefined
     steps.push(step)
     save()
     console.log(`  ${name} ${size}: ${step.pass ? 'pass' : 'FAIL'} p95 ${step.p95Ms} ms${step.generator.bound ? ' (generator-bound)' : ''}`)
     if (!step.pass) break
   }
-  if (kind === 'calls') await askAll('callClose', () => ({ perSec: 200 }))
+  if (kind === 'calls' && !result.invalid && steps.every(s => s.stackAliveAfter)) await askAll('callClose', () => ({ perSec: 200 }))
   const failed = steps.find(s => !s.pass)
-  Object.assign(result, { passes: steps.filter(s => s.pass).length, fails: steps.filter(s => !s.pass).length, gaveOutFirst: failed ? gaveOut(failed, kind) : `nothing: all ${steps.length} steps passed, the stack was not taken to its limit (add larger steps)` })
+  Object.assign(result, { passes: steps.filter(s => s.pass).length, fails: steps.filter(s => !s.pass).length, gaveOutFirst: result.invalid ? `INVALID run: ${result.invalid}` : failed ? gaveOut(failed, kind) : `nothing: all ${steps.length} steps passed, the stack was not taken to its limit (add larger steps)` })
 }
 
 // ---- The report ----------------------------------------------------------------------------------------------------
@@ -361,13 +383,13 @@ const markdown = report => {
     const sizes = [...new Set(runs.flatMap(r => r.steps.map(s => sizeOf(s, kind))))].sort((a, b) => a - b)
     lines.push(`Spread over ${runs.length} runs (steps never reached are not counted):`, '', `| ${kind === 'calls' ? 'calls/s' : 'phones'} | runs passed | p95 ms (min-max) | ${kind === 'calls' ? 'set up' : 'held'} % (min-max) |`, '|---|---|---|---|')
     for (const size of sizes) {
-      const at = runs.flatMap(r => r.steps.filter(s => sizeOf(s, kind) === size))
+      const at = runs.filter(r => !r.invalid).flatMap(r => r.steps.filter(s => sizeOf(s, kind) === size))
       const p95s = at.map(s => s.p95Ms).filter(v => v !== undefined)
       const rates = at.map(s => (kind === 'calls' ? s.successRate : s.heldRate) * 100)
       lines.push(`| ${size} | ${at.filter(s => s.pass).length} of ${at.length} | ${p95s.length ? `${Math.min(...p95s)}-${Math.max(...p95s)}` : '-'} | ${round(Math.min(...rates), 1)}-${round(Math.max(...rates), 1)} |`)
     }
     runs.forEach((run, i) => {
-      lines.push('', `### Run ${i + 1}: passes ${run.passes}, fails ${run.fails}, gave out first: ${run.gaveOutFirst}`, '')
+      lines.push('', `### Run ${i + 1}${run.invalid ? ' (INVALID, not counted)' : ''}: passes ${run.passes}, fails ${run.fails}, gave out first: ${run.gaveOutFirst}`, '')
       lines.push(`| ${kind === 'calls' ? 'calls/s' : 'phones'} | ${kind === 'calls' ? 'set up' : 'held (min of samples)'} | failures | p50 / p95 ms | retransmissions | UDP InErrors / RcvbufErrors | CPU cores | RSS MB | generator busy / lag p99 |${kind === 'calls' ? ' rtpengine sessions left (5 s / 40 s) |' : ''} result |`)
       lines.push(`|---|---|---|---|---|---|---|---|---|${kind === 'calls' ? '---|' : ''}---|`)
       for (const step of run.steps) lines.push(stepRow(step, kind))
@@ -387,7 +409,8 @@ const settings = () => {
     opensips: {
       env: pick('opensips', ['SIP_DOMAIN', 'LISTEN_IP', 'DB_MAX_ASYNC_CONNECTIONS', 'PUSH_WAIT_SEC', 'CALL_PING_SEC', 'WAZO_SIP', 'WAZO_LINES', 'MEET_SIP', 'MEET_CALLS_ALL', 'TRUNK_MIN_CALL_SEC', 'RTPENGINE_INTERFACE_INTERNAL', 'RTPENGINE_INTERFACE_EXTERNAL', 'OPENSIPS_LOG_LEVEL']),
       rendered: container('opensips', 'grep -E "^(udp_workers|tcp_workers|tcp_max_connections|tcp_connection_lifetime|db_max_async_connections)" /etc/opensips/opensips.cfg').split('\n'),
-      tcpMaxConnections: 'not set in the script: the default of OpenSIPS (2048 by its documentation), not read from the process',
+      defaults: 'tcp_max_connections is not set by the script (OpenSIPS default 2048: exactly 2048 WebSocket phones were held in run 43834899085), shared memory not set (-m absent: the default of OpenSIPS); the bench raises both (docker/bench/opensips-bench.sh)',
+      commandLine: container('opensips', 'cat /proc/1/cmdline | tr "\\000" " "'),
       registrar: 'default_expires 300, max_expires 3600, max_contacts 10 (opensips.cfg.tpl), min_expires the default (60)',
       ulimitNofile: container('opensips', 'ulimit -n')
     },

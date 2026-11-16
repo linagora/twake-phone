@@ -1,9 +1,19 @@
-# Over docker/docker-compose.sip.yml for the load bench: the one limit that is only a size, rtpengine's port range
-# (30000-30400 holds about a hundred calls, each kept 30 s after its end), widened so that the calls a second step
-# is not stopped by it. Everything else stays at the compose defaults (docker/bench/README.md). Clear of the control
-# ports (22222, 22223).
+# Over docker/docker-compose.sip.yml for the load bench: the limits that are only sizes, widened so that a step is not
+# stopped by one of them (README.md). Everything else stays at the compose defaults.
+# - rtpengine's port range (30000-30400 holds about a hundred calls, each kept 30 s after its end): 23000-65000, clear
+#   of the control ports (22222, 22223).
+# - OpenSIPS's shared memory (`-m`, in MB; not set by default) and its TCP connection limit (`tcp_max_connections`, not
+#   set in the script, default 2048), by opensips-bench.sh: the stack's script is not changed. Its open files: 65536.
 services:
   rtpengine:
     environment:
-      RTPENGINE_PORT_MIN: "36000"
-      RTPENGINE_PORT_MAX: "60000"
+      RTPENGINE_PORT_MIN: "23000"
+      RTPENGINE_PORT_MAX: "65000"
+  opensips:
+    entrypoint: ["/bin/sh", "/bench/opensips-bench.sh"]
+    command: ["-m", "1024"]
+    # 16000 connections and as many sockets: more than the 1024 some Docker setups give by default.
+    ulimits:
+      nofile: 65536
+    volumes:
+      - ./bench/opensips-bench.sh:/bench/opensips-bench.sh:ro
