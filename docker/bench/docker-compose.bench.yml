@@ -1,0 +1,9 @@
+# Over docker/docker-compose.sip.yml for the load bench: the one limit that is only a size, rtpengine's port range
+# (30000-30400 holds about a hundred calls, each kept 30 s after its end), widened so that the calls a second step
+# is not stopped by it. Everything else stays at the compose defaults (docker/bench/README.md). Clear of the control
+# ports (22222, 22223).
+services:
+  rtpengine:
+    environment:
+      RTPENGINE_PORT_MIN: "36000"
+      RTPENGINE_PORT_MAX: "60000"

@@ -69,12 +69,12 @@ export default defineConfig(
   // Globals by where the code runs. They only matter to the .js and .mjs files: on TypeScript, `no-undef` is off
   // (typescript-eslint) and the compiler knows the globals from each tsconfig's `lib` and `types`.
   {
-    files: ['*.{js,mjs,ts}', 'apps/gateway/**', 'apps/web/server/**', 'apps/web/test/**', 'packages/*/test/**', '**/*.spec.{ts,tsx,mjs}'],
+    files: ['*.{js,mjs,ts}', 'apps/gateway/**', 'apps/web/server/**', 'apps/web/test/**', 'docker/bench/**', 'packages/*/test/**', '**/*.spec.{ts,tsx,mjs}'],
     languageOptions: { globals: { ...globals.node } }
   },
   {
     // The e2e also evaluate functions in the app's pages and in its service worker.
-    files: ['apps/web/test/**'],
+    files: ['apps/web/test/**', 'docker/bench/**'],
     languageOptions: { globals: { ...globals.browser, ...globals.serviceworker } }
   },
   {

@@ -5,6 +5,11 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      bench:
+        description: "Lancer le banc de charge SIP (docker/bench) à la place des autres jobs"
+        type: boolean
+        default: false
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -13,6 +18,7 @@ concurrency:
 jobs:
   gateway-and-packages:
     name: Paquets et passerelle (Node 24, PostgreSQL)
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.bench) }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     services:
@@ -79,6 +85,7 @@ jobs:
 
   workplace:
     name: App Twake Workplace (coquille, intent CALL)
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.bench) }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -111,6 +118,7 @@ jobs:
 
   sip-e2e:
     name: SIP (OpenSIPS, rtpengine, ${{ matrix.browser }})
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.bench) }}
     runs-on: ubuntu-latest
     timeout-minutes: 40
     strategy:
@@ -237,6 +245,7 @@ jobs:
 
   pilot:
     name: Kit pilote (images Docker, Caddy, Keycloak, LDAP, Chromium)
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.bench) }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -341,5 +350,48 @@ jobs:
         if: always()
         working-directory: docker/pilot
         run: docker compose down -v
+
+  # Le banc de charge (docker/bench/README.md) : à la demande seulement (`gh workflow run ci.yml -f bench=true`), il remplace
+  # alors les autres jobs. La pile est celle du compose, sans le plafond réduit du sip-e2e (MEET_CALLS_ALL, etc.) : seule
+  # la plage de ports de rtpengine est élargie (docker/bench/docker-compose.bench.yml). Seuls PostgreSQL, rtpengine et
+  # OpenSIPS tournent : ni la passerelle, ni Wazo, ni LiveKit.
+  bench:
+    name: Banc de charge SIP (phase 1)
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.bench }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: yarn
+      - name: Pile SIP minimale (PostgreSQL, rtpengine, OpenSIPS)
+        run: docker compose -f docker/docker-compose.sip.yml -f docker/bench/docker-compose.bench.yml up --build --wait --wait-timeout 420 opensips
+      - run: yarn install --frozen-lockfile
+      - name: Fournisseur OpenSIPS (les comptes `subscriber`)
+        run: npx tsc -b packages/provider-opensips
+      # Le fichier JSON est réécrit après chaque palier : il est publié même si le banc échoue ou est coupé par le délai.
+      - name: Banc (3 passages de chaque scénario)
+        run: |
+          ulimit -n 65536 2>/dev/null || ulimit -n "$(ulimit -Hn)"
+          node docker/bench/bench.mjs
+        env:
+          BENCH_JSON: bench-result.json
+      - name: Résultat (JSON et Markdown)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-result
+          path: |
+            bench-result.json
+            bench-result.md
+          if-no-files-found: warn
+      - name: Journaux de la pile en cas d'échec
+        if: failure()
+        run: docker compose -f docker/docker-compose.sip.yml -f docker/bench/docker-compose.bench.yml logs --no-color --timestamps --tail 300 opensips rtpengine postgres
+      - name: Arrêt de la pile
+        if: always()
+        run: docker compose -f docker/docker-compose.sip.yml -f docker/bench/docker-compose.bench.yml down -v
 
   # yarn e2e:web, yarn e2e:sip et yarn e2e:pilot tournent ci-dessus : tous les e2e du dépôt se jouent en CI.
