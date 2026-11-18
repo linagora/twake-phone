@@ -16,8 +16,6 @@
 
 ---
 
----
-
 ## En bref
 
 - **Rien à installer.** Le softphone tourne dans le navigateur (WebRTC), connecté par la session Twake.
@@ -32,14 +30,14 @@
 
 | Domaine | Fonctions |
 |---|---|
-| Appels | Émettre, recevoir, attente, transfert direct et supervisé, DTMF, réception sans onglet ouvert (Web Push), click-to-call vers le téléphone de bureau |
+| Appels | Émettre, recevoir, attente, transfert direct et supervisé, DTMF, sonnerie dans tous les onglets, réception sans onglet ouvert (Web Push), click-to-call vers le téléphone de bureau ou Linphone |
 | Annuaire | LDAP avec photos, présence téléphonique en temps réel, « ne pas déranger » planifié |
 | Règles d'appel | Renvois (immédiat, occupé, non-réponse), groupes à sonnerie simultanée, numéro de repli |
 | Opérateur | Trunk OVHcloud ou tout trunk SIP, numéros directs, urgences par site, international bloqué par défaut, plafonds, détection de fraude |
 | Wazo | Messagerie vocale transcrite (LinTO) avec avis dans Twake Chat, SVI, files, groupes séquentiels, enregistrement et supervision |
 | Visio | Rejoindre une salle Meet par téléphone, appeler un numéro depuis une salle, passer un appel à deux en conférence |
 | Administration | Trunks, numéros, routes, droits, plafonds, webhooks, sans console |
-| Intégration | Webhooks signés (HMAC), CDR rapprochés avec OVHcloud, TwakePhone dans Twake Workplace (intent CALL, widget) |
+| Intégration | Webhooks signés (HMAC), CDR rapprochés avec OVHcloud, historique unifié, TwakePhone dans Twake Workplace (intent CALL, widget sans pile SIP) |
 
 Pas encore : QoS (Homer, MOS), haute disponibilité, mobile, transcription des appels, SaaS multi-tenant (décidé, [ADR 0036](docs/adr/0036-saas-pile-partagee.md)).
 
@@ -90,11 +88,11 @@ Pour aller plus loin : [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) (le détail,
 | Application | React, OIDC (PKCE) sur LemonLDAP::NG | Autonome, intégrable ensuite dans Twake Chat (grille d'apps, widget Matrix) |
 | Softphone | [JsSIP](https://jssip.net) (MIT) | Maintenu (3.13, mai 2026) ; [sip_ua](https://pub.dev/packages/sip_ua), son port Dart, servira le mobile |
 | Passerelle | Fastify 5, TypeScript, PostgreSQL, OpenAPI, WebSocket | Reprise du POC : auth OIDC, secrets SIP par utilisateur chiffrés, historique, multi-tenant, tests de contrat |
-| Serveur SIP | [OpenSIPS](https://opensips.org) 3.6 (GPLv2) + [rtpengine](https://github.com/sipwise/rtpengine) (GPLv3) | Registrar, WSS, `dispatcher`, `drouting`, `dialplan`, `fraud_detection`, `acc`, `dialog`, HEP ; `mid_registrar` pour les extensions qui ont une ligne chez Wazo (étape 11c-1, ADR 0027) |
+| Serveur SIP | [OpenSIPS](https://opensips.org) 3.6 (GPLv2) + [rtpengine](https://github.com/sipwise/rtpengine) (GPLv3) | Registrar, WSS, `dispatcher`, `drouting`, `dialplan`, `fraud_detection`, `acc`, `dialog` ; `mid_registrar` pour les extensions qui ont une ligne chez Wazo (étape 11c-1, ADR 0027) |
 | IPBX (étape 11) | [Wazo Platform](https://wazo-platform.org) (GPLv3, gratuit) | Seul moyen libre et complet d'avoir messagerie, SVI, files, enregistrement, supervision |
-| Visio | [LiveKit SIP](https://docs.livekit.io/sip/) (Apache 2.0) + La Suite Meet | Déjà fonctionnel dans le POC : dial-in par PIN, dial-out |
+| Visio | [LiveKit SIP](https://docs.livekit.io/sip/) (Apache 2.0) + La Suite Meet | Entrée des téléphones dans les salles Meet ; passage à la téléphonie de Meet upstream décidé ([ADR 0018](docs/adr/0018-meet-livekit-sip-derriere-opensips.md)), code pas encore aligné |
 | Transcription | [LinTO](https://linto.ai) STT (AGPL) | Souverain, maîtrisé par LINAGORA |
-| QoS | Homer 7, Prometheus, Grafana | MOS par appel, traces SIP, alertes |
+| QoS (prévu) | Homer 7, Prometheus, Grafana | MOS par appel, traces SIP, alertes |
 | Opérateur | Trunk SIP OVHcloud par défaut, tout trunk standard accepté | SDA, repli, urgences |
 
 Retirés le 13 octobre 2026 : Linphone desktop, Flexisip, SIP.js, Asterisk brut par ARI, Cozy comme hôte de l'application.
