@@ -57,7 +57,7 @@ Limites communes aujourd'hui : un seul tenant dans le chemin d'appel (`use_domai
 | [0032](0032-twakephone-dans-twake-workplace.md) | TwakePhone dans Workplace par une coquille Cozy ; intent `CALL` qui remplit le clavier ; contacts de Workplace | proposée |
 | [0033](0033-click-to-call-par-wazo.md) | Click-to-call : Wazo sonne la ligne (`Originate`), puis `Dial` vers la cible sous l'autorisation d'OpenSIPS | acceptée |
 | [0034](0034-widget-telecommande.md) | Le widget est une télécommande de la fenêtre Twake Phone, relayée par la coquille ; pas de softphone | acceptée |
-| [0035](0035-cluster-de-dev.md) | Cluster de dev : images publiées sur Harbor par la CI ; pod en réseau de l'hôte refusé par l'infra, chemin du son à décider | proposée |
+| [0035](0035-cluster-de-dev.md) | Clusters de la dev : images publiées sur Harbor par la CI ; pile SIP et média en réseau de l'hôte sur le cluster média, TLS et liens entre clusters à confirmer | proposée |
 | [0036](0036-saas-pile-partagee.md) | SaaS : une pile partagée, un domaine SIP et un tenant Wazo par organisation, clés `(tenant, poste)` ; code pas encore aligné | acceptée, code pas encore aligné |
 
 Gabarit : date, révision, état et « remplacé par » ; contexte (2 à 4 phrases) ; décision (3 à 8 puces) ; séquence Mermaid quand un flux est la décision ; compromis (gagné, perdu, limite) ; alternatives écartées ; code. Un écart entre l'ADR et le code s'écrit « Écart : … » avec le fichier et la ligne. Une décision cite le fil ou le compte rendu où elle a été prise, pas une personne.
