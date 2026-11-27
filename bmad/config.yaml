@@ -1,0 +1,16 @@
+# BMAD Method v6 - Project Configuration
+project_name: "twake-phone"
+project_type: "web-app"
+project_level: 4  # 40+ stories
+
+# The BMAD documents live apart from the repository's own docs (ARCHITECTURE.md, ADRs)
+output_folder: "docs/bmad"
+
+bmm:
+  workflow_status_file: "docs/bmad/bmm-workflow-status.yaml"
+  sprint_status_file: "docs/bmad/sprint-status.yaml"
+
+paths:
+  docs: "docs/bmad"
+  stories: "docs/bmad/stories"
+  tests: "apps/web/test"
